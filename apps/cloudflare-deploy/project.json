@@ -1,0 +1,33 @@
+{
+  "name": "cloudflare-deploy",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/cloudflare-deploy",
+  "tags": [],
+  "implicitDependencies": ["api", "web"],
+  "targets": {
+    "build": {
+      "dependsOn": ["^build"],
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "rm -rf dist build .wrangler",
+          "cp -r ../../dist/apps/web ./dist",
+          "go run github.com/syumai/workers/cmd/workers-assets-gen@latest -mode go .",
+          "GOOS=js GOARCH=wasm go build -o build/app.wasm ."
+        ],
+        "cwd": "apps/cloudflare-deploy",
+        "parallel": false
+      }
+    },
+    "deploy": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "wrangler deploy"
+        ],
+        "cwd": "apps/cloudflare-deploy"
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+name = "my-sanctuary"
+main = "build/worker.mjs"
+compatibility_date = "2026-05-02"
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[[routes]]
+pattern = "my-sanctuary.fahimalizain.com"
+custom_domain = true

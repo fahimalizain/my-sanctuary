@@ -1,0 +1,9 @@
+{
+  "name": "@my-sanctuary/cloudflare-deploy",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {},
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

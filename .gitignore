@@ -52,3 +52,7 @@ Thumbs.db
 *.out
 vendor/
 go.work.sum
+*.wasm
+
+# Wrangler
+.wrangler
