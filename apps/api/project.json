@@ -1,0 +1,49 @@
+{
+  "name": "api",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/api",
+  "tags": [],
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "CGO_ENABLED=0 go build -o ../../dist/apps/api ."
+        ],
+        "cwd": "apps/api"
+      },
+      "outputs": ["{workspaceRoot}/dist/apps/api"]
+    },
+    "serve": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "go run ."
+        ],
+        "cwd": "apps/api"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "CGO_ENABLED=0 go test -cover ./..."
+        ],
+        "cwd": "apps/api"
+      }
+    },
+    "lint": {
+      "executor": "@nx-go/nx-go:lint"
+    },
+    "tidy": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "go mod tidy"
+        ],
+        "cwd": "apps/api"
+      }
+    }
+  }
+}
