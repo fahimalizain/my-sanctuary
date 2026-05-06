@@ -28,7 +28,7 @@
       "executor": "nx:run-commands",
       "options": {
         "commands": [
-          "CGO_ENABLED=0 go test -cover ./..."
+          "CGO_ENABLED=0 go test ./..."
         ],
         "cwd": "apps/api"
       }
