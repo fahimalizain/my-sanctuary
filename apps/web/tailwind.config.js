@@ -14,8 +14,8 @@ export default {
         'gym-terracotta': '#c45a2c',
         'family-plum': '#7a4a6a',
         'relax-sage': '#3a7a5a',
-        border: 'hsl(var(--border))',
-        input: 'hsl(var(--input))',
+        border: 'hsl(var(--border) / var(--border-opacity))',
+        input: 'hsl(var(--input) / var(--border-opacity))',
         ring: 'hsl(var(--ring))',
         background: 'hsl(var(--background))',
         foreground: 'hsl(var(--foreground))',
@@ -46,6 +46,11 @@ export default {
         card: {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
+        },
+        priority: {
+          high: '#ef4444',
+          medium: '#f59e0b',
+          low: '#60a5fa',
         },
       },
       fontFamily: {

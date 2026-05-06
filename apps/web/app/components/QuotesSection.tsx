@@ -29,9 +29,9 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
   const currentQuote = quotes[currentIndex]
 
   return (
-    <div className={cn('bg-white rounded-xl p-6 shadow-sm', className)}>
+    <div className={cn('bg-card rounded-xl p-6 shadow-sm border border-border', className)}>
       <div className="flex items-center gap-2 mb-4">
-        <Quote className="h-5 w-5 text-sanctuary-green" />
+        <Quote className="h-5 w-5 text-primary" />
         <h2 className="font-heading text-lg font-semibold text-foreground">
           Daily Inspiration
         </h2>
@@ -39,7 +39,7 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
 
       <div className="min-h-[100px] flex flex-col justify-center">
         <p className="text-lg text-foreground/90 leading-relaxed mb-3">
-          "{currentQuote.text}"
+          &ldquo;{currentQuote.text}&rdquo;
         </p>
         <p className="text-sm text-muted-foreground">
           — {currentQuote.author}
@@ -54,7 +54,7 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
               onClick={() => setCurrentIndex(index)}
               className={cn(
                 'h-2 w-2 rounded-full transition-colors',
-                index === currentIndex ? 'bg-sanctuary-green' : 'bg-gray-200'
+                index === currentIndex ? 'bg-primary' : 'bg-muted'
               )}
             />
           ))}
@@ -62,15 +62,15 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
         <div className="flex gap-1">
           <button
             onClick={goToPrev}
-            className="p-1.5 rounded-md hover:bg-gray-100 transition-colors"
+            className="p-1.5 rounded-md hover:bg-muted transition-colors"
           >
-            <ChevronLeft className="h-4 w-4 text-gray-600" />
+            <ChevronLeft className="h-4 w-4 text-muted-foreground" />
           </button>
           <button
             onClick={goToNext}
-            className="p-1.5 rounded-md hover:bg-gray-100 transition-colors"
+            className="p-1.5 rounded-md hover:bg-muted transition-colors"
           >
-            <ChevronRight className="h-4 w-4 text-gray-600" />
+            <ChevronRight className="h-4 w-4 text-muted-foreground" />
           </button>
         </div>
       </div>

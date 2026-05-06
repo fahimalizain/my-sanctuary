@@ -3,6 +3,7 @@ export interface Task {
   title: string
   duration: number
   priority: 'high' | 'medium' | 'low'
+  completed?: boolean
 }
 
 export interface TimeBlock {
@@ -20,3 +21,12 @@ export interface Stream {
   name: string
   color: string
 }
+
+// A task event that appears directly on the timeline (not inside a time block)
+export interface TaskEvent extends Task {
+  startTime: string
+  endTime: string
+}
+
+// Union type for timeline items - can be a full time block or a task event
+export type TimelineItem = TimeBlock | TaskEvent

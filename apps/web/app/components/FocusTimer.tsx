@@ -42,13 +42,13 @@ export function FocusTimer({ className }: FocusTimerProps) {
   }
 
   return (
-    <div className={cn('bg-white rounded-xl p-6 shadow-sm', className)}>
+    <div className={cn('bg-card rounded-xl p-6 shadow-sm border border-border', className)}>
       <h2 className="font-heading text-lg font-semibold text-foreground mb-4">
         Focus Timer
       </h2>
 
       <div className="text-center mb-6">
-        <div className="font-heading text-5xl font-bold text-sanctuary-green mb-2">
+        <div className="font-heading text-5xl font-bold text-primary mb-2">
           {formatTime(minutes, seconds)}
         </div>
         <p className="text-sm text-muted-foreground">
@@ -67,7 +67,7 @@ export function FocusTimer({ className }: FocusTimerProps) {
         </Button>
         <Button
           onClick={() => setIsRunning(!isRunning)}
-          className="rounded-full px-8 bg-sanctuary-green hover:bg-sanctuary-green/90"
+          className="rounded-full px-8 bg-primary hover:bg-primary/90"
         >
           {isRunning ? (
             <>
