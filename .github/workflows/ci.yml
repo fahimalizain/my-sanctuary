@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
 
       - run: npm ci
 
-      - run: npx nx format:check --base="remotes/origin/main"
+      - run: npx nx format:check --base="remotes/origin/master"
 
   lint:
     runs-on: ubuntu-latest
@@ -86,7 +86,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
 
