@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/gorilla/sessions"
@@ -42,7 +41,7 @@ func NewAuthHandler(cfg *config.Config) *AuthHandler {
 		Path:     "/",
 		MaxAge:   86400 * 7,
 		HttpOnly: true,
-		Secure:   os.Getenv("SECURE_COOKIE") == "true",
+		Secure:   cfg.SecureCookie,
 		SameSite: http.SameSiteLaxMode,
 	}
 

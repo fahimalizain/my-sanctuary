@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/syumai/workers"
+	"github.com/syumai/workers/cloudflare"
 	"my-sanctuary/apps/api/config"
 	"my-sanctuary/apps/api/handlers"
 )
@@ -17,7 +18,7 @@ import (
 var staticFS embed.FS
 
 func main() {
-	cfg, err := config.Load()
+	cfg, err := config.LoadWithEnv(cloudflare.Getenv)
 	if err != nil {
 		fmt.Printf("failed to load config: %v\n", err)
 		return

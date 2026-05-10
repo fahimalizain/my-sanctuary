@@ -101,6 +101,22 @@ echo "$GOOGLE_CREDENTIALS_JSON" | npx wrangler secret put GOOGLE_CREDENTIALS_JSO
 
 > ⚠️ Never commit secrets. `wrangler.toml` is kept free of any credentials.
 
+### Why `wrangler secret put` / Dashboard Variables Don't Work Out-of-the-Box for Go
+
+If you set a secret in the Wrangler dashboard or via `wrangler secret put`, it **is** available in the Cloudflare Workers runtime — but Go code cannot read it with `os.Getenv()`.
+
+**The problem:** Cloudflare Workers expose env vars (including secrets) through a JavaScript runtime object, not POSIX environment variables. When Go is compiled to WebAssembly for Workers, `os.Getenv` has no access to the JS runtime context and returns empty strings.
+
+**The solution:** Use `cloudflare.Getenv` from `github.com/syumai/workers/cloudflare`, which bridges to the JS runtime context where Wrangler secrets and variables live.
+
+| Method | Works in JS Worker? | Works in Go WASM Worker? |
+|--------|--------------------|-------------------------|
+| `wrangler secret put` then `env.SECRET` in JS | ✅ Yes | N/A (JS only) |
+| `wrangler secret put` then `os.Getenv("SECRET")` in Go | ❌ No | ❌ Returns empty |
+| `wrangler secret put` then `cloudflare.Getenv("SECRET")` in Go | N/A | ✅ Yes |
+
+This is why `main.go` uses `config.LoadWithEnv(cloudflare.Getenv)` instead of the standard `config.Load()` (which uses `os.Getenv` for local dev).
+
 ## Deployment
 
 ```bash

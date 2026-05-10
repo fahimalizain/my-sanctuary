@@ -12,6 +12,7 @@ type Config struct {
 	OAuth         *OAuthConfig
 	SessionSecret string
 	FrontendURL   string
+	SecureCookie  bool
 }
 
 // OAuthConfig holds the parsed Google OAuth client credentials.
@@ -34,19 +35,27 @@ type googleCredentialsFile struct {
 
 // Load reads environment variables and returns a validated Config.
 func Load() (*Config, error) {
+	return LoadWithEnv(os.Getenv)
+}
+
+// LoadWithEnv reads configuration using the provided environment variable getter.
+// This allows custom env sources (e.g. Cloudflare Workers runtime) to be used.
+func LoadWithEnv(getenv func(string) string) (*Config, error) {
 	cfg := &Config{
-		FrontendURL: os.Getenv("FRONTEND_URL"),
+		FrontendURL: getenv("FRONTEND_URL"),
 	}
 	if cfg.FrontendURL == "" {
 		cfg.FrontendURL = "http://localhost:5173"
 	}
 
-	cfg.SessionSecret = os.Getenv("SESSION_SECRET")
+	cfg.SessionSecret = getenv("SESSION_SECRET")
 	if cfg.SessionSecret == "" {
 		return nil, fmt.Errorf("SESSION_SECRET environment variable is required")
 	}
 
-	googleJSON := os.Getenv("GOOGLE_CREDENTIALS_JSON")
+	cfg.SecureCookie = getenv("SECURE_COOKIE") == "true"
+
+	googleJSON := getenv("GOOGLE_CREDENTIALS_JSON")
 	if googleJSON == "" {
 		return nil, fmt.Errorf("GOOGLE_CREDENTIALS_JSON environment variable is required")
 	}
