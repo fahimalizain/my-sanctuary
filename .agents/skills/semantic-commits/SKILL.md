@@ -3,7 +3,7 @@ name: semantic-commits
 description: Enforces Conventional Commits format for all git commits in this repository. Use whenever staging changes, committing, amending commits, or writing commit messages. Ensures consistency with feat, fix, docs, style, refactor, perf, test, chore, ci, and build types.
 metadata:
   author: my-sanctuary
-  version: '1.0'
+  version: '1.0.1'
 ---
 
 # Semantic Commit Messages
