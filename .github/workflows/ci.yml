@@ -106,13 +106,15 @@ jobs:
 
       - run: npx nx build cloudflare-deploy
 
-      # Write non-secret env vars from GitHub repository variables into wrangler.toml
+      # Write env vars from GitHub Secrets into wrangler.toml
+      # Note: wrangler.toml [vars] supports values; secrets go via wrangler secret put.
+      # Since these are in GitHub Secrets, we inject them here instead of [vars].
       - run: |
           cat >> apps/cloudflare-deploy/wrangler.toml << 'EOF'
 
           [vars]
-          FRONTEND_URL = "${{ vars.FRONTEND_URL }}"
-          SECURE_COOKIE = "${{ vars.SECURE_COOKIE }}"
+          FRONTEND_URL = "${{ secrets.FRONTEND_URL }}"
+          SECURE_COOKIE = "${{ secrets.SECURE_COOKIE }}"
           EOF
 
       # Deploy first (required before secrets can be set)
