@@ -58,6 +58,10 @@ chore(deps): bump @tanstack/react-router to 1.115
 ci(repo): add GitHub Actions workflow for PR checks
 ```
 
+## Auto-Version Bump
+
+On every commit, the root `package.json` version is automatically bumped by patch via the pre-commit hook (`.githooks/pre-commit`). The hook stages the updated `package.json` alongside your commit. No manual version editing needed.
+
 ## Rules
 
 1. Use lowercase for type, scope, and description.

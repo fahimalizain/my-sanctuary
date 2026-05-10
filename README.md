@@ -1,10 +1,60 @@
-# New Nx Repository
+# Sanctuary
 
-<a alt="Nx logo" href="https://nx.dev" target="_blank" rel="noreferrer"><img src="https://raw.githubusercontent.com/nrwl/nx/master/images/nx-logo.png" width="45"></a>
+A personal productivity sanctuary — an installable PWA for managing your life streams, tasks, and consistency.
 
-✨ Your new, shiny [Nx workspace](https://nx.dev) is ready ✨.
+## Apps
 
-[Learn more about this workspace setup and its capabilities](https://nx.dev/nx-api/js?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or run `npx nx graph` to visually explore what was created. Now, let's get you up to speed!
+| App | Description | Tech |
+|-----|-------------|------|
+| `apps/web` | Installable PWA with offline support | React 19, TanStack Router, Vite, Tailwind CSS |
+| `apps/api` | Backend API (Go Workers) | Go |
+
+---
+
+## Quick Start
+
+```sh
+npm install          # installs dependencies + configures git hooks
+npx nx serve web     # starts the web dev server
+npx nx run web:build # production build
+```
+
+---
+
+## PWA
+
+The web app is a fully installable Progressive Web App:
+
+- **Offline capable** — Service Worker precaches all assets
+- **Installable** — Add to home screen on iOS Safari and Android Chrome
+- **Auto-updating** — New builds prompt a reload when available
+
+### Add to Home Screen (iOS Safari)
+
+1. Open the deployed URL in Safari
+2. Tap the **Share** button
+3. Scroll down and tap **Add to Home Screen**
+4. Tap **Add**
+
+The app opens in standalone mode (no Safari chrome).
+
+---
+
+## Git Hooks
+
+This repo uses tracked git hooks in `.githooks/`:
+
+- **pre-commit** — auto-bumps the `apps/web/package.json` patch version on every commit
+
+The `prepare` script in `package.json` auto-configures the hook path on `npm install`. If it ever needs manual setup:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+---
+
+## Nx Commands
 ## Generate a library
 
 ```sh

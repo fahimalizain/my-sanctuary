@@ -2,7 +2,9 @@
   "name": "@org/source",
   "version": "0.0.0",
   "license": "MIT",
-  "scripts": {},
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true"
+  },
   "private": true,
   "devDependencies": {
     "@nx-go/nx-go": "^4.0.0",
