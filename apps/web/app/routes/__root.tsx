@@ -3,7 +3,7 @@ import '../styles/globals.css';
 import { Home, LayoutGrid, CalendarDays, Target, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ReloadPrompt } from '@/app/components/ReloadPrompt';
-import pkg from '../../package.json';
+declare const __APP_VERSION__: string;
 
 function Navigation() {
   const location = useLocation();
@@ -54,7 +54,7 @@ function Navigation() {
 function VersionBadge() {
   return (
     <div className="fixed bottom-1 left-1/2 -translate-x-1/2 z-40 text-[10px] text-muted-foreground/40 pointer-events-none select-none">
-      v{pkg.version}
+      v{__APP_VERSION__}
     </div>
   );
 }

@@ -6,6 +6,11 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Read root package.json for version injection
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const rootPkg = require('../../package.json');
+
 export default defineConfig(({ mode }) => ({
   plugins: [
     react(),
@@ -58,6 +63,7 @@ export default defineConfig(({ mode }) => ({
     __API_BASE_URL__: JSON.stringify(
       mode === 'production' ? '' : (process.env.VITE_API_BASE_URL || 'http://localhost:8080')
     ),
+    __APP_VERSION__: JSON.stringify(rootPkg.version),
   },
   build: {
     outDir: '../../dist/apps/web',

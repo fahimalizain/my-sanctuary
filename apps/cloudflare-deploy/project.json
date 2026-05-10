@@ -11,10 +11,7 @@
       "executor": "nx:run-commands",
       "options": {
         "commands": [
-          "rm -rf dist build .wrangler",
-          "cp -r ../../dist/apps/web ./dist",
-          "go run github.com/syumai/workers/cmd/workers-assets-gen@latest -mode go .",
-          "GOOS=js GOARCH=wasm go build -o build/app.wasm ."
+          "bash build.sh"
         ],
         "cwd": "apps/cloudflare-deploy",
         "parallel": false

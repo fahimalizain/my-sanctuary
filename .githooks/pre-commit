@@ -1,4 +1,4 @@
 #!/bin/bash
 # Auto-bump patch version on every commit
 node .agents/skills/semantic-commits/bump-version.mjs
-git add apps/web/package.json
+git add package.json

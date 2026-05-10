@@ -23,3 +23,33 @@
 <!-- nx configuration end-->
 
 > All commits in this repository follow [Conventional Commits](https://www.conventionalcommits.org/). Load the `semantic-commits` skill (`.agents/skills/semantic-commits/SKILL.md`) for the full specification.
+
+---
+
+## @apps/web
+
+The web app is an installable PWA built with Vite + React 19 + TanStack Router + Tailwind CSS.
+
+- **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version on every commit. The web app reads this at build time via `__APP_VERSION__` (injected by Vite `define`).
+- **PWA** — `vite-plugin-pwa` handles the manifest, service worker (Workbox), and precaching. A `<ReloadPrompt />` component notifies users when updates are available or offline mode is ready.
+- **Icons** — `public/logo.svg` is the source of truth. PNG exports (`pwa-*.png`, `favicon.png`, `apple-touch-icon.png`) are generated from it using `resvg`.
+- **Build** — `npx nx run web:build` outputs to `dist/apps/web`.
+- **Dev** — `npx nx serve web` or `npm run dev` inside `apps/web`.
+
+## @apps/api
+
+The API is a Go HTTP server using chi router + huma for OpenAPI documentation.
+
+- **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version. The Go binary reads this at build time via `-ldflags -X main.version=...` from `build.sh`.
+- **Build** — `npx nx run api:build` outputs to `dist/apps/api`.
+- **Dev** — `npx nx serve api` or `go run .` inside `apps/api`.
+- **Endpoints** — `GET /version` returns the deployed app version.
+
+## @apps/cloudflare-deploy
+
+The Cloudflare Workers deploy app bundles the web frontend and API into a single WASM Workers deployment.
+
+- **Version** — same root `package.json` single source of truth. Injected via `-ldflags -X main.version=...` from `build.sh`.
+- **Build** — `npx nx run cloudflare-deploy:build` bundles web dist + Go WASM binary.
+- **Deploy** — `npx nx run cloudflare-deploy:deploy` pushes to Cloudflare via wrangler.
+- **Implied deps** — `api` and `web` must be built first.

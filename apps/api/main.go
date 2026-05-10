@@ -10,6 +10,8 @@ import (
 	"my-sanctuary/apps/api/handlers"
 )
 
+var version = "dev"
+
 func main() {
 	cli := humacli.New(func(hooks humacli.Hooks, options *struct{}) {
 		cfg, err := config.Load()
@@ -19,7 +21,7 @@ func main() {
 		}
 
 		router := chi.NewMux()
-		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg, HTTPClient: http.DefaultClient})
+		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg, HTTPClient: http.DefaultClient, Version: version})
 
 		server := &http.Server{
 			Addr:    ":8080",
@@ -27,7 +29,7 @@ func main() {
 		}
 
 		hooks.OnStart(func() {
-			fmt.Println("Server running on http://localhost:8080")
+			fmt.Printf("Sanctuary API v%s running on http://localhost:8080\n", version)
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				fmt.Printf("Server error: %v\n", err)
 			}

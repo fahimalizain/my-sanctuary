@@ -8,7 +8,7 @@
     "build": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": ["CGO_ENABLED=0 go build -o ../../dist/apps/api ."],
+        "commands": ["bash build.sh"],
         "cwd": "apps/api"
       },
       "outputs": ["{workspaceRoot}/dist/apps/api"]

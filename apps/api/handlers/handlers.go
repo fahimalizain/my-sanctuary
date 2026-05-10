@@ -16,6 +16,7 @@ import (
 type Dependencies struct {
 	Config     *config.Config
 	HTTPClient *http.Client
+	Version    string
 }
 
 // GreetingInput represents the input for the greeting endpoint.
@@ -76,6 +77,12 @@ func RegisterRoutes(router chi.Router, deps *Dependencies) {
 				Status string `json:"status"`
 			}{Status: "ok"},
 		}, nil
+	})
+
+	// Version endpoint
+	router.Get("/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"version":"` + deps.Version + `"}`))
 	})
 
 	// Auth routes

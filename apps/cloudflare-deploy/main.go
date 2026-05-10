@@ -18,6 +18,8 @@ import (
 //go:embed dist/*
 var staticFS embed.FS
 
+var version = "dev"
+
 func main() {
 	cfg, err := config.LoadWithEnv(cloudflare.Getenv)
 	if err != nil {
@@ -31,6 +33,7 @@ func main() {
 	handlers.RegisterRoutes(router, &handlers.Dependencies{
 		Config:     cfg,
 		HTTPClient: fetch.NewClient().HTTPClient(fetch.RedirectModeFollow),
+		Version:    version,
 	})
 
 	// Static files + SPA fallback
