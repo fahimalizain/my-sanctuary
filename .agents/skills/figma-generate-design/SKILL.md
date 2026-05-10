@@ -68,7 +68,6 @@ You need three things from the design system: **components** (buttons, cards, et
 
 #### 2a: Discover components
 
-
 **2a-i — REQUIRED: Check Code Connect for needed components.** Starting from the component list you built in Step 1, check whether each component has a Code Connect file in the codebase. Code Connect files live next to the component source and are named by platform:
 
 - **TypeScript/JS**: `*.figma.ts`, `*.figma.js`
@@ -83,8 +82,8 @@ From each matching Code Connect file, extract the Figma component URL. Parse `fi
 **Example:** Code Connect file contains `// url=https://figma.com/design/ABC123/File?node-id=609-35535`. Parse `fileKey` = `ABC123`, `nodeId` = `609:35535`. Run `use_figma` against the **library file** (fileKey `ABC123`, not the target file) to resolve the key:
 
 ```js
-const node = await figma.getNodeByIdAsync("609:35535");
-const set = node?.parent?.type === "COMPONENT_SET" ? node.parent : node;
+const node = await figma.getNodeByIdAsync('609:35535');
+const set = node?.parent?.type === 'COMPONENT_SET' ? node.parent : node;
 return { componentKey: set.key };
 ```
 
@@ -95,17 +94,19 @@ Mark resolved components. If all components are resolved, skip 2a-ii and 2a-iii.
 **2a-ii — REQUIRED if unresolved components remain: Inspect existing screens.** Check if the target file already contains screens using the same design system. A single `use_figma` call that walks an existing frame's instances gives you an exact, authoritative component map:
 
 ```js
-const frame = figma.currentPage.findOne(n => n.name === "Existing Screen");
+const frame = figma.currentPage.findOne((n) => n.name === 'Existing Screen');
 const uniqueSets = new Map();
-frame.findAll(n => n.type === "INSTANCE").forEach(inst => {
-  const mc = inst.mainComponent;
-  const cs = mc?.parent?.type === "COMPONENT_SET" ? mc.parent : null;
-  const key = cs ? cs.key : mc?.key;
-  const name = cs ? cs.name : mc?.name;
-  if (key && !uniqueSets.has(key)) {
-    uniqueSets.set(key, { name, key, isSet: !!cs, sampleVariant: mc.name });
-  }
-});
+frame
+  .findAll((n) => n.type === 'INSTANCE')
+  .forEach((inst) => {
+    const mc = inst.mainComponent;
+    const cs = mc?.parent?.type === 'COMPONENT_SET' ? mc.parent : null;
+    const key = cs ? cs.key : mc?.key;
+    const name = cs ? cs.name : mc?.name;
+    if (key && !uniqueSets.has(key)) {
+      uniqueSets.set(key, { name, key, isSet: !!cs, sampleVariant: mc.name });
+    }
+  });
 return [...uniqueSets.values()];
 ```
 
@@ -176,21 +177,23 @@ See [variable-patterns.md](../figma-use/references/variable-patterns.md) for bin
 Search for styles using `search_design_system` with `includeStyles: true` and terms like "heading", "body", "shadow", "elevation". Or inspect what an existing screen uses:
 
 ```js
-const frame = figma.currentPage.findOne(n => n.name === "Existing Screen");
+const frame = figma.currentPage.findOne((n) => n.name === 'Existing Screen');
 const styles = { text: new Map(), effect: new Map() };
-frame.findAll(() => true).forEach(node => {
-  if ('textStyleId' in node && node.textStyleId) {
-    const s = figma.getStyleById(node.textStyleId);
-    if (s) styles.text.set(s.id, { name: s.name, id: s.id, key: s.key });
-  }
-  if ('effectStyleId' in node && node.effectStyleId) {
-    const s = figma.getStyleById(node.effectStyleId);
-    if (s) styles.effect.set(s.id, { name: s.name, id: s.id, key: s.key });
-  }
-});
+frame
+  .findAll(() => true)
+  .forEach((node) => {
+    if ('textStyleId' in node && node.textStyleId) {
+      const s = figma.getStyleById(node.textStyleId);
+      if (s) styles.text.set(s.id, { name: s.name, id: s.id, key: s.key });
+    }
+    if ('effectStyleId' in node && node.effectStyleId) {
+      const s = figma.getStyleById(node.effectStyleId);
+      if (s) styles.effect.set(s.id, { name: s.name, id: s.id, key: s.key });
+    }
+  });
 return {
   textStyles: [...styles.text.values()],
-  effectStyles: [...styles.effect.values()]
+  effectStyles: [...styles.effect.values()],
 };
 ```
 
@@ -211,7 +214,7 @@ for (const child of figma.currentPage.children) {
   maxX = Math.max(maxX, child.x + child.width);
 }
 
-const wrapper = figma.createAutoLayout("VERTICAL");
+const wrapper = figma.createAutoLayout('VERTICAL');
 
 // --- Size the wrapper based on container type ---
 // Full page:       wrapper.resize(1440, 100); wrapper.name = "Homepage";
@@ -220,11 +223,11 @@ const wrapper = figma.createAutoLayout("VERTICAL");
 // Panel:           wrapper.resize(400, 100);  wrapper.name = "Details Panel";
 // Adapt width to match the source code's actual dimensions.
 
-wrapper.name = "VIEW_NAME";
-wrapper.primaryAxisAlignItems = "CENTER";
-wrapper.counterAxisAlignItems = "CENTER";
+wrapper.name = 'VIEW_NAME';
+wrapper.primaryAxisAlignItems = 'CENTER';
+wrapper.counterAxisAlignItems = 'CENTER';
 wrapper.resize(WIDTH, 100);
-wrapper.layoutSizingHorizontal = "FIXED";
+wrapper.layoutSizingHorizontal = 'FIXED';
 wrapper.x = maxX + 200;
 wrapper.y = 0;
 
@@ -237,30 +240,35 @@ return { success: true, wrapperId: wrapper.id };
 
 ```js
 const createdNodeIds = [];
-const wrapper = await figma.getNodeByIdAsync("WRAPPER_ID_FROM_STEP_3");
+const wrapper = await figma.getNodeByIdAsync('WRAPPER_ID_FROM_STEP_3');
 
 // Import design system components by key
-const buttonSet = await figma.importComponentSetByKeyAsync("BUTTON_SET_KEY");
-const primaryButton = buttonSet.children.find(c =>
-  c.type === "COMPONENT" && c.name.includes("variant=primary")
-) || buttonSet.defaultVariant;
+const buttonSet = await figma.importComponentSetByKeyAsync('BUTTON_SET_KEY');
+const primaryButton =
+  buttonSet.children.find(
+    (c) => c.type === 'COMPONENT' && c.name.includes('variant=primary'),
+  ) || buttonSet.defaultVariant;
 
 // Import design system variables for colors and spacing
-const bgColorVar = await figma.variables.importVariableByKeyAsync("BG_COLOR_VAR_KEY");
-const spacingVar = await figma.variables.importVariableByKeyAsync("SPACING_VAR_KEY");
+const bgColorVar =
+  await figma.variables.importVariableByKeyAsync('BG_COLOR_VAR_KEY');
+const spacingVar =
+  await figma.variables.importVariableByKeyAsync('SPACING_VAR_KEY');
 
 // Build section frame with variable bindings (not hardcoded values)
 const section = figma.createAutoLayout();
-section.name = "Header";
-section.setBoundVariable("paddingLeft", spacingVar);
-section.setBoundVariable("paddingRight", spacingVar);
+section.name = 'Header';
+section.setBoundVariable('paddingLeft', spacingVar);
+section.setBoundVariable('paddingRight', spacingVar);
 const bgPaint = figma.variables.setBoundVariableForPaint(
-  { type: 'SOLID', color: { r: 0, g: 0, b: 0 } }, 'color', bgColorVar
+  { type: 'SOLID', color: { r: 0, g: 0, b: 0 } },
+  'color',
+  bgColorVar,
 );
 section.fills = [bgPaint];
 
 // Import and apply text/effect styles
-const shadowStyle = await figma.importStyleByKeyAsync("SHADOW_STYLE_KEY");
+const shadowStyle = await figma.importStyleByKeyAsync('SHADOW_STYLE_KEY');
 section.effectStyleId = shadowStyle.id;
 
 // Create component instances inside the section
@@ -270,7 +278,7 @@ createdNodeIds.push(btnInstance.id);
 
 // Append section to wrapper
 wrapper.appendChild(section);
-section.layoutSizingHorizontal = "FILL"; // AFTER appending
+section.layoutSizingHorizontal = 'FILL'; // AFTER appending
 
 createdNodeIds.push(section.id);
 return { success: true, createdNodeIds };
@@ -285,9 +293,13 @@ Component instances ship with placeholder text ("Title", "Heading", "Button"). U
 For nested instances that expose their own TEXT properties, call `setProperties()` on the nested instance:
 
 ```js
-const nestedHeading = cardInstance.findOne(n => n.type === "INSTANCE" && n.name === "Text Heading");
+const nestedHeading = cardInstance.findOne(
+  (n) => n.type === 'INSTANCE' && n.name === 'Text Heading',
+);
 if (nestedHeading) {
-  nestedHeading.setProperties({ "Text#2104:5": "Actual heading from source code" });
+  nestedHeading.setProperties({
+    'Text#2104:5': 'Actual heading from source code',
+  });
 }
 ```
 
@@ -299,12 +311,12 @@ When translating code components to Figma instances, check the component's defau
 
 #### What to build manually vs. import from design system
 
-| Build manually | Import from design system |
-|----------------|--------------------------|
-| Wrapper frame | **Components**: buttons, cards, inputs, nav, etc. |
-| Section container frames | **Variables**: colors (fills, strokes), spacing (padding, gap), radii |
-| Layout grids (rows, columns) | **Text styles**: heading, body, caption, etc. |
-| | **Effect styles**: shadows, blurs, etc. |
+| Build manually               | Import from design system                                             |
+| ---------------------------- | --------------------------------------------------------------------- |
+| Wrapper frame                | **Components**: buttons, cards, inputs, nav, etc.                     |
+| Section container frames     | **Variables**: colors (fills, strokes), spacing (padding, gap), radii |
+| Layout grids (rows, columns) | **Text styles**: heading, body, caption, etc.                         |
+|                              | **Effect styles**: shadows, blurs, etc.                               |
 
 **Never hardcode hex colors or pixel spacing** when a design system variable exists. Use `setBoundVariable` for spacing/radii and `setBoundVariableForPaint` for colors. Apply text styles with `node.textStyleId` and effect styles with `node.effectStyleId`.
 
@@ -313,6 +325,7 @@ When translating code components to Figma instances, check the component's defau
 After composing all sections, call `get_screenshot` on the wrapper frame and compare against the source. Fix any issues with targeted `use_figma` calls — don't rebuild the entire view.
 
 **Screenshot individual sections, not just the full view.** A full-view screenshot at reduced resolution hides text truncation, wrong colors, and placeholder text that hasn't been overridden. Take a screenshot of each section by node ID to catch:
+
 - **Cropped/clipped text** — line heights or frame sizing cutting off descenders, ascenders, or entire lines
 - **Overlapping content** — elements stacking on top of each other due to incorrect sizing or missing auto-layout
 - Placeholder text still showing ("Title", "Heading", "Button")
@@ -326,13 +339,17 @@ If you ran `generate_figma_design` in parallel (mandatory when the source contai
 
 1. Find all image nodes in the capture output by searching for fills with `type === "IMAGE"`:
    ```js
-   const capture = await figma.getNodeByIdAsync("CAPTURE_NODE_ID");
+   const capture = await figma.getNodeByIdAsync('CAPTURE_NODE_ID');
    const imageNodes = [];
-   capture.findAll(n => {
+   capture.findAll((n) => {
      if (n.fills && Array.isArray(n.fills)) {
        for (const fill of n.fills) {
-         if (fill.type === "IMAGE") {
-           imageNodes.push({ name: n.name, id: n.id, imageHash: fill.imageHash });
+         if (fill.type === 'IMAGE') {
+           imageNodes.push({
+             name: n.name,
+             id: n.id,
+             imageHash: fill.imageHash,
+           });
            return true;
          }
        }
@@ -344,7 +361,9 @@ If you ran `generate_figma_design` in parallel (mandatory when the source contai
 2. Match each captured image to the corresponding frame in your use_figma output (by position, name, or order).
 3. Apply the image hash to the target frame:
    ```js
-   targetFrame.fills = [{ type: "IMAGE", imageHash: "hash_from_capture", scaleMode: "FILL" }];
+   targetFrame.fills = [
+     { type: 'IMAGE', imageHash: 'hash_from_capture', scaleMode: 'FILL' },
+   ];
    ```
 4. Delete the `generate_figma_design` capture output after all images are transferred.
 
@@ -364,13 +383,16 @@ When updating rather than creating from scratch:
 
 ```js
 // Example: Swap a button variant in an existing screen
-const existingButton = await figma.getNodeByIdAsync("EXISTING_BUTTON_INSTANCE_ID");
-if (existingButton && existingButton.type === "INSTANCE") {
+const existingButton = await figma.getNodeByIdAsync(
+  'EXISTING_BUTTON_INSTANCE_ID',
+);
+if (existingButton && existingButton.type === 'INSTANCE') {
   // Import the updated component
-  const buttonSet = await figma.importComponentSetByKeyAsync("BUTTON_SET_KEY");
-  const newVariant = buttonSet.children.find(c =>
-    c.name.includes("variant=primary") && c.name.includes("size=lg")
-  ) || buttonSet.defaultVariant;
+  const buttonSet = await figma.importComponentSetByKeyAsync('BUTTON_SET_KEY');
+  const newVariant =
+    buttonSet.children.find(
+      (c) => c.name.includes('variant=primary') && c.name.includes('size=lg'),
+    ) || buttonSet.defaultVariant;
   existingButton.swapComponent(newVariant);
 }
 return { success: true, mutatedNodeIds: [existingButton.id] };

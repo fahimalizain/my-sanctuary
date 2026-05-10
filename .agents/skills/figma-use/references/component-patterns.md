@@ -16,22 +16,21 @@
 - Importing Components by Key
 - Working with Instances (finding variants, setProperties, text overrides, detachInstance)
 
-
 ## Creating a Component
 
 `figma.createComponent()` returns a `ComponentNode`, which behaves like a `FrameNode` but can be published, instanced, and combined into variant sets.
 
 ```javascript
 const comp = figma.createComponent();
-comp.name = "MyComponent";
-comp.layoutMode = "HORIZONTAL";
-comp.primaryAxisAlignItems = "CENTER";
-comp.counterAxisAlignItems = "CENTER";
+comp.name = 'MyComponent';
+comp.layoutMode = 'HORIZONTAL';
+comp.primaryAxisAlignItems = 'CENTER';
+comp.counterAxisAlignItems = 'CENTER';
 comp.paddingLeft = 12;
 comp.paddingRight = 12;
-comp.layoutSizingHorizontal = "HUG";
-comp.layoutSizingVertical = "HUG";
-comp.fills = [{ type: "SOLID", color: { r: 0.2, g: 0.36, b: 0.96 } }];
+comp.layoutSizingHorizontal = 'HUG';
+comp.layoutSizingVertical = 'HUG';
+comp.fills = [{ type: 'SOLID', color: { r: 0.2, g: 0.36, b: 0.96 } }];
 ```
 
 ## Combining Components into a Component Set (Variants)
@@ -43,12 +42,12 @@ Variant names use a `Property=Value` format. Every unique combination must exist
 ```javascript
 // Each component's name encodes its variant properties
 const comp1 = figma.createComponent();
-comp1.name = "size=md, style=primary";
+comp1.name = 'size=md, style=primary';
 const comp2 = figma.createComponent();
-comp2.name = "size=md, style=secondary";
+comp2.name = 'size=md, style=secondary';
 
 const componentSet = figma.combineAsVariants([comp1, comp2], figma.currentPage);
-componentSet.name = "Button";
+componentSet.name = 'Button';
 ```
 
 **Before creating variants, inspect the file** for existing naming patterns. Different files use different conventions (`State=Default` vs `state=default` vs `State/Default`). Always match what's already there.
@@ -67,7 +66,8 @@ cs.children.forEach((child, i) => {
 });
 
 // CRITICAL: resize the component set from actual child bounds
-let maxX = 0, maxY = 0;
+let maxX = 0,
+  maxY = 0;
 for (const child of cs.children) {
   maxX = Math.max(maxX, child.x + child.width);
   maxY = Math.max(maxY, child.y + child.height);
@@ -80,7 +80,7 @@ For multi-axis variants (e.g., size × style × state), parse the child's name t
 ```javascript
 for (const child of cs.children) {
   const props = Object.fromEntries(
-    child.name.split(', ').map(p => p.split('='))
+    child.name.split(', ').map((p) => p.split('=')),
   );
   const col = stateValues.indexOf(props.state);
   const row = styleValues.indexOf(props.style);
@@ -97,7 +97,11 @@ for (const child of cs.children) {
 // Returns the key as a string — capture it!
 const labelKey = comp.addComponentProperty('Label', 'TEXT', 'Default text');
 const showIconKey = comp.addComponentProperty('Show Icon', 'BOOLEAN', true);
-const iconSlotKey = comp.addComponentProperty('Icon', 'INSTANCE_SWAP', iconComponentId);
+const iconSlotKey = comp.addComponentProperty(
+  'Icon',
+  'INSTANCE_SWAP',
+  iconComponentId,
+);
 ```
 
 **Timing**: Add component properties to each variant component **before** calling `combineAsVariants`. After combining, the component set inherits all properties from its children. Do not add properties to the `ComponentSetNode` directly.
@@ -110,22 +114,27 @@ A property that is added but not linked to a child node does **nothing**. You mu
 // TEXT property → link to a text node's characters
 const labelKey = comp.addComponentProperty('Label', 'TEXT', 'Button');
 const textNode = figma.createText();
-textNode.characters = "Button";
+textNode.characters = 'Button';
 comp.appendChild(textNode);
 textNode.componentPropertyReferences = { characters: labelKey };
 
 // BOOLEAN + INSTANCE_SWAP → link to an instance node
 const showIconKey = comp.addComponentProperty('Show Icon', 'BOOLEAN', true);
-const iconSlotKey = comp.addComponentProperty('Icon', 'INSTANCE_SWAP', iconComp.id);
+const iconSlotKey = comp.addComponentProperty(
+  'Icon',
+  'INSTANCE_SWAP',
+  iconComp.id,
+);
 const iconInstance = iconComp.createInstance();
 comp.appendChild(iconInstance);
 iconInstance.componentPropertyReferences = {
-  visible: showIconKey,        // BOOLEAN controls show/hide
-  mainComponent: iconSlotKey   // INSTANCE_SWAP controls which component
+  visible: showIconKey, // BOOLEAN controls show/hide
+  mainComponent: iconSlotKey, // INSTANCE_SWAP controls which component
 };
 ```
 
 **Valid `componentPropertyReferences` keys:**
+
 - `characters` — TEXT property on a TextNode
 - `visible` — BOOLEAN property (any node)
 - `mainComponent` — INSTANCE_SWAP property on an InstanceNode
@@ -137,13 +146,17 @@ When a component has many possible sub-elements (e.g., 30 different icons), **ne
 ```javascript
 // Create icon as its own ComponentNode
 const iconComp = figma.createComponent();
-iconComp.name = "Icon/Search";
+iconComp.name = 'Icon/Search';
 iconComp.resize(24, 24);
 const svgNode = figma.createNodeFromSvg('<svg>...</svg>');
 iconComp.appendChild(svgNode);
 
 // Use it as the default for INSTANCE_SWAP
-const iconSlotKey = comp.addComponentProperty('Icon', 'INSTANCE_SWAP', iconComp.id);
+const iconSlotKey = comp.addComponentProperty(
+  'Icon',
+  'INSTANCE_SWAP',
+  iconComp.id,
+);
 const instance = iconComp.createInstance();
 comp.appendChild(instance);
 instance.componentPropertyReferences = { mainComponent: iconSlotKey };
@@ -161,9 +174,11 @@ This works for icons, avatars, badges, or any swappable nested element.
 const results = [];
 for (const page of figma.root.children) {
   await figma.setCurrentPageAsync(page);
-  page.findAll(n => {
-    if (n.type === 'COMPONENT') results.push(`[${page.name}] ${n.name} (COMPONENT) id=${n.id}`);
-    if (n.type === 'COMPONENT_SET') results.push(`[${page.name}] ${n.name} (COMPONENT_SET) id=${n.id}`);
+  page.findAll((n) => {
+    if (n.type === 'COMPONENT')
+      results.push(`[${page.name}] ${n.name} (COMPONENT) id=${n.id}`);
+    if (n.type === 'COMPONENT_SET')
+      results.push(`[${page.name}] ${n.name} (COMPONENT_SET) id=${n.id}`);
     return false;
   });
 }
@@ -174,7 +189,7 @@ return results.join('\n');
 
 ```javascript
 const cs = await figma.getNodeByIdAsync('COMPONENT_SET_ID');
-const variantNames = cs.children.map(c => c.name);
+const variantNames = cs.children.map((c) => c.name);
 const propDefs = cs.componentPropertyDefinitions;
 return { variantNames, propDefs };
 ```
@@ -185,9 +200,15 @@ return { variantNames, propDefs };
 const components = [];
 for (const page of figma.root.children) {
   await figma.setCurrentPageAsync(page);
-  page.findAll(n => {
+  page.findAll((n) => {
     if (n.type === 'COMPONENT') {
-      components.push({ name: n.name, id: n.id, page: page.name, w: n.width, h: n.height });
+      components.push({
+        name: n.name,
+        id: n.id,
+        page: page.name,
+        w: n.width,
+        h: n.height,
+      });
     }
     return false;
   });
@@ -201,14 +222,15 @@ return components;
 
 ```javascript
 // Import a component from a team library
-const comp = await figma.importComponentByKeyAsync("COMPONENT_KEY");
+const comp = await figma.importComponentByKeyAsync('COMPONENT_KEY');
 const instance = comp.createInstance();
 
 // Import a component set from a team library and pick a variant
-const set = await figma.importComponentSetByKeyAsync("COMPONENT_SET_KEY");
-const variant = set.children.find(c =>
-  c.type === "COMPONENT" && c.name.includes("size=md")
-) || set.defaultVariant;
+const set = await figma.importComponentSetByKeyAsync('COMPONENT_SET_KEY');
+const variant =
+  set.children.find(
+    (c) => c.type === 'COMPONENT' && c.name.includes('size=md'),
+  ) || set.defaultVariant;
 const variantInstance = variant.createInstance();
 ```
 
@@ -219,14 +241,15 @@ const variantInstance = variant.createInstance();
 Parse variant names to match on multiple properties simultaneously:
 
 ```javascript
-const compSet = await figma.importComponentSetByKeyAsync("KEY");
+const compSet = await figma.importComponentSetByKeyAsync('KEY');
 
-const variant = compSet.children.find(c => {
-  const props = Object.fromEntries(
-    c.name.split(', ').map(p => p.split('='))
-  );
-  return props.variant === "primary" && props.size === "md";
-}) || compSet.defaultVariant;
+const variant =
+  compSet.children.find((c) => {
+    const props = Object.fromEntries(
+      c.name.split(', ').map((p) => p.split('=')),
+    );
+    return props.variant === 'primary' && props.size === 'md';
+  }) || compSet.defaultVariant;
 
 const instance = variant.createInstance();
 ```
@@ -238,8 +261,8 @@ After creating an instance from a component set, you can set variant properties 
 ```javascript
 const instance = defaultVariant.createInstance();
 instance.setProperties({
-  "variant": "primary",
-  "size": "medium"
+  variant: 'primary',
+  size: 'medium',
 });
 ```
 
@@ -259,11 +282,11 @@ return propDefs;
 Also check nested instances — a parent component may not expose text properties directly, but its nested child instances might:
 
 ```javascript
-const nestedInstances = instance.findAll(n => n.type === "INSTANCE");
-const nestedProps = nestedInstances.map(ni => ({
+const nestedInstances = instance.findAll((n) => n.type === 'INSTANCE');
+const nestedProps = nestedInstances.map((ni) => ({
   name: ni.name,
   id: ni.id,
-  properties: ni.componentProperties
+  properties: ni.componentProperties,
 }));
 ```
 
@@ -273,8 +296,8 @@ const nestedProps = nestedInstances.map(ni => ({
 const instance = comp.createInstance();
 const propDefs = instance.componentProperties;
 for (const [key, def] of Object.entries(propDefs)) {
-  if (def.type === "TEXT") {
-    instance.setProperties({ [key]: "New text value" });
+  if (def.type === 'TEXT') {
+    instance.setProperties({ [key]: 'New text value' });
   }
 }
 ```
@@ -282,19 +305,21 @@ for (const [key, def] of Object.entries(propDefs)) {
 For nested instances that expose their own TEXT properties, call `setProperties()` on the nested instance:
 
 ```javascript
-const nestedHeading = instance.findOne(n => n.type === "INSTANCE" && n.name === "Text Heading");
+const nestedHeading = instance.findOne(
+  (n) => n.type === 'INSTANCE' && n.name === 'Text Heading',
+);
 if (nestedHeading) {
-  nestedHeading.setProperties({ "Text#2104:5": "Actual heading text" });
+  nestedHeading.setProperties({ 'Text#2104:5': 'Actual heading text' });
 }
 ```
 
 **Step 3: Only fall back to direct node.characters for unmanaged text.** If text is NOT controlled by any component property, find text nodes directly. **Always load the node's actual font first** — instance text nodes inherit fonts from the source component, so don't assume Inter Regular:
 
 ```javascript
-const textNodes = instance.findAll(n => n.type === "TEXT");
+const textNodes = instance.findAll((n) => n.type === 'TEXT');
 for (const t of textNodes) {
   await figma.loadFontAsync(t.fontName);
-  t.characters = "Updated text";
+  t.characters = 'Updated text';
 }
 ```
 
@@ -312,7 +337,7 @@ const parent = await figma.getNodeByIdAsync(parentId); // null!
 const stableFrame = await figma.getNodeByIdAsync(manualFrameId); // a frame YOU created
 nestedChild.detachInstance();
 // Re-find the parent by traversing from the stable frame
-const parent = stableFrame.findOne(n => n.name === "ParentName");
+const parent = stableFrame.findOne((n) => n.name === 'ParentName');
 ```
 
 If you must detach multiple nested instances across sibling components, do it in a **single** `use_figma` call — discover all targets by traversal at the start before any detachment mutates the tree.
@@ -336,7 +361,9 @@ async function importComponentByKey(componentKey) {
     try {
       return await figma.importComponentSetByKeyAsync(componentKey);
     } catch {
-      throw new Error(`No Component or Component Set available with key '${componentKey}'`);
+      throw new Error(
+        `No Component or Component Set available with key '${componentKey}'`,
+      );
     }
   }
 }
@@ -350,7 +377,7 @@ async function importComponentByKey(componentKey) {
  * @returns {ComponentNode|ComponentSetNode}
  */
 function getRelevantComponentNode(mainComponent) {
-  return mainComponent.parent.type === "COMPONENT_SET"
+  return mainComponent.parent.type === 'COMPONENT_SET'
     ? mainComponent.parent
     : mainComponent;
 }
@@ -366,12 +393,13 @@ function getComponentProps(node) {
   const result = {};
   for (let key in node.componentPropertyDefinitions) {
     const prop = {
-      name: key.replace(/#[^#]+$/, ""),
+      name: key.replace(/#[^#]+$/, ''),
       type: node.componentPropertyDefinitions[key].type,
-      key: key
+      key: key,
     };
-    if (prop.type === "VARIANT") {
-      prop.variantOptions = node.componentPropertyDefinitions[key].variantOptions;
+    if (prop.type === 'VARIANT') {
+      prop.variantOptions =
+        node.componentPropertyDefinitions[key].variantOptions;
     }
     result[key] = prop;
   }
@@ -388,18 +416,23 @@ function getComponentProps(node) {
  * @param {Record<string, object>} result - Accumulator object populated in place.
  */
 function collectDescendants(node, namespace, result) {
-  if (node.type === "INSTANCE" || node.type === "TEXT") {
+  if (node.type === 'INSTANCE' || node.type === 'TEXT') {
     const references = node.componentPropertyReferences || {};
     if (!node.visible && !references.visible) return;
 
     const object = { type: node.type, name: node.name, references };
     let key = `${node.type}[${node.name}]`;
 
-    if (result[key] && JSON.stringify(references) !== JSON.stringify(result[key].references)) {
-      key += btoa(btoa(unescape(encodeURIComponent(JSON.stringify(references)))));
+    if (
+      result[key] &&
+      JSON.stringify(references) !== JSON.stringify(result[key].references)
+    ) {
+      key += btoa(
+        btoa(unescape(encodeURIComponent(JSON.stringify(references)))),
+      );
     }
 
-    if (node.type === "INSTANCE") {
+    if (node.type === 'INSTANCE') {
       const mainComponent = getRelevantComponentNode(node.mainComponent);
       object.properties = getComponentProps(mainComponent);
       object.descendants = {};
@@ -409,10 +442,14 @@ function collectDescendants(node, namespace, result) {
 
     const start = namespace.length ? { variants: [] } : {};
     result[key] = Object.assign(object, result[key] || start);
-    if (namespace.length) result[key].variants.push(namespace[namespace.length - 1]);
-  } else if ("children" in node && node.visible) {
-    if (node.type === "COMPONENT" && node.parent.type === "COMPONENT_SET") namespace.push(node.name);
-    node.children.forEach(child => collectDescendants(child, namespace, result));
+    if (namespace.length)
+      result[key].variants.push(namespace[namespace.length - 1]);
+  } else if ('children' in node && node.visible) {
+    if (node.type === 'COMPONENT' && node.parent.type === 'COMPONENT_SET')
+      namespace.push(node.name);
+    node.children.forEach((child) =>
+      collectDescendants(child, namespace, result),
+    );
   }
 }
 
@@ -424,18 +461,18 @@ function collectDescendants(node, namespace, result) {
  */
 async function getLocalComponentMetadata(componentId) {
   const node = await figma.getNodeByIdAsync(componentId);
-  if (node.type === "COMPONENT_SET" || node.type === "COMPONENT") {
+  if (node.type === 'COMPONENT_SET' || node.type === 'COMPONENT') {
     const result = {
       name: node.name,
       nodeId: node.id,
       properties: {},
-      descendants: {}
+      descendants: {},
     };
     result.properties = getComponentProps(node);
     collectDescendants(node, [], result.descendants);
     return result;
   } else {
-    throw new Error("Node is not a Component or Component Set");
+    throw new Error('Node is not a Component or Component Set');
   }
 }
 
@@ -451,7 +488,7 @@ async function getPublishedComponentMetadata(componentKey) {
     name: node.name,
     nodeId: node.id,
     properties: {},
-    descendants: {}
+    descendants: {},
   };
   result.properties = getComponentProps(node);
   collectDescendants(node, [], result.descendants);

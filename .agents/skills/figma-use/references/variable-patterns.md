@@ -16,17 +16,16 @@
 - Discovering Existing Variables in the File
 - Effect Styles (For Shadows)
 
-
 ## Creating Variable Collections and Modes
 
 ```javascript
-const collection = figma.variables.createVariableCollection("MyCollection");
+const collection = figma.variables.createVariableCollection('MyCollection');
 
 // A new collection starts with 1 mode named "Mode 1" — always rename it
-collection.renameMode(collection.modes[0].modeId, "Light");
+collection.renameMode(collection.modes[0].modeId, 'Light');
 
 // Add additional modes (returns the new modeId)
-const darkModeId = collection.addMode("Dark");
+const darkModeId = collection.addMode('Dark');
 const lightModeId = collection.modes[0].modeId;
 ```
 
@@ -38,19 +37,35 @@ const lightModeId = collection.modes[0].modeId;
 
 ```javascript
 // COLOR — values use {r, g, b, a} (all 0–1 range, includes alpha)
-const colorVar = figma.variables.createVariable("my-color", collection, "COLOR");
+const colorVar = figma.variables.createVariable(
+  'my-color',
+  collection,
+  'COLOR',
+);
 colorVar.setValueForMode(modeId, { r: 0.2, g: 0.36, b: 0.96, a: 1 });
 
 // FLOAT — for spacing, radii, sizing, numeric values
-const floatVar = figma.variables.createVariable("my-spacing", collection, "FLOAT");
+const floatVar = figma.variables.createVariable(
+  'my-spacing',
+  collection,
+  'FLOAT',
+);
 floatVar.setValueForMode(modeId, 16);
 
 // STRING — for font families, font style names, any text value
-const stringVar = figma.variables.createVariable("my-font", collection, "STRING");
-stringVar.setValueForMode(modeId, "Inter");
+const stringVar = figma.variables.createVariable(
+  'my-font',
+  collection,
+  'STRING',
+);
+stringVar.setValueForMode(modeId, 'Inter');
 
 // BOOLEAN
-const boolVar = figma.variables.createVariable("my-flag", collection, "BOOLEAN");
+const boolVar = figma.variables.createVariable(
+  'my-flag',
+  collection,
+  'BOOLEAN',
+);
 boolVar.setValueForMode(modeId, true);
 ```
 
@@ -65,7 +80,11 @@ boolVar.setValueForMode(modeId, true);
 ```javascript
 // Create a base paint, bind the variable, assign the result
 const basePaint = { type: 'SOLID', color: { r: 0, g: 0, b: 0 } };
-const boundPaint = figma.variables.setBoundVariableForPaint(basePaint, "color", colorVar);
+const boundPaint = figma.variables.setBoundVariableForPaint(
+  basePaint,
+  'color',
+  colorVar,
+);
 node.fills = [boundPaint];
 
 // Only SOLID paints support color variable binding — gradients/images will throw
@@ -77,30 +96,30 @@ node.fills = [boundPaint];
 
 ```javascript
 // Padding
-node.setBoundVariable("paddingTop", spacingVar);
-node.setBoundVariable("paddingBottom", spacingVar);
-node.setBoundVariable("paddingLeft", spacingVar);
-node.setBoundVariable("paddingRight", spacingVar);
+node.setBoundVariable('paddingTop', spacingVar);
+node.setBoundVariable('paddingBottom', spacingVar);
+node.setBoundVariable('paddingLeft', spacingVar);
+node.setBoundVariable('paddingRight', spacingVar);
 
 // Gap
-node.setBoundVariable("itemSpacing", gapVar);
-node.setBoundVariable("counterAxisSpacing", gapVar);
+node.setBoundVariable('itemSpacing', gapVar);
+node.setBoundVariable('counterAxisSpacing', gapVar);
 
 // Corner radius — use individual corners, NOT cornerRadius
-node.setBoundVariable("topLeftRadius", radiusVar);
-node.setBoundVariable("topRightRadius", radiusVar);
-node.setBoundVariable("bottomLeftRadius", radiusVar);
-node.setBoundVariable("bottomRightRadius", radiusVar);
+node.setBoundVariable('topLeftRadius', radiusVar);
+node.setBoundVariable('topRightRadius', radiusVar);
+node.setBoundVariable('bottomLeftRadius', radiusVar);
+node.setBoundVariable('bottomRightRadius', radiusVar);
 
 // Size
-node.setBoundVariable("width", sizeVar);
-node.setBoundVariable("height", sizeVar);
-node.setBoundVariable("minWidth", sizeVar);
-node.setBoundVariable("maxWidth", sizeVar);
+node.setBoundVariable('width', sizeVar);
+node.setBoundVariable('height', sizeVar);
+node.setBoundVariable('minWidth', sizeVar);
+node.setBoundVariable('maxWidth', sizeVar);
 
 // Other
-node.setBoundVariable("opacity", opacityVar);
-node.setBoundVariable("strokeWeight", strokeVar);
+node.setBoundVariable('opacity', opacityVar);
+node.setBoundVariable('strokeWeight', strokeVar);
 ```
 
 **Not bindable via setBoundVariable:** `fontSize`, `fontWeight`, `lineHeight` — set these directly on text nodes.
@@ -109,7 +128,11 @@ node.setBoundVariable("strokeWeight", strokeVar);
 
 ```javascript
 const effectCopy = JSON.parse(JSON.stringify(node.effects[0]));
-const newEffect = figma.variables.setBoundVariableForEffect(effectCopy, "color", colorVar);
+const newEffect = figma.variables.setBoundVariableForEffect(
+  effectCopy,
+  'color',
+  colorVar,
+);
 // ⚠️ Returns a NEW effect — must capture return value!
 node.effects = [newEffect];
 // Valid fields: "color" (COLOR), "radius" | "spread" | "offsetX" | "offsetY" (FLOAT)
@@ -129,11 +152,11 @@ Without this, all nodes use the collection's default (first) mode.
 `variable.scopes` controls which Figma property pickers show the variable. The default is `["ALL_SCOPES"]` which shows it everywhere — this is almost never what you want.
 
 ```javascript
-variable.scopes = ["FRAME_FILL", "SHAPE_FILL"];  // only fill pickers
-variable.scopes = ["TEXT_FILL"];                   // only text color picker
-variable.scopes = ["GAP"];                         // only gap/spacing pickers
-variable.scopes = ["CORNER_RADIUS"];               // only radius pickers
-variable.scopes = [];                              // hidden from all pickers
+variable.scopes = ['FRAME_FILL', 'SHAPE_FILL']; // only fill pickers
+variable.scopes = ['TEXT_FILL']; // only text color picker
+variable.scopes = ['GAP']; // only gap/spacing pickers
+variable.scopes = ['CORNER_RADIUS']; // only radius pickers
+variable.scopes = []; // hidden from all pickers
 ```
 
 **All valid scope values:**
@@ -151,7 +174,7 @@ A variable's value can reference another variable via alias. This is how semanti
 // Set a variable's value as an alias to another variable
 semanticVar.setValueForMode(modeId, {
   type: 'VARIABLE_ALIAS',
-  id: primitiveVar.id
+  id: primitiveVar.id,
 });
 ```
 
@@ -174,12 +197,10 @@ variable.setVariableCodeSyntax('iOS', 'Color.bgDefault');
 ```javascript
 // WRONG — leaves spaces in CSS variable name
 `var(--${figmaName.replace(/\//g, '-').toLowerCase()})`
-
 // CORRECT — replace all whitespace and slashes
 `var(--${figmaName.replace(/[\s\/]+/g, '-').toLowerCase()})`
-
 // BEST — use the original CSS variable name from the source, not a derived one
-`var(${token.cssVar})`
+`var(${token.cssVar})`;
 ```
 
 ## Importing Library Variables
@@ -188,10 +209,12 @@ For variables from **team libraries** (not the current file), use `importVariabl
 
 ```javascript
 // Import a single variable by its key
-const colorVar = await figma.variables.importVariableByKeyAsync("VARIABLE_KEY");
+const colorVar = await figma.variables.importVariableByKeyAsync('VARIABLE_KEY');
 // Now use it like any local variable
 const paint = figma.variables.setBoundVariableForPaint(
-  { type: 'SOLID', color: { r: 0, g: 0, b: 0 } }, 'color', colorVar
+  { type: 'SOLID', color: { r: 0, g: 0, b: 0 } },
+  'color',
+  colorVar,
 );
 node.fills = [paint];
 ```
@@ -200,11 +223,14 @@ To discover available library variable collections and their variables:
 
 ```javascript
 // List all available library variable collections
-const libCollections = await figma.teamLibrary.getAvailableLibraryVariableCollectionsAsync();
+const libCollections =
+  await figma.teamLibrary.getAvailableLibraryVariableCollectionsAsync();
 // Each has: name, key, libraryName
 
 // Get variables in a specific library collection
-const libVars = await figma.teamLibrary.getVariablesInLibraryCollectionAsync(libCollections[0].key);
+const libVars = await figma.teamLibrary.getVariablesInLibraryCollectionAsync(
+  libCollections[0].key,
+);
 // Each has: name, key, resolvedType
 // Import the ones you need:
 const imported = await figma.variables.importVariableByKeyAsync(libVars[0].key);
@@ -220,11 +246,11 @@ const imported = await figma.variables.importVariableByKeyAsync(libVars[0].key);
 
 ```javascript
 const collections = await figma.variables.getLocalVariableCollectionsAsync();
-const results = collections.map(c => ({
+const results = collections.map((c) => ({
   name: c.name,
   id: c.id,
   varCount: c.variableIds.length,
-  modes: c.modes.map(m => ({ name: m.name, id: m.modeId }))
+  modes: c.modes.map((m) => ({ name: m.name, id: m.modeId })),
 }));
 return results;
 ```
@@ -258,7 +284,9 @@ function bindFill(node, varName) {
   const v = varByName[varName];
   if (!v) throw new Error(`Variable not found: ${varName}`);
   const paint = figma.variables.setBoundVariableForPaint(
-    { type: 'SOLID', color: { r: 0, g: 0, b: 0 } }, 'color', v
+    { type: 'SOLID', color: { r: 0, g: 0, b: 0 } },
+    'color',
+    v,
   );
   node.fills = [paint];
 }
@@ -294,8 +322,8 @@ async function listVariableCollectionsAndVariables() {
     results.push({
       name: collection.name,
       id: collection.id,
-      modes: collection.modes.map(m => [m.name, m.modeId]),
-      variables: vars
+      modes: collection.modes.map((m) => [m.name, m.modeId]),
+      variables: vars,
     });
   }
   return results;
@@ -332,7 +360,10 @@ async function setVariableCodeSyntax(variableId, platform, syntax) {
  * @param {string} variableId
  * @param {Array<'WEB'|'ANDROID'|'iOS'>} platforms — defaults to all three
  */
-async function removeVariableCodeSyntax(variableId, platforms = ["WEB", "ANDROID", "iOS"]) {
+async function removeVariableCodeSyntax(
+  variableId,
+  platforms = ['WEB', 'ANDROID', 'iOS'],
+) {
   const variable = await figma.variables.getVariableByIdAsync(variableId);
   for (const platform of platforms) {
     variable.removeVariableCodeSyntax(platform);
@@ -359,16 +390,18 @@ Shadows can't be stored as variables. Use effect styles. For comprehensive patte
 
 ```javascript
 const shadow = figma.createEffectStyle();
-shadow.name = "Shadow/Subtle";
-shadow.effects = [{
-  type: "DROP_SHADOW",
-  color: { r: 0, g: 0, b: 0, a: 0.06 },
-  offset: { x: 0, y: 2 },
-  radius: 8,
-  spread: 0,
-  visible: true,
-  blendMode: "NORMAL"
-}];
+shadow.name = 'Shadow/Subtle';
+shadow.effects = [
+  {
+    type: 'DROP_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.06 },
+    offset: { x: 0, y: 2 },
+    radius: 8,
+    spread: 0,
+    visible: true,
+    blendMode: 'NORMAL',
+  },
+];
 
 // Apply to a node
 frame.effectStyleId = shadow.id;

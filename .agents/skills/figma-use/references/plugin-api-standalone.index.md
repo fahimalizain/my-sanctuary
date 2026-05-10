@@ -9,27 +9,27 @@
 
 ### Identity & State
 
-| Member                          | Type                                                                             |
-| ------------------------------- | -------------------------------------------------------------------------------- |
-| `apiVersion`                    | `'1.0.0'`                                                                        |
-| `editorType`                    | `'figma' \| 'figjam' \| 'dev' \| 'slides' \| 'buzz'`                             |
-| `mode`                          | `'default' \| 'textreview' \| 'inspect' \| 'codegen' \| 'linkpreview' \| 'auth'` |
-| `fileKey`                       | `string \| undefined`                                                            |
-| `root`                          | `DocumentNode`                                                                   |
+| Member                          | Type                                                                                                                                             |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apiVersion`                    | `'1.0.0'`                                                                                                                                        |
+| `editorType`                    | `'figma' \| 'figjam' \| 'dev' \| 'slides' \| 'buzz'`                                                                                             |
+| `mode`                          | `'default' \| 'textreview' \| 'inspect' \| 'codegen' \| 'linkpreview' \| 'auth'`                                                                 |
+| `fileKey`                       | `string \| undefined`                                                                                                                            |
+| `root`                          | `DocumentNode`                                                                                                                                   |
 | `currentPage`                   | `PageNode` — **read-only**; sync setter `figma.currentPage = page` does NOT work and throws; use `await figma.setCurrentPageAsync(page)` instead |
-| `currentUser`                   | `User \| null`                                                                   |
-| `mixed`                         | `unique symbol` — sentinel for mixed values in selection                         |
-| `skipInvisibleInstanceChildren` | `boolean`                                                                        |
+| `currentUser`                   | `User \| null`                                                                                                                                   |
+| `mixed`                         | `unique symbol` — sentinel for mixed values in selection                                                                                         |
+| `skipInvisibleInstanceChildren` | `boolean`                                                                                                                                        |
 
 ### Navigation & Lookup
 
-| Method                      | Returns                                                 |
-| --------------------------- | ------------------------------------------------------- |
+| Method                      | Returns                                                                                   |
+| --------------------------- | ----------------------------------------------------------------------------------------- |
 | `setCurrentPageAsync(page)` | `Promise<void>` — **MUST use this**; sync setter `figma.currentPage = page` does NOT work |
-| `getNodeByIdAsync(id)`      | `Promise<BaseNode \| null>`                             |
-| `getNodeById(id)`           | `BaseNode \| null`                                      |
-| `getStyleByIdAsync(id)`     | `Promise<BaseStyle \| null>`                            |
-| `getStyleById(id)`          | `BaseStyle \| null`                                     |
+| `getNodeByIdAsync(id)`      | `Promise<BaseNode \| null>`                                                               |
+| `getNodeById(id)`           | `BaseNode \| null`                                                                        |
+| `getStyleByIdAsync(id)`     | `Promise<BaseStyle \| null>`                                                              |
+| `getStyleById(id)`          | `BaseStyle \| null`                                                                       |
 
 ### Create Nodes
 
@@ -81,15 +81,15 @@
 
 ### Plugin Lifecycle
 
-| Method                                  | Notes                                                        |
-| --------------------------------------- | ------------------------------------------------------------ |
-| `closePlugin(message?)`                 | Auto-called; use `return` instead to pass results back       |
-| `closePluginWithFailure(message?)`      | Auto-called on errors; do not call manually                  |
-| `commitUndo()`                          | Snapshot to undo history                                     |
-| `triggerUndo()`                         | Revert to last snapshot                                      |
-| `saveVersionHistoryAsync(title, desc?)` | `Promise<VersionHistoryResult>`                              |
+| Method                                  | Notes                                                  |
+| --------------------------------------- | ------------------------------------------------------ |
+| `closePlugin(message?)`                 | Auto-called; use `return` instead to pass results back |
+| `closePluginWithFailure(message?)`      | Auto-called on errors; do not call manually            |
+| `commitUndo()`                          | Snapshot to undo history                               |
+| `triggerUndo()`                         | Revert to last snapshot                                |
+| `saveVersionHistoryAsync(title, desc?)` | `Promise<VersionHistoryResult>`                        |
 | `notify(message, options?)`             | **throws "not implemented" in use_figma — do not use** |
-| `openExternal(url)`                     | Opens URL in browser                                         |
+| `openExternal(url)`                     | Opens URL in browser                                   |
 
 ### Sub-APIs (properties on figma)
 
@@ -183,33 +183,33 @@ type BaseNode   (L10913) = DocumentNode | PageNode | SceneNode
 
 ## Mixin Interfaces
 
-| Mixin                        | L#    | Provides                                                                                        |
-| ---------------------------- | ----- | ----------------------------------------------------------------------------------------------- |
-| `BaseNodeMixin`              | L5284 | `id`, `name`, `type`, `parent`, `remove()`, plugin data                                         |
-| `SceneNodeMixin`             | L5561 | `visible`, `locked`, `opacity`, variable bindings                                               |
-| `ChildrenMixin`              | L5773 | `children`, `appendChild()`, `insertChild()`, `findAll()`, `findOne()`, `findAllWithCriteria()` |
-| `LayoutMixin`                | L6135 | `x`, `y`, `width`, `height`, `rotation`, `resize()`, `rescale()`                                |
-| `AutoLayoutMixin`            | L6436 | `layoutMode`, axis alignment, padding, `itemSpacing`, `layoutSizingHorizontal/Vertical`         |
-| `AutoLayoutChildrenMixin`    | L7064 | `layoutAlign`, `layoutGrow`, sizing — **set AFTER `appendChild()`**                             |
-| `GridLayoutMixin`            | L6939 | CSS Grid tracks, gap, template                                                                  |
-| `GridChildrenMixin`          | L7127 | grid child positioning                                                                          |
-| `GeometryMixin`              | L7485 | `fills`, `strokes`, `strokeWeight`, `strokeAlign`                                               |
-| `MinimalFillsMixin`          | L7328 | `fills` only                                                                                    |
-| `MinimalStrokesMixin`        | L7246 | `strokes`, `strokeWeight`                                                                       |
-| `BlendMixin`                 | L6339 | `opacity`, `blendMode`, `isMask`, `effects`                                                     |
-| `CornerMixin`                | L7537 | `cornerRadius`, `cornerSmoothing`                                                               |
-| `RectangleCornerMixin`       | L7560 | Per-corner radii                                                                                |
-| `ExportMixin`                | L7577 | `exportSettings`, `exportAsync()`                                                               |
-| `ReactionMixin`              | L7704 | `reactions` (prototyping)                                                                       |
-| `PublishableMixin`           | L7875 | `description`, `key`, `getPublishStatusAsync()`                                                 |
-| `VariantMixin`               | L8182 | `variantProperties`                                                                             |
-| `ComponentPropertiesMixin`   | L8229 | `componentProperties`, `addComponentProperty()`                                                 |
+| Mixin                        | L#    | Provides                                                                                                           |
+| ---------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------ |
+| `BaseNodeMixin`              | L5284 | `id`, `name`, `type`, `parent`, `remove()`, plugin data                                                            |
+| `SceneNodeMixin`             | L5561 | `visible`, `locked`, `opacity`, variable bindings                                                                  |
+| `ChildrenMixin`              | L5773 | `children`, `appendChild()`, `insertChild()`, `findAll()`, `findOne()`, `findAllWithCriteria()`                    |
+| `LayoutMixin`                | L6135 | `x`, `y`, `width`, `height`, `rotation`, `resize()`, `rescale()`                                                   |
+| `AutoLayoutMixin`            | L6436 | `layoutMode`, axis alignment, padding, `itemSpacing`, `layoutSizingHorizontal/Vertical`                            |
+| `AutoLayoutChildrenMixin`    | L7064 | `layoutAlign`, `layoutGrow`, sizing — **set AFTER `appendChild()`**                                                |
+| `GridLayoutMixin`            | L6939 | CSS Grid tracks, gap, template                                                                                     |
+| `GridChildrenMixin`          | L7127 | grid child positioning                                                                                             |
+| `GeometryMixin`              | L7485 | `fills`, `strokes`, `strokeWeight`, `strokeAlign`                                                                  |
+| `MinimalFillsMixin`          | L7328 | `fills` only                                                                                                       |
+| `MinimalStrokesMixin`        | L7246 | `strokes`, `strokeWeight`                                                                                          |
+| `BlendMixin`                 | L6339 | `opacity`, `blendMode`, `isMask`, `effects`                                                                        |
+| `CornerMixin`                | L7537 | `cornerRadius`, `cornerSmoothing`                                                                                  |
+| `RectangleCornerMixin`       | L7560 | Per-corner radii                                                                                                   |
+| `ExportMixin`                | L7577 | `exportSettings`, `exportAsync()`                                                                                  |
+| `ReactionMixin`              | L7704 | `reactions` (prototyping)                                                                                          |
+| `PublishableMixin`           | L7875 | `description`, `key`, `getPublishStatusAsync()`                                                                    |
+| `VariantMixin`               | L8182 | `variantProperties`                                                                                                |
+| `ComponentPropertiesMixin`   | L8229 | `componentProperties`, `addComponentProperty()`                                                                    |
 | `PluginDataMixin`            | L5443 | `getSharedPluginData()`, `setSharedPluginData()` supported; `getPluginData()`, `setPluginData()` **NOT supported** |
-| `FramePrototypingMixin`      | L7651 | `overflowDirection`, `numberOfFixedChildren`                                                    |
-| `BaseFrameMixin`             | L7939 | ChildrenMixin + LayoutMixin + AutoLayoutMixin + GeometryMixin + …                               |
-| `DefaultFrameMixin`          | L7997 | BaseFrameMixin + FramePrototypingMixin + ReactionMixin                                          |
-| `DefaultShapeMixin`          | L7928 | BlendMixin + GeometryMixin + LayoutMixin + ExportMixin + ReactionMixin                          |
-| `ExplicitVariableModesMixin` | L9084 | `setExplicitVariableModeForCollection()`                                                        |
+| `FramePrototypingMixin`      | L7651 | `overflowDirection`, `numberOfFixedChildren`                                                                       |
+| `BaseFrameMixin`             | L7939 | ChildrenMixin + LayoutMixin + AutoLayoutMixin + GeometryMixin + …                                                  |
+| `DefaultFrameMixin`          | L7997 | BaseFrameMixin + FramePrototypingMixin + ReactionMixin                                                             |
+| `DefaultShapeMixin`          | L7928 | BlendMixin + GeometryMixin + LayoutMixin + ExportMixin + ReactionMixin                                             |
+| `ExplicitVariableModesMixin` | L9084 | `setExplicitVariableModeForCollection()`                                                                           |
 
 ---
 
@@ -443,23 +443,23 @@ Video                   VersionHistoryResult    FindAllCriteria
 
 ### Node Methods
 
-| Method / Property             | Returns / Type    | Description |
-| ----------------------------- | ----------------- | ----------- |
-| `node.query(selector)`        | `QueryResult`     | CSS-like selector search within subtree |
-| `node.matches(selector)`      | `boolean`         | Test if node matches a selector |
-| `node.set(props)`             | `this`            | Set multiple properties at once, chainable |
-| `await node.screenshot(opts?)` | `Promise<void>`  | Capture PNG inline in tool response |
-| `node.placeholder`            | `boolean`         | Show/hide shimmer overlay |
+| Method / Property              | Returns / Type  | Description                                |
+| ------------------------------ | --------------- | ------------------------------------------ |
+| `node.query(selector)`         | `QueryResult`   | CSS-like selector search within subtree    |
+| `node.matches(selector)`       | `boolean`       | Test if node matches a selector            |
+| `node.set(props)`              | `this`          | Set multiple properties at once, chainable |
+| `await node.screenshot(opts?)` | `Promise<void>` | Capture PNG inline in tool response        |
+| `node.placeholder`             | `boolean`       | Show/hide shimmer overlay                  |
 
 ### figma.io Namespace
 
-| Method                        | Returns           | Description |
-| ----------------------------- | ----------------- | ----------- |
-| `figma.io.write(path, data)`  | `void`            | Write image/data to be returned in tool response |
+| Method                       | Returns | Description                                      |
+| ---------------------------- | ------- | ------------------------------------------------ |
+| `figma.io.write(path, data)` | `void`  | Write image/data to be returned in tool response |
 
 ### Types
 
-| Type                | Description |
-| ------------------- | ----------- |
+| Type                | Description                                                                                                                         |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | `QueryResult`       | Iterable result from `node.query()` with `.first()`, `.last()`, `.each()`, `.map()`, `.filter()`, `.values()`, `.set()`, `.query()` |
-| `ScreenshotOptions` | `{ scale?: number, contentsOnly?: boolean }` |
+| `ScreenshotOptions` | `{ scale?: number, contentsOnly?: boolean }`                                                                                        |

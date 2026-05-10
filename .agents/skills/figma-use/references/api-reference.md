@@ -16,26 +16,25 @@
 - Node Traversal
 - Unsupported APIs
 
-
 ## Node Creation (Design Mode)
 
 ```js
-figma.createRectangle()
-figma.createFrame()
-figma.createAutoLayout()        // Frame with auto layout enabled, both axes hug — prefer over createFrame() for layout containers
-figma.createAutoLayout("VERTICAL") // Same but vertical direction
-figma.createComponent()         // Creates a ComponentNode
-figma.createText()
-figma.createEllipse()
-figma.createStar()
-figma.createLine()
-figma.createVector()
-figma.createPolygon()
-figma.createBooleanOperation()
-figma.createSlice()
-figma.createPage()              // Page node can be created, but child persistence is limited in use_figma
-figma.createSection()
-figma.createTextPath()
+figma.createRectangle();
+figma.createFrame();
+figma.createAutoLayout(); // Frame with auto layout enabled, both axes hug — prefer over createFrame() for layout containers
+figma.createAutoLayout('VERTICAL'); // Same but vertical direction
+figma.createComponent(); // Creates a ComponentNode
+figma.createText();
+figma.createEllipse();
+figma.createStar();
+figma.createLine();
+figma.createVector();
+figma.createPolygon();
+figma.createBooleanOperation();
+figma.createSlice();
+figma.createPage(); // Page node can be created, but child persistence is limited in use_figma
+figma.createSection();
+figma.createTextPath();
 ```
 
 ## Grouping & Boolean Operations
@@ -56,15 +55,16 @@ These methods import components from **team libraries** (not the same file you'r
 
 ```js
 // Import a published component from a team library by key
-const comp = await figma.importComponentByKeyAsync("COMPONENT_KEY")
-const instance = comp.createInstance()
+const comp = await figma.importComponentByKeyAsync('COMPONENT_KEY');
+const instance = comp.createInstance();
 
 // Import a published component set from a team library by key
-const compSet = await figma.importComponentSetByKeyAsync("COMPONENT_SET_KEY")
+const compSet = await figma.importComponentSetByKeyAsync('COMPONENT_SET_KEY');
 const variant =
-  compSet.children.find((c) => c.type === "COMPONENT" && c.name.includes("size=md")) ||
-  compSet.defaultVariant
-const variantInstance = variant.createInstance()
+  compSet.children.find(
+    (c) => c.type === 'COMPONENT' && c.name.includes('size=md'),
+  ) || compSet.defaultVariant;
+const variantInstance = variant.createInstance();
 ```
 
 ## Library Style Import (Team Libraries)
@@ -73,14 +73,14 @@ These methods import styles from **team libraries** (not the same file). For sty
 
 ```js
 // Import a published style from a team library by key
-const style = await figma.importStyleByKeyAsync("STYLE_KEY")
+const style = await figma.importStyleByKeyAsync('STYLE_KEY');
 
 // Apply the imported style to a node
-await node.setFillStyleIdAsync(style.id)    // for PaintStyle as fill
-await node.setStrokeStyleIdAsync(style.id)  // for PaintStyle as stroke
-await node.setTextStyleIdAsync(style.id)    // for TextStyle
-await node.setEffectStyleIdAsync(style.id)  // for EffectStyle
-await node.setGridStyleIdAsync(style.id)    // for GridStyle
+await node.setFillStyleIdAsync(style.id); // for PaintStyle as fill
+await node.setStrokeStyleIdAsync(style.id); // for PaintStyle as stroke
+await node.setTextStyleIdAsync(style.id); // for TextStyle
+await node.setEffectStyleIdAsync(style.id); // for EffectStyle
+await node.setGridStyleIdAsync(style.id); // for GridStyle
 ```
 
 ## Library Variable Import (Team Libraries)
@@ -89,14 +89,18 @@ This imports variables from **team libraries** (not the same file). For variable
 
 ```js
 // Import a published variable from a team library by key
-const variable = await figma.variables.importVariableByKeyAsync("VARIABLE_KEY")
+const variable = await figma.variables.importVariableByKeyAsync('VARIABLE_KEY');
 
 // Bind the imported variable to node properties
-node.setBoundVariable("width", variable)           // FLOAT variable
+node.setBoundVariable('width', variable); // FLOAT variable
 
 // Bind to fills/strokes (COLOR variable) — returns a NEW paint, must capture it
-const newPaint = figma.variables.setBoundVariableForPaint(paintCopy, "color", variable)
-node.fills = [newPaint]
+const newPaint = figma.variables.setBoundVariableForPaint(
+  paintCopy,
+  'color',
+  variable,
+);
+node.fills = [newPaint];
 ```
 
 ## Variables API
@@ -187,101 +191,109 @@ node.setExplicitVariableModeForCollection(collection, modeId)  // pass collectio
 ## Core Properties
 
 ```js
-figma.root                      // DocumentNode
-figma.currentPage               // Current page — READ ONLY; the sync setter (figma.currentPage = page) does NOT work and throws
-figma.setCurrentPageAsync(page) // Switch page and load its content (MUST await) — this is the ONLY way to change pages
-figma.fileKey                   // File key string
-figma.mixed                     // Mixed sentinel value
+figma.root; // DocumentNode
+figma.currentPage; // Current page — READ ONLY; the sync setter (figma.currentPage = page) does NOT work and throws
+figma.setCurrentPageAsync(page); // Switch page and load its content (MUST await) — this is the ONLY way to change pages
+figma.fileKey; // File key string
+figma.mixed; // Mixed sentinel value
 ```
 
 ## Node Manipulation
 
 ```js
 // Fills & Strokes (read-only arrays — must clone)
-node.fills = [{ type: 'SOLID', color: { r: 1, g: 0, b: 0 } }]
-node.strokes = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0 } }]
-node.strokeWeight = 1
-node.strokeAlign = 'INSIDE'             // 'INSIDE' | 'CENTER' | 'OUTSIDE'
+node.fills = [{ type: 'SOLID', color: { r: 1, g: 0, b: 0 } }];
+node.strokes = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0 } }];
+node.strokeWeight = 1;
+node.strokeAlign = 'INSIDE'; // 'INSIDE' | 'CENTER' | 'OUTSIDE'
 
 // Effects
-node.effects = [{ type: 'DROP_SHADOW', color: {r:0,g:0,b:0,a:0.25}, offset:{x:0,y:4}, radius:4, visible:true }]
+node.effects = [
+  {
+    type: 'DROP_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.25 },
+    offset: { x: 0, y: 4 },
+    radius: 4,
+    visible: true,
+  },
+];
 
 // Layout
-node.layoutMode = 'HORIZONTAL'          // 'NONE' | 'HORIZONTAL' | 'VERTICAL'
-node.primaryAxisAlignItems = 'CENTER'    // 'MIN' | 'CENTER' | 'MAX' | 'SPACE_BETWEEN'
-node.counterAxisAlignItems = 'CENTER'    // 'MIN' | 'CENTER' | 'MAX' | 'BASELINE'
-node.paddingLeft = 8
-node.paddingRight = 8
-node.paddingTop = 4
-node.paddingBottom = 4
-node.itemSpacing = 4
-node.layoutSizingHorizontal = 'HUG'     // 'FIXED' | 'HUG' | 'FILL'
-node.layoutSizingVertical = 'HUG'       // 'FIXED' | 'HUG' | 'FILL'
+node.layoutMode = 'HORIZONTAL'; // 'NONE' | 'HORIZONTAL' | 'VERTICAL'
+node.primaryAxisAlignItems = 'CENTER'; // 'MIN' | 'CENTER' | 'MAX' | 'SPACE_BETWEEN'
+node.counterAxisAlignItems = 'CENTER'; // 'MIN' | 'CENTER' | 'MAX' | 'BASELINE'
+node.paddingLeft = 8;
+node.paddingRight = 8;
+node.paddingTop = 4;
+node.paddingBottom = 4;
+node.itemSpacing = 4;
+node.layoutSizingHorizontal = 'HUG'; // 'FIXED' | 'HUG' | 'FILL'
+node.layoutSizingVertical = 'HUG'; // 'FIXED' | 'HUG' | 'FILL'
 
 // Sizing
-node.resize(width, height)                     // ⚠️ Resets sizing modes to FIXED
-node.resizeWithoutConstraints(width, height)   // Doesn't affect constraints
+node.resize(width, height); // ⚠️ Resets sizing modes to FIXED
+node.resizeWithoutConstraints(width, height); // Doesn't affect constraints
 
 // Corner radius
-node.cornerRadius = 8
+node.cornerRadius = 8;
 
 // Visibility & Opacity
-node.visible = true
-node.opacity = 0.5
+node.visible = true;
+node.opacity = 0.5;
 
 // Naming & Hierarchy
-node.name = "My Node"
-parent.appendChild(child)
-parent.insertChild(index, child)
-node.remove()
+node.name = 'My Node';
+parent.appendChild(child);
+parent.insertChild(index, child);
+node.remove();
 ```
 
 ## Descriptions & Documentation Links
 
 ```js
 // Description — plain text, shown in Figma's component panel
-node.description = "A short summary of this component's purpose and usage."
+node.description = "A short summary of this component's purpose and usage.";
 
 // Documentation links — array of {uri, label} shown as clickable links
 componentSet.documentationLinks = [
-  { uri: "https://example.com/docs", label: "Component Docs" }
-]
+  { uri: 'https://example.com/docs', label: 'Component Docs' },
+];
 // ⚠️ uri MUST be a valid URL (https://...) — relative paths will throw
 ```
 
 ## SVG Import
 
 ```js
-const svgNode = figma.createNodeFromSvg('<svg>...</svg>')
+const svgNode = figma.createNodeFromSvg('<svg>...</svg>');
 ```
 
 ## Images
 
 ```js
-const image = figma.createImage(uint8Array)
-node.fills = [{ type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash }]
+const image = figma.createImage(uint8Array);
+node.fills = [{ type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash }];
 ```
 
 ## Fonts
 
 ```js
 // Discover all available fonts and their exact style strings
-const allFonts = await figma.listAvailableFontsAsync()  // Font[] — each has { fontName: { family, style } }
-const interStyles = allFonts.filter(f => f.fontName.family === "Inter")
+const allFonts = await figma.listAvailableFontsAsync(); // Font[] — each has { fontName: { family, style } }
+const interStyles = allFonts.filter((f) => f.fontName.family === 'Inter');
 
 // MUST load a font before any text property edit
-await figma.loadFontAsync({ family: "Inter", style: "Regular" })
+await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
 
 // Check if the file has missing fonts
-figma.hasMissingFont  // boolean
+figma.hasMissingFont; // boolean
 ```
 
 ## Utilities
 
 ```js
-figma.base64Encode(uint8Array)     // Uint8Array → base64 string
-figma.base64Decode(base64String)   // base64 string → Uint8Array
-figma.createComponentFromNode(node) // Convert existing node to component (Design/Sites only)
+figma.base64Encode(uint8Array); // Uint8Array → base64 string
+figma.base64Decode(base64String); // base64 string → Uint8Array
+figma.createComponentFromNode(node); // Convert existing node to component (Design/Sites only)
 ```
 
 ## Plugin Lifecycle
@@ -289,8 +301,8 @@ figma.createComponentFromNode(node) // Convert existing node to component (Desig
 Scripts are automatically wrapped in an async IIFE with error handling. Use `return` to send data back:
 
 ```js
-return { nodeId: frame.id }     // Return object — auto-serialized to JSON
-return "success message"        // Return string
+return { nodeId: frame.id }; // Return object — auto-serialized to JSON
+return 'success message'; // Return string
 // Errors are auto-captured — no try/catch or closePlugin needed
 ```
 
@@ -309,12 +321,12 @@ node.parent                    // Parent node
 
 ## What Does NOT Work
 
-| API | Status |
-|-----|--------|
-| `figma.notify()` | **Throws "not implemented"** — most common mistake |
-| `figma.showUI()` | No-op (silently ignored) |
-| `figma.openExternal()` | No-op (silently ignored) |
-| `figma.loadAllPagesAsync()` | Not implemented |
-| `figma.variables.extendLibraryCollectionByKeyAsync()` | Not implemented |
-| `figma.teamLibrary.*` | Not implemented (requires LiveGraph) |
-| `figma.getLocalComponents*()` | **Does not exist** — unlike styles, there is no `getLocalComponents()` or `getLocalComponentSetsAsync()` (or any `getLocalComponent*` variant). Use `findAll(n => n.type === 'COMPONENT')` / `findAll(n => n.type === 'COMPONENT_SET')` to locate components in the current file. |
+| API                                                   | Status                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `figma.notify()`                                      | **Throws "not implemented"** — most common mistake                                                                                                                                                                                                                                |
+| `figma.showUI()`                                      | No-op (silently ignored)                                                                                                                                                                                                                                                          |
+| `figma.openExternal()`                                | No-op (silently ignored)                                                                                                                                                                                                                                                          |
+| `figma.loadAllPagesAsync()`                           | Not implemented                                                                                                                                                                                                                                                                   |
+| `figma.variables.extendLibraryCollectionByKeyAsync()` | Not implemented                                                                                                                                                                                                                                                                   |
+| `figma.teamLibrary.*`                                 | Not implemented (requires LiveGraph)                                                                                                                                                                                                                                              |
+| `figma.getLocalComponents*()`                         | **Does not exist** — unlike styles, there is no `getLocalComponents()` or `getLocalComponentSetsAsync()` (or any `getLocalComponent*` variant). Use `findAll(n => n.type === 'COMPONENT')` / `findAll(n => n.type === 'COMPONENT_SET')` to locate components in the current file. |

@@ -17,7 +17,6 @@
 - Cloning, Finding Nodes, and Grids
 - Constraints and Viewport
 
-
 ## Execution Basics
 
 ### Page Context
@@ -25,7 +24,7 @@
 Page context resets between `use_figma` calls — `figma.currentPage` always starts on the first page. Use `await figma.setCurrentPageAsync(page)` at the start of each invocation to switch to the correct page. The sync setter `figma.currentPage = page` does **NOT work** and will throw — always use the async method.
 
 ```javascript
-const targetPage = figma.root.children.find(p => p.name === "My Page");
+const targetPage = figma.root.children.find((p) => p.name === 'My Page');
 await figma.setCurrentPageAsync(targetPage);
 // targetPage.children is now populated
 ```
@@ -36,10 +35,10 @@ Scripts are automatically wrapped in an async IIFE with error handling. Just wri
 
 ```javascript
 // Return an object — auto-serialized to JSON
-return { nodeId: frame.id, count: 5 }
+return { nodeId: frame.id, count: 5 };
 
 // Return a string
-return "Created 3 components"
+return 'Created 3 components';
 ```
 
 Errors are automatically captured — no try/catch needed. `figma.notify()` does **not** exist. Return all information via the `return` value.
@@ -47,6 +46,7 @@ Errors are automatically captured — no try/catch needed. `figma.notify()` does
 ### Working Incrementally
 
 Don't build an entire screen in one call. Break work into small steps:
+
 1. Create tokens/variables
 2. Create text styles
 3. Build individual components
@@ -61,54 +61,54 @@ Verify structure with `get_metadata` between steps. Use `get_screenshot` after e
 
 ```javascript
 const frame = figma.createFrame();
-frame.name = "Container";
+frame.name = 'Container';
 frame.resize(1440, 900);
 frame.x = 0;
 frame.y = 0;
-frame.fills = [{ type: "SOLID", color: { r: 0.98, g: 0.98, b: 0.99 } }];
+frame.fills = [{ type: 'SOLID', color: { r: 0.98, g: 0.98, b: 0.99 } }];
 ```
 
 ### Text
 
 ```javascript
 // MUST load font before any text operations
-await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
 
 const text = figma.createText();
-text.fontName = { family: "Inter", style: "Regular" };
+text.fontName = { family: 'Inter', style: 'Regular' };
 text.fontSize = 16;
-text.lineHeight = { value: 24, unit: "PIXELS" };
-text.letterSpacing = { value: 0, unit: "PERCENT" };
-text.characters = "Hello World";
-text.fills = [{ type: "SOLID", color: { r: 0.1, g: 0.1, b: 0.12 } }];
+text.lineHeight = { value: 24, unit: 'PIXELS' };
+text.letterSpacing = { value: 0, unit: 'PERCENT' };
+text.characters = 'Hello World';
+text.fills = [{ type: 'SOLID', color: { r: 0.1, g: 0.1, b: 0.12 } }];
 ```
 
 ### Rectangles
 
 ```javascript
 const rect = figma.createRectangle();
-rect.name = "Background";
+rect.name = 'Background';
 rect.resize(400, 300);
 rect.cornerRadius = 12;
-rect.fills = [{ type: "SOLID", color: { r: 0.95, g: 0.95, b: 0.96 } }];
+rect.fills = [{ type: 'SOLID', color: { r: 0.95, g: 0.95, b: 0.96 } }];
 ```
 
 ### Ellipses
 
 ```javascript
 const circle = figma.createEllipse();
-circle.name = "Avatar Circle";
+circle.name = 'Avatar Circle';
 circle.resize(48, 48);
-circle.fills = [{ type: "SOLID", color: { r: 0.85, g: 0.87, b: 0.90 } }];
+circle.fills = [{ type: 'SOLID', color: { r: 0.85, g: 0.87, b: 0.9 } }];
 ```
 
 ### Lines
 
 ```javascript
 const line = figma.createLine();
-line.name = "Divider";
+line.name = 'Divider';
 line.resize(400, 0);
-line.strokes = [{ type: "SOLID", color: { r: 0, g: 0, b: 0 }, opacity: 0.08 }];
+line.strokes = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0 }, opacity: 0.08 }];
 line.strokeWeight = 1;
 ```
 
@@ -120,7 +120,7 @@ const svgString = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" x
 </svg>`;
 
 const node = figma.createNodeFromSvg(svgString);
-node.name = "Icon/Arrow Right";
+node.name = 'Icon/Arrow Right';
 node.resize(24, 24);
 ```
 
@@ -129,13 +129,15 @@ node.resize(24, 24);
 ### Solid Fill
 
 ```javascript
-node.fills = [{ type: "SOLID", color: { r: 0.2, g: 0.2, b: 0.25 } }];
+node.fills = [{ type: 'SOLID', color: { r: 0.2, g: 0.2, b: 0.25 } }];
 ```
 
 ### Fill with Opacity
 
 ```javascript
-node.fills = [{ type: "SOLID", color: { r: 0.2, g: 0.2, b: 0.25 }, opacity: 0.5 }];
+node.fills = [
+  { type: 'SOLID', color: { r: 0.2, g: 0.2, b: 0.25 }, opacity: 0.5 },
+];
 ```
 
 ### No Fill (Transparent)
@@ -147,30 +149,35 @@ node.fills = [];
 ### Linear Gradient
 
 ```javascript
-node.fills = [{
-  type: "GRADIENT_LINEAR",
-  gradientStops: [
-    { color: { r: 0.2, g: 0.36, b: 0.96, a: 1 }, position: 0 },
-    { color: { r: 0.56, g: 0.24, b: 0.88, a: 1 }, position: 1 }
-  ],
-  gradientTransform: [[1, 0, 0], [0, 1, 0]]
-}];
+node.fills = [
+  {
+    type: 'GRADIENT_LINEAR',
+    gradientStops: [
+      { color: { r: 0.2, g: 0.36, b: 0.96, a: 1 }, position: 0 },
+      { color: { r: 0.56, g: 0.24, b: 0.88, a: 1 }, position: 1 },
+    ],
+    gradientTransform: [
+      [1, 0, 0],
+      [0, 1, 0],
+    ],
+  },
+];
 ```
 
 ### Strokes
 
 ```javascript
-node.strokes = [{ type: "SOLID", color: { r: 0.85, g: 0.85, b: 0.87 } }];
+node.strokes = [{ type: 'SOLID', color: { r: 0.85, g: 0.85, b: 0.87 } }];
 node.strokeWeight = 1;
-node.strokeAlign = "INSIDE";  // "CENTER", "OUTSIDE"
+node.strokeAlign = 'INSIDE'; // "CENTER", "OUTSIDE"
 ```
 
 ### Multiple Fills (Layered)
 
 ```javascript
 node.fills = [
-  { type: "SOLID", color: { r: 0.95, g: 0.95, b: 0.96 } },
-  { type: "SOLID", color: { r: 0.2, g: 0.36, b: 0.96 }, opacity: 0.05 }
+  { type: 'SOLID', color: { r: 0.95, g: 0.95, b: 0.96 } },
+  { type: 'SOLID', color: { r: 0.2, g: 0.36, b: 0.96 }, opacity: 0.05 },
 ];
 ```
 
@@ -182,7 +189,7 @@ node.fills = [
 
 ```javascript
 const frame = figma.createAutoLayout(); // HORIZONTAL by default
-const column = figma.createAutoLayout("VERTICAL");
+const column = figma.createAutoLayout('VERTICAL');
 
 // Customize from there as usual:
 frame.itemSpacing = 16;
@@ -196,25 +203,25 @@ If you need a non-auto-layout frame, use `figma.createFrame()` and set the prope
 
 ```javascript
 const frame = figma.createFrame();
-frame.layoutMode = "VERTICAL";              // or "HORIZONTAL"
-frame.primaryAxisSizingMode = "AUTO";       // Hug main axis
-frame.counterAxisSizingMode = "FIXED";      // Fixed cross axis
-frame.resize(360, 1);                        // Width fixed, height auto
+frame.layoutMode = 'VERTICAL'; // or "HORIZONTAL"
+frame.primaryAxisSizingMode = 'AUTO'; // Hug main axis
+frame.counterAxisSizingMode = 'FIXED'; // Fixed cross axis
+frame.resize(360, 1); // Width fixed, height auto
 ```
 
 ### Alignment
 
 ```javascript
 // Main axis (direction of layout)
-frame.primaryAxisAlignItems = "MIN";            // Start
-frame.primaryAxisAlignItems = "CENTER";         // Center
-frame.primaryAxisAlignItems = "MAX";            // End
-frame.primaryAxisAlignItems = "SPACE_BETWEEN";  // Distribute
+frame.primaryAxisAlignItems = 'MIN'; // Start
+frame.primaryAxisAlignItems = 'CENTER'; // Center
+frame.primaryAxisAlignItems = 'MAX'; // End
+frame.primaryAxisAlignItems = 'SPACE_BETWEEN'; // Distribute
 
 // Cross axis
-frame.counterAxisAlignItems = "MIN";     // Start
-frame.counterAxisAlignItems = "CENTER";  // Center
-frame.counterAxisAlignItems = "MAX";     // End
+frame.counterAxisAlignItems = 'MIN'; // Start
+frame.counterAxisAlignItems = 'CENTER'; // Center
+frame.counterAxisAlignItems = 'MAX'; // End
 // NOTE: 'STRETCH' is NOT valid — use 'MIN' + child.layoutSizingX = 'FILL'
 ```
 
@@ -222,30 +229,30 @@ frame.counterAxisAlignItems = "MAX";     // End
 
 ```javascript
 // IMPORTANT: FILL can only be set AFTER the child is appended to an auto-layout parent
-parent.appendChild(child)
-child.layoutSizingHorizontal = "FILL";   // Stretch to parent
-child.layoutSizingHorizontal = "HUG";    // Shrink to content
-child.layoutSizingHorizontal = "FIXED";  // Manual width
+parent.appendChild(child);
+child.layoutSizingHorizontal = 'FILL'; // Stretch to parent
+child.layoutSizingHorizontal = 'HUG'; // Shrink to content
+child.layoutSizingHorizontal = 'FIXED'; // Manual width
 
-child.layoutSizingVertical = "FILL";
-child.layoutSizingVertical = "HUG";
-child.layoutSizingVertical = "FIXED";
+child.layoutSizingVertical = 'FILL';
+child.layoutSizingVertical = 'HUG';
+child.layoutSizingVertical = 'FIXED';
 ```
 
 ### Wrapping (Grid-like Layout)
 
 ```javascript
-frame.layoutMode = "HORIZONTAL";
-frame.layoutWrap = "WRAP";
-frame.itemSpacing = 24;          // Horizontal gap
-frame.counterAxisSpacing = 24;   // Vertical gap (between rows)
+frame.layoutMode = 'HORIZONTAL';
+frame.layoutWrap = 'WRAP';
+frame.itemSpacing = 24; // Horizontal gap
+frame.counterAxisSpacing = 24; // Vertical gap (between rows)
 ```
 
 ### Absolute Positioning Within Auto Layout
 
 ```javascript
-child.layoutPositioning = "ABSOLUTE";
-child.constraints = { horizontal: "MAX", vertical: "MIN" };  // Top-right
+child.layoutPositioning = 'ABSOLUTE';
+child.constraints = { horizontal: 'MAX', vertical: 'MIN' }; // Top-right
 child.x = parentWidth - childWidth - 8;
 child.y = 8;
 ```
@@ -255,57 +262,81 @@ child.y = 8;
 ### Drop Shadow
 
 ```javascript
-node.effects = [{
-  type: "DROP_SHADOW",
-  color: { r: 0, g: 0, b: 0, a: 0.08 },
-  offset: { x: 0, y: 4 },
-  radius: 16,
-  spread: -2,
-  visible: true,
-  blendMode: "NORMAL"
-}];
+node.effects = [
+  {
+    type: 'DROP_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.08 },
+    offset: { x: 0, y: 4 },
+    radius: 16,
+    spread: -2,
+    visible: true,
+    blendMode: 'NORMAL',
+  },
+];
 ```
 
 ### Inner Shadow
 
 ```javascript
-node.effects = [{
-  type: "INNER_SHADOW",
-  color: { r: 0, g: 0, b: 0, a: 0.05 },
-  offset: { x: 0, y: 1 },
-  radius: 2,
-  spread: 0,
-  visible: true,
-  blendMode: "NORMAL"
-}];
+node.effects = [
+  {
+    type: 'INNER_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.05 },
+    offset: { x: 0, y: 1 },
+    radius: 2,
+    spread: 0,
+    visible: true,
+    blendMode: 'NORMAL',
+  },
+];
 ```
 
 ### Background Blur
 
 ```javascript
-node.effects = [{
-  type: "BACKGROUND_BLUR",
-  radius: 16,
-  visible: true
-}];
+node.effects = [
+  {
+    type: 'BACKGROUND_BLUR',
+    radius: 16,
+    visible: true,
+  },
+];
 ```
 
 ### Layer Blur
 
 ```javascript
-node.effects = [{
-  type: "LAYER_BLUR",
-  radius: 8,
-  visible: true
-}];
+node.effects = [
+  {
+    type: 'LAYER_BLUR',
+    radius: 8,
+    visible: true,
+  },
+];
 ```
 
 ### Multiple Effects
 
 ```javascript
 node.effects = [
-  { type: "DROP_SHADOW", color: { r: 0, g: 0, b: 0, a: 0.04 }, offset: { x: 0, y: 1 }, radius: 3, spread: 0, visible: true, blendMode: "NORMAL" },
-  { type: "DROP_SHADOW", color: { r: 0, g: 0, b: 0, a: 0.06 }, offset: { x: 0, y: 8 }, radius: 24, spread: -4, visible: true, blendMode: "NORMAL" }
+  {
+    type: 'DROP_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.04 },
+    offset: { x: 0, y: 1 },
+    radius: 3,
+    spread: 0,
+    visible: true,
+    blendMode: 'NORMAL',
+  },
+  {
+    type: 'DROP_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.06 },
+    offset: { x: 0, y: 8 },
+    radius: 24,
+    spread: -4,
+    visible: true,
+    blendMode: 'NORMAL',
+  },
 ];
 ```
 
@@ -313,7 +344,7 @@ node.effects = [
 
 ```javascript
 node.opacity = 0.5;
-node.blendMode = "NORMAL";    // "MULTIPLY", "SCREEN", "OVERLAY", "DARKEN", "LIGHTEN", etc.
+node.blendMode = 'NORMAL'; // "MULTIPLY", "SCREEN", "OVERLAY", "DARKEN", "LIGHTEN", etc.
 ```
 
 ## Corner Radius
@@ -332,7 +363,7 @@ node.bottomRightRadius = 0;
 ## Clipping
 
 ```javascript
-frame.clipsContent = true;   // Children clipped to frame bounds
+frame.clipsContent = true; // Children clipped to frame bounds
 ```
 
 ## Grouping & Organization
@@ -341,14 +372,14 @@ frame.clipsContent = true;   // Children clipped to frame bounds
 
 ```javascript
 const group = figma.group([node1, node2, node3], figma.currentPage);
-group.name = "Grouped Elements";
+group.name = 'Grouped Elements';
 ```
 
 ### Sections
 
 ```javascript
 const section = figma.createSection();
-section.name = "My Section";
+section.name = 'My Section';
 section.resize(800, 600); // `resize` and `resizeWithoutConstraints` are equivalent on sections
 section.x = 0;
 section.y = 0;
@@ -361,7 +392,7 @@ section.y = 0;
 parentFrame.appendChild(childNode);
 
 // Insert at a specific index
-parentFrame.insertChild(0, childNode);  // Insert at beginning
+parentFrame.insertChild(0, childNode); // Insert at beginning
 ```
 
 ## Components & Variants
@@ -370,8 +401,8 @@ parentFrame.insertChild(0, childNode);  // Insert at beginning
 
 ```javascript
 const component = figma.createComponent();
-component.name = "Button/Primary";
-component.description = "Primary action button.";
+component.name = 'Button/Primary';
+component.description = 'Primary action button.';
 ```
 
 ### Create Instance
@@ -388,13 +419,13 @@ These methods import components from **team libraries** (not the same file). For
 
 ```javascript
 // Import a published component from a team library by its key
-const comp = await figma.importComponentByKeyAsync(componentKey)
-const instance = comp.createInstance()
+const comp = await figma.importComponentByKeyAsync(componentKey);
+const instance = comp.createInstance();
 
 // Import a published component set from a team library by its key
-const set = await figma.importComponentSetByKeyAsync(componentSetKey)
-const variant = set.defaultVariant
-const variantInstance = variant.createInstance()
+const set = await figma.importComponentSetByKeyAsync(componentSetKey);
+const variant = set.defaultVariant;
+const variantInstance = variant.createInstance();
 ```
 
 ### Combine as Variants
@@ -403,13 +434,14 @@ const variantInstance = variant.createInstance()
 // IMPORTANT: Pass ComponentNodes (not frames)
 const componentSet = figma.combineAsVariants(
   [variantA, variantB, variantC],
-  figma.currentPage
+  figma.currentPage,
 );
-componentSet.name = "Button";
-componentSet.description = "Button component with multiple variants.";
+componentSet.name = 'Button';
+componentSet.description = 'Button component with multiple variants.';
 
 // CRITICAL: Layout variants in a grid after combining (they stack at 0,0)
-let maxX = 0, maxY = 0;
+let maxX = 0,
+  maxY = 0;
 componentSet.children.forEach((child, i) => {
   child.x = (i % numCols) * colWidth;
   child.y = Math.floor(i / numCols) * rowHeight;
@@ -425,15 +457,19 @@ componentSet.resizeWithoutConstraints(maxX + 40, maxY + 40);
 
 ```javascript
 // addComponentProperty returns a STRING key — capture it!
-const labelKey = component.addComponentProperty("label", "TEXT", "Button");
-const showIconKey = component.addComponentProperty("showIcon", "BOOLEAN", true);
-const iconSlotKey = component.addComponentProperty("iconSlot", "INSTANCE_SWAP", defaultIconId);
+const labelKey = component.addComponentProperty('label', 'TEXT', 'Button');
+const showIconKey = component.addComponentProperty('showIcon', 'BOOLEAN', true);
+const iconSlotKey = component.addComponentProperty(
+  'iconSlot',
+  'INSTANCE_SWAP',
+  defaultIconId,
+);
 
 // MUST link properties to child nodes via componentPropertyReferences
 labelNode.componentPropertyReferences = { characters: labelKey };
 iconInstance.componentPropertyReferences = {
   visible: showIconKey,
-  mainComponent: iconSlotKey
+  mainComponent: iconSlotKey,
 };
 ```
 
@@ -442,14 +478,14 @@ iconInstance.componentPropertyReferences = {
 ### Text Style
 
 ```javascript
-await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
 
 const style = figma.createTextStyle();
-style.name = "Body/Default";
-style.fontName = { family: "Inter", style: "Regular" };
+style.name = 'Body/Default';
+style.fontName = { family: 'Inter', style: 'Regular' };
 style.fontSize = 16;
-style.lineHeight = { value: 24, unit: "PIXELS" };
-style.letterSpacing = { value: 0, unit: "PERCENT" };
+style.lineHeight = { value: 24, unit: 'PIXELS' };
+style.letterSpacing = { value: 0, unit: 'PERCENT' };
 
 // Apply to a text node
 textNode.textStyleId = style.id;
@@ -459,16 +495,18 @@ textNode.textStyleId = style.id;
 
 ```javascript
 const shadowStyle = figma.createEffectStyle();
-shadowStyle.name = "Shadow/Subtle";
-shadowStyle.effects = [{
-  type: "DROP_SHADOW",
-  color: { r: 0, g: 0, b: 0, a: 0.06 },
-  offset: { x: 0, y: 2 },
-  radius: 8,
-  spread: 0,
-  visible: true,
-  blendMode: "NORMAL"
-}];
+shadowStyle.name = 'Shadow/Subtle';
+shadowStyle.effects = [
+  {
+    type: 'DROP_SHADOW',
+    color: { r: 0, g: 0, b: 0, a: 0.06 },
+    offset: { x: 0, y: 2 },
+    radius: 8,
+    spread: 0,
+    visible: true,
+    blendMode: 'NORMAL',
+  },
+];
 
 // Apply to a node
 frame.effectStyleId = shadowStyle.id;
@@ -479,20 +517,22 @@ frame.effectStyleId = shadowStyle.id;
 ```javascript
 const clone = originalNode.clone();
 clone.x = originalNode.x + originalNode.width + 40;
-clone.name = "Copy of " + originalNode.name;
+clone.name = 'Copy of ' + originalNode.name;
 ```
 
 ## Finding Nodes
 
 ```javascript
 // Find by name on current page
-const node = figma.currentPage.findOne(n => n.name === "My Frame");
+const node = figma.currentPage.findOne((n) => n.name === 'My Frame');
 
 // Find all by type
-const allTexts = figma.currentPage.findAll(n => n.type === "TEXT");
+const allTexts = figma.currentPage.findAll((n) => n.type === 'TEXT');
 
 // Find all by name pattern
-const allButtons = figma.currentPage.findAll(n => n.name.startsWith("Button/"));
+const allButtons = figma.currentPage.findAll((n) =>
+  n.name.startsWith('Button/'),
+);
 ```
 
 ## Layout Grids
@@ -500,13 +540,13 @@ const allButtons = figma.currentPage.findAll(n => n.name.startsWith("Button/"));
 ```javascript
 frame.layoutGrids = [
   {
-    pattern: "COLUMNS",
-    alignment: "STRETCH",
+    pattern: 'COLUMNS',
+    alignment: 'STRETCH',
     count: 12,
     gutterSize: 24,
     offset: 80,
-    visible: true
-  }
+    visible: true,
+  },
 ];
 ```
 
@@ -514,8 +554,8 @@ frame.layoutGrids = [
 
 ```javascript
 child.constraints = {
-  horizontal: "LEFT_RIGHT",  // LEFT, RIGHT, CENTER, LEFT_RIGHT, SCALE
-  vertical: "TOP"            // TOP, BOTTOM, CENTER, TOP_BOTTOM, SCALE
+  horizontal: 'LEFT_RIGHT', // LEFT, RIGHT, CENTER, LEFT_RIGHT, SCALE
+  vertical: 'TOP', // TOP, BOTTOM, CENTER, TOP_BOTTOM, SCALE
 };
 ```
 

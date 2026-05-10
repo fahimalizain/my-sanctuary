@@ -23,14 +23,14 @@
  */
 async function listTextStyles() {
   const styles = await figma.getLocalTextStylesAsync();
-  return styles.map(s => ({
+  return styles.map((s) => ({
     id: s.id,
     name: s.name,
     key: s.key,
     fontSize: s.fontSize,
     fontName: s.fontName,
     lineHeight: s.lineHeight,
-    letterSpacing: s.letterSpacing
+    letterSpacing: s.letterSpacing,
   }));
 }
 ```
@@ -59,7 +59,14 @@ Font **MUST** be loaded before setting `fontName`. `lineHeight` and `letterSpaci
  * @param {string} [description] - e.g. the CSS variable name "CSS: var(--font-body-base)"
  * @returns {TextStyle}
  */
-function createTextStyleFull(name, fontName, fontSize, lineHeight, letterSpacing, description) {
+function createTextStyleFull(
+  name,
+  fontName,
+  fontSize,
+  lineHeight,
+  letterSpacing,
+  description,
+) {
   const style = figma.createTextStyle();
   style.name = name;
   style.fontName = fontName;
@@ -73,7 +80,7 @@ function createTextStyleFull(name, fontName, fontSize, lineHeight, letterSpacing
 
 ## Discovering Available Font Styles
 
-Font style names vary per provider and per file.  Use `figma.listAvailableFontsAsync()` to discover exact style strings — never guess or probe with try/catch:
+Font style names vary per provider and per file. Use `figma.listAvailableFontsAsync()` to discover exact style strings — never guess or probe with try/catch:
 
 ```javascript
 /**
@@ -85,8 +92,8 @@ Font style names vary per provider and per file.  Use `figma.listAvailableFontsA
 async function getAvailableFontStyles(family) {
   const allFonts = await figma.listAvailableFontsAsync();
   return allFonts
-    .filter(f => f.fontName.family === family)
-    .map(f => f.fontName.style);
+    .filter((f) => f.fontName.family === family)
+    .map((f) => f.fontName.style);
 }
 ```
 
@@ -111,11 +118,11 @@ async function createTypeRamp(defs) {
     uniqueFonts.add(JSON.stringify({ family, style }));
   }
   await Promise.all(
-    [...uniqueFonts].map(f => figma.loadFontAsync(JSON.parse(f)))
+    [...uniqueFonts].map((f) => figma.loadFontAsync(JSON.parse(f))),
   );
 
   const existing = new Set(
-    (await figma.getLocalTextStylesAsync()).map(s => s.name)
+    (await figma.getLocalTextStylesAsync()).map((s) => s.name),
   );
 
   const created = [];
@@ -143,11 +150,32 @@ Full runnable script:
 
 ```javascript
 const defs = [
-  ['heading/xl', 'Inter', 'Bold',      48, { unit: 'PIXELS', value: 56 }, '--font-heading-xl'],
-  ['heading/lg', 'Inter', 'Bold',      36, { unit: 'PIXELS', value: 44 }, '--font-heading-lg'],
-  ['body/base',  'Inter', 'Regular',   16, { unit: 'AUTO' },              '--font-body-base'],
-  ['body/sm',    'Inter', 'Regular',   14, { unit: 'AUTO' },              '--font-body-sm'],
-  ['code/base',  'Roboto Mono', 'Regular', 14, { unit: 'AUTO' },          '--font-code-base'],
+  [
+    'heading/xl',
+    'Inter',
+    'Bold',
+    48,
+    { unit: 'PIXELS', value: 56 },
+    '--font-heading-xl',
+  ],
+  [
+    'heading/lg',
+    'Inter',
+    'Bold',
+    36,
+    { unit: 'PIXELS', value: 44 },
+    '--font-heading-lg',
+  ],
+  ['body/base', 'Inter', 'Regular', 16, { unit: 'AUTO' }, '--font-body-base'],
+  ['body/sm', 'Inter', 'Regular', 14, { unit: 'AUTO' }, '--font-body-sm'],
+  [
+    'code/base',
+    'Roboto Mono',
+    'Regular',
+    14,
+    { unit: 'AUTO' },
+    '--font-code-base',
+  ],
 ];
 const result = await createTypeRamp(defs);
 return result;
@@ -159,7 +187,7 @@ For text styles from **team libraries**, use `importStyleByKeyAsync`:
 
 ```javascript
 // Import a library text style by key
-const headingStyle = await figma.importStyleByKeyAsync("TEXT_STYLE_KEY");
+const headingStyle = await figma.importStyleByKeyAsync('TEXT_STYLE_KEY');
 // Apply to a text node
 await textNode.setTextStyleIdAsync(headingStyle.id);
 ```
