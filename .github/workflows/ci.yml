@@ -115,6 +115,9 @@ jobs:
           SECURE_COOKIE = "${{ vars.SECURE_COOKIE }}"
           EOF
 
+      # Deploy first (required before secrets can be set)
+      - run: npx nx deploy cloudflare-deploy
+
       # Push secrets from GitHub Secrets to Cloudflare Worker
       - run: echo "$SESSION_SECRET" | npx wrangler secret put SESSION_SECRET --cwd apps/cloudflare-deploy
         env:
@@ -123,5 +126,3 @@ jobs:
       - run: echo "$GOOGLE_CREDENTIALS_JSON" | npx wrangler secret put GOOGLE_CREDENTIALS_JSON --cwd apps/cloudflare-deploy
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-
-      - run: npx nx deploy cloudflare-deploy
