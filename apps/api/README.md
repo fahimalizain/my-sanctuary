@@ -3,9 +3,11 @@
 | Variable                  | Required | Default                 | Description                                                                               |
 | ------------------------- | -------- | ----------------------- | ----------------------------------------------------------------------------------------- |
 | `GOOGLE_CREDENTIALS_JSON` | Yes      | —                       | Raw JSON content of your Google OAuth 2.0 client credentials file (web application type). |
-| `SESSION_SECRET`          | Yes      | —                       | 32+ byte secret used to encrypt session cookies.                                          |
+| `SESSION_SECRET`          | Yes      | —                       | 32+ byte secret used to sign session cookies.                                             |
 | `FRONTEND_URL`            | No       | `http://localhost:5173` | URL of the web frontend. Used to redirect users after login.                              |
 | `SECURE_COOKIE`           | No       | `false`                 | Set to `true` in production to mark cookies as Secure.                                    |
+
+> **Production**: All env vars are managed in GitHub. See `.env.example` for the single source of truth.
 
 ## Endpoints
 
