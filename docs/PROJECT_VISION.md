@@ -11,6 +11,7 @@ Sanctuary is a life-organisation app for people juggling multiple domains (famil
 ### Streams
 
 A **Stream** represents a major area of your life:
+
 - Family
 - Work
 - Personal Startup
@@ -22,6 +23,7 @@ Each stream has its own set of tasks.
 ### Tasks
 
 Tasks live **inside** a stream. Each task has:
+
 - Title / description
 - Estimated duration
 - Priority
@@ -62,6 +64,7 @@ The **Home page** is a **single-day timeline view** with a **non-linear, content
 ```
 
 **Non-linear timeline principles:**
+
 - **Block height driven by task density**, not clock duration
   - Single-task blocks are compact (just stream title + task name)
   - Multi-task blocks expand to show all tasks inline
@@ -97,6 +100,7 @@ Sanctuary tracks how consistent you are with your personal commitments by lettin
 ### Custom Rules
 
 A rule is a personal commitment you define with:
+
 - **Name**: e.g. "Wake up early"
 - **Condition**: e.g. "Wake up between 5:00 AM and 6:00 AM"
 - **Schedule**: e.g. "Every day" or "Weekdays only"
@@ -111,6 +115,7 @@ A rule is a personal commitment you define with:
 ### Consistency Dashboard
 
 Each rule shows:
+
 - **Streak**: current consecutive days met
 - **Longest streak**: all-time best
 - **Compliance %**: e.g. "82% this month" (25/30 days)
@@ -119,13 +124,13 @@ Each rule shows:
 
 ### Example Rules
 
-| Rule | Condition | Schedule |
-|------|-----------|----------|
-| Wake up early | "Wake up" event starts between 5:00–6:00 AM | Daily |
-| Morning run | "Run" or "Morning run" event exists before 8 AM | Weekdays |
-| No work after 8 PM | No event tagged "Work" starts after 8:00 PM | Daily |
-| Read before bed | "Reading" block exists after 9 PM | Daily |
-| Gym 3×/week | At least 3 "Gym/Fitness" events per week | Weekly |
+| Rule               | Condition                                       | Schedule |
+| ------------------ | ----------------------------------------------- | -------- |
+| Wake up early      | "Wake up" event starts between 5:00–6:00 AM     | Daily    |
+| Morning run        | "Run" or "Morning run" event exists before 8 AM | Weekdays |
+| No work after 8 PM | No event tagged "Work" starts after 8:00 PM     | Daily    |
+| Read before bed    | "Reading" block exists after 9 PM               | Daily    |
+| Gym 3×/week        | At least 3 "Gym/Fitness" events per week        | Weekly   |
 
 ---
 
@@ -145,14 +150,14 @@ Google Calendar is the **source of truth** for all scheduling:
 
 ## Screens / Pages
 
-| Screen          | Purpose |
-|-----------------|---------|
-| **Login**       | Sign in with Google (only auth method) |
-| **Home**        | Single-day timeline + focus timer + quotes slideshow |
-| **Streams**     | Manage streams and their tasks |
-| **Calendar**    | Full week/month view (Google Calendar-powered) |
+| Screen          | Purpose                                                   |
+| --------------- | --------------------------------------------------------- |
+| **Login**       | Sign in with Google (only auth method)                    |
+| **Home**        | Single-day timeline + focus timer + quotes slideshow      |
+| **Streams**     | Manage streams and their tasks                            |
+| **Calendar**    | Full week/month view (Google Calendar-powered)            |
 | **Consistency** | Custom rules, habit tracking, streaks, compliance history |
-| **Settings**    | Profile, preferences, integrations |
+| **Settings**    | Profile, preferences, integrations                        |
 
 ## Design Language
 

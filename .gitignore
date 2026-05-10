@@ -56,3 +56,9 @@ go.work.sum
 
 # Wrangler
 .wrangler
+
+# direnv cache
+.direnv/
+# devenv / nix
+result
+result-*
