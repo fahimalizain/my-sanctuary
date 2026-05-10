@@ -2,6 +2,7 @@ import { Outlet, Link, useLocation } from '@tanstack/react-router';
 import '../styles/globals.css';
 import { Home, LayoutGrid, CalendarDays, Target, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ReloadPrompt } from '@/app/components/ReloadPrompt';
 
 function Navigation() {
   const location = useLocation();
@@ -54,6 +55,7 @@ export function RootComponent() {
     <>
       <Outlet />
       <Navigation />
+      <ReloadPrompt />
     </>
   );
 }

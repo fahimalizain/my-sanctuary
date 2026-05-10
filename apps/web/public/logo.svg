@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2d6a1a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a3d0a;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Rounded square background -->
+  <rect x="16" y="16" width="480" height="480" rx="120" ry="120" fill="url(#bgGrad)"/>
+  
+  <!-- Abstract sanctuary / leaf symbol -->
+  <g transform="translate(256, 256)" fill="#f5f5ef">
+    <!-- Outer ring -->
+    <circle cx="0" cy="0" r="140" fill="none" stroke="#f5f5ef" stroke-width="16" opacity="0.3"/>
+    
+    <!-- Leaf / shelter shape -->
+    <path d="M -60,40 
+             Q -60,-80 0,-120 
+             Q 60,-80 60,40 
+             Q 60,80 0,100 
+             Q -60,80 -60,40 Z" 
+          fill="#f5f5ef"/>
+    
+    <!-- Inner stem / path -->
+    <path d="M 0,-80 L 0,60" stroke="#1a3d0a" stroke-width="14" stroke-linecap="round" fill="none"/>
+    
+    <!-- Left branch -->
+    <path d="M 0,-20 L -35,-50" stroke="#1a3d0a" stroke-width="12" stroke-linecap="round" fill="none"/>
+    
+    <!-- Right branch -->
+    <path d="M 0,10 L 35,-20" stroke="#1a3d0a" stroke-width="12" stroke-linecap="round" fill="none"/>
+    
+    <!-- Small dot / seed -->
+    <circle cx="0" cy="75" r="10" fill="#1a3d0a"/>
+  </g>
+</svg>
