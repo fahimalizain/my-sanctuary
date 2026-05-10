@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/syumai/workers"
 	"github.com/syumai/workers/cloudflare"
+	"github.com/syumai/workers/cloudflare/fetch"
 	"my-sanctuary/apps/api/config"
 	"my-sanctuary/apps/api/handlers"
 )
@@ -27,7 +28,10 @@ func main() {
 	router := chi.NewMux()
 
 	// Register API routes from the shared handlers package
-	handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg})
+	handlers.RegisterRoutes(router, &handlers.Dependencies{
+		Config:     cfg,
+		HTTPClient: fetch.NewClient().HTTPClient(fetch.RedirectModeFollow),
+	})
 
 	// Static files + SPA fallback
 	subFS, err := fs.Sub(staticFS, "dist")

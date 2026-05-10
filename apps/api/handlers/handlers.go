@@ -14,7 +14,8 @@ import (
 
 // Dependencies holds injected configuration for route registration.
 type Dependencies struct {
-	Config *config.Config
+	Config     *config.Config
+	HTTPClient *http.Client
 }
 
 // GreetingInput represents the input for the greeting endpoint.
@@ -31,7 +32,7 @@ type GreetingOutput struct {
 
 // RegisterRoutes registers all API routes on the provided chi router.
 func RegisterRoutes(router chi.Router, deps *Dependencies) {
-	authHandler := NewAuthHandler(deps.Config)
+	authHandler := NewAuthHandler(deps.Config, deps.HTTPClient)
 
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{deps.Config.FrontendURL},

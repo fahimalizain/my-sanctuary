@@ -18,7 +18,7 @@ func TestAuthHandler_Initiate_Redirects(t *testing.T) {
 		},
 		SessionSecret: "super-secret-key-for-tests!!",
 		FrontendURL:   "http://localhost:5173",
-	})
+	}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/google", nil)
 	rr := httptest.NewRecorder()
@@ -43,7 +43,7 @@ func TestAuthHandler_Callback_InvalidState(t *testing.T) {
 		},
 		SessionSecret: "super-secret-key-for-tests!!",
 		FrontendURL:   "http://localhost:5173",
-	})
+	}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/google/callback?state=bad", nil)
 	rr := httptest.NewRecorder()
@@ -64,7 +64,7 @@ func TestAuthHandler_Me_Unauthorized(t *testing.T) {
 		},
 		SessionSecret: "super-secret-key-for-tests!!",
 		FrontendURL:   "http://localhost:5173",
-	})
+	}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
 	rr := httptest.NewRecorder()
@@ -88,7 +88,7 @@ func TestAuthHandler_Logout_ClearsSession(t *testing.T) {
 		},
 		SessionSecret: "super-secret-key-for-tests!!",
 		FrontendURL:   "http://localhost:5173",
-	})
+	}, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	rr := httptest.NewRecorder()

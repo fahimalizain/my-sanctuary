@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -23,6 +24,7 @@ type AuthHandler struct {
 	oauthConfig *oauth2.Config
 	store       *sessions.CookieStore
 	frontendURL string
+	httpClient  *http.Client
 }
 
 // GoogleUser represents the public profile returned by Google.
@@ -35,7 +37,7 @@ type GoogleUser struct {
 }
 
 // NewAuthHandler creates an AuthHandler from application config.
-func NewAuthHandler(cfg *config.Config) *AuthHandler {
+func NewAuthHandler(cfg *config.Config, httpClient *http.Client) *AuthHandler {
 	store := sessions.NewCookieStore([]byte(cfg.SessionSecret))
 	store.Options = &sessions.Options{
 		Path:     "/",
@@ -63,7 +65,19 @@ func NewAuthHandler(cfg *config.Config) *AuthHandler {
 		},
 		store:       store,
 		frontendURL: cfg.FrontendURL,
+		httpClient:  httpClient,
 	}
+}
+
+// oauth2Context returns a context that carries the custom HTTP client for oauth2
+// operations. This is required in environments like Cloudflare Workers where the
+// default Go HTTP client can trigger "Illegal invocation" errors due to loose
+// fetch bindings in the JS/WASM runtime.
+func (h *AuthHandler) oauth2Context(ctx context.Context) context.Context {
+	if h.httpClient != nil {
+		return context.WithValue(ctx, oauth2.HTTPClient, h.httpClient)
+	}
+	return ctx
 }
 
 func generateState() string {
@@ -114,13 +128,13 @@ func (h *AuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := h.oauthConfig.Exchange(r.Context(), code)
+	token, err := h.oauthConfig.Exchange(h.oauth2Context(r.Context()), code)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to exchange token: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	client := h.oauthConfig.Client(r.Context(), token)
+	client := h.oauthConfig.Client(h.oauth2Context(r.Context()), token)
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to get user info: %v", err), http.StatusInternalServerError)

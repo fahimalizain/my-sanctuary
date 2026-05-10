@@ -19,7 +19,7 @@ func main() {
 		}
 
 		router := chi.NewMux()
-		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg})
+		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg, HTTPClient: http.DefaultClient})
 
 		server := &http.Server{
 			Addr:    ":8080",

@@ -26,7 +26,7 @@ func (h *CalendarHandler) ListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := h.auth.oauthConfig.Client(r.Context(), token)
+	client := h.auth.oauthConfig.Client(h.auth.oauth2Context(r.Context()), token)
 	resp, err := client.Get("https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=10&orderBy=startTime&singleEvents=true")
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -90,7 +90,7 @@ func (h *CalendarHandler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := h.auth.oauthConfig.Client(r.Context(), token)
+	client := h.auth.oauthConfig.Client(h.auth.oauth2Context(r.Context()), token)
 	resp, err := client.Do(req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")

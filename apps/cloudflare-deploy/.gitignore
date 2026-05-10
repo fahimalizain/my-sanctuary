@@ -1,1 +1,3 @@
 build/
+cloudflare-deploy
+*.wasm
