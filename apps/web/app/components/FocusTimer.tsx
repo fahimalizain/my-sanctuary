@@ -1,48 +1,53 @@
-import { useState, useEffect } from 'react'
-import { Play, Pause, RotateCcw } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
+import { useState, useEffect } from 'react';
+import { Play, Pause, RotateCcw } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
 
 interface FocusTimerProps {
-  className?: string
+  className?: string;
 }
 
 export function FocusTimer({ className }: FocusTimerProps) {
-  const [timeLeft, setTimeLeft] = useState(25 * 60)
-  const [isRunning, setIsRunning] = useState(false)
-  const [sessions, setSessions] = useState(3)
+  const [timeLeft, setTimeLeft] = useState(25 * 60);
+  const [isRunning, setIsRunning] = useState(false);
+  const [sessions, setSessions] = useState(3);
 
   useEffect(() => {
-    if (!isRunning) return
+    if (!isRunning) return;
 
     const interval = setInterval(() => {
       setTimeLeft((prev) => {
         if (prev <= 0) {
-          setIsRunning(false)
-          setSessions((s) => s + 1)
-          return 25 * 60
+          setIsRunning(false);
+          setSessions((s) => s + 1);
+          return 25 * 60;
         }
-        return prev - 1
-      })
-    }, 1000)
+        return prev - 1;
+      });
+    }, 1000);
 
-    return () => clearInterval(interval)
-  }, [isRunning])
+    return () => clearInterval(interval);
+  }, [isRunning]);
 
-  const minutes = Math.floor(timeLeft / 60)
-  const seconds = timeLeft % 60
+  const minutes = Math.floor(timeLeft / 60);
+  const seconds = timeLeft % 60;
 
   const formatTime = (m: number, s: number) => {
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-  }
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
 
   const handleReset = () => {
-    setIsRunning(false)
-    setTimeLeft(25 * 60)
-  }
+    setIsRunning(false);
+    setTimeLeft(25 * 60);
+  };
 
   return (
-    <div className={cn('bg-card rounded-xl p-6 shadow-sm border border-border', className)}>
+    <div
+      className={cn(
+        'bg-card rounded-xl p-6 shadow-sm border border-border',
+        className,
+      )}
+    >
       <h2 className="font-heading text-lg font-semibold text-foreground mb-4">
         Focus Timer
       </h2>
@@ -85,9 +90,11 @@ export function FocusTimer({ className }: FocusTimerProps) {
 
       <div className="text-center">
         <p className="text-sm text-muted-foreground">
-          Sessions: <span className="font-semibold text-foreground">{sessions}</span> today
+          Sessions:{' '}
+          <span className="font-semibold text-foreground">{sessions}</span>{' '}
+          today
         </p>
       </div>
     </div>
-  )
+  );
 }

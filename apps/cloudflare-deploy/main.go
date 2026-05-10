@@ -2,12 +2,14 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/syumai/workers"
+	"my-sanctuary/apps/api/config"
 	"my-sanctuary/apps/api/handlers"
 )
 
@@ -15,10 +17,16 @@ import (
 var staticFS embed.FS
 
 func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Printf("failed to load config: %v\n", err)
+		return
+	}
+
 	router := chi.NewMux()
 
 	// Register API routes from the shared handlers package
-	handlers.RegisterRoutes(router)
+	handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg})
 
 	// Static files + SPA fallback
 	subFS, err := fs.Sub(staticFS, "dist")

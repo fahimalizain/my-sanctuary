@@ -8,6 +8,12 @@ require (
 	my-sanctuary/apps/api v0.0.0
 )
 
-require github.com/danielgtaylor/huma/v2 v2.37.3 // indirect
+require (
+	github.com/danielgtaylor/huma/v2 v2.37.3 // indirect
+	github.com/go-chi/cors v1.2.2 // indirect
+	github.com/gorilla/securecookie v1.1.2 // indirect
+	github.com/gorilla/sessions v1.4.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
+)
 
 replace my-sanctuary/apps/api => ../api

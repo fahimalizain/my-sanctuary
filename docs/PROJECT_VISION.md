@@ -6,6 +6,14 @@ Sanctuary is a life-organisation app for people juggling multiple domains (famil
 
 ---
 
+## Current Priorities
+
+1. **Google Auth** — Secure sign-in as the foundation for all calendar integration.
+2. **Read-only Timeline** — Display Google Calendar events on the home timeline without editing capabilities.
+3. **Focus Stream Blocks** — Group sequential tasks that exceed 30 minutes into unified stream blocks to emphasize deep-focus sessions.
+
+---
+
 ## Architecture
 
 ### Streams
@@ -165,3 +173,22 @@ Google Calendar is the **source of truth** for all scheduling:
 - **Primary accent**: `#204f0a` dark green
 - **Fonts**: Sen (headings), Kumbh Sans (body)
 - **Clean, minimal, warm** aesthetic
+
+---
+
+## Security Notes
+
+### Session Storage
+
+The current authentication implementation uses **Gorilla Sessions with `CookieStore`**, which stores the entire session (including Google OAuth access tokens and refresh tokens) in a **client-side, `HttpOnly` cookie** signed by `SESSION_SECRET`.
+
+**Current behavior:**
+- ✅ Signed with HMAC-SHA256 — prevents tampering
+- ✅ `HttpOnly` — JavaScript cannot read the cookie
+- ✅ `Secure` (in production) — only sent over HTTPS
+- ⚠️ **Not encrypted** — the payload is base64-encoded but not confidential. Anyone with access to the cookie value (browser extensions, network interceptors, etc.) can decode it and see the contained tokens.
+
+**Future direction:**
+For an app requesting full Google Calendar write access, server-side session storage is recommended. This would store only a random session ID in the cookie while keeping the actual tokens on the server (e.g., in Cloudflare KV for the Worker deployment). This eliminates the risk of token exposure from cookie inspection.
+
+Short term: Consider adding cookie encryption (via a second key to `sessions.NewCookieStore`) to provide confidentiality until server-side sessions are implemented.

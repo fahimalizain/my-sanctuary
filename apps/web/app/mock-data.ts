@@ -1,11 +1,11 @@
-import type { Stream, TimeBlock, TaskEvent, TimelineItem } from './types'
+import type { Stream, TimeBlock, TaskEvent, TimelineItem } from './types';
 
 export const streams: Stream[] = [
   { id: 'work', name: 'Work', color: '#2a5c8a' },
   { id: 'gym', name: 'Fitness', color: '#c45a2c' },
   { id: 'family', name: 'Family', color: '#7a4a6a' },
   { id: 'relax', name: 'Relaxation', color: '#3a7a5a' },
-]
+];
 
 export const todayItems: TimelineItem[] = [
   // Standalone tasks (no stream)
@@ -68,11 +68,31 @@ export const todayItems: TimelineItem[] = [
     tasks: [
       { id: 't1', title: 'Review Q3 Roadmap', duration: 30, priority: 'high' },
       { id: 't2', title: 'Team Standup', duration: 45, priority: 'high' },
-      { id: 't3', title: 'Update Dashboard Mockups', duration: 60, priority: 'medium' },
-      { id: 't4', title: 'Design API Architecture', duration: 90, priority: 'high' },
-      { id: 't5', title: 'Review Frontend PRs', duration: 30, priority: 'medium' },
+      {
+        id: 't3',
+        title: 'Update Dashboard Mockups',
+        duration: 60,
+        priority: 'medium',
+      },
+      {
+        id: 't4',
+        title: 'Design API Architecture',
+        duration: 90,
+        priority: 'high',
+      },
+      {
+        id: 't5',
+        title: 'Review Frontend PRs',
+        duration: 30,
+        priority: 'medium',
+      },
       { id: 't6', title: 'Write Documentation', duration: 45, priority: 'low' },
-      { id: 't7', title: 'Client Meeting Prep', duration: 20, priority: 'high' },
+      {
+        id: 't7',
+        title: 'Client Meeting Prep',
+        duration: 20,
+        priority: 'high',
+      },
       { id: 't8', title: 'Email Cleanup', duration: 15, priority: 'low' },
     ],
   } as TimeBlock,
@@ -111,13 +131,19 @@ export const todayItems: TimelineItem[] = [
       { id: 't13', title: 'Meditation', duration: 20, priority: 'low' },
     ],
   } as TimeBlock,
-]
+];
 
 // Backwards compatibility alias
-export const todayBlocks = todayItems
+export const todayBlocks = todayItems;
 
 export const quotes = [
-  { text: "The only way to do great work is to love what you do.", author: "Steve Jobs" },
-  { text: "Focus on being productive instead of busy.", author: "Tim Ferriss" },
-  { text: "Your future is created by what you do today, not tomorrow.", author: "Robert Kiyosaki" },
-]
+  {
+    text: 'The only way to do great work is to love what you do.',
+    author: 'Steve Jobs',
+  },
+  { text: 'Focus on being productive instead of busy.', author: 'Tim Ferriss' },
+  {
+    text: 'Your future is created by what you do today, not tomorrow.',
+    author: 'Robert Kiyosaki',
+  },
+];

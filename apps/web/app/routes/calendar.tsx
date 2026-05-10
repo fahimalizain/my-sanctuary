@@ -1,1 +1,1 @@
-export { CalendarPage as CalendarComponent } from '@/app/modules/calendar'
+export { CalendarPage as CalendarComponent } from '@/app/modules/calendar';

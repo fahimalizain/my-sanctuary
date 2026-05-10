@@ -1,12 +1,28 @@
-# API
+# API Environment Variables
 
-The API is built with [Huma](https://huma.rocks/) on top of [Chi](https://github.com/go-chi/chi).
+| Variable                  | Required | Default                 | Description                                                                               |
+| ------------------------- | -------- | ----------------------- | ----------------------------------------------------------------------------------------- |
+| `GOOGLE_CREDENTIALS_JSON` | Yes      | —                       | Raw JSON content of your Google OAuth 2.0 client credentials file (web application type). |
+| `SESSION_SECRET`          | Yes      | —                       | 32+ byte secret used to encrypt session cookies.                                          |
+| `FRONTEND_URL`            | No       | `http://localhost:5173` | URL of the web frontend. Used to redirect users after login.                              |
+| `SECURE_COOKIE`           | No       | `false`                 | Set to `true` in production to mark cookies as Secure.                                    |
 
-- **Chi** (`go-chi/chi/v5`) is the HTTP router. It handles path matching, URL parameters, and middleware chains.
-- **Huma** (`danielgtaylor/huma/v2`) is the OpenAPI framework. It wraps Chi (via the `humachi` adapter) and provides input validation, output serialization, and auto-generated OpenAPI schemas.
+## Endpoints
 
-Chi does the actual HTTP dispatch. Huma adds structured types, validation, and docs on top of it.
+| Method | Path                    | Description                               |
+| ------ | ----------------------- | ----------------------------------------- |
+| GET    | `/health`               | Health check                              |
+| GET    | `/greeting/{name}`      | Example greeting endpoint                 |
+| GET    | `/auth/google`          | Initiate Google OAuth login               |
+| GET    | `/auth/google/callback` | OAuth callback (redirect from Google)     |
+| GET    | `/auth/me`              | Returns current user or `null`            |
+| POST   | `/auth/logout`          | Clears session cookie                     |
+| GET    | `/api/calendar/events`  | List next 10 events from primary calendar |
+| POST   | `/api/calendar/events`  | Create a new event in primary calendar    |
 
-## Handlers
+## Scopes Requested
 
-All route handlers live in `handlers/handlers.go` and are registered via `RegisterRoutes(router chi.Router)`. This package is imported by both the local development server (`main.go`) and the Cloudflare Worker deployment target (`apps/cloudflare-deploy`).
+- `openid`
+- `email`
+- `profile`
+- `https://www.googleapis.com/auth/calendar`

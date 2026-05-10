@@ -1,1 +1,1 @@
-export { ConsistencyPage } from './ConsistencyPage'
+export { ConsistencyPage } from './ConsistencyPage';

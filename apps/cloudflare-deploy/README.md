@@ -61,10 +61,10 @@ The worker runs on `my-sanctuary.fahimalizain.com`.
 
 ## Tech Stack
 
-| Component | Library / Tool | Role |
-|-----------|---------------|------|
-| Router | [Chi](https://github.com/go-chi/chi) | HTTP routing |
-| API Framework | [Huma](https://huma.rocks/) | Validation, serialization, OpenAPI |
-| Worker Runtime | [syumai/workers](https://github.com/syumai/workers) | Go → Cloudflare Workers bridge |
-| Build Tool | Wrangler (`workers-assets-gen`) | JS shim + WASM bundling |
-| Frontend | [Vite](https://vitejs.dev/) + React | Static SPA |
+| Component      | Library / Tool                                      | Role                               |
+| -------------- | --------------------------------------------------- | ---------------------------------- |
+| Router         | [Chi](https://github.com/go-chi/chi)                | HTTP routing                       |
+| API Framework  | [Huma](https://huma.rocks/)                         | Validation, serialization, OpenAPI |
+| Worker Runtime | [syumai/workers](https://github.com/syumai/workers) | Go → Cloudflare Workers bridge     |
+| Build Tool     | Wrangler (`workers-assets-gen`)                     | JS shim + WASM bundling            |
+| Frontend       | [Vite](https://vitejs.dev/) + React                 | Static SPA                         |

@@ -1,1 +1,1 @@
-export { HomePage as HomeComponent } from '@/app/modules/home'
+export { HomePage as HomeComponent } from '@/app/modules/home';

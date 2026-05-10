@@ -1,1 +1,1 @@
-export { LoginPage as LoginComponent } from '@/app/modules/login'
+export { LoginPage as LoginComponent } from '@/app/modules/login';

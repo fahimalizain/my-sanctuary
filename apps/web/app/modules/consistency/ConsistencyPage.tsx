@@ -1,17 +1,25 @@
-import { Flame, Target, Calendar, Clock, BookOpen, Dumbbell, Moon } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
+import {
+  Flame,
+  Target,
+  Calendar,
+  Clock,
+  BookOpen,
+  Dumbbell,
+  Moon,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
 
 interface Rule {
-  id: string
-  name: string
-  icon: React.ReactNode
-  condition: string
-  schedule: string
-  streak: number
-  longestStreak: number
-  compliance: number
-  history: boolean[]
+  id: string;
+  name: string;
+  icon: React.ReactNode;
+  condition: string;
+  schedule: string;
+  streak: number;
+  longestStreak: number;
+  compliance: number;
+  history: boolean[];
 }
 
 const rules: Rule[] = [
@@ -24,7 +32,22 @@ const rules: Rule[] = [
     streak: 12,
     longestStreak: 23,
     compliance: 82,
-    history: [true, true, true, false, true, true, true, true, true, false, true, true, true, true],
+    history: [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+    ],
   },
   {
     id: '2',
@@ -35,7 +58,22 @@ const rules: Rule[] = [
     streak: 5,
     longestStreak: 15,
     compliance: 68,
-    history: [true, false, true, true, true, false, true, true, false, true, true, true, false, true],
+    history: [
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+    ],
   },
   {
     id: '3',
@@ -46,7 +84,22 @@ const rules: Rule[] = [
     streak: 8,
     longestStreak: 12,
     compliance: 75,
-    history: [true, true, false, true, true, true, true, true, false, true, true, true, true, false],
+    history: [
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+    ],
   },
   {
     id: '4',
@@ -57,9 +110,24 @@ const rules: Rule[] = [
     streak: 3,
     longestStreak: 8,
     compliance: 45,
-    history: [true, false, false, true, true, false, true, false, true, true, false, false, true, false],
+    history: [
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+    ],
   },
-]
+];
 
 function RuleCard({ rule }: { rule: Rule }) {
   return (
@@ -70,7 +138,9 @@ function RuleCard({ rule }: { rule: Rule }) {
             {rule.icon}
           </div>
           <div>
-            <h3 className="font-heading font-semibold text-foreground">{rule.name}</h3>
+            <h3 className="font-heading font-semibold text-foreground">
+              {rule.name}
+            </h3>
             <p className="text-sm text-muted-foreground">{rule.condition}</p>
           </div>
         </div>
@@ -112,13 +182,13 @@ function RuleCard({ rule }: { rule: Rule }) {
             key={i}
             className={cn(
               'h-6 w-6 rounded',
-              met ? 'bg-primary' : 'bg-destructive/20'
+              met ? 'bg-primary' : 'bg-destructive/20',
             )}
           />
         ))}
       </div>
     </div>
-  )
+  );
 }
 
 export function ConsistencyPage() {
@@ -169,5 +239,5 @@ export function ConsistencyPage() {
         </div>
       </div>
     </div>
-  )
+  );
 }

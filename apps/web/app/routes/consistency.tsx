@@ -1,1 +1,1 @@
-export { ConsistencyPage as ConsistencyComponent } from '@/app/modules/consistency'
+export { ConsistencyPage as ConsistencyComponent } from '@/app/modules/consistency';

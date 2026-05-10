@@ -1,1 +1,1 @@
-export { TaskModal } from './TaskModal'
+export { TaskModal } from './TaskModal';

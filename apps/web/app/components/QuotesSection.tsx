@@ -1,35 +1,40 @@
-import { useState, useEffect } from 'react'
-import { ChevronLeft, ChevronRight, Quote } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { useState, useEffect } from 'react';
+import { ChevronLeft, ChevronRight, Quote } from 'lucide-react';
+import { cn } from '@/lib/utils';
 
 interface QuotesSectionProps {
-  quotes: { text: string; author: string }[]
-  className?: string
+  quotes: { text: string; author: string }[];
+  className?: string;
 }
 
 export function QuotesSection({ quotes, className }: QuotesSectionProps) {
-  const [currentIndex, setCurrentIndex] = useState(0)
+  const [currentIndex, setCurrentIndex] = useState(0);
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setCurrentIndex((prev) => (prev + 1) % quotes.length)
-    }, 10000)
+      setCurrentIndex((prev) => (prev + 1) % quotes.length);
+    }, 10000);
 
-    return () => clearInterval(interval)
-  }, [quotes.length])
+    return () => clearInterval(interval);
+  }, [quotes.length]);
 
   const goToPrev = () => {
-    setCurrentIndex((prev) => (prev - 1 + quotes.length) % quotes.length)
-  }
+    setCurrentIndex((prev) => (prev - 1 + quotes.length) % quotes.length);
+  };
 
   const goToNext = () => {
-    setCurrentIndex((prev) => (prev + 1) % quotes.length)
-  }
+    setCurrentIndex((prev) => (prev + 1) % quotes.length);
+  };
 
-  const currentQuote = quotes[currentIndex]
+  const currentQuote = quotes[currentIndex];
 
   return (
-    <div className={cn('bg-card rounded-xl p-6 shadow-sm border border-border', className)}>
+    <div
+      className={cn(
+        'bg-card rounded-xl p-6 shadow-sm border border-border',
+        className,
+      )}
+    >
       <div className="flex items-center gap-2 mb-4">
         <Quote className="h-5 w-5 text-primary" />
         <h2 className="font-heading text-lg font-semibold text-foreground">
@@ -41,9 +46,7 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
         <p className="text-lg text-foreground/90 leading-relaxed mb-3">
           &ldquo;{currentQuote.text}&rdquo;
         </p>
-        <p className="text-sm text-muted-foreground">
-          — {currentQuote.author}
-        </p>
+        <p className="text-sm text-muted-foreground">— {currentQuote.author}</p>
       </div>
 
       <div className="flex items-center justify-between mt-4">
@@ -54,7 +57,7 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
               onClick={() => setCurrentIndex(index)}
               className={cn(
                 'h-2 w-2 rounded-full transition-colors',
-                index === currentIndex ? 'bg-primary' : 'bg-muted'
+                index === currentIndex ? 'bg-primary' : 'bg-muted',
               )}
             />
           ))}
@@ -75,5 +78,5 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
         </div>
       </div>
     </div>
-  )
+  );
 }

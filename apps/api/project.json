@@ -8,9 +8,7 @@
     "build": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": [
-          "CGO_ENABLED=0 go build -o ../../dist/apps/api ."
-        ],
+        "commands": ["CGO_ENABLED=0 go build -o ../../dist/apps/api ."],
         "cwd": "apps/api"
       },
       "outputs": ["{workspaceRoot}/dist/apps/api"]
@@ -18,18 +16,14 @@
     "serve": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": [
-          "go run ."
-        ],
+        "commands": ["go run ."],
         "cwd": "apps/api"
       }
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": [
-          "CGO_ENABLED=0 go test ./..."
-        ],
+        "commands": ["CGO_ENABLED=0 go test ./..."],
         "cwd": "apps/api"
       }
     },
@@ -39,9 +33,7 @@
     "tidy": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": [
-          "go mod tidy"
-        ],
+        "commands": ["go mod tidy"],
         "cwd": "apps/api"
       }
     }

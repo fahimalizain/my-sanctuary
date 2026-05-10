@@ -1,16 +1,16 @@
-import { useState } from 'react'
-import { SkewedTimeline } from '@/app/components/SkewedTimeline'
-import { FocusTimer } from '@/app/components/FocusTimer'
-import { QuotesSection } from '@/app/components/QuotesSection'
-import { todayItems, quotes } from '@/app/mock-data'
-import type { TimelineItem } from '@/app/types'
+import { useState } from 'react';
+import { SkewedTimeline } from '@/app/components/SkewedTimeline';
+import { FocusTimer } from '@/app/components/FocusTimer';
+import { QuotesSection } from '@/app/components/QuotesSection';
+import { todayItems, quotes } from '@/app/mock-data';
+import type { TimelineItem } from '@/app/types';
 
 export function HomePage() {
-  const [items, setItems] = useState<TimelineItem[]>(todayItems)
+  const [items, setItems] = useState<TimelineItem[]>(todayItems);
 
   const handleItemsChange = (newItems: TimelineItem[]) => {
-    setItems(newItems)
-  }
+    setItems(newItems);
+  };
 
   return (
     <div className="min-h-screen bg-cream">
@@ -33,5 +33,5 @@ export function HomePage() {
         </div>
       </div>
     </div>
-  )
+  );
 }

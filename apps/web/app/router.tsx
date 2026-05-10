@@ -1,51 +1,67 @@
-import { createRootRoute, createRoute, createRouter } from '@tanstack/react-router'
-import { RootComponent } from './routes/__root'
-import { HomeComponent } from './routes/index'
-import { LoginComponent } from './routes/login'
-import { StreamsComponent } from './routes/streams'
-import { CalendarComponent } from './routes/calendar'
-import { ConsistencyComponent } from './routes/consistency'
-import { SettingsComponent } from './routes/settings'
+import type { ComponentType } from 'react';
+import {
+  createRootRoute,
+  createRoute,
+  createRouter,
+} from '@tanstack/react-router';
+import { RootComponent } from './routes/__root';
+import { HomeComponent } from './routes/index';
+import { LoginComponent } from './routes/login';
+import { StreamsComponent } from './routes/streams';
+import { CalendarComponent } from './routes/calendar';
+import { ConsistencyComponent } from './routes/consistency';
+import { SettingsComponent } from './routes/settings';
+import { AuthGuard } from './components/AuthGuard';
 
 const rootRoute = createRootRoute({
   component: RootComponent,
-})
+});
+
+function withAuth(Component: ComponentType) {
+  return function ProtectedRoute() {
+    return (
+      <AuthGuard>
+        <Component />
+      </AuthGuard>
+    );
+  };
+}
 
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
-  component: HomeComponent,
-})
+  component: withAuth(HomeComponent),
+});
 
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/login',
   component: LoginComponent,
-})
+});
 
 const streamsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/streams',
-  component: StreamsComponent,
-})
+  component: withAuth(StreamsComponent),
+});
 
 const calendarRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/calendar',
-  component: CalendarComponent,
-})
+  component: withAuth(CalendarComponent),
+});
 
 const consistencyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/consistency',
-  component: ConsistencyComponent,
-})
+  component: withAuth(ConsistencyComponent),
+});
 
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
-  component: SettingsComponent,
-})
+  component: withAuth(SettingsComponent),
+});
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
@@ -54,12 +70,12 @@ const routeTree = rootRoute.addChildren([
   calendarRoute,
   consistencyRoute,
   settingsRoute,
-])
+]);
 
-export const router = createRouter({ routeTree })
+export const router = createRouter({ routeTree });
 
 declare module '@tanstack/react-router' {
   interface Register {
-    router: typeof router
+    router: typeof router;
   }
 }

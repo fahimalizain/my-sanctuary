@@ -1,1 +1,1 @@
-export { StreamsPage } from './StreamsPage'
+export { StreamsPage } from './StreamsPage';

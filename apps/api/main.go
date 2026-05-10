@@ -6,13 +6,20 @@ import (
 
 	"github.com/danielgtaylor/huma/v2/humacli"
 	"github.com/go-chi/chi/v5"
+	"my-sanctuary/apps/api/config"
 	"my-sanctuary/apps/api/handlers"
 )
 
 func main() {
 	cli := humacli.New(func(hooks humacli.Hooks, options *struct{}) {
+		cfg, err := config.Load()
+		if err != nil {
+			fmt.Printf("failed to load config: %v\n", err)
+			return
+		}
+
 		router := chi.NewMux()
-		handlers.RegisterRoutes(router)
+		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg})
 
 		server := &http.Server{
 			Addr:    ":8080",

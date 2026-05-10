@@ -1,24 +1,31 @@
-import { useState } from 'react'
-import { Plus, MoreHorizontal, Clock, Calendar as CalendarIcon } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { TaskModal } from '@/app/components/TaskModal'
-import { streams, todayItems } from '@/app/mock-data'
-import type { Task, TimeBlock } from '@/app/types'
-import { cn } from '@/lib/utils'
+import { useState } from 'react';
+import {
+  Plus,
+  MoreHorizontal,
+  Clock,
+  Calendar as CalendarIcon,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { TaskModal } from '@/app/components/TaskModal';
+import { streams, todayItems } from '@/app/mock-data';
+import type { Task, TimeBlock } from '@/app/types';
+import { cn } from '@/lib/utils';
 
 // Filter for TimeBlocks only (standalone tasks don't belong to streams)
-const timeBlocks = todayItems.filter((item): item is TimeBlock => 'tasks' in item)
+const timeBlocks = todayItems.filter(
+  (item): item is TimeBlock => 'tasks' in item,
+);
 
 interface StreamCardProps {
-  stream: typeof streams[0]
-  tasks: Task[]
-  onAddTask: (streamId: string) => void
-  onEditTask: (task: Task) => void
+  stream: (typeof streams)[0];
+  tasks: Task[];
+  onAddTask: (streamId: string) => void;
+  onEditTask: (task: Task) => void;
 }
 
 function StreamCard({ stream, tasks, onAddTask, onEditTask }: StreamCardProps) {
   return (
-    <div 
+    <div
       className="rounded-xl overflow-hidden"
       style={{ backgroundColor: stream.color }}
     >
@@ -31,7 +38,7 @@ function StreamCard({ stream, tasks, onAddTask, onEditTask }: StreamCardProps) {
             <MoreHorizontal className="h-5 w-5 text-primary-foreground/70" />
           </button>
         </div>
-        
+
         <div className="text-sm text-primary-foreground/70 mb-3">
           {tasks.length} tasks
         </div>
@@ -45,7 +52,7 @@ function StreamCard({ stream, tasks, onAddTask, onEditTask }: StreamCardProps) {
           Add Task
         </button>
       </div>
-      
+
       <div className="bg-black/20 p-3 space-y-2">
         {tasks.slice(0, 4).map((task) => (
           <button
@@ -53,19 +60,25 @@ function StreamCard({ stream, tasks, onAddTask, onEditTask }: StreamCardProps) {
             onClick={() => onEditTask(task)}
             className="flex items-center gap-3 text-sm w-full text-left hover:bg-primary-foreground/5 rounded-lg p-1 -mx-1 transition-colors"
           >
-            <span className={cn(
-              'h-2 w-2 rounded-full flex-shrink-0',
-              task.priority === 'high' && 'bg-priority-high',
-              task.priority === 'medium' && 'bg-priority-medium',
-              task.priority === 'low' && 'bg-priority-low'
-            )} />
-            <span className={cn(
-              "text-primary-foreground/90 flex-1 truncate",
-              task.completed && "line-through text-primary-foreground/50"
-            )}>
+            <span
+              className={cn(
+                'h-2 w-2 rounded-full flex-shrink-0',
+                task.priority === 'high' && 'bg-priority-high',
+                task.priority === 'medium' && 'bg-priority-medium',
+                task.priority === 'low' && 'bg-priority-low',
+              )}
+            />
+            <span
+              className={cn(
+                'text-primary-foreground/90 flex-1 truncate',
+                task.completed && 'line-through text-primary-foreground/50',
+              )}
+            >
               {task.title}
             </span>
-            <span className="text-primary-foreground/60 text-xs">{task.duration}m</span>
+            <span className="text-primary-foreground/60 text-xs">
+              {task.duration}m
+            </span>
           </button>
         ))}
         {tasks.length > 4 && (
@@ -75,77 +88,79 @@ function StreamCard({ stream, tasks, onAddTask, onEditTask }: StreamCardProps) {
         )}
       </div>
     </div>
-  )
+  );
 }
 
 export function StreamsPage() {
-  const [modalOpen, setModalOpen] = useState(false)
-  const [selectedTask, setSelectedTask] = useState<Task | undefined>()
-  const [selectedStreamId, setSelectedStreamId] = useState<string | undefined>()
+  const [modalOpen, setModalOpen] = useState(false);
+  const [selectedTask, setSelectedTask] = useState<Task | undefined>();
+  const [selectedStreamId, setSelectedStreamId] = useState<
+    string | undefined
+  >();
 
   // Distribute tasks among streams for mock data
-  const allTasks = timeBlocks.flatMap(b => b.tasks)
+  const allTasks = timeBlocks.flatMap((b) => b.tasks);
   const [streamTasks, setStreamTasks] = useState<Record<string, Task[]>>({
     work: allTasks.slice(0, 6),
     gym: allTasks.slice(6, 8),
     family: allTasks.slice(8, 10),
     relax: allTasks.slice(10, 12),
-  })
+  });
 
   const handleAddTask = (streamId: string) => {
-    setSelectedTask(undefined)
-    setSelectedStreamId(streamId)
-    setModalOpen(true)
-  }
+    setSelectedTask(undefined);
+    setSelectedStreamId(streamId);
+    setModalOpen(true);
+  };
 
   const handleEditTask = (task: Task) => {
-    setSelectedTask(task)
-    setSelectedStreamId(undefined)
-    setModalOpen(true)
-  }
+    setSelectedTask(task);
+    setSelectedStreamId(undefined);
+    setModalOpen(true);
+  };
 
   const handleSaveTask = (task: Partial<Task>) => {
-    if (!task.id) return
+    if (!task.id) return;
 
-    setStreamTasks(prev => {
-      const newTasks = { ...prev }
-      
+    setStreamTasks((prev) => {
+      const newTasks = { ...prev };
+
       // If editing, remove from old location first
       if (selectedTask) {
-        Object.keys(newTasks).forEach(key => {
-          newTasks[key] = newTasks[key].filter(t => t.id !== task.id)
-        })
+        Object.keys(newTasks).forEach((key) => {
+          newTasks[key] = newTasks[key].filter((t) => t.id !== task.id);
+        });
       }
 
       // Add to selected stream or keep in original
-      const targetStream = selectedStreamId || 'work'
-      const taskData = task as Task
-      
+      const targetStream = selectedStreamId || 'work';
+      const taskData = task as Task;
+
       if (selectedTask) {
         // Update existing
-        newTasks[targetStream] = newTasks[targetStream].map(t => 
-          t.id === task.id ? taskData : t
-        )
+        newTasks[targetStream] = newTasks[targetStream].map((t) =>
+          t.id === task.id ? taskData : t,
+        );
       } else {
         // Add new
-        newTasks[targetStream] = [...(newTasks[targetStream] || []), taskData]
+        newTasks[targetStream] = [...(newTasks[targetStream] || []), taskData];
       }
 
-      return newTasks
-    })
-  }
+      return newTasks;
+    });
+  };
 
   const handleDeleteTask = (taskId: string) => {
-    setStreamTasks(prev => {
-      const newTasks = { ...prev }
-      Object.keys(newTasks).forEach(key => {
-        newTasks[key] = newTasks[key].filter(t => t.id !== taskId)
-      })
-      return newTasks
-    })
-  }
+    setStreamTasks((prev) => {
+      const newTasks = { ...prev };
+      Object.keys(newTasks).forEach((key) => {
+        newTasks[key] = newTasks[key].filter((t) => t.id !== taskId);
+      });
+      return newTasks;
+    });
+  };
 
-  const totalTasks = Object.values(streamTasks).flat().length
+  const totalTasks = Object.values(streamTasks).flat().length;
 
   return (
     <div className="min-h-screen bg-cream">
@@ -169,9 +184,9 @@ export function StreamsPage() {
         {/* Streams Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
           {streams.map((stream) => (
-            <StreamCard 
-              key={stream.id} 
-              stream={stream} 
+            <StreamCard
+              key={stream.id}
+              stream={stream}
               tasks={streamTasks[stream.id] || []}
               onAddTask={handleAddTask}
               onEditTask={handleEditTask}
@@ -189,9 +204,11 @@ export function StreamsPage() {
               <h3 className="font-heading font-semibold">Total Tasks</h3>
             </div>
             <p className="text-3xl font-bold text-foreground">{totalTasks}</p>
-            <p className="text-sm text-muted-foreground mt-1">Across all streams</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              Across all streams
+            </p>
           </div>
-          
+
           <div className="bg-card rounded-xl p-6 shadow-sm border border-border">
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-work-blue/10 rounded-lg">
@@ -199,10 +216,12 @@ export function StreamsPage() {
               </div>
               <h3 className="font-heading font-semibold">Scheduled Today</h3>
             </div>
-            <p className="text-3xl font-bold text-foreground">{timeBlocks.length}</p>
+            <p className="text-3xl font-bold text-foreground">
+              {timeBlocks.length}
+            </p>
             <p className="text-sm text-muted-foreground mt-1">Time blocks</p>
           </div>
-          
+
           <div className="bg-card rounded-xl p-6 shadow-sm border border-border">
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-gym-terracotta/10 rounded-lg">
@@ -225,5 +244,5 @@ export function StreamsPage() {
         onDelete={handleDeleteTask}
       />
     </div>
-  )
+  );
 }

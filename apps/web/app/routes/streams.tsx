@@ -1,1 +1,1 @@
-export { StreamsPage as StreamsComponent } from '@/app/modules/streams'
+export { StreamsPage as StreamsComponent } from '@/app/modules/streams';

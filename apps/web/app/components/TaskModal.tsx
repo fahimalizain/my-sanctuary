@@ -1,27 +1,37 @@
-import { useState } from 'react'
-import { Clock, Flag, Tag, CheckCircle2, Circle, AlertCircle } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { useState } from 'react';
+import {
+  Clock,
+  Flag,
+  Tag,
+  CheckCircle2,
+  Circle,
+  AlertCircle,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogDescription,
-} from '@/components/ui/dialog'
-import { cn } from '@/lib/utils'
-import type { Task } from '@/app/types'
+} from '@/components/ui/dialog';
+import { cn } from '@/lib/utils';
+import type { Task } from '@/app/types';
 
-type Priority = 'low' | 'medium' | 'high'
+type Priority = 'low' | 'medium' | 'high';
 
 interface TaskModalProps {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  task?: Task
-  onSave?: (task: Partial<Task>) => void
-  onDelete?: (taskId: string) => void
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  task?: Task;
+  onSave?: (task: Partial<Task>) => void;
+  onDelete?: (taskId: string) => void;
 }
 
-const priorityConfig: Record<Priority, { label: string; icon: React.ReactNode }> = {
+const priorityConfig: Record<
+  Priority,
+  { label: string; icon: React.ReactNode }
+> = {
   low: {
     label: 'Low',
     icon: <Circle className="h-4 w-4" />,
@@ -34,15 +44,23 @@ const priorityConfig: Record<Priority, { label: string; icon: React.ReactNode }>
     label: 'High',
     icon: <AlertCircle className="h-4 w-4" />,
   },
-}
+};
 
-export function TaskModal({ open, onOpenChange, task, onSave, onDelete }: TaskModalProps) {
-  const isEditing = !!task
-  const [title, setTitle] = useState(task?.title || '')
-  const [description, setDescription] = useState('')
-  const [priority, setPriority] = useState<Priority>(task?.priority || 'medium')
-  const [duration, setDuration] = useState(task?.duration?.toString() || '30')
-  const [completed, setCompleted] = useState(task?.completed || false)
+export function TaskModal({
+  open,
+  onOpenChange,
+  task,
+  onSave,
+  onDelete,
+}: TaskModalProps) {
+  const isEditing = !!task;
+  const [title, setTitle] = useState(task?.title || '');
+  const [description, setDescription] = useState('');
+  const [priority, setPriority] = useState<Priority>(
+    task?.priority || 'medium',
+  );
+  const [duration, setDuration] = useState(task?.duration?.toString() || '30');
+  const [completed, setCompleted] = useState(task?.completed || false);
 
   const handleSave = () => {
     onSave?.({
@@ -51,16 +69,16 @@ export function TaskModal({ open, onOpenChange, task, onSave, onDelete }: TaskMo
       priority,
       duration: parseInt(duration) || 30,
       completed,
-    })
-    onOpenChange(false)
-  }
+    });
+    onOpenChange(false);
+  };
 
   const handleDelete = () => {
     if (task?.id) {
-      onDelete?.(task.id)
-      onOpenChange(false)
+      onDelete?.(task.id);
+      onOpenChange(false);
     }
-  }
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -97,7 +115,10 @@ export function TaskModal({ open, onOpenChange, task, onSave, onDelete }: TaskMo
           {/* Description */}
           <div className="space-y-2 mb-5">
             <label className="text-sm font-medium text-foreground">
-              Description <span className="text-muted-foreground/60 font-normal">(optional)</span>
+              Description{' '}
+              <span className="text-muted-foreground/60 font-normal">
+                (optional)
+              </span>
             </label>
             <textarea
               value={description}
@@ -123,7 +144,7 @@ export function TaskModal({ open, onOpenChange, task, onSave, onDelete }: TaskMo
                     'flex items-center gap-2 px-4 py-2 rounded-xl border-2 text-sm font-medium transition-all',
                     priority === p
                       ? 'bg-primary/10 border-primary text-primary'
-                      : 'bg-background border-input text-muted-foreground hover:border-primary/30'
+                      : 'bg-background border-input text-muted-foreground hover:border-primary/30',
                   )}
                 >
                   {priorityConfig[p].icon}
@@ -158,14 +179,16 @@ export function TaskModal({ open, onOpenChange, task, onSave, onDelete }: TaskMo
 
             {/* Status Toggle */}
             <div className="space-y-2">
-              <label className="text-sm font-medium text-foreground">Status</label>
+              <label className="text-sm font-medium text-foreground">
+                Status
+              </label>
               <button
                 onClick={() => setCompleted(!completed)}
                 className={cn(
                   'w-full flex items-center gap-2 px-4 py-3 rounded-xl border-2 text-sm font-medium transition-all',
                   completed
                     ? 'bg-primary/10 border-primary text-primary'
-                    : 'bg-background border-input text-muted-foreground hover:border-primary/30'
+                    : 'bg-background border-input text-muted-foreground hover:border-primary/30',
                 )}
               >
                 {completed ? (
@@ -218,5 +241,5 @@ export function TaskModal({ open, onOpenChange, task, onSave, onDelete }: TaskMo
         </div>
       </DialogContent>
     </Dialog>
-  )
+  );
 }

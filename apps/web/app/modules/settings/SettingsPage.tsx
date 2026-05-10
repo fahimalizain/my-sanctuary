@@ -1,10 +1,22 @@
-import { User, Bell, Shield, HelpCircle, LogOut, ChevronRight, Moon, Sun, Monitor } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
+import {
+  User,
+  Bell,
+  Shield,
+  HelpCircle,
+  LogOut,
+  ChevronRight,
+  Moon,
+  Sun,
+  Monitor,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
+import { useAuth } from '@/lib/auth';
+import { useNavigate } from '@tanstack/react-router';
 
 interface SettingsSectionProps {
-  title: string
-  children: React.ReactNode
+  title: string;
+  children: React.ReactNode;
 }
 
 function SettingsSection({ title, children }: SettingsSectionProps) {
@@ -15,24 +27,30 @@ function SettingsSection({ title, children }: SettingsSectionProps) {
       </div>
       <div className="p-4">{children}</div>
     </div>
-  )
+  );
 }
 
 interface SettingsItemProps {
-  icon: React.ReactNode
-  label: string
-  value?: string
-  action?: React.ReactNode
-  onClick?: () => void
+  icon: React.ReactNode;
+  label: string;
+  value?: string;
+  action?: React.ReactNode;
+  onClick?: () => void;
 }
 
-function SettingsItem({ icon, label, value, action, onClick }: SettingsItemProps) {
+function SettingsItem({
+  icon,
+  label,
+  value,
+  action,
+  onClick,
+}: SettingsItemProps) {
   return (
     <button
       onClick={onClick}
       className={cn(
         'flex items-center gap-4 w-full p-3 rounded-lg transition-colors',
-        onClick && 'hover:bg-muted'
+        onClick && 'hover:bg-muted',
       )}
     >
       <div className="p-2 bg-muted rounded-lg text-muted-foreground">
@@ -42,12 +60,32 @@ function SettingsItem({ icon, label, value, action, onClick }: SettingsItemProps
         <p className="font-medium text-foreground">{label}</p>
         {value && <p className="text-sm text-muted-foreground">{value}</p>}
       </div>
-      {action || (onClick && <ChevronRight className="h-5 w-5 text-muted-foreground/60" />)}
+      {action ||
+        (onClick && (
+          <ChevronRight className="h-5 w-5 text-muted-foreground/60" />
+        ))}
     </button>
-  )
+  );
 }
 
 export function SettingsPage() {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = async () => {
+    await logout();
+    navigate({ to: '/login' });
+  };
+
+  const initials = user?.name
+    ? user.name
+        .split(' ')
+        .map((n) => n[0])
+        .join('')
+        .toUpperCase()
+        .slice(0, 2)
+    : 'G';
+
   return (
     <div className="min-h-screen bg-cream">
       <div className="max-w-3xl mx-auto px-6 py-8">
@@ -64,14 +102,24 @@ export function SettingsPage() {
         {/* Profile Card */}
         <div className="bg-card rounded-xl p-6 shadow-sm border border-border mb-6">
           <div className="flex items-center gap-4">
-            <div className="h-16 w-16 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xl font-bold">
-              JD
-            </div>
+            {user?.picture ? (
+              <img
+                src={user.picture}
+                alt={user.name}
+                className="h-16 w-16 rounded-full object-cover"
+              />
+            ) : (
+              <div className="h-16 w-16 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xl font-bold">
+                {initials}
+              </div>
+            )}
             <div className="flex-1">
               <h2 className="font-heading text-lg font-semibold text-foreground">
-                John Doe
+                {user?.name || 'Guest'}
               </h2>
-              <p className="text-sm text-muted-foreground">john.doe@example.com</p>
+              <p className="text-sm text-muted-foreground">
+                {user?.email || 'Not signed in'}
+              </p>
             </div>
             <Button variant="outline" size="sm">
               Edit Profile
@@ -122,9 +170,11 @@ export function SettingsPage() {
                 </button>
               </div>
             </div>
-            
+
             <div>
-              <p className="text-sm font-medium text-foreground mb-3">Accent Color</p>
+              <p className="text-sm font-medium text-foreground mb-3">
+                Accent Color
+              </p>
               <div className="flex gap-3">
                 <button className="h-10 w-10 rounded-full bg-sanctuary-green ring-2 ring-offset-2 ring-sanctuary-green" />
                 <button className="h-10 w-10 rounded-full bg-work-blue" />
@@ -139,10 +189,23 @@ export function SettingsPage() {
         <SettingsSection title="Integrations">
           <div className="space-y-1">
             <SettingsItem
-              icon={<svg className="h-5 w-5" viewBox="0 0 24 24"><path fill="currentColor" d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.4 16.2L16.2 18l-4.2-4.2-4.2 4.2-1.2-1.8 4.2-4.2-4.2-4.2 1.2-1.8 4.2 4.2 4.2-4.2 1.2 1.8-4.2 4.2 4.2 4.2z"/></svg>}
+              icon={
+                <svg className="h-5 w-5" viewBox="0 0 24 24">
+                  <path
+                    fill="currentColor"
+                    d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.4 16.2L16.2 18l-4.2-4.2-4.2 4.2-1.2-1.8 4.2-4.2-4.2-4.2 1.2-1.8 4.2 4.2 4.2-4.2 1.2 1.8-4.2 4.2 4.2 4.2z"
+                  />
+                </svg>
+              }
               label="Google Calendar"
-              value="Connected"
-              action={<span className="text-sm text-primary font-medium">Connected</span>}
+              value={user ? 'Connected' : 'Not connected'}
+              action={
+                user ? (
+                  <span className="text-sm text-primary font-medium">
+                    Connected
+                  </span>
+                ) : undefined
+              }
             />
           </div>
         </SettingsSection>
@@ -156,7 +219,18 @@ export function SettingsPage() {
               onClick={() => {}}
             />
             <SettingsItem
-              icon={<svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>}
+              icon={
+                <svg
+                  className="h-5 w-5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                >
+                  <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+                  <polyline points="22,6 12,13 2,6" />
+                </svg>
+              }
               label="Contact Support"
               onClick={() => {}}
             />
@@ -164,9 +238,10 @@ export function SettingsPage() {
         </SettingsSection>
 
         {/* Sign Out */}
-        <Button 
-          variant="outline" 
+        <Button
+          variant="outline"
           className="w-full text-destructive border-destructive/30 hover:bg-destructive/10"
+          onClick={handleLogout}
         >
           <LogOut className="h-4 w-4 mr-2" />
           Sign Out
@@ -177,5 +252,5 @@ export function SettingsPage() {
         </p>
       </div>
     </div>
-  )
+  );
 }

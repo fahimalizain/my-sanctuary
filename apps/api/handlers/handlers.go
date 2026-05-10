@@ -8,7 +8,14 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
+	"my-sanctuary/apps/api/config"
 )
+
+// Dependencies holds injected configuration for route registration.
+type Dependencies struct {
+	Config *config.Config
+}
 
 // GreetingInput represents the input for the greeting endpoint.
 type GreetingInput struct {
@@ -23,7 +30,19 @@ type GreetingOutput struct {
 }
 
 // RegisterRoutes registers all API routes on the provided chi router.
-func RegisterRoutes(router chi.Router) {
+func RegisterRoutes(router chi.Router, deps *Dependencies) {
+	authHandler := NewAuthHandler(deps.Config)
+
+	corsMiddleware := cors.New(cors.Options{
+		AllowedOrigins:   []string{deps.Config.FrontendURL},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	})
+	router.Use(corsMiddleware.Handler)
+
 	api := humachi.New(router, huma.DefaultConfig("Sanctuary API", "1.0.0"))
 
 	// Register greeting endpoint
@@ -57,4 +76,15 @@ func RegisterRoutes(router chi.Router) {
 			}{Status: "ok"},
 		}, nil
 	})
+
+	// Auth routes
+	router.Get("/auth/google", authHandler.Initiate)
+	router.Get("/auth/google/callback", authHandler.Callback)
+	router.Get("/auth/me", authHandler.Me)
+	router.Post("/auth/logout", authHandler.Logout)
+
+	// Calendar routes
+	calHandler := NewCalendarHandler(authHandler)
+	router.Get("/api/calendar/events", calHandler.ListEvents)
+	router.Post("/api/calendar/events", calHandler.CreateEvent)
 }

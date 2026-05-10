@@ -23,9 +23,7 @@
     "deploy": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": [
-          "wrangler deploy"
-        ],
+        "commands": ["wrangler deploy"],
         "cwd": "apps/cloudflare-deploy"
       }
     }
