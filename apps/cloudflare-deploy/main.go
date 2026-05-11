@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/syumai/workers"
 	"github.com/syumai/workers/cloudflare"
 	"github.com/syumai/workers/cloudflare/fetch"
@@ -28,6 +29,8 @@ func main() {
 	}
 
 	router := chi.NewMux()
+	router.Use(middleware.Recoverer)
+	router.Use(middleware.Logger)
 
 	// Register API routes from the shared handlers package
 	handlers.RegisterRoutes(router, &handlers.Dependencies{

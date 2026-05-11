@@ -6,6 +6,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2/humacli"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"my-sanctuary/apps/api/config"
 	"my-sanctuary/apps/api/handlers"
 )
@@ -21,6 +22,8 @@ func main() {
 		}
 
 		router := chi.NewMux()
+		router.Use(middleware.Recoverer)
+		router.Use(middleware.Logger)
 		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg, HTTPClient: http.DefaultClient, Version: version})
 
 		server := &http.Server{
