@@ -1,0 +1,45 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Web: Vite dev server",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "${workspaceFolder}/apps/web",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "serverReadyAction": {
+        "action": "startDebugging",
+        "name": "Web: Chrome",
+        "pattern": "Local:.*(https?://[a-zA-Z0-9.:]+)"
+      }
+    },
+    {
+      "type": "chrome",
+      "request": "launch",
+      "name": "Web: Chrome",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/apps/web",
+      "userDataDir": "${workspaceFolder}/.vscode/chrome-debug-profile",
+      "runtimeArgs": ["--test-type", "--disable-blink-features=AutomationControlled"]
+    },
+    {
+      "type": "go",
+      "request": "launch",
+      "name": "API: dev server",
+      "mode": "auto",
+      "program": "${workspaceFolder}/apps/api",
+      "cwd": "${workspaceFolder}/apps/api",
+      "envFile": "${workspaceFolder}/.env",
+      "args": []
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Web + API",
+      "configurations": ["Web: Vite dev server", "API: dev server"]
+    }
+  ]
+}
