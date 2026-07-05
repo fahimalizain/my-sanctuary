@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS google_calendars (
 	google_calendar_id TEXT NOT NULL,
 	summary TEXT,
 	time_zone TEXT,
-	primary INTEGER NOT NULL DEFAULT 0,
+	is_primary INTEGER NOT NULL DEFAULT 0,
 	access_role TEXT,
 	sync_enabled INTEGER NOT NULL DEFAULT 1,
 	sync_token TEXT,

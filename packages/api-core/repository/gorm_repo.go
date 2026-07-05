@@ -162,7 +162,7 @@ func (r *gormCalendarRepo) ListByUserID(ctx context.Context, userID string) ([]m
 	var cals []models.GoogleCalendar
 	err := r.db.WithContext(ctx).
 		Where("user_id = ? AND deleted_at IS NULL", userID).
-		Order("\"primary\" DESC, summary ASC").
+		Order("is_primary DESC, summary ASC").
 		Find(&cals).Error
 	return cals, err
 }
@@ -211,7 +211,7 @@ func (r *gormCalendarRepo) Upsert(ctx context.Context, cal *models.GoogleCalenda
 	return r.db.WithContext(ctx).Model(&models.GoogleCalendar{}).Where("id = ?", existing.ID).Updates(map[string]interface{}{
 		"summary":        cal.Summary,
 		"time_zone":       cal.TimeZone,
-		"primary":         cal.Primary,
+		"is_primary":      cal.Primary,
 		"access_role":     cal.AccessRole,
 		"sync_enabled":    cal.SyncEnabled,
 		"sync_token":      cal.SyncToken,

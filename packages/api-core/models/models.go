@@ -48,7 +48,7 @@ type GoogleCalendar struct {
 	GoogleCalID  string     `gorm:"column:google_calendar_id;uniqueIndex:idx_user_calid,priority:2;not null" json:"google_calendar_id"`
 	Summary      string     `json:"summary"`
 	TimeZone     string     `json:"time_zone"`
-	Primary      bool       `gorm:"default:false" json:"primary"`
+	Primary      bool       `gorm:"column:is_primary;default:false" json:"primary"`
 	AccessRole   string     `json:"access_role"`
 	SyncEnabled  bool       `gorm:"default:true" json:"sync_enabled"`
 	SyncToken    string     `gorm:"type:text" json:"sync_token"`

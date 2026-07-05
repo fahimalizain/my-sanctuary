@@ -165,7 +165,7 @@ func scanToken(row js.Value) models.GoogleOAuthToken {
 
 func scanCalendar(row js.Value) models.GoogleCalendar {
 	primary := false
-	if p := row.Get("primary"); !p.IsUndefined() && !p.IsNull() {
+	if p := row.Get("is_primary"); !p.IsUndefined() && !p.IsNull() {
 		primary = p.Bool()
 	}
 	syncEnabled := true
@@ -367,7 +367,7 @@ func NewD1CalendarRepo(getD1 D1BindingFunc) CalendarRepo { return &d1CalendarRep
 
 func (r *d1CalendarRepo) ListByUserID(ctx context.Context, userID string) ([]models.GoogleCalendar, error) {
 	res, err := d1Query(r.getD1,
-		"SELECT * FROM google_calendars WHERE user_id = ? AND deleted_at IS NULL ORDER BY \"primary\" DESC, summary ASC",
+		"SELECT * FROM google_calendars WHERE user_id = ? AND deleted_at IS NULL ORDER BY is_primary DESC, summary ASC",
 		userID)
 	if err != nil {
 		return nil, err
@@ -410,12 +410,12 @@ func (r *d1CalendarRepo) Upsert(ctx context.Context, cal *models.GoogleCalendar)
 		lastSynced = cal.LastSyncedAt.UTC().Format(time.RFC3339)
 	}
 	sql := `INSERT INTO google_calendars
-		(id, user_id, google_calendar_id, summary, time_zone, "primary", access_role, sync_enabled, sync_token, last_synced_at, created_at, updated_at)
+		(id, user_id, google_calendar_id, summary, time_zone, is_primary, access_role, sync_enabled, sync_token, last_synced_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET
 			summary = excluded.summary,
 			time_zone = excluded.time_zone,
-			"primary" = excluded."primary",
+			is_primary = excluded.is_primary,
 			access_role = excluded.access_role,
 			sync_enabled = excluded.sync_enabled,
 			sync_token = COALESCE(NULLIF(excluded.sync_token, ''), google_calendars.sync_token),
