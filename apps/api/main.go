@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"my-sanctuary/packages/api-core/config"
 	"my-sanctuary/packages/api-core/handlers"
+	"my-sanctuary/packages/api-core/repository"
 )
 
 var version = "dev"
@@ -21,10 +22,29 @@ func main() {
 			return
 		}
 
+		db, err := repository.NewGORMDB(cfg.DatabaseDSN)
+		if err != nil {
+			fmt.Printf("failed to open database: %v\n", err)
+			return
+		}
+		if err := repository.AutoMigrate(db); err != nil {
+			fmt.Printf("failed to migrate database: %v\n", err)
+			return
+		}
+		fmt.Println("DB migrated successfully")
+
 		router := chi.NewMux()
 		router.Use(middleware.Recoverer)
 		router.Use(middleware.Logger)
-		handlers.RegisterRoutes(router, &handlers.Dependencies{Config: cfg, HTTPClient: http.DefaultClient, Version: version})
+		handlers.RegisterRoutes(router, &handlers.Dependencies{
+			Config:            cfg,
+			HTTPClient:        http.DefaultClient,
+			Version:           version,
+			UserRepo:          repository.NewGORMUserRepo(db),
+			TokenRepo:         repository.NewGORMTokenRepo(db),
+			CalendarRepo:      repository.NewGORMCalendarRepo(db),
+			CalendarEventRepo: repository.NewGORMCalendarEventRepo(db),
+		})
 
 		server := &http.Server{
 			Addr:    ":8080",

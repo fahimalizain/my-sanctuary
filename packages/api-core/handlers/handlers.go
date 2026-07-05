@@ -10,13 +10,18 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 	"my-sanctuary/packages/api-core/config"
+	"my-sanctuary/packages/api-core/repository"
 )
 
 // Dependencies holds injected configuration for route registration.
 type Dependencies struct {
-	Config     *config.Config
-	HTTPClient *http.Client
-	Version    string
+	Config            *config.Config
+	HTTPClient        *http.Client
+	Version           string
+	UserRepo          repository.UserRepo
+	TokenRepo         repository.TokenRepo
+	CalendarRepo      repository.CalendarRepo
+	CalendarEventRepo repository.CalendarEventRepo
 }
 
 // GreetingInput represents the input for the greeting endpoint.
@@ -33,7 +38,7 @@ type GreetingOutput struct {
 
 // RegisterRoutes registers all API routes on the provided chi router.
 func RegisterRoutes(router chi.Router, deps *Dependencies) {
-	authHandler := NewAuthHandler(deps.Config, deps.HTTPClient)
+	authHandler := NewAuthHandler(deps.Config, deps.HTTPClient, deps.UserRepo, deps.TokenRepo)
 
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{deps.Config.FrontendURL},
@@ -92,7 +97,7 @@ func RegisterRoutes(router chi.Router, deps *Dependencies) {
 	router.Post("/auth/logout", authHandler.Logout)
 
 	// Calendar routes
-	calHandler := NewCalendarHandler(authHandler)
+	calHandler := NewCalendarHandler(deps.Config, deps.HTTPClient, authHandler, deps.CalendarRepo, deps.CalendarEventRepo, deps.TokenRepo)
 	router.Get("/api/calendar/events", calHandler.ListEvents)
 	router.Post("/api/calendar/events", calHandler.CreateEvent)
 }

@@ -13,6 +13,7 @@ type Config struct {
 	SessionSecret string
 	FrontendURL   string
 	SecureCookie  bool
+	DatabaseDSN   string
 }
 
 // OAuthConfig holds the parsed Google OAuth client credentials.
@@ -54,6 +55,11 @@ func LoadWithEnv(getenv func(string) string) (*Config, error) {
 	}
 
 	cfg.SecureCookie = getenv("SECURE_COOKIE") == "true"
+
+	cfg.DatabaseDSN = getenv("DATABASE_DSN")
+	if cfg.DatabaseDSN == "" {
+		cfg.DatabaseDSN = "sanctuary.db"
+	}
 
 	googleJSON := getenv("GOOGLE_CREDENTIALS_JSON")
 	if googleJSON == "" {

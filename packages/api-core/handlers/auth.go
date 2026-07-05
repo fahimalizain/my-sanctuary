@@ -7,11 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gorilla/sessions"
 	"golang.org/x/oauth2"
 	"my-sanctuary/packages/api-core/config"
+	"my-sanctuary/packages/api-core/models"
+	"my-sanctuary/packages/api-core/repository"
 )
 
 const (
@@ -25,6 +26,8 @@ type AuthHandler struct {
 	store       *sessions.CookieStore
 	frontendURL string
 	httpClient  *http.Client
+	userRepo    repository.UserRepo
+	tokenRepo   repository.TokenRepo
 }
 
 // GoogleUser represents the public profile returned by Google.
@@ -37,7 +40,9 @@ type GoogleUser struct {
 }
 
 // NewAuthHandler creates an AuthHandler from application config.
-func NewAuthHandler(cfg *config.Config, httpClient *http.Client) *AuthHandler {
+// userRepo and tokenRepo may be nil for routes that don't need persistence
+// (e.g. the existing test handlers), but Callback will fail if they are nil.
+func NewAuthHandler(cfg *config.Config, httpClient *http.Client, userRepo repository.UserRepo, tokenRepo repository.TokenRepo) *AuthHandler {
 	store := sessions.NewCookieStore([]byte(cfg.SessionSecret))
 	store.Options = &sessions.Options{
 		Path:     "/",
@@ -66,6 +71,8 @@ func NewAuthHandler(cfg *config.Config, httpClient *http.Client) *AuthHandler {
 		store:       store,
 		frontendURL: cfg.FrontendURL,
 		httpClient:  httpClient,
+		userRepo:    userRepo,
+		tokenRepo:   tokenRepo,
 	}
 }
 
@@ -148,14 +155,36 @@ func (h *AuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Persist user identity to the DB (upsert by google_id).
+	savedUser, err := h.userRepo.UpsertByGoogleID(r.Context(), &models.User{
+		GoogleID: user.ID,
+		Email:    user.Email,
+		Name:     user.Name,
+		Picture:  user.Picture,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to save user: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Persist Google tokens to the dedicated table.
+	if err := h.tokenRepo.Upsert(r.Context(), &models.GoogleOAuthToken{
+		UserID:       savedUser.ID,
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		Expiry:       token.Expiry,
+		TokenType:    token.TokenType,
+	}); err != nil {
+		http.Error(w, fmt.Sprintf("failed to save token: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Cookie carries only identity. Google tokens live in the DB now.
 	session, _ := h.store.Get(r, sessionName)
-	session.Values["user_id"] = user.ID
-	session.Values["email"] = user.Email
-	session.Values["name"] = user.Name
-	session.Values["picture"] = user.Picture
-	session.Values["access_token"] = token.AccessToken
-	session.Values["refresh_token"] = token.RefreshToken
-	session.Values["token_expiry"] = token.Expiry.Unix()
+	session.Values["user_id"] = savedUser.ID
+	session.Values["email"] = savedUser.Email
+	session.Values["name"] = savedUser.Name
+	session.Values["picture"] = savedUser.Picture
 
 	if err := session.Save(r, w); err != nil {
 		http.Error(w, fmt.Sprintf("failed to save session: %v", err), http.StatusInternalServerError)
@@ -196,18 +225,19 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// tokenFromSession reconstructs an oauth2.Token from the session store.
-func (h *AuthHandler) tokenFromSession(r *http.Request) (*oauth2.Token, bool) {
+// userIDFromSession returns the authenticated user's DB id from the session.
+// The session no longer carries Google tokens; those live in the DB and are
+// retrieved via TokenRefresher when needed.
+func (h *AuthHandler) userIDFromSession(r *http.Request) (string, bool) {
 	session, err := h.store.Get(r, sessionName)
 	if err != nil || session.Values["user_id"] == nil {
-		return nil, false
+		return "", false
 	}
-	token := &oauth2.Token{
-		AccessToken:  getString(session.Values, "access_token"),
-		RefreshToken: getString(session.Values, "refresh_token"),
-		Expiry:       time.Unix(getInt64(session.Values, "token_expiry"), 0),
+	id := getString(session.Values, "user_id")
+	if id == "" {
+		return "", false
 	}
-	return token, true
+	return id, true
 }
 
 func getString(m map[interface{}]interface{}, key string) string {
@@ -217,19 +247,4 @@ func getString(m map[interface{}]interface{}, key string) string {
 	}
 	s, _ := v.(string)
 	return s
-}
-
-func getInt64(m map[interface{}]interface{}, key string) int64 {
-	v, ok := m[key]
-	if !ok {
-		return 0
-	}
-	switch n := v.(type) {
-	case int64:
-		return n
-	case int:
-		return int64(n)
-	default:
-		return 0
-	}
 }
