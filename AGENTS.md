@@ -36,9 +36,13 @@ The web app is an installable PWA built with Vite + React 19 + TanStack Router +
 - **Build** — `npx nx run web:build` outputs to `dist/apps/web`.
 - **Dev** — `npx nx serve web` or `npm run dev` inside `apps/web`.
 
+## @packages/api-core
+
+Shared Go library containing the API's `config` and `handlers` packages. Consumed by both `apps/api` and `apps/cloudflare-deploy` (each via a `replace` directive in their `go.mod`).
+
 ## @apps/api
 
-The API is a Go HTTP server using chi router + huma for OpenAPI documentation.
+The API is a Go HTTP server using chi router + huma for OpenAPI documentation. It is a thin entrypoint — config and handlers live in `@packages/api-core`.
 
 - **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version. The Go binary reads this at build time via `-ldflags -X main.version=...` from `build.sh`.
 - **Build** — `npx nx run api:build` outputs to `dist/apps/api`.
@@ -47,9 +51,9 @@ The API is a Go HTTP server using chi router + huma for OpenAPI documentation.
 
 ## @apps/cloudflare-deploy
 
-The Cloudflare Workers deploy app bundles the web frontend and API into a single WASM Workers deployment.
+The Cloudflare Workers deploy app bundles the web frontend and API into a single WASM Workers deployment. It imports handlers/config from `@packages/api-core`, not from `apps/api`.
 
 - **Version** — same root `package.json` single source of truth. Injected via `-ldflags -X main.version=...` from `build.sh`.
 - **Build** — `npx nx run cloudflare-deploy:build` bundles web dist + Go WASM binary.
 - **Deploy** — `npx nx run cloudflare-deploy:deploy` pushes to Cloudflare via wrangler.
-- **Implied deps** — `api` and `web` must be built first.
+- **Implied deps** — `api-core` and `web` must be built first.

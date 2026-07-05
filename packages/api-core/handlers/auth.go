@@ -11,7 +11,7 @@ import (
 
 	"github.com/gorilla/sessions"
 	"golang.org/x/oauth2"
-	"my-sanctuary/apps/api/config"
+	"my-sanctuary/packages/api-core/config"
 )
 
 const (

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"my-sanctuary/apps/api/config"
+	"my-sanctuary/packages/api-core/config"
 )
 
 func TestAuthHandler_Initiate_Redirects(t *testing.T) {

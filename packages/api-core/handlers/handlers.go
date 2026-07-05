@@ -9,7 +9,7 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
-	"my-sanctuary/apps/api/config"
+	"my-sanctuary/packages/api-core/config"
 )
 
 // Dependencies holds injected configuration for route registration.

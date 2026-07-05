@@ -7,8 +7,8 @@ import (
 	"github.com/danielgtaylor/huma/v2/humacli"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"my-sanctuary/apps/api/config"
-	"my-sanctuary/apps/api/handlers"
+	"my-sanctuary/packages/api-core/config"
+	"my-sanctuary/packages/api-core/handlers"
 )
 
 var version = "dev"

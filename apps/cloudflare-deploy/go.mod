@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/syumai/workers v0.33.0
-	my-sanctuary/apps/api v0.0.0
+	my-sanctuary/packages/api-core v0.0.0
 )
 
 require (
@@ -16,4 +16,4 @@ require (
 	golang.org/x/oauth2 v0.36.0 // indirect
 )
 
-replace my-sanctuary/apps/api => ../api
+replace my-sanctuary/packages/api-core => ../../packages/api-core

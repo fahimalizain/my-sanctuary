@@ -12,8 +12,8 @@ import (
 	"github.com/syumai/workers"
 	"github.com/syumai/workers/cloudflare"
 	"github.com/syumai/workers/cloudflare/fetch"
-	"my-sanctuary/apps/api/config"
-	"my-sanctuary/apps/api/handlers"
+	"my-sanctuary/packages/api-core/config"
+	"my-sanctuary/packages/api-core/handlers"
 )
 
 //go:embed dist/*

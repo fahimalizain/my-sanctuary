@@ -4,7 +4,7 @@
   "projectType": "application",
   "sourceRoot": "apps/cloudflare-deploy",
   "tags": [],
-  "implicitDependencies": ["api", "web"],
+  "implicitDependencies": ["api-core", "web"],
   "targets": {
     "build": {
       "dependsOn": ["^build"],
