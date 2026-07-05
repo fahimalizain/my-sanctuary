@@ -66,11 +66,12 @@ type googleCalendarListResponse struct {
 
 // googleEvent models the subset of a Google Calendar event we persist.
 type googleEvent struct {
-	ID          string `json:"id"`
-	Etag        string `json:"etag"`
-	Updated     string `json:"updated"`
-	Summary     string `json:"summary"`
-	Description string `json:"description"`
+	ID          string   `json:"id"`
+	Etag        string   `json:"etag"`
+	Updated     string   `json:"updated"`
+	Summary     string   `json:"summary"`
+	Description string   `json:"description"`
+	Recurrence  []string `json:"recurrence"`
 	Start       struct {
 		DateTime string `json:"dateTime"`
 	} `json:"start"`
@@ -235,14 +236,7 @@ func (h *CalendarHandler) fetchGoogleEvents(ctx context.Context, tok *oauth2.Tok
 	pageToken := ""
 
 	for {
-		url := fmt.Sprintf("https://www.googleapis.com/calendar/v3/calendars/%s/events?singleEvents=true&maxResults=250", googleCalID)
-		if syncToken == "" {
-			// Full sync: limit to past 1 month + next 2 years to avoid
-			// syncing years of daily recurring events.
-			timeMin := time.Now().AddDate(0, -1, 0).UTC().Format(time.RFC3339)
-			timeMax := time.Now().AddDate(2, 0, 0).UTC().Format(time.RFC3339)
-			url += "&timeMin=" + timeMin + "&timeMax=" + timeMax
-		}
+		url := fmt.Sprintf("https://www.googleapis.com/calendar/v3/calendars/%s/events?singleEvents=false&maxResults=250", googleCalID)
 		if syncToken != "" {
 			url += "&syncToken=" + syncToken
 		}
@@ -379,7 +373,16 @@ func mapGoogleEventToModel(g googleEvent, calendarID string) models.CalendarEven
 		Description:     g.Description,
 		StartTime:       start,
 		EndTime:         end,
+		Recurrence:      serializeRecurrence(g.Recurrence),
 	}
+}
+
+func serializeRecurrence(rules []string) string {
+	if len(rules) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(rules)
+	return string(b)
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

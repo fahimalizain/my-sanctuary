@@ -287,6 +287,7 @@ func (r *gormCalendarEventRepo) Upsert(ctx context.Context, event *models.Calend
 		"description":       event.Description,
 		"start_time":        event.StartTime,
 		"end_time":          event.EndTime,
+		"recurrence":        event.Recurrence,
 		"updated_at":        event.UpdatedAt,
 	}).Error
 }

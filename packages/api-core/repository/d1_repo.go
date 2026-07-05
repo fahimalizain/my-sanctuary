@@ -202,6 +202,7 @@ func scanCalendarEvent(row js.Value) models.CalendarEvent {
 		Description:     jsString(row.Get("description")),
 		StartTime:       jsTimeOrZero(row.Get("start_time")),
 		EndTime:         jsTimeOrZero(row.Get("end_time")),
+		Recurrence:      jsString(row.Get("recurrence")),
 		CreatedAt:       jsTimeOrZero(row.Get("created_at")),
 		UpdatedAt:       jsTimeOrZero(row.Get("updated_at")),
 		DeletedAt:       jsTimePtr(row.Get("deleted_at")),
@@ -468,8 +469,8 @@ func NewD1CalendarEventRepo(getD1 D1BindingFunc) CalendarEventRepo {
 func (r *d1CalendarEventRepo) Upsert(ctx context.Context, event *models.CalendarEvent) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	sql := `INSERT INTO calendar_events
-		(id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(calendar_id, google_event_id) DO UPDATE SET
 			google_etag = excluded.google_etag,
 			google_updated_at = excluded.google_updated_at,
@@ -478,6 +479,7 @@ func (r *d1CalendarEventRepo) Upsert(ctx context.Context, event *models.Calendar
 			description = excluded.description,
 			start_time = excluded.start_time,
 			end_time = excluded.end_time,
+			recurrence = excluded.recurrence,
 			updated_at = excluded.updated_at`
 	return d1Exec(r.getD1, sql,
 		uuid.NewString(), event.CalendarID, event.GoogleEventID, event.GoogleETag,
@@ -486,6 +488,7 @@ func (r *d1CalendarEventRepo) Upsert(ctx context.Context, event *models.Calendar
 		event.Title, event.Description,
 		event.StartTime.UTC().Format(time.RFC3339),
 		event.EndTime.UTC().Format(time.RFC3339),
+		event.Recurrence,
 		now, now,
 	)
 }

@@ -70,6 +70,7 @@ type CalendarEvent struct {
 	Description     string     `gorm:"type:text" json:"description"`
 	StartTime       time.Time  `gorm:"not null" json:"start_time"`
 	EndTime         time.Time  `gorm:"not null" json:"end_time"`
+	Recurrence      string     `gorm:"type:text" json:"recurrence"` // JSON array of RRULE strings, empty if non-recurring
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	DeletedAt       *time.Time `gorm:"index" json:"-"`

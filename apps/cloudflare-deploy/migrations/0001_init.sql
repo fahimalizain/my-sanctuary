@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS calendar_events (
 	description TEXT,
 	start_time TEXT NOT NULL,
 	end_time TEXT NOT NULL,
+	recurrence TEXT,
 	created_at TEXT NOT NULL DEFAULT (datetime('now')),
 	updated_at TEXT NOT NULL DEFAULT (datetime('now')),
 	deleted_at TEXT,
