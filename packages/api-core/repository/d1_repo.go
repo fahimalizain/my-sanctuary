@@ -21,13 +21,41 @@ type D1BindingFunc func() js.Value
 // JS bridge helpers
 // ──────────────────────────────────────────
 
+// awaitPromise resolves a JS Promise synchronously via then/catch channels.
+// D1's prepare().bind().all() and prepare().bind().run() return Promises.
+func awaitPromise(promiseVal js.Value) (js.Value, error) {
+	resultCh := make(chan js.Value)
+	errCh := make(chan error)
+	var then, catch js.Func
+	then = js.FuncOf(func(_ js.Value, args []js.Value) any {
+		defer then.Release()
+		resultCh <- args[0]
+		return js.Undefined()
+	})
+	catch = js.FuncOf(func(_ js.Value, args []js.Value) any {
+		defer catch.Release()
+		errCh <- fmt.Errorf("d1: promise rejected: %s", args[0].Call("toString").String())
+		return js.Undefined()
+	})
+	promiseVal.Call("then", then).Call("catch", catch)
+	select {
+	case result := <-resultCh:
+		return result, nil
+	case err := <-errCh:
+		return js.Value{}, err
+	}
+}
+
 func d1Query(getD1 D1BindingFunc, sql string, args ...interface{}) (js.Value, error) {
 	d1 := getD1()
 	if d1.IsUndefined() || d1.IsNull() {
 		return js.Value{}, fmt.Errorf("d1: binding not initialized")
 	}
-	stmt := d1.Call("prepare", sql)
-	result := stmt.Call("bind", args...).Call("all")
+	promise := d1.Call("prepare", sql).Call("bind", args...).Call("all")
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return js.Value{}, err
+	}
 	if !result.Get("success").Bool() {
 		msg := "d1: query failed"
 		if e := result.Get("error"); !e.IsUndefined() && !e.IsNull() {
@@ -43,7 +71,11 @@ func d1Exec(getD1 D1BindingFunc, sql string, args ...interface{}) error {
 	if d1.IsUndefined() || d1.IsNull() {
 		return fmt.Errorf("d1: binding not initialized")
 	}
-	result := d1.Call("prepare", sql).Call("bind", args...).Call("run")
+	promise := d1.Call("prepare", sql).Call("bind", args...).Call("run")
+	result, err := awaitPromise(promise)
+	if err != nil {
+		return err
+	}
 	if !result.Get("success").Bool() {
 		msg := "d1: exec failed"
 		if e := result.Get("error"); !e.IsUndefined() && !e.IsNull() {
