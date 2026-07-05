@@ -236,6 +236,13 @@ func (h *CalendarHandler) fetchGoogleEvents(ctx context.Context, tok *oauth2.Tok
 
 	for {
 		url := fmt.Sprintf("https://www.googleapis.com/calendar/v3/calendars/%s/events?singleEvents=true&maxResults=250", googleCalID)
+		if syncToken == "" {
+			// Full sync: limit to past 1 month + next 2 years to avoid
+			// syncing years of daily recurring events.
+			timeMin := time.Now().AddDate(0, -1, 0).UTC().Format(time.RFC3339)
+			timeMax := time.Now().AddDate(2, 0, 0).UTC().Format(time.RFC3339)
+			url += "&timeMin=" + timeMin + "&timeMax=" + timeMax
+		}
 		if syncToken != "" {
 			url += "&syncToken=" + syncToken
 		}
