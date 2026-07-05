@@ -9,10 +9,10 @@ Workers WASM + D1).
 The architecture uses **repository interfaces** defined in the shared package,
 with two implementations selected at link time via Go build tags:
 
-| Target | GOOS/GOARCH | Impl file | Driver |
-|---|---|---|---|
-| `apps/api` (local) | `darwin`/`linux` | `gorm_repo.go` | `glebarez/sqlite` (pure Go) |
-| `apps/cloudflare-deploy` (WASM) | `js`/`wasm` | `d1_repo.go` | Cloudflare D1 via `syscall/js` |
+| Target                          | GOOS/GOARCH      | Impl file      | Driver                         |
+| ------------------------------- | ---------------- | -------------- | ------------------------------ |
+| `apps/api` (local)              | `darwin`/`linux` | `gorm_repo.go` | `glebarez/sqlite` (pure Go)    |
+| `apps/cloudflare-deploy` (WASM) | `js`/`wasm`      | `d1_repo.go`   | Cloudflare D1 via `syscall/js` |
 
 Because the two targets have different `GOOS`, **build tags are mandatory** and
 the GORM/D1 files are mutually exclusive at compile time. This keeps the WASM
@@ -78,6 +78,7 @@ The WASM build uses `GOOS=js GOARCH=wasm`. Under `GOOS=js`:
   `GOOS=js` (it uses `os`/`syscall` heavily).
 
 Therefore:
+
 - `gorm_repo.go` and its test get `//go:build !js`.
 - `d1_repo.go` gets `//go:build js`.
 - `repository.go` interfaces file has **no build tag** (compiles in both).

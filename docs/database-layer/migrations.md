@@ -138,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_events_deleted ON calendar_events(deleted_at);
 The two backends diverge in how they handle subsequent migrations.
 
 **Local dev (GORM AutoMigrate)** is additive-only and automatic. It runs on
-every `apps/api` startup, so local dev never falls behind on *additive* schema
+every `apps/api` startup, so local dev never falls behind on _additive_ schema
 changes. For destructive changes, drop the local SQLite file.
 
 **D1 (`wrangler d1 migrations`)** is explicit and ordered. Destructive changes
@@ -152,8 +152,8 @@ change.
    `apps/cloudflare-deploy/migrations/NNNN_*.sql` file in the same commit.
 2. AutoMigrate is a dev convenience, not a migration tool. Never rely on it
    for the D1/production schema.
-3. The `0001_init.sql` file is the source of truth for the *initial* D1 schema;
-   the Go struct tags are the source of truth for the *current* GORM schema.
+3. The `0001_init.sql` file is the source of truth for the _initial_ D1 schema;
+   the Go struct tags are the source of truth for the _current_ GORM schema.
    When they diverge after a change, the new `NNNN_*.sql` migration is what
    brings D1 back in line.
 4. Future CI step: run `gorm.AutoMigrate` against a scratch SQLite DB and diff

@@ -1,5 +1,5 @@
-import "./wasm_exec.js";
-import { createRuntimeContext, loadModule } from "./runtime.mjs";
+import './wasm_exec.js';
+import { createRuntimeContext, loadModule } from './runtime.mjs';
 
 let mod;
 

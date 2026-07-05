@@ -158,6 +158,7 @@ func d1Exec(getD1 D1BindingFunc, sql string, args ...interface{}) error
 Source: [`gorm_repo_test.go`](../../packages/api-core/repository/gorm_repo_test.go) (`//go:build !js`)
 
 Tests cover:
+
 - `TestUserRepo_UpsertByGoogleID` — insert then update by `google_id`
 - `TestTokenRepo_SeparateFromUser` — token table is separate, not auto-loaded
 - `TestTokenRepo_UpsertPreservesRefreshToken` — empty `refresh_token` preserves

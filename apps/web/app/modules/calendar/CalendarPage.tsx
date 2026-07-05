@@ -213,7 +213,11 @@ export function CalendarPage() {
 
   // Build the 6-row (42-cell) month grid starting on Monday.
   const gridCells = useMemo(() => {
-    const firstOfMonth = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1);
+    const firstOfMonth = new Date(
+      viewDate.getFullYear(),
+      viewDate.getMonth(),
+      1,
+    );
     const jsDay = firstOfMonth.getDay();
     const offset = jsDay === 0 ? 6 : jsDay - 1; // days to show from prev month
     const start = new Date(firstOfMonth);
@@ -234,7 +238,9 @@ export function CalendarPage() {
   });
 
   const shiftMonth = (delta: number) => {
-    setViewDate((prev) => new Date(prev.getFullYear(), prev.getMonth() + delta, 1));
+    setViewDate(
+      (prev) => new Date(prev.getFullYear(), prev.getMonth() + delta, 1),
+    );
   };
 
   const goToToday = () => {
@@ -349,10 +355,7 @@ export function CalendarPage() {
                       {dayEvents.length > 0 && (
                         <div className="mt-2 space-y-1">
                           {visible.map((event) => (
-                            <MonthGridEvent
-                              key={event.id}
-                              event={event}
-                            />
+                            <MonthGridEvent key={event.id} event={event} />
                           ))}
                           {overflow > 0 && (
                             <p className="text-xs text-muted-foreground pl-1">
