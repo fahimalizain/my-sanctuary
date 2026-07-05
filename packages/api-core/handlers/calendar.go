@@ -154,9 +154,20 @@ func (h *CalendarHandler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"events": events, "source": "cache"})
 }
 
+// oauth2Context injects the Workers-compatible HTTP client into the context
+// so oauth2's transport uses fetch with correct `this` binding. Without this,
+// Google API calls panic with "Illegal invocation" on Cloudflare Workers.
+// See docs/CF_WORKERS_OAUTH2_ILLEGAL_INVOCATION.md for details.
+func (h *CalendarHandler) oauth2Context(ctx context.Context) context.Context {
+	if h.httpClient != nil {
+		return context.WithValue(ctx, oauth2.HTTPClient, h.httpClient)
+	}
+	return ctx
+}
+
 // refreshCalendarList fetches /users/me/calendarList and upserts each row.
 func (h *CalendarHandler) refreshCalendarList(ctx context.Context, userID string, tok *oauth2.Token) ([]models.GoogleCalendar, error) {
-	client := h.oauthConfig.Client(ctx, tok)
+	client := h.oauthConfig.Client(h.oauth2Context(ctx), tok)
 	resp, err := client.Get("https://www.googleapis.com/calendar/v3/users/me/calendarList")
 	if err != nil {
 		return nil, fmt.Errorf("calendarList fetch: %w", err)
@@ -217,7 +228,7 @@ func (h *CalendarHandler) syncCalendar(ctx context.Context, cal *models.GoogleCa
 // fetchGoogleEvents calls events.list, optionally with a syncToken for
 // incremental sync. It follows nextPageToken for full syncs.
 func (h *CalendarHandler) fetchGoogleEvents(ctx context.Context, tok *oauth2.Token, googleCalID, syncToken string) (*googleEventsResponse, error) {
-	client := h.oauthConfig.Client(ctx, tok)
+	client := h.oauthConfig.Client(h.oauth2Context(ctx), tok)
 
 	var allItems []googleEvent
 	var nextSyncToken string
@@ -326,7 +337,7 @@ func (h *CalendarHandler) postGoogleEvent(ctx context.Context, tok *oauth2.Token
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := h.oauthConfig.Client(ctx, tok)
+	client := h.oauthConfig.Client(h.oauth2Context(ctx), tok)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
