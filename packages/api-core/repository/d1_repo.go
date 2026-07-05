@@ -164,13 +164,14 @@ func scanToken(row js.Value) models.GoogleOAuthToken {
 }
 
 func scanCalendar(row js.Value) models.GoogleCalendar {
+	// D1 returns booleans as INTEGER 0/1, not JS boolean.
 	primary := false
 	if p := row.Get("is_primary"); !p.IsUndefined() && !p.IsNull() {
-		primary = p.Bool()
+		primary = p.Int() != 0
 	}
 	syncEnabled := true
 	if s := row.Get("sync_enabled"); !s.IsUndefined() && !s.IsNull() {
-		syncEnabled = s.Bool()
+		syncEnabled = s.Int() != 0
 	}
 	return models.GoogleCalendar{
 		ID:           jsString(row.Get("id")),
