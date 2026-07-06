@@ -61,11 +61,7 @@ function startOfWeek(date: Date): Date {
 
 /** Local midnight for the first cell of the 6×7 month grid (Mon-aligned). */
 function monthGridStart(viewDate: Date): Date {
-  const firstOfMonth = new Date(
-    viewDate.getFullYear(),
-    viewDate.getMonth(),
-    1,
-  );
+  const firstOfMonth = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1);
   const jsDay = firstOfMonth.getDay();
   const offset = jsDay === 0 ? 6 : jsDay - 1;
   const start = new Date(firstOfMonth);
@@ -82,7 +78,10 @@ function monthGridStart(viewDate: Date): Date {
  * Bounds are built from local civil midnights, then serialized as absolute
  * UTC instants via toISOString() for the API.
  */
-function queryRangeForView(viewDate: Date): { timeMin: string; timeMax: string } {
+function queryRangeForView(viewDate: Date): {
+  timeMin: string;
+  timeMax: string;
+} {
   const gridStart = monthGridStart(viewDate);
   const gridEnd = new Date(gridStart);
   gridEnd.setDate(gridEnd.getDate() + 42);
