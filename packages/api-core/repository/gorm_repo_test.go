@@ -185,6 +185,65 @@ func TestCalendarRepo_UpsertAndSync(t *testing.T) {
 	}
 }
 
+func TestCalendarEventRepo_ListByUserIDAndTimeRange_Overlap(t *testing.T) {
+	db := newTestDB(t)
+	cals := NewGORMCalendarRepo(db)
+	events := NewGORMCalendarEventRepo(db)
+	ctx := context.Background()
+	userID := uuid.NewString()
+
+	cal := &models.GoogleCalendar{
+		UserID: userID, GoogleCalID: "work@x.com", Summary: "Work",
+		Primary: true, AccessRole: "owner", SyncEnabled: true,
+	}
+	if err := cals.Upsert(ctx, cal); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fixed window: [day 2 00:00, day 4 00:00) in UTC.
+	day1 := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	day2 := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	day3 := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	day5 := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	windowStart := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
+	windowEnd := time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC)
+
+	evs := []models.CalendarEvent{
+		// Fully before window — excluded
+		{CalendarID: cal.ID, GoogleEventID: "before", Title: "Before", StartTime: day1, EndTime: day1.Add(time.Hour), LastSyncedAt: day1},
+		// Fully inside — included
+		{CalendarID: cal.ID, GoogleEventID: "inside", Title: "Inside", StartTime: day2, EndTime: day2.Add(time.Hour), LastSyncedAt: day2},
+		// Spans into window from before — included (overlap)
+		{CalendarID: cal.ID, GoogleEventID: "span-in", Title: "SpanIn", StartTime: day1, EndTime: day3, LastSyncedAt: day1},
+		// Spans out of window — included (overlap)
+		{CalendarID: cal.ID, GoogleEventID: "span-out", Title: "SpanOut", StartTime: day3, EndTime: day5, LastSyncedAt: day3},
+		// Fully after window — excluded
+		{CalendarID: cal.ID, GoogleEventID: "after", Title: "After", StartTime: day5, EndTime: day5.Add(time.Hour), LastSyncedAt: day5},
+	}
+	if err := events.UpsertBatch(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := events.ListByUserIDAndTimeRange(ctx, userID, TimeRange{Start: windowStart, End: windowEnd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, e := range got {
+		ids[e.GoogleEventID] = true
+	}
+	for _, want := range []string{"inside", "span-in", "span-out"} {
+		if !ids[want] {
+			t.Errorf("expected %q in results, got %+v", want, ids)
+		}
+	}
+	for _, ban := range []string{"before", "after"} {
+		if ids[ban] {
+			t.Errorf("did not expect %q in results, got %+v", ban, ids)
+		}
+	}
+}
+
 func TestCalendarRepo_UpsertPreservesSyncToken(t *testing.T) {
 	db := newTestDB(t)
 	cals := NewGORMCalendarRepo(db)

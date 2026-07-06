@@ -59,43 +59,126 @@ function startOfWeek(date: Date): Date {
   return d;
 }
 
+/** Local midnight for the first cell of the 6×7 month grid (Mon-aligned). */
+function monthGridStart(viewDate: Date): Date {
+  const firstOfMonth = new Date(
+    viewDate.getFullYear(),
+    viewDate.getMonth(),
+    1,
+  );
+  const jsDay = firstOfMonth.getDay();
+  const offset = jsDay === 0 ? 6 : jsDay - 1;
+  const start = new Date(firstOfMonth);
+  start.setDate(start.getDate() - offset);
+  start.setHours(0, 0, 0, 0);
+  return start;
+}
+
+/**
+ * Query window for the current view: union of the visible month grid and the
+ * current local week (so "Today" / "This Week" panels stay populated when the
+ * user navigates away from the current month).
+ *
+ * Bounds are built from local civil midnights, then serialized as absolute
+ * UTC instants via toISOString() for the API.
+ */
+function queryRangeForView(viewDate: Date): { timeMin: string; timeMax: string } {
+  const gridStart = monthGridStart(viewDate);
+  const gridEnd = new Date(gridStart);
+  gridEnd.setDate(gridEnd.getDate() + 42);
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const weekStart = startOfWeek(today);
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+
+  const start = gridStart < weekStart ? gridStart : weekStart;
+  const end = gridEnd > weekEnd ? gridEnd : weekEnd;
+
+  return { timeMin: start.toISOString(), timeMax: end.toISOString() };
+}
+
 interface FetchState {
   events: CalendarEvent[];
   isLoading: boolean;
+  isRefreshing: boolean;
   error: string | null;
 }
 
-function useCalendarEvents() {
+function useCalendarEvents(viewDate: Date) {
   const [state, setState] = useState<FetchState>({
     events: [],
     isLoading: true,
+    isRefreshing: false,
     error: null,
   });
 
-  const load = useCallback(() => {
-    setState((prev) => ({ ...prev, isLoading: true, error: null }));
-    fetch(`${API_BASE_URL}/api/calendar/events`, {
-      credentials: 'include',
-    })
-      .then(async (res) => {
-        if (!res.ok) {
-          throw new Error(`Request failed with status ${res.status}`);
-        }
-        const data = (await res.json()) as CalendarEventsResponse;
-        setState({ events: data.events ?? [], isLoading: false, error: null });
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load events';
-        setState({ events: [], isLoading: false, error: message });
+  const viewYear = viewDate.getFullYear();
+  const viewMonth = viewDate.getMonth();
+  const range = useMemo(
+    () => queryRangeForView(new Date(viewYear, viewMonth, 1)),
+    [viewYear, viewMonth],
+  );
+
+  const load = useCallback(
+    (signal?: AbortSignal) => {
+      setState((prev) => ({
+        ...prev,
+        // Full-page loader only on the first load (or after a hard error cleared events).
+        isLoading: prev.events.length === 0,
+        isRefreshing: prev.events.length > 0,
+        error: null,
+      }));
+
+      const params = new URLSearchParams({
+        time_min: range.timeMin,
+        time_max: range.timeMax,
       });
-  }, []);
+
+      fetch(`${API_BASE_URL}/api/calendar/events?${params}`, {
+        credentials: 'include',
+        signal,
+      })
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`Request failed with status ${res.status}`);
+          }
+          const data = (await res.json()) as CalendarEventsResponse;
+          setState({
+            events: data.events ?? [],
+            isLoading: false,
+            isRefreshing: false,
+            error: null,
+          });
+        })
+        .catch((err: unknown) => {
+          if (err instanceof DOMException && err.name === 'AbortError') {
+            return;
+          }
+          const message =
+            err instanceof Error ? err.message : 'Failed to load events';
+          setState((prev) => ({
+            // Keep previous events on refresh failure so the grid doesn't blank out.
+            events: prev.events,
+            isLoading: false,
+            isRefreshing: false,
+            error: message,
+          }));
+        });
+    },
+    [range.timeMin, range.timeMax],
+  );
 
   useEffect(() => {
-    load();
+    const ac = new AbortController();
+    load(ac.signal);
+    return () => ac.abort();
   }, [load]);
 
-  return { ...state, retry: load };
+  const retry = useCallback(() => load(), [load]);
+
+  return { ...state, retry };
 }
 
 interface MonthGridEventProps {
@@ -140,20 +223,22 @@ function TodaysEvent({ event }: TodaysEventProps) {
 }
 
 export function CalendarPage() {
-  const { events, isLoading, error, retry } = useCalendarEvents();
-
   // Current view month/year. Starts at today; the prev/next buttons shift it.
   const [viewDate, setViewDate] = useState(() => {
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), 1);
   });
 
+  const { events, isLoading, isRefreshing, error, retry } =
+    useCalendarEvents(viewDate);
+
   const today = useMemo(() => {
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   }, []);
 
-  // Index events by yyyy-mm-dd for O(1) lookups in the grid.
+  // Index events by local calendar day for O(1) lookups in the grid.
+  // toDateString() uses the browser timezone (not UTC date of the instant).
   const eventsByDay = useMemo(() => {
     const map = new Map<string, CalendarEvent[]>();
     for (const event of events) {
@@ -211,17 +296,9 @@ export function CalendarPage() {
     return groups;
   }, [weekEvents]);
 
-  // Build the 6-row (42-cell) month grid starting on Monday.
+  // Build the 6-row (42-cell) month grid starting on Monday (local civil days).
   const gridCells = useMemo(() => {
-    const firstOfMonth = new Date(
-      viewDate.getFullYear(),
-      viewDate.getMonth(),
-      1,
-    );
-    const jsDay = firstOfMonth.getDay();
-    const offset = jsDay === 0 ? 6 : jsDay - 1; // days to show from prev month
-    const start = new Date(firstOfMonth);
-    start.setDate(start.getDate() - offset);
+    const start = monthGridStart(viewDate);
 
     const cells: { date: Date; inMonth: boolean }[] = [];
     for (let i = 0; i < 42; i++) {
@@ -260,6 +337,12 @@ export function CalendarPage() {
             <p className="text-muted-foreground">{monthLabel}</p>
           </div>
           <div className="flex items-center gap-2">
+            {isRefreshing && (
+              <Loader2
+                className="h-4 w-4 animate-spin text-muted-foreground"
+                aria-label="Refreshing events"
+              />
+            )}
             <Button
               variant="outline"
               size="icon"
@@ -287,7 +370,7 @@ export function CalendarPage() {
             <Loader2 className="h-8 w-8 animate-spin mb-3" />
             <p className="text-sm">Loading events...</p>
           </div>
-        ) : error ? (
+        ) : error && events.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-32 text-center">
             <p className="text-foreground font-medium mb-2">
               Failed to load events
@@ -298,21 +381,27 @@ export function CalendarPage() {
               Retry
             </Button>
           </div>
-        ) : events.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-32 text-center">
-            <CalendarDays className="h-10 w-10 text-muted-foreground mb-3" />
-            <p className="text-foreground font-medium mb-2">
-              No events synced yet
-            </p>
-            <p className="text-sm text-muted-foreground max-w-sm">
-              Events sync from your connected Google Calendar automatically.
-              Once synced they&apos;ll appear here.
-            </p>
-          </div>
         ) : (
           <>
-            {/* Calendar Grid */}
-            <div className="bg-card rounded-xl shadow-sm border border-border overflow-hidden">
+            {error && (
+              <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-border bg-muted/50 px-4 py-3 text-sm">
+                <p className="text-muted-foreground">
+                  Couldn&apos;t refresh events: {error}
+                </p>
+                <Button variant="outline" size="sm" onClick={retry}>
+                  <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                  Retry
+                </Button>
+              </div>
+            )}
+
+            {/* Calendar Grid — always shown so empty months still navigate cleanly */}
+            <div
+              className={cn(
+                'bg-card rounded-xl shadow-sm border border-border overflow-hidden transition-opacity',
+                isRefreshing && 'opacity-70',
+              )}
+            >
               {/* Week Header */}
               <div className="grid grid-cols-7 border-b border-border">
                 {WEEK_DAYS.map((day) => (
@@ -369,6 +458,19 @@ export function CalendarPage() {
                 })}
               </div>
             </div>
+
+            {events.length === 0 && !error && (
+              <div className="mt-6 flex flex-col items-center justify-center py-8 text-center">
+                <CalendarDays className="h-10 w-10 text-muted-foreground mb-3" />
+                <p className="text-foreground font-medium mb-2">
+                  No events in this period
+                </p>
+                <p className="text-sm text-muted-foreground max-w-sm">
+                  Events sync from your connected Google Calendar. Try another
+                  month, or check back once calendars have synced.
+                </p>
+              </div>
+            )}
 
             {/* Upcoming Events */}
             <div className="mt-8 grid grid-cols-1 lg:grid-cols-2 gap-6">

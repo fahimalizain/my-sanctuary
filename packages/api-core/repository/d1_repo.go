@@ -531,12 +531,13 @@ func (r *d1CalendarEventRepo) ListByCalendarID(ctx context.Context, calendarID s
 }
 
 func (r *d1CalendarEventRepo) ListByUserIDAndTimeRange(ctx context.Context, userID string, tr TimeRange) ([]models.CalendarEvent, error) {
+	// Overlap: event intersects [Start, End) rather than being fully contained.
 	res, err := d1Query(r.getD1,
 		`SELECT e.* FROM calendar_events e
 		 JOIN google_calendars c ON c.id = e.calendar_id
-		 WHERE c.user_id = ? AND e.deleted_at IS NULL AND e.start_time >= ? AND e.end_time <= ?
+		 WHERE c.user_id = ? AND e.deleted_at IS NULL AND e.start_time < ? AND e.end_time > ?
 		 ORDER BY e.start_time ASC`,
-		userID, tr.Start.UTC().Format(time.RFC3339), tr.End.UTC().Format(time.RFC3339))
+		userID, tr.End.UTC().Format(time.RFC3339), tr.Start.UTC().Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}

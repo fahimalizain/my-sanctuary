@@ -95,10 +95,21 @@ type googleCancelledEntry struct {
 
 // ListEvents serves cached events for all of the user's sync-enabled
 // calendars, syncing each calendar from Google if its cache is stale.
+//
+// Optional query params time_min and time_max (RFC 3339 instants, typically
+// UTC from the client) bound the result set. Bounds are absolute instants —
+// the client should derive them from local civil day boundaries then convert
+// with toISOString(). When omitted, a wide UTC window around now is used.
 func (h *CalendarHandler) ListEvents(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.auth.userIDFromSession(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	tr, err := parseEventTimeRange(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -147,12 +158,49 @@ func (h *CalendarHandler) ListEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, err := h.eventRepo.ListByUserID(r.Context(), userID, repository.PaginationParams{Limit: 100})
+	events, err := h.eventRepo.ListByUserIDAndTimeRange(r.Context(), userID, tr)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load events")
 		return
 	}
 	writeJSON(w, map[string]interface{}{"events": events, "source": "cache"})
+}
+
+// parseEventTimeRange reads optional time_min / time_max query params as RFC 3339
+// (or RFC 3339 with fractional seconds). Missing bounds default to a wide UTC
+// window around now so older clients still get a useful set.
+func parseEventTimeRange(r *http.Request) (repository.TimeRange, error) {
+	now := time.Now().UTC()
+	tr := repository.TimeRange{
+		Start: now.AddDate(0, -1, 0),
+		End:   now.AddDate(0, 2, 0),
+	}
+
+	if minStr := r.URL.Query().Get("time_min"); minStr != "" {
+		t, err := parseRFC3339Instant(minStr)
+		if err != nil {
+			return tr, fmt.Errorf("invalid time_min: must be RFC 3339")
+		}
+		tr.Start = t
+	}
+	if maxStr := r.URL.Query().Get("time_max"); maxStr != "" {
+		t, err := parseRFC3339Instant(maxStr)
+		if err != nil {
+			return tr, fmt.Errorf("invalid time_max: must be RFC 3339")
+		}
+		tr.End = t
+	}
+	if !tr.End.After(tr.Start) {
+		return tr, fmt.Errorf("time_max must be after time_min")
+	}
+	return tr, nil
+}
+
+func parseRFC3339Instant(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
 }
 
 // oauth2Context injects the Workers-compatible HTTP client into the context

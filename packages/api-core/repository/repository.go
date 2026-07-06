@@ -13,7 +13,9 @@ type PaginationParams struct {
 	Limit  int
 }
 
-// TimeRange bounds a calendar query to a [Start, End] interval.
+// TimeRange bounds a calendar query to a half-open [Start, End) interval.
+// ListByUserIDAndTimeRange returns events that *overlap* this window
+// (start < End AND end > Start), not only events fully contained in it.
 type TimeRange struct {
 	Start time.Time
 	End   time.Time

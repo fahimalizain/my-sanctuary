@@ -345,10 +345,12 @@ func (r *gormCalendarEventRepo) ListByCalendarID(ctx context.Context, calendarID
 }
 
 func (r *gormCalendarEventRepo) ListByUserIDAndTimeRange(ctx context.Context, userID string, tr TimeRange) ([]models.CalendarEvent, error) {
+	// Overlap: event intersects [Start, End) rather than being fully contained.
+	// Keeps multi-day and overnight events that straddle the window edges.
 	var events []models.CalendarEvent
 	err := r.db.WithContext(ctx).
 		Joins("JOIN google_calendars ON google_calendars.id = calendar_events.calendar_id").
-		Where("google_calendars.user_id = ? AND calendar_events.deleted_at IS NULL AND start_time >= ? AND end_time <= ?", userID, tr.Start, tr.End).
+		Where("google_calendars.user_id = ? AND calendar_events.deleted_at IS NULL AND calendar_events.start_time < ? AND calendar_events.end_time > ?", userID, tr.End, tr.Start).
 		Order("calendar_events.start_time ASC").
 		Find(&events).Error
 	return events, err
