@@ -467,39 +467,31 @@ func NewD1CalendarEventRepo(getD1 D1BindingFunc) CalendarEventRepo {
 }
 
 func (r *d1CalendarEventRepo) Upsert(ctx context.Context, event *models.CalendarEvent) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	sql := `INSERT INTO calendar_events
-		(id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(calendar_id, google_event_id) DO UPDATE SET
-			google_etag = excluded.google_etag,
-			google_updated_at = excluded.google_updated_at,
-			last_synced_at = excluded.last_synced_at,
-			title = excluded.title,
-			description = excluded.description,
-			start_time = excluded.start_time,
-			end_time = excluded.end_time,
-			recurrence = excluded.recurrence,
-			updated_at = excluded.updated_at`
-	return d1Exec(r.getD1, sql,
-		uuid.NewString(), event.CalendarID, event.GoogleEventID, event.GoogleETag,
-		event.GoogleUpdatedAt.UTC().Format(time.RFC3339),
-		event.LastSyncedAt.UTC().Format(time.RFC3339),
-		event.Title, event.Description,
-		event.StartTime.UTC().Format(time.RFC3339),
-		event.EndTime.UTC().Format(time.RFC3339),
-		event.Recurrence,
-		now, now,
-	)
+	return r.UpsertBatch(ctx, []models.CalendarEvent{*event})
 }
 
+// UpsertBatch writes events with multi-row INSERT … ON CONFLICT statements.
+// Rows are chunked to stay under D1's 100 bound-parameter limit (7 events/statement).
+// Each statement is one D1 subrequest, so 700 events ≈ 100 queries instead of 700.
 func (r *d1CalendarEventRepo) UpsertBatch(ctx context.Context, events []models.CalendarEvent) error {
-	for i := range events {
-		if err := r.Upsert(ctx, &events[i]); err != nil {
+	if len(events) == 0 {
+		return nil
+	}
+	for start := 0; start < len(events); start += eventUpsertChunkSize {
+		end := start + eventUpsertChunkSize
+		if end > len(events) {
+			end = len(events)
+		}
+		if err := r.upsertEventChunk(events[start:end]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (r *d1CalendarEventRepo) upsertEventChunk(events []models.CalendarEvent) error {
+	sql, args := buildEventUpsertSQL(events)
+	return d1Exec(r.getD1, sql, args...)
 }
 
 func (r *d1CalendarEventRepo) GetByID(ctx context.Context, id string) (*models.CalendarEvent, error) {

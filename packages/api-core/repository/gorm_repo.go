@@ -292,10 +292,21 @@ func (r *gormCalendarEventRepo) Upsert(ctx context.Context, event *models.Calend
 	}).Error
 }
 
+// UpsertBatch uses multi-row INSERT … ON CONFLICT (same SQL as D1), chunked
+// to the 100-parameter bind limit. Single-row Upsert still uses the
+// read-then-write path so the caller's event.ID is preserved.
 func (r *gormCalendarEventRepo) UpsertBatch(ctx context.Context, events []models.CalendarEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for i := range events {
-			if err := (&gormCalendarEventRepo{tx}).Upsert(ctx, &events[i]); err != nil {
+		for start := 0; start < len(events); start += eventUpsertChunkSize {
+			end := start + eventUpsertChunkSize
+			if end > len(events) {
+				end = len(events)
+			}
+			sql, args := buildEventUpsertSQL(events[start:end])
+			if err := tx.Exec(sql, args...).Error; err != nil {
 				return err
 			}
 		}

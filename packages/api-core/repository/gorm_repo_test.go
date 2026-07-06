@@ -155,6 +155,27 @@ func TestCalendarRepo_UpsertAndSync(t *testing.T) {
 		t.Fatalf("expected 2, got %d", len(gotEvs))
 	}
 
+	// Re-upsert with updated titles — multi-row ON CONFLICT must update, not duplicate.
+	evs[0].Title = "One Updated"
+	evs[1].Title = "Two Updated"
+	if err := events.UpsertBatch(ctx, evs); err != nil {
+		t.Fatal(err)
+	}
+	gotEvs, err = events.ListByUserID(ctx, userID, PaginationParams{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotEvs) != 2 {
+		t.Fatalf("expected 2 after re-upsert, got %d", len(gotEvs))
+	}
+	titles := map[string]string{}
+	for _, e := range gotEvs {
+		titles[e.GoogleEventID] = e.Title
+	}
+	if titles["e1"] != "One Updated" || titles["e2"] != "Two Updated" {
+		t.Fatalf("expected updated titles, got %+v", titles)
+	}
+
 	if err := events.DeleteByGoogleEventID(ctx, cal.ID, "e1"); err != nil {
 		t.Fatal(err)
 	}

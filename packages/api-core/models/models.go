@@ -59,13 +59,15 @@ type GoogleCalendar struct {
 }
 
 // CalendarEvent is a cached row from the user's Google Calendar.
+// Explicit column tags keep GORM aligned with the D1 migration (GORM would
+// otherwise map GoogleETag → google_e_tag).
 type CalendarEvent struct {
 	ID              string     `gorm:"primaryKey;type:text" json:"id"`
-	CalendarID      string     `gorm:"index;not null" json:"calendar_id"`
-	GoogleEventID   string     `gorm:"uniqueIndex:idx_cal_google,priority:2;not null" json:"google_event_id"`
-	GoogleETag      string     `json:"google_etag"`
-	GoogleUpdatedAt time.Time  `json:"google_updated_at"`
-	LastSyncedAt    time.Time  `json:"last_synced_at"`
+	CalendarID      string     `gorm:"index;not null;uniqueIndex:idx_cal_google,priority:1" json:"calendar_id"`
+	GoogleEventID   string     `gorm:"column:google_event_id;uniqueIndex:idx_cal_google,priority:2;not null" json:"google_event_id"`
+	GoogleETag      string     `gorm:"column:google_etag" json:"google_etag"`
+	GoogleUpdatedAt time.Time  `gorm:"column:google_updated_at" json:"google_updated_at"`
+	LastSyncedAt    time.Time  `gorm:"column:last_synced_at" json:"last_synced_at"`
 	Title           string     `gorm:"not null" json:"title"`
 	Description     string     `gorm:"type:text" json:"description"`
 	StartTime       time.Time  `gorm:"not null" json:"start_time"`

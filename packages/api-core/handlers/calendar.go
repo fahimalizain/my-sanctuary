@@ -212,11 +212,12 @@ func (h *CalendarHandler) syncCalendar(ctx context.Context, cal *models.GoogleCa
 		return err
 	}
 
+	events := make([]models.CalendarEvent, 0, len(resp.Items))
 	for i := range resp.Items {
-		ev := mapGoogleEventToModel(resp.Items[i], cal.ID)
-		if err := h.eventRepo.Upsert(ctx, &ev); err != nil {
-			return err
-		}
+		events = append(events, mapGoogleEventToModel(resp.Items[i], cal.ID))
+	}
+	if err := h.eventRepo.UpsertBatch(ctx, events); err != nil {
+		return err
 	}
 
 	nextToken := resp.NextSyncToken
