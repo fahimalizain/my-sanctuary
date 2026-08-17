@@ -58,6 +58,12 @@ go.work.sum
 *.wasm
 __debug_bin*
 
+# Local SQLite databases (created by AutoMigrate on startup)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Wrangler
 .wrangler
 

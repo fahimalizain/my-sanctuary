@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/http"
 	"strings"
+	"syscall/js"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,12 +15,19 @@ import (
 	"github.com/syumai/workers/cloudflare/fetch"
 	"my-sanctuary/packages/api-core/config"
 	"my-sanctuary/packages/api-core/handlers"
+	"my-sanctuary/packages/api-core/repository"
 )
 
 //go:embed dist/*
 var staticFS embed.FS
 
 var version = "dev"
+
+// getD1Binding returns the D1 binding set by d1_shim.js on globalThis.__D1__.
+// The shim wraps the generated fetch handler to stash env.DB before invoking Go.
+func getD1Binding() js.Value {
+	return js.Global().Get("__D1__")
+}
 
 func main() {
 	cfg, err := config.LoadWithEnv(cloudflare.Getenv)
@@ -32,11 +40,16 @@ func main() {
 	router.Use(middleware.Recoverer)
 	router.Use(middleware.Logger)
 
-	// Register API routes from the shared handlers package
+	// Register API routes from the shared handlers package.
+	// D1 repos read from the __D1__ global set by d1_shim.js.
 	handlers.RegisterRoutes(router, &handlers.Dependencies{
-		Config:     cfg,
-		HTTPClient: fetch.NewClient().HTTPClient(fetch.RedirectModeFollow),
-		Version:    version,
+		Config:            cfg,
+		HTTPClient:        fetch.NewClient().HTTPClient(fetch.RedirectModeFollow),
+		Version:           version,
+		UserRepo:          repository.NewD1UserRepo(getD1Binding),
+		TokenRepo:         repository.NewD1TokenRepo(getD1Binding),
+		CalendarRepo:      repository.NewD1CalendarRepo(getD1Binding),
+		CalendarEventRepo: repository.NewD1CalendarEventRepo(getD1Binding),
 	})
 
 	// Static files + SPA fallback

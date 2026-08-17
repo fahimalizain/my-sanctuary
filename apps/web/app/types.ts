@@ -30,3 +30,21 @@ export interface TaskEvent extends Task {
 
 // Union type for timeline items - can be a full time block or a task event
 export type TimelineItem = TimeBlock | TaskEvent;
+
+// A Google Calendar event synced from the backend
+export interface CalendarEvent {
+  id: string;
+  calendar_id: string;
+  google_event_id: string;
+  title: string;
+  description: string;
+  start_time: string; // ISO 8601
+  end_time: string; // ISO 8601
+  last_synced_at: string;
+}
+
+// The envelope returned by GET /api/calendar/events
+export interface CalendarEventsResponse {
+  events: CalendarEvent[];
+  source: 'cache' | string;
+}

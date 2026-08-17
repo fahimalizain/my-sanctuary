@@ -3,5 +3,14 @@
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "library",
   "sourceRoot": "packages/api-core",
-  "tags": []
+  "tags": [],
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["CGO_ENABLED=0 go test ./..."],
+        "cwd": "packages/api-core"
+      }
+    }
+  }
 }
