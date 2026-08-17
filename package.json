@@ -1,13 +1,12 @@
 {
   "name": "@org/source",
-  "version": "0.0.23",
+  "version": "0.0.25",
   "license": "MIT",
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "private": true,
   "devDependencies": {
-    "@nx-go/nx-go": "^4.0.0",
     "@nx/js": "22.7.0",
     "@swc-node/register": "1.11.1",
     "@swc/core": "1.15.8",
@@ -20,5 +19,14 @@
   "workspaces": [
     "apps/*",
     "packages/*"
-  ]
+  ],
+  "allowScripts": {
+    "@swc/core@1.15.8": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.27.3": true,
+    "fsevents@2.3.3": true,
+    "nx@22.7.0": true,
+    "sharp@0.34.5": true,
+    "workerd@1.20260430.1": true
+  }
 }

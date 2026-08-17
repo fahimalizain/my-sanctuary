@@ -1,8 +1,8 @@
 {
-  "name": "cloudflare-deploy",
+  "name": "worker",
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "projectType": "application",
-  "sourceRoot": "apps/cloudflare-deploy",
+  "sourceRoot": "apps/worker",
   "tags": [],
   "implicitDependencies": ["api-core", "web"],
   "targets": {
@@ -10,18 +10,23 @@
       "dependsOn": ["^build"],
       "executor": "nx:run-commands",
       "options": {
-        "commands": [
-          "bash build.sh"
-        ],
-        "cwd": "apps/cloudflare-deploy",
-        "parallel": false
+        "commands": ["worker-build --release"],
+        "cwd": "apps/worker"
+      },
+      "outputs": ["{projectRoot}/build"]
+    },
+    "serve": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["wrangler dev"],
+        "cwd": "apps/worker"
       }
     },
     "deploy": {
       "executor": "nx:run-commands",
       "options": {
         "commands": ["wrangler deploy"],
-        "cwd": "apps/cloudflare-deploy"
+        "cwd": "apps/worker"
       }
     }
   }

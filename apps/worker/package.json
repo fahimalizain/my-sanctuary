@@ -1,5 +1,5 @@
 {
-  "name": "@my-sanctuary/cloudflare-deploy",
+  "name": "@my-sanctuary/worker",
   "version": "0.0.0",
   "private": true,
   "scripts": {},

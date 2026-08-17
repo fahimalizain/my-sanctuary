@@ -1,0 +1,5 @@
+# Rust build output (worker-build)
+build/
+
+# Local dev secrets — copy .dev.vars.example and fill in
+.dev.vars

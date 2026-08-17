@@ -38,22 +38,15 @@ The web app is an installable PWA built with Vite + React 19 + TanStack Router +
 
 ## @packages/api-core
 
-Shared Go library containing the API's `config` and `handlers` packages. Consumed by both `apps/api` and `apps/cloudflare-deploy` (each via a `replace` directive in their `go.mod`).
+Shared Rust library (`api-core` crate) holding the API response types. Pure Rust, no `worker` dependency, so it can be unit-tested natively (`cargo test -p api-core`). Consumed by `apps/worker`.
 
-## @apps/api
+## @apps/worker
 
-The API is a Go HTTP server using chi router + huma for OpenAPI documentation. It is a thin entrypoint — config and handlers live in `@packages/api-core`.
+The Cloudflare Worker is a workers-rs (Rust → WASM) app that serves `GET /health`, `GET /version`, and the Vite PWA via Workers Static Assets. Local runtime is `wrangler dev` + local D1; there is no native API server.
 
-- **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version. The Go binary reads this at build time via `-ldflags -X main.version=...` from `build.sh`.
-- **Build** — `npx nx run api:build` outputs to `dist/apps/api`.
-- **Dev** — `npx nx serve api` or `go run .` inside `apps/api`.
-- **Endpoints** — `GET /version` returns the deployed app version.
-
-## @apps/cloudflare-deploy
-
-The Cloudflare Workers deploy app bundles the web frontend and API into a single WASM Workers deployment. It imports handlers/config from `@packages/api-core`, not from `apps/api`.
-
-- **Version** — same root `package.json` single source of truth. Injected via `-ldflags -X main.version=...` from `build.sh`.
-- **Build** — `npx nx run cloudflare-deploy:build` bundles web dist + Go WASM binary.
-- **Deploy** — `npx nx run cloudflare-deploy:deploy` pushes to Cloudflare via wrangler.
-- **Implied deps** — `api-core` and `web` must be built first.
+- **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version. `apps/worker/build.rs` reads it at build time and injects it as `APP_VERSION` (consumed via `env!("APP_VERSION")`), replacing the old Go `-ldflags` mechanism.
+- **Build** — `npx nx run worker:build` runs `worker-build --release` (implies `web:build` via `dependsOn`). Output lands in `apps/worker/build` (`build/index.js` is `main` in `wrangler.toml`).
+- **Dev** — `npx nx serve worker` (`wrangler dev` in `apps/worker`), frontend on `http://localhost:5173` with Vite proxying `/api`, `/auth`, `/health`, `/version` to `http://127.0.0.1:8787`.
+- **Static Assets** — `[assets]` serves `dist/apps/web` with `not_found_handling = "single-page-application"`; `run_worker_first = ["/api/*", "/auth/*", "/health", "/version"]` keeps API paths on the Worker.
+- **Deploy** — `npx nx deploy worker` pushes via wrangler (custom domain `my-sanctuary.fahimalizain.com`).
+- **Toolchain** — pinned by the root `rust-toolchain.toml` (stable + `wasm32-unknown-unknown`); `worker-build` is installed via `cargo install worker-build --version 0.8.4` (pinned: 0.8.5 regressed on `strip = true` with "externref table required for catch wrappers").

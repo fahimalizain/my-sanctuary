@@ -8,10 +8,8 @@
     devShells = forAllSystems (pkgs: {
       default = pkgs.mkShell {
         packages = with pkgs; [
-          go
-          gopls         # LSP
-          delve         # debugger
-          golangci-lint # linter
+          rustup        # cargo/rustc shims; rust-toolchain.toml pins stable + wasm32-unknown-unknown
+          rust-analyzer # LSP
         ];
       };
     });
