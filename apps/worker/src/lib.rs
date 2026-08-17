@@ -1,4 +1,5 @@
 mod auth;
+mod calendar;
 mod db;
 mod http;
 
@@ -54,6 +55,9 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .options("/auth/logout", auth::options)
         .options("/auth/google", auth::options)
         .options("/auth/google/callback", auth::options)
+        .get_async("/api/calendar/events", calendar::list_events)
+        .post_async("/api/calendar/events", calendar::create_event)
+        .options("/api/calendar/events", auth::options)
         .run(req, env)
         .await
 }

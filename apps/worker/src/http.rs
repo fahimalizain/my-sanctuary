@@ -5,6 +5,7 @@
 //! directly — the old Go worker hit "Illegal invocation" doing that.
 
 use api_core::HttpError;
+use worker::js_sys;
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 pub struct WorkerHttp;
@@ -38,6 +39,18 @@ impl api_core::HttpClient for WorkerHttp {
     }
 
     async fn get_bearer(&self, url: &str, access_token: &str) -> Result<Vec<u8>, HttpError> {
+        let (status, bytes) = self.get_bearer_raw(url, access_token).await?;
+        if !(200..300).contains(&status) {
+            return Err(HttpError::Message(format!("GET {url} returned {status}")));
+        }
+        Ok(bytes)
+    }
+
+    async fn get_bearer_raw(
+        &self,
+        url: &str,
+        access_token: &str,
+    ) -> Result<(u16, Vec<u8>), HttpError> {
         let headers = Headers::new();
         headers
             .set("Authorization", &format!("Bearer {access_token}"))
@@ -48,9 +61,30 @@ impl api_core::HttpClient for WorkerHttp {
         let mut response = Fetch::Request(request).send().await.map_err(http_err)?;
         let status = response.status_code();
         let bytes = response.bytes().await.map_err(http_err)?;
-        if !(200..300).contains(&status) {
-            return Err(HttpError::Message(format!("GET {url} returned {status}")));
-        }
-        Ok(bytes)
+        Ok((status, bytes))
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), HttpError> {
+        let headers = Headers::new();
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(http_err)?;
+        headers
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .map_err(http_err)?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(js_sys::Uint8Array::from(body).into()));
+        let request = Request::new_with_init(url, &init).map_err(http_err)?;
+        let mut response = Fetch::Request(request).send().await.map_err(http_err)?;
+        let status = response.status_code();
+        let bytes = response.bytes().await.map_err(http_err)?;
+        Ok((status, bytes))
     }
 }

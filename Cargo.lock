@@ -598,6 +598,7 @@ version = "0.1.0"
 dependencies = [
  "api-core",
  "async-trait",
+ "serde",
  "serde_json",
  "url",
  "uuid",

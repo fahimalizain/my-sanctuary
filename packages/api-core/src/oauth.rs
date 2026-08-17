@@ -38,8 +38,9 @@ pub enum HttpError {
     Message(String),
 }
 
-/// Minimal HTTP surface needed for OAuth. The Worker implements this with
-/// `worker::Fetch` (see `apps/worker/src/http.rs`); tests use a fake.
+/// Minimal HTTP surface needed for OAuth and the calendar API. The Worker
+/// implements this with `worker::Fetch` (see `apps/worker/src/http.rs`); tests
+/// use a fake.
 ///
 /// `#[async_trait(?Send)]` because `worker::Fetch` futures are `!Send` on wasm.
 #[async_trait(?Send)]
@@ -50,6 +51,24 @@ pub trait HttpClient: Send + Sync {
     /// GETs a URL with an `Authorization: Bearer …` header and returns the raw
     /// response body. Non-2xx responses are errors.
     async fn get_bearer(&self, url: &str, access_token: &str) -> Result<Vec<u8>, HttpError>;
+    /// Like [`get_bearer`](Self::get_bearer) but returns the status alongside
+    /// the body and treats non-2xx as data: the calendar sync needs to inspect
+    /// `410 Gone` (stale sync token → full resync) and `404` (calendar does not
+    /// support events.list → disable sync).
+    async fn get_bearer_raw(
+        &self,
+        url: &str,
+        access_token: &str,
+    ) -> Result<(u16, Vec<u8>), HttpError>;
+    /// POSTs a JSON body with `Content-Type: application/json` and an
+    /// `Authorization: Bearer …` header. Returns `(status, body)` so the
+    /// caller can distinguish 2xx (created event) from errors.
+    async fn post_json(
+        &self,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), HttpError>;
 }
 
 /// Errors produced by the code-exchange/login orchestration.
@@ -248,6 +267,29 @@ mod tests {
                 .unwrap()
                 .push((url.to_string(), access_token.to_string()));
             self.userinfo_body.clone()
+        }
+
+        async fn get_bearer_raw(
+            &self,
+            url: &str,
+            access_token: &str,
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            // OAuth tests never exercise the raw variant; mirror get_bearer.
+            self.gets
+                .lock()
+                .unwrap()
+                .push((url.to_string(), access_token.to_string()));
+            Ok((200, self.userinfo_body.clone().unwrap_or_default()))
+        }
+
+        async fn post_json(
+            &self,
+            _url: &str,
+            _access_token: &str,
+            _body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            // OAuth tests never POST JSON.
+            Ok((200, Vec::new()))
         }
     }
 
