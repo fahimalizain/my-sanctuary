@@ -1,5 +1,6 @@
 mod auth;
 mod calendar;
+mod cron;
 mod db;
 mod http;
 
@@ -31,19 +32,33 @@ fn load_config(env: &Env) -> Option<api_core::Config> {
         .secret("GOOGLE_CREDENTIALS_JSON")
         .ok()
         .map(|var| var.to_string());
+    // A public URL, not a secret: Google needs it in every events.watch body.
+    let watch_callback_url = env.var("WATCH_CALLBACK_URL").ok().map(|var| var.to_string());
     api_core::Config::from_env(|key| match key {
         "SESSION_SECRET" => Some(session_secret.clone()),
         "FRONTEND_URL" => frontend_url.clone().filter(|value| !value.is_empty()),
         "SECURE_COOKIE" => secure_cookie.clone(),
         "GOOGLE_CREDENTIALS_JSON" => google_json.clone(),
+        "WATCH_CALLBACK_URL" => watch_callback_url.clone().filter(|value| !value.is_empty()),
         _ => None,
     })
     .ok()
 }
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let config = load_config(&env);
+
+    // Google Calendar push webhooks (ADR 0001 § Webhook) are intercepted
+    // before the Router: `Router::run` never sees the fetch `Context`, and
+    // the background sync after a verified push must run via
+    // `ctx.wait_until`. Only a POST to the configured callback path (or the
+    // documented default) is a webhook; everything else — including GETs to
+    // that path — falls through to the Router.
+    if is_webhook_request(&req, config.as_ref()) {
+        return calendar::notifications(req, env, ctx).await;
+    }
+
     Router::with_data(config)
         .get("/health", health)
         .get("/version", version)
@@ -60,4 +75,25 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .options("/api/calendar/events", auth::options)
         .run(req, env)
         .await
+}
+
+/// Whether `req` is a Google Calendar push notification: a POST whose path
+/// matches the `WATCH_CALLBACK_URL` path (when set and parseable) or the
+/// documented default `/api/calendar/notifications`.
+///
+/// Path-only comparison — query strings and fragments are ignored, and the
+/// `run_worker_first = ["/api/*"]` asset config already keeps these paths on
+/// the Worker.
+fn is_webhook_request(req: &Request, config: Option<&api_core::Config>) -> bool {
+    if req.method() != Method::Post {
+        return false;
+    }
+    let path = req.path();
+    if path == "/api/calendar/notifications" {
+        return true;
+    }
+    config
+        .and_then(|config| config.watch_callback_url.as_deref())
+        .and_then(|raw| url::Url::parse(raw).ok())
+        .is_some_and(|callback| callback.path() == path)
 }

@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewToken,
-    NewUser, User,
+    NewUser, User, WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -68,6 +68,9 @@ pub trait TokenRepo: Send + Sync {
 pub trait CalendarRepo: Send + Sync {
     /// The user's calendars, primary first then by summary.
     async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError>;
+    /// Every sync-enabled, non-deleted calendar across all users — the
+    /// fallback cron's work list (ADR 0001 § Fallback cron).
+    async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError>;
     /// Returns the calendar with local `id`, or `None` when absent/soft-deleted.
     async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError>;
     /// Returns the calendar with `google_calendar_id`, or `None`.
@@ -140,6 +143,42 @@ pub trait CalendarEventRepo: Send + Sync {
     ) -> Result<(), RepoError>;
 }
 
+/// Google Calendar watch channel persistence (`google_calendars_watch_channels`
+/// rows).
+///
+/// Unlike every other table, deletes are HARD: rows are physically removed,
+/// never soft-deleted. This table is a subscription, not a domain entity (see
+/// ADR 0001).
+#[async_trait(?Send)]
+pub trait WatchChannelRepo: Send + Sync {
+    /// Inserts a new watch channel and returns the generated `id`.
+    /// `now_rfc3339` is stamped into `created_at`/`updated_at`.
+    async fn insert(
+        &self,
+        channel: NewWatchChannel,
+        now_rfc3339: &str,
+    ) -> Result<String, RepoError>;
+    /// Returns the channel with `channel_id` (the UUID we minted and that
+    /// Google echoes back as `X-Goog-Channel-ID`), or `None`.
+    async fn get_by_channel_id(&self, channel_id: &str) -> Result<Option<WatchChannel>, RepoError>;
+    /// All channels for `calendar_id`. Many rows per calendar are expected:
+    /// renewal overlaps two channels briefly (ADR 0001).
+    async fn list_by_calendar_id(&self, calendar_id: &str) -> Result<Vec<WatchChannel>, RepoError>;
+    /// Channels for `calendar_id` whose `expiration` is still in the future.
+    /// RFC 3339 UTC strings compare lexicographically, so `expiration > ?`
+    /// is correct.
+    async fn list_unexpired_by_calendar_id(
+        &self,
+        calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<Vec<WatchChannel>, RepoError>;
+    /// HARD delete by local row id.
+    async fn delete_by_id(&self, id: &str) -> Result<(), RepoError>;
+    /// HARD delete of every channel row for `calendar_id` (used when a
+    /// calendar is disabled or soft-deleted — see ADR 0001).
+    async fn delete_by_calendar_id(&self, calendar_id: &str) -> Result<(), RepoError>;
+}
+
 pub const USER_GET_BY_ID_SQL: &str = "SELECT * FROM users WHERE id = ? AND deleted_at IS NULL";
 
 pub const USER_GET_BY_GOOGLE_ID_SQL: &str =
@@ -195,6 +234,11 @@ pub const TOKEN_DELETE_SQL: &str =
 
 pub const CALENDAR_LIST_BY_USER_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE user_id = ? AND deleted_at IS NULL ORDER BY is_primary DESC, summary ASC";
+
+/// The fallback cron's work list: every sync-enabled calendar that is not
+/// soft-deleted, ordered by user, then primary first, then summary.
+pub const CALENDAR_LIST_SYNC_ENABLED_SQL: &str =
+    "SELECT * FROM google_calendars WHERE sync_enabled = 1 AND deleted_at IS NULL ORDER BY user_id ASC, is_primary DESC, summary ASC";
 
 pub const CALENDAR_GET_BY_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE id = ? AND deleted_at IS NULL";
@@ -333,6 +377,44 @@ pub fn build_event_upsert_sql(
     (sql, args)
 }
 
+// ──────────────────────────────────────────
+// Watch channel SQL
+// ──────────────────────────────────────────
+
+/// Plain INSERT, not an upsert: `channel_id` is UNIQUE and renewal mints a new
+/// row rather than replacing an old one — overlap of two rows per calendar is
+/// expected (ADR 0001). The D1 implementation supplies `id` (UUIDv4) and
+/// `created_at`/`updated_at` from the passed `now_rfc3339`.
+pub const WATCH_CHANNEL_INSERT_SQL: &str = "
+    INSERT INTO google_calendars_watch_channels
+        (id, calendar_id, channel_id, resource_id, token, expiration, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+pub const WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL: &str =
+    "SELECT * FROM google_calendars_watch_channels WHERE channel_id = ?";
+
+pub const WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL: &str =
+    "SELECT * FROM google_calendars_watch_channels WHERE calendar_id = ? ORDER BY created_at ASC";
+
+/// RFC 3339 UTC strings compare correctly as text, so `expiration > ?` finds
+/// channels that are still valid.
+pub const WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL: &str = "
+    SELECT * FROM google_calendars_watch_channels
+    WHERE calendar_id = ? AND expiration > ?
+    ORDER BY created_at ASC
+";
+
+/// HARD delete: this table has no `deleted_at` (ADR 0001), so rows are
+/// physically removed.
+pub const WATCH_CHANNEL_DELETE_BY_ID_SQL: &str =
+    "DELETE FROM google_calendars_watch_channels WHERE id = ?";
+
+/// HARD delete of every row for a calendar. `channels.stop` runs per row
+/// before this; overlap rows are removed together (ADR 0001).
+pub const WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL: &str =
+    "DELETE FROM google_calendars_watch_channels WHERE calendar_id = ?";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +425,7 @@ mod tests {
         assert!(USER_GET_BY_GOOGLE_ID_SQL.contains("deleted_at IS NULL"));
         assert!(TOKEN_GET_BY_USER_ID_SQL.contains("deleted_at IS NULL"));
         assert!(CALENDAR_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(CALENDAR_LIST_SYNC_ENABLED_SQL.contains("deleted_at IS NULL"));
         assert!(CALENDAR_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
         assert!(CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL.contains("deleted_at IS NULL"));
         assert!(EVENT_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
@@ -410,6 +493,20 @@ mod tests {
         assert_eq!(
             &sql[order_start..],
             "ORDER BY is_primary DESC, summary ASC"
+        );
+    }
+
+    #[test]
+    fn calendar_list_sync_enabled_filters_and_orders() {
+        // The fallback cron's work list: only sync-enabled, non-deleted rows,
+        // ordered by user then primary first then summary.
+        let sql = CALENDAR_LIST_SYNC_ENABLED_SQL;
+        assert!(sql.contains("sync_enabled = 1"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        let order_start = sql.find("ORDER BY").expect("has ORDER BY");
+        assert_eq!(
+            &sql[order_start..],
+            "ORDER BY user_id ASC, is_primary DESC, summary ASC"
         );
     }
 
@@ -490,5 +587,64 @@ mod tests {
         assert_eq!(args[0], "evt-0");
         assert_eq!(args[13], "evt-1");
         assert_eq!(args[13 * 6], "evt-6");
+    }
+
+    #[test]
+    fn watch_channel_insert_is_insert_not_upsert_and_lists_adr_columns() {
+        let sql = WATCH_CHANNEL_INSERT_SQL;
+        assert!(sql.contains("INSERT INTO google_calendars_watch_channels"), "{sql}");
+        assert!(!sql.contains("ON CONFLICT"), "{sql}");
+        // Columns from the ADR DDL: every NOT NULL business column plus the
+        // D1-generated `id` and timestamps.
+        for column in [
+            "id",
+            "calendar_id",
+            "channel_id",
+            "resource_id",
+            "token",
+            "expiration",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(sql.contains(column), "missing {column} in {sql}");
+        }
+        assert_eq!(sql.matches('?').count(), 8, "one placeholder per column: {sql}");
+        assert!(!sql.contains("deleted_at"), "{sql}");
+    }
+
+    #[test]
+    fn watch_channel_deletes_are_hard_not_soft() {
+        for sql in [WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL] {
+            assert!(sql.starts_with("DELETE FROM"), "{sql}");
+            assert!(!sql.contains("UPDATE"), "{sql}");
+            assert!(!sql.contains("deleted_at"), "{sql}");
+        }
+        assert!(WATCH_CHANNEL_DELETE_BY_ID_SQL.contains("WHERE id = ?"), "{}", WATCH_CHANNEL_DELETE_BY_ID_SQL);
+        assert!(
+            WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL.contains("WHERE calendar_id = ?"),
+            "{}",
+            WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL
+        );
+    }
+
+    #[test]
+    fn watch_channel_reads_have_no_deleted_at_filter() {
+        // Hard-delete table: reads must not reference `deleted_at`.
+        for sql in [
+            WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
+            WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
+            WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
+        ] {
+            assert!(!sql.contains("deleted_at"), "{sql}");
+        }
+        assert!(WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL.contains("WHERE channel_id = ?"), "{}", WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL);
+        assert!(WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL.contains("WHERE calendar_id = ?"), "{}", WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL);
+    }
+
+    #[test]
+    fn watch_channel_unexpired_query_filters_on_expiration() {
+        let sql = WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL;
+        assert!(sql.contains("expiration > ?"), "{sql}");
+        assert!(sql.contains("calendar_id = ?"), "{sql}");
     }
 }

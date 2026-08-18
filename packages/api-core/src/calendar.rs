@@ -6,38 +6,87 @@
 //! from the caller — never `SystemTime`. The Worker layers session checks and
 //! token refresh on top (`apps/worker/src/calendar.rs`).
 //!
-//! Sync rules (ported from Go):
-//! - A calendar is stale when `last_synced_at` is missing or older than
-//!   [`SYNC_STALE_THRESHOLD_SECS`] (5 minutes). Syncs are awaited — never
-//!   `wait_until`-style fire-and-forget.
+//! Sync rules (ADR 0001):
+//! - `list_events` awaits a sync only when `last_synced_at` is missing or
+//!   unparseable — i.e. the calendar has never synced (first paint after
+//!   calendar import). Once `last_synced_at` is set, `list_events` is
+//!   cache-only: no stale pull on the request path, whatever the age. The
+//!   fallback cron ([`run_fallback_cron`]) reintroduces a time-based
+//!   threshold (`CRON_SYNC_STALE_SECS`).
 //! - `events.list` uses `singleEvents=false&maxResults=250`, optionally with
 //!   the stored `syncToken` (incremental), and follows `nextPageToken`.
 //! - HTTP 410 (stale sync token) retries once with an empty token (full
 //!   resync). HTTP 404 (e.g. holidays/birthdays calendars that don't support
 //!   `events.list`) disables sync for that calendar. Other errors are logged
 //!   (returned in `sync_errors`) and do not fail the whole listing.
-//! - Events without a `start.dateTime`/`end.dateTime` (all-day events) and
-//!   cancelled events are skipped — the old Go parser stored zero times for
-//!   those, which is worse than skipping.
+//! - Incremental cancelled events (`status == "cancelled"`) are soft-deleted
+//!   via `delete_by_google_event_id` (missing rows no-op) instead of being
+//!   skipped. Events without a `start.dateTime`/`end.dateTime` (all-day
+//!   events) are skipped — the old Go parser stored zero times for those,
+//!   which is worse than skipping.
+//! - Watch: every `sync_enabled` calendar is ensure-watched (`events.watch`)
+//!   before its first-paint sync, but only when `WATCH_CALLBACK_URL` is set
+//!   and is a public HTTPS URL ([`is_public_https_callback`]). Watch 404
+//!   disables sync (and stops any prior channels); other watch errors are
+//!   logged and leave sync enabled. When sync is disabled for a calendar
+//!   (either by a watch 404 or an `events.list` 404), every stored channel
+//!   row is stopped (`channels.stop`) and hard-deleted.
+//! - Renewal: `ensure_watch` only requires *some* unexpired channel, so the
+//!   fallback cron renews via [`renew_watch_if_needed`] — it mints a new
+//!   channel unless one expires more than `WATCH_RENEW_HORIZON_SECS` out,
+//!   then stops and hard-deletes only the old rows (overlap is allowed).
+//! - Webhook: [`decide_webhook`] verifies push notifications
+//!   (`X-Goog-Channel-ID`/`-Token`/`-Resource-State`) against the stored
+//!   channel and calendar rows — pure and unit-tested; the Worker handler
+//!   wires D1 lookups and `ctx.wait_until(sync_calendar)` (ADR 0001 §
+//!   Webhook).
 
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
-use crate::models::{CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput};
+use crate::config::OAuthConfig;
+use crate::models::{
+    CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput, NewWatchChannel,
+    WatchChannel,
+};
 use crate::oauth::{HttpClient, HttpError};
-use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError};
+use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, WatchChannelRepo};
 use crate::time::{add_months_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
-use crate::token::GoogleAccess;
+use crate::token::{refresh_if_needed, GoogleAccess};
 
 /// A calendar is stale (needs a sync) when it has not synced in this many
 /// seconds (5 minutes, same as Go's `syncStaleThreshold`).
+///
+/// The request path no longer uses this — `list_events` is cache-only once
+/// `last_synced_at` is set (ADR 0001). The fallback cron uses the 15-minute
+/// [`CRON_SYNC_STALE_SECS`] instead.
 pub const SYNC_STALE_THRESHOLD_SECS: i64 = 5 * 60;
+
+/// A sync-enabled calendar is stale (needs a cron sync) when it has not
+/// synced in this many seconds (15 minutes — the fallback cron's cadence,
+/// ADR 0001 § Fallback cron).
+pub const CRON_SYNC_STALE_SECS: i64 = 15 * 60;
+
+/// Watch channels must still be valid at least this far in the future
+/// (`now_unix + WATCH_RENEW_HORIZON_SECS`) for the cron to consider the
+/// coverage healthy; channels expiring sooner are renewed (ADR 0001 §
+/// Fallback cron). Google channels live 7 days by default, so a 24-hour
+/// horizon renews each channel roughly weekly with plenty of slack.
+pub const WATCH_RENEW_HORIZON_SECS: i64 = 24 * 60 * 60;
 
 /// Google Calendar API endpoints.
 pub const GOOGLE_CALENDAR_LIST_URL: &str =
     "https://www.googleapis.com/calendar/v3/users/me/calendarList";
 pub const GOOGLE_EVENTS_BASE_URL: &str = "https://www.googleapis.com/calendar/v3/calendars";
+
+/// `channels.stop` endpoint: POST `{id, resourceId}` to unsubscribe a watch
+/// channel (ADR 0001).
+pub const GOOGLE_CHANNELS_STOP_URL: &str = "https://www.googleapis.com/calendar/v3/channels/stop";
+
+/// Default watch channel lifetime in seconds (7 days) used when Google's
+/// `events.watch` response omits `expiration`.
+pub const WATCH_DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Errors produced by the calendar service.
 #[derive(Debug, Clone, Error)]
@@ -125,15 +174,22 @@ pub fn parse_event_time_range(
 
 /// Lists the user's cached events, syncing each stale calendar from Google
 /// first (see module docs for the sync rules).
+///
+/// When `watch_callback_url` is a public HTTPS URL ([`is_public_https_callback`]),
+/// each `sync_enabled` calendar is ensure-watched before its first-paint sync;
+/// a watch 404 disables sync and stops any prior channels (ADR 0001).
+/// `None` or a non-public URL skips all watch I/O (local dev).
 pub async fn list_events(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    watches: &dyn WatchChannelRepo,
     access: &GoogleAccess,
     user_id: &str,
     start_rfc3339: &str,
     end_rfc3339: &str,
     now_unix: i64,
+    watch_callback_url: Option<&str>,
 ) -> Result<CalendarListOutput, CalendarError> {
     let mut cals = calendars.list_by_user_id(user_id).await?;
     if cals.is_empty() {
@@ -144,16 +200,61 @@ pub async fn list_events(
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let mut sync_errors: Vec<String> = Vec::new();
+    let watch_callback_url = watch_callback_url.filter(|url| is_public_https_callback(url));
     for cal in &cals {
         if !cal.sync_enabled {
             continue;
         }
-        if let Some(last_synced_at) = &cal.last_synced_at {
-            if let Some(last_unix) = rfc3339_to_unix_secs(last_synced_at) {
-                if now_unix - last_unix < SYNC_STALE_THRESHOLD_SECS {
-                    continue; // fresh enough
+        // Ensure-watch before the first-paint sync (ADR 0001): a sync-enabled
+        // calendar with no unexpired channel gets `events.watch`. Skipped
+        // entirely when WATCH_CALLBACK_URL is unset or not public HTTPS.
+        if let Some(callback_url) = watch_callback_url {
+            match ensure_watch(http, watches, access, cal, callback_url, now_unix).await {
+                Ok(()) => {}
+                Err(CalendarError::GoogleNotFound) => {
+                    sync_errors.push(format!(
+                        "calendar {} ({}) returned 404 for events.watch — disabling sync",
+                        cal.id, cal.google_calendar_id
+                    ));
+                    if let Err(err) = calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await {
+                        sync_errors.push(format!(
+                            "failed to disable sync for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
+                    // A prior channel may exist for this calendar (e.g. the
+                    // calendar became unavailable): stop + hard-delete them.
+                    if let Err(err) =
+                        stop_watches_for_calendar(http, watches, access, &cal.id).await
+                    {
+                        sync_errors.push(format!(
+                            "failed to stop watch channels for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    // Other watch errors leave sync enabled; the next request
+                    // (or the fallback cron) retries.
+                    sync_errors.push(format!(
+                        "watch failed for calendar {} ({}): {err}",
+                        cal.id, cal.google_calendar_id
+                    ));
                 }
             }
+        }
+        // Cache-only after first paint (ADR 0001): a set, parseable
+        // `last_synced_at` means the sync cursor exists, so never pull on the
+        // request path — regardless of age. Missing or unparseable means the
+        // calendar has never synced: await the first sync.
+        let previously_synced = cal
+            .last_synced_at
+            .as_deref()
+            .and_then(rfc3339_to_unix_secs)
+            .is_some();
+        if previously_synced {
+            continue;
         }
         match sync_calendar(http, calendars, events, access, cal, &now_rfc3339).await {
             Ok(()) => {}
@@ -165,6 +266,16 @@ pub async fn list_events(
                 if let Err(err) = calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await {
                     sync_errors.push(format!(
                         "failed to disable sync for calendar {}: {err}",
+                        cal.id
+                    ));
+                }
+                // The calendar is gone from Google's side: stop its channels
+                // so stale subscriptions do not push at a dead calendar.
+                if let Err(err) =
+                    stop_watches_for_calendar(http, watches, access, &cal.id).await
+                {
+                    sync_errors.push(format!(
+                        "failed to stop watch channels for calendar {}: {err}",
                         cal.id
                     ));
                 }
@@ -241,6 +352,486 @@ pub async fn create_event(
     })
 }
 
+// ──────────────────────────────────────────
+// Watch channels (ADR 0001)
+// ──────────────────────────────────────────
+
+/// Whether `url` is a callback Google may push webhooks to: it parses as a
+/// URL, has scheme `https`, and its host is not a loopback address
+/// (`localhost`, `127.0.0.1`, `::1` — host comparison is case-insensitive).
+/// Empty strings, unparseable values, and missing hosts are `false`.
+///
+/// Google refuses to deliver push notifications to non-public addresses, and
+/// watching from local `wrangler dev` would leak a channel we cannot consume —
+/// so `list_events` treats a non-public callback as "skip all watch I/O".
+pub fn is_public_https_callback(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // `url::Url` renders IPv6 hosts with brackets (`[::1]`); strip them so the
+    // loopback comparison sees the bare address.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    host != "localhost" && host != "127.0.0.1" && host != "::1"
+}
+
+/// Mints the watch `channel_id`: 16 random bytes formatted as a UUID string
+/// (`8-4-4-4-12` hex, 36 chars — well under Google's 64-char limit). The UUID
+/// shape is cosmetic; it is the `X-Goog-Channel-ID` webhook lookup key.
+fn mint_channel_id() -> String {
+    let mut bytes = [0u8; 16];
+    // Same randomness source as oauth::generate_state (OS entropy natively,
+    // Web Crypto on wasm); failure is practically impossible.
+    let _ = getrandom::getrandom(&mut bytes);
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+         {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
+        bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    )
+}
+
+/// Mints the webhook `token`: 32 random bytes hex-encoded (64 hex chars).
+/// Compared against `X-Goog-Channel-Token` by the webhook handler. Never
+/// contains OAuth tokens or other secrets.
+fn mint_token() -> String {
+    let mut bytes = [0u8; 32];
+    let _ = getrandom::getrandom(&mut bytes);
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Google's `events.watch` success body (subset): the channel `id` we minted
+/// (ignored — we store ours), Google's `resourceId`, and the channel
+/// `expiration` in Unix **milliseconds**.
+#[derive(Debug, Deserialize)]
+struct WatchChannelResponse {
+    #[serde(rename = "resourceId")]
+    resource_id: String,
+    #[serde(default, rename = "expiration")]
+    expiration_millis: Option<i64>,
+}
+
+/// POSTs `events.watch` for `cal` (with a freshly minted `channel_id`/`token`)
+/// and inserts the returned [`NewWatchChannel`] from Google's `resourceId` and
+/// the converted expiration (Unix ms → RFC 3339 UTC; 7 days from `now_unix`
+/// when Google omits it).
+///
+/// Shared by [`ensure_watch`] and [`renew_watch_if_needed`]. Watch HTTP 404 →
+/// [`CalendarError::GoogleNotFound`] so the caller can disable sync (same as
+/// an `events.list` 404). Other non-2xx → `GoogleApi`.
+async fn create_watch(
+    http: &dyn HttpClient,
+    watches: &dyn WatchChannelRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    callback_url: &str,
+    now_unix: i64,
+) -> Result<(), CalendarError> {
+    let channel_id = mint_channel_id();
+    let token = mint_token();
+    let url = format!(
+        "{GOOGLE_EVENTS_BASE_URL}/{}/events/watch",
+        encode_path_segment(&cal.google_calendar_id)
+    );
+    let payload = serde_json::json!({
+        "id": channel_id,
+        "type": "web_hook",
+        "address": callback_url,
+        "token": token,
+    });
+    let body =
+        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
+    let (status, response) = http.post_json(&url, &access.access_token, &body).await?;
+    if status == 404 {
+        return Err(CalendarError::GoogleNotFound);
+    }
+    if !(200..300).contains(&status) {
+        return Err(CalendarError::GoogleApi(format!(
+            "google events.watch returned {status}"
+        )));
+    }
+    let channel: WatchChannelResponse = serde_json::from_slice(&response)
+        .map_err(|err| CalendarError::InvalidResponse(format!("events.watch body: {err}")))?;
+    let expiration_secs = channel
+        .expiration_millis
+        .map(|millis| millis / 1000)
+        .unwrap_or(now_unix + WATCH_DEFAULT_TTL_SECS);
+    watches
+        .insert(
+            NewWatchChannel {
+                calendar_id: cal.id.clone(),
+                channel_id,
+                resource_id: channel.resource_id,
+                token,
+                expiration: unix_secs_to_rfc3339(expiration_secs),
+            },
+            &unix_secs_to_rfc3339(now_unix),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Ensures a Google `events.watch` channel exists for `cal`.
+///
+/// Returns `Ok` when an unexpired channel row is already stored for the
+/// calendar; otherwise POSTs `events.watch` via [`create_watch`] and inserts
+/// the channel row. Note that "unexpired" only means `expiration > now` — a
+/// channel with 23 hours left still short-circuits here; renewal is the
+/// fallback cron's job ([`renew_watch_if_needed`]).
+pub async fn ensure_watch(
+    http: &dyn HttpClient,
+    watches: &dyn WatchChannelRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    callback_url: &str,
+    now_unix: i64,
+) -> Result<(), CalendarError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    if !watches
+        .list_unexpired_by_calendar_id(&cal.id, &now_rfc3339)
+        .await?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    create_watch(http, watches, access, cal, callback_url, now_unix).await
+}
+
+/// POSTs `channels.stop` for one channel; HTTP 404 counts as success (the
+/// channel is already gone). Any other non-2xx is an error.
+async fn stop_channel(
+    http: &dyn HttpClient,
+    access: &GoogleAccess,
+    channel: &WatchChannel,
+) -> Result<(), CalendarError> {
+    let payload = serde_json::json!({
+        "id": channel.channel_id,
+        "resourceId": channel.resource_id,
+    });
+    let body =
+        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
+    let (status, _response) =
+        http.post_json(GOOGLE_CHANNELS_STOP_URL, &access.access_token, &body).await?;
+    if status == 404 {
+        return Ok(()); // already gone — success
+    }
+    if !(200..300).contains(&status) {
+        return Err(CalendarError::GoogleApi(format!(
+            "google channels.stop returned {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Stops every stored watch channel for `calendar_id` via `channels.stop`
+/// (HTTP 404 counts as success — the channel is already gone) and then HARD
+/// deletes the rows (ADR 0001).
+///
+/// Channels are stopped sequentially. On the first hard failure this returns
+/// the error **before** deleting anything: rows that were not stopped keep
+/// their `{id, resourceId}` so a later run can retry them, and earlier rows
+/// that stopped successfully may already be dead on Google's side but their
+/// rows are only removed once every stop succeeds.
+pub async fn stop_watches_for_calendar(
+    http: &dyn HttpClient,
+    watches: &dyn WatchChannelRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+) -> Result<(), CalendarError> {
+    let channels = watches.list_by_calendar_id(calendar_id).await?;
+    for channel in &channels {
+        stop_channel(http, access, channel).await?;
+    }
+    watches.delete_by_calendar_id(calendar_id).await?;
+    Ok(())
+}
+
+/// Renews a calendar's watch channel when none covers `WATCH_RENEW_HORIZON_SECS`
+/// from `now_unix` (ADR 0001 § Fallback cron).
+///
+/// `ensure_watch` only checks that some channel is unexpired (`expiration >
+/// now`) — a channel with 23 hours left would skip it. Renewal instead mints
+/// a new channel whenever no stored channel expires later than `now_unix +
+/// WATCH_RENEW_HORIZON_SECS`, then stops and hard-deletes the **old** rows
+/// individually — never `delete_by_calendar_id`, which would kill the new row.
+///
+/// Returns `Ok(true)` when a new channel was created, `Ok(false)` when the
+/// existing coverage already spans the horizon. Watch HTTP 404 →
+/// [`CalendarError::GoogleNotFound`] (the caller disables sync and stops any
+/// prior channels). If stopping an old channel fails, the error is returned
+/// and the new channel row remains — overlap of two rows per calendar is
+/// expected (ADR 0001).
+pub async fn renew_watch_if_needed(
+    http: &dyn HttpClient,
+    watches: &dyn WatchChannelRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    callback_url: &str,
+    now_unix: i64,
+) -> Result<bool, CalendarError> {
+    let existing = watches.list_by_calendar_id(&cal.id).await?;
+    let horizon = unix_secs_to_rfc3339(now_unix + WATCH_RENEW_HORIZON_SECS);
+    // RFC 3339 UTC strings of this shape compare lexicographically.
+    if existing.iter().any(|channel| channel.expiration > horizon) {
+        return Ok(false);
+    }
+
+    create_watch(http, watches, access, cal, callback_url, now_unix).await?;
+    for old in &existing {
+        stop_channel(http, access, old).await?;
+        watches.delete_by_id(&old.id).await?;
+    }
+    Ok(true)
+}
+
+/// Outcome of one fallback cron run: counters plus human-readable failures —
+/// a failure for one calendar never fails the whole job.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CronReport {
+    /// Calendars synced in this run.
+    pub synced: usize,
+    /// Watch channels minted (renewals) in this run.
+    pub renewed: usize,
+    /// Human-readable failures; empty when everything worked.
+    pub errors: Vec<String>,
+}
+
+/// The fallback cron (ADR 0001 § Fallback cron): for every sync-enabled,
+/// non-deleted calendar, sync it when `last_synced_at` is missing/unparseable
+/// or older than [`CRON_SYNC_STALE_SECS`], then renew its watch channel when
+/// none covers [`WATCH_RENEW_HORIZON_SECS`].
+///
+/// Orchestration lives here (pure, unit-tested) so the Worker's
+/// `#[event(scheduled)]` handler is a thin shell. Per-calendar failures are
+/// collected in [`CronReport::errors`] and never abort the rest of the job.
+///
+/// Per calendar, in order:
+/// 1. `refresh_if_needed` for the owner's Google token. On failure the
+///    calendar is skipped entirely (no sync, no renew).
+/// 2. Stale check (`last_synced_at` missing/unparseable, or
+///    `now - last_sync >= CRON_SYNC_STALE_SECS`) → `sync_calendar`.
+///    - `events.list` 404 disables sync, stops any prior channels, and skips
+///      the renew step (a disabled calendar is not renewed).
+///    - Other sync errors are logged but renewal still runs (the calendar is
+///      still enabled).
+/// 3. When `watch_callback_url` is a public HTTPS URL and the calendar is
+///    still enabled: `renew_watch_if_needed`. A watch 404 disables sync and
+///    stops any prior channels; other errors are logged.
+pub async fn run_fallback_cron(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    watches: &dyn WatchChannelRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    watch_callback_url: Option<&str>,
+    now_unix: i64,
+) -> CronReport {
+    let mut report = CronReport::default();
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    // Same gate as list_events: without a public HTTPS callback Google cannot
+    // deliver push notifications, so all watch I/O is skipped (local dev).
+    let callback = watch_callback_url.filter(|url| is_public_https_callback(url));
+
+    let cals = match calendars.list_sync_enabled().await {
+        Ok(cals) => cals,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("list_sync_enabled failed: {err}"));
+            return report;
+        }
+    };
+    for cal in &cals {
+        let access = match refresh_if_needed(http, tokens, oauth, &cal.user_id, now_unix).await {
+            Ok(access) => access,
+            Err(err) => {
+                report.errors.push(format!(
+                    "token refresh failed for user {} (calendar {}): {err}",
+                    cal.user_id, cal.id
+                ));
+                continue;
+            }
+        };
+
+        // Stale: never synced, unparseable timestamp, or last sync older than
+        // the cron's 15-minute threshold.
+        let stale = cal
+            .last_synced_at
+            .as_deref()
+            .and_then(rfc3339_to_unix_secs)
+            .is_none_or(|last_unix| now_unix - last_unix >= CRON_SYNC_STALE_SECS);
+        if stale {
+            match sync_calendar(http, calendars, events, &access, cal, &now_rfc3339).await {
+                Ok(()) => report.synced += 1,
+                Err(CalendarError::GoogleNotFound) => {
+                    report.errors.push(format!(
+                        "calendar {} ({}) returned 404 — disabling sync",
+                        cal.id, cal.google_calendar_id
+                    ));
+                    if let Err(err) =
+                        calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await
+                    {
+                        report.errors.push(format!(
+                            "failed to disable sync for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
+                    // The calendar is gone from Google's side: stop its
+                    // channels so stale subscriptions do not push at it.
+                    if let Err(err) =
+                        stop_watches_for_calendar(http, watches, &access, &cal.id).await
+                    {
+                        report.errors.push(format!(
+                            "failed to stop watch channels for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
+                    // Do not renew a calendar whose sync was just disabled.
+                    continue;
+                }
+                Err(err) => report.errors.push(format!(
+                    "sync failed for calendar {} ({}): {err}",
+                    cal.id, cal.google_calendar_id
+                )),
+            }
+        }
+
+        if let Some(callback_url) = callback {
+            match renew_watch_if_needed(http, watches, &access, cal, callback_url, now_unix).await
+            {
+                Ok(true) => report.renewed += 1,
+                Ok(false) => {}
+                Err(CalendarError::GoogleNotFound) => {
+                    report.errors.push(format!(
+                        "calendar {} ({}) returned 404 for events.watch — disabling sync",
+                        cal.id, cal.google_calendar_id
+                    ));
+                    if let Err(err) =
+                        calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await
+                    {
+                        report.errors.push(format!(
+                            "failed to disable sync for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
+                    if let Err(err) =
+                        stop_watches_for_calendar(http, watches, &access, &cal.id).await
+                    {
+                        report.errors.push(format!(
+                            "failed to stop watch channels for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
+                }
+                Err(err) => report.errors.push(format!(
+                    "watch renew failed for calendar {} ({}): {err}",
+                    cal.id, cal.google_calendar_id
+                )),
+            }
+        }
+    }
+    report
+}
+
+// ──────────────────────────────────────────
+// Webhook verification (ADR 0001 § Webhook)
+// ──────────────────────────────────────────
+
+/// Outcome of verifying a Google push notification (`X-Goog-*` headers)
+/// against the stored watch channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookDecision {
+    /// HTTP 200, no sync: unknown channel, bad or missing token, missing or
+    /// disabled calendar, the `sync` handshake, or any non-`exists` state.
+    /// Verification failures never surface as 4xx/5xx (no existence leak,
+    /// no Google retry hammer).
+    Ignore,
+    /// HTTP 200, then `ctx.wait_until(sync_calendar)` for this local
+    /// calendar id.
+    Sync { calendar_id: String },
+}
+
+/// Constant-time token comparison.
+///
+/// When both strings have the same length, every byte is XOR-accumulated, so
+/// a mismatch reveals nothing about *where* the tokens differ. Different
+/// lengths return `false` immediately — that is fine because our tokens are
+/// fixed 64 hex chars, so length carries no secret information. The contents
+/// are never compared with `==`.
+pub fn tokens_match(stored: &str, presented: &str) -> bool {
+    if stored.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (stored_byte, presented_byte) in stored.bytes().zip(presented.bytes()) {
+        diff |= stored_byte ^ presented_byte;
+    }
+    diff == 0
+}
+
+/// Decides what a push notification should do, from the request headers and
+/// the stored rows. Pure: no Google or D1 I/O — the caller fetches `stored`
+/// (via `X-Goog-Channel-ID`) and `calendar` (via `stored.calendar_id`)
+/// first.
+///
+/// Rules (ADR 0001 § Webhook), in order:
+/// 1. `stored` is `None` → [`WebhookDecision::Ignore`] (unknown channel).
+/// 2. `presented_token` is `None` or `!tokens_match(stored.token, …)` →
+///    [`WebhookDecision::Ignore`].
+/// 3. `calendar` is `None` (missing or soft-deleted — `get_by_id` already
+///    filters `deleted_at IS NULL`) or `!calendar.sync_enabled` →
+///    [`WebhookDecision::Ignore`].
+/// 4. `resource_state` == `"exists"` → [`WebhookDecision::Sync`] for
+///    `stored.calendar_id`.
+/// 5. `"sync"` (the channel handshake) or anything else →
+///    [`WebhookDecision::Ignore`].
+///
+/// The state comparison is case-sensitive and exact: Google sends bare
+/// values like `exists`/`sync`, so a whitespace-wrapped `exists` is treated
+/// as an unknown state and ignored.
+pub fn decide_webhook(
+    resource_state: &str,
+    stored: Option<&WatchChannel>,
+    presented_token: Option<&str>,
+    calendar: Option<&GoogleCalendar>,
+) -> WebhookDecision {
+    let Some(stored) = stored else {
+        return WebhookDecision::Ignore;
+    };
+    let Some(presented) = presented_token else {
+        return WebhookDecision::Ignore;
+    };
+    if !tokens_match(&stored.token, presented) {
+        return WebhookDecision::Ignore;
+    }
+    let Some(calendar) = calendar else {
+        return WebhookDecision::Ignore;
+    };
+    if !calendar.sync_enabled {
+        return WebhookDecision::Ignore;
+    }
+    if resource_state == "exists" {
+        return WebhookDecision::Sync {
+            calendar_id: stored.calendar_id.clone(),
+        };
+    }
+    WebhookDecision::Ignore
+}
+
 /// Imports `/users/me/calendarList` and upserts each entry (all imported
 /// calendars default to `sync_enabled = true`).
 async fn refresh_calendar_list(
@@ -284,7 +875,10 @@ async fn refresh_calendar_list(
 /// Full or incremental sync of one calendar: fetch events (following
 /// `nextPageToken`, retrying once on 410), upsert them, and store the new
 /// sync cursor.
-async fn sync_calendar(
+///
+/// `pub` for the webhook handler and the fallback cron (later slices); the
+/// request path reaches it via [`list_events`].
+pub async fn sync_calendar(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
@@ -336,13 +930,25 @@ async fn sync_calendar(
         }
     }
 
-    let mapped: Vec<NewCalendarEvent> = all_items
-        .iter()
-        .filter(|item| !is_skipped(item))
-        .map(|item| map_google_event(item, &cal.id, now_rfc3339))
-        .collect();
-    if !mapped.is_empty() {
-        events.upsert_batch(mapped, now_rfc3339).await?;
+    let mut to_upsert: Vec<NewCalendarEvent> = Vec::new();
+    for item in &all_items {
+        if item.status.as_deref() == Some("cancelled") {
+            // Incremental cancelled event: soft-delete the cached row (a no-op
+            // when the row was never cached, e.g. an all-day event). A delete
+            // failure propagates so the sync token is not advanced after a
+            // partial apply.
+            events
+                .delete_by_google_event_id(&cal.id, &item.id, now_rfc3339)
+                .await?;
+            continue;
+        }
+        if is_skipped(item) {
+            continue;
+        }
+        to_upsert.push(map_google_event(item, &cal.id, now_rfc3339));
+    }
+    if !to_upsert.is_empty() {
+        events.upsert_batch(to_upsert, now_rfc3339).await?;
     }
 
     // Keep the previous sync token when Google omitted nextSyncToken.
@@ -394,14 +1000,12 @@ fn encode_path_segment(segment: &str) -> String {
     out
 }
 
-/// Whether a Google event should be skipped during sync: cancelled events and
-/// events without `start.dateTime`/`end.dateTime` (e.g. all-day events, which
-/// use `start.date` instead). The old Go parser stored zero times for those —
-/// skipping is cleaner.
+/// Whether a Google event should be skipped during sync: events without
+/// `start.dateTime`/`end.dateTime` (e.g. all-day events, which use
+/// `start.date` instead). The old Go parser stored zero times for those —
+/// skipping is cleaner. Cancelled events are NOT skipped here; they are
+/// soft-deleted first in [`sync_calendar`].
 fn is_skipped(event: &GoogleEvent) -> bool {
-    if event.status.as_deref() == Some("cancelled") {
-        return true;
-    }
     let has_date_time =
         |time: &Option<GoogleEventTime>| matches!(time, Some(t) if !t.date_time.as_deref().unwrap_or("").is_empty());
     !(has_date_time(&event.start) && has_date_time(&event.end))
@@ -521,7 +1125,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::models::{GoogleCalendar, NewCalendar};
+    use crate::models::{GoogleCalendar, GoogleOAuthToken, NewCalendar, NewToken, WatchChannel};
 
     // ──────────────────────────────────────────
     // Fakes
@@ -620,6 +1224,17 @@ mod tests {
             Ok(self.stored.lock().unwrap().clone())
         }
 
+        async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|cal| cal.sync_enabled && cal.deleted_at.is_none())
+                .cloned()
+                .collect())
+        }
+
         async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
             Ok(self
                 .stored
@@ -709,7 +1324,9 @@ mod tests {
         upserted_batch: Mutex<Vec<NewCalendarEvent>>,
         upserted_single: Mutex<Option<(String, NewCalendarEvent)>>,
         ranged: Mutex<Vec<(String, String, String)>>,
+        deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
         fail_upsert: Mutex<bool>,
+        fail_delete: Mutex<bool>,
         next_id: Mutex<u64>,
     }
 
@@ -720,7 +1337,9 @@ mod tests {
                 upserted_batch: Mutex::new(Vec::new()),
                 upserted_single: Mutex::new(None),
                 ranged: Mutex::new(Vec::new()),
+                deleted_by_google_event_id: Mutex::new(Vec::new()),
                 fail_upsert: Mutex::new(false),
+                fail_delete: Mutex::new(false),
                 next_id: Mutex::new(1),
             }
         }
@@ -787,10 +1406,17 @@ mod tests {
 
         async fn delete_by_google_event_id(
             &self,
-            _calendar_id: &str,
-            _google_event_id: &str,
+            calendar_id: &str,
+            google_event_id: &str,
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            self.deleted_by_google_event_id
+                .lock()
+                .unwrap()
+                .push((calendar_id.to_string(), google_event_id.to_string()));
+            if *self.fail_delete.lock().unwrap() {
+                return Err(RepoError::Backend("cache delete failed".into()));
+            }
             Ok(())
         }
 
@@ -800,6 +1426,119 @@ mod tests {
             _older_than_rfc3339: &str,
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// In-memory watch-channel repo: stores rows and records every
+    /// insert/delete/list call so tests can assert watch behavior.
+    struct FakeWatchChannelRepo {
+        stored: Mutex<Vec<WatchChannel>>,
+        inserted: Mutex<Vec<NewWatchChannel>>,
+        deleted_by_id: Mutex<Vec<String>>,
+        deleted_by_calendar_id: Mutex<Vec<String>>,
+    }
+
+    impl FakeWatchChannelRepo {
+        fn new() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                inserted: Mutex::new(Vec::new()),
+                deleted_by_id: Mutex::new(Vec::new()),
+                deleted_by_calendar_id: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with(channels: Vec<WatchChannel>) -> Self {
+            Self {
+                stored: Mutex::new(channels),
+                inserted: Mutex::new(Vec::new()),
+                deleted_by_id: Mutex::new(Vec::new()),
+                deleted_by_calendar_id: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl WatchChannelRepo for FakeWatchChannelRepo {
+        async fn insert(
+            &self,
+            channel: NewWatchChannel,
+            now_rfc3339: &str,
+        ) -> Result<String, RepoError> {
+            self.inserted.lock().unwrap().push(channel.clone());
+            // Ids must not collide with preloaded fixture rows (the real D1
+            // impl mints UUIDv4s).
+            let id = format!("wc-{}", self.stored.lock().unwrap().len() + 1);
+            self.stored.lock().unwrap().push(WatchChannel {
+                id: id.clone(),
+                calendar_id: channel.calendar_id.clone(),
+                channel_id: channel.channel_id.clone(),
+                resource_id: channel.resource_id.clone(),
+                token: channel.token.clone(),
+                expiration: channel.expiration.clone(),
+                created_at: now_rfc3339.to_string(),
+                updated_at: now_rfc3339.to_string(),
+            });
+            Ok(id)
+        }
+
+        async fn get_by_channel_id(
+            &self,
+            _channel_id: &str,
+        ) -> Result<Option<WatchChannel>, RepoError> {
+            Ok(None)
+        }
+
+        async fn list_by_calendar_id(
+            &self,
+            calendar_id: &str,
+        ) -> Result<Vec<WatchChannel>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|channel| channel.calendar_id == calendar_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn list_unexpired_by_calendar_id(
+            &self,
+            calendar_id: &str,
+            now_rfc3339: &str,
+        ) -> Result<Vec<WatchChannel>, RepoError> {
+            // RFC 3339 UTC strings compare lexicographically (fixed width).
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|channel| channel.calendar_id == calendar_id)
+                .filter(|channel| channel.expiration.as_str() > now_rfc3339)
+                .cloned()
+                .collect())
+        }
+
+        async fn delete_by_id(&self, id: &str) -> Result<(), RepoError> {
+            self.deleted_by_id.lock().unwrap().push(id.to_string());
+            self.stored
+                .lock()
+                .unwrap()
+                .retain(|channel| channel.id != id);
+            Ok(())
+        }
+
+        async fn delete_by_calendar_id(&self, calendar_id: &str) -> Result<(), RepoError> {
+            self.deleted_by_calendar_id
+                .lock()
+                .unwrap()
+                .push(calendar_id.to_string());
+            self.stored
+                .lock()
+                .unwrap()
+                .retain(|channel| channel.calendar_id != calendar_id);
             Ok(())
         }
     }
@@ -818,9 +1557,18 @@ mod tests {
     }
 
     fn calendar(id: &str, google_cal_id: &str, sync_enabled: bool) -> GoogleCalendar {
+        calendar_for_user("u-1", id, google_cal_id, sync_enabled)
+    }
+
+    fn calendar_for_user(
+        user_id: &str,
+        id: &str,
+        google_cal_id: &str,
+        sync_enabled: bool,
+    ) -> GoogleCalendar {
         GoogleCalendar {
             id: id.to_string(),
-            user_id: "u-1".to_string(),
+            user_id: user_id.to_string(),
             google_calendar_id: google_cal_id.to_string(),
             summary: "Work".to_string(),
             time_zone: "UTC".to_string(),
@@ -834,6 +1582,90 @@ mod tests {
             deleted_at: None,
         }
     }
+
+    /// Token repo for cron tests: returns a stored token per user (expiring
+    /// far in the future, so `refresh_if_needed` never POSTs) — or `None`
+    /// for users without one, which fails that user's refresh without
+    /// touching anyone else. Records nothing.
+    struct FakeTokenRepo {
+        stored: std::sync::Mutex<std::collections::HashMap<String, GoogleOAuthToken>>,
+    }
+
+    impl FakeTokenRepo {
+        fn with(tokens: Vec<GoogleOAuthToken>) -> Self {
+            let stored = tokens
+                .into_iter()
+                .map(|token| (token.user_id.clone(), token))
+                .collect();
+            Self {
+                stored: std::sync::Mutex::new(stored),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TokenRepo for FakeTokenRepo {
+        async fn get_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<GoogleOAuthToken>, RepoError> {
+            Ok(self.stored.lock().unwrap().get(user_id).cloned())
+        }
+
+        async fn upsert(&self, _token: NewToken) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _user_id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// A stored OAuth token for `user_id` whose expiry is centuries out, so
+    /// `refresh_if_needed` returns it as-is (no refresh POST).
+    fn fresh_token(user_id: &str, access_token: &str) -> GoogleOAuthToken {
+        GoogleOAuthToken {
+            id: format!("tok-{user_id}"),
+            user_id: user_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expiry: "2099-01-01T00:00:00Z".to_string(),
+            token_type: "Bearer".to_string(),
+            scope: Some("calendar".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// OAuth client credentials for `run_fallback_cron` tests; the fresh
+    /// tokens above mean `refresh_if_needed` never uses them.
+    fn oauth_config() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "client-id.apps.googleusercontent.com".to_string(),
+            client_secret: "client-secret".to_string(),
+            redirect_url: "http://localhost:5173/auth/google/callback".to_string(),
+        }
+    }
+
+    /// A stored watch channel for `calendar_id` with the given RFC 3339
+    /// `expiration` (future expirations must be > NOW_UNIX's instant,
+    /// 2023-11-14T22:13:20Z, to count as unexpired).
+    fn watch_channel(calendar_id: &str, expiration: &str) -> WatchChannel {
+        WatchChannel {
+            id: "wc-1".to_string(),
+            calendar_id: calendar_id.to_string(),
+            channel_id: "minted-id".to_string(),
+            resource_id: "resource-1".to_string(),
+            token: "tok-1".to_string(),
+            expiration: expiration.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    const CALLBACK_URL: &str =
+        "https://my-sanctuary.fahimalizain.com/api/calendar/notifications";
 
     const CALENDAR_LIST_JSON: &str = r#"{
         "items": [
@@ -925,9 +1757,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -955,14 +1788,17 @@ mod tests {
     }
 
     #[test]
-    fn stale_calendar_is_synced_before_the_cache_query() {
+    fn never_synced_calendar_is_synced_before_the_cache_query() {
+        // `calendar()` defaults to `last_synced_at: None` — first paint, so
+        // the sync is awaited before the cache query.
         let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -995,21 +1831,25 @@ mod tests {
     }
 
     #[test]
-    fn fresh_calendar_is_not_synced() {
+    fn previously_synced_calendar_is_not_synced_even_if_old() {
         let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
         let mut cal = calendar("cal-1", "primary@example.com", true);
-        cal.last_synced_at = Some("2023-11-14T22:13:00Z".to_string()); // 20s ago
+        // Days old — stale under the old 5-minute rule, but the request path
+        // is cache-only once `last_synced_at` is set (ADR 0001).
+        cal.last_synced_at = Some("2023-11-10T00:00:00Z".to_string());
         let calendars = FakeCalendarRepo::with(vec![cal]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
-        assert!(http.gets.lock().unwrap().is_empty(), "no Google calls for fresh calendar");
+        assert!(http.gets.lock().unwrap().is_empty(), "no Google calls for a previously synced calendar");
         assert!(events.upserted_batch.lock().unwrap().is_empty());
+        assert!(calendars.sync_states.lock().unwrap().is_empty(), "sync state untouched");
         assert!(output.sync_errors.is_empty());
     }
 
@@ -1019,9 +1859,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", false)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -1036,9 +1877,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "holidays", true)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -1062,9 +1904,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![cal]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -1086,9 +1929,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -1109,9 +1953,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -1123,10 +1968,39 @@ mod tests {
     }
 
     #[test]
-    fn all_day_and_cancelled_events_are_skipped() {
+    fn all_day_and_no_time_events_are_skipped() {
         let body = r#"{"items":[
             {"id": "all-day", "start": {"date": "2026-08-01"}, "end": {"date": "2026-08-02"}},
             {"id": "no-time", "summary": "No times at all"},
+            {"id": "real", "summary": "Real",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ], "nextSyncToken": "st-9"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        let upserted = events.upserted_batch.lock().unwrap();
+        assert_eq!(upserted.len(), 1, "only the timed event");
+        assert_eq!(upserted[0].google_event_id, "real");
+        assert!(
+            events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+            "skipped events are not deleted"
+        );
+        assert_eq!(output.events.len(), 1);
+        // Sync state still advances even when everything was skipped.
+        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+    }
+
+    #[test]
+    fn cancelled_events_are_soft_deleted() {
+        let body = r#"{"items":[
             {"id": "cancelled", "status": "cancelled",
              "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}},
             {"id": "real", "summary": "Real",
@@ -1136,18 +2010,63 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
+        // Cancelled events are soft-deleted by google id, not skipped.
+        assert_eq!(
+            *events.deleted_by_google_event_id.lock().unwrap(),
+            vec![("cal-1".to_string(), "cancelled".to_string())]
+        );
         let upserted = events.upserted_batch.lock().unwrap();
         assert_eq!(upserted.len(), 1, "only the timed, non-cancelled event");
         assert_eq!(upserted[0].google_event_id, "real");
         assert_eq!(output.events.len(), 1);
-        // Sync state still advances even when everything was skipped.
+        // Sync state still advances.
         assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+    }
+
+    #[test]
+    fn cancelled_event_delete_failure_does_not_advance_sync_token() {
+        let body = r#"{"items":[
+            {"id": "cancelled", "status": "cancelled",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}},
+            {"id": "real", "summary": "Real",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ], "nextSyncToken": "st-9"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        *events.fail_delete.lock().unwrap() = true;
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            *events.deleted_by_google_event_id.lock().unwrap(),
+            vec![("cal-1".to_string(), "cancelled".to_string())]
+        );
+        // A delete failure fails the sync: no partial apply, no upsert, and
+        // the sync token must not advance.
+        assert!(events.upserted_batch.lock().unwrap().is_empty());
+        assert!(
+            calendars.sync_states.lock().unwrap().is_empty(),
+            "sync token must not advance after a delete failure"
+        );
+        assert_eq!(output.sync_errors.len(), 1);
+        assert!(
+            output.sync_errors[0].contains("cache delete failed"),
+            "{}",
+            output.sync_errors[0]
+        );
     }
 
     #[test]
@@ -1156,9 +2075,10 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
 
+        let watches = FakeWatchChannelRepo::new();
         let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
-            "2026-09-01T00:00:00Z", NOW_UNIX,
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
         ))
         .unwrap();
 
@@ -1166,6 +2086,587 @@ mod tests {
         assert!(output.sync_errors[0].contains("500"), "{}", output.sync_errors[0]);
         assert!(output.events.is_empty());
         assert!(calendars.disabled.lock().unwrap().is_empty(), "500 is not a 404");
+    }
+
+    // ──────────────────────────────────────────
+    // is_public_https_callback
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn is_public_https_callback_accepts_only_public_https_urls() {
+        assert!(is_public_https_callback(CALLBACK_URL));
+        assert!(is_public_https_callback("https://sanctuary.example.com/notify"));
+        assert!(is_public_https_callback("https://SANCTUARY.EXAMPLE.COM/notify"));
+
+        assert!(!is_public_https_callback(""), "empty is false");
+        assert!(!is_public_https_callback("not a url"), "unparseable is false");
+        assert!(
+            !is_public_https_callback("http://my-sanctuary.fahimalizain.com/api/calendar/notifications"),
+            "http scheme is false"
+        );
+        assert!(!is_public_https_callback("https://localhost/api/calendar/notifications"));
+        assert!(!is_public_https_callback("https://LOCALHOST:8443/x"), "host case-insensitive");
+        assert!(!is_public_https_callback("https://127.0.0.1:8787/api/calendar/notifications"));
+        assert!(!is_public_https_callback("https://[::1]/api/calendar/notifications"));
+    }
+
+    // ──────────────────────────────────────────
+    // list_events watch wiring
+    // ──────────────────────────────────────────
+
+    const WATCH_JSON: &str = r#"{"id":"minted-id","resourceId":"resource-123","expiration":1710000000000}"#;
+
+    #[test]
+    fn list_events_skips_watch_when_callback_is_none() {
+        // FakeHttp has no `/watch` route: if list_events tried to watch, the
+        // fake would panic with "no route for …/events/watch".
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert!(http.posts.lock().unwrap().is_empty(), "no watch POST without a callback");
+        assert!(watches.inserted.lock().unwrap().is_empty());
+        // The first-paint sync still runs with no callback configured.
+        assert_eq!(http.gets.lock().unwrap().len(), 1);
+        assert_eq!(output.events.len(), 2);
+        assert!(output.sync_errors.is_empty());
+    }
+
+    #[test]
+    fn list_events_skips_watch_when_callback_is_localhost() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX,
+            Some("http://localhost:8787/api/calendar/notifications"),
+        ))
+        .unwrap();
+
+        assert!(http.posts.lock().unwrap().is_empty(), "no watch POST for a localhost callback");
+        assert!(watches.inserted.lock().unwrap().is_empty());
+        assert_eq!(output.events.len(), 2, "first-paint sync unaffected");
+        assert!(output.sync_errors.is_empty());
+    }
+
+    #[test]
+    fn never_synced_calendar_is_watched_then_synced() {
+        // `/events/watch` must precede `/events`: the substring matcher would
+        // otherwise swallow the watch POST URL.
+        let http = FakeHttp::new(vec![
+            ("/events/watch", 200, WATCH_JSON),
+            ("/events", 200, EVENTS_JSON),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX,
+            Some(CALLBACK_URL),
+        ))
+        .unwrap();
+
+        // Watch POST: web_hook with the configured callback address.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "one watch POST");
+        let (url, body) = posts.first().unwrap().clone();
+        assert!(url.contains("/calendars/primary%40example.com/events/watch"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["type"], "web_hook");
+        assert_eq!(body["address"], CALLBACK_URL);
+        assert_eq!(body["id"].as_str().unwrap().len(), 36, "uuid-shaped channel id");
+        assert_eq!(body["token"].as_str().unwrap().len(), 64, "64 hex chars");
+
+        // Channel row inserted with Google's resourceId + converted expiration
+        // (1710000000000 ms == 1710000000 s == 2024-03-09T16:00:00Z).
+        let inserted = watches.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].calendar_id, "cal-1");
+        assert_eq!(inserted[0].resource_id, "resource-123");
+        assert_eq!(inserted[0].expiration, "2024-03-09T16:00:00Z");
+
+        // First-paint sync still ran and populated the cache.
+        assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
+        assert_eq!(output.events.len(), 2);
+        assert!(output.sync_errors.is_empty());
+    }
+
+    #[test]
+    fn already_unexpired_channel_does_not_rewatch() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        // Future expiration: 2023-11-21T22:13:20Z > NOW_UNIX instant.
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-21T22:13:20Z")]);
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX,
+            Some(CALLBACK_URL),
+        ))
+        .unwrap();
+
+        assert!(http.posts.lock().unwrap().is_empty(), "unexpired channel must not be rewatched");
+        assert!(watches.inserted.lock().unwrap().is_empty());
+        assert_eq!(http.gets.lock().unwrap().len(), 1, "sync still runs");
+        assert!(output.sync_errors.is_empty());
+    }
+
+    #[test]
+    fn watch_404_disables_sync_and_does_not_list_events() {
+        let http = FakeHttp::new(vec![("/events/watch", 404, r#"{"error":"not found"}"#)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX,
+            Some(CALLBACK_URL),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            *calendars.disabled.lock().unwrap(),
+            vec![("cal-1".to_string(), false)]
+        );
+        assert!(http.gets.lock().unwrap().is_empty(), "no events.list after watch 404");
+        assert!(events.upserted_batch.lock().unwrap().is_empty());
+        assert_eq!(output.sync_errors.len(), 1);
+        assert!(output.sync_errors[0].contains("404"), "{}", output.sync_errors[0]);
+    }
+
+    #[test]
+    fn events_list_404_stops_existing_watches() {
+        let http = FakeHttp::new(vec![
+            ("/events", 404, r#"{"error":"not found"}"#),
+            ("/channels/stop", 200, "{}"),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        // Channel preloaded unexpired: ensure_watch short-circuits, so the
+        // only POST is channels.stop from the events.list 404 path.
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-21T22:13:20Z")]);
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX,
+            Some(CALLBACK_URL),
+        ))
+        .unwrap();
+
+        // events.list 404 → sync disabled (as before)…
+        assert_eq!(
+            *calendars.disabled.lock().unwrap(),
+            vec![("cal-1".to_string(), false)]
+        );
+        // …and the stored channel is stopped and hard-deleted.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let (url, body) = posts.first().unwrap().clone();
+        assert!(url.contains("/channels/stop"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["id"], "minted-id");
+        assert_eq!(body["resourceId"], "resource-1");
+        assert_eq!(
+            *watches.deleted_by_calendar_id.lock().unwrap(),
+            vec!["cal-1".to_string()]
+        );
+        assert!(watches.stored.lock().unwrap().is_empty(), "rows hard-deleted");
+        assert_eq!(output.sync_errors.len(), 1);
+        assert!(output.sync_errors[0].contains("404"), "{}", output.sync_errors[0]);
+    }
+
+    // ──────────────────────────────────────────
+    // renew_watch_if_needed / run_fallback_cron
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn renew_skips_when_channel_expires_after_horizon() {
+        // No /events/watch route: a watch POST would panic "no route".
+        let http = FakeHttp::new(vec![]);
+        let cal = calendar("cal-1", "primary@example.com", true);
+        // 2023-11-16T00:00:00Z > horizon (now + 24h == 2023-11-15T22:13:20Z).
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-16T00:00:00Z")]);
+
+        let renewed = pollster::block_on(renew_watch_if_needed(
+            &http, &watches, &access(), &cal, CALLBACK_URL, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert!(!renewed, "existing coverage spans the horizon");
+        assert!(http.posts.lock().unwrap().is_empty(), "no watch POST");
+        assert!(watches.inserted.lock().unwrap().is_empty());
+        assert!(watches.deleted_by_id.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn renew_creates_watch_and_stops_old_when_expiring_within_horizon() {
+        let http = FakeHttp::new(vec![
+            ("/events/watch", 200, WATCH_JSON),
+            ("/channels/stop", 200, "{}"),
+        ]);
+        let cal = calendar("cal-1", "primary@example.com", true);
+        // 1 hour out: unexpired (ensure_watch would short-circuit) but inside
+        // the 24-hour horizon — the cron must renew.
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-14T23:13:20Z")]);
+
+        let renewed = pollster::block_on(renew_watch_if_needed(
+            &http, &watches, &access(), &cal, CALLBACK_URL, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert!(renewed, "new channel minted");
+        // New channel inserted with the same body/minting contract as
+        // ensure_watch: Google's resourceId + converted expiration.
+        let inserted = watches.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].calendar_id, "cal-1");
+        assert_eq!(inserted[0].resource_id, "resource-123");
+        assert_eq!(inserted[0].expiration, "2024-03-09T16:00:00Z");
+
+        // watch POST, then a channels.stop POST with the OLD channel's id.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2);
+        assert!(posts[0].0.contains("/events/watch"), "{}", posts[0].0);
+        assert!(posts[1].0.contains("/channels/stop"), "{}", posts[1].0);
+        let stop_body: serde_json::Value = serde_json::from_str(&posts[1].1).unwrap();
+        assert_eq!(stop_body["id"], "minted-id");
+        assert_eq!(stop_body["resourceId"], "resource-1");
+
+        // Old row hard-deleted by id only — never delete_by_calendar_id
+        // (that would kill the new row). The new row remains stored.
+        assert_eq!(
+            *watches.deleted_by_id.lock().unwrap(),
+            vec!["wc-1".to_string()]
+        );
+        assert!(watches.deleted_by_calendar_id.lock().unwrap().is_empty());
+        let stored = watches.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1, "new row only");
+        assert_eq!(stored[0].channel_id, inserted[0].channel_id);
+    }
+
+    #[test]
+    fn cron_syncs_stale_and_skips_fresh() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let mut stale = calendar("cal-a", "primary@example.com", true);
+        stale.last_synced_at = Some("2023-11-14T21:53:20Z".to_string()); // 20 min ago
+        let mut fresh = calendar("cal-b", "secondary@example.com", true);
+        fresh.last_synced_at = Some("2023-11-14T22:12:20Z".to_string()); // 1 min ago
+        let calendars = FakeCalendarRepo::with(vec![stale, fresh]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1, "only the stale calendar synced");
+        assert_eq!(report.renewed, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1, "fresh calendar must not hit events.list");
+        assert!(gets[0].contains("primary%40example.com/events"), "{:?}", gets);
+        let states = calendars.sync_states.lock().unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].0, "cal-a");
+    }
+
+    #[test]
+    fn cron_syncs_never_synced() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        // `calendar()` defaults last_synced_at: None → stale by definition.
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1);
+        assert_eq!(report.renewed, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(http.gets.lock().unwrap().len(), 1);
+        assert_eq!(calendars.sync_states.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cron_watch_404_disables() {
+        let http = FakeHttp::new(vec![("/events/watch", 404, r#"{"error":"not found"}"#)]);
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.last_synced_at = Some("2023-11-14T22:12:20Z".to_string()); // fresh → no sync
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, Some(CALLBACK_URL), NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.renewed, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("404"), "{}", report.errors[0]);
+        assert_eq!(
+            *calendars.disabled.lock().unwrap(),
+            vec![("cal-1".to_string(), false)]
+        );
+        assert!(
+            http.gets.lock().unwrap().is_empty(),
+            "fresh calendar was not synced"
+        );
+    }
+
+    #[test]
+    fn cron_skips_watch_when_callback_not_public() {
+        // No /events/watch route: a renew attempt would panic "no route".
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth,
+            Some("http://localhost:8787/api/calendar/notifications"),
+            NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1, "sync unaffected by the callback gate");
+        assert_eq!(report.renewed, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            http.posts.lock().unwrap().is_empty(),
+            "no watch POST for a non-public callback"
+        );
+    }
+
+    #[test]
+    fn cron_token_refresh_failure_for_one_user_does_not_abort_the_rest() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        // User u-a has NO stored token → refresh fails; u-b has one → proceeds.
+        let mut cal_a = calendar_for_user("u-a", "cal-a", "primary@example.com", true);
+        cal_a.last_synced_at = Some("2023-11-14T21:53:20Z".to_string()); // stale
+        let mut cal_b = calendar_for_user("u-b", "cal-b", "secondary@example.com", true);
+        cal_b.last_synced_at = Some("2023-11-14T21:53:20Z".to_string()); // stale
+        let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-b", "at-b")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1, "u-b's calendar synced despite u-a's failure");
+        assert_eq!(report.renewed, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("u-a"), "{}", report.errors[0]);
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1);
+        assert!(gets[0].contains("secondary%40example.com"), "{:?}", gets);
+    }
+
+    // ──────────────────────────────────────────
+    // decide_webhook / tokens_match
+    // ──────────────────────────────────────────
+
+    /// A stored channel whose token is `tok-1` (the `watch_channel` fixture
+    /// token), so the fixture calendar and channel pair verify cleanly.
+    fn webhook_channel(calendar_id: &str) -> WatchChannel {
+        watch_channel(calendar_id, "2023-11-21T22:13:20Z")
+    }
+
+    #[test]
+    fn unknown_channel_is_ignored() {
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                None,
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn token_mismatch_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("tok-2"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn token_length_mismatch_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("short"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn missing_token_header_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                None,
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn missing_calendar_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook("exists", Some(&channel), Some("tok-1"), None),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn sync_disabled_calendar_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", false)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn sync_handshake_state_is_ignored() {
+        // Channel + calendar verify, but the `sync` handshake must not sync.
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "sync",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn unknown_state_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        let calendar = calendar("cal-1", "primary@example.com", true);
+        for state in ["", "deleted", "EXISTS", "exists2"] {
+            assert_eq!(
+                decide_webhook(state, Some(&channel), Some("tok-1"), Some(&calendar)),
+                WebhookDecision::Ignore,
+                "state {state:?} must not sync"
+            );
+        }
+    }
+
+    #[test]
+    fn exists_with_extra_whitespace_is_ignored() {
+        // Google sends bare values; a padded `exists` is not one of them.
+        let channel = webhook_channel("cal-1");
+        let calendar = calendar("cal-1", "primary@example.com", true);
+        for state in [" exists", "exists ", " exists ", "\texists"] {
+            assert_eq!(
+                decide_webhook(state, Some(&channel), Some("tok-1"), Some(&calendar)),
+                WebhookDecision::Ignore,
+                "state {state:?} must not sync"
+            );
+        }
+    }
+
+    #[test]
+    fn exists_state_syncs_the_channel_calendar() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Sync {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn tokens_match_compares_whole_strings() {
+        let stored = "0123456789abcdef0123456789abcdef";
+        assert!(tokens_match(stored, "0123456789abcdef0123456789abcdef"));
+        assert!(
+            !tokens_match(stored, "1123456789abcdef0123456789abcdef"),
+            "first byte differs"
+        );
+        assert!(
+            !tokens_match(stored, "0123456789abcdef0123456789abcde0"),
+            "last byte differs"
+        );
+    }
+
+    #[test]
+    fn tokens_match_rejects_different_lengths() {
+        assert!(!tokens_match("abcdef", "abc"));
+        assert!(!tokens_match("", "x"));
+        assert!(tokens_match("", ""));
+    }
+
+    #[test]
+    fn tokens_match_handles_real_64_hex_tokens() {
+        let stored = "a".repeat(64);
+        let same = "a".repeat(64);
+        let different = format!("{}b", "a".repeat(63));
+        assert!(tokens_match(&stored, &same));
+        assert!(!tokens_match(&stored, &different));
+        assert!(!tokens_match(&stored, &"a".repeat(63)));
     }
 
     // ──────────────────────────────────────────

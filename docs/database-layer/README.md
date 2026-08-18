@@ -1,5 +1,7 @@
 # Database Layer
 
+Architecture decisions are recorded in [`docs/adr/`](../adr/) — see [ADR 0001: Google Calendar watch channels](../adr/0001-google-calendar-watch-channels.md) for the watch-channel schema.
+
 Documentation for the database layer of `@packages/api-core`, the shared Go
 library consumed by both `@apps/api` (native local dev) and
 `@apps/cloudflare-deploy` (Cloudflare Workers WASM + D1).
