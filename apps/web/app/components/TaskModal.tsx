@@ -9,7 +9,11 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import type { TaskCategorySummary, TaskPriority, TaskRecord } from '@/app/types';
+import type {
+  TaskCategorySummary,
+  TaskPriority,
+  TaskRecord,
+} from '@/app/types';
 
 interface TaskFormValues {
   title: string;
@@ -88,7 +92,7 @@ export function TaskModal({
     if (!task) return;
     setSaving(true);
     setFormError(null);
-    const error = await onDelete?.(task.id) ?? null;
+    const error = (await onDelete?.(task.id)) ?? null;
     setSaving(false);
     if (error) {
       setFormError(error);
@@ -105,7 +109,10 @@ export function TaskModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[480px] p-0 gap-0 overflow-hidden bg-card border-border">
         {/* Header accent bar */}
-        <div className="h-2" style={{ backgroundColor: hintCategory?.color || undefined }} />
+        <div
+          className="h-2"
+          style={{ backgroundColor: hintCategory?.color || undefined }}
+        />
 
         <div className="p-6">
           <DialogHeader className="mb-6">
@@ -231,9 +238,7 @@ export function TaskModal({
               {hintCategory ? hintCategory.title : '—'}
             </span>
             {hintCategory?.is_untracked && (
-              <span className="text-xs text-muted-foreground">
-                (untracked)
-              </span>
+              <span className="text-xs text-muted-foreground">(untracked)</span>
             )}
           </div>
 
