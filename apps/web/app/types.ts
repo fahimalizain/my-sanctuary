@@ -161,3 +161,68 @@ export interface UpdateCategoryInput {
   sort_order?: number;
   patterns?: NewCategoryPatternInput[];
 }
+
+export type TaskPriority = 'high' | 'medium' | 'low';
+
+// The computed category attached to a task (`tasks` have no category_id
+// column — the server classifies the title and returns this summary). The
+// frontend groups tasks under `category.id`.
+export interface TaskCategorySummary {
+  id: string;
+  title: string;
+  slug: string;
+  list_id: string | null;
+  inherited_list_id: string | null;
+  is_untracked: boolean;
+  color: string;
+}
+
+// A task as returned by the API: the `tasks` row shape (snake_case) plus the
+// computed `category`. `status` is read-only this slice (always "OPEN").
+export interface TaskRecord {
+  id: string;
+  user_id: string;
+  title: string;
+  description: string;
+  duration_minutes: number;
+  priority: TaskPriority;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  category: TaskCategorySummary;
+}
+
+// The envelope returned by GET /api/tasks
+export interface TasksResponse {
+  tasks: TaskRecord[];
+}
+
+// The envelope returned by POST /api/tasks and PATCH /api/tasks/:id
+export interface TaskResponse {
+  task: TaskRecord;
+}
+
+// The envelope returned by DELETE /api/tasks/:id
+export interface DeleteTaskResponse {
+  success: boolean;
+}
+
+// Request body for POST /api/tasks. The title must uniquely match a
+// non-untracked category (the server decides and explains 400s); duration
+// defaults to 15 minutes, priority to 'medium'.
+export interface NewTaskInput {
+  title: string;
+  description?: string;
+  duration_minutes?: number;
+  priority?: TaskPriority;
+}
+
+// Request body for PATCH /api/tasks/:id — every field optional. A present
+// `title` must uniquely match a non-untracked category. Status is never
+// updatable (that is slice 4).
+export interface UpdateTaskInput {
+  title?: string;
+  description?: string;
+  duration_minutes?: number;
+  priority?: TaskPriority;
+}

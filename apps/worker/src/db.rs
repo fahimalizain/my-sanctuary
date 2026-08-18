@@ -12,14 +12,14 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
     NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, NewWatchChannel,
-    TaskCategory, TaskCategoryPattern, TaskList, UpdateTaskCategory, UpdateTaskList, User,
-    WatchChannel,
+    Task, TaskCategory, TaskCategoryPattern, TaskList, UpdateTask, UpdateTaskCategory,
+    UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TokenRepo, UserRepo, WatchChannelRepo, CALENDAR_DELETE_SQL,
+    TaskListRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo, CALENDAR_DELETE_SQL,
     CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
     CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
     CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL,
@@ -28,11 +28,12 @@ use api_core::repo::{
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
     TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
-    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
+    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
+    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
-    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TOKEN_DELETE_SQL,
-    TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL,
-    USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
+    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TASK_UPDATE_SQL,
+    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL,
+    USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
     WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
     WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
     WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
@@ -873,6 +874,113 @@ fn optional_text(value: Option<&str>) -> D1Type<'_> {
     match value {
         Some(value) => D1Type::Text(value),
         None => D1Type::Null,
+    }
+}
+
+/// `tasks` table persistence.
+pub struct D1TaskRepo {
+    db: D1Database,
+}
+
+impl D1TaskRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl TaskRepo for D1TaskRepo {
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Task>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<Task>(None).await.map_err(backend)
+    }
+
+    async fn insert(&self, task: NewTask) -> Result<Task, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        // This slice creates tasks in exactly one status; the literal is bound
+        // here (the schema's DEFAULT 'OPEN' is a backstop only).
+        let stmt = self
+            .db
+            .prepare(TASK_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&task.user_id),
+                D1Type::Text(&task.title),
+                D1Type::Text(&task.description),
+                D1Type::Integer(task.duration_minutes as i32),
+                D1Type::Text(&task.priority),
+                D1Type::Text(api_core::TASK_STATUS_OPEN),
+                D1Type::Text(&now),
+                D1Type::Text(&now),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        Ok(Task {
+            id: id.clone(),
+            user_id: task.user_id,
+            title: task.title,
+            description: task.description,
+            duration_minutes: task.duration_minutes,
+            priority: task.priority,
+            status: api_core::TASK_STATUS_OPEN.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            deleted_at: None,
+        })
+    }
+
+    async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError> {
+        // NULL binds flow through COALESCE and leave the column unchanged;
+        // status is deliberately not bound (this slice has no transitions).
+        let title = optional_text(updates.title.as_deref());
+        let description = optional_text(updates.description.as_deref());
+        let duration_minutes = match updates.duration_minutes {
+            Some(value) => D1Type::Integer(value as i32),
+            None => D1Type::Null,
+        };
+        let priority = optional_text(updates.priority.as_deref());
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(TASK_UPDATE_SQL)
+            .bind_refs(&[
+                title,
+                description,
+                duration_minutes,
+                priority,
+                D1Type::Text(&now),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_DELETE_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 }
 

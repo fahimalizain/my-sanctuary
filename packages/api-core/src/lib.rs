@@ -10,6 +10,7 @@ pub mod lists;
 pub mod models;
 pub mod oauth;
 pub mod repo;
+pub mod tasks;
 pub mod time;
 pub mod token;
 
@@ -44,14 +45,20 @@ pub use oauth::{
 };
 pub use repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TokenRepo, UserRepo, WatchChannelRepo, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    TaskListRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo, CALENDAR_LIST_SYNC_ENABLED_SQL,
     EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
-    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
+    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
+    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
-    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
+    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TASK_UPDATE_SQL,
+};
+pub use tasks::{
+    create_task, delete_task, list_tasks, update_task, DeleteTaskResponse, TaskCategorySummary,
+    TaskResponse, TasksError, TasksResponse, TaskView, DEFAULT_DURATION_MINUTES,
+    MIN_DURATION_MINUTES, TASK_STATUS_OPEN,
 };
 pub use session::{
     clear_session_cookie_header, cookie_value_from_header, seal, session_cookie_header, unseal,

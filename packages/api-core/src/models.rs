@@ -424,6 +424,78 @@ pub struct NewTaskCategoryPattern {
     pub google_calendar_id: Option<String>,
 }
 
+/// A task, as stored in `tasks`.
+///
+/// Doubles as the D1 row projection AND part of the API response payload:
+/// serde field names are snake_case and match the frontend `TaskRecord`
+/// (`title, description, duration_minutes, priority, status` plus ids and
+/// timestamps). Classification lives on the **category** side only — there is
+/// deliberately no `category_id`/`list_id` column; the service computes the
+/// category per title via `classify` and attaches it to the task view.
+///
+/// `status` is always `OPEN` in this slice: create stamps it and `UpdateTask`
+/// has no status field (status transitions arrive in slice 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub user_id: String,
+    pub title: String,
+    /// Nullable column mapped to `""` via [`de_empty_string`].
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub description: String,
+    /// Planned duration in minutes; service enforces `>= 1` (default 15).
+    pub duration_minutes: i64,
+    /// `high|medium|low`; service enforces the enum (default `medium`).
+    pub priority: String,
+    /// `OPEN` for every task in this slice; slice 4 adds transitions.
+    pub status: String,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+    /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
+    pub deleted_at: Option<String>,
+}
+
+/// Insert input for [`crate::repo::TaskRepo::insert`]. The D1 implementation
+/// generates the UUID `id`, the `created_at`/`updated_at` timestamps, and
+/// stamps `status = "OPEN"` (this slice never creates tasks in any other
+/// state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTask {
+    pub user_id: String,
+    pub title: String,
+    /// Empty string when the caller omitted a description.
+    pub description: String,
+    pub duration_minutes: i64,
+    pub priority: String,
+}
+
+/// Request body for `POST /api/tasks`. `duration_minutes`/`priority` default
+/// server-side (15, `medium`); `description` defaults to `""`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewTaskInput {
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub duration_minutes: Option<i64>,
+    #[serde(default)]
+    pub priority: Option<String>,
+}
+
+/// Update input for [`crate::repo::TaskRepo::update`] (`PATCH /api/tasks/:id`).
+/// `None` fields are left unchanged (COALESCE in SQL); the service rejects a
+/// body where every field is `None` (400 "nothing to update"). Status is
+/// deliberately absent — this slice does not transition tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateTask {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub duration_minutes: Option<i64>,
+    pub priority: Option<String>,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
@@ -677,6 +749,86 @@ mod tests {
         assert_eq!(pattern.regex, "^Work$");
         assert_eq!(pattern.google_calendar_id, None);
         assert_eq!(pattern.sort_order, 0);
+    }
+
+    #[test]
+    fn task_deserializes_from_d1_row_shape() {
+        // D1 returns numbers as JS numbers and NULL for `deleted_at`.
+        let task: Task = serde_json::from_str(
+            r##"{
+                "id": "t-1", "user_id": "u-1", "title": "Review | Work",
+                "description": null, "duration_minutes": 15, "priority": "high",
+                "status": "OPEN", "created_at": "2026-08-18T00:00:00Z",
+                "updated_at": "2026-08-18T00:00:00Z", "deleted_at": null
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(task.title, "Review | Work");
+        assert_eq!(task.description, "", "NULL maps to empty string");
+        assert_eq!(task.duration_minutes, 15);
+        assert_eq!(task.priority, "high");
+        assert_eq!(task.status, "OPEN");
+        assert_eq!(task.deleted_at, None);
+    }
+
+    #[test]
+    fn task_serializes_snake_case_for_frontend() {
+        let task = Task {
+            id: "t-1".to_string(),
+            user_id: "u-1".to_string(),
+            title: "Work".to_string(),
+            description: "Deep focus".to_string(),
+            duration_minutes: 25,
+            priority: "medium".to_string(),
+            status: "OPEN".to_string(),
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+            deleted_at: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&task).unwrap();
+        // Every field the frontend `TaskRecord` requires.
+        for key in [
+            "id",
+            "user_id",
+            "title",
+            "description",
+            "duration_minutes",
+            "priority",
+            "status",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}: {value}");
+        }
+        assert_eq!(value["duration_minutes"], 25);
+        assert_eq!(value["priority"], "medium");
+        assert_eq!(value["status"], "OPEN");
+    }
+
+    #[test]
+    fn new_task_input_defaults_to_none_for_optional_fields() {
+        // A body with only the title must not fail: description/duration/
+        // priority default server-side.
+        let input: NewTaskInput = serde_json::from_str(r#"{"title": "Work"}"#).unwrap();
+        assert_eq!(input.title, "Work");
+        assert_eq!(input.description, None);
+        assert_eq!(input.duration_minutes, None);
+        assert_eq!(input.priority, None);
+    }
+
+    #[test]
+    fn update_task_missing_fields_deserialize_to_none() {
+        // An empty `{}` body yields all-`None` (the service rejects that 400).
+        let updates: UpdateTask = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            updates,
+            UpdateTask {
+                title: None,
+                description: None,
+                duration_minutes: None,
+                priority: None,
+            }
+        );
     }
 
     #[test]

@@ -8,14 +8,23 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { TaskModal } from '@/app/components/TaskModal';
 import { API_BASE_URL } from '@/lib/api';
+import { cn } from '@/lib/utils';
 import type {
   CategoriesResponse,
   Category,
   NewCategoryInput,
+  NewTaskInput,
+  TaskCategorySummary,
   TaskList,
   TaskListsResponse,
+  TaskPriority,
+  TaskRecord,
+  TaskResponse,
+  TasksResponse,
   UpdateCategoryInput,
+  UpdateTaskInput,
 } from '@/app/types';
 
 // The server's error envelope is `{"error": "message"}`; fall back to a
@@ -57,9 +66,19 @@ interface ListFormState {
   list?: TaskList;
 }
 
+interface TaskFormState {
+  mode: 'create' | 'edit';
+  /** Create-anchor category (its title is the hint; the server still decides
+   *  the final match). */
+  category?: TaskCategorySummary;
+  /** Edit target. */
+  task?: TaskRecord;
+}
+
 export function ListsPage() {
   const [lists, setLists] = useState<TaskList[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [tasks, setTasks] = useState<TaskRecord[]>([]);
   // Latest `lists` for the dependency-free `load` callback below (writing a
   // ref during render is the "latest value" pattern). Reading it lets `load`
   // decide whether to show the full-page loader without closing over a stale
@@ -90,6 +109,9 @@ export function ListsPage() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Task dialog state.
+  const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
+
   const load = useCallback(() => {
     // Full-page loader only when the grid is empty (first load, or a retry
     // after a hard error cleared it) — the same rule as CalendarPage
@@ -100,7 +122,9 @@ export function ListsPage() {
     // Sequential on purpose: GET /api/lists performs the first-visit seed (it
     // inserts the default lists AND the category taxonomy), so the categories
     // request must run after it — a parallel fetch would often return [] on
-    // first paint and never retry.
+    // first paint and never retry. Tasks come last: their computed categories
+    // depend on the seeded taxonomy, and GET /api/tasks also runs the
+    // count-gated seed (a no-op once lists seeded).
     fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
       .then(async (listsRes) => {
         if (!listsRes.ok) throw new Error(await readError(listsRes));
@@ -112,6 +136,12 @@ export function ListsPage() {
         if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
         const categoriesData = (await categoriesRes.json()) as CategoriesResponse;
         setCategories(categoriesData.categories ?? []);
+        return fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' });
+      })
+      .then(async (tasksRes) => {
+        if (!tasksRes.ok) throw new Error(await readError(tasksRes));
+        const tasksData = (await tasksRes.json()) as TasksResponse;
+        setTasks(tasksData.tasks ?? []);
       })
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : 'Failed to load lists';
@@ -323,6 +353,84 @@ export function ListsPage() {
   };
 
   // ──────────────────────────────────────────
+  // Task actions
+  // ──────────────────────────────────────────
+
+  const openCreateTask = (category: TaskCategorySummary) => {
+    setTaskForm({ mode: 'create', category });
+    setFormError(null);
+  };
+
+  const openEditTask = (task: TaskRecord) => {
+    setTaskForm({ mode: 'edit', task });
+    setFormError(null);
+  };
+
+  const closeTaskForm = () => {
+    setTaskForm(null);
+  };
+
+  // Persists the task. Returns an error message to show on the form (the
+  // server explains 400s like "title does not match a category"), or null
+  // when the modal may close.
+  const handleTaskSubmit = async (values: {
+    title: string;
+    description: string;
+    durationMinutes: number;
+    priority: TaskPriority;
+  }): Promise<string | null> => {
+    if (!taskForm) return null;
+    setActionError(null);
+    const body: NewTaskInput | UpdateTaskInput = {
+      title: values.title,
+      description: values.description,
+      duration_minutes: values.durationMinutes,
+      priority: values.priority,
+    };
+    const res =
+      taskForm.mode === 'create'
+        ? await fetch(`${API_BASE_URL}/api/tasks`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          })
+        : await fetch(`${API_BASE_URL}/api/tasks/${taskForm.task!.id}`, {
+            method: 'PATCH',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+    if (!res.ok) {
+      return await readError(res);
+    }
+    // The response carries the computed category — reuse it directly so the
+    // card regroups instantly.
+    const data = (await res.json()) as TaskResponse;
+    setTasks((prev) =>
+      taskForm.mode === 'create'
+        ? [data.task, ...prev]
+        : prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+    );
+    closeTaskForm();
+    return null;
+  };
+
+  const handleTaskDelete = async (taskId: string): Promise<string | null> => {
+    setActionError(null);
+    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      return await readError(res);
+    }
+    setTasks((prev) => prev.filter((entry) => entry.id !== taskId));
+    closeTaskForm();
+    return null;
+  };
+
+  // ──────────────────────────────────────────
   // Patterns editor
   // ──────────────────────────────────────────
 
@@ -424,14 +532,35 @@ export function ListsPage() {
                 key={list.id}
                 list={list}
                 categories={categories}
+                tasks={tasks}
                 onEditList={openEditList}
                 onDeleteList={handleDeleteList}
                 onAddCategory={openCreateRoot}
                 onAddChild={openCreateChild}
                 onEditCategory={openEditCategory}
                 onDeleteCategory={handleDeleteCategory}
+                onAddTask={openCreateTask}
+                onEditTask={openEditTask}
               />
             ))}
+          </div>
+        )}
+
+        {/* Task whose category no longer renders (the user deleted its
+            patterns): still shown, grouped under the untracked sink's
+            summary, so a read never drops data. */}
+        {tasks.filter((task) => task.category.is_untracked).length > 0 && (
+          <div className="mt-6 rounded-xl border border-border bg-card p-4">
+            <h2 className="font-heading text-lg font-semibold text-foreground mb-3">
+              Untracked tasks
+            </h2>
+            <div className="flex flex-wrap gap-2">
+              {tasks
+                .filter((task) => task.category.is_untracked)
+                .map((task) => (
+                  <TaskChip key={task.id} task={task} onEdit={openEditTask} />
+                ))}
+            </div>
           </div>
         )}
       </div>
@@ -640,6 +769,16 @@ export function ListsPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* New / Edit Task Dialog */}
+      <TaskModal
+        open={taskForm !== null}
+        onOpenChange={(open) => !open && closeTaskForm()}
+        category={taskForm?.mode === 'create' ? taskForm.category : undefined}
+        task={taskForm?.mode === 'edit' ? taskForm.task : undefined}
+        onSubmit={handleTaskSubmit}
+        onDelete={handleTaskDelete}
+      />
     </div>
   );
 }
@@ -647,23 +786,29 @@ export function ListsPage() {
 interface ListCardProps {
   list: TaskList;
   categories: Category[];
+  tasks: TaskRecord[];
   onEditList: (list: TaskList) => void;
   onDeleteList: (list: TaskList) => void;
   onAddCategory: (list: TaskList) => void;
   onAddChild: (category: Category) => void;
   onEditCategory: (category: Category) => void;
   onDeleteCategory: (category: Category) => void;
+  onAddTask: (category: TaskCategorySummary) => void;
+  onEditTask: (task: TaskRecord) => void;
 }
 
 function ListCard({
   list,
   categories,
+  tasks,
   onEditList,
   onDeleteList,
   onAddCategory,
   onAddChild,
   onEditCategory,
   onDeleteCategory,
+  onAddTask,
+  onEditTask,
 }: ListCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -673,6 +818,14 @@ function ListCard({
   const roots = categories.filter(
     (category) =>
       !category.is_untracked && !category.parent_id && category.inherited_list_id === list.id,
+  );
+
+  // Tasks filed under this list's categories (children inherit the root's
+  // list, so `category.inherited_list_id` matches too; untracked tasks are
+  // rendered at page level, not here).
+  const listTasks = tasks.filter(
+    (task) =>
+      !task.category.is_untracked && task.category.inherited_list_id === list.id,
   );
 
   return (
@@ -733,11 +886,13 @@ function ListCard({
         </button>
       </div>
 
-      {/* Categories under this list — the one-level tree (roots + children) */}
+      {/* Categories under this list — the one-level tree (roots + children);
+          tasks render under the category they match */}
       {roots.length > 0 && (
         <div className="bg-black/20 p-3 space-y-2">
           {roots.map((root) => {
             const children = categories.filter((category) => category.parent_id === root.id);
+            const rootTasks = tasks.filter((task) => task.category.id === root.id);
             return (
               <div key={root.id}>
                 <div className="flex items-center gap-2">
@@ -754,6 +909,14 @@ function ListCard({
                     </span>
                   )}
                   <div className="flex flex-shrink-0 gap-1">
+                    <button
+                      onClick={() => onAddTask(root)}
+                      className="p-1.5 rounded-md hover:bg-primary-foreground/10 transition-colors"
+                      aria-label={`Add task to ${root.title}`}
+                      title="Add task"
+                    >
+                      <Plus className="h-3.5 w-3.5 text-primary-foreground/70" />
+                    </button>
                     <button
                       onClick={() => onAddChild(root)}
                       className="p-1.5 rounded-md hover:bg-primary-foreground/10 transition-colors"
@@ -780,35 +943,63 @@ function ListCard({
                     </button>
                   </div>
                 </div>
+                {/* Tasks filed into the root (category.id === root.id) */}
+                {rootTasks.length > 0 && (
+                  <div className="ml-3.5 mt-1 space-y-1">
+                    {rootTasks.map((task) => (
+                      <TaskChip key={task.id} task={task} onEdit={onEditTask} />
+                    ))}
+                  </div>
+                )}
                 {children.length > 0 && (
                   <div className="ml-3.5 mt-1 pl-3 border-l border-primary-foreground/20 space-y-1">
-                    {children.map((child) => (
-                      <div key={child.id} className="flex items-center gap-2">
-                        <span
-                          className="h-2 w-2 rounded-full flex-shrink-0"
-                          style={{ backgroundColor: child.color || root.color || list.color }}
-                        />
-                        <span className="flex-1 min-w-0 text-xs text-primary-foreground/80 truncate">
-                          {child.title}
-                        </span>
-                        <div className="flex flex-shrink-0 gap-1">
-                          <button
-                            onClick={() => onEditCategory(child)}
-                            className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                            aria-label={`Edit ${child.title}`}
-                          >
-                            <Pencil className="h-3 w-3 text-primary-foreground/60" />
-                          </button>
-                          <button
-                            onClick={() => onDeleteCategory(child)}
-                            className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                            aria-label={`Delete ${child.title}`}
-                          >
-                            <Trash2 className="h-3 w-3 text-primary-foreground/60" />
-                          </button>
+                    {children.map((child) => {
+                      const childTasks = tasks.filter((task) => task.category.id === child.id);
+                      return (
+                        <div key={child.id}>
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="h-2 w-2 rounded-full flex-shrink-0"
+                              style={{ backgroundColor: child.color || root.color || list.color }}
+                            />
+                            <span className="flex-1 min-w-0 text-xs text-primary-foreground/80 truncate">
+                              {child.title}
+                            </span>
+                            <div className="flex flex-shrink-0 gap-1">
+                              <button
+                                onClick={() => onAddTask(child)}
+                                className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
+                                aria-label={`Add task to ${child.title}`}
+                                title="Add task"
+                              >
+                                <Plus className="h-3 w-3 text-primary-foreground/60" />
+                              </button>
+                              <button
+                                onClick={() => onEditCategory(child)}
+                                className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
+                                aria-label={`Edit ${child.title}`}
+                              >
+                                <Pencil className="h-3 w-3 text-primary-foreground/60" />
+                              </button>
+                              <button
+                                onClick={() => onDeleteCategory(child)}
+                                className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
+                                aria-label={`Delete ${child.title}`}
+                              >
+                                <Trash2 className="h-3 w-3 text-primary-foreground/60" />
+                              </button>
+                            </div>
+                          </div>
+                          {childTasks.length > 0 && (
+                            <div className="ml-3.5 mt-1 space-y-1">
+                              {childTasks.map((task) => (
+                                <TaskChip key={task.id} task={task} onEdit={onEditTask} />
+                              ))}
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -817,12 +1008,50 @@ function ListCard({
         </div>
       )}
 
-      {/* Tasks area — populated in slice 3 */}
-      <div className="bg-black/20 p-4 border-t border-black/10">
-        <p className="text-sm text-primary-foreground/70 italic">
-          No tasks yet
-        </p>
-      </div>
+      {/* Empty state — only when this list has no tasks at all */}
+      {listTasks.length === 0 && (
+        <div className="bg-black/20 p-4 border-t border-black/10">
+          <p className="text-sm text-primary-foreground/70 italic">
+            No tasks yet
+          </p>
+        </div>
+      )}
     </div>
+  );
+}
+
+/** One task row: title + duration, click to edit (delete lives in the edit
+ *  dialog). */
+function TaskChip({
+  task,
+  onEdit,
+}: {
+  task: TaskRecord;
+  onEdit: (task: TaskRecord) => void;
+}) {
+  return (
+    <button
+      onClick={() => onEdit(task)}
+      className="flex w-full items-center gap-2 rounded-lg bg-black/25 px-2.5 py-1.5 text-left hover:bg-black/35 transition-colors"
+      title={`${task.title} — ${task.duration_minutes} min, ${task.priority}`}
+    >
+      <span className="flex-1 min-w-0 text-xs text-primary-foreground/90 truncate">
+        {task.title}
+      </span>
+      <span className="flex-shrink-0 text-[10px] text-primary-foreground/60">
+        {task.duration_minutes} min
+      </span>
+      <span
+        className={cn(
+          'h-1.5 w-1.5 rounded-full flex-shrink-0',
+          task.priority === 'high'
+            ? 'bg-red-400'
+            : task.priority === 'medium'
+              ? 'bg-amber-400'
+              : 'bg-sky-400',
+        )}
+        aria-hidden
+      />
+    </button>
   );
 }

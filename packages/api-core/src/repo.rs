@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, TaskCategory,
-    TaskCategoryPattern, TaskList, UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
-    NewWatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
+    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, Task, TaskCategory,
+    TaskCategoryPattern, TaskList, UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
+    WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -226,6 +226,31 @@ pub trait TaskCategoryRepo: Send + Sync {
     /// HARD-deletes every pattern row for the category (used on category
     /// delete).
     async fn delete_patterns_by_category_id(&self, category_id: &str) -> Result<(), RepoError>;
+}
+
+/// Task persistence (`tasks` rows).
+///
+/// Tasks carry NO `category_id`/`list_id` column: the category is computed per
+/// title by the service (`classify`), so the repo stays deliberately thin.
+/// All deletes are SOFT: `deleted_at` is stamped, rows are never removed.
+#[async_trait(?Send)]
+pub trait TaskRepo: Send + Sync {
+    /// The user's living tasks, most recently updated/created first.
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Task>, RepoError>;
+    /// Returns the task with local `id`, or `None` when absent or soft-deleted.
+    /// NOT user-scoped; callers must verify `row.user_id` (the service does).
+    async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError>;
+    /// Inserts a new task and returns the stored row. The D1 implementation
+    /// generates the UUID `id`, stamps `created_at`/`updated_at`, and forces
+    /// `status = "OPEN"` (this slice creates no other status).
+    async fn insert(&self, task: NewTask) -> Result<Task, RepoError>;
+    /// Updates `title`/`description`/`duration_minutes`/`priority` on a living
+    /// task (`None` fields are left unchanged; status is never touched here)
+    /// and returns the updated row, or `None` when the task is missing or
+    /// soft-deleted.
+    async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339`.
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
 
 /// Google Calendar watch channel persistence (`google_calendars_watch_channels`
@@ -588,6 +613,46 @@ pub const TASK_CATEGORY_PATTERNS_INSERT_SQL: &str = "
     INSERT INTO task_category_patterns (id, category_id, regex, google_calendar_id, sort_order, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
 ";
+
+// ──────────────────────────────────────────
+// Task SQL
+// ──────────────────────────────────────────
+
+/// Living tasks for the user, most recently updated first (ties broken by
+/// creation time). No order outside the app's control: the frontend regroups
+/// by computed category anyway.
+pub const TASK_LIST_BY_USER_ID_SQL: &str =
+    "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC";
+
+pub const TASK_GET_BY_ID_SQL: &str =
+    "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL";
+
+/// Plain INSERT (no `ON CONFLICT`): tasks are user-authored, never upserted.
+/// The D1 implementation binds the UUID `id`, the timestamps, and the
+/// hardcoded `status = 'OPEN'` (this slice creates no other status).
+pub const TASK_INSERT_SQL: &str = "
+    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). Status
+/// is intentionally not updatable — slice 4 adds the status transitions. The
+/// D1 implementation binds `D1Type::Null` for `None` fields; the service
+/// validates values before this runs, so invalid priorities/empty titles never
+/// reach the DB.
+pub const TASK_UPDATE_SQL: &str = "
+    UPDATE tasks SET
+        title = COALESCE(?, title),
+        description = COALESCE(?, description),
+        duration_minutes = COALESCE(?, duration_minutes),
+        priority = COALESCE(?, priority),
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
+pub const TASK_DELETE_SQL: &str =
+    "UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
 // ──────────────────────────────────────────
 // Watch channel SQL
@@ -989,5 +1054,60 @@ mod tests {
         let sql = WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL;
         assert!(sql.contains("expiration > ?"), "{sql}");
         assert!(sql.contains("calendar_id = ?"), "{sql}");
+    }
+
+    #[test]
+    fn task_reads_filter_soft_deleted_rows_and_order_by_updated_then_created() {
+        assert!(TASK_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_LIST_BY_USER_ID_SQL);
+        let order_start = TASK_LIST_BY_USER_ID_SQL
+            .find("ORDER BY")
+            .expect("has ORDER BY");
+        assert_eq!(
+            &TASK_LIST_BY_USER_ID_SQL[order_start..],
+            "ORDER BY updated_at DESC, created_at DESC"
+        );
+        assert!(TASK_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_GET_BY_ID_SQL);
+    }
+
+    #[test]
+    fn task_insert_binds_all_9_columns_with_status_open() {
+        assert!(TASK_INSERT_SQL.contains("INSERT INTO tasks"), "{}", TASK_INSERT_SQL);
+        assert!(!TASK_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_INSERT_SQL);
+        assert_eq!(
+            TASK_INSERT_SQL.matches('?').count(),
+            9,
+            "one placeholder per column: {}",
+            TASK_INSERT_SQL
+        );
+        // The status column exists and is not user-bound — the D1 impl binds
+        // the literal 'OPEN'.
+        assert!(TASK_INSERT_SQL.contains("status"), "{TASK_INSERT_SQL}");
+        for column in [
+            "id", "user_id", "title", "description", "duration_minutes",
+            "priority", "status", "created_at", "updated_at",
+        ] {
+            assert!(TASK_INSERT_SQL.contains(column), "missing {column}");
+        }
+    }
+
+    #[test]
+    fn task_update_uses_coalesce_and_never_touches_status() {
+        let sql = TASK_UPDATE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("COALESCE(?, title)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, description)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, duration_minutes)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, priority)"), "{sql}");
+        assert!(!sql.contains("status"), "status is not updatable this slice: {sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        // 4 COALESCE binds + now + id: nothing else.
+        assert_eq!(sql.matches('?').count(), 6, "{sql}");
+    }
+
+    #[test]
+    fn task_delete_is_soft_not_hard() {
+        assert!(TASK_DELETE_SQL.starts_with("UPDATE"), "{}", TASK_DELETE_SQL);
+        assert!(TASK_DELETE_SQL.contains("SET deleted_at = ?"), "{}", TASK_DELETE_SQL);
+        assert!(!TASK_DELETE_SQL.contains("DELETE FROM"), "{}", TASK_DELETE_SQL);
     }
 }

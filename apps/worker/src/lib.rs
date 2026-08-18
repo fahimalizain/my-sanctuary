@@ -5,6 +5,7 @@ mod cron;
 mod db;
 mod http;
 mod lists;
+mod tasks;
 
 use worker::*;
 
@@ -87,6 +88,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .delete_async("/api/categories/:id", categories::delete_category)
         .options("/api/categories", auth::options)
         .options("/api/categories/:id", auth::options)
+        .get_async("/api/tasks", tasks::list_tasks)
+        .post_async("/api/tasks", tasks::create_task)
+        .patch_async("/api/tasks/:id", tasks::update_task)
+        .delete_async("/api/tasks/:id", tasks::delete_task)
+        .options("/api/tasks", auth::options)
+        .options("/api/tasks/:id", auth::options)
         .run(req, env)
         .await
 }
