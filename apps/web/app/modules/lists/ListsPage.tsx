@@ -97,19 +97,20 @@ export function ListsPage() {
     // are on screen never flash the spinner.
     setIsLoading(listsRef.current.length === 0);
     setLoadError(null);
-    // Lists and categories are fetched in parallel; the taxonomy is seeded by
-    // GET /api/lists, so this renders empty categories on a true first paint
-    // and everything on the next load.
-    Promise.all([
-      fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' }),
-      fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' }),
-    ])
-      .then(async ([listsRes, categoriesRes]) => {
+    // Sequential on purpose: GET /api/lists performs the first-visit seed (it
+    // inserts the default lists AND the category taxonomy), so the categories
+    // request must run after it — a parallel fetch would often return [] on
+    // first paint and never retry.
+    fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
+      .then(async (listsRes) => {
         if (!listsRes.ok) throw new Error(await readError(listsRes));
-        if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
         const listsData = (await listsRes.json()) as TaskListsResponse;
-        const categoriesData = (await categoriesRes.json()) as CategoriesResponse;
         setLists(listsData.lists ?? []);
+        return fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' });
+      })
+      .then(async (categoriesRes) => {
+        if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
+        const categoriesData = (await categoriesRes.json()) as CategoriesResponse;
         setCategories(categoriesData.categories ?? []);
       })
       .catch((err: unknown) => {

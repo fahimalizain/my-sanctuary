@@ -56,6 +56,13 @@ fn d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TaskC
     Ok(crate::db::D1TaskCategoryRepo::new(db))
 }
 
+fn lists_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TaskListRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1TaskListRepo::new(db))
+}
+
 /// `GET /api/categories` → 200 `{"categories":[...]}` (the taxonomy is seeded
 /// by `GET /api/lists`, so this is a pure read).
 pub async fn list_categories(
@@ -77,7 +84,8 @@ pub async fn list_categories(
 }
 
 /// `POST /api/categories` → 200 `{"category":{...}}`. Body: category fields +
-/// `patterns` (see `NewTaskCategoryInput`).
+/// `patterns` (see `NewTaskCategoryInput`). Roots must reference a list owned
+/// by the session user (404 otherwise).
 pub async fn create_category(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -89,7 +97,7 @@ pub async fn create_category(
         Ok(input) => input,
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
-    match api_core::categories::create_category(&d1(&ctx)?, &user.id, &input).await {
+    match api_core::categories::create_category(&d1(&ctx)?, &lists_d1(&ctx)?, &user.id, &input).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(
@@ -102,7 +110,8 @@ pub async fn create_category(
 
 /// `PATCH /api/categories/:id` → 200 `{"category":{...}}`. Body:
 /// `UpdateTaskCategory` — every field optional, `patterns` replaces the whole
-/// set when present.
+/// set when present. A root's new `list_id` must reference a list owned by
+/// the session user (404 otherwise).
 pub async fn update_category(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -117,7 +126,7 @@ pub async fn update_category(
         Ok(updates) => updates,
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
-    match api_core::categories::update_category(&d1(&ctx)?, &user.id, id, &updates).await {
+    match api_core::categories::update_category(&d1(&ctx)?, &lists_d1(&ctx)?, &user.id, id, &updates).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(

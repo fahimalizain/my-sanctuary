@@ -335,13 +335,14 @@ pub async fn list_categories(
 ///   (Conflict).
 /// - `is_untracked` cannot be set via the API (the sink is system-seeded).
 /// - A child must not carry a `list_id`; a non-`untracked` root must carry
-///   one.
+///   one, and that list must exist and belong to the user (404 otherwise).
 /// - The parent must be a living root of the same user (404 when missing;
 ///   400 when it is itself a child — no grandchildren).
 /// - Every pattern must compile, be non-empty, and ≤ [`MAX_PATTERN_LEN`]
 ///   chars.
 pub async fn create_category(
     repo: &dyn TaskCategoryRepo,
+    list_repo: &dyn TaskListRepo,
     user_id: &str,
     input: &NewTaskCategoryInput,
 ) -> Result<CategoryResponse, CategoriesError> {
@@ -394,7 +395,11 @@ pub async fn create_category(
                     "root categories must have a list_id".to_string(),
                 ));
             };
-            (None, Some(list_id.to_string()), None)
+            // The list must exist and belong to the user; another user's (or
+            // a missing) list is a plain 404, never a leak.
+            let list = list_repo.get_by_id(list_id).await?;
+            let list = list.filter(|list| list.user_id == user_id).ok_or(CategoriesError::NotFound)?;
+            (None, Some(list.id.clone()), None)
         }
     };
 
@@ -445,9 +450,12 @@ pub async fn create_category(
 ///   category must not already have children (400), and a child can never
 ///   carry a `list_id` (400). A root moved under a parent is stored as a
 ///   child — `list_id` NULL (the repo's UPDATE NULLs it).
+/// - A root's new `list_id` must exist and belong to the user (404
+///   otherwise).
 /// - Patterns: same validation as create; `Some` replaces the whole set.
 pub async fn update_category(
     repo: &dyn TaskCategoryRepo,
+    list_repo: &dyn TaskListRepo,
     user_id: &str,
     id: &str,
     updates: &UpdateTaskCategory,
@@ -543,6 +551,12 @@ pub async fn update_category(
         if let Some(list_id) = updates.list_id.as_deref() {
             if list_id.trim().is_empty() {
                 return Err(CategoriesError::Invalid("list_id must not be empty".to_string()));
+            }
+            // The new list must exist and belong to the user; a missing or
+            // other-user list is a plain 404, never a leak.
+            let list = list_repo.get_by_id(list_id).await?;
+            if !list.is_some_and(|list| list.user_id == user_id) {
+                return Err(CategoriesError::NotFound);
             }
         }
     }
@@ -925,8 +939,8 @@ mod tests {
         }
     }
 
-    /// Minimal in-memory `TaskListRepo` for the seed test (the lists tests
-    /// keep their own richer fake in `crate::lists`).
+    /// Minimal in-memory `TaskListRepo` for the seed and ownership tests (the
+    /// lists tests keep their own richer fake in `crate::lists`).
     struct FakeTaskListRepo {
         stored: Mutex<Vec<TaskList>>,
         inserted: Mutex<Vec<NewTaskList>>,
@@ -939,6 +953,26 @@ mod tests {
                 stored: Mutex::new(Vec::new()),
                 inserted: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+            }
+        }
+
+        /// Seeds the fake with living list rows.
+        fn with(rows: Vec<TaskList>) -> Self {
+            let repo = Self::new();
+            repo.stored.lock().unwrap().extend(rows);
+            repo
+        }
+
+        fn row(id: &str, user_id: &str, name: &str, sort_order: i64) -> TaskList {
+            TaskList {
+                id: id.to_string(),
+                user_id: user_id.to_string(),
+                name: name.to_string(),
+                color: "#2a5c8a".to_string(),
+                sort_order,
+                created_at: "2026-08-18T00:00:00Z".to_string(),
+                updated_at: "2026-08-18T00:00:00Z".to_string(),
+                deleted_at: None,
             }
         }
     }
@@ -958,8 +992,14 @@ mod tests {
             Ok(rows)
         }
 
-        async fn get_by_id(&self, _id: &str) -> Result<Option<TaskList>, RepoError> {
-            Ok(None)
+        async fn get_by_id(&self, id: &str) -> Result<Option<TaskList>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == id && row.deleted_at.is_none())
+                .cloned())
         }
 
         async fn insert(&self, list: NewTaskList) -> Result<TaskList, RepoError> {
@@ -1303,15 +1343,14 @@ mod tests {
 
     #[test]
     fn create_root_with_list_id_and_patterns() {
-        let repo = FakeTaskCategoryRepo::with(vec![
-            FakeTaskCategoryRepo::row("l-1", "u-1", None, None, "Work", "work", true, false, 0),
-        ]);
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
         let mut new_input = input("  Deep Work  ", "  #2a5c8a  ");
         new_input.list_id = Some("l-1".to_string());
         new_input.is_productive = Some(true);
         new_input.patterns = vec![pattern("^Deep Work$"), pattern("^.* [|] Deep Work$")];
 
-        let response = pollster::block_on(create_category(&repo, "u-1", &new_input)).unwrap();
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.slug, "deep-work", "slugified from the title");
@@ -1329,10 +1368,11 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
             FakeTaskCategoryRepo::row("l-1", "u-2", None, None, "Other", "other", false, false, 0),
         ]);
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
         let mut new_input = input("Code Reviews", "#2a5c8a");
         new_input.parent_id = Some("root".to_string());
 
-        let response = pollster::block_on(create_category(&repo, "u-1", &new_input)).unwrap();
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
         let category = response.category;
         assert_eq!(category.parent_id.as_deref(), Some("root"));
         assert_eq!(category.list_id, None);
@@ -1344,11 +1384,12 @@ mod tests {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let mut new_input = input("Child", "#2a5c8a");
         new_input.parent_id = Some("root".to_string());
         new_input.list_id = Some("l-1".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &new_input)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
             Err(CategoriesError::Invalid(message)) if message == "children cannot have a list_id"
         ));
     }
@@ -1356,8 +1397,9 @@ mod tests {
     #[test]
     fn create_root_without_list_id_is_invalid() {
         let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &input("Work", "#2a5c8a"))),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &input("Work", "#2a5c8a"))),
             Err(CategoriesError::Invalid(message)) if message == "root categories must have a list_id"
         ));
     }
@@ -1368,10 +1410,11 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
             FakeTaskCategoryRepo::row("child", "u-1", None, Some("root"), "Coding", "coding", false, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let mut new_input = input("Grandchild", "#2a5c8a");
         new_input.parent_id = Some("child".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &new_input)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
             Err(CategoriesError::Invalid(message)) if message == "cannot create a category under a non-root category"
         ));
     }
@@ -1381,16 +1424,17 @@ mod tests {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-2", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let mut new_input = input("Child", "#2a5c8a");
         new_input.parent_id = Some("root".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &new_input)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
             Err(CategoriesError::NotFound)
         ));
         let mut other = input("Child", "#2a5c8a");
         other.parent_id = Some("nope".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &other)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &other)),
             Err(CategoriesError::NotFound)
         ));
         assert_eq!(pollster::block_on(repo.count_by_user_id("u-1")).unwrap(), 0, "nothing persisted");
@@ -1399,23 +1443,24 @@ mod tests {
     #[test]
     fn create_rejects_empty_title_color_and_untracked_flag() {
         let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
         let mut no_title = input("   ", "#2a5c8a");
         no_title.list_id = Some("l-1".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &no_title)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &no_title)),
             Err(CategoriesError::Invalid(message)) if message == "title must not be empty"
         ));
         let mut no_color = input("Work", "  ");
         no_color.list_id = Some("l-1".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &no_color)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &no_color)),
             Err(CategoriesError::Invalid(message)) if message == "color must not be empty"
         ));
         let mut sink = input("Work", "#2a5c8a");
         sink.list_id = Some("l-1".to_string());
         sink.is_untracked = Some(true);
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &sink)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &sink)),
             Err(CategoriesError::Invalid(message)) if message == "is_untracked can only be set by the system"
         ));
         assert_eq!(pollster::block_on(repo.count_by_user_id("u-1")).unwrap(), 0);
@@ -1424,11 +1469,12 @@ mod tests {
     #[test]
     fn create_rejects_bad_patterns() {
         let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
         let mut empty_pattern = input("Work", "#2a5c8a");
         empty_pattern.list_id = Some("l-1".to_string());
         empty_pattern.patterns = vec![pattern("   ")];
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &empty_pattern)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &empty_pattern)),
             Err(CategoriesError::Invalid(message)) if message == "pattern regex must not be empty"
         ));
 
@@ -1436,7 +1482,7 @@ mod tests {
         bad_regex.list_id = Some("l-1".to_string());
         bad_regex.patterns = vec![pattern("(unclosed")];
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &bad_regex)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &bad_regex)),
             Err(CategoriesError::Invalid(message)) if message == "pattern regex does not compile"
         ));
 
@@ -1444,7 +1490,7 @@ mod tests {
         long_pattern.list_id = Some("l-1".to_string());
         long_pattern.patterns = vec![pattern(&"a".repeat(257))];
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &long_pattern)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &long_pattern)),
             Err(CategoriesError::Invalid(message)) if message == "pattern regex must be at most 256 characters"
         ));
         assert_eq!(pollster::block_on(repo.count_by_user_id("u-1")).unwrap(), 0);
@@ -1455,12 +1501,57 @@ mod tests {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
         let mut new_input = input("Work", "#2a5c8a");
         new_input.list_id = Some("l-1".to_string());
         assert!(matches!(
-            pollster::block_on(create_category(&repo, "u-1", &new_input)),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
             Err(CategoriesError::Conflict(message)) if message == r#"slug "work" is already in use"#
         ));
+    }
+
+    #[test]
+    fn create_root_rejects_another_users_list() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-2", "Theirs", 0)]);
+        let mut new_input = input("Work", "#2a5c8a");
+        new_input.list_id = Some("l-1".to_string());
+        assert!(
+            matches!(
+                pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
+                Err(CategoriesError::NotFound)
+            ),
+            "a category must never be filed onto another user's list"
+        );
+        assert_eq!(pollster::block_on(repo.count_by_user_id("u-1")).unwrap(), 0, "nothing persisted");
+    }
+
+    #[test]
+    fn create_root_rejects_missing_list() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
+        let mut new_input = input("Work", "#2a5c8a");
+        new_input.list_id = Some("no-such-list".to_string());
+        assert!(matches!(
+            pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
+            Err(CategoriesError::NotFound)
+        ));
+        assert_eq!(pollster::block_on(repo.count_by_user_id("u-1")).unwrap(), 0);
+    }
+
+    #[test]
+    fn create_root_with_own_list_is_ok() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
+        let mut new_input = input("Deep Work", "#2a5c8a");
+        new_input.list_id = Some("l-1".to_string());
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
+        assert_eq!(response.category.inherited_list_id.as_deref(), Some("l-1"));
+        assert_eq!(
+            pollster::block_on(repo.count_by_user_id("u-1")).unwrap(),
+            1,
+            "created under the user's own list"
+        );
     }
 
     // ──────────────────────────────────────────
@@ -1472,6 +1563,7 @@ mod tests {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             title: Some("Deep Work".to_string()),
             color: Some("#3a3a3a".to_string()),
@@ -1479,7 +1571,7 @@ mod tests {
             patterns: Some(vec![pattern("^Deep Work$")]),
             ..UpdateTaskCategory::default()
         };
-        let response = pollster::block_on(update_category(&repo, "u-1", "root", &updates)).unwrap();
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.color, "#3a3a3a");
@@ -1496,12 +1588,13 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
             FakeTaskCategoryRepo::row("child", "u-1", None, Some("root"), "Coding", "coding", false, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             list_id: Some("l-1".to_string()),
             ..UpdateTaskCategory::default()
         };
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "child", &updates)),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "child", &updates)),
             Err(CategoriesError::Invalid(message)) if message == "children cannot have a list_id"
         ));
     }
@@ -1511,12 +1604,13 @@ mod tests {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("sink", "u-1", None, None, "Untracked", "untracked", false, true, 100),
         ]);
+        let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             title: Some("Renamed".to_string()),
             ..UpdateTaskCategory::default()
         };
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "sink", &updates)),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "sink", &updates)),
             Err(CategoriesError::Conflict(message)) if message == "untracked category cannot be modified"
         ));
     }
@@ -1527,12 +1621,13 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
             FakeTaskCategoryRepo::row("child", "u-1", None, Some("root"), "Coding", "coding", false, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let self_parent = UpdateTaskCategory {
             parent_id: Some("child".to_string()),
             ..UpdateTaskCategory::default()
         };
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "child", &self_parent)),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "child", &self_parent)),
             Err(CategoriesError::Invalid(message)) if message == "cannot parent a category to itself"
         ));
         let to_child = UpdateTaskCategory {
@@ -1540,7 +1635,7 @@ mod tests {
             ..UpdateTaskCategory::default()
         };
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "root", &to_child)),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &to_child)),
             Err(CategoriesError::Invalid(message)) if message == "cannot parent a category to a child"
         ));
     }
@@ -1552,12 +1647,13 @@ mod tests {
             FakeTaskCategoryRepo::row("other", "u-1", Some("l-2"), None, "Fitness", "fitness", true, false, 1),
             FakeTaskCategoryRepo::row("child", "u-1", None, Some("root"), "Coding", "coding", false, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             parent_id: Some("other".to_string()),
             ..UpdateTaskCategory::default()
         };
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "root", &updates)),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
             Err(CategoriesError::Invalid(message)) if message == "cannot reparent a category that has children"
         ));
     }
@@ -1568,11 +1664,12 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
             FakeTaskCategoryRepo::row("other", "u-1", Some("l-2"), None, "Fitness", "fitness", true, false, 1),
         ]);
+        let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             parent_id: Some("root".to_string()),
             ..UpdateTaskCategory::default()
         };
-        let response = pollster::block_on(update_category(&repo, "u-1", "other", &updates)).unwrap();
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "other", &updates)).unwrap();
         let category = response.category;
         assert_eq!(category.parent_id.as_deref(), Some("root"));
         assert_eq!(category.list_id, None, "stored list_id NULLed on move");
@@ -1580,12 +1677,71 @@ mod tests {
     }
 
     #[test]
+    fn update_root_moving_to_another_users_list_is_not_found() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::with(vec![
+            FakeTaskListRepo::row("l-1", "u-1", "Work", 0),
+            FakeTaskListRepo::row("l-2", "u-2", "Theirs", 1),
+        ]);
+        let updates = UpdateTaskCategory {
+            list_id: Some("l-2".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+            Err(CategoriesError::NotFound)
+        ));
+        assert_eq!(
+            pollster::block_on(repo.count_by_user_id("u-1")).unwrap(),
+            1,
+            "category survives"
+        );
+    }
+
+    #[test]
+    fn update_root_moving_to_missing_list_is_not_found() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            list_id: Some("no-such-list".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+            Err(CategoriesError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn update_root_can_move_to_another_own_list() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::with(vec![
+            FakeTaskListRepo::row("l-1", "u-1", "Work", 0),
+            FakeTaskListRepo::row("l-2", "u-1", "Reading", 1),
+        ]);
+        let updates = UpdateTaskCategory {
+            list_id: Some("l-2".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
+        assert_eq!(response.category.inherited_list_id.as_deref(), Some("l-2"));
+        assert_eq!(response.category.list_id.as_deref(), Some("l-2"));
+    }
+
+    #[test]
     fn update_rejects_empty_body_and_other_users_category() {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "root", &UpdateTaskCategory::default())),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &UpdateTaskCategory::default())),
             Err(CategoriesError::Invalid(message)) if message == "nothing to update"
         ));
         let updates = UpdateTaskCategory {
@@ -1593,11 +1749,11 @@ mod tests {
             ..UpdateTaskCategory::default()
         };
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-2", "root", &updates)),
+            pollster::block_on(update_category(&repo, &lists, "u-2", "root", &updates)),
             Err(CategoriesError::NotFound)
         ));
         assert!(matches!(
-            pollster::block_on(update_category(&repo, "u-1", "nope", &updates)),
+            pollster::block_on(update_category(&repo, &lists, "u-1", "nope", &updates)),
             Err(CategoriesError::NotFound)
         ));
     }
@@ -1611,11 +1767,12 @@ mod tests {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
+        let lists = FakeTaskListRepo::new();
         let mut new_input = input("Code Reviews", "#2a5c8a");
         new_input.parent_id = Some("root".to_string());
         new_input.patterns = vec![pattern("^Review$")];
         let created =
-            pollster::block_on(create_category(&repo, "u-1", &new_input)).unwrap().category;
+            pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap().category;
 
         let response = pollster::block_on(delete_category(
             &repo,
