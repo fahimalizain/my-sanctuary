@@ -30,6 +30,11 @@
 //!   logged and leave sync enabled. When sync is disabled for a calendar
 //!   (either by a watch 404 or an `events.list` 404), every stored channel
 //!   row is stopped (`channels.stop`) and hard-deleted.
+//! - Webhook: [`decide_webhook`] verifies push notifications
+//!   (`X-Goog-Channel-ID`/`-Token`/`-Resource-State`) against the stored
+//!   channel and calendar rows — pure and unit-tested; the Worker handler
+//!   wires D1 lookups and `ctx.wait_until(sync_calendar)` (ADR 0001 §
+//!   Webhook).
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -37,6 +42,7 @@ use url::Url;
 
 use crate::models::{
     CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput, NewWatchChannel,
+    WatchChannel,
 };
 use crate::oauth::{HttpClient, HttpError};
 use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError, WatchChannelRepo};
@@ -507,6 +513,91 @@ pub async fn stop_watches_for_calendar(
     }
     watches.delete_by_calendar_id(calendar_id).await?;
     Ok(())
+}
+
+// ──────────────────────────────────────────
+// Webhook verification (ADR 0001 § Webhook)
+// ──────────────────────────────────────────
+
+/// Outcome of verifying a Google push notification (`X-Goog-*` headers)
+/// against the stored watch channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookDecision {
+    /// HTTP 200, no sync: unknown channel, bad or missing token, missing or
+    /// disabled calendar, the `sync` handshake, or any non-`exists` state.
+    /// Verification failures never surface as 4xx/5xx (no existence leak,
+    /// no Google retry hammer).
+    Ignore,
+    /// HTTP 200, then `ctx.wait_until(sync_calendar)` for this local
+    /// calendar id.
+    Sync { calendar_id: String },
+}
+
+/// Constant-time token comparison.
+///
+/// When both strings have the same length, every byte is XOR-accumulated, so
+/// a mismatch reveals nothing about *where* the tokens differ. Different
+/// lengths return `false` immediately — that is fine because our tokens are
+/// fixed 64 hex chars, so length carries no secret information. The contents
+/// are never compared with `==`.
+pub fn tokens_match(stored: &str, presented: &str) -> bool {
+    if stored.len() != presented.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (stored_byte, presented_byte) in stored.bytes().zip(presented.bytes()) {
+        diff |= stored_byte ^ presented_byte;
+    }
+    diff == 0
+}
+
+/// Decides what a push notification should do, from the request headers and
+/// the stored rows. Pure: no Google or D1 I/O — the caller fetches `stored`
+/// (via `X-Goog-Channel-ID`) and `calendar` (via `stored.calendar_id`)
+/// first.
+///
+/// Rules (ADR 0001 § Webhook), in order:
+/// 1. `stored` is `None` → [`WebhookDecision::Ignore`] (unknown channel).
+/// 2. `presented_token` is `None` or `!tokens_match(stored.token, …)` →
+///    [`WebhookDecision::Ignore`].
+/// 3. `calendar` is `None` (missing or soft-deleted — `get_by_id` already
+///    filters `deleted_at IS NULL`) or `!calendar.sync_enabled` →
+///    [`WebhookDecision::Ignore`].
+/// 4. `resource_state` == `"exists"` → [`WebhookDecision::Sync`] for
+///    `stored.calendar_id`.
+/// 5. `"sync"` (the channel handshake) or anything else →
+///    [`WebhookDecision::Ignore`].
+///
+/// The state comparison is case-sensitive and exact: Google sends bare
+/// values like `exists`/`sync`, so a whitespace-wrapped `exists` is treated
+/// as an unknown state and ignored.
+pub fn decide_webhook(
+    resource_state: &str,
+    stored: Option<&WatchChannel>,
+    presented_token: Option<&str>,
+    calendar: Option<&GoogleCalendar>,
+) -> WebhookDecision {
+    let Some(stored) = stored else {
+        return WebhookDecision::Ignore;
+    };
+    let Some(presented) = presented_token else {
+        return WebhookDecision::Ignore;
+    };
+    if !tokens_match(&stored.token, presented) {
+        return WebhookDecision::Ignore;
+    }
+    let Some(calendar) = calendar else {
+        return WebhookDecision::Ignore;
+    };
+    if !calendar.sync_enabled {
+        return WebhookDecision::Ignore;
+    }
+    if resource_state == "exists" {
+        return WebhookDecision::Sync {
+            calendar_id: stored.calendar_id.clone(),
+        };
+    }
+    WebhookDecision::Ignore
 }
 
 /// Imports `/users/me/calendarList` and upserts each entry (all imported
@@ -1871,6 +1962,183 @@ mod tests {
         assert!(watches.stored.lock().unwrap().is_empty(), "rows hard-deleted");
         assert_eq!(output.sync_errors.len(), 1);
         assert!(output.sync_errors[0].contains("404"), "{}", output.sync_errors[0]);
+    }
+
+    // ──────────────────────────────────────────
+    // decide_webhook / tokens_match
+    // ──────────────────────────────────────────
+
+    /// A stored channel whose token is `tok-1` (the `watch_channel` fixture
+    /// token), so the fixture calendar and channel pair verify cleanly.
+    fn webhook_channel(calendar_id: &str) -> WatchChannel {
+        watch_channel(calendar_id, "2023-11-21T22:13:20Z")
+    }
+
+    #[test]
+    fn unknown_channel_is_ignored() {
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                None,
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn token_mismatch_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("tok-2"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn token_length_mismatch_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("short"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn missing_token_header_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                None,
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn missing_calendar_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook("exists", Some(&channel), Some("tok-1"), None),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn sync_disabled_calendar_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", false)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn sync_handshake_state_is_ignored() {
+        // Channel + calendar verify, but the `sync` handshake must not sync.
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "sync",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn unknown_state_is_ignored() {
+        let channel = webhook_channel("cal-1");
+        let calendar = calendar("cal-1", "primary@example.com", true);
+        for state in ["", "deleted", "EXISTS", "exists2"] {
+            assert_eq!(
+                decide_webhook(state, Some(&channel), Some("tok-1"), Some(&calendar)),
+                WebhookDecision::Ignore,
+                "state {state:?} must not sync"
+            );
+        }
+    }
+
+    #[test]
+    fn exists_with_extra_whitespace_is_ignored() {
+        // Google sends bare values; a padded `exists` is not one of them.
+        let channel = webhook_channel("cal-1");
+        let calendar = calendar("cal-1", "primary@example.com", true);
+        for state in [" exists", "exists ", " exists ", "\texists"] {
+            assert_eq!(
+                decide_webhook(state, Some(&channel), Some("tok-1"), Some(&calendar)),
+                WebhookDecision::Ignore,
+                "state {state:?} must not sync"
+            );
+        }
+    }
+
+    #[test]
+    fn exists_state_syncs_the_channel_calendar() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "exists",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::Sync {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn tokens_match_compares_whole_strings() {
+        let stored = "0123456789abcdef0123456789abcdef";
+        assert!(tokens_match(stored, "0123456789abcdef0123456789abcdef"));
+        assert!(
+            !tokens_match(stored, "1123456789abcdef0123456789abcdef"),
+            "first byte differs"
+        );
+        assert!(
+            !tokens_match(stored, "0123456789abcdef0123456789abcde0"),
+            "last byte differs"
+        );
+    }
+
+    #[test]
+    fn tokens_match_rejects_different_lengths() {
+        assert!(!tokens_match("abcdef", "abc"));
+        assert!(!tokens_match("", "x"));
+        assert!(tokens_match("", ""));
+    }
+
+    #[test]
+    fn tokens_match_handles_real_64_hex_tokens() {
+        let stored = "a".repeat(64);
+        let same = "a".repeat(64);
+        let different = format!("{}b", "a".repeat(63));
+        assert!(tokens_match(&stored, &same));
+        assert!(!tokens_match(&stored, &different));
+        assert!(!tokens_match(&stored, &"a".repeat(63)));
     }
 
     // ──────────────────────────────────────────
