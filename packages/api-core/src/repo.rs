@@ -68,6 +68,9 @@ pub trait TokenRepo: Send + Sync {
 pub trait CalendarRepo: Send + Sync {
     /// The user's calendars, primary first then by summary.
     async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError>;
+    /// Every sync-enabled, non-deleted calendar across all users — the
+    /// fallback cron's work list (ADR 0001 § Fallback cron).
+    async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError>;
     /// Returns the calendar with local `id`, or `None` when absent/soft-deleted.
     async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError>;
     /// Returns the calendar with `google_calendar_id`, or `None`.
@@ -231,6 +234,11 @@ pub const TOKEN_DELETE_SQL: &str =
 
 pub const CALENDAR_LIST_BY_USER_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE user_id = ? AND deleted_at IS NULL ORDER BY is_primary DESC, summary ASC";
+
+/// The fallback cron's work list: every sync-enabled calendar that is not
+/// soft-deleted, ordered by user, then primary first, then summary.
+pub const CALENDAR_LIST_SYNC_ENABLED_SQL: &str =
+    "SELECT * FROM google_calendars WHERE sync_enabled = 1 AND deleted_at IS NULL ORDER BY user_id ASC, is_primary DESC, summary ASC";
 
 pub const CALENDAR_GET_BY_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE id = ? AND deleted_at IS NULL";
@@ -417,6 +425,7 @@ mod tests {
         assert!(USER_GET_BY_GOOGLE_ID_SQL.contains("deleted_at IS NULL"));
         assert!(TOKEN_GET_BY_USER_ID_SQL.contains("deleted_at IS NULL"));
         assert!(CALENDAR_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(CALENDAR_LIST_SYNC_ENABLED_SQL.contains("deleted_at IS NULL"));
         assert!(CALENDAR_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
         assert!(CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL.contains("deleted_at IS NULL"));
         assert!(EVENT_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
@@ -484,6 +493,20 @@ mod tests {
         assert_eq!(
             &sql[order_start..],
             "ORDER BY is_primary DESC, summary ASC"
+        );
+    }
+
+    #[test]
+    fn calendar_list_sync_enabled_filters_and_orders() {
+        // The fallback cron's work list: only sync-enabled, non-deleted rows,
+        // ordered by user then primary first then summary.
+        let sql = CALENDAR_LIST_SYNC_ENABLED_SQL;
+        assert!(sql.contains("sync_enabled = 1"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        let order_start = sql.find("ORDER BY").expect("has ORDER BY");
+        assert_eq!(
+            &sql[order_start..],
+            "ORDER BY user_id ASC, is_primary DESC, summary ASC"
         );
     }
 

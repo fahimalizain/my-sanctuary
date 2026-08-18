@@ -1,5 +1,6 @@
 mod auth;
 mod calendar;
+mod cron;
 mod db;
 mod http;
 
