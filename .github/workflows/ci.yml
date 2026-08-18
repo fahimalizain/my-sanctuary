@@ -132,6 +132,7 @@ jobs:
           [vars]
           FRONTEND_URL = "${{ secrets.FRONTEND_URL }}"
           SECURE_COOKIE = "${{ secrets.SECURE_COOKIE }}"
+          WATCH_CALLBACK_URL = "${{ secrets.FRONTEND_URL }}/api/calendar/notifications"
           EOF
 
       # Apply D1 migrations before deploying the Worker
