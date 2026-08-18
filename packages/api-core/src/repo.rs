@@ -1,0 +1,494 @@
+//! Repository traits, errors, and the D1 SQL statements.
+//!
+//! The traits live in api-core (pure Rust, unit-testable with fakes); the D1
+//! implementations live in `apps/worker/src/db.rs`. SQL is a single source of
+//! truth here so it can be reviewed and asserted in tests.
+//!
+//! Soft-delete rules:
+//! - Reads filter `deleted_at IS NULL`.
+//! - `TokenRepo::delete` is a soft delete (`UPDATE … SET deleted_at = ?`),
+//!   fixing the old Go D1 bug that hard-deleted token rows.
+//! - Both upserts set `deleted_at = NULL` on conflict, so a subsequent login
+//!   resurrects a soft-deleted user/token row instead of tripping the UNIQUE
+//!   constraint.
+
+use async_trait::async_trait;
+use thiserror::Error;
+
+use crate::models::{
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewToken,
+    NewUser, User,
+};
+
+/// Errors surfaced by repository operations.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum RepoError {
+    #[error("record not found")]
+    NotFound,
+    #[error("record conflicts with an existing one")]
+    Conflict,
+    #[error("database error: {0}")]
+    Backend(String),
+}
+
+/// Identity persistence. No token methods here — tokens are [`TokenRepo`]'s job.
+///
+/// `#[async_trait(?Send)]`: the returned futures must not require `Send`
+/// because the Worker's D1 (`js_sys` promises) and `worker::Fetch` futures are
+/// `!Send` on wasm. The `Send + Sync` supertraits still hold — the D1 repos
+/// wrap a `D1Database` (unsafe `Send + Sync` in the worker crate).
+#[async_trait(?Send)]
+pub trait UserRepo: Send + Sync {
+    /// Returns the user with `id`, or `None` when absent or soft-deleted.
+    async fn get_by_id(&self, id: &str) -> Result<Option<User>, RepoError>;
+    /// Returns the user with `google_id`, or `None` when absent or soft-deleted.
+    async fn get_by_google_id(&self, google_id: &str) -> Result<Option<User>, RepoError>;
+    /// Inserts a new user or updates the existing one (keyed on `google_id`).
+    /// Returns the stored row, including the DB-generated `id`.
+    async fn upsert_by_google_id(&self, user: NewUser) -> Result<User, RepoError>;
+}
+
+/// Google OAuth token persistence.
+#[async_trait(?Send)]
+pub trait TokenRepo: Send + Sync {
+    /// Returns the active token row for `user_id`, or `None` when absent or
+    /// soft-deleted. Slice 4's token refresher will consume this.
+    async fn get_by_user_id(&self, user_id: &str) -> Result<Option<GoogleOAuthToken>, RepoError>;
+    /// Inserts or replaces the token row for `user_id`. A missing/empty
+    /// `refresh_token` never blanks a stored one (see `TOKEN_UPSERT_SQL`).
+    async fn upsert(&self, token: NewToken) -> Result<(), RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339` on the active row.
+    async fn delete(&self, user_id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+}
+
+/// Google Calendar persistence (`google_calendars` rows).
+///
+/// All deletes are SOFT: `deleted_at` is stamped, rows are never removed.
+#[async_trait(?Send)]
+pub trait CalendarRepo: Send + Sync {
+    /// The user's calendars, primary first then by summary.
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError>;
+    /// Returns the calendar with local `id`, or `None` when absent/soft-deleted.
+    async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError>;
+    /// Returns the calendar with `google_calendar_id`, or `None`.
+    async fn get_by_google_cal_id(
+        &self,
+        user_id: &str,
+        google_cal_id: &str,
+    ) -> Result<Option<GoogleCalendar>, RepoError>;
+    async fn upsert(&self, calendar: NewCalendar) -> Result<(), RepoError>;
+    async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError>;
+    /// Stores the incremental sync cursor and the sync timestamp.
+    async fn update_sync_state(
+        &self,
+        id: &str,
+        sync_token: &str,
+        last_synced_at_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    async fn set_sync_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339`.
+    async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+}
+
+/// Cached Google Calendar event persistence (`calendar_events` rows).
+///
+/// All deletes are SOFT: `deleted_at` is stamped, rows are never removed
+/// (fixing the old Go D1 implementation, which hard-deleted).
+#[async_trait(?Send)]
+pub trait CalendarEventRepo: Send + Sync {
+    /// Inserts or updates one event and returns the generated `id`.
+    async fn upsert(&self, event: NewCalendarEvent, now_rfc3339: &str) -> Result<String, RepoError>;
+    /// Inserts or updates many events, chunked to respect D1's 100-bound-
+    /// parameter limit (see `EVENT_UPSERT_CHUNK_SIZE`).
+    async fn upsert_batch(
+        &self,
+        events: Vec<NewCalendarEvent>,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError>;
+    /// Events that *overlap* the half-open `[start, end)` window:
+    /// `start_time < end AND end_time > start` (multi-day events are not
+    /// clipped at window edges).
+    async fn list_by_user_id_and_time_range(
+        &self,
+        user_id: &str,
+        start_rfc3339: &str,
+        end_rfc3339: &str,
+    ) -> Result<Vec<CalendarEvent>, RepoError>;
+    /// SOFT delete by local id.
+    async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// SOFT delete by `(calendar_id, google_event_id)` — used when incremental
+    /// sync reports a cancelled event.
+    async fn delete_by_google_event_id(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// SOFT delete of rows whose `last_synced_at` is older than
+    /// `older_than_rfc3339` (stale-event cleanup).
+    async fn delete_stale(
+        &self,
+        calendar_id: &str,
+        older_than_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+}
+
+pub const USER_GET_BY_ID_SQL: &str = "SELECT * FROM users WHERE id = ? AND deleted_at IS NULL";
+
+pub const USER_GET_BY_GOOGLE_ID_SQL: &str =
+    "SELECT * FROM users WHERE google_id = ? AND deleted_at IS NULL";
+
+/// Upsert keyed on `google_id`; `deleted_at = NULL` on conflict resurrects a
+/// soft-deleted row so the user can log in again.
+pub const USER_UPSERT_SQL: &str = "
+    INSERT INTO users (id, google_id, email, name, picture, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(google_id) DO UPDATE SET
+        email = excluded.email,
+        name = excluded.name,
+        picture = excluded.picture,
+        updated_at = excluded.updated_at,
+        deleted_at = NULL
+    RETURNING *
+";
+
+/// Fallback for D1 deployments where `RETURNING` misbehaves: update the row
+/// found by `get_by_google_id` instead. Mirrors the old Go d1_repo.go fallback.
+pub const USER_UPDATE_BY_ID_SQL: &str =
+    "UPDATE users SET email = ?, name = ?, picture = ?, updated_at = ? WHERE id = ?";
+
+pub const TOKEN_GET_BY_USER_ID_SQL: &str =
+    "SELECT * FROM google_oauth_tokens WHERE user_id = ? AND deleted_at IS NULL";
+
+/// Upsert keyed on `user_id`; `refresh_token` is preserved when the incoming
+/// value is NULL or an empty string, and `deleted_at = NULL` on conflict
+/// resurrects a soft-deleted row.
+pub const TOKEN_UPSERT_SQL: &str = "
+    INSERT INTO google_oauth_tokens
+        (id, user_id, access_token, refresh_token, expiry, token_type, scope, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        access_token = excluded.access_token,
+        refresh_token = COALESCE(NULLIF(excluded.refresh_token, ''), google_oauth_tokens.refresh_token),
+        expiry = excluded.expiry,
+        scope = excluded.scope,
+        token_type = excluded.token_type,
+        updated_at = excluded.updated_at,
+        deleted_at = NULL
+";
+
+/// SOFT delete: the row keeps its UNIQUE `user_id` slot but becomes invisible
+/// to `deleted_at IS NULL` reads.
+pub const TOKEN_DELETE_SQL: &str =
+    "UPDATE google_oauth_tokens SET deleted_at = ?, updated_at = ? WHERE user_id = ? AND deleted_at IS NULL";
+
+// ──────────────────────────────────────────
+// Calendar SQL
+// ──────────────────────────────────────────
+
+pub const CALENDAR_LIST_BY_USER_ID_SQL: &str =
+    "SELECT * FROM google_calendars WHERE user_id = ? AND deleted_at IS NULL ORDER BY is_primary DESC, summary ASC";
+
+pub const CALENDAR_GET_BY_ID_SQL: &str =
+    "SELECT * FROM google_calendars WHERE id = ? AND deleted_at IS NULL";
+
+pub const CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL: &str =
+    "SELECT * FROM google_calendars WHERE user_id = ? AND google_calendar_id = ? AND deleted_at IS NULL";
+
+/// Upsert keyed on `(user_id, google_calendar_id)`. An empty incoming
+/// `sync_token`/`last_synced_at` preserves the stored value (`COALESCE`), and
+/// `deleted_at = NULL` on conflict resurrects a soft-deleted row so a
+/// re-import of the calendar list brings it back.
+pub const CALENDAR_UPSERT_SQL: &str = "
+    INSERT INTO google_calendars
+        (id, user_id, google_calendar_id, summary, time_zone, is_primary, access_role, sync_enabled, sync_token, last_synced_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET
+        summary = excluded.summary,
+        time_zone = excluded.time_zone,
+        is_primary = excluded.is_primary,
+        access_role = excluded.access_role,
+        sync_enabled = excluded.sync_enabled,
+        sync_token = COALESCE(NULLIF(excluded.sync_token, ''), google_calendars.sync_token),
+        last_synced_at = COALESCE(NULLIF(excluded.last_synced_at, ''), google_calendars.last_synced_at),
+        updated_at = excluded.updated_at,
+        deleted_at = NULL
+";
+
+pub const CALENDAR_UPDATE_SYNC_STATE_SQL: &str =
+    "UPDATE google_calendars SET sync_token = ?, last_synced_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
+    "UPDATE google_calendars SET sync_enabled = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// SOFT delete: stamps `deleted_at`, keeping the row's UNIQUE
+/// `(user_id, google_calendar_id)` slot.
+pub const CALENDAR_DELETE_SQL: &str =
+    "UPDATE google_calendars SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+// ──────────────────────────────────────────
+// Calendar event SQL
+// ──────────────────────────────────────────
+
+pub const EVENT_GET_BY_ID_SQL: &str =
+    "SELECT * FROM calendar_events WHERE id = ? AND deleted_at IS NULL";
+
+/// Overlap semantics: an event intersects `[start, end)` when it begins before
+/// the window ends AND ends after it begins — multi-day and overnight events
+/// are not clipped at window edges.
+pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
+    SELECT e.* FROM calendar_events e
+    JOIN google_calendars c ON c.id = e.calendar_id
+    WHERE c.user_id = ? AND e.deleted_at IS NULL AND e.start_time < ? AND e.end_time > ?
+    ORDER BY e.start_time ASC
+";
+
+/// SOFT delete by local id.
+pub const EVENT_DELETE_SQL: &str =
+    "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// SOFT delete by `(calendar_id, google_event_id)`.
+pub const EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL: &str =
+    "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND google_event_id = ? AND deleted_at IS NULL";
+
+/// SOFT delete of stale rows (older than a cutoff).
+pub const EVENT_DELETE_STALE_SQL: &str =
+    "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND last_synced_at < ? AND deleted_at IS NULL";
+
+/// D1 allows at most 100 bound parameters per SQL statement.
+/// `calendar_events` upsert binds 13 columns per row → max 7 rows per statement.
+pub const EVENT_UPSERT_COL_COUNT: usize = 13;
+pub const EVENT_UPSERT_CHUNK_SIZE: usize = 100 / EVENT_UPSERT_COL_COUNT; // 7
+
+const EVENT_UPSERT_ON_CONFLICT: &str = "
+    ON CONFLICT(calendar_id, google_event_id) DO UPDATE SET
+        google_etag = excluded.google_etag,
+        google_updated_at = excluded.google_updated_at,
+        last_synced_at = excluded.last_synced_at,
+        title = excluded.title,
+        description = excluded.description,
+        start_time = excluded.start_time,
+        end_time = excluded.end_time,
+        recurrence = excluded.recurrence,
+        updated_at = excluded.updated_at
+";
+
+/// Builds a multi-row `INSERT … ON CONFLICT` statement for one chunk of
+/// events (non-empty and ≤ `EVENT_UPSERT_CHUNK_SIZE`). `ids` supplies the new
+/// UUID for each row and must match `events.len()` — the D1 implementation
+/// generates them (api-core stays free of a UUID dependency).
+///
+/// Returns `(sql, args)` where every arg is a string; the D1 implementation
+/// binds them as `D1Type::Text`. Mirrors the old Go `buildEventUpsertSQL`
+/// (13 columns, COALESCE-free — the Go upsert did not resurrect soft-deleted
+/// events, and neither does this one).
+pub fn build_event_upsert_sql(
+    events: &[NewCalendarEvent],
+    now_rfc3339: &str,
+    ids: Vec<String>,
+) -> (String, Vec<String>) {
+    assert!(!events.is_empty(), "event upsert chunk must not be empty");
+    assert!(
+        events.len() <= EVENT_UPSERT_CHUNK_SIZE,
+        "event upsert chunk exceeds {EVENT_UPSERT_CHUNK_SIZE} rows"
+    );
+    assert_eq!(events.len(), ids.len(), "one id per event required");
+
+    let mut sql = String::from(
+        "INSERT INTO calendar_events
+        (id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, created_at, updated_at)
+        VALUES ",
+    );
+    let mut args: Vec<String> = Vec::with_capacity(events.len() * EVENT_UPSERT_COL_COUNT);
+    for (index, (event, id)) in events.iter().zip(ids).enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        args.extend([
+            id,
+            event.calendar_id.clone(),
+            event.google_event_id.clone(),
+            event.google_etag.clone(),
+            event.google_updated_at.clone(),
+            event.last_synced_at.clone(),
+            event.title.clone(),
+            event.description.clone(),
+            event.start_time.clone(),
+            event.end_time.clone(),
+            event.recurrence.clone(),
+            now_rfc3339.to_string(),
+            now_rfc3339.to_string(),
+        ]);
+    }
+    sql.push(' ');
+    sql.push_str(EVENT_UPSERT_ON_CONFLICT);
+    (sql, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_reads_filter_soft_deleted_rows() {
+        assert!(USER_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{USER_GET_BY_ID_SQL}");
+        assert!(USER_GET_BY_GOOGLE_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(TOKEN_GET_BY_USER_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(CALENDAR_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(CALENDAR_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(EVENT_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
+        assert!(EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL.contains("deleted_at IS NULL"));
+    }
+
+    #[test]
+    fn token_delete_is_soft_not_hard() {
+        assert!(TOKEN_DELETE_SQL.starts_with("UPDATE"), "{TOKEN_DELETE_SQL}");
+        assert!(TOKEN_DELETE_SQL.contains("SET deleted_at = ?"), "{TOKEN_DELETE_SQL}");
+        assert!(!TOKEN_DELETE_SQL.contains("DELETE FROM"), "{TOKEN_DELETE_SQL}");
+    }
+
+    #[test]
+    fn calendar_and_event_deletes_are_soft_not_hard() {
+        for sql in [
+            CALENDAR_DELETE_SQL,
+            EVENT_DELETE_SQL,
+            EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
+            EVENT_DELETE_STALE_SQL,
+        ] {
+            assert!(sql.starts_with("UPDATE"), "{sql}");
+            assert!(sql.contains("SET deleted_at = ?"), "{sql}");
+            assert!(!sql.contains("DELETE FROM"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn token_upsert_preserves_existing_refresh_token() {
+        assert!(
+            TOKEN_UPSERT_SQL.contains(
+                "COALESCE(NULLIF(excluded.refresh_token, ''), google_oauth_tokens.refresh_token)"
+            ),
+            "{TOKEN_UPSERT_SQL}"
+        );
+    }
+
+    #[test]
+    fn upserts_resurrect_soft_deleted_rows() {
+        assert!(USER_UPSERT_SQL.contains("deleted_at = NULL"), "{USER_UPSERT_SQL}");
+        assert!(TOKEN_UPSERT_SQL.contains("deleted_at = NULL"), "{TOKEN_UPSERT_SQL}");
+        assert!(CALENDAR_UPSERT_SQL.contains("deleted_at = NULL"), "{CALENDAR_UPSERT_SQL}");
+    }
+
+    #[test]
+    fn calendar_upsert_preserves_sync_token_and_last_synced_at() {
+        assert!(
+            CALENDAR_UPSERT_SQL.contains(
+                "sync_token = COALESCE(NULLIF(excluded.sync_token, ''), google_calendars.sync_token)"
+            ),
+            "{CALENDAR_UPSERT_SQL}"
+        );
+        assert!(
+            CALENDAR_UPSERT_SQL.contains(
+                "last_synced_at = COALESCE(NULLIF(excluded.last_synced_at, ''), google_calendars.last_synced_at)"
+            ),
+            "{CALENDAR_UPSERT_SQL}"
+        );
+    }
+
+    #[test]
+    fn calendar_list_orders_primary_first_then_summary() {
+        let sql = CALENDAR_LIST_BY_USER_ID_SQL;
+        let order_start = sql.find("ORDER BY").expect("has ORDER BY");
+        assert_eq!(
+            &sql[order_start..],
+            "ORDER BY is_primary DESC, summary ASC"
+        );
+    }
+
+    #[test]
+    fn event_range_query_uses_overlap_semantics() {
+        let sql = EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL;
+        assert!(sql.contains("e.start_time < ?"), "{sql}");
+        assert!(sql.contains("e.end_time > ?"), "{sql}");
+        assert!(sql.contains("c.user_id = ?"), "{sql}");
+        assert!(sql.contains("ORDER BY e.start_time ASC"), "{sql}");
+    }
+
+    #[test]
+    fn event_upsert_chunk_size_respects_d1_100_param_limit() {
+        assert_eq!(EVENT_UPSERT_COL_COUNT, 13);
+        assert_eq!(EVENT_UPSERT_CHUNK_SIZE, 7);
+        assert!(EVENT_UPSERT_CHUNK_SIZE * EVENT_UPSERT_COL_COUNT <= 100);
+    }
+
+    #[test]
+    fn event_upsert_sql_has_13_placeholders_per_row_and_on_conflict() {
+        let event = NewCalendarEvent {
+            calendar_id: "cal-1".to_string(),
+            google_event_id: "g-1".to_string(),
+            google_etag: "etag".to_string(),
+            google_updated_at: "2026-08-17T10:00:00Z".to_string(),
+            last_synced_at: "2026-08-17T12:00:00Z".to_string(),
+            title: "Standup".to_string(),
+            description: String::new(),
+            start_time: "2026-08-18T09:00:00Z".to_string(),
+            end_time: "2026-08-18T09:30:00Z".to_string(),
+            recurrence: String::new(),
+        };
+        let (sql, args) = build_event_upsert_sql(
+            &[event.clone()],
+            "2026-08-17T12:00:00Z",
+            vec!["evt-1".to_string()],
+        );
+
+        assert!(sql.starts_with("INSERT INTO calendar_events"), "{sql}");
+        assert!(sql.contains("ON CONFLICT(calendar_id, google_event_id)"), "{sql}");
+        assert!(sql.contains("google_etag = excluded.google_etag"), "{sql}");
+        assert!(sql.contains("updated_at = excluded.updated_at"), "{sql}");
+
+        assert_eq!(args.len(), 13);
+        assert_eq!(args[0], "evt-1");
+        assert_eq!(args[1], "cal-1");
+        assert_eq!(args[5], "2026-08-17T12:00:00Z", "last_synced_at bound");
+        assert_eq!(args[11], "2026-08-17T12:00:00Z", "created_at bound");
+        assert_eq!(args[12], "2026-08-17T12:00:00Z", "updated_at bound");
+
+        // Exactly 13 placeholders for the single row (no trailing/extra commas).
+        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 1);
+        assert!(!sql.contains("(?,?,?,?,?,?,?,?,?,?,?,?,?,?"), "no 14th placeholder");
+    }
+
+    #[test]
+    fn event_upsert_sql_chunks_7_rows_with_91_placeholders() {
+        let event = NewCalendarEvent {
+            calendar_id: "cal-1".to_string(),
+            google_event_id: "g".to_string(),
+            google_etag: String::new(),
+            google_updated_at: String::new(),
+            last_synced_at: "2026-08-17T12:00:00Z".to_string(),
+            title: "T".to_string(),
+            description: String::new(),
+            start_time: "2026-08-18T09:00:00Z".to_string(),
+            end_time: "2026-08-18T09:30:00Z".to_string(),
+            recurrence: String::new(),
+        };
+        let events: Vec<NewCalendarEvent> = (0..7).map(|_| event.clone()).collect();
+        let ids: Vec<String> = (0..7).map(|i| format!("evt-{i}")).collect();
+        let (sql, args) = build_event_upsert_sql(&events, "2026-08-17T12:00:00Z", ids);
+
+        assert_eq!(args.len(), 7 * 13);
+        assert_eq!(sql.matches('?').count(), 7 * 13);
+        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 7);
+        assert_eq!(args[0], "evt-0");
+        assert_eq!(args[13], "evt-1");
+        assert_eq!(args[13 * 6], "evt-6");
+    }
+}

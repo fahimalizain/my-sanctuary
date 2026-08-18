@@ -1,0 +1,4 @@
+# Local-only Worker secrets (wrangler dev). Never commit real values.
+# Used by later slices: session cookies and Google OAuth.
+SESSION_SECRET=
+GOOGLE_CREDENTIALS_JSON=

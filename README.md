@@ -4,10 +4,10 @@ A personal productivity sanctuary — an installable PWA for managing your life 
 
 ## Apps
 
-| App | Description | Tech |
-|-----|-------------|------|
-| `apps/web` | Installable PWA with offline support | React 19, TanStack Router, Vite, Tailwind CSS |
-| `apps/api` | Backend API (Go Workers) | Go |
+| App           | Description                                           | Tech                                          |
+| ------------- | ----------------------------------------------------- | --------------------------------------------- |
+| `apps/web`    | Installable PWA with offline support                  | React 19, TanStack Router, Vite, Tailwind CSS |
+| `apps/worker` | Cloudflare Worker serving the API + PWA static assets | Rust (workers-rs), wrangler                   |
 
 ---
 
@@ -15,8 +15,9 @@ A personal productivity sanctuary — an installable PWA for managing your life 
 
 ```sh
 npm install          # installs dependencies + configures git hooks
-npx nx serve web     # starts the web dev server
-npx nx run web:build # production build
+npx nx serve worker  # starts the local Worker (wrangler dev) on :8787
+npx nx serve web     # starts the web dev server on :5173 (proxies /api, /auth, /health, /version to the Worker)
+npx nx run worker:build # production build (worker-build, implies web build)
 ```
 
 ---
@@ -44,7 +45,7 @@ The app opens in standalone mode (no Safari chrome).
 
 This repo uses tracked git hooks in `.githooks/`:
 
-- **pre-commit** — auto-bumps the `apps/web/package.json` patch version on every commit
+- **pre-commit** — auto-bumps the root `package.json` patch version on every commit
 
 The `prepare` script in `package.json` auto-configures the hook path on `npm install`. If it ever needs manual setup:
 
@@ -55,6 +56,7 @@ git config core.hooksPath .githooks
 ---
 
 ## Nx Commands
+
 ## Generate a library
 
 ```sh

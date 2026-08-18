@@ -8,7 +8,7 @@
     "test": {
       "executor": "nx:run-commands",
       "options": {
-        "commands": ["CGO_ENABLED=0 go test ./..."],
+        "commands": ["cargo test -p api-core"],
         "cwd": "packages/api-core"
       }
     }

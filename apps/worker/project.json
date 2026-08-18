@@ -1,0 +1,33 @@
+{
+  "name": "worker",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/worker",
+  "tags": [],
+  "implicitDependencies": ["api-core", "web"],
+  "targets": {
+    "build": {
+      "dependsOn": ["^build"],
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["worker-build --release"],
+        "cwd": "apps/worker"
+      },
+      "outputs": ["{projectRoot}/build"]
+    },
+    "serve": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["wrangler dev"],
+        "cwd": "apps/worker"
+      }
+    },
+    "deploy": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["wrangler deploy"],
+        "cwd": "apps/worker"
+      }
+    }
+  }
+}

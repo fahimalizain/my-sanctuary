@@ -1,0 +1,19 @@
+[package]
+name = "sanctuary-worker"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+api-core = { path = "../../packages/api-core" }
+async-trait = "0.1"
+serde = "1"
+serde_json = "1"
+url = "2"
+uuid = { version = "1", features = ["v4", "js"] }
+worker = { version = "0.8", features = ["d1"] }
+
+[build-dependencies]
+serde_json = "1"

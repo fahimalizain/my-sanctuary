@@ -11,7 +11,7 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const rootPkg = require('../../package.json');
 
-export default defineConfig(({ mode }) => ({
+export default defineConfig(() => ({
   plugins: [
     react(),
     VitePWA({
@@ -61,10 +61,18 @@ export default defineConfig(({ mode }) => ({
     },
   },
   define: {
-    __API_BASE_URL__: JSON.stringify(
-      mode === 'production' ? '' : (process.env.VITE_API_BASE_URL || 'http://localhost:8080')
-    ),
+    // Same-origin by default: wrangler dev serves the API on 127.0.0.1:8787 and
+    // the dev server proxies /api, /auth, /health, /version to it.
+    __API_BASE_URL__: JSON.stringify(process.env.VITE_API_BASE_URL || ''),
     __APP_VERSION__: JSON.stringify(rootPkg.version),
+  },
+  server: {
+    proxy: {
+      '/api': 'http://127.0.0.1:8787',
+      '/auth': 'http://127.0.0.1:8787',
+      '/health': 'http://127.0.0.1:8787',
+      '/version': 'http://127.0.0.1:8787',
+    },
   },
   build: {
     outDir: '../../dist/apps/web',

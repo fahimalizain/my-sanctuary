@@ -23,23 +23,25 @@
       "url": "http://localhost:5173",
       "webRoot": "${workspaceFolder}/apps/web",
       "userDataDir": "${workspaceFolder}/.vscode/chrome-debug-profile",
-      "runtimeArgs": ["--test-type", "--disable-blink-features=AutomationControlled"]
+      "runtimeArgs": [
+        "--test-type",
+        "--disable-blink-features=AutomationControlled"
+      ]
     },
     {
-      "type": "go",
+      "type": "node",
       "request": "launch",
-      "name": "API: dev server",
-      "mode": "auto",
-      "program": "${workspaceFolder}/apps/api",
-      "cwd": "${workspaceFolder}/apps/api",
-      "envFile": "${workspaceFolder}/.env",
-      "args": []
+      "name": "Worker: wrangler dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["exec", "wrangler", "dev"],
+      "cwd": "${workspaceFolder}/apps/worker",
+      "console": "integratedTerminal"
     }
   ],
   "compounds": [
     {
-      "name": "Web + API",
-      "configurations": ["Web: Vite dev server", "API: dev server"]
+      "name": "Web + Worker",
+      "configurations": ["Web: Vite dev server", "Worker: wrangler dev"]
     }
   ]
 }
