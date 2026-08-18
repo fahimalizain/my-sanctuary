@@ -1,6 +1,6 @@
 # Database Layer
 
-Architecture decisions are recorded in [`docs/adr/`](../adr/) — see [ADR 0001: Google Calendar watch channels](../adr/0001-google-calendar-watch-channels.md) for the watch-channel schema.
+Architecture decisions are recorded in [`docs/adr/`](../adr/) — see [ADR 0001: Google Calendar watch channels](../adr/0001-google-calendar-watch-channels.md) for the watch-channel schema and [ADR 0002: Task recurrence](../adr/0002-task-recurrence.md) for the task-series model.
 
 Documentation for the database layer of `@packages/api-core`, the shared Go
 library consumed by both `@apps/api` (native local dev) and
