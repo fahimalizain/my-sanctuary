@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -37,8 +37,19 @@ interface ListFormState {
 
 export function ListsPage() {
   const [lists, setLists] = useState<TaskList[]>([]);
+  // Latest `lists` for the dependency-free `load` callback below (writing a
+  // ref during render is the "latest value" pattern). Reading it lets `load`
+  // decide whether to show the full-page loader without closing over a stale
+  // array.
+  const listsRef = useRef<TaskList[]>([]);
+  listsRef.current = lists;
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // Load failures: only set from `load()`. Replaces the grid with the
+  // error+retry banner when there are no lists to show.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // Action failures (delete 409, etc.): rendered as a banner above the
+  // still-visible grid — cards are never unmounted by an action error.
+  const [actionError, setActionError] = useState<string | null>(null);
   const [form, setForm] = useState<ListFormState | null>(null);
   const [name, setName] = useState('');
   const [color, setColor] = useState('#2a5c8a');
@@ -46,8 +57,12 @@ export function ListsPage() {
   const [formError, setFormError] = useState<string | null>(null);
 
   const load = useCallback(() => {
-    setIsLoading(true);
-    setError(null);
+    // Full-page loader only when the grid is empty (first load, or a retry
+    // after a hard error cleared it) — the same rule as CalendarPage
+    // (`isLoading: prev.events.length === 0`), so reloads fired while cards
+    // are on screen never flash the spinner.
+    setIsLoading(listsRef.current.length === 0);
+    setLoadError(null);
     fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
       .then(async (res) => {
         if (!res.ok) throw new Error(await readError(res));
@@ -56,7 +71,7 @@ export function ListsPage() {
       })
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : 'Failed to load lists';
-        setError(message);
+        setLoadError(message);
       })
       .finally(() => setIsLoading(false));
   }, []);
@@ -92,6 +107,7 @@ export function ListsPage() {
 
     setSaving(true);
     setFormError(null);
+    setActionError(null);
     const res =
       form.mode === 'create'
         ? await fetch(`${API_BASE_URL}/api/lists`, {
@@ -119,7 +135,7 @@ export function ListsPage() {
     const confirmed = window.confirm(`Delete "${list.name}"?`);
     if (!confirmed) return;
 
-    setError(null);
+    setActionError(null);
     const res = await fetch(`${API_BASE_URL}/api/lists/${list.id}`, {
       method: 'DELETE',
       credentials: 'include',
@@ -127,7 +143,7 @@ export function ListsPage() {
     if (!res.ok) {
       const message = await readError(res);
       // 409 from the backend: living root categories still reference the list.
-      setError(
+      setActionError(
         res.status === 409
           ? `"${list.name}" is still in use and cannot be deleted.`
           : message,
@@ -159,15 +175,17 @@ export function ListsPage() {
           </Button>
         </header>
 
-        {/* Error banner */}
-        {error && (
+        {/* Load error banner — replaces the grid only when there are no lists
+            to show; with cards on screen it reads as a refresh-failure notice
+            above the still-visible grid */}
+        {loadError && (
           <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
-            <p className="text-sm">{error}</p>
+            <p className="text-sm">{loadError}</p>
             <Button
               variant="outline"
               size="sm"
               onClick={() => {
-                setError(null);
+                setLoadError(null);
                 load();
               }}
             >
@@ -176,16 +194,33 @@ export function ListsPage() {
           </div>
         )}
 
-        {/* Loading */}
-        {isLoading && (
+        {/* Action error banner (e.g. a delete 409) — the grid stays mounted */}
+        {actionError && (
+          <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
+            <p className="text-sm">{actionError}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setActionError(null)}
+            >
+              Dismiss
+            </Button>
+          </div>
+        )}
+
+        {/* Loading — only while the grid is empty (first load or a retry after
+            a hard error); reloads with cards on screen never flash this */}
+        {isLoading && lists.length === 0 && (
           <div className="flex items-center justify-center py-24 gap-2 text-muted-foreground">
             <Loader2 className="h-5 w-5 animate-spin" />
             Loading lists…
           </div>
         )}
 
-        {/* Lists Grid */}
-        {!isLoading && !error && (
+        {/* Lists Grid — hidden only when there is nothing to show (first load
+            in flight, or a load error that replaced the cards). Action errors
+            never unmount the grid. */}
+        {(lists.length > 0 || (!isLoading && !loadError)) && (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             {lists.map((list) => (
               <ListCard
