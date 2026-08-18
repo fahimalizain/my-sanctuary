@@ -24,16 +24,16 @@ Use `events.watch` push channels on `sync_enabled` calendars, with a 15-minute c
 
 ### Table `google_calendars_watch_channels`
 
-| Column        | Type | Constraints                                                      | Purpose |
-| ------------- | ---- | ---------------------------------------------------------------- | ------- |
-| `id`          | TEXT | PK (UUIDv4)                                                      | Row identity |
-| `calendar_id` | TEXT | NOT NULL → `google_calendars.id`                                 | Owning calendar |
-| `channel_id`  | TEXT | NOT NULL UNIQUE                                                  | UUID we mint; webhook lookup key (`X-Goog-Channel-ID`) |
-| `resource_id` | TEXT | NOT NULL                                                         | Google's id; required to `channels.stop` |
-| `token`       | TEXT | NOT NULL                                                         | Secret we mint; compared to `X-Goog-Channel-Token` |
-| `expiration`  | TEXT | NOT NULL                                                         | RFC 3339 UTC (rest of the schema uses ISO 8601 TEXT, never epoch integers) |
-| `created_at`  | TEXT | NOT NULL                                                         | Row creation time |
-| `updated_at`  | TEXT | NOT NULL                                                         | Last change time |
+| Column        | Type | Constraints                      | Purpose                                                                    |
+| ------------- | ---- | -------------------------------- | -------------------------------------------------------------------------- |
+| `id`          | TEXT | PK (UUIDv4)                      | Row identity                                                               |
+| `calendar_id` | TEXT | NOT NULL → `google_calendars.id` | Owning calendar                                                            |
+| `channel_id`  | TEXT | NOT NULL UNIQUE                  | UUID we mint; webhook lookup key (`X-Goog-Channel-ID`)                     |
+| `resource_id` | TEXT | NOT NULL                         | Google's id; required to `channels.stop`                                   |
+| `token`       | TEXT | NOT NULL                         | Secret we mint; compared to `X-Goog-Channel-Token`                         |
+| `expiration`  | TEXT | NOT NULL                         | RFC 3339 UTC (rest of the schema uses ISO 8601 TEXT, never epoch integers) |
+| `created_at`  | TEXT | NOT NULL                         | Row creation time                                                          |
+| `updated_at`  | TEXT | NOT NULL                         | Last change time                                                           |
 
 Rules:
 
