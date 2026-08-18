@@ -35,6 +35,13 @@ pub struct Config {
     /// Google OAuth client credentials; `None` when `GOOGLE_CREDENTIALS_JSON`
     /// is not set (or empty).
     pub oauth: Option<OAuthConfig>,
+    /// Full HTTPS callback URL for Google watch notifications
+    /// (`WATCH_CALLBACK_URL`, e.g.
+    /// `https://my-sanctuary.fahimalizain.com/api/calendar/notifications`);
+    /// `None` when unset or empty, in which case watch I/O is skipped. Stored
+    /// raw — the public-HTTPS check happens at use time (see
+    /// [`crate::calendar::is_public_https_callback`]).
+    pub watch_callback_url: Option<String>,
 }
 
 /// Errors produced while loading [`Config`] from the environment.
@@ -135,6 +142,8 @@ impl Config {
     /// - `GOOGLE_CREDENTIALS_JSON` is optional; when present it must parse to
     ///   valid OAuth credentials or `from_env` fails. An absent or empty value
     ///   leaves `oauth: None`.
+    /// - `WATCH_CALLBACK_URL` is optional and stored raw (no validation —
+    ///   missing or empty yields `watch_callback_url: None`).
     pub fn from_env(getenv: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let session_secret = getenv("SESSION_SECRET").ok_or(ConfigError::MissingSecret)?;
         if session_secret.len() < MIN_SESSION_SECRET_LEN {
@@ -150,11 +159,13 @@ impl Config {
             }
             _ => None,
         };
+        let watch_callback_url = getenv("WATCH_CALLBACK_URL").filter(|value| !value.is_empty());
         Ok(Self {
             session_secret,
             frontend_url,
             secure_cookie,
             oauth,
+            watch_callback_url,
         })
     }
 }
@@ -363,6 +374,36 @@ mod tests {
         }"#;
         let config = OAuthConfig::from_credentials_json(json, DEFAULT_FRONTEND_URL).unwrap();
         assert_eq!(config.redirect_url, "https://other.example.com/auth/google/callback");
+    }
+
+    #[test]
+    fn missing_watch_callback_url_yields_none() {
+        let config = Config::from_env(lookup(&[("SESSION_SECRET", SECRET)])).unwrap();
+        assert!(config.watch_callback_url.is_none());
+    }
+
+    #[test]
+    fn empty_watch_callback_url_yields_none() {
+        let config = Config::from_env(lookup(&[
+            ("SESSION_SECRET", SECRET),
+            ("WATCH_CALLBACK_URL", ""),
+        ]))
+        .unwrap();
+        assert!(config.watch_callback_url.is_none());
+    }
+
+    #[test]
+    fn watch_callback_url_is_stored_raw() {
+        // Even a non-public URL is stored as-is: the public-HTTPS predicate is
+        // applied at use time (`is_public_https_callback` in list_events), not
+        // at config load.
+        let raw = "http://localhost:8787/api/calendar/notifications";
+        let config = Config::from_env(lookup(&[
+            ("SESSION_SECRET", SECRET),
+            ("WATCH_CALLBACK_URL", raw),
+        ]))
+        .unwrap();
+        assert_eq!(config.watch_callback_url.as_deref(), Some(raw));
     }
 
     #[test]

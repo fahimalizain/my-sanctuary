@@ -86,15 +86,22 @@ pub async fn list_events(
 
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    let watches = crate::db::D1WatchChannelRepo::new(d1()?);
+    let watch_callback_url = ctx
+        .data
+        .as_ref()
+        .and_then(|config| config.watch_callback_url.as_deref());
     let output = match api_core::list_events(
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &watches,
         &access,
         &user_id,
         &start,
         &end,
         now_unix,
+        watch_callback_url,
     )
     .await
     {

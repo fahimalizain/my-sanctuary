@@ -31,11 +31,14 @@ fn load_config(env: &Env) -> Option<api_core::Config> {
         .secret("GOOGLE_CREDENTIALS_JSON")
         .ok()
         .map(|var| var.to_string());
+    // A public URL, not a secret: Google needs it in every events.watch body.
+    let watch_callback_url = env.var("WATCH_CALLBACK_URL").ok().map(|var| var.to_string());
     api_core::Config::from_env(|key| match key {
         "SESSION_SECRET" => Some(session_secret.clone()),
         "FRONTEND_URL" => frontend_url.clone().filter(|value| !value.is_empty()),
         "SECURE_COOKIE" => secure_cookie.clone(),
         "GOOGLE_CREDENTIALS_JSON" => google_json.clone(),
+        "WATCH_CALLBACK_URL" => watch_callback_url.clone().filter(|value| !value.is_empty()),
         _ => None,
     })
     .ok()
