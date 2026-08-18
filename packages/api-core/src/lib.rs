@@ -19,13 +19,13 @@ mod health;
 mod session;
 
 pub use calendar::{
-    create_event, decide_webhook, ensure_watch, is_public_https_callback, list_events,
-    parse_event_time_range, patch_event, renew_watch_if_needed, run_fallback_cron,
+    create_event, decide_webhook, ensure_watch, is_public_https_callback, list_calendars,
+    list_events, parse_event_time_range, patch_event, renew_watch_if_needed, run_fallback_cron,
     stop_watches_for_calendar, sync_calendar, tokens_match, CalendarError, CalendarEventsResponse,
-    CreateEventOutput, CreateEventResponse, CalendarListOutput, CronReport, WebhookDecision,
-    CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL, GOOGLE_CHANNELS_STOP_URL,
-    GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS, WATCH_DEFAULT_TTL_SECS,
-    WATCH_RENEW_HORIZON_SECS,
+    CalendarView, CalendarsResponse, CreateEventOutput, CreateEventResponse, CalendarListOutput,
+    CronReport, WebhookDecision, CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL,
+    GOOGLE_CHANNELS_STOP_URL, GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS,
+    WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,

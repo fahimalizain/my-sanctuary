@@ -142,6 +142,39 @@ pub struct CreateEventResponse {
     pub source: String,
 }
 
+/// Public picker row for `GET /api/calendar/calendars`.
+/// Omits sync internals (`sync_token`, `last_synced_at`, `deleted_at`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarView {
+    pub id: String,                 // local `google_calendars.id`
+    pub google_calendar_id: String, // Google's id — this is what categories store
+    pub summary: String,
+    pub time_zone: String,
+    pub is_primary: bool,
+    pub access_role: String,
+    pub sync_enabled: bool,
+}
+
+impl From<GoogleCalendar> for CalendarView {
+    fn from(cal: GoogleCalendar) -> Self {
+        Self {
+            id: cal.id,
+            google_calendar_id: cal.google_calendar_id,
+            summary: cal.summary,
+            time_zone: cal.time_zone,
+            is_primary: cal.is_primary,
+            access_role: cal.access_role,
+            sync_enabled: cal.sync_enabled,
+        }
+    }
+}
+
+/// Response envelope for `GET /api/calendar/calendars`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CalendarsResponse {
+    pub calendars: Vec<CalendarView>,
+}
+
 /// Resolves the event time window from optional `time_min`/`time_max` query
 /// params (RFC 3339, with or without fractional seconds).
 ///
@@ -418,6 +451,36 @@ pub async fn patch_event(
         event: row_from_new_event(new_event, id, &now_rfc3339),
         source: "google".to_string(),
         cache_error: None,
+    })
+}
+
+/// Lists the user's imported calendars for the picker
+/// (`GET /api/calendar/calendars`).
+///
+/// Cache-first, like `list_events`: a non-empty store is served as-is — no
+/// Google HTTP, no re-import. (Re-importing would overwrite `sync_enabled`
+/// via `CALENDAR_UPSERT_SQL`'s `sync_enabled = excluded.sync_enabled`.) An
+/// empty store runs the same first-contact `calendarList` import
+/// `list_events` performs, then re-reads.
+/// Event sync and watch channels are never touched here.
+///
+/// Rows are mapped to [`CalendarView`] (repo order: `is_primary DESC,
+/// summary ASC`). Import failures propagate as [`CalendarError`] — nothing
+/// is swallowed.
+pub async fn list_calendars(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+) -> Result<CalendarsResponse, CalendarError> {
+    let mut rows = calendars.list_by_user_id(user_id).await?;
+    if rows.is_empty() {
+        // First contact with Google: import the calendar list, then re-read.
+        refresh_calendar_list(http, calendars, access, user_id).await?;
+        rows = calendars.list_by_user_id(user_id).await?;
+    }
+    Ok(CalendarsResponse {
+        calendars: rows.into_iter().map(CalendarView::from).collect(),
     })
 }
 
@@ -2275,6 +2338,115 @@ mod tests {
         assert!(output.sync_errors[0].contains("500"), "{}", output.sync_errors[0]);
         assert!(output.events.is_empty());
         assert!(calendars.disabled.lock().unwrap().is_empty(), "500 is not a 404");
+    }
+
+    // ──────────────────────────────────────────
+    // list_calendars
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn list_calendars_empty_store_imports_calendar_list_without_syncing_events() {
+        // Only a calendarList route: any events.list or watch call would make
+        // the fake panic — this test proves list_calendars does neither.
+        let http = FakeHttp::new(vec![("calendarList", 200, CALENDAR_LIST_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![]);
+
+        let output =
+            pollster::block_on(list_calendars(&http, &calendars, &access(), "u-1")).unwrap();
+
+        let views = output.calendars;
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].google_calendar_id, "primary@example.com");
+        assert_eq!(
+            views[1].google_calendar_id,
+            "en.usa#holiday@group.v.calendar.google.com"
+        );
+        assert_eq!(views[0].summary, "Work");
+        assert_eq!(views[1].summary, "Holidays");
+        assert!(views[0].is_primary, "fixture marks the primary calendar");
+        assert_eq!(views[0].access_role, "owner");
+        assert!(!views[1].is_primary);
+        assert_eq!(views[1].access_role, "reader");
+
+        // Exactly one Google GET — the calendarList import.
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1, "calendarList import only");
+        assert!(gets[0].contains("calendarList"), "{gets:?}");
+        assert!(http.posts.lock().unwrap().is_empty(), "no watch POSTs");
+        assert_eq!(calendars.upserted.lock().unwrap().len(), 2);
+        assert!(
+            calendars.sync_states.lock().unwrap().is_empty(),
+            "no event sync"
+        );
+    }
+
+    #[test]
+    fn list_calendars_non_empty_store_is_cache_only() {
+        // No routes: any HTTP call would make the fake panic.
+        let http = FakeHttp::new(vec![]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+
+        let output =
+            pollster::block_on(list_calendars(&http, &calendars, &access(), "u-1")).unwrap();
+
+        assert!(
+            http.gets.lock().unwrap().is_empty(),
+            "no Google calls for a cached store"
+        );
+        let views = output.calendars;
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "cal-1");
+        assert_eq!(views[0].google_calendar_id, "primary@example.com");
+        assert_eq!(views[0].summary, "Work");
+        assert!(views[0].is_primary);
+        assert!(views[0].sync_enabled);
+        assert!(
+            calendars.upserted.lock().unwrap().is_empty(),
+            "no re-import"
+        );
+    }
+
+    #[test]
+    fn list_calendars_import_error_propagates() {
+        let http = FakeHttp::new(vec![("calendarList", 500, "nope")]);
+        let calendars = FakeCalendarRepo::with(vec![]);
+
+        let err =
+            pollster::block_on(list_calendars(&http, &calendars, &access(), "u-1")).unwrap_err();
+
+        assert!(err.to_string().contains("calendarList fetch"), "{err}");
+    }
+
+    #[test]
+    fn list_calendars_view_json_omits_sync_internals() {
+        let json = serde_json::to_value(CalendarsResponse {
+            calendars: vec![CalendarView::from(calendar(
+                "cal-1",
+                "primary@example.com",
+                true,
+            ))],
+        })
+        .unwrap();
+        let object = json.as_object().unwrap();
+        let view = object["calendars"][0].as_object().unwrap();
+        for key in [
+            "id",
+            "google_calendar_id",
+            "summary",
+            "time_zone",
+            "is_primary",
+            "access_role",
+            "sync_enabled",
+        ] {
+            assert!(view.contains_key(key), "missing picker field {key}");
+        }
+        for key in ["sync_token", "last_synced_at", "deleted_at"] {
+            assert!(
+                !view.contains_key(key),
+                "sync internals must stay hidden: {key}"
+            );
+        }
     }
 
     // ──────────────────────────────────────────

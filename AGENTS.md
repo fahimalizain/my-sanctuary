@@ -42,7 +42,7 @@ Shared Rust library (`api-core` crate) holding the API response types. Pure Rust
 
 ## @apps/worker
 
-The Cloudflare Worker is a workers-rs (Rust → WASM) app that serves `GET /health`, `GET /version`, `GET/POST /api/calendar/events`, and the Vite PWA via Workers Static Assets. Local runtime is `wrangler dev` + local D1; there is no native API server.
+The Cloudflare Worker is a workers-rs (Rust → WASM) app that serves `GET /health`, `GET /version`, `GET/POST /api/calendar/events`, `GET /api/calendar/calendars`, and the Vite PWA via Workers Static Assets. Local runtime is `wrangler dev` + local D1; there is no native API server.
 
 - **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version. `apps/worker/build.rs` reads it at build time and injects it as `APP_VERSION` (consumed via `env!("APP_VERSION")`), replacing the old Go `-ldflags` mechanism.
 - **Build** — `npx nx run worker:build` runs `worker-build --release` (implies `web:build` via `dependsOn`). Output lands in `apps/worker/build` (`build/index.js` is `main` in `wrangler.toml`).

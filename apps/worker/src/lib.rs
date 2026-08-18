@@ -76,6 +76,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/api/calendar/events", calendar::list_events)
         .post_async("/api/calendar/events", calendar::create_event)
         .options("/api/calendar/events", auth::options)
+        .get_async("/api/calendar/calendars", calendar::list_calendars)
+        .options("/api/calendar/calendars", auth::options)
         .get_async("/api/lists", lists::list_lists)
         .post_async("/api/lists", lists::create_list)
         .patch_async("/api/lists/:id", lists::update_list)
