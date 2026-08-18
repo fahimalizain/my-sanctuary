@@ -246,6 +246,42 @@ pub struct NewCalendarEvent {
     pub recurrence: String,
 }
 
+/// A Google Calendar watch channel (`events.watch` subscription), as stored in
+/// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
+/// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
+/// every other table — there is **no** `deleted_at`: channels are hard-deleted
+/// on stop (see ADR 0001).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WatchChannel {
+    pub id: String,
+    /// Owning calendar (`google_calendars.id`); many rows per calendar, since
+    /// renewal briefly overlaps two channels.
+    pub calendar_id: String,
+    /// The UUID we mint; the webhook lookup key (`X-Goog-Channel-ID`). UNIQUE.
+    pub channel_id: String,
+    /// Google's resource id; required to call `channels.stop`.
+    pub resource_id: String,
+    /// Secret we mint; compared to `X-Goog-Channel-Token`.
+    pub token: String,
+    /// RFC 3339 UTC instant when the channel expires.
+    pub expiration: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::WatchChannelRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the `created_at`/`updated_at`
+/// timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWatchChannel {
+    pub calendar_id: String,
+    pub channel_id: String,
+    pub resource_id: String,
+    pub token: String,
+    /// RFC 3339 UTC instant when the channel expires.
+    pub expiration: String,
+}
+
 /// Request body for `POST /api/calendar/events`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewEventInput {

@@ -30,7 +30,7 @@ pub use oauth::{
 };
 pub use repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, UserRepo,
-    EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
+    WatchChannelRepo, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
 };
 pub use session::{
     clear_session_cookie_header, cookie_value_from_header, seal, session_cookie_header, unseal,

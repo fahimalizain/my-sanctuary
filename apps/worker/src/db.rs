@@ -13,16 +13,19 @@
 
 use api_core::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewToken,
-    NewUser, User,
+    NewUser, NewWatchChannel, User, WatchChannel,
 };
 use api_core::repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, UserRepo,
-    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
-    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
-    CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL,
-    EVENT_DELETE_STALE_SQL, EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
-    EVENT_UPSERT_CHUNK_SIZE, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
-    USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL,
+    WatchChannelRepo, CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
+    CALENDAR_GET_BY_ID_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_SET_SYNC_ENABLED_SQL,
+    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
+    EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_ID_SQL,
+    EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_UPSERT_CHUNK_SIZE, TOKEN_DELETE_SQL,
+    TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL,
+    USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
+    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use worker::{D1Database, D1PreparedStatement, D1Type};
 
@@ -93,6 +96,17 @@ pub struct D1CalendarEventRepo {
 }
 
 impl D1CalendarEventRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+/// `google_calendars_watch_channels` table persistence.
+pub struct D1WatchChannelRepo {
+    db: D1Database,
+}
+
+impl D1WatchChannelRepo {
     pub fn new(db: D1Database) -> Self {
         Self { db }
     }
@@ -470,6 +484,82 @@ impl D1CalendarEventRepo {
     async fn run_upsert(&self, sql: &str, args: &[String]) -> Result<(), RepoError> {
         let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
         let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
+        run_stmt(stmt).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl WatchChannelRepo for D1WatchChannelRepo {
+    async fn insert(
+        &self,
+        channel: NewWatchChannel,
+        now_rfc3339: &str,
+    ) -> Result<String, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&channel.calendar_id),
+                D1Type::Text(&channel.channel_id),
+                D1Type::Text(&channel.resource_id),
+                D1Type::Text(&channel.token),
+                D1Type::Text(&channel.expiration),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        Ok(id)
+    }
+
+    async fn get_by_channel_id(&self, channel_id: &str) -> Result<Option<WatchChannel>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL)
+            .bind_refs(&[D1Type::Text(channel_id)])
+            .map_err(backend)?;
+        stmt.first::<WatchChannel>(None).await.map_err(backend)
+    }
+
+    async fn list_by_calendar_id(&self, calendar_id: &str) -> Result<Vec<WatchChannel>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_unexpired_by_calendar_id(
+        &self,
+        calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<Vec<WatchChannel>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(now_rfc3339)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn delete_by_id(&self, id: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_DELETE_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn delete_by_calendar_id(&self, calendar_id: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
         run_stmt(stmt).await
     }
 }
