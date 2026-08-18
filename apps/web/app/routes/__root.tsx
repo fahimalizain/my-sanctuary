@@ -10,7 +10,7 @@ function Navigation() {
 
   const navItems = [
     { path: '/', label: 'Home', icon: Home },
-    { path: '/streams', label: 'Streams', icon: LayoutGrid },
+    { path: '/lists', label: 'Lists', icon: LayoutGrid },
     { path: '/calendar', label: 'Calendar', icon: CalendarDays },
     { path: '/consistency', label: 'Consistency', icon: Target },
     { path: '/settings', label: 'Settings', icon: Settings },

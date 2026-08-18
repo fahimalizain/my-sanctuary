@@ -8,15 +8,15 @@ export interface Task {
 
 export interface TimeBlock {
   id: string;
-  streamId: string;
-  streamName: string;
-  streamColor: string;
+  listId: string;
+  listName: string;
+  listColor: string;
   startTime: string;
   endTime: string;
   tasks: Task[];
 }
 
-export interface Stream {
+export interface List {
   id: string;
   name: string;
   color: string;
@@ -47,4 +47,31 @@ export interface CalendarEvent {
 export interface CalendarEventsResponse {
   events: CalendarEvent[];
   source: 'cache' | string;
+}
+
+// A task list as stored in the backend (`task_lists` row shape, snake_case).
+// The UI `List` type above is a view of this used by the mock timeline.
+export interface TaskList {
+  id: string;
+  user_id: string;
+  name: string;
+  color: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// The envelope returned by GET /api/lists
+export interface TaskListsResponse {
+  lists: TaskList[];
+}
+
+// The envelope returned by POST /api/lists and PATCH /api/lists/:id
+export interface TaskListResponse {
+  list: TaskList;
+}
+
+// The envelope returned by DELETE /api/lists/:id
+export interface DeleteListResponse {
+  success: boolean;
 }

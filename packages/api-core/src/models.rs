@@ -246,6 +246,46 @@ pub struct NewCalendarEvent {
     pub recurrence: String,
 }
 
+/// A task list (the former "stream"), as stored in `task_lists`. Doubles as
+/// the D1 row projection AND the API response payload: serde field names are
+/// already snake_case and match the frontend `TaskList` in
+/// `apps/web/app/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskList {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i64,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+    /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
+    pub deleted_at: Option<String>,
+}
+
+/// Insert input for [`crate::repo::TaskListRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the `created_at`/`updated_at`
+/// timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskList {
+    pub user_id: String,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i64,
+}
+
+/// Update input for [`crate::repo::TaskListRepo::update`] (`PATCH
+/// /api/lists/:id`). `None` fields are left unchanged; the service rejects a
+/// body where every field is `None` (400 "nothing to update").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateTaskList {
+    pub name: Option<String>,
+    pub color: Option<String>,
+    pub sort_order: Option<i64>,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
@@ -383,6 +423,66 @@ mod tests {
             assert!(value.get(key).is_some(), "missing {key}: {value}");
         }
         assert_eq!(value["start_time"], "2026-08-18T09:00:00Z");
+    }
+
+    #[test]
+    fn task_list_deserializes_from_d1_row_shape() {
+        // D1 returns `sort_order` as a JS number and `deleted_at` as null.
+        let list: TaskList = serde_json::from_str(
+            r##"{
+                "id": "l-1", "user_id": "u-1", "name": "Work", "color": "#2a5c8a",
+                "sort_order": 0, "created_at": "2026-08-18T00:00:00Z",
+                "updated_at": "2026-08-18T00:00:00Z", "deleted_at": null
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(list.name, "Work");
+        assert_eq!(list.color, "#2a5c8a");
+        assert_eq!(list.sort_order, 0);
+        assert_eq!(list.deleted_at, None);
+    }
+
+    #[test]
+    fn task_list_serializes_snake_case_for_frontend() {
+        let list = TaskList {
+            id: "l-1".to_string(),
+            user_id: "u-1".to_string(),
+            name: "Work".to_string(),
+            color: "#2a5c8a".to_string(),
+            sort_order: 2,
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+            deleted_at: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&list).unwrap();
+        // Every field the frontend `TaskList` requires.
+        for key in [
+            "id",
+            "user_id",
+            "name",
+            "color",
+            "sort_order",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}: {value}");
+        }
+        assert_eq!(value["sort_order"], 2);
+    }
+
+    #[test]
+    fn update_task_list_missing_fields_deserialize_to_none() {
+        // A PATCH body that omits a field must not wipe it; an empty `{}`
+        // body yields all-`None` (the service rejects that as 400).
+        let updates: UpdateTaskList = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            updates,
+            UpdateTaskList {
+                name: None,
+                color: None,
+                sort_order: None
+            }
+        );
     }
 
     #[test]

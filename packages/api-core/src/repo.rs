@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewToken,
-    NewUser, User, WatchChannel, NewWatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTaskList,
+    NewToken, NewUser, TaskList, UpdateTaskList, User, WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -141,6 +141,34 @@ pub trait CalendarEventRepo: Send + Sync {
         older_than_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+}
+
+/// Task list persistence (`task_lists` rows).
+///
+/// All deletes are SOFT: `deleted_at` is stamped, rows are never removed.
+/// Deletion is guarded in the service: a list with living ROOT categories
+/// (`count_root_categories_for_list > 0`) cannot be deleted (409).
+#[async_trait(?Send)]
+pub trait TaskListRepo: Send + Sync {
+    /// The user's living lists, ordered by `sort_order` then `name`.
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskList>, RepoError>;
+    /// Returns the list with local `id`, or `None` when absent or soft-deleted.
+    /// NOT user-scoped; callers must verify `row.user_id` (the service does).
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskList>, RepoError>;
+    /// Inserts a new list and returns the stored row. The D1 implementation
+    /// generates the UUID `id` and the `created_at`/`updated_at` timestamps.
+    async fn insert(&self, list: NewTaskList) -> Result<TaskList, RepoError>;
+    /// Updates `name`/`color`/`sort_order` on a living list (`None` fields are
+    /// left unchanged) and returns the updated row, or `None` when the list is
+    /// missing or soft-deleted.
+    async fn update(&self, id: &str, updates: &UpdateTaskList) -> Result<Option<TaskList>, RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339`.
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Number of living lists for the user (first-visit seed check).
+    async fn count_by_user_id(&self, user_id: &str) -> Result<i64, RepoError>;
+    /// Number of living ROOT categories (`parent_id IS NULL`) still
+    /// referencing the list — the delete guard (409 when non-zero).
+    async fn count_root_categories_for_list(&self, list_id: &str) -> Result<i64, RepoError>;
 }
 
 /// Google Calendar watch channel persistence (`google_calendars_watch_channels`
@@ -378,6 +406,51 @@ pub fn build_event_upsert_sql(
 }
 
 // ──────────────────────────────────────────
+// Task list SQL
+// ──────────────────────────────────────────
+
+pub const TASK_LIST_LIST_BY_USER_ID_SQL: &str =
+    "SELECT * FROM task_lists WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, name ASC";
+
+pub const TASK_LIST_GET_BY_ID_SQL: &str =
+    "SELECT * FROM task_lists WHERE id = ? AND deleted_at IS NULL";
+
+/// Plain INSERT (no `ON CONFLICT`): lists are user-authored, never upserted
+/// (the seed inserts fresh rows per new user). The D1 implementation binds the
+/// UUID `id` and the `created_at`/`updated_at` timestamps.
+pub const TASK_LIST_INSERT_SQL: &str = "
+    INSERT INTO task_lists (id, user_id, name, color, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+";
+
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). The D1
+/// implementation binds `D1Type::Null` for `None` fields; the service validates
+/// non-empty name/color before this runs, so empty strings never reach the DB.
+pub const TASK_LIST_UPDATE_SQL: &str = "
+    UPDATE task_lists SET
+        name = COALESCE(?, name),
+        color = COALESCE(?, color),
+        sort_order = COALESCE(?, sort_order),
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
+pub const TASK_LIST_DELETE_SQL: &str =
+    "UPDATE task_lists SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+pub const TASK_LIST_COUNT_BY_USER_ID_SQL: &str =
+    "SELECT COUNT(*) AS count FROM task_lists WHERE user_id = ? AND deleted_at IS NULL";
+
+/// The delete guard: living ROOT categories (`parent_id IS NULL`) still
+/// referencing the list. Children store `list_id NULL` (they inherit on read),
+/// so only roots matter here.
+pub const TASK_LIST_COUNT_ROOT_CATEGORIES_SQL: &str = "
+    SELECT COUNT(*) AS count FROM task_categories
+    WHERE list_id = ? AND parent_id IS NULL AND deleted_at IS NULL
+";
+
+// ──────────────────────────────────────────
 // Watch channel SQL
 // ──────────────────────────────────────────
 
@@ -587,6 +660,57 @@ mod tests {
         assert_eq!(args[0], "evt-0");
         assert_eq!(args[13], "evt-1");
         assert_eq!(args[13 * 6], "evt-6");
+    }
+
+    #[test]
+    fn task_list_reads_filter_soft_deleted_rows_and_order_by_sort_then_name() {
+        assert!(TASK_LIST_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_LIST_LIST_BY_USER_ID_SQL);
+        let order_start = TASK_LIST_LIST_BY_USER_ID_SQL
+            .find("ORDER BY")
+            .expect("has ORDER BY");
+        assert_eq!(
+            &TASK_LIST_LIST_BY_USER_ID_SQL[order_start..],
+            "ORDER BY sort_order ASC, name ASC"
+        );
+        assert!(TASK_LIST_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_LIST_GET_BY_ID_SQL);
+        assert!(TASK_LIST_COUNT_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_LIST_COUNT_BY_USER_ID_SQL);
+    }
+
+    #[test]
+    fn task_list_insert_binds_all_columns() {
+        assert!(TASK_LIST_INSERT_SQL.contains("INSERT INTO task_lists"), "{}", TASK_LIST_INSERT_SQL);
+        assert!(!TASK_LIST_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_LIST_INSERT_SQL);
+        assert_eq!(
+            TASK_LIST_INSERT_SQL.matches('?').count(),
+            7,
+            "one placeholder per column: {}",
+            TASK_LIST_INSERT_SQL
+        );
+    }
+
+    #[test]
+    fn task_list_update_uses_coalesce_for_partial_updates() {
+        let sql = TASK_LIST_UPDATE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("COALESCE(?, name)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, color)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, sort_order)"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn task_list_delete_is_soft_not_hard() {
+        assert!(TASK_LIST_DELETE_SQL.starts_with("UPDATE"), "{}", TASK_LIST_DELETE_SQL);
+        assert!(TASK_LIST_DELETE_SQL.contains("SET deleted_at = ?"), "{}", TASK_LIST_DELETE_SQL);
+        assert!(!TASK_LIST_DELETE_SQL.contains("DELETE FROM"), "{}", TASK_LIST_DELETE_SQL);
+    }
+
+    #[test]
+    fn task_list_root_category_guard_filters_living_roots() {
+        let sql = TASK_LIST_COUNT_ROOT_CATEGORIES_SQL;
+        assert!(sql.contains("list_id = ?"), "{sql}");
+        assert!(sql.contains("parent_id IS NULL"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
     }
 
     #[test]

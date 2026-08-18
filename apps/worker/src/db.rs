@@ -12,21 +12,25 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewToken,
-    NewUser, NewWatchChannel, User, WatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTaskList,
+    NewToken, NewUser, NewWatchChannel, TaskList, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, UserRepo,
-    WatchChannelRepo, CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
+    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskListRepo, TokenRepo,
+    UserRepo, WatchChannelRepo, CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
     CALENDAR_GET_BY_ID_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_UPSERT_CHUNK_SIZE,
-    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL,
-    USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
-    WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
+    TASK_LIST_COUNT_BY_USER_ID_SQL, TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL,
+    TASK_LIST_GET_BY_ID_SQL, TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL,
+    TASK_LIST_UPDATE_SQL, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
+    USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL,
+    WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
+    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
     WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
+use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, D1Type};
 
 /// Current time as an RFC 3339 UTC string, from the JS clock.
@@ -494,6 +498,140 @@ impl D1CalendarEventRepo {
         let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
         let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
         run_stmt(stmt).await
+    }
+}
+
+/// Row projection for `SELECT COUNT(*) AS count` statements.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct CountRow {
+    pub count: i64,
+}
+
+/// `task_lists` table persistence.
+pub struct D1TaskListRepo {
+    db: D1Database,
+}
+
+impl D1TaskListRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl TaskListRepo for D1TaskListRepo {
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskList>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskList>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<TaskList>(None).await.map_err(backend)
+    }
+
+    async fn insert(&self, list: NewTaskList) -> Result<TaskList, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&list.user_id),
+                D1Type::Text(&list.name),
+                D1Type::Text(&list.color),
+                D1Type::Integer(list.sort_order as i32),
+                D1Type::Text(&now),
+                D1Type::Text(&now),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        Ok(TaskList {
+            id: id.clone(),
+            user_id: list.user_id,
+            name: list.name,
+            color: list.color,
+            sort_order: list.sort_order,
+            created_at: now.clone(),
+            updated_at: now,
+            deleted_at: None,
+        })
+    }
+
+    async fn update(
+        &self,
+        id: &str,
+        updates: &UpdateTaskList,
+    ) -> Result<Option<TaskList>, RepoError> {
+        // NULL binds flow through COALESCE and leave the column unchanged.
+        let name = match updates.name.as_deref() {
+            Some(value) => D1Type::Text(value),
+            None => D1Type::Null,
+        };
+        let color = match updates.color.as_deref() {
+            Some(value) => D1Type::Text(value),
+            None => D1Type::Null,
+        };
+        let sort_order = match updates.sort_order {
+            Some(value) => D1Type::Integer(value as i32),
+            None => D1Type::Null,
+        };
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_UPDATE_SQL)
+            .bind_refs(&[
+                name,
+                color,
+                sort_order,
+                D1Type::Text(&now),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_DELETE_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn count_by_user_id(&self, user_id: &str) -> Result<i64, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_COUNT_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<CountRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.count).unwrap_or(0))
+    }
+
+    async fn count_root_categories_for_list(&self, list_id: &str) -> Result<i64, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LIST_COUNT_ROOT_CATEGORIES_SQL)
+            .bind_refs(&[D1Type::Text(list_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<CountRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.count).unwrap_or(0))
     }
 }
 

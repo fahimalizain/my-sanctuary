@@ -94,7 +94,7 @@ export function TaskModal({
             <DialogDescription>
               {isEditing
                 ? 'Update the details of your task below.'
-                : 'Create a new task to add to your stream.'}
+                : 'Create a new task to add to your list.'}
             </DialogDescription>
           </DialogHeader>
 
@@ -201,10 +201,10 @@ export function TaskModal({
             </div>
           </div>
 
-          {/* Stream Tag */}
+          {/* List Tag */}
           <div className="flex items-center gap-2 mb-6 p-3 bg-muted rounded-xl">
             <Tag className="h-4 w-4 text-primary" />
-            <span className="text-sm text-foreground">Stream:</span>
+            <span className="text-sm text-foreground">List:</span>
             <span className="text-sm font-medium text-primary">Work</span>
           </div>
 
