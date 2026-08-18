@@ -41,7 +41,9 @@
 //!   wires D1 lookups and `ctx.wait_until(sync_calendar)` (ADR 0001 §
 //!   Webhook).
 
+use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
+use std::fmt;
 use thiserror::Error;
 use url::Url;
 
@@ -420,8 +422,63 @@ fn mint_token() -> String {
 struct WatchChannelResponse {
     #[serde(rename = "resourceId")]
     resource_id: String,
-    #[serde(default, rename = "expiration")]
+    #[serde(default, rename = "expiration", deserialize_with = "de_optional_expiration")]
     expiration_millis: Option<i64>,
+}
+
+/// Deserializes `Channel.expiration` (Unix ms) into `Option<i64>`. Google's
+/// discovery doc types it `string`/`int64`, so `events.watch` sends it as a
+/// JSON string of digits (`"1787628641000"`), while some responses send a
+/// JSON number. `null`/missing → `None` (callers fall back to the default 7-day
+/// TTL); an unparseable string is an error, never a silent `None`.
+fn de_optional_expiration<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ExpirationVisitor;
+
+    impl<'de> Visitor<'de> for ExpirationVisitor {
+        type Value = Option<i64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an integer, a string of digits, or null")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(Some(value))
+        }
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            i64::try_from(value)
+                .map(Some)
+                .map_err(|_| de::Error::invalid_value(de::Unexpected::Unsigned(value), &self))
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| de::Error::invalid_value(de::Unexpected::Str(value), &self))
+        }
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_any(ExpirationVisitor)
 }
 
 /// POSTs `events.watch` for `cal` (with a freshly minted `channel_id`/`token`)
@@ -2115,6 +2172,52 @@ mod tests {
     // ──────────────────────────────────────────
 
     const WATCH_JSON: &str = r#"{"id":"minted-id","resourceId":"resource-123","expiration":1710000000000}"#;
+    // Production shape: `Channel.expiration` is discovery type string/int64, so
+    // `events.watch` returns it as a JSON string of milliseconds. Same millis
+    // as `WATCH_JSON` — the converted expiration "2024-03-09T16:00:00Z" holds.
+    const WATCH_JSON_STRING_EXPIRATION: &str =
+        r#"{"id":"minted-id","resourceId":"resource-123","expiration":"1710000000000"}"#;
+
+    // ──────────────────────────────────────────
+    // WatchChannelResponse deserialization
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn watch_channel_response_accepts_numeric_expiration() {
+        let channel: WatchChannelResponse =
+            serde_json::from_str(r#"{"resourceId":"r","expiration":1710000000000}"#).unwrap();
+        assert_eq!(channel.expiration_millis, Some(1710000000000));
+    }
+
+    #[test]
+    fn watch_channel_response_accepts_string_expiration() {
+        let channel: WatchChannelResponse =
+            serde_json::from_str(r#"{"resourceId":"r","expiration":"1787628641000"}"#).unwrap();
+        assert_eq!(channel.expiration_millis, Some(1787628641000));
+    }
+
+    #[test]
+    fn watch_channel_response_defaults_missing_expiration_to_none() {
+        let channel: WatchChannelResponse =
+            serde_json::from_str(r#"{"resourceId":"r"}"#).unwrap();
+        assert_eq!(channel.expiration_millis, None);
+    }
+
+    #[test]
+    fn watch_channel_response_maps_null_expiration_to_none() {
+        let channel: WatchChannelResponse =
+            serde_json::from_str(r#"{"resourceId":"r","expiration":null}"#).unwrap();
+        assert_eq!(channel.expiration_millis, None);
+    }
+
+    #[test]
+    fn watch_channel_response_rejects_unparseable_expiration_string() {
+        let err = serde_json::from_str::<WatchChannelResponse>(
+            r#"{"resourceId":"r","expiration":"not-a-number"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not-a-number"), "{err}");
+    }
 
     #[test]
     fn list_events_skips_watch_when_callback_is_none() {
@@ -2191,6 +2294,42 @@ mod tests {
 
         // Channel row inserted with Google's resourceId + converted expiration
         // (1710000000000 ms == 1710000000 s == 2024-03-09T16:00:00Z).
+        let inserted = watches.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].calendar_id, "cal-1");
+        assert_eq!(inserted[0].resource_id, "resource-123");
+        assert_eq!(inserted[0].expiration, "2024-03-09T16:00:00Z");
+
+        // First-paint sync still ran and populated the cache.
+        assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
+        assert_eq!(output.events.len(), 2);
+        assert!(output.sync_errors.is_empty());
+    }
+
+    #[test]
+    fn never_synced_calendar_is_watched_then_synced_with_string_expiration() {
+        // Production shape: Google sends `expiration` as a JSON string
+        // (discovery type string/int64). This is the path that used to fail
+        // with "invalid type: string ..., expected i64" and orphan every
+        // channel; the row must be inserted exactly like the numeric case.
+        let http = FakeHttp::new(vec![
+            ("/events/watch", 200, WATCH_JSON_STRING_EXPIRATION),
+            ("/events", 200, EVENTS_JSON),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX,
+            Some(CALLBACK_URL),
+        ))
+        .unwrap();
+
+        // Channel row inserted with Google's resourceId + converted expiration
+        // ("1710000000000" ms == 1710000000 s == 2024-03-09T16:00:00Z — same as
+        // the numeric fixture).
         let inserted = watches.inserted.lock().unwrap();
         assert_eq!(inserted.len(), 1);
         assert_eq!(inserted[0].calendar_id, "cal-1");
