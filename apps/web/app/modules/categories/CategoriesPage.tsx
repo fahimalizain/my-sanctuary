@@ -437,7 +437,9 @@ export function CategoriesPage() {
                                       className="h-2 w-2 rounded-full flex-shrink-0"
                                       style={{
                                         backgroundColor:
-                                          child.color || root.color || list.color,
+                                          child.color ||
+                                          root.color ||
+                                          list.color,
                                       }}
                                     />
                                     <span className="flex-1 min-w-0 text-xs text-muted-foreground truncate">
