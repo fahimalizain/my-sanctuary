@@ -8,6 +8,7 @@ import { RootComponent } from './routes/__root';
 import { HomeComponent } from './routes/index';
 import { LoginComponent } from './routes/login';
 import { ListsComponent } from './routes/lists';
+import { CategoriesComponent } from './routes/categories';
 import { CalendarComponent } from './routes/calendar';
 import { ConsistencyComponent } from './routes/consistency';
 import { SettingsComponent } from './routes/settings';
@@ -45,6 +46,12 @@ const listsRoute = createRoute({
   component: withAuth(ListsComponent),
 });
 
+const categoriesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/categories',
+  component: withAuth(CategoriesComponent),
+});
+
 const calendarRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/calendar',
@@ -67,6 +74,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
   listsRoute,
+  categoriesRoute,
   calendarRoute,
   consistencyRoute,
   settingsRoute,

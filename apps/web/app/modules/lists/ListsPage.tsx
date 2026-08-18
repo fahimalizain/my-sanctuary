@@ -20,21 +20,17 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { TaskModal } from '@/app/components/TaskModal';
+import { useNavigate } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import type {
-  CategoriesResponse,
-  Category,
-  NewCategoryInput,
   NewTaskInput,
-  TaskCategorySummary,
   TaskList,
   TaskListsResponse,
   TaskPriority,
   TaskRecord,
   TaskResponse,
   TasksResponse,
-  UpdateCategoryInput,
   UpdateTaskInput,
 } from '@/app/types';
 
@@ -60,21 +56,6 @@ async function readError(res: Response): Promise<string> {
   return `Request failed with status ${res.status}`;
 }
 
-interface PatternDraft {
-  regex: string;
-  googleCalendarId: string;
-}
-
-interface CategoryFormState {
-  mode: 'create' | 'edit';
-  /** Create-root target (undefined for a child category). */
-  list?: TaskList;
-  /** Create-child target (undefined for a root category). */
-  parent?: Category;
-  /** Edit target. */
-  category?: Category;
-}
-
 interface ListFormState {
   mode: 'create' | 'edit';
   list?: TaskList;
@@ -82,16 +63,13 @@ interface ListFormState {
 
 interface TaskFormState {
   mode: 'create' | 'edit';
-  /** Create-anchor category (its title is the hint; the server still decides
-   *  the final match). */
-  category?: TaskCategorySummary;
   /** Edit target. */
   task?: TaskRecord;
 }
 
 export function ListsPage() {
+  const navigate = useNavigate();
   const [lists, setLists] = useState<TaskList[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   // Latest `lists` for the dependency-free `load` callback below (writing a
   // ref during render is the "latest value" pattern). Reading it lets `load`
@@ -112,14 +90,6 @@ export function ListsPage() {
   const [listName, setListName] = useState('');
   const [listColor, setListColor] = useState('#2a5c8a');
 
-  // Category dialog state.
-  const [form, setForm] = useState<CategoryFormState | null>(null);
-  const [title, setTitle] = useState('');
-  const [color, setColor] = useState('#2a5c8a');
-  const [isProductive, setIsProductive] = useState(false);
-  const [googleCalendarId, setGoogleCalendarId] = useState('');
-  const [patterns, setPatterns] = useState<PatternDraft[]>([]);
-
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -134,25 +104,16 @@ export function ListsPage() {
     setIsLoading(listsRef.current.length === 0);
     setLoadError(null);
     // Sequential on purpose: GET /api/lists performs the first-visit seed (it
-    // inserts the default lists AND the category taxonomy), so the categories
-    // request must run after it — a parallel fetch would often return [] on
-    // first paint and never retry. Tasks come last: their computed categories
-    // depend on the seeded taxonomy, and GET /api/tasks also runs the
-    // count-gated seed (a no-op once lists seeded).
+    // inserts the default lists AND the category taxonomy), so the tasks
+    // request must run after it — their computed categories depend on the
+    // seeded taxonomy, and GET /api/tasks also runs the count-gated seed (a
+    // no-op once lists seeded). The board hides untracked tasks, so the
+    // categories endpoint is never needed here.
     fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
       .then(async (listsRes) => {
         if (!listsRes.ok) throw new Error(await readError(listsRes));
         const listsData = (await listsRes.json()) as TaskListsResponse;
         setLists(listsData.lists ?? []);
-        return fetch(`${API_BASE_URL}/api/categories`, {
-          credentials: 'include',
-        });
-      })
-      .then(async (categoriesRes) => {
-        if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
-        const categoriesData =
-          (await categoriesRes.json()) as CategoriesResponse;
-        setCategories(categoriesData.categories ?? []);
         return fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' });
       })
       .then(async (tasksRes) => {
@@ -172,8 +133,8 @@ export function ListsPage() {
     load();
   }, [load]);
 
-  // Refreshes only the tasks (timer actions never change lists/categories, so
-  // the sequential lists→categories→tasks reload is unnecessary here).
+  // Refreshes only the tasks (timer actions never change lists, so the
+  // sequential lists→tasks reload is unnecessary here).
   const reloadTasks = useCallback(() => {
     fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' })
       .then(async (res) => {
@@ -297,132 +258,14 @@ export function ListsPage() {
   };
 
   // ──────────────────────────────────────────
-  // Category actions
-  // ──────────────────────────────────────────
-
-  const openCreateRoot = (list: TaskList) => {
-    setForm({ mode: 'create', list });
-    setTitle('');
-    setColor(list.color);
-    setIsProductive(false);
-    setGoogleCalendarId('');
-    setPatterns([]);
-    setFormError(null);
-  };
-
-  const openCreateChild = (parent: Category) => {
-    setForm({ mode: 'create', parent });
-    setTitle('');
-    setColor(parent.color || '#2a5c8a');
-    setIsProductive(false);
-    setGoogleCalendarId('');
-    setPatterns([]);
-    setFormError(null);
-  };
-
-  const openEditCategory = (category: Category) => {
-    setForm({ mode: 'edit', category });
-    setTitle(category.title);
-    setColor(category.color || '#2a5c8a');
-    setIsProductive(category.is_productive);
-    setGoogleCalendarId(category.google_calendar_id ?? '');
-    setPatterns(
-      category.patterns.map((pattern) => ({
-        regex: pattern.regex,
-        googleCalendarId: pattern.google_calendar_id ?? '',
-      })),
-    );
-    setFormError(null);
-  };
-
-  const closeForm = () => {
-    setForm(null);
-    setSaving(false);
-    setFormError(null);
-  };
-
-  const handleCategorySubmit = async () => {
-    if (!form) return;
-    const trimmedTitle = title.trim();
-    if (!trimmedTitle || !color) return;
-
-    const bodyPatterns = patterns
-      .filter((pattern) => pattern.regex.trim().length > 0)
-      .map((pattern) => ({
-        regex: pattern.regex.trim(),
-        google_calendar_id: pattern.googleCalendarId.trim() || null,
-      }));
-
-    setSaving(true);
-    setFormError(null);
-    setActionError(null);
-
-    let res: Response;
-    if (form.mode === 'edit') {
-      const body: UpdateCategoryInput = {
-        title: trimmedTitle,
-        color,
-        is_productive: isProductive,
-        google_calendar_id: googleCalendarId.trim() || null,
-        patterns: bodyPatterns,
-      };
-      res = await fetch(`${API_BASE_URL}/api/categories/${form.category!.id}`, {
-        method: 'PATCH',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-    } else {
-      const body: NewCategoryInput = {
-        title: trimmedTitle,
-        color,
-        is_productive: isProductive,
-        google_calendar_id: googleCalendarId.trim() || null,
-        // Roots carry the target list; children carry no list_id at all (the
-        // service rejects a child with one).
-        list_id: form.list ? form.list.id : null,
-        parent_id: form.parent ? form.parent.id : null,
-        patterns: bodyPatterns,
-      };
-      res = await fetch(`${API_BASE_URL}/api/categories`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-    }
-    if (!res.ok) {
-      setSaving(false);
-      setFormError(await readError(res));
-      return;
-    }
-    closeForm();
-    load();
-  };
-
-  const handleDeleteCategory = async (category: Category) => {
-    const confirmed = window.confirm(`Delete "${category.title}"?`);
-    if (!confirmed) return;
-
-    setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/categories/${category.id}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      // The backend explains 409s (living children, undeletable untracked).
-      setActionError(await readError(res));
-      return;
-    }
-    load();
-  };
-
-  // ──────────────────────────────────────────
   // Task actions
   // ──────────────────────────────────────────
 
-  const openCreateTask = (category: TaskCategorySummary) => {
-    setTaskForm({ mode: 'create', category });
+  // New Task is page-level: no category anchor. The title matcher files the
+  // task onto a list (0 / many / untracked matches → the modal shows the
+  // server's 400 message).
+  const openCreateTask = () => {
+    setTaskForm({ mode: 'create' });
     setFormError(null);
   };
 
@@ -470,7 +313,9 @@ export function ListsPage() {
       return await readError(res);
     }
     // The response carries the computed category — reuse it directly so the
-    // card regroups instantly.
+    // card regroups instantly (the task lands on the card whose
+    // `inherited_list_id` matches; an untracked result stays hidden, which is
+    // correct on this page).
     const data = (await res.json()) as TaskResponse;
     setTasks((prev) =>
       taskForm.mode === 'create'
@@ -495,36 +340,6 @@ export function ListsPage() {
     return null;
   };
 
-  // ──────────────────────────────────────────
-  // Patterns editor
-  // ──────────────────────────────────────────
-
-  const addPattern = () => {
-    setPatterns((prev) => [...prev, { regex: '', googleCalendarId: '' }]);
-  };
-
-  const updatePattern = (index: number, patch: Partial<PatternDraft>) => {
-    setPatterns((prev) =>
-      prev.map((pattern, i) =>
-        i === index ? { ...pattern, ...patch } : pattern,
-      ),
-    );
-  };
-
-  const removePattern = (index: number) => {
-    setPatterns((prev) => prev.filter((_, i) => i !== index));
-  };
-
-  const dialogTitle = form
-    ? form.mode === 'edit'
-      ? 'Edit Category'
-      : form.parent
-        ? `Sub-Category under ${form.parent.title}`
-        : form.list
-          ? `Category in ${form.list.name}`
-          : 'New Category'
-    : '';
-
   return (
     <div className="min-h-screen bg-cream">
       <div className="max-w-7xl mx-auto px-6 py-8">
@@ -535,16 +350,28 @@ export function ListsPage() {
               My Lists
             </h1>
             <p className="text-muted-foreground">
-              Manage your life domains — tasks live inside categories later
+              Tasks are filed into lists by their title
             </p>
           </div>
-          <Button
-            onClick={openCreateList}
-            className="bg-sanctuary-green hover:bg-sanctuary-green/90"
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            New List
-          </Button>
+          <div className="flex gap-3">
+            <Button variant="outline" onClick={openCreateTask}>
+              <Plus className="h-4 w-4 mr-2" />
+              New Task
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => navigate({ to: '/categories' })}
+            >
+              Edit Categories
+            </Button>
+            <Button
+              onClick={openCreateList}
+              className="bg-sanctuary-green hover:bg-sanctuary-green/90"
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              New List
+            </Button>
+          </div>
         </header>
 
         {/* Load error banner — replaces the grid only when there are no lists
@@ -598,15 +425,9 @@ export function ListsPage() {
               <ListCard
                 key={list.id}
                 list={list}
-                categories={categories}
                 tasks={tasks}
                 onEditList={openEditList}
                 onDeleteList={handleDeleteList}
-                onAddCategory={openCreateRoot}
-                onAddChild={openCreateChild}
-                onEditCategory={openEditCategory}
-                onDeleteCategory={handleDeleteCategory}
-                onAddTask={openCreateTask}
                 onEditTask={openEditTask}
                 anyRunning={anyRunning}
                 onStartTask={handleStartTask}
@@ -616,34 +437,6 @@ export function ListsPage() {
                 onDiscardTask={handleDiscardTask}
               />
             ))}
-          </div>
-        )}
-
-        {/* Task whose category no longer renders (the user deleted its
-            patterns): still shown, grouped under the untracked sink's
-            summary, so a read never drops data. */}
-        {tasks.filter((task) => task.category.is_untracked).length > 0 && (
-          <div className="mt-6 rounded-xl border border-border bg-card p-4">
-            <h2 className="font-heading text-lg font-semibold text-foreground mb-3">
-              Untracked tasks
-            </h2>
-            <div className="flex flex-wrap gap-2">
-              {tasks
-                .filter((task) => task.category.is_untracked)
-                .map((task) => (
-                  <TaskChip
-                    key={task.id}
-                    task={task}
-                    onEdit={openEditTask}
-                    anyRunning={anyRunning}
-                    onStart={handleStartTask}
-                    onStop={handleStopTask}
-                    onPause={handlePauseTask}
-                    onComplete={handleCompleteTask}
-                    onDiscard={handleDiscardTask}
-                  />
-                ))}
-            </div>
           </div>
         )}
       </div>
@@ -723,173 +516,10 @@ export function ListsPage() {
         </DialogContent>
       </Dialog>
 
-      {/* New / Edit Category Dialog */}
-      <Dialog
-        open={form !== null}
-        onOpenChange={(open) => !open && closeForm()}
-      >
-        <DialogContent className="sm:max-w-[560px] p-0 gap-0 overflow-hidden bg-card border-border">
-          <div className="h-2" style={{ backgroundColor: color }} />
-          <div className="p-6 max-h-[80vh] overflow-y-auto">
-            <DialogHeader className="mb-6">
-              <DialogTitle className="text-foreground">
-                {dialogTitle}
-              </DialogTitle>
-              <DialogDescription>
-                {form?.mode === 'edit'
-                  ? 'Update the category and its title-matching patterns.'
-                  : 'Categories group tasks; patterns classify titles into them.'}
-              </DialogDescription>
-            </DialogHeader>
-
-            <div className="space-y-2 mb-5">
-              <label className="text-sm font-medium text-foreground">
-                Title
-              </label>
-              <input
-                type="text"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g. Deep Work"
-                className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-              />
-            </div>
-
-            <div className="space-y-2 mb-5">
-              <label className="text-sm font-medium text-foreground">
-                Color
-              </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="color"
-                  value={color}
-                  onChange={(e) => setColor(e.target.value)}
-                  className="h-10 w-14 rounded-lg border border-input bg-background cursor-pointer"
-                  aria-label="Category color"
-                />
-                <span className="text-sm text-muted-foreground font-mono">
-                  {color}
-                </span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 mb-5">
-              <input
-                type="checkbox"
-                id="is_productive"
-                checked={isProductive}
-                onChange={(e) => setIsProductive(e.target.checked)}
-                className="h-4 w-4 rounded border-input accent-emerald-600"
-              />
-              <label
-                htmlFor="is_productive"
-                className="text-sm font-medium text-foreground"
-              >
-                Productive
-              </label>
-            </div>
-
-            <div className="space-y-2 mb-6">
-              <label className="text-sm font-medium text-foreground">
-                Google Calendar id
-              </label>
-              <input
-                type="text"
-                value={googleCalendarId}
-                onChange={(e) => setGoogleCalendarId(e.target.value)}
-                placeholder="Optional — links this category to a calendar"
-                className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-              />
-            </div>
-
-            <div className="space-y-2 mb-6">
-              <label className="text-sm font-medium text-foreground">
-                Patterns{' '}
-                <span className="text-muted-foreground font-normal">
-                  (title → category)
-                </span>
-              </label>
-              {patterns.length === 0 && (
-                <p className="text-xs text-muted-foreground">
-                  No patterns yet — matching titles will never land in this
-                  category.
-                </p>
-              )}
-              {patterns.map((pattern, index) => (
-                <div
-                  key={index}
-                  className="space-y-1 rounded-xl border border-input bg-background p-3"
-                >
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={pattern.regex}
-                      onChange={(e) =>
-                        updatePattern(index, { regex: e.target.value })
-                      }
-                      placeholder="e.g. ^Deep Work$"
-                      className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm font-mono"
-                    />
-                    <button
-                      onClick={() => removePattern(index)}
-                      className="p-2 rounded-md hover:bg-destructive/10 hover:text-destructive transition-colors text-muted-foreground"
-                      aria-label={`Remove pattern ${index + 1}`}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  </div>
-                  <input
-                    type="text"
-                    value={pattern.googleCalendarId}
-                    onChange={(e) =>
-                      updatePattern(index, { googleCalendarId: e.target.value })
-                    }
-                    placeholder="Google Calendar id (optional — events only)"
-                    className="w-full px-3 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-xs"
-                  />
-                </div>
-              ))}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={addPattern}
-                className="border-input text-foreground hover:bg-muted"
-              >
-                <Plus className="h-4 w-4 mr-1" />
-                Add pattern
-              </Button>
-            </div>
-
-            {formError && (
-              <p className="mb-4 text-sm text-destructive">{formError}</p>
-            )}
-
-            <div className="flex justify-end gap-3">
-              <Button
-                variant="outline"
-                onClick={closeForm}
-                className="border-input text-foreground hover:bg-muted"
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={handleCategorySubmit}
-                disabled={!title.trim() || saving}
-                className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {saving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                {form?.mode === 'edit' ? 'Save Changes' : 'Create Category'}
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       {/* New / Edit Task Dialog */}
       <TaskModal
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
-        category={taskForm?.mode === 'create' ? taskForm.category : undefined}
         task={taskForm?.mode === 'edit' ? taskForm.task : undefined}
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
@@ -900,15 +530,9 @@ export function ListsPage() {
 
 interface ListCardProps {
   list: TaskList;
-  categories: Category[];
   tasks: TaskRecord[];
   onEditList: (list: TaskList) => void;
   onDeleteList: (list: TaskList) => void;
-  onAddCategory: (list: TaskList) => void;
-  onAddChild: (category: Category) => void;
-  onEditCategory: (category: Category) => void;
-  onDeleteCategory: (category: Category) => void;
-  onAddTask: (category: TaskCategorySummary) => void;
   onEditTask: (task: TaskRecord) => void;
   anyRunning: boolean;
   onStartTask: (taskId: string) => void;
@@ -920,15 +544,9 @@ interface ListCardProps {
 
 function ListCard({
   list,
-  categories,
   tasks,
   onEditList,
   onDeleteList,
-  onAddCategory,
-  onAddChild,
-  onEditCategory,
-  onDeleteCategory,
-  onAddTask,
   onEditTask,
   anyRunning,
   onStartTask,
@@ -939,19 +557,8 @@ function ListCard({
 }: ListCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
-  // Roots belonging to this list — `inherited_list_id` equals the root's own
-  // list_id, so one filter covers both stored and inherited membership.
-  // `untracked` (list_id NULL, is_untracked) never appears here.
-  const roots = categories.filter(
-    (category) =>
-      !category.is_untracked &&
-      !category.parent_id &&
-      category.inherited_list_id === list.id,
-  );
-
-  // Tasks filed under this list's categories (children inherit the root's
-  // list, so `category.inherited_list_id` matches too; untracked tasks are
-  // rendered at page level, not here).
+  // Flat, category-blind pile: a tracked task lands here when its computed
+  // category inherits this list. Untracked tasks are hidden on this page.
   const listTasks = tasks.filter(
     (task) =>
       !task.category.is_untracked &&
@@ -1009,168 +616,29 @@ function ListCard({
             )}
           </div>
         </div>
-
-        <button
-          onClick={() => onAddCategory(list)}
-          className="flex w-full items-center justify-center gap-1 rounded-lg border border-dashed border-primary-foreground/30 py-2 text-sm text-primary-foreground/80 hover:bg-primary-foreground/10 transition-colors"
-        >
-          <Plus className="h-4 w-4" />
-          Category
-        </button>
       </div>
 
-      {/* Categories under this list — the one-level tree (roots + children);
-          tasks render under the category they match */}
-      {roots.length > 0 && (
-        <div className="bg-black/20 p-3 space-y-2">
-          {roots.map((root) => {
-            const children = categories.filter(
-              (category) => category.parent_id === root.id,
-            );
-            const rootTasks = tasks.filter(
-              (task) => task.category.id === root.id,
-            );
-            return (
-              <div key={root.id}>
-                <div className="flex items-center gap-2">
-                  <span
-                    className="h-2.5 w-2.5 rounded-full flex-shrink-0"
-                    style={{ backgroundColor: root.color || list.color }}
-                  />
-                  <span className="flex-1 min-w-0 text-sm font-medium text-primary-foreground truncate">
-                    {root.title}
-                  </span>
-                  {root.is_productive && (
-                    <span className="flex-shrink-0 rounded-full bg-emerald-400/30 px-2 py-0.5 text-[10px] uppercase tracking-wide text-emerald-100">
-                      productive
-                    </span>
-                  )}
-                  <div className="flex flex-shrink-0 gap-1">
-                    <button
-                      onClick={() => onAddTask(root)}
-                      className="p-1.5 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                      aria-label={`Add task to ${root.title}`}
-                      title="Add task"
-                    >
-                      <Plus className="h-3.5 w-3.5 text-primary-foreground/70" />
-                    </button>
-                    <button
-                      onClick={() => onAddChild(root)}
-                      className="p-1.5 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                      aria-label={`Add sub-category under ${root.title}`}
-                      title="Add sub-category"
-                    >
-                      <Plus className="h-3.5 w-3.5 text-primary-foreground/70" />
-                    </button>
-                    <button
-                      onClick={() => onEditCategory(root)}
-                      className="p-1.5 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                      aria-label={`Edit ${root.title}`}
-                      title="Edit"
-                    >
-                      <Pencil className="h-3.5 w-3.5 text-primary-foreground/70" />
-                    </button>
-                    <button
-                      onClick={() => onDeleteCategory(root)}
-                      className="p-1.5 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                      aria-label={`Delete ${root.title}`}
-                      title="Delete"
-                    >
-                      <Trash2 className="h-3.5 w-3.5 text-primary-foreground/70" />
-                    </button>
-                  </div>
-                </div>
-                {/* Tasks filed into the root (category.id === root.id) */}
-                {rootTasks.length > 0 && (
-                  <div className="ml-3.5 mt-1 space-y-1">
-                    {rootTasks.map((task) => (
-                      <TaskChip
-                        key={task.id}
-                        task={task}
-                        onEdit={onEditTask}
-                        anyRunning={anyRunning}
-                        onStart={onStartTask}
-                        onStop={onStopTask}
-                        onPause={onPauseTask}
-                        onComplete={onCompleteTask}
-                        onDiscard={onDiscardTask}
-                      />
-                    ))}
-                  </div>
-                )}
-                {children.length > 0 && (
-                  <div className="ml-3.5 mt-1 pl-3 border-l border-primary-foreground/20 space-y-1">
-                    {children.map((child) => {
-                      const childTasks = tasks.filter(
-                        (task) => task.category.id === child.id,
-                      );
-                      return (
-                        <div key={child.id}>
-                          <div className="flex items-center gap-2">
-                            <span
-                              className="h-2 w-2 rounded-full flex-shrink-0"
-                              style={{
-                                backgroundColor:
-                                  child.color || root.color || list.color,
-                              }}
-                            />
-                            <span className="flex-1 min-w-0 text-xs text-primary-foreground/80 truncate">
-                              {child.title}
-                            </span>
-                            <div className="flex flex-shrink-0 gap-1">
-                              <button
-                                onClick={() => onAddTask(child)}
-                                className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                                aria-label={`Add task to ${child.title}`}
-                                title="Add task"
-                              >
-                                <Plus className="h-3 w-3 text-primary-foreground/60" />
-                              </button>
-                              <button
-                                onClick={() => onEditCategory(child)}
-                                className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                                aria-label={`Edit ${child.title}`}
-                              >
-                                <Pencil className="h-3 w-3 text-primary-foreground/60" />
-                              </button>
-                              <button
-                                onClick={() => onDeleteCategory(child)}
-                                className="p-1 rounded-md hover:bg-primary-foreground/10 transition-colors"
-                                aria-label={`Delete ${child.title}`}
-                              >
-                                <Trash2 className="h-3 w-3 text-primary-foreground/60" />
-                              </button>
-                            </div>
-                          </div>
-                          {childTasks.length > 0 && (
-                            <div className="ml-3.5 mt-1 space-y-1">
-                              {childTasks.map((task) => (
-                                <TaskChip
-                                  key={task.id}
-                                  task={task}
-                                  onEdit={onEditTask}
-                                  anyRunning={anyRunning}
-                                  onStart={onStartTask}
-                                  onStop={onStopTask}
-                                  onPause={onPauseTask}
-                                  onComplete={onCompleteTask}
-                                  onDiscard={onDiscardTask}
-                                />
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+      {/* Flat task pile — no categories; tasks land here by their computed
+          category's inherited list */}
+      {listTasks.length > 0 && (
+        <div className="bg-black/20 p-3 space-y-1.5">
+          {listTasks.map((task) => (
+            <TaskChip
+              key={task.id}
+              task={task}
+              onEdit={onEditTask}
+              anyRunning={anyRunning}
+              onStart={onStartTask}
+              onStop={onStopTask}
+              onPause={onPauseTask}
+              onComplete={onCompleteTask}
+              onDiscard={onDiscardTask}
+            />
+          ))}
         </div>
       )}
 
-      {/* Empty state — only when this list has no tasks at all */}
+      {/* Empty state — no tracked task matches this list */}
       {listTasks.length === 0 && (
         <div className="bg-black/20 p-4 border-t border-black/10">
           <p className="text-sm text-primary-foreground/70 italic">

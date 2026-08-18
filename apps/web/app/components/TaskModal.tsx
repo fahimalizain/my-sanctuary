@@ -25,8 +25,10 @@ interface TaskFormValues {
 interface TaskModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** The category anchor for a NEW task — its title appears in the hint.
-   *  The server still decides the final match (any category may win). */
+  /** Reserved — create is page-level now (no category anchor), so callers
+   *  never pass this and the component does not use it. Kept on the type so
+   *  code that still passes it compiles. The server files new tasks by
+   *  title match. */
   category?: TaskCategorySummary;
   /** The task being edited (undefined = create). */
   task?: TaskRecord;
@@ -46,7 +48,6 @@ const priorityConfig: Record<TaskPriority, { label: string }> = {
 export function TaskModal({
   open,
   onOpenChange,
-  category,
   task,
   onSubmit,
   onDelete,
@@ -101,17 +102,16 @@ export function TaskModal({
     onOpenChange(false);
   };
 
-  // Hint for create mode: the anchor category that opened the dialog, plus
-  // the pipe-suffix convention of the seeded patterns.
-  const hintCategory = isEditing ? task!.category : category;
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[480px] p-0 gap-0 overflow-hidden bg-card border-border">
-        {/* Header accent bar */}
+        {/* Header accent bar — edit mode uses the task's computed category
+            color; create has no category anchor (no color is fine) */}
         <div
           className="h-2"
-          style={{ backgroundColor: hintCategory?.color || undefined }}
+          style={{
+            backgroundColor: isEditing ? task!.category.color : undefined,
+          }}
         />
 
         <div className="p-6">
@@ -228,19 +228,23 @@ export function TaskModal({
             )}
           </div>
 
-          {/* Category tag — computed by the server from the title */}
-          <div className="flex items-center gap-2 mb-6 p-3 bg-muted rounded-xl">
-            <Tag className="h-4 w-4 text-primary" />
-            <span className="text-sm text-foreground">
-              {isEditing ? 'Category:' : 'Files into category:'}
-            </span>
-            <span className="text-sm font-medium text-primary">
-              {hintCategory ? hintCategory.title : '—'}
-            </span>
-            {hintCategory?.is_untracked && (
-              <span className="text-xs text-muted-foreground">(untracked)</span>
-            )}
-          </div>
+          {/* Category tag — edit mode only: the computed filing result of an
+              existing task. Create is page-level and files by title match, so
+              there is no category to show here. */}
+          {isEditing && (
+            <div className="flex items-center gap-2 mb-6 p-3 bg-muted rounded-xl">
+              <Tag className="h-4 w-4 text-primary" />
+              <span className="text-sm text-foreground">Category:</span>
+              <span className="text-sm font-medium text-primary">
+                {task!.category.title}
+              </span>
+              {task!.category.is_untracked && (
+                <span className="text-xs text-muted-foreground">
+                  (untracked)
+                </span>
+              )}
+            </div>
+          )}
 
           {formError && (
             <p className="mb-4 text-sm text-destructive">{formError}</p>
