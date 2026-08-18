@@ -1,14 +1,14 @@
-import type { Stream, TimeBlock, TaskEvent, TimelineItem } from './types';
+import type { List, TimeBlock, TaskEvent, TimelineItem } from './types';
 
-export const streams: Stream[] = [
+export const lists: List[] = [
   { id: 'work', name: 'Work', color: '#2a5c8a' },
   { id: 'gym', name: 'Fitness', color: '#c45a2c' },
   { id: 'family', name: 'Family', color: '#7a4a6a' },
-  { id: 'relax', name: 'Relaxation', color: '#3a7a5a' },
+  { id: 'personal', name: 'Personal', color: '#3a7a5a' },
 ];
 
 export const todayItems: TimelineItem[] = [
-  // Standalone tasks (no stream)
+  // Standalone tasks (no list)
   {
     id: 'task-morning-1',
     title: 'Fresh Up',
@@ -57,12 +57,12 @@ export const todayItems: TimelineItem[] = [
     startTime: '7:45 AM',
     endTime: '8:00 AM',
   } as TaskEvent,
-  // Time blocks (with streams)
+  // Time blocks (with lists)
   {
     id: 'block-1',
-    streamId: 'work',
-    streamName: 'Work',
-    streamColor: '#2a5c8a',
+    listId: 'work',
+    listName: 'Work',
+    listColor: '#2a5c8a',
     startTime: '9:00 AM',
     endTime: '12:00 PM',
     tasks: [
@@ -98,9 +98,9 @@ export const todayItems: TimelineItem[] = [
   } as TimeBlock,
   {
     id: 'block-2',
-    streamId: 'gym',
-    streamName: 'Gym Time',
-    streamColor: '#c45a2c',
+    listId: 'gym',
+    listName: 'Gym Time',
+    listColor: '#c45a2c',
     startTime: '12:00 PM',
     endTime: '2:00 PM',
     tasks: [
@@ -109,9 +109,9 @@ export const todayItems: TimelineItem[] = [
   } as TimeBlock,
   {
     id: 'block-3',
-    streamId: 'family',
-    streamName: 'Family Dinner',
-    streamColor: '#7a4a6a',
+    listId: 'family',
+    listName: 'Family Dinner',
+    listColor: '#7a4a6a',
     startTime: '2:00 PM',
     endTime: '4:00 PM',
     tasks: [
@@ -121,9 +121,9 @@ export const todayItems: TimelineItem[] = [
   } as TimeBlock,
   {
     id: 'block-4',
-    streamId: 'relax',
-    streamName: 'Evening Relaxation',
-    streamColor: '#3a7a5a',
+    listId: 'personal',
+    listName: 'Evening Relaxation',
+    listColor: '#3a7a5a',
     startTime: '4:00 PM',
     endTime: '6:00 PM',
     tasks: [

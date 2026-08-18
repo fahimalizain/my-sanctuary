@@ -301,6 +301,10 @@ pub async fn list_events(
 /// Creates an event on Google (`events.insert`) and upserts the returned row
 /// into the local cache. A cache failure is logged (returned in
 /// [`CreateEventOutput::cache_error`]), never fatal.
+///
+/// When `input.task_id` is set, the payload carries
+/// `extendedProperties.shared.sanctuary_task_id` — the task timer's carrier
+/// (slice 4); the sync path maps it back onto `calendar_events.task_id`.
 pub async fn create_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -317,12 +321,17 @@ pub async fn create_event(
         "{GOOGLE_EVENTS_BASE_URL}/{}/events",
         encode_path_segment(&cal.google_calendar_id)
     );
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "summary": input.summary,
         "description": input.description,
         "start": { "dateTime": input.start },
         "end": { "dateTime": input.end },
     });
+    if let Some(task_id) = &input.task_id {
+        payload["extendedProperties"] = serde_json::json!({
+            "shared": { "sanctuary_task_id": task_id }
+        });
+    }
     let body =
         serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
     let (status, response) = http.post_json(&url, &access.access_token, &body).await?;
@@ -336,6 +345,64 @@ pub async fn create_event(
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let new_event = map_google_event(&created, &cal.id, &now_rfc3339);
+    let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
+        Ok(id) => id,
+        Err(err) => {
+            return Ok(CreateEventOutput {
+                event: row_from_new_event(new_event, "".to_string(), &now_rfc3339),
+                source: "google".to_string(),
+                cache_error: Some(err.to_string()),
+            });
+        }
+    };
+
+    Ok(CreateEventOutput {
+        event: row_from_new_event(new_event, id, &now_rfc3339),
+        source: "google".to_string(),
+        cache_error: None,
+    })
+}
+
+/// Patches an event's `end` on Google (`events.patch`) and upserts the
+/// returned row into the local cache — the task timer's stop/pause path.
+/// Google echoes the stored `extendedProperties` back, so the upsert
+/// preserves the `sanctuary_task_id` link. Cache failures are logged
+/// ([`CreateEventOutput::cache_error`]), never fatal.
+pub async fn patch_event(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+    google_event_id: &str,
+    end_rfc3339: &str,
+    now_unix: i64,
+) -> Result<CreateEventOutput, CalendarError> {
+    let Some(cal) = calendars.get_by_id(calendar_id).await? else {
+        return Err(CalendarError::NotFound);
+    };
+
+    let url = format!(
+        "{GOOGLE_EVENTS_BASE_URL}/{}/events/{}",
+        encode_path_segment(&cal.google_calendar_id),
+        encode_path_segment(google_event_id)
+    );
+    let payload = serde_json::json!({
+        "end": { "dateTime": end_rfc3339 },
+    });
+    let body =
+        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
+    let (status, response) = http.patch_json(&url, &access.access_token, &body).await?;
+    if !(200..300).contains(&status) {
+        return Err(CalendarError::GoogleApi(format!(
+            "google events.patch returned {status}"
+        )));
+    }
+    let patched: GoogleEvent = serde_json::from_slice(&response)
+        .map_err(|err| CalendarError::InvalidResponse(format!("events.patch body: {err}")))?;
+
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let new_event = map_google_event(&patched, &cal.id, &now_rfc3339);
     let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
         Ok(id) => id,
         Err(err) => {
@@ -1069,6 +1136,10 @@ fn is_skipped(event: &GoogleEvent) -> bool {
 }
 
 /// Converts a Google event API response into the local cache model.
+///
+/// `task_id` is copied from `extendedProperties.shared.sanctuary_task_id`
+/// (the task timer's carrier); events without the property map to `""` and
+/// the upsert's `COALESCE` leaves any stored value untouched.
 fn map_google_event(event: &GoogleEvent, calendar_id: &str, now_rfc3339: &str) -> NewCalendarEvent {
     NewCalendarEvent {
         calendar_id: calendar_id.to_string(),
@@ -1093,6 +1164,12 @@ fn map_google_event(event: &GoogleEvent, calendar_id: &str, now_rfc3339: &str) -
             .as_ref()
             .map(|rules| serde_json::to_string(rules).unwrap_or_default())
             .unwrap_or_default(),
+        task_id: event
+            .extended_properties
+            .as_ref()
+            .and_then(|props| props.shared.as_ref())
+            .and_then(|shared| shared.sanctuary_task_id.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -1111,6 +1188,7 @@ fn row_from_new_event(event: NewCalendarEvent, id: String, now_rfc3339: &str) ->
         start_time: event.start_time,
         end_time: event.end_time,
         recurrence: event.recurrence,
+        task_id: event.task_id,
         created_at: now_rfc3339.to_string(),
         updated_at: now_rfc3339.to_string(),
         deleted_at: None,
@@ -1137,7 +1215,8 @@ struct CalendarListResponse {
     items: Vec<CalendarListEntry>,
 }
 
-/// A Google Calendar event as returned by `events.list` / `events.insert`.
+/// A Google Calendar event as returned by `events.list` / `events.insert` /
+/// `events.patch`.
 #[derive(Debug, Deserialize)]
 struct GoogleEvent {
     id: String,
@@ -1157,6 +1236,22 @@ struct GoogleEvent {
     start: Option<GoogleEventTime>,
     #[serde(default)]
     end: Option<GoogleEventTime>,
+    #[serde(default, rename = "extendedProperties")]
+    extended_properties: Option<GoogleEventExtendedProperties>,
+}
+
+/// `extendedProperties` of a Google event. Only the shared map is modelled —
+/// the task timer's `sanctuary_task_id` lives under `shared`.
+#[derive(Debug, Deserialize)]
+struct GoogleEventExtendedProperties {
+    #[serde(default)]
+    shared: Option<GoogleEventSharedProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleEventSharedProperties {
+    #[serde(default, rename = "sanctuary_task_id")]
+    sanctuary_task_id: Option<String>,
 }
 
 /// `start`/`end` of a Google event; all-day events carry `date` instead of
@@ -1194,6 +1289,7 @@ mod tests {
         routes: Vec<(String, u16, String)>,
         gets: Mutex<Vec<String>>,
         posts: Mutex<Vec<(String, String)>>,
+        patches: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeHttp {
@@ -1207,6 +1303,7 @@ mod tests {
                     .collect(),
                 gets: Mutex::new(Vec::new()),
                 posts: Mutex::new(Vec::new()),
+                patches: Mutex::new(Vec::new()),
             }
         }
 
@@ -1246,6 +1343,19 @@ mod tests {
             body: &[u8],
         ) -> Result<(u16, Vec<u8>), HttpError> {
             self.posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
+            Ok(self.route(url))
+        }
+
+        async fn patch_json(
+            &self,
+            url: &str,
+            _token: &str,
+            body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            self.patches
                 .lock()
                 .unwrap()
                 .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
@@ -1455,6 +1565,28 @@ mod tests {
                 .unwrap()
                 .push((user_id.to_string(), start_rfc3339.to_string(), end_rfc3339.to_string()));
             Ok(self.stored.lock().unwrap().clone())
+        }
+
+        async fn list_running_by_user_id(
+            &self,
+            _user_id: &str,
+            now_rfc3339: &str,
+        ) -> Result<Vec<CalendarEvent>, RepoError> {
+            // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: task-tagged, living,
+            // `start_time <= now < end_time` (lexicographic RFC 3339).
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event.deleted_at.is_none()
+                        && !event.task_id.is_empty()
+                        && event.start_time.as_str() <= now_rfc3339
+                        && event.end_time.as_str() > now_rfc3339
+                })
+                .cloned()
+                .collect())
         }
 
         async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
@@ -2826,7 +2958,22 @@ mod tests {
             description: Some("About things".to_string()),
             start: "2026-08-19T09:00:00Z".to_string(),
             end: "2026-08-19T10:00:00Z".to_string(),
+            task_id: None,
         }
+    }
+
+    /// A created event that carries the task carrier, exactly as Google
+    /// echoes it back after `events.insert` with the property.
+    fn created_with_task_json(task_id: &str) -> String {
+        format!(
+            r#"{{
+                "id": "google-evt-created", "etag": "e1", "updated": "2026-08-17T12:00:00.000Z",
+                "summary": "New meeting", "description": "About things",
+                "start": {{"dateTime": "2026-08-19T09:00:00Z"}},
+                "end": {{"dateTime": "2026-08-19T10:00:00Z"}},
+                "extendedProperties": {{"shared": {{"sanctuary_task_id": "{task_id}"}}}}
+            }}"#
+        )
     }
 
     #[test]
@@ -2914,6 +3061,207 @@ mod tests {
 
         assert_eq!(output.source, "google");
         assert_eq!(output.event.google_event_id, "google-evt-created");
+        assert!(
+            matches!(output.cache_error.as_deref(), Some(message) if message.contains("cache write failed")),
+            "{:?}",
+            output.cache_error
+        );
+    }
+
+    #[test]
+    fn create_with_task_id_sends_extended_properties_and_maps_it_back() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_with_task_json("task-1"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        let output = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // The insert body carries the shared carrier — never `private`, never
+        // a description footer.
+        let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_task_id"],
+            "task-1"
+        );
+        assert!(body.get("private").is_none(), "no private properties");
+
+        // The echoed event maps the property onto the cached row.
+        assert_eq!(output.event.task_id, "task-1");
+        let upserted = events.upserted_single.lock().unwrap().clone().unwrap().1;
+        assert_eq!(upserted.task_id, "task-1");
+    }
+
+    #[test]
+    fn create_without_task_id_sends_no_extended_properties() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            CREATED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let output = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &input(), NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(body.get("extendedProperties").is_none(), "{body}");
+        assert_eq!(output.event.task_id, "", "no property → no task link");
+    }
+
+    #[test]
+    fn sync_maps_sanctuary_task_id_onto_cached_events() {
+        let body = r#"{"items":[
+            {"id": "timed", "summary": "Deep Work",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"},
+             "end": {"dateTime": "2026-08-18T10:00:00Z"},
+             "extendedProperties": {"shared": {"sanctuary_task_id": "task-1"}}}
+        ], "nextSyncToken": "st-9"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        let upserted = events.upserted_batch.lock().unwrap();
+        assert_eq!(upserted.len(), 1);
+        assert_eq!(upserted[0].task_id, "task-1", "carrier copied from shared props");
+        assert_eq!(output.events[0].task_id, "task-1");
+    }
+
+    // ──────────────────────────────────────────
+    // patch_event
+    // ──────────────────────────────────────────
+
+    const PATCHED_JSON: &str = r#"{
+        "id": "google-evt-created", "etag": "e2", "updated": "2026-08-17T12:30:00.000Z",
+        "summary": "New meeting",
+        "start": {"dateTime": "2026-08-19T09:00:00Z"},
+        "end": {"dateTime": "2026-08-19T11:00:00Z"}
+    }"#;
+
+    #[test]
+    fn patch_posts_end_and_upserts_the_echoed_event() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/google-evt-created",
+            200,
+            PATCHED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let output = pollster::block_on(patch_event(
+            &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+            "2026-08-19T11:00:00Z", NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(output.event.google_event_id, "google-evt-created");
+        assert_eq!(output.event.end_time, "2026-08-19T11:00:00Z");
+        assert_eq!(output.event.calendar_id, "cal-1");
+
+        // PATCH body: `end.dateTime` only.
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let (url, body) = patches.first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events/google-evt-created"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2026-08-19T11:00:00Z");
+
+        // The echoed (patched) event replaced the cached row.
+        let (google_id, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
+        assert_eq!(google_id, "google-evt-created");
+        assert_eq!(upserted.end_time, "2026-08-19T11:00:00Z");
+    }
+
+    #[test]
+    fn patch_preserves_task_link_when_google_echoes_it() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/google-evt-created",
+            200,
+            &created_with_task_json("task-1"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let output = pollster::block_on(patch_event(
+            &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+            "2026-08-19T11:00:00Z", NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(output.event.task_id, "task-1");
+        let (_, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
+        assert_eq!(upserted.task_id, "task-1");
+    }
+
+    #[test]
+    fn patch_missing_calendar_is_not_found() {
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-other", "other", true)]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(patch_event(
+            &http, &calendars, &events, &access(), "cal-1", "g-1",
+            "2026-08-19T11:00:00Z", NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+    }
+
+    #[test]
+    fn patch_google_non_2xx_is_an_api_error() {
+        let http = FakeHttp::new(vec![("/events/google-evt-created", 400, r#"{"error":"invalid"}"#)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(patch_event(
+            &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+            "2026-08-19T11:00:00Z", NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
+        assert!(events.upserted_single.lock().unwrap().is_none(), "no cache write on failure");
+    }
+
+    #[test]
+    fn patch_cache_failure_is_logged_not_fatal() {
+        let http = FakeHttp::new(vec![(
+            "/events/google-evt-created",
+            200,
+            PATCHED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        *events.fail_upsert.lock().unwrap() = true;
+
+        let output = pollster::block_on(patch_event(
+            &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+            "2026-08-19T11:00:00Z", NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(output.event.end_time, "2026-08-19T11:00:00Z");
         assert!(
             matches!(output.cache_error.as_deref(), Some(message) if message.contains("cache write failed")),
             "{:?}",

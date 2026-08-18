@@ -201,6 +201,15 @@ mod tests {
         ) -> Result<(u16, Vec<u8>), HttpError> {
             Ok((200, Vec::new()))
         }
+
+        async fn patch_json(
+            &self,
+            _url: &str,
+            _token: &str,
+            _body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            Ok((200, Vec::new()))
+        }
     }
 
     /// Fake token repo: returns the configured row; records upserts.

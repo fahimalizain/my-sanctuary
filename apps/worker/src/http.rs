@@ -70,6 +70,29 @@ impl api_core::HttpClient for WorkerHttp {
         access_token: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), HttpError> {
+        self.json_request(Method::Post, url, access_token, body).await
+    }
+
+    async fn patch_json(
+        &self,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), HttpError> {
+        self.json_request(Method::Patch, url, access_token, body).await
+    }
+}
+
+impl WorkerHttp {
+    /// Shared JSON-with-bearer request used by both `post_json` and
+    /// `patch_json` (the timer's `events.patch`).
+    async fn json_request(
+        &self,
+        method: Method,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), HttpError> {
         let headers = Headers::new();
         headers
             .set("Content-Type", "application/json")
@@ -78,7 +101,7 @@ impl api_core::HttpClient for WorkerHttp {
             .set("Authorization", &format!("Bearer {access_token}"))
             .map_err(http_err)?;
         let mut init = RequestInit::new();
-        init.with_method(Method::Post)
+        init.with_method(method)
             .with_headers(headers)
             .with_body(Some(js_sys::Uint8Array::from(body).into()));
         let request = Request::new_with_init(url, &init).map_err(http_err)?;

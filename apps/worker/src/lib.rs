@@ -1,8 +1,11 @@
 mod auth;
 mod calendar;
+mod categories;
 mod cron;
 mod db;
 mod http;
+mod lists;
+mod tasks;
 
 use worker::*;
 
@@ -73,6 +76,34 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/api/calendar/events", calendar::list_events)
         .post_async("/api/calendar/events", calendar::create_event)
         .options("/api/calendar/events", auth::options)
+        .get_async("/api/lists", lists::list_lists)
+        .post_async("/api/lists", lists::create_list)
+        .patch_async("/api/lists/:id", lists::update_list)
+        .delete_async("/api/lists/:id", lists::delete_list)
+        .options("/api/lists", auth::options)
+        .options("/api/lists/:id", auth::options)
+        .get_async("/api/categories", categories::list_categories)
+        .post_async("/api/categories", categories::create_category)
+        .patch_async("/api/categories/:id", categories::update_category)
+        .delete_async("/api/categories/:id", categories::delete_category)
+        .options("/api/categories", auth::options)
+        .options("/api/categories/:id", auth::options)
+        .get_async("/api/tasks", tasks::list_tasks)
+        .post_async("/api/tasks", tasks::create_task)
+        .patch_async("/api/tasks/:id", tasks::update_task)
+        .delete_async("/api/tasks/:id", tasks::delete_task)
+        .post_async("/api/tasks/:id/start", tasks::start_task)
+        .post_async("/api/tasks/:id/stop", tasks::stop_task)
+        .post_async("/api/tasks/:id/pause", tasks::pause_task)
+        .post_async("/api/tasks/:id/complete", tasks::complete_task)
+        .post_async("/api/tasks/:id/discard", tasks::discard_task)
+        .options("/api/tasks", auth::options)
+        .options("/api/tasks/:id", auth::options)
+        .options("/api/tasks/:id/start", auth::options)
+        .options("/api/tasks/:id/stop", auth::options)
+        .options("/api/tasks/:id/pause", auth::options)
+        .options("/api/tasks/:id/complete", auth::options)
+        .options("/api/tasks/:id/discard", auth::options)
         .run(req, env)
         .await
 }

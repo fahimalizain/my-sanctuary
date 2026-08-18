@@ -65,13 +65,13 @@ export function TimeBlock({ block, className, onTaskClick }: TimeBlockProps) {
   return (
     <div
       className={cn('relative rounded-xl overflow-hidden', className)}
-      style={{ backgroundColor: block.streamColor }}
+      style={{ backgroundColor: block.listColor }}
     >
       {/* Header */}
       <div className="flex items-start justify-between p-4 pb-2">
         <div>
           <h3 className="font-heading text-lg font-semibold text-primary-foreground">
-            {block.streamName}
+            {block.listName}
           </h3>
           <div className="flex items-center gap-2 text-sm text-primary-foreground/70 mt-1">
             <Clock className="h-3.5 w-3.5" />

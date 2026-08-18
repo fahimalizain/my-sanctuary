@@ -7,7 +7,7 @@ import {
 import { RootComponent } from './routes/__root';
 import { HomeComponent } from './routes/index';
 import { LoginComponent } from './routes/login';
-import { StreamsComponent } from './routes/streams';
+import { ListsComponent } from './routes/lists';
 import { CalendarComponent } from './routes/calendar';
 import { ConsistencyComponent } from './routes/consistency';
 import { SettingsComponent } from './routes/settings';
@@ -39,10 +39,10 @@ const loginRoute = createRoute({
   component: LoginComponent,
 });
 
-const streamsRoute = createRoute({
+const listsRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: '/streams',
-  component: withAuth(StreamsComponent),
+  path: '/lists',
+  component: withAuth(ListsComponent),
 });
 
 const calendarRoute = createRoute({
@@ -66,7 +66,7 @@ const settingsRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
-  streamsRoute,
+  listsRoute,
   calendarRoute,
   consistencyRoute,
   settingsRoute,

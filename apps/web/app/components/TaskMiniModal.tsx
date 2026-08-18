@@ -136,7 +136,7 @@ export function TaskMiniModal({
   const isBlock = 'tasks' in item;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [title, setTitle] = useState(
-    isBlock ? item.streamName : (item as unknown as { title: string }).title,
+    isBlock ? item.listName : (item as unknown as { title: string }).title,
   );
   const [startTime, setStartTime] = useState(item.startTime);
   const [endTime, setEndTime] = useState(item.endTime);

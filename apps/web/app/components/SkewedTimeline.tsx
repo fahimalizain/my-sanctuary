@@ -292,7 +292,7 @@ function itemToTask(item: TimelineItem): Task {
     return (
       item.tasks[0] || {
         id: item.id,
-        title: item.streamName,
+        title: item.listName,
         duration: 30,
         priority: 'medium',
       }
@@ -339,7 +339,7 @@ export function SkewedTimeline({
         // Update time block
         return {
           ...item,
-          streamName: updates.title,
+          listName: updates.title,
           startTime: updates.startTime,
           endTime: updates.endTime,
         };

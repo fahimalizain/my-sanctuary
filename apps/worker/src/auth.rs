@@ -24,7 +24,7 @@ pub(crate) fn cors_headers(origin: &str) -> Result<Headers> {
     let headers = Headers::new();
     headers.set("Access-Control-Allow-Origin", origin)?;
     headers.set("Access-Control-Allow-Credentials", "true")?;
-    headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
+    headers.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")?;
     headers.set("Access-Control-Allow-Headers", "Accept, Content-Type")?;
     Ok(headers)
 }
