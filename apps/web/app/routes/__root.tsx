@@ -26,7 +26,12 @@ function Navigation() {
       <div className="flex items-center gap-1">
         {navItems.map((item) => {
           const Icon = item.icon;
-          const isActive = location.pathname === item.path;
+          // The Lists entry also covers the dedicated categories editor.
+          const isActive =
+            item.path === '/lists'
+              ? location.pathname === '/lists' ||
+                location.pathname === '/categories'
+              : location.pathname === item.path;
 
           return (
             <Link

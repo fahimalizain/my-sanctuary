@@ -20,6 +20,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { TaskModal } from '@/app/components/TaskModal';
+import { useNavigate } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import type {
@@ -90,6 +91,7 @@ interface TaskFormState {
 }
 
 export function ListsPage() {
+  const navigate = useNavigate();
   const [lists, setLists] = useState<TaskList[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
@@ -538,13 +540,21 @@ export function ListsPage() {
               Manage your life domains — tasks live inside categories later
             </p>
           </div>
-          <Button
-            onClick={openCreateList}
-            className="bg-sanctuary-green hover:bg-sanctuary-green/90"
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            New List
-          </Button>
+          <div className="flex gap-3">
+            <Button
+              variant="outline"
+              onClick={() => navigate({ to: '/categories' })}
+            >
+              Edit Categories
+            </Button>
+            <Button
+              onClick={openCreateList}
+              className="bg-sanctuary-green hover:bg-sanctuary-green/90"
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              New List
+            </Button>
+          </div>
         </header>
 
         {/* Load error banner — replaces the grid only when there are no lists
