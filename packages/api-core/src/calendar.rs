@@ -6,19 +6,23 @@
 //! from the caller — never `SystemTime`. The Worker layers session checks and
 //! token refresh on top (`apps/worker/src/calendar.rs`).
 //!
-//! Sync rules (ported from Go):
-//! - A calendar is stale when `last_synced_at` is missing or older than
-//!   [`SYNC_STALE_THRESHOLD_SECS`] (5 minutes). Syncs are awaited — never
-//!   `wait_until`-style fire-and-forget.
+//! Sync rules (ADR 0001):
+//! - `list_events` awaits a sync only when `last_synced_at` is missing or
+//!   unparseable — i.e. the calendar has never synced (first paint after
+//!   calendar import). Once `last_synced_at` is set, `list_events` is
+//!   cache-only: no stale pull on the request path, whatever the age. The
+//!   fallback cron (a later slice) reintroduces a time-based threshold.
 //! - `events.list` uses `singleEvents=false&maxResults=250`, optionally with
 //!   the stored `syncToken` (incremental), and follows `nextPageToken`.
 //! - HTTP 410 (stale sync token) retries once with an empty token (full
 //!   resync). HTTP 404 (e.g. holidays/birthdays calendars that don't support
 //!   `events.list`) disables sync for that calendar. Other errors are logged
 //!   (returned in `sync_errors`) and do not fail the whole listing.
-//! - Events without a `start.dateTime`/`end.dateTime` (all-day events) and
-//!   cancelled events are skipped — the old Go parser stored zero times for
-//!   those, which is worse than skipping.
+//! - Incremental cancelled events (`status == "cancelled"`) are soft-deleted
+//!   via `delete_by_google_event_id` (missing rows no-op) instead of being
+//!   skipped. Events without a `start.dateTime`/`end.dateTime` (all-day
+//!   events) are skipped — the old Go parser stored zero times for those,
+//!   which is worse than skipping.
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -32,6 +36,10 @@ use crate::token::GoogleAccess;
 
 /// A calendar is stale (needs a sync) when it has not synced in this many
 /// seconds (5 minutes, same as Go's `syncStaleThreshold`).
+///
+/// The request path no longer uses this — `list_events` is cache-only once
+/// `last_synced_at` is set (ADR 0001). The fallback cron (a later slice) will
+/// use a 15-minute threshold; kept here as the shared constant for that job.
 pub const SYNC_STALE_THRESHOLD_SECS: i64 = 5 * 60;
 
 /// Google Calendar API endpoints.
@@ -148,12 +156,17 @@ pub async fn list_events(
         if !cal.sync_enabled {
             continue;
         }
-        if let Some(last_synced_at) = &cal.last_synced_at {
-            if let Some(last_unix) = rfc3339_to_unix_secs(last_synced_at) {
-                if now_unix - last_unix < SYNC_STALE_THRESHOLD_SECS {
-                    continue; // fresh enough
-                }
-            }
+        // Cache-only after first paint (ADR 0001): a set, parseable
+        // `last_synced_at` means the sync cursor exists, so never pull on the
+        // request path — regardless of age. Missing or unparseable means the
+        // calendar has never synced: await the first sync.
+        let previously_synced = cal
+            .last_synced_at
+            .as_deref()
+            .and_then(rfc3339_to_unix_secs)
+            .is_some();
+        if previously_synced {
+            continue;
         }
         match sync_calendar(http, calendars, events, access, cal, &now_rfc3339).await {
             Ok(()) => {}
@@ -336,13 +349,25 @@ async fn sync_calendar(
         }
     }
 
-    let mapped: Vec<NewCalendarEvent> = all_items
-        .iter()
-        .filter(|item| !is_skipped(item))
-        .map(|item| map_google_event(item, &cal.id, now_rfc3339))
-        .collect();
-    if !mapped.is_empty() {
-        events.upsert_batch(mapped, now_rfc3339).await?;
+    let mut to_upsert: Vec<NewCalendarEvent> = Vec::new();
+    for item in &all_items {
+        if item.status.as_deref() == Some("cancelled") {
+            // Incremental cancelled event: soft-delete the cached row (a no-op
+            // when the row was never cached, e.g. an all-day event). A delete
+            // failure propagates so the sync token is not advanced after a
+            // partial apply.
+            events
+                .delete_by_google_event_id(&cal.id, &item.id, now_rfc3339)
+                .await?;
+            continue;
+        }
+        if is_skipped(item) {
+            continue;
+        }
+        to_upsert.push(map_google_event(item, &cal.id, now_rfc3339));
+    }
+    if !to_upsert.is_empty() {
+        events.upsert_batch(to_upsert, now_rfc3339).await?;
     }
 
     // Keep the previous sync token when Google omitted nextSyncToken.
@@ -394,14 +419,12 @@ fn encode_path_segment(segment: &str) -> String {
     out
 }
 
-/// Whether a Google event should be skipped during sync: cancelled events and
-/// events without `start.dateTime`/`end.dateTime` (e.g. all-day events, which
-/// use `start.date` instead). The old Go parser stored zero times for those —
-/// skipping is cleaner.
+/// Whether a Google event should be skipped during sync: events without
+/// `start.dateTime`/`end.dateTime` (e.g. all-day events, which use
+/// `start.date` instead). The old Go parser stored zero times for those —
+/// skipping is cleaner. Cancelled events are NOT skipped here; they are
+/// soft-deleted first in [`sync_calendar`].
 fn is_skipped(event: &GoogleEvent) -> bool {
-    if event.status.as_deref() == Some("cancelled") {
-        return true;
-    }
     let has_date_time =
         |time: &Option<GoogleEventTime>| matches!(time, Some(t) if !t.date_time.as_deref().unwrap_or("").is_empty());
     !(has_date_time(&event.start) && has_date_time(&event.end))
@@ -709,7 +732,9 @@ mod tests {
         upserted_batch: Mutex<Vec<NewCalendarEvent>>,
         upserted_single: Mutex<Option<(String, NewCalendarEvent)>>,
         ranged: Mutex<Vec<(String, String, String)>>,
+        deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
         fail_upsert: Mutex<bool>,
+        fail_delete: Mutex<bool>,
         next_id: Mutex<u64>,
     }
 
@@ -720,7 +745,9 @@ mod tests {
                 upserted_batch: Mutex::new(Vec::new()),
                 upserted_single: Mutex::new(None),
                 ranged: Mutex::new(Vec::new()),
+                deleted_by_google_event_id: Mutex::new(Vec::new()),
                 fail_upsert: Mutex::new(false),
+                fail_delete: Mutex::new(false),
                 next_id: Mutex::new(1),
             }
         }
@@ -787,10 +814,17 @@ mod tests {
 
         async fn delete_by_google_event_id(
             &self,
-            _calendar_id: &str,
-            _google_event_id: &str,
+            calendar_id: &str,
+            google_event_id: &str,
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            self.deleted_by_google_event_id
+                .lock()
+                .unwrap()
+                .push((calendar_id.to_string(), google_event_id.to_string()));
+            if *self.fail_delete.lock().unwrap() {
+                return Err(RepoError::Backend("cache delete failed".into()));
+            }
             Ok(())
         }
 
@@ -955,7 +989,9 @@ mod tests {
     }
 
     #[test]
-    fn stale_calendar_is_synced_before_the_cache_query() {
+    fn never_synced_calendar_is_synced_before_the_cache_query() {
+        // `calendar()` defaults to `last_synced_at: None` — first paint, so
+        // the sync is awaited before the cache query.
         let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
@@ -995,10 +1031,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_calendar_is_not_synced() {
+    fn previously_synced_calendar_is_not_synced_even_if_old() {
         let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
         let mut cal = calendar("cal-1", "primary@example.com", true);
-        cal.last_synced_at = Some("2023-11-14T22:13:00Z".to_string()); // 20s ago
+        // Days old — stale under the old 5-minute rule, but the request path
+        // is cache-only once `last_synced_at` is set (ADR 0001).
+        cal.last_synced_at = Some("2023-11-10T00:00:00Z".to_string());
         let calendars = FakeCalendarRepo::with(vec![cal]);
         let events = FakeEventRepo::new();
 
@@ -1008,8 +1046,9 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(http.gets.lock().unwrap().is_empty(), "no Google calls for fresh calendar");
+        assert!(http.gets.lock().unwrap().is_empty(), "no Google calls for a previously synced calendar");
         assert!(events.upserted_batch.lock().unwrap().is_empty());
+        assert!(calendars.sync_states.lock().unwrap().is_empty(), "sync state untouched");
         assert!(output.sync_errors.is_empty());
     }
 
@@ -1123,10 +1162,38 @@ mod tests {
     }
 
     #[test]
-    fn all_day_and_cancelled_events_are_skipped() {
+    fn all_day_and_no_time_events_are_skipped() {
         let body = r#"{"items":[
             {"id": "all-day", "start": {"date": "2026-08-01"}, "end": {"date": "2026-08-02"}},
             {"id": "no-time", "summary": "No times at all"},
+            {"id": "real", "summary": "Real",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ], "nextSyncToken": "st-9"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
+            "2026-09-01T00:00:00Z", NOW_UNIX,
+        ))
+        .unwrap();
+
+        let upserted = events.upserted_batch.lock().unwrap();
+        assert_eq!(upserted.len(), 1, "only the timed event");
+        assert_eq!(upserted[0].google_event_id, "real");
+        assert!(
+            events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+            "skipped events are not deleted"
+        );
+        assert_eq!(output.events.len(), 1);
+        // Sync state still advances even when everything was skipped.
+        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+    }
+
+    #[test]
+    fn cancelled_events_are_soft_deleted() {
+        let body = r#"{"items":[
             {"id": "cancelled", "status": "cancelled",
              "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}},
             {"id": "real", "summary": "Real",
@@ -1142,12 +1209,55 @@ mod tests {
         ))
         .unwrap();
 
+        // Cancelled events are soft-deleted by google id, not skipped.
+        assert_eq!(
+            *events.deleted_by_google_event_id.lock().unwrap(),
+            vec![("cal-1".to_string(), "cancelled".to_string())]
+        );
         let upserted = events.upserted_batch.lock().unwrap();
         assert_eq!(upserted.len(), 1, "only the timed, non-cancelled event");
         assert_eq!(upserted[0].google_event_id, "real");
         assert_eq!(output.events.len(), 1);
-        // Sync state still advances even when everything was skipped.
+        // Sync state still advances.
         assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+    }
+
+    #[test]
+    fn cancelled_event_delete_failure_does_not_advance_sync_token() {
+        let body = r#"{"items":[
+            {"id": "cancelled", "status": "cancelled",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}},
+            {"id": "real", "summary": "Real",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ], "nextSyncToken": "st-9"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        *events.fail_delete.lock().unwrap() = true;
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &access(), "u-1", "2026-08-01T00:00:00Z",
+            "2026-09-01T00:00:00Z", NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            *events.deleted_by_google_event_id.lock().unwrap(),
+            vec![("cal-1".to_string(), "cancelled".to_string())]
+        );
+        // A delete failure fails the sync: no partial apply, no upsert, and
+        // the sync token must not advance.
+        assert!(events.upserted_batch.lock().unwrap().is_empty());
+        assert!(
+            calendars.sync_states.lock().unwrap().is_empty(),
+            "sync token must not advance after a delete failure"
+        );
+        assert_eq!(output.sync_errors.len(), 1);
+        assert!(
+            output.sync_errors[0].contains("cache delete failed"),
+            "{}",
+            output.sync_errors[0]
+        );
     }
 
     #[test]
