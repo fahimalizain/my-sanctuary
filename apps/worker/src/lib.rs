@@ -92,8 +92,18 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/api/tasks", tasks::create_task)
         .patch_async("/api/tasks/:id", tasks::update_task)
         .delete_async("/api/tasks/:id", tasks::delete_task)
+        .post_async("/api/tasks/:id/start", tasks::start_task)
+        .post_async("/api/tasks/:id/stop", tasks::stop_task)
+        .post_async("/api/tasks/:id/pause", tasks::pause_task)
+        .post_async("/api/tasks/:id/complete", tasks::complete_task)
+        .post_async("/api/tasks/:id/discard", tasks::discard_task)
         .options("/api/tasks", auth::options)
         .options("/api/tasks/:id", auth::options)
+        .options("/api/tasks/:id/start", auth::options)
+        .options("/api/tasks/:id/stop", auth::options)
+        .options("/api/tasks/:id/pause", auth::options)
+        .options("/api/tasks/:id/complete", auth::options)
+        .options("/api/tasks/:id/discard", auth::options)
         .run(req, env)
         .await
 }

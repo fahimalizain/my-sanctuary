@@ -69,6 +69,15 @@ pub trait HttpClient: Send + Sync {
         access_token: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), HttpError>;
+    /// PATCHes a JSON body with the same headers as
+    /// [`post_json`](Self::post_json) (Google `events.patch` for the task
+    /// timer). Returns `(status, body)`.
+    async fn patch_json(
+        &self,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), HttpError>;
 }
 
 /// Errors produced by the code-exchange/login orchestration.
@@ -289,6 +298,16 @@ mod tests {
             _body: &[u8],
         ) -> Result<(u16, Vec<u8>), HttpError> {
             // OAuth tests never POST JSON.
+            Ok((200, Vec::new()))
+        }
+
+        async fn patch_json(
+            &self,
+            _url: &str,
+            _access_token: &str,
+            _body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            // OAuth tests never PATCH JSON.
             Ok((200, Vec::new()))
         }
     }

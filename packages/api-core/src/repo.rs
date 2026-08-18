@@ -17,9 +17,9 @@ use thiserror::Error;
 
 use crate::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, Task, TaskCategory,
-    TaskCategoryPattern, TaskList, UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
-    WatchChannel, NewWatchChannel,
+    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Task,
+    TaskCategory, TaskCategoryPattern, TaskList, UpdateTask, UpdateTaskCategory, UpdateTaskList,
+    User, WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -124,6 +124,16 @@ pub trait CalendarEventRepo: Send + Sync {
         user_id: &str,
         start_rfc3339: &str,
         end_rfc3339: &str,
+    ) -> Result<Vec<CalendarEvent>, RepoError>;
+    /// The user's *living* timed events (task-tagged, joined to their
+    /// calendars) with `task_id` set AND `start_time <= now < end_time` —
+    /// the derived "running" set (RFC 3339 UTC strings of this shape compare
+    /// lexicographically). At most one such event per user is expected;
+    /// callers use the emptiness check for the one-running-task rule.
+    async fn list_running_by_user_id(
+        &self,
+        user_id: &str,
+        now_rfc3339: &str,
     ) -> Result<Vec<CalendarEvent>, RepoError>;
     /// SOFT delete by local id.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
@@ -249,8 +259,31 @@ pub trait TaskRepo: Send + Sync {
     /// and returns the updated row, or `None` when the task is missing or
     /// soft-deleted.
     async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError>;
+    /// Transitions `status` on a living task (slice 4 timer: start/stop/pause/
+    /// complete/discard). Returns the updated row, or `None` when the task is
+    /// missing or soft-deleted. Deliberately NOT part of `UpdateTask` — the
+    /// public PATCH /api/tasks/:id never touches status.
+    async fn set_status(
+        &self,
+        id: &str,
+        status: &str,
+        now_rfc3339: &str,
+    ) -> Result<Option<Task>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+}
+
+/// Task audit-trail persistence (`task_logs` rows).
+///
+/// Append-only by design — there is no update, delete, or even read method on
+/// the trait. The service logs transitions (started/stopped/paused/completed/
+/// discarded) and nothing ever mutates those rows.
+#[async_trait(?Send)]
+pub trait TaskLogRepo: Send + Sync {
+    /// Inserts one log row. The D1 implementation generates the UUID `id` and
+    /// the `created_at` timestamp; `at` (the transition instant) comes from
+    /// the service. Returns the generated `id`.
+    async fn insert(&self, log: NewTaskLog, now_rfc3339: &str) -> Result<String, RepoError>;
 }
 
 /// Google Calendar watch channel persistence (`google_calendars_watch_channels`
@@ -404,6 +437,22 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     ORDER BY e.start_time ASC
 ";
 
+/// The derived "running" set: task-tagged events joined to the user's (living)
+/// calendars where `task_id` is set AND `start_time <= now < end_time`.
+/// SQLite evaluates `NULL != ''` to NULL (falsy), so the NULL guard before the
+/// empty-string test is required, not cosmetic. RFC 3339 UTC strings of this
+/// shape (`…Z`, zero-padded, no fractions) compare lexicographically, so the
+/// range test needs no timestamp function.
+pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
+    SELECT e.* FROM calendar_events e
+    JOIN google_calendars c ON c.id = e.calendar_id
+    WHERE c.user_id = ?
+      AND e.deleted_at IS NULL
+      AND e.task_id IS NOT NULL AND e.task_id != ''
+      AND e.start_time <= ? AND e.end_time > ?
+    ORDER BY e.start_time ASC
+";
+
 /// SOFT delete by local id.
 pub const EVENT_DELETE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
@@ -417,8 +466,8 @@ pub const EVENT_DELETE_STALE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND last_synced_at < ? AND deleted_at IS NULL";
 
 /// D1 allows at most 100 bound parameters per SQL statement.
-/// `calendar_events` upsert binds 13 columns per row → max 7 rows per statement.
-pub const EVENT_UPSERT_COL_COUNT: usize = 13;
+/// `calendar_events` upsert binds 14 columns per row → max 7 rows per statement.
+pub const EVENT_UPSERT_COL_COUNT: usize = 14;
 pub const EVENT_UPSERT_CHUNK_SIZE: usize = 100 / EVENT_UPSERT_COL_COUNT; // 7
 
 const EVENT_UPSERT_ON_CONFLICT: &str = "
@@ -431,6 +480,7 @@ const EVENT_UPSERT_ON_CONFLICT: &str = "
         start_time = excluded.start_time,
         end_time = excluded.end_time,
         recurrence = excluded.recurrence,
+        task_id = COALESCE(NULLIF(excluded.task_id, ''), calendar_events.task_id),
         updated_at = excluded.updated_at
 ";
 
@@ -441,8 +491,8 @@ const EVENT_UPSERT_ON_CONFLICT: &str = "
 ///
 /// Returns `(sql, args)` where every arg is a string; the D1 implementation
 /// binds them as `D1Type::Text`. Mirrors the old Go `buildEventUpsertSQL`
-/// (13 columns, COALESCE-free — the Go upsert did not resurrect soft-deleted
-/// events, and neither does this one).
+/// (14 columns; COALESCE-free apart from the `task_id` guard — a Google event
+/// without the `sanctuary_task_id` property must not wipe a stored link).
 pub fn build_event_upsert_sql(
     events: &[NewCalendarEvent],
     now_rfc3339: &str,
@@ -457,7 +507,7 @@ pub fn build_event_upsert_sql(
 
     let mut sql = String::from(
         "INSERT INTO calendar_events
-        (id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, created_at, updated_at)
+        (id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, task_id, created_at, updated_at)
         VALUES ",
     );
     let mut args: Vec<String> = Vec::with_capacity(events.len() * EVENT_UPSERT_COL_COUNT);
@@ -465,7 +515,7 @@ pub fn build_event_upsert_sql(
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        sql.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         args.extend([
             id,
             event.calendar_id.clone(),
@@ -478,6 +528,7 @@ pub fn build_event_upsert_sql(
             event.start_time.clone(),
             event.end_time.clone(),
             event.recurrence.clone(),
+            event.task_id.clone(),
             now_rfc3339.to_string(),
             now_rfc3339.to_string(),
         ]);
@@ -654,6 +705,19 @@ pub const TASK_UPDATE_SQL: &str = "
 pub const TASK_DELETE_SQL: &str =
     "UPDATE tasks SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
+/// Timer transitions only (slice 4): `status` is deliberately not part of the
+/// public `TASK_UPDATE_SQL`; this statement is the repo's internal status
+/// channel, called by the service's start/stop/pause/complete/discard.
+pub const TASK_SET_STATUS_SQL: &str =
+    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// Append-only audit insert: the D1 implementation binds the UUID `id`, the
+/// timestamps, and NULLs for absent `calendar_id`/`google_event_id`.
+pub const TASK_LOG_INSERT_SQL: &str = "
+    INSERT INTO task_logs (id, task_id, user_id, type, at, calendar_id, google_event_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+";
+
 // ──────────────────────────────────────────
 // Watch channel SQL
 // ──────────────────────────────────────────
@@ -798,13 +862,13 @@ mod tests {
 
     #[test]
     fn event_upsert_chunk_size_respects_d1_100_param_limit() {
-        assert_eq!(EVENT_UPSERT_COL_COUNT, 13);
+        assert_eq!(EVENT_UPSERT_COL_COUNT, 14);
         assert_eq!(EVENT_UPSERT_CHUNK_SIZE, 7);
         assert!(EVENT_UPSERT_CHUNK_SIZE * EVENT_UPSERT_COL_COUNT <= 100);
     }
 
     #[test]
-    fn event_upsert_sql_has_13_placeholders_per_row_and_on_conflict() {
+    fn event_upsert_sql_has_14_placeholders_per_row_and_on_conflict() {
         let event = NewCalendarEvent {
             calendar_id: "cal-1".to_string(),
             google_event_id: "g-1".to_string(),
@@ -816,6 +880,7 @@ mod tests {
             start_time: "2026-08-18T09:00:00Z".to_string(),
             end_time: "2026-08-18T09:30:00Z".to_string(),
             recurrence: String::new(),
+            task_id: "task-1".to_string(),
         };
         let (sql, args) = build_event_upsert_sql(
             &[event.clone()],
@@ -828,20 +893,21 @@ mod tests {
         assert!(sql.contains("google_etag = excluded.google_etag"), "{sql}");
         assert!(sql.contains("updated_at = excluded.updated_at"), "{sql}");
 
-        assert_eq!(args.len(), 13);
+        assert_eq!(args.len(), 14);
         assert_eq!(args[0], "evt-1");
         assert_eq!(args[1], "cal-1");
         assert_eq!(args[5], "2026-08-17T12:00:00Z", "last_synced_at bound");
-        assert_eq!(args[11], "2026-08-17T12:00:00Z", "created_at bound");
-        assert_eq!(args[12], "2026-08-17T12:00:00Z", "updated_at bound");
+        assert_eq!(args[11], "task-1", "task_id bound");
+        assert_eq!(args[12], "2026-08-17T12:00:00Z", "created_at bound");
+        assert_eq!(args[13], "2026-08-17T12:00:00Z", "updated_at bound");
 
-        // Exactly 13 placeholders for the single row (no trailing/extra commas).
-        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 1);
-        assert!(!sql.contains("(?,?,?,?,?,?,?,?,?,?,?,?,?,?"), "no 14th placeholder");
+        // Exactly 14 placeholders for the single row (no trailing/extra commas).
+        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 1);
+        assert!(!sql.contains("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"), "no 15th placeholder");
     }
 
     #[test]
-    fn event_upsert_sql_chunks_7_rows_with_91_placeholders() {
+    fn event_upsert_sql_chunks_7_rows_with_98_placeholders() {
         let event = NewCalendarEvent {
             calendar_id: "cal-1".to_string(),
             google_event_id: "g".to_string(),
@@ -853,17 +919,30 @@ mod tests {
             start_time: "2026-08-18T09:00:00Z".to_string(),
             end_time: "2026-08-18T09:30:00Z".to_string(),
             recurrence: String::new(),
+            task_id: "task-1".to_string(),
         };
         let events: Vec<NewCalendarEvent> = (0..7).map(|_| event.clone()).collect();
         let ids: Vec<String> = (0..7).map(|i| format!("evt-{i}")).collect();
         let (sql, args) = build_event_upsert_sql(&events, "2026-08-17T12:00:00Z", ids);
 
-        assert_eq!(args.len(), 7 * 13);
-        assert_eq!(sql.matches('?').count(), 7 * 13);
-        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 7);
+        assert_eq!(args.len(), 7 * 14);
+        assert_eq!(sql.matches('?').count(), 7 * 14);
+        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 7);
         assert_eq!(args[0], "evt-0");
-        assert_eq!(args[13], "evt-1");
-        assert_eq!(args[13 * 6], "evt-6");
+        assert_eq!(args[14], "evt-1");
+        assert_eq!(args[14 * 6], "evt-6");
+    }
+
+    #[test]
+    fn event_upsert_preserves_existing_task_id_when_incoming_is_empty() {
+        // A sync of an untagged Google event must never wipe a stored task
+        // link: the COALESCE keeps the existing value.
+        assert!(
+            EVENT_UPSERT_ON_CONFLICT.contains(
+                "task_id = COALESCE(NULLIF(excluded.task_id, ''), calendar_events.task_id)"
+            ),
+            "{EVENT_UPSERT_ON_CONFLICT}"
+        );
     }
 
     #[test]
@@ -1109,5 +1188,46 @@ mod tests {
         assert!(TASK_DELETE_SQL.starts_with("UPDATE"), "{}", TASK_DELETE_SQL);
         assert!(TASK_DELETE_SQL.contains("SET deleted_at = ?"), "{}", TASK_DELETE_SQL);
         assert!(!TASK_DELETE_SQL.contains("DELETE FROM"), "{}", TASK_DELETE_SQL);
+    }
+
+    #[test]
+    fn task_set_status_updates_only_status_on_living_rows() {
+        let sql = TASK_SET_STATUS_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("SET status = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert_eq!(sql.matches('?').count(), 3, "{sql}");
+        assert!(!sql.contains("title"), "status transitions only: {sql}");
+    }
+
+    #[test]
+    fn running_events_query_filters_task_tagged_living_events_in_now_window() {
+        let sql = EVENT_LIST_RUNNING_BY_USER_ID_SQL;
+        assert!(sql.contains("c.user_id = ?"), "{sql}");
+        assert!(sql.contains("e.deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("e.task_id IS NOT NULL AND e.task_id != ''"), "{sql}");
+        assert!(sql.contains("e.start_time <= ? AND e.end_time > ?"), "{sql}");
+        assert!(sql.contains("JOIN google_calendars c ON c.id = e.calendar_id"), "{sql}");
+    }
+
+    #[test]
+    fn task_log_insert_binds_all_8_columns() {
+        let sql = TASK_LOG_INSERT_SQL;
+        assert!(sql.contains("INSERT INTO task_logs"), "{sql}");
+        assert!(!sql.contains("ON CONFLICT"), "append-only: {sql}");
+        for column in [
+            "id",
+            "task_id",
+            "user_id",
+            "type",
+            "at",
+            "calendar_id",
+            "google_event_id",
+            "created_at",
+        ] {
+            assert!(sql.contains(column), "missing {column} in {sql}");
+        }
+        assert_eq!(sql.matches('?').count(), 8, "{sql}");
     }
 }

@@ -218,6 +218,11 @@ pub struct CalendarEvent {
     /// JSON array of RRULE strings; empty for non-recurring events.
     #[serde(default, deserialize_with = "de_empty_string")]
     pub recurrence: String,
+    /// The task this event was created for (slice 4: start writes
+    /// `extendedProperties.shared.sanctuary_task_id`, sync maps it back).
+    /// Empty when the event never had one.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub task_id: String,
     pub created_at: String,
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
@@ -244,6 +249,10 @@ pub struct NewCalendarEvent {
     pub end_time: String,
     /// JSON array of RRULE strings; empty for non-recurring events.
     pub recurrence: String,
+    /// Task link (from `extendedProperties.shared.sanctuary_task_id`); empty
+    /// for events that never had one. The upsert NEVER wipes a stored value
+    /// with an empty incoming one (`COALESCE` in SQL).
+    pub task_id: String,
 }
 
 /// A task list (the former "stream"), as stored in `task_lists`. Doubles as
@@ -433,8 +442,10 @@ pub struct NewTaskCategoryPattern {
 /// deliberately no `category_id`/`list_id` column; the service computes the
 /// category per title via `classify` and attaches it to the task view.
 ///
-/// `status` is always `OPEN` in this slice: create stamps it and `UpdateTask`
-/// has no status field (status transitions arrive in slice 4).
+/// Create stamps `status = "OPEN"`. Transitions — `IN_PROGRESS`, back to
+/// `OPEN`, `COMPLETED`, `DISCARDED` — happen exclusively through the timer
+/// endpoints (start/stop/pause/complete/discard); the public `UpdateTask`
+/// has no status field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -459,8 +470,7 @@ pub struct Task {
 
 /// Insert input for [`crate::repo::TaskRepo::insert`]. The D1 implementation
 /// generates the UUID `id`, the `created_at`/`updated_at` timestamps, and
-/// stamps `status = "OPEN"` (this slice never creates tasks in any other
-/// state).
+/// stamps `status = "OPEN"` (tasks are never created in any other state).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTask {
     pub user_id: String,
@@ -484,10 +494,52 @@ pub struct NewTaskInput {
     pub priority: Option<String>,
 }
 
+/// One entry of the task audit trail, as stored in `task_logs`.
+///
+/// Doubles as the D1 row projection: field names match the schema (the column
+/// is `type`, hence the raw identifier, which serde serializes as `"type"`).
+/// Append-only by construction — nothing ever updates or deletes these rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLog {
+    pub id: String,
+    pub task_id: String,
+    pub user_id: String,
+    /// `started|stopped|paused|completed|discarded`.
+    pub r#type: String,
+    /// RFC 3339 instant of the transition.
+    pub at: String,
+    /// Local calendar id of the Google event the transition touched; `""`
+    /// when no calendar was involved (e.g. `completed` without a running
+    /// event). Nullable column mapped via [`de_empty_string`].
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub calendar_id: String,
+    /// Google event id of the touched event; `""` when none.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub google_event_id: String,
+    pub created_at: String,
+}
+
+/// Insert input for [`crate::repo::TaskLogRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the `created_at` timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskLog {
+    pub task_id: String,
+    pub user_id: String,
+    /// `started|stopped|paused|completed|discarded`.
+    pub r#type: String,
+    /// RFC 3339 instant of the transition.
+    pub at: String,
+    /// Local calendar id of the touched event (when any).
+    pub calendar_id: Option<String>,
+    /// Google event id of the touched event (when any).
+    pub google_event_id: Option<String>,
+}
+
 /// Update input for [`crate::repo::TaskRepo::update`] (`PATCH /api/tasks/:id`).
 /// `None` fields are left unchanged (COALESCE in SQL); the service rejects a
 /// body where every field is `None` (400 "nothing to update"). Status is
-/// deliberately absent — this slice does not transition tasks.
+/// deliberately absent — transitions go through the timer endpoints only
+/// (`TaskRepo::set_status`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub struct UpdateTask {
     pub title: Option<String>,
@@ -544,6 +596,11 @@ pub struct NewEventInput {
     pub start: String,
     /// dateTime string (RFC 3339) passed through to Google.
     pub end: String,
+    /// When set, the created event carries
+    /// `extendedProperties.shared.sanctuary_task_id` (the task timer's
+    /// carrier — slice 4). `None` for hand-created events.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -614,6 +671,7 @@ mod tests {
             start_time: "2026-08-18T09:00:00Z".to_string(),
             end_time: "2026-08-18T09:30:00Z".to_string(),
             recurrence: String::new(),
+            task_id: "task-1".to_string(),
             created_at: "2026-08-17T12:00:00Z".to_string(),
             updated_at: "2026-08-17T12:00:00Z".to_string(),
             deleted_at: None,
@@ -633,6 +691,7 @@ mod tests {
             assert!(value.get(key).is_some(), "missing {key}: {value}");
         }
         assert_eq!(value["start_time"], "2026-08-18T09:00:00Z");
+        assert_eq!(value["task_id"], "task-1", "task link is part of the payload");
     }
 
     #[test]
@@ -838,12 +897,46 @@ mod tests {
                 "id": "evt-1", "calendar_id": "cal-1", "google_event_id": "g-1",
                 "google_etag": null, "google_updated_at": null, "last_synced_at": "x",
                 "title": "T", "description": null, "start_time": "s", "end_time": "e",
-                "recurrence": null, "created_at": "x", "updated_at": "x", "deleted_at": null
+                "recurrence": null, "task_id": null, "created_at": "x", "updated_at": "x",
+                "deleted_at": null
             }"#,
         )
         .unwrap();
         assert_eq!(event.description, "");
         assert_eq!(event.google_etag, "");
         assert_eq!(event.recurrence, "");
+        assert_eq!(event.task_id, "", "NULL task_id maps to empty string");
+    }
+
+    #[test]
+    fn task_log_deserializes_from_d1_row_shape() {
+        // D1 returns NULL for the nullable columns and a plain `type` column.
+        let log: TaskLog = serde_json::from_str(
+            r#"{
+                "id": "log-1", "task_id": "t-1", "user_id": "u-1", "type": "started",
+                "at": "2026-08-18T09:00:00Z", "calendar_id": null, "google_event_id": null,
+                "created_at": "2026-08-18T09:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(log.r#type, "started");
+        assert_eq!(log.calendar_id, "");
+        assert_eq!(log.google_event_id, "");
+    }
+
+    #[test]
+    fn task_log_serializes_type_column_name() {
+        let log = TaskLog {
+            id: "log-1".to_string(),
+            task_id: "t-1".to_string(),
+            user_id: "u-1".to_string(),
+            r#type: "stopped".to_string(),
+            at: "2026-08-18T09:30:00Z".to_string(),
+            calendar_id: "cal-1".to_string(),
+            google_event_id: "g-1".to_string(),
+            created_at: "2026-08-18T09:30:00Z".to_string(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&log).unwrap();
+        assert_eq!(value["type"], "stopped", "raw identifier serializes as `type`");
     }
 }

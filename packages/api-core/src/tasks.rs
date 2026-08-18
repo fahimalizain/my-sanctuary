@@ -1,8 +1,12 @@
-//! Task service: CRUD for `tasks`, classified by title regex.
+//! Task service: CRUD for `tasks` (classified by title regex) plus the timer:
+//! start/stop/pause/complete/discard backed by Google Calendar events.
 //!
 //! Pure Rust and unit-testable: persistence goes through [`TaskRepo`]/
-//! [`TaskCategoryRepo`]/[`TaskListRepo`] (faked with in-memory impls in tests).
-//! The Worker layers session checks on top (`apps/worker/src/tasks.rs`).
+//! [`TaskCategoryRepo`]/[`TaskListRepo`]/[`TaskLogRepo`]/[`CalendarRepo`]/
+//! [`CalendarEventRepo`] (faked with in-memory impls in tests), Google HTTP
+//! through [`HttpClient`], and "now" comes from the caller — never
+//! `SystemTime`. The Worker layers session checks and token refresh on top
+//! (`apps/worker/src/tasks.rs`).
 //!
 //! Domain rules (locked):
 //! - Tasks carry NO `category_id`/`list_id`. The category is **computed** per
@@ -13,9 +17,7 @@
 //!   `Untracked { conflict: true }` (cross-tree conflict), and a match on the
 //!   `untracked` sink itself are all invalid. A title matching only a root
 //!   whose children do not match is **allowed** (parent remainder).
-//! - Titles are not unique. Create always stores `status = "OPEN"`; this slice
-//!   has no status transitions (no complete/discard/in_progress) and
-//!   `UpdateTask` has no `status` field.
+//! - Titles are not unique. Create always stores `status = "OPEN"`.
 //! - `duration_minutes` defaults to 15 and must be >= 1; `priority` must be
 //!   `high|medium|low` (default `medium`).
 //! - Delete is SOFT; a missing/soft-deleted/other-user task is always
@@ -26,33 +28,97 @@
 //!   deleted the pattern) is still returned with the `untracked` summary —
 //!   listing is a read, not a validation.
 //!
-//! Taxonomy seeding: `list_tasks` and `create_task` run `ensure_taxonomy`
-//! (lists count + categories count) so a tasks-only client still gets a
-//! matcher; the gate keeps the first Lists visit order (lists → categories →
-//! tasks) safe.
+//! Timer rules (locked):
+//! - `start_task` opens a Google Calendar event `now … now + duration_minutes`
+//!   with `extendedProperties.shared.sanctuary_task_id` = task UUID (never
+//!   `private`, never a description footer). Summary is the task **title**
+//!   exactly — no `| Category` suffix.
+//! - Calendar pick: the matched category's `google_calendar_id` **when that
+//!   calendar exists for this user, is not soft-deleted, and is writable**
+//!   (`access_role` `owner` or `writer`); otherwise the user's **primary**
+//!   calendar. No writable calendar → 400.
+//! - One running task per user: a second start raises [`TasksError::Conflict`]
+//!   (409) even when the same task is already running. "Running" is **derived
+//!   from the cache** — `calendar_events.task_id` set AND
+//!   `start_time <= now < end_time` — never from `tasks.status`.
+//! - `stop_task`/`pause_task` PATCH the event's end to now (start + 60s when
+//!   `now <= start`) and flip status to OPEN — even when no open event exists
+//!   for the task (the user closed it in Google): the flip is idempotent.
+//! - `complete_task`/`discard_task` auto-stop a running event first (a
+//!   `stopped` log precedes the terminal log), then set the terminal status.
+//!   Repeating the same terminal action is an idempotent 200 no-op.
+//! - Start on COMPLETED/DISCARDED is a 400; missing/other-user/soft-deleted
+//!   tasks are 404.
+//! - Every transition appends to `task_logs` (an audit trail, not a
+//!   timesheet): `started|stopped|paused|completed|discarded`.
 
 use thiserror::Error;
 
+use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{ensure_taxonomy, classify, CategoryWithPatterns, ClassifyOutcome};
-use crate::models::{NewTask, NewTaskInput, Task, TaskCategory, UpdateTask};
-use crate::repo::{RepoError, TaskCategoryRepo, TaskListRepo, TaskRepo};
+use crate::models::{
+    CalendarEvent, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task, TaskCategory,
+    UpdateTask,
+};
+use crate::oauth::HttpClient;
+use crate::repo::{
+    CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo, TaskListRepo, TaskLogRepo,
+    TaskRepo,
+};
+use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+use crate::token::GoogleAccess;
 
 /// Default planned duration for a new task, in minutes.
 pub const DEFAULT_DURATION_MINUTES: i64 = 15;
 /// Minimum planned duration, in minutes.
 pub const MIN_DURATION_MINUTES: i64 = 1;
-/// The status every created task gets (this slice has no other states).
+/// The status every created task gets.
 pub const TASK_STATUS_OPEN: &str = "OPEN";
+/// A running task (an open timed event exists in the cache).
+pub const TASK_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// A finished task.
+pub const TASK_STATUS_COMPLETED: &str = "COMPLETED";
+/// A discarded task.
+pub const TASK_STATUS_DISCARDED: &str = "DISCARDED";
+
+/// `task_logs.type` values (the audit trail is append-only).
+pub const TASK_LOG_STARTED: &str = "started";
+pub const TASK_LOG_STOPPED: &str = "stopped";
+pub const TASK_LOG_PAUSED: &str = "paused";
+pub const TASK_LOG_COMPLETED: &str = "completed";
+pub const TASK_LOG_DISCARDED: &str = "discarded";
 
 /// Errors produced by the tasks service.
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
+///
+/// No `PartialEq`/`Eq`: the `Calendar` variant wraps
+/// [`CalendarError`] (which carries non-`Eq` HTTP errors) — tests match with
+/// `matches!`, never `==`.
+#[derive(Debug, Clone, Error)]
 pub enum TasksError {
     #[error("{0}")]
     Invalid(String),
     #[error("task not found")]
     NotFound,
+    #[error("a task is already running")]
+    Conflict,
+    #[error("google api error: {0}")]
+    GoogleApi(String),
     #[error("database error: {0}")]
     Repo(#[from] RepoError),
+    #[error("calendar error: {0}")]
+    Calendar(CalendarError),
+}
+
+impl From<CalendarError> for TasksError {
+    fn from(err: CalendarError) -> Self {
+        match err {
+            CalendarError::GoogleApi(message) => TasksError::GoogleApi(message),
+            // The timer only ever touches calendars it resolved itself, so a
+            // NotFound/InvalidResponse/Http here is a 500-shaped surprise —
+            // surface the message and let the worker pick the status.
+            other => TasksError::Calendar(other),
+        }
+    }
 }
 
 /// `list_tasks`/`create_task` run `ensure_taxonomy`, whose errors fold into
@@ -85,6 +151,16 @@ pub struct TaskResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeleteTaskResponse {
     pub success: bool,
+}
+
+/// Response envelope for the timer actions (start/stop/pause/complete/
+/// discard): the fresh task view plus the Google event the action touched
+/// (`None` when no event was involved, e.g. an idempotent complete or a stop
+/// whose event had already been closed in Google).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TaskActionResponse {
+    pub task: TaskView,
+    pub event: Option<CalendarEvent>,
 }
 
 /// HTTP shape of a task: every `tasks` column (minus `deleted_at`) plus the
@@ -308,6 +384,443 @@ pub async fn delete_task(
 }
 
 // ──────────────────────────────────────────
+// Timer (slice 4): start / stop / pause / complete / discard
+// ──────────────────────────────────────────
+
+/// Starts a task: opens a timed Google Calendar event and marks the task
+/// IN_PROGRESS. The event's summary is the task **title** exactly and carries
+/// `extendedProperties.shared.sanctuary_task_id` = task UUID.
+///
+/// Order of operations:
+/// 1. Load the task — missing, soft-deleted, or another user's task → 404.
+/// 2. COMPLETED/DISCARDED tasks cannot start → 400.
+/// 3. If ANY open timed event exists for the user → 409 (`Conflict`) — even
+///    when it belongs to this very task.
+/// 4. Classify the title (seeding the taxonomy like every other read) to pick
+///    the category; its `google_calendar_id` is the calendar *candidate*.
+/// 5. Resolve the target calendar: the candidate when it exists for this
+///    user and is writable (`access_role` owner/writer), else the user's
+///    primary calendar. No writable calendar → 400.
+/// 6. `create_event` (now … now + duration_minutes, task carrier attached).
+/// 7. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
+///    request.
+pub async fn start_task(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<TaskActionResponse, TasksError> {
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    if task.status == TASK_STATUS_COMPLETED {
+        return Err(TasksError::Invalid("cannot start a completed task".to_string()));
+    }
+    if task.status == TASK_STATUS_DISCARDED {
+        return Err(TasksError::Invalid("cannot start a discarded task".to_string()));
+    }
+
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    // Running is derived from the cache, never from `tasks.status`: any open
+    // timed event blocks a new start, whatever this task's stored status.
+    let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
+    if !running.is_empty() {
+        return Err(TasksError::Conflict);
+    }
+
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+    let target = resolve_target_calendar(calendars, &taxonomy, &task.title, user_id).await?;
+
+    let end_rfc3339 = unix_secs_to_rfc3339(now_unix + task.duration_minutes * 60);
+    let output = create_event(
+        http,
+        calendars,
+        events,
+        access,
+        &NewEventInput {
+            calendar_id: target.calendar_id.clone(),
+            summary: task.title.clone(),
+            description: None,
+            start: now_rfc3339.clone(),
+            end: end_rfc3339,
+            task_id: Some(task.id.clone()),
+        },
+        now_unix,
+    )
+    .await?;
+    let event = output.event;
+
+    let Some(updated) = task_repo
+        .set_status(&task.id, TASK_STATUS_IN_PROGRESS, &now_rfc3339)
+        .await?
+    else {
+        return Err(TasksError::NotFound);
+    };
+    logs.insert(
+        NewTaskLog {
+            task_id: task.id.clone(),
+            user_id: user_id.to_string(),
+            r#type: TASK_LOG_STARTED.to_string(),
+            at: now_rfc3339.clone(),
+            calendar_id: Some(target.calendar_id),
+            google_event_id: Some(event.google_event_id.clone()),
+        },
+        &now_rfc3339,
+    )
+    .await?;
+
+    Ok(TaskActionResponse {
+        task: to_view(&updated, &taxonomy),
+        event: Some(event),
+    })
+}
+
+/// Stops a task: PATCHes its open event's end to now (`start + 60s` when
+/// `now <= start`) and flips status back to OPEN. The status flip is
+/// idempotent — when the user already closed the event in Google, stop only
+/// rewrites the status and appends a `stopped` log.
+pub async fn stop_task(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<TaskActionResponse, TasksError> {
+    stop_or_pause(
+        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        now_unix, TASK_LOG_STOPPED,
+    )
+    .await
+}
+
+/// Pauses a task: identical to [`stop_task`] (the event's end is patched to
+/// now) except the log row says `paused`. Reopening later is simply Start
+/// again (logged `started`).
+pub async fn pause_task(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<TaskActionResponse, TasksError> {
+    stop_or_pause(
+        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        now_unix, TASK_LOG_PAUSED,
+    )
+    .await
+}
+
+/// Completes a task: auto-stops a running event first (a `stopped` log
+/// precedes the `completed` log), then sets COMPLETED. Already COMPLETED is
+/// an idempotent 200 no-op.
+pub async fn complete_task(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<TaskActionResponse, TasksError> {
+    complete_or_discard(
+        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED,
+    )
+    .await
+}
+
+/// Discards a task: auto-stops a running event first (a `stopped` log
+/// precedes the `discarded` log), then sets DISCARDED. Already DISCARDED is
+/// an idempotent 200 no-op.
+pub async fn discard_task(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<TaskActionResponse, TasksError> {
+    complete_or_discard(
+        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED,
+    )
+    .await
+}
+
+/// Shared stop/pause machinery (see [`stop_task`]).
+async fn stop_or_pause(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+    log_type: &str,
+) -> Result<TaskActionResponse, TasksError> {
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    // Terminal tasks are never reopened — not even by stop/pause.
+    if task.status == TASK_STATUS_COMPLETED || task.status == TASK_STATUS_DISCARDED {
+        return Err(TasksError::Invalid(format!(
+            "cannot {log_type} a {status} task",
+            status = task.status
+        )));
+    }
+
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let (patched, at, calendar_id, google_event_id) =
+        stop_running_event(http, calendars, events, access, user_id, task_id, now_unix).await?;
+
+    let Some(updated) = task_repo
+        .set_status(task_id, TASK_STATUS_OPEN, &now_rfc3339)
+        .await?
+    else {
+        return Err(TasksError::NotFound);
+    };
+    logs.insert(
+        NewTaskLog {
+            task_id: task_id.to_string(),
+            user_id: user_id.to_string(),
+            r#type: log_type.to_string(),
+            at,
+            calendar_id,
+            google_event_id,
+        },
+        &now_rfc3339,
+    )
+    .await?;
+
+    let taxonomy = load_taxonomy(category_repo, user_id).await?;
+    Ok(TaskActionResponse {
+        task: to_view(&updated, &taxonomy),
+        event: patched,
+    })
+}
+
+/// Shared complete/discard machinery (see [`complete_task`]).
+async fn complete_or_discard(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+    target_status: &str,
+    log_type: &str,
+) -> Result<TaskActionResponse, TasksError> {
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    // Idempotent 200: the terminal action already happened — no Google call,
+    // no log row, just the current state.
+    if task.status == target_status {
+        let taxonomy = load_taxonomy(category_repo, user_id).await?;
+        return Ok(TaskActionResponse {
+            task: to_view(&task, &taxonomy),
+            event: None,
+        });
+    }
+
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    // Auto-stop: a running event is closed first, and that close is logged
+    // (`stopped`) before the terminal log.
+    let (patched, at, calendar_id, google_event_id) =
+        stop_running_event(http, calendars, events, access, user_id, task_id, now_unix).await?;
+    if let Some(_event) = &patched {
+        logs.insert(
+            NewTaskLog {
+                task_id: task_id.to_string(),
+                user_id: user_id.to_string(),
+                r#type: TASK_LOG_STOPPED.to_string(),
+                at,
+                calendar_id,
+                google_event_id,
+            },
+            &now_rfc3339,
+        )
+        .await?;
+    }
+
+    let Some(updated) = task_repo
+        .set_status(task_id, target_status, &now_rfc3339)
+        .await?
+    else {
+        return Err(TasksError::NotFound);
+    };
+    logs.insert(
+        NewTaskLog {
+            task_id: task_id.to_string(),
+            user_id: user_id.to_string(),
+            r#type: log_type.to_string(),
+            at: now_rfc3339.clone(),
+            calendar_id: None,
+            google_event_id: None,
+        },
+        &now_rfc3339,
+    )
+    .await?;
+
+    let taxonomy = load_taxonomy(category_repo, user_id).await?;
+    Ok(TaskActionResponse {
+        task: to_view(&updated, &taxonomy),
+        event: patched,
+    })
+}
+
+/// Finds the task's open timed event in the user's running set and PATCHes
+/// its end to now (or `start + 60s` when `now <= start`, keeping the Google
+/// event valid). Returns the patched event (None when the task has no open
+/// event — the user closed it in Google), the closing instant, and the
+/// calendar/google ids for the log row.
+async fn stop_running_event(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<(Option<CalendarEvent>, String, Option<String>, Option<String>), TasksError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
+    let Some(found) = running.into_iter().find(|event| event.task_id == task_id) else {
+        return Ok((None, now_rfc3339, None, None));
+    };
+    let start_unix = rfc3339_to_unix_secs(&found.start_time).unwrap_or(now_unix);
+    let end_unix = if now_unix <= start_unix {
+        start_unix + 60
+    } else {
+        now_unix
+    };
+    let end_rfc3339 = unix_secs_to_rfc3339(end_unix);
+    let output = patch_event(
+        http,
+        calendars,
+        events,
+        access,
+        &found.calendar_id,
+        &found.google_event_id,
+        &end_rfc3339,
+        now_unix,
+    )
+    .await?;
+    Ok((
+        Some(output.event),
+        end_rfc3339,
+        Some(found.calendar_id),
+        Some(found.google_event_id),
+    ))
+}
+
+/// Loads the taxonomy, seeding it first (same count-gated path as
+/// `list_tasks`/`create_task`; the gate keeps the first Lists visit order).
+async fn load_taxonomy_seeded(
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    user_id: &str,
+) -> Result<Taxonomy, TasksError> {
+    let lists = list_repo.list_by_user_id(user_id).await?;
+    let categories = category_repo.list_by_user_id(user_id).await?;
+    ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id).await?;
+    load_taxonomy(category_repo, user_id).await.map_err(TasksError::from)
+}
+
+/// Resolves the Google calendar a started event lands on (locked rule):
+/// the matched category's `google_calendar_id` when that calendar exists for
+/// the user, is not soft-deleted (`list_by_user_id` already filters), and is
+/// writable (`access_role` owner/writer); otherwise the user's **primary**
+/// calendar (also writable). No writable calendar → 400.
+async fn resolve_target_calendar(
+    calendars: &dyn CalendarRepo,
+    taxonomy: &Taxonomy,
+    title: &str,
+    user_id: &str,
+) -> Result<TargetCalendar, TasksError> {
+    let user_cals = calendars.list_by_user_id(user_id).await?;
+    let category = match classify(title, None, &taxonomy.matchers) {
+        ClassifyOutcome::Matched { category_id } => taxonomy
+            .categories
+            .iter()
+            .find(|category| category.id == category_id),
+        // A title that matches nothing (or conflicts) falls back to the
+        // primary calendar: starting is a read, never a validation.
+        ClassifyOutcome::Untracked { .. } => None,
+    };
+    let candidate = category
+        .and_then(|category| category.google_calendar_id.as_deref())
+        .and_then(|wanted| {
+            user_cals
+                .iter()
+                .find(|cal| cal.google_calendar_id == wanted && is_writable(cal))
+        });
+    let target = candidate
+        .or_else(|| {
+            user_cals
+                .iter()
+                .find(|cal| cal.is_primary && is_writable(cal))
+        })
+        .ok_or_else(|| TasksError::Invalid("no writable calendar".to_string()))?;
+    Ok(TargetCalendar {
+        calendar_id: target.id.clone(),
+    })
+}
+
+/// A resolved target calendar for a started event (local `google_calendars.id`
+/// — the Google id itself lives on the row the event insert re-reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetCalendar {
+    calendar_id: String,
+}
+
+/// Whether a calendar looks writable: Google `access_role` is `owner` or
+/// `writer`.
+fn is_writable(calendar: &crate::models::GoogleCalendar) -> bool {
+    calendar.access_role == "owner" || calendar.access_role == "writer"
+}
+
+// ──────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────
 
@@ -430,10 +943,12 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, NewTaskList, TaskCategory,
-        TaskCategoryPattern, TaskList, UpdateTaskCategory, UpdateTaskList,
+        GoogleCalendar, NewCalendar, NewCalendarEvent, NewTaskCategory, NewTaskCategoryInput,
+        NewTaskCategoryPattern, NewTaskList, TaskCategory, TaskCategoryPattern, TaskList,
+        UpdateTaskCategory, UpdateTaskList,
     };
-    use crate::repo::TaskCategoryRepo;
+    use crate::oauth::{HttpClient, HttpError};
+    use crate::repo::{CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo};
 
     // ──────────────────────────────────────────
     // Fakes
@@ -528,6 +1043,24 @@ mod tests {
                 row.priority = priority.clone();
             }
             row.updated_at = "2026-08-18T01:00:00Z".to_string();
+            Ok(Some(row.clone()))
+        }
+
+        async fn set_status(
+            &self,
+            id: &str,
+            status: &str,
+            now_rfc3339: &str,
+        ) -> Result<Option<Task>, RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            let Some(row) = stored
+                .iter_mut()
+                .find(|row| row.id == id && row.deleted_at.is_none())
+            else {
+                return Ok(None);
+            };
+            row.status = status.to_string();
+            row.updated_at = now_rfc3339.to_string();
             Ok(Some(row.clone()))
         }
 
@@ -1223,5 +1756,1059 @@ mod tests {
         pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
         let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-2")).unwrap();
         assert!(response.tasks.is_empty());
+    }
+
+    // ──────────────────────────────────────────
+    // Timer fakes
+    // ──────────────────────────────────────────
+
+    /// Scripted HTTP fake with POST/PATCH routes — enough for the timer's
+    /// `events.insert` and `events.patch` calls.
+    struct FakeHttp {
+        routes: Vec<(String, u16, String)>,
+        posts: Mutex<Vec<(String, String)>>,
+        patches: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeHttp {
+        fn new(routes: Vec<(&str, u16, &str)>) -> Self {
+            Self {
+                routes: routes
+                    .into_iter()
+                    .map(|(substr, status, body)| {
+                        (substr.to_string(), status, body.to_string())
+                    })
+                    .collect(),
+                posts: Mutex::new(Vec::new()),
+                patches: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn route(&self, url: &str) -> (u16, Vec<u8>) {
+            for (substr, status, body) in &self.routes {
+                if url.contains(substr) {
+                    return (*status, body.clone().into_bytes());
+                }
+            }
+            panic!("no route for {url}");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl HttpClient for FakeHttp {
+        async fn post_form(&self, _url: &str, _form: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_bearer(&self, _url: &str, _token: &str) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_bearer_raw(
+            &self,
+            _url: &str,
+            _token: &str,
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            Ok((200, Vec::new()))
+        }
+
+        async fn post_json(
+            &self,
+            url: &str,
+            _token: &str,
+            body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
+            Ok(self.route(url))
+        }
+
+        async fn patch_json(
+            &self,
+            url: &str,
+            _token: &str,
+            body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            self.patches
+                .lock()
+                .unwrap()
+                .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
+            Ok(self.route(url))
+        }
+    }
+
+    const NOW_UNIX: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z
+    const NOW: &str = "2023-11-14T22:13:20Z";
+
+    fn access() -> GoogleAccess {
+        GoogleAccess {
+            access_token: "at-1".to_string(),
+            token_type: "Bearer".to_string(),
+        }
+    }
+
+    /// A writable primary calendar for `u-1` — the default target.
+    fn calendar(google_cal_id: &str, is_primary: bool) -> GoogleCalendar {
+        GoogleCalendar {
+            id: format!("cal-{google_cal_id}"),
+            user_id: "u-1".to_string(),
+            google_calendar_id: google_cal_id.to_string(),
+            summary: "Work".to_string(),
+            time_zone: "UTC".to_string(),
+            is_primary,
+            access_role: "owner".to_string(),
+            sync_enabled: true,
+            sync_token: String::new(),
+            last_synced_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    struct FakeCalendarRepo {
+        stored: Mutex<Vec<GoogleCalendar>>,
+    }
+
+    impl FakeCalendarRepo {
+        fn with(calendars: Vec<GoogleCalendar>) -> Self {
+            Self {
+                stored: Mutex::new(calendars),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CalendarRepo for FakeCalendarRepo {
+        async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|cal| cal.user_id == user_id && cal.deleted_at.is_none())
+                .cloned()
+                .collect())
+        }
+
+        async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+
+        async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|cal| cal.id == id && cal.deleted_at.is_none())
+                .cloned())
+        }
+
+        async fn get_by_google_cal_id(
+            &self,
+            _user_id: &str,
+            google_cal_id: &str,
+        ) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|cal| cal.google_calendar_id == google_cal_id)
+                .cloned())
+        }
+
+        async fn upsert(&self, _calendar: NewCalendar) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn upsert_batch(&self, _calendars: Vec<NewCalendar>) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn update_sync_state(
+            &self,
+            _id: &str,
+            _sync_token: &str,
+            _last_synced_at_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn set_sync_enabled(
+            &self,
+            _id: &str,
+            _enabled: bool,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// In-memory event repo: upserts materialize `CalendarEvent` rows (so the
+    /// running query sees them) and every write is recorded.
+    struct FakeEventRepo {
+        stored: Mutex<Vec<CalendarEvent>>,
+        upserted: Mutex<Vec<NewCalendarEvent>>,
+        next_id: Mutex<u64>,
+    }
+
+    impl FakeEventRepo {
+        fn new() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                upserted: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CalendarEventRepo for FakeEventRepo {
+        async fn upsert(
+            &self,
+            event: NewCalendarEvent,
+            now_rfc3339: &str,
+        ) -> Result<String, RepoError> {
+            let mut next = self.next_id.lock().unwrap();
+            let id = format!("evt-{next}");
+            *next += 1;
+            *self.upserted.lock().unwrap() = vec![event.clone()];
+            let mut stored = self.stored.lock().unwrap();
+            // Mirrors the ON CONFLICT(calendar_id, google_event_id) replace:
+            // the patched echo must supersede the row it came from.
+            stored.retain(|row| {
+                !(row.calendar_id == event.calendar_id && row.google_event_id == event.google_event_id)
+            });
+            stored.push(CalendarEvent {
+                id: id.clone(),
+                calendar_id: event.calendar_id.clone(),
+                google_event_id: event.google_event_id.clone(),
+                google_etag: event.google_etag.clone(),
+                google_updated_at: event.google_updated_at.clone(),
+                last_synced_at: event.last_synced_at.clone(),
+                title: event.title.clone(),
+                description: event.description.clone(),
+                start_time: event.start_time.clone(),
+                end_time: event.end_time.clone(),
+                recurrence: event.recurrence.clone(),
+                task_id: event.task_id.clone(),
+                created_at: now_rfc3339.to_string(),
+                updated_at: now_rfc3339.to_string(),
+                deleted_at: None,
+            });
+            Ok(id)
+        }
+
+        async fn upsert_batch(
+            &self,
+            _events: Vec<NewCalendarEvent>,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn get_by_id(&self, _id: &str) -> Result<Option<CalendarEvent>, RepoError> {
+            Ok(None)
+        }
+
+        async fn list_by_user_id_and_time_range(
+            &self,
+            _user_id: &str,
+            _start_rfc3339: &str,
+            _end_rfc3339: &str,
+        ) -> Result<Vec<CalendarEvent>, RepoError> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+
+        async fn list_running_by_user_id(
+            &self,
+            _user_id: &str,
+            now_rfc3339: &str,
+        ) -> Result<Vec<CalendarEvent>, RepoError> {
+            // Same semantics as EVENT_LIST_RUNNING_BY_USER_ID_SQL.
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| {
+                    event.deleted_at.is_none()
+                        && !event.task_id.is_empty()
+                        && event.start_time.as_str() <= now_rfc3339
+                        && event.end_time.as_str() > now_rfc3339
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete_by_google_event_id(
+            &self,
+            _calendar_id: &str,
+            _google_event_id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete_stale(
+            &self,
+            _calendar_id: &str,
+            _older_than_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeTaskLogRepo {
+        inserted: Mutex<Vec<NewTaskLog>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TaskLogRepo for FakeTaskLogRepo {
+        async fn insert(&self, log: NewTaskLog, _now_rfc3339: &str) -> Result<String, RepoError> {
+            self.inserted.lock().unwrap().push(log);
+            Ok("log-1".to_string())
+        }
+    }
+
+    /// Creates a "Work" task for `u-1` on the seeded taxonomy and returns its
+    /// view (the persisted row is reachable through `tasks`).
+    fn work_task(
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        tasks: &FakeTaskRepo,
+    ) -> TaskView {
+        pollster::block_on(create_task(lists, categories, tasks, "u-1", &input("Work")))
+            .unwrap()
+            .task
+    }
+
+    /// The Google `events.insert` echo for `task_id`, `start` and `end` — the
+    /// exact shape Google returns (including the shared carrier).
+    fn created_event_json(task_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"g-1","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+        )
+    }
+
+    /// The `events.patch` echo: same event with a new end.
+    fn patched_event_json(task_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"g-1","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+        )
+    }
+
+    // ──────────────────────────────────────────
+    // start_task
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn start_opens_event_with_carrier_and_marks_in_progress() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(
+                &task.id,
+                "2023-11-14T22:13:20Z",
+                "2023-11-14T22:28:20Z",
+            ),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Status flipped and the response carries the created event.
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        let event = response.event.expect("start always returns the event");
+        assert_eq!(event.google_event_id, "g-1");
+        assert_eq!(event.task_id, task.id, "carrier mapped onto the cache row");
+        assert_eq!(event.start_time, NOW);
+        assert_eq!(event.end_time, "2023-11-14T22:28:20Z", "now + 15 min");
+
+        // Summary is the title EXACTLY — no `| Category` suffix.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["summary"], "Work");
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_task_id"],
+            task.id
+        );
+        assert!(body.get("private").is_none(), "carrier is shared, not private");
+
+        // `started` log with the event's calendar + google ids.
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].r#type, TASK_LOG_STARTED);
+        assert_eq!(inserted[0].task_id, task.id);
+        assert_eq!(inserted[0].at, NOW);
+        assert_eq!(inserted[0].calendar_id.as_deref(), Some("cal-primary@example.com"));
+        assert_eq!(inserted[0].google_event_id.as_deref(), Some("g-1"));
+    }
+
+    #[test]
+    fn start_uses_category_calendar_when_writable() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        // Point the Work category at a non-primary calendar (direct store
+        // mutation — the fake's `update` is a stub).
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            let work = stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap();
+            work.google_calendar_id = Some("work@example.com".to_string());
+        }
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            calendar("work@example.com", false),
+        ]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("work%40example.com/events"), "{url}");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
+            Some("cal-work@example.com")
+        );
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_falls_back_to_primary_when_category_calendar_missing_or_readonly() {
+        // Missing: the category names a calendar we never imported.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap()
+                .google_calendar_id = Some("never-imported@example.com".to_string());
+        }
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events"), "{url}");
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+
+        // Readonly: the category calendar exists but the user only reads it.
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            GoogleCalendar {
+                access_role: "reader".to_string(),
+                ..calendar("work@example.com", false)
+            },
+        ]);
+        // Fresh event/log fakes: the previous scenario left an event running.
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events"), "{url}");
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_without_any_writable_calendar_is_invalid() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            access_role: "reader".to_string(),
+            ..calendar("primary@example.com", true)
+        }]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Invalid(m) if m == "no writable calendar"));
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google call");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN,
+            "status untouched"
+        );
+    }
+
+    #[test]
+    fn start_while_another_task_runs_is_conflict_and_never_inserts() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        let second = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Fitness"),
+        ))
+        .unwrap()
+        .task;
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        // First start succeeds (event g-1 opens).
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&first.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &first.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Second start hits the one-running-task rule → 409.
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &second.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Conflict), "got {err:?}");
+        assert_eq!(http.posts.lock().unwrap().len(), 0, "no insert attempted");
+        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only the first event");
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "only the first start logged");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN
+        );
+    }
+
+    #[test]
+    fn start_while_same_task_runs_is_also_conflict() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Conflict));
+    }
+
+    #[test]
+    fn start_completed_task_is_invalid() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        // Mark COMPLETED directly (complete_task needs Google fakes; the repo
+        // fake's `set_status` is the same statement the service uses).
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Invalid(m) if m == "cannot start a completed task"));
+        assert!(http.posts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_discarded_task_is_invalid() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_DISCARDED, NOW)).unwrap();
+
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Invalid(m) if m == "cannot start a discarded task"));
+    }
+
+    #[test]
+    fn start_missing_or_other_users_task_is_not_found() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        assert!(matches!(
+            pollster::block_on(start_task(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+                &access(), "u-2", &task.id, NOW_UNIX,
+            )),
+            Err(TasksError::NotFound)
+        ));
+        assert!(matches!(
+            pollster::block_on(start_task(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+                &access(), "u-1", "nope", NOW_UNIX,
+            )),
+            Err(TasksError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn start_google_error_surfaces_as_google_api_error() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![("/events", 400, r#"{"error":"invalid"}"#)]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::GoogleApi(_)), "got {err:?}");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN,
+            "status untouched on google failure"
+        );
+        assert!(logs.inserted.lock().unwrap().is_empty());
+    }
+
+    // ──────────────────────────────────────────
+    // stop / pause
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn stop_patches_end_and_returns_open() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Stop 5 minutes later.
+        let stop_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, stop_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        let event = response.event.expect("stop returns the patched event");
+        assert_eq!(event.end_time, "2023-11-14T22:18:20Z");
+
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let (url, body) = patches.first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events/g-1"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:18:20Z");
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 2, "started then stopped");
+        assert_eq!(inserted[1].r#type, TASK_LOG_STOPPED);
+        assert_eq!(inserted[1].at, "2023-11-14T22:18:20Z", "log at the patched end");
+    }
+
+    #[test]
+    fn stop_when_now_equals_start_clamps_end_to_start_plus_60s() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Stop at the exact start instant: `now <= start` → end = start + 60s.
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:14:20Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let event = response.event.expect("patched event returned");
+        assert_eq!(event.end_time, "2023-11-14T22:14:20Z", "start + 60s");
+        let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:14:20Z");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[1].at,
+            "2023-11-14T22:14:20Z"
+        );
+    }
+
+    #[test]
+    fn stop_without_open_event_still_flips_status_to_open() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        // No event was ever opened for this task.
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN, "idempotent flip");
+        assert!(response.event.is_none());
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].r#type, TASK_LOG_STOPPED);
+        assert!(inserted[0].calendar_id.is_none());
+    }
+
+    #[test]
+    fn pause_patches_end_and_logs_paused() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let pause_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:23:20Z"),
+        )]);
+        let response = pollster::block_on(pause_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, pause_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:23:20Z");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
+        // Ending the event also frees the one-running slot: a new start works.
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, "2023-11-14T22:23:20Z", "2023-11-14T22:38:20Z"),
+        )]);
+        let restarted = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, pause_unix,
+        ))
+        .unwrap();
+        assert_eq!(restarted.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn stop_on_terminal_task_is_invalid() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Invalid(_)), "got {err:?}");
+    }
+
+    // ──────────────────────────────────────────
+    // complete / discard
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn complete_while_running_patches_then_completes_with_both_logs() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let complete_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+        )]);
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, complete_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:18:20Z");
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "auto-stop patched");
+
+        // Log order: started, stopped, completed.
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "stopped", "completed"], "{inserted:?}");
+        assert_eq!(inserted[1].calendar_id.as_deref(), Some("cal-primary@example.com"));
+        assert_eq!(inserted[1].google_event_id.as_deref(), Some("g-1"));
+    }
+
+    #[test]
+    fn complete_while_not_running_completes_without_google_call() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        // Task never started — complete has nothing to stop.
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert!(response.event.is_none());
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["completed"], "{inserted:?}");
+    }
+
+    #[test]
+    fn complete_already_completed_is_idempotent_200() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![]);
+        pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+        // Second complete: no-op, still 200.
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "no extra log");
+    }
+
+    #[test]
+    fn discard_while_running_patches_then_discards_with_both_logs() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let discard_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+        )]);
+        let response = pollster::block_on(discard_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, discard_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "stopped", "discarded"]);
+        assert_eq!(http.patches.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discard_while_not_running_discards_without_google_call() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(discard_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
+        assert!(http.patches.lock().unwrap().is_empty());
+        assert_eq!(logs.inserted.lock().unwrap()[0].r#type, TASK_LOG_DISCARDED);
+    }
+
+    #[test]
+    fn complete_and_discard_are_not_found_for_other_users() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+        let access = access();
+
+        let complete_other = complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs, &access, "u-2",
+            &task.id, NOW_UNIX,
+        );
+        assert!(matches!(pollster::block_on(complete_other), Err(TasksError::NotFound)));
+        let discard_other = discard_task(
+            &http, &calendars, &events, &categories, &tasks, &logs, &access, "u-2",
+            &task.id, NOW_UNIX,
+        );
+        assert!(matches!(pollster::block_on(discard_other), Err(TasksError::NotFound)));
+        let complete_missing = complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs, &access, "u-1",
+            "nope", NOW_UNIX,
+        );
+        assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
     }
 }

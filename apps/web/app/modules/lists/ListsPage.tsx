@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react';
+import {
+  Check,
+  Loader2,
+  MoreHorizontal,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  Square,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -26,6 +37,9 @@ import type {
   UpdateCategoryInput,
   UpdateTaskInput,
 } from '@/app/types';
+
+// Timer actions map to the same POST endpoints; the server explains 409s.
+type TaskAction = 'start' | 'stop' | 'pause' | 'complete' | 'discard';
 
 // The server's error envelope is `{"error": "message"}`; fall back to a
 // generic message when the body is not JSON.
@@ -130,11 +144,14 @@ export function ListsPage() {
         if (!listsRes.ok) throw new Error(await readError(listsRes));
         const listsData = (await listsRes.json()) as TaskListsResponse;
         setLists(listsData.lists ?? []);
-        return fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' });
+        return fetch(`${API_BASE_URL}/api/categories`, {
+          credentials: 'include',
+        });
       })
       .then(async (categoriesRes) => {
         if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
-        const categoriesData = (await categoriesRes.json()) as CategoriesResponse;
+        const categoriesData =
+          (await categoriesRes.json()) as CategoriesResponse;
         setCategories(categoriesData.categories ?? []);
         return fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' });
       })
@@ -144,7 +161,8 @@ export function ListsPage() {
         setTasks(tasksData.tasks ?? []);
       })
       .catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : 'Failed to load lists';
+        const message =
+          err instanceof Error ? err.message : 'Failed to load lists';
         setLoadError(message);
       })
       .finally(() => setIsLoading(false));
@@ -153,6 +171,53 @@ export function ListsPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Refreshes only the tasks (timer actions never change lists/categories, so
+  // the sequential lists→categories→tasks reload is unnecessary here).
+  const reloadTasks = useCallback(() => {
+    fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readError(res));
+        const data = (await res.json()) as TasksResponse;
+        setTasks(data.tasks ?? []);
+      })
+      .catch((err: unknown) => {
+        setActionError(
+          err instanceof Error ? err.message : 'Failed to reload tasks',
+        );
+      });
+  }, []);
+
+  // ──────────────────────────────────────────
+  // Task timer actions (start/stop/pause/complete/discard)
+  // ──────────────────────────────────────────
+
+  // Any task IN_PROGRESS means the single running slot is taken: every Start
+  // button is disabled until a stop/pause/complete/discard frees it.
+  const anyRunning = tasks.some((task) => task.status === 'IN_PROGRESS');
+
+  const handleTaskAction = async (taskId: string, action: TaskAction) => {
+    setActionError(null);
+    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/${action}`, {
+      method: 'POST',
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      // The server's 409 message ("a task is already running") lands in the
+      // banner; the cards stay visible.
+      setActionError(await readError(res));
+      return;
+    }
+    reloadTasks();
+  };
+
+  const handleStartTask = (taskId: string) => handleTaskAction(taskId, 'start');
+  const handleStopTask = (taskId: string) => handleTaskAction(taskId, 'stop');
+  const handlePauseTask = (taskId: string) => handleTaskAction(taskId, 'pause');
+  const handleCompleteTask = (taskId: string) =>
+    handleTaskAction(taskId, 'complete');
+  const handleDiscardTask = (taskId: string) =>
+    handleTaskAction(taskId, 'discard');
 
   // ──────────────────────────────────────────
   // List actions
@@ -440,7 +505,9 @@ export function ListsPage() {
 
   const updatePattern = (index: number, patch: Partial<PatternDraft>) => {
     setPatterns((prev) =>
-      prev.map((pattern, i) => (i === index ? { ...pattern, ...patch } : pattern)),
+      prev.map((pattern, i) =>
+        i === index ? { ...pattern, ...patch } : pattern,
+      ),
     );
   };
 
@@ -541,6 +608,12 @@ export function ListsPage() {
                 onDeleteCategory={handleDeleteCategory}
                 onAddTask={openCreateTask}
                 onEditTask={openEditTask}
+                anyRunning={anyRunning}
+                onStartTask={handleStartTask}
+                onStopTask={handleStopTask}
+                onPauseTask={handlePauseTask}
+                onCompleteTask={handleCompleteTask}
+                onDiscardTask={handleDiscardTask}
               />
             ))}
           </div>
@@ -558,7 +631,17 @@ export function ListsPage() {
               {tasks
                 .filter((task) => task.category.is_untracked)
                 .map((task) => (
-                  <TaskChip key={task.id} task={task} onEdit={openEditTask} />
+                  <TaskChip
+                    key={task.id}
+                    task={task}
+                    onEdit={openEditTask}
+                    anyRunning={anyRunning}
+                    onStart={handleStartTask}
+                    onStop={handleStopTask}
+                    onPause={handlePauseTask}
+                    onComplete={handleCompleteTask}
+                    onDiscard={handleDiscardTask}
+                  />
                 ))}
             </div>
           </div>
@@ -566,7 +649,10 @@ export function ListsPage() {
       </div>
 
       {/* New / Edit List Dialog */}
-      <Dialog open={listForm !== null} onOpenChange={(open) => !open && closeListForm()}>
+      <Dialog
+        open={listForm !== null}
+        onOpenChange={(open) => !open && closeListForm()}
+      >
         <DialogContent className="sm:max-w-[420px] p-0 gap-0 overflow-hidden bg-card border-border">
           <div className="h-2" style={{ backgroundColor: listColor }} />
           <div className="p-6">
@@ -582,7 +668,9 @@ export function ListsPage() {
             </DialogHeader>
 
             <div className="space-y-2 mb-5">
-              <label className="text-sm font-medium text-foreground">Name</label>
+              <label className="text-sm font-medium text-foreground">
+                Name
+              </label>
               <input
                 type="text"
                 value={listName}
@@ -593,7 +681,9 @@ export function ListsPage() {
             </div>
 
             <div className="space-y-2 mb-6">
-              <label className="text-sm font-medium text-foreground">Color</label>
+              <label className="text-sm font-medium text-foreground">
+                Color
+              </label>
               <div className="flex items-center gap-3">
                 <input
                   type="color"
@@ -602,7 +692,9 @@ export function ListsPage() {
                   className="h-10 w-14 rounded-lg border border-input bg-background cursor-pointer"
                   aria-label="List color"
                 />
-                <span className="text-sm text-muted-foreground font-mono">{listColor}</span>
+                <span className="text-sm text-muted-foreground font-mono">
+                  {listColor}
+                </span>
               </div>
             </div>
 
@@ -632,12 +724,17 @@ export function ListsPage() {
       </Dialog>
 
       {/* New / Edit Category Dialog */}
-      <Dialog open={form !== null} onOpenChange={(open) => !open && closeForm()}>
+      <Dialog
+        open={form !== null}
+        onOpenChange={(open) => !open && closeForm()}
+      >
         <DialogContent className="sm:max-w-[560px] p-0 gap-0 overflow-hidden bg-card border-border">
           <div className="h-2" style={{ backgroundColor: color }} />
           <div className="p-6 max-h-[80vh] overflow-y-auto">
             <DialogHeader className="mb-6">
-              <DialogTitle className="text-foreground">{dialogTitle}</DialogTitle>
+              <DialogTitle className="text-foreground">
+                {dialogTitle}
+              </DialogTitle>
               <DialogDescription>
                 {form?.mode === 'edit'
                   ? 'Update the category and its title-matching patterns.'
@@ -646,7 +743,9 @@ export function ListsPage() {
             </DialogHeader>
 
             <div className="space-y-2 mb-5">
-              <label className="text-sm font-medium text-foreground">Title</label>
+              <label className="text-sm font-medium text-foreground">
+                Title
+              </label>
               <input
                 type="text"
                 value={title}
@@ -657,7 +756,9 @@ export function ListsPage() {
             </div>
 
             <div className="space-y-2 mb-5">
-              <label className="text-sm font-medium text-foreground">Color</label>
+              <label className="text-sm font-medium text-foreground">
+                Color
+              </label>
               <div className="flex items-center gap-3">
                 <input
                   type="color"
@@ -666,7 +767,9 @@ export function ListsPage() {
                   className="h-10 w-14 rounded-lg border border-input bg-background cursor-pointer"
                   aria-label="Category color"
                 />
-                <span className="text-sm text-muted-foreground font-mono">{color}</span>
+                <span className="text-sm text-muted-foreground font-mono">
+                  {color}
+                </span>
               </div>
             </div>
 
@@ -678,7 +781,10 @@ export function ListsPage() {
                 onChange={(e) => setIsProductive(e.target.checked)}
                 className="h-4 w-4 rounded border-input accent-emerald-600"
               />
-              <label htmlFor="is_productive" className="text-sm font-medium text-foreground">
+              <label
+                htmlFor="is_productive"
+                className="text-sm font-medium text-foreground"
+              >
                 Productive
               </label>
             </div>
@@ -698,20 +804,29 @@ export function ListsPage() {
 
             <div className="space-y-2 mb-6">
               <label className="text-sm font-medium text-foreground">
-                Patterns <span className="text-muted-foreground font-normal">(title → category)</span>
+                Patterns{' '}
+                <span className="text-muted-foreground font-normal">
+                  (title → category)
+                </span>
               </label>
               {patterns.length === 0 && (
                 <p className="text-xs text-muted-foreground">
-                  No patterns yet — matching titles will never land in this category.
+                  No patterns yet — matching titles will never land in this
+                  category.
                 </p>
               )}
               {patterns.map((pattern, index) => (
-                <div key={index} className="space-y-1 rounded-xl border border-input bg-background p-3">
+                <div
+                  key={index}
+                  className="space-y-1 rounded-xl border border-input bg-background p-3"
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="text"
                       value={pattern.regex}
-                      onChange={(e) => updatePattern(index, { regex: e.target.value })}
+                      onChange={(e) =>
+                        updatePattern(index, { regex: e.target.value })
+                      }
                       placeholder="e.g. ^Deep Work$"
                       className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm font-mono"
                     />
@@ -795,6 +910,12 @@ interface ListCardProps {
   onDeleteCategory: (category: Category) => void;
   onAddTask: (category: TaskCategorySummary) => void;
   onEditTask: (task: TaskRecord) => void;
+  anyRunning: boolean;
+  onStartTask: (taskId: string) => void;
+  onStopTask: (taskId: string) => void;
+  onPauseTask: (taskId: string) => void;
+  onCompleteTask: (taskId: string) => void;
+  onDiscardTask: (taskId: string) => void;
 }
 
 function ListCard({
@@ -809,6 +930,12 @@ function ListCard({
   onDeleteCategory,
   onAddTask,
   onEditTask,
+  anyRunning,
+  onStartTask,
+  onStopTask,
+  onPauseTask,
+  onCompleteTask,
+  onDiscardTask,
 }: ListCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -817,7 +944,9 @@ function ListCard({
   // `untracked` (list_id NULL, is_untracked) never appears here.
   const roots = categories.filter(
     (category) =>
-      !category.is_untracked && !category.parent_id && category.inherited_list_id === list.id,
+      !category.is_untracked &&
+      !category.parent_id &&
+      category.inherited_list_id === list.id,
   );
 
   // Tasks filed under this list's categories (children inherit the root's
@@ -825,11 +954,15 @@ function ListCard({
   // rendered at page level, not here).
   const listTasks = tasks.filter(
     (task) =>
-      !task.category.is_untracked && task.category.inherited_list_id === list.id,
+      !task.category.is_untracked &&
+      task.category.inherited_list_id === list.id,
   );
 
   return (
-    <div className="rounded-xl overflow-hidden" style={{ backgroundColor: list.color }}>
+    <div
+      className="rounded-xl overflow-hidden"
+      style={{ backgroundColor: list.color }}
+    >
       <div className="p-4">
         <div className="flex items-center justify-between mb-4 gap-2">
           <h3 className="font-heading text-lg font-semibold text-primary-foreground truncate">
@@ -891,8 +1024,12 @@ function ListCard({
       {roots.length > 0 && (
         <div className="bg-black/20 p-3 space-y-2">
           {roots.map((root) => {
-            const children = categories.filter((category) => category.parent_id === root.id);
-            const rootTasks = tasks.filter((task) => task.category.id === root.id);
+            const children = categories.filter(
+              (category) => category.parent_id === root.id,
+            );
+            const rootTasks = tasks.filter(
+              (task) => task.category.id === root.id,
+            );
             return (
               <div key={root.id}>
                 <div className="flex items-center gap-2">
@@ -947,20 +1084,35 @@ function ListCard({
                 {rootTasks.length > 0 && (
                   <div className="ml-3.5 mt-1 space-y-1">
                     {rootTasks.map((task) => (
-                      <TaskChip key={task.id} task={task} onEdit={onEditTask} />
+                      <TaskChip
+                        key={task.id}
+                        task={task}
+                        onEdit={onEditTask}
+                        anyRunning={anyRunning}
+                        onStart={onStartTask}
+                        onStop={onStopTask}
+                        onPause={onPauseTask}
+                        onComplete={onCompleteTask}
+                        onDiscard={onDiscardTask}
+                      />
                     ))}
                   </div>
                 )}
                 {children.length > 0 && (
                   <div className="ml-3.5 mt-1 pl-3 border-l border-primary-foreground/20 space-y-1">
                     {children.map((child) => {
-                      const childTasks = tasks.filter((task) => task.category.id === child.id);
+                      const childTasks = tasks.filter(
+                        (task) => task.category.id === child.id,
+                      );
                       return (
                         <div key={child.id}>
                           <div className="flex items-center gap-2">
                             <span
                               className="h-2 w-2 rounded-full flex-shrink-0"
-                              style={{ backgroundColor: child.color || root.color || list.color }}
+                              style={{
+                                backgroundColor:
+                                  child.color || root.color || list.color,
+                              }}
                             />
                             <span className="flex-1 min-w-0 text-xs text-primary-foreground/80 truncate">
                               {child.title}
@@ -993,7 +1145,17 @@ function ListCard({
                           {childTasks.length > 0 && (
                             <div className="ml-3.5 mt-1 space-y-1">
                               {childTasks.map((task) => (
-                                <TaskChip key={task.id} task={task} onEdit={onEditTask} />
+                                <TaskChip
+                                  key={task.id}
+                                  task={task}
+                                  onEdit={onEditTask}
+                                  anyRunning={anyRunning}
+                                  onStart={onStartTask}
+                                  onStop={onStopTask}
+                                  onPause={onPauseTask}
+                                  onComplete={onCompleteTask}
+                                  onDiscard={onDiscardTask}
+                                />
                               ))}
                             </div>
                           )}
@@ -1020,19 +1182,33 @@ function ListCard({
   );
 }
 
-/** One task row: title + duration, click to edit (delete lives in the edit
- *  dialog). */
+/** One task row: title + duration + status badge + timer actions. Clicking
+ *  the row (not a button) opens the edit modal; every action button stops
+ *  propagation so it never opens the modal. */
 function TaskChip({
   task,
   onEdit,
+  anyRunning,
+  onStart,
+  onStop,
+  onPause,
+  onComplete,
+  onDiscard,
 }: {
   task: TaskRecord;
   onEdit: (task: TaskRecord) => void;
+  anyRunning: boolean;
+  onStart: (taskId: string) => void;
+  onStop: (taskId: string) => void;
+  onPause: (taskId: string) => void;
+  onComplete: (taskId: string) => void;
+  onDiscard: (taskId: string) => void;
 }) {
+  const isRunning = task.status === 'IN_PROGRESS';
   return (
-    <button
+    <div
       onClick={() => onEdit(task)}
-      className="flex w-full items-center gap-2 rounded-lg bg-black/25 px-2.5 py-1.5 text-left hover:bg-black/35 transition-colors"
+      className="flex w-full cursor-pointer items-center gap-1.5 rounded-lg bg-black/25 px-2.5 py-1.5 text-left hover:bg-black/35 transition-colors"
       title={`${task.title} — ${task.duration_minutes} min, ${task.priority}`}
     >
       <span className="flex-1 min-w-0 text-xs text-primary-foreground/90 truncate">
@@ -1052,6 +1228,95 @@ function TaskChip({
         )}
         aria-hidden
       />
-    </button>
+      {/* Status badge — only for states that changed the task's look */}
+      {isRunning && (
+        <span className="flex-shrink-0 rounded-full bg-emerald-400/30 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-emerald-100">
+          running
+        </span>
+      )}
+      {task.status === 'COMPLETED' && (
+        <span className="flex-shrink-0 rounded-full bg-sky-400/30 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-sky-100">
+          done
+        </span>
+      )}
+      {task.status === 'DISCARDED' && (
+        <span className="flex-shrink-0 rounded-full bg-rose-400/30 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-rose-100">
+          discarded
+        </span>
+      )}
+      {/* Actions — Start only on OPEN and only when the running slot is free;
+          Stop + Pause only while this task runs; Complete/Discard whenever
+          the task is not already in that terminal state */}
+      {task.status === 'OPEN' && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onStart(task.id);
+          }}
+          disabled={anyRunning}
+          className={cn(
+            'flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground',
+            anyRunning &&
+              'cursor-not-allowed opacity-40 hover:bg-transparent hover:text-primary-foreground/70',
+          )}
+          aria-label={`Start ${task.title}`}
+          title={anyRunning ? 'Another task is running' : 'Start'}
+        >
+          <Play className="h-3 w-3" />
+        </button>
+      )}
+      {isRunning && (
+        <>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onStop(task.id);
+            }}
+            className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
+            aria-label={`Stop ${task.title}`}
+            title="Stop"
+          >
+            <Square className="h-3 w-3" />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onPause(task.id);
+            }}
+            className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
+            aria-label={`Pause ${task.title}`}
+            title="Pause"
+          >
+            <Pause className="h-3 w-3" />
+          </button>
+        </>
+      )}
+      {task.status !== 'COMPLETED' && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onComplete(task.id);
+          }}
+          className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
+          aria-label={`Complete ${task.title}`}
+          title="Complete"
+        >
+          <Check className="h-3 w-3" />
+        </button>
+      )}
+      {task.status !== 'DISCARDED' && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDiscard(task.id);
+          }}
+          className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
+          aria-label={`Discard ${task.title}`}
+          title="Discard"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      )}
+    </div>
   );
 }

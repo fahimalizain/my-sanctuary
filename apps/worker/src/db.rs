@@ -13,29 +13,30 @@
 
 use api_core::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, NewWatchChannel,
-    Task, TaskCategory, TaskCategoryPattern, TaskList, UpdateTask, UpdateTaskCategory,
-    UpdateTaskList, User, WatchChannel,
+    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
+    NewWatchChannel, Task, TaskCategory, TaskCategoryPattern, TaskList, UpdateTask,
+    UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo, CALENDAR_DELETE_SQL,
-    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
-    CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
-    CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL,
-    EVENT_DELETE_STALE_SQL, EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
-    EVENT_UPSERT_CHUNK_SIZE, TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
-    TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
-    TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
+    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
+    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
+    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
+    EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
+    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
+    TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
+    TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TASK_UPDATE_SQL,
-    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL,
-    USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
-    WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
-    WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
+    TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
+    TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
+    USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
+    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
     WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use serde::Deserialize;
@@ -411,7 +412,7 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        // Chunk to stay under D1's 100 bound-parameter limit (7 rows of 13
+        // Chunk to stay under D1's 100 bound-parameter limit (7 rows of 14
         // columns per statement); each chunk is one D1 subrequest.
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
             let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
@@ -444,6 +445,19 @@ impl CalendarEventRepo for D1CalendarEventRepo {
                 D1Type::Text(end_rfc3339),
                 D1Type::Text(start_rfc3339),
             ])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_running_by_user_id(
+        &self,
+        user_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<Vec<CalendarEvent>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_LIST_RUNNING_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(now_rfc3339), D1Type::Text(now_rfc3339)])
             .map_err(backend)?;
         query_vec(stmt).await
     }
@@ -970,6 +984,21 @@ impl TaskRepo for D1TaskRepo {
         self.get_by_id(id).await
     }
 
+    async fn set_status(
+        &self,
+        id: &str,
+        status: &str,
+        now_rfc3339: &str,
+    ) -> Result<Option<Task>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_SET_STATUS_SQL)
+            .bind_refs(&[D1Type::Text(status), D1Type::Text(now_rfc3339), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
         let stmt = self
             .db
@@ -981,6 +1010,43 @@ impl TaskRepo for D1TaskRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+}
+
+/// `task_logs` table persistence (append-only audit trail).
+pub struct D1TaskLogRepo {
+    db: D1Database,
+}
+
+impl D1TaskLogRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl TaskLogRepo for D1TaskLogRepo {
+    async fn insert(&self, log: NewTaskLog, now_rfc3339: &str) -> Result<String, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let stmt = self
+            .db
+            .prepare(TASK_LOG_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&log.task_id),
+                D1Type::Text(&log.user_id),
+                D1Type::Text(&log.r#type),
+                D1Type::Text(&log.at),
+                optional_text(log.calendar_id.as_deref()),
+                optional_text(log.google_event_id.as_deref()),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        let result = stmt.run().await.map_err(backend)?;
+        if !result.success() {
+            return Err(RepoError::Backend(result.error().unwrap_or_default()));
+        }
+        Ok(id)
     }
 }
 

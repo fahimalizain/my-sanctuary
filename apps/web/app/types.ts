@@ -178,7 +178,10 @@ export interface TaskCategorySummary {
 }
 
 // A task as returned by the API: the `tasks` row shape (snake_case) plus the
-// computed `category`. `status` is read-only this slice (always "OPEN").
+// computed `category`. `status` is driven by the timer endpoints:
+// "OPEN" | "IN_PROGRESS" | "COMPLETED" | "DISCARDED".
+export type TaskStatus = 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | 'DISCARDED';
+
 export interface TaskRecord {
   id: string;
   user_id: string;
@@ -186,7 +189,7 @@ export interface TaskRecord {
   description: string;
   duration_minutes: number;
   priority: TaskPriority;
-  status: string;
+  status: TaskStatus;
   created_at: string;
   updated_at: string;
   category: TaskCategorySummary;
@@ -219,7 +222,8 @@ export interface NewTaskInput {
 
 // Request body for PATCH /api/tasks/:id — every field optional. A present
 // `title` must uniquely match a non-untracked category. Status is never
-// updatable (that is slice 4).
+// updatable through PATCH: use the timer endpoints (start/stop/pause/
+// complete/discard) instead.
 export interface UpdateTaskInput {
   title?: string;
   description?: string;
