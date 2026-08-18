@@ -16,8 +16,10 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTaskList,
-    NewToken, NewUser, TaskList, UpdateTaskList, User, WatchChannel, NewWatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent,
+    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, TaskCategory,
+    TaskCategoryPattern, TaskList, UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
+    NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -169,6 +171,61 @@ pub trait TaskListRepo: Send + Sync {
     /// Number of living ROOT categories (`parent_id IS NULL`) still
     /// referencing the list — the delete guard (409 when non-zero).
     async fn count_root_categories_for_list(&self, list_id: &str) -> Result<i64, RepoError>;
+}
+
+/// Task category persistence (`task_categories` + `task_category_patterns`
+/// rows).
+///
+/// Categories form a one-level forest: a root (`parent_id` NULL) owns a
+/// `list_id`; children hang off roots with `list_id NULL` (inherited on read).
+/// `untracked` is the only root allowed `list_id NULL` and can never be
+/// deleted. All category deletes are SOFT; pattern deletes are HARD (`PATCH`
+/// replaces the whole set, so stale rows must actually disappear).
+#[async_trait(?Send)]
+pub trait TaskCategoryRepo: Send + Sync {
+    /// The user's living categories, ordered by `sort_order` then `title`.
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskCategory>, RepoError>;
+    /// Returns the category with local `id`, or `None` when absent or
+    /// soft-deleted. NOT user-scoped; callers must verify `row.user_id`.
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskCategory>, RepoError>;
+    /// Inserts a new category and returns the stored row. The D1
+    /// implementation generates the UUID `id` and the timestamps.
+    async fn insert(&self, category: NewTaskCategory) -> Result<TaskCategory, RepoError>;
+    /// Updates the mutable columns on a living category (`None` fields are
+    /// left unchanged, including `parent_id`/`list_id` — a `COALESCE` update
+    /// can never clear them) and returns the updated row, or `None` when the
+    /// category is missing or soft-deleted.
+    async fn update(
+        &self,
+        id: &str,
+        updates: &UpdateTaskCategory,
+    ) -> Result<Option<TaskCategory>, RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339`.
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Number of living categories for the user (first-visit seed check).
+    async fn count_by_user_id(&self, user_id: &str) -> Result<i64, RepoError>;
+    /// Number of living children — the delete/reparent guard (409 when
+    /// non-zero).
+    async fn count_children(&self, category_id: &str) -> Result<i64, RepoError>;
+    /// The user's `untracked` sink category (a root with `list_id NULL`), or
+    /// `None` before the first seed.
+    async fn get_untracked(&self, user_id: &str) -> Result<Option<TaskCategory>, RepoError>;
+    /// The category's patterns in `sort_order` order.
+    async fn list_patterns_by_category_id(
+        &self,
+        category_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError>;
+    /// HARD-deletes the existing patterns and inserts `patterns` in order
+    /// (each gets `sort_order` = its Vec index). The D1 implementation
+    /// generates UUID ids and timestamps.
+    async fn replace_patterns(
+        &self,
+        category_id: &str,
+        patterns: Vec<NewTaskCategoryPattern>,
+    ) -> Result<(), RepoError>;
+    /// HARD-deletes every pattern row for the category (used on category
+    /// delete).
+    async fn delete_patterns_by_category_id(&self, category_id: &str) -> Result<(), RepoError>;
 }
 
 /// Google Calendar watch channel persistence (`google_calendars_watch_channels`
@@ -451,6 +508,88 @@ pub const TASK_LIST_COUNT_ROOT_CATEGORIES_SQL: &str = "
 ";
 
 // ──────────────────────────────────────────
+// Task category SQL
+// ──────────────────────────────────────────
+
+pub const TASK_CATEGORY_LIST_BY_USER_ID_SQL: &str =
+    "SELECT * FROM task_categories WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, title ASC";
+
+pub const TASK_CATEGORY_GET_BY_ID_SQL: &str =
+    "SELECT * FROM task_categories WHERE id = ? AND deleted_at IS NULL";
+
+/// Plain INSERT (no `ON CONFLICT`): categories are user-authored, never
+/// upserted (the seed inserts fresh rows per new user; the unique
+/// `(user_id, slug)` partial index guards duplicate slugs). The D1
+/// implementation binds the UUID `id`, the timestamps, and INTEGER 0/1 bools
+/// for `is_productive`/`is_untracked`.
+pub const TASK_CATEGORY_INSERT_SQL: &str = "
+    INSERT INTO task_categories
+        (id, user_id, list_id, parent_id, title, slug, color, is_productive, google_calendar_id, google_color_id, sort_order, is_untracked, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). A
+/// category can never be *cleared* of `parent_id` or `list_id` through this
+/// statement (no UI for promotion/detachment today).
+///
+/// One exception — moving a root under a parent must NULL its `list_id`:
+/// children are stored with `list_id NULL` (they inherit on read), so the
+/// update sets `list_id = NULL` whenever a new `parent_id` is bound and only
+/// `COALESCE`s otherwise. The D1 implementation binds `parent_id` twice.
+pub const TASK_CATEGORY_UPDATE_SQL: &str = "
+    UPDATE task_categories SET
+        title = COALESCE(?, title),
+        slug = COALESCE(?, slug),
+        color = COALESCE(?, color),
+        is_productive = COALESCE(?, is_productive),
+        google_calendar_id = COALESCE(?, google_calendar_id),
+        google_color_id = COALESCE(?, google_color_id),
+        sort_order = COALESCE(?, sort_order),
+        parent_id = COALESCE(?, parent_id),
+        list_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE COALESCE(?, list_id) END,
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
+/// Patterns are hard-deleted first (see `TASK_CATEGORY_PATTERNS_DELETE_SQL`).
+pub const TASK_CATEGORY_DELETE_SQL: &str =
+    "UPDATE task_categories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+pub const TASK_CATEGORY_COUNT_BY_USER_ID_SQL: &str =
+    "SELECT COUNT(*) AS count FROM task_categories WHERE user_id = ? AND deleted_at IS NULL";
+
+/// The delete/reparent guard: living children are still hanging off this
+/// category, so it cannot be deleted (or reparented) until they are gone.
+pub const TASK_CATEGORY_COUNT_CHILDREN_SQL: &str =
+    "SELECT COUNT(*) AS count FROM task_categories WHERE parent_id = ? AND deleted_at IS NULL";
+
+/// The `untracked` sink: a root with `list_id NULL` and `is_untracked = 1`,
+/// seeded on first visit; there is at most one per user (`slug` unique).
+pub const TASK_CATEGORY_GET_UNTRACKED_SQL: &str = "
+    SELECT * FROM task_categories
+    WHERE user_id = ? AND is_untracked = 1 AND deleted_at IS NULL
+    ORDER BY sort_order ASC
+    LIMIT 1
+";
+
+pub const TASK_CATEGORY_PATTERNS_LIST_SQL: &str =
+    "SELECT * FROM task_category_patterns WHERE category_id = ? ORDER BY sort_order ASC";
+
+/// HARD delete: replace_patterns wipes then re-inserts, so stale rows must
+/// actually disappear (same rule as watch channels — but note the FKs here
+/// are plain, so a hard delete is also required on category delete).
+pub const TASK_CATEGORY_PATTERNS_DELETE_SQL: &str =
+    "DELETE FROM task_category_patterns WHERE category_id = ?";
+
+/// Plain INSERT: `replace_patterns` deletes first, and the D1 implementation
+/// binds the UUID `id`, the timestamps, and `sort_order` = Vec index.
+pub const TASK_CATEGORY_PATTERNS_INSERT_SQL: &str = "
+    INSERT INTO task_category_patterns (id, category_id, regex, google_calendar_id, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+";
+
+// ──────────────────────────────────────────
 // Watch channel SQL
 // ──────────────────────────────────────────
 
@@ -711,6 +850,86 @@ mod tests {
         assert!(sql.contains("list_id = ?"), "{sql}");
         assert!(sql.contains("parent_id IS NULL"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn task_category_reads_filter_soft_deleted_rows_and_order_by_sort_then_title() {
+        assert!(TASK_CATEGORY_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_CATEGORY_LIST_BY_USER_ID_SQL);
+        let order_start = TASK_CATEGORY_LIST_BY_USER_ID_SQL
+            .find("ORDER BY")
+            .expect("has ORDER BY");
+        assert_eq!(
+            &TASK_CATEGORY_LIST_BY_USER_ID_SQL[order_start..],
+            "ORDER BY sort_order ASC, title ASC"
+        );
+        assert!(TASK_CATEGORY_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_CATEGORY_GET_BY_ID_SQL);
+        assert!(TASK_CATEGORY_COUNT_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_CATEGORY_COUNT_BY_USER_ID_SQL);
+        assert!(TASK_CATEGORY_GET_UNTRACKED_SQL.contains("deleted_at IS NULL"), "{}", TASK_CATEGORY_GET_UNTRACKED_SQL);
+    }
+
+    #[test]
+    fn task_category_insert_binds_all_14_columns() {
+        assert!(TASK_CATEGORY_INSERT_SQL.contains("INSERT INTO task_categories"), "{}", TASK_CATEGORY_INSERT_SQL);
+        assert!(!TASK_CATEGORY_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_CATEGORY_INSERT_SQL);
+        assert_eq!(
+            TASK_CATEGORY_INSERT_SQL.matches('?').count(),
+            14,
+            "one placeholder per column: {}",
+            TASK_CATEGORY_INSERT_SQL
+        );
+        for column in [
+            "id", "user_id", "list_id", "parent_id", "title", "slug", "color",
+            "is_productive", "google_calendar_id", "google_color_id", "sort_order",
+            "is_untracked", "created_at", "updated_at",
+        ] {
+            assert!(TASK_CATEGORY_INSERT_SQL.contains(column), "missing {column}");
+        }
+    }
+
+    #[test]
+    fn task_category_update_uses_coalesce_and_nulls_list_id_on_reparent() {
+        let sql = TASK_CATEGORY_UPDATE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("COALESCE(?, title)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, parent_id)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, list_id)"), "{sql}");
+        assert!(sql.contains("CASE WHEN ? IS NOT NULL THEN NULL"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        // 11 mutable/now bindings + the id: nothing else.
+        assert_eq!(sql.matches('?').count(), 12, "{sql}");
+    }
+
+    #[test]
+    fn task_category_delete_is_soft_not_hard() {
+        assert!(TASK_CATEGORY_DELETE_SQL.starts_with("UPDATE"), "{}", TASK_CATEGORY_DELETE_SQL);
+        assert!(TASK_CATEGORY_DELETE_SQL.contains("SET deleted_at = ?"), "{}", TASK_CATEGORY_DELETE_SQL);
+        assert!(!TASK_CATEGORY_DELETE_SQL.contains("DELETE FROM"), "{}", TASK_CATEGORY_DELETE_SQL);
+    }
+
+    #[test]
+    fn task_category_children_guard_filters_living_children() {
+        let sql = TASK_CATEGORY_COUNT_CHILDREN_SQL;
+        assert!(sql.contains("parent_id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn task_category_untracked_query_scopes_user_and_flag() {
+        let sql = TASK_CATEGORY_GET_UNTRACKED_SQL;
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("is_untracked = 1"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("LIMIT 1"), "{sql}");
+    }
+
+    #[test]
+    fn task_category_patterns_are_hard_deleted_and_replaced_in_order() {
+        assert!(TASK_CATEGORY_PATTERNS_DELETE_SQL.starts_with("DELETE FROM"), "{}", TASK_CATEGORY_PATTERNS_DELETE_SQL);
+        assert!(TASK_CATEGORY_PATTERNS_DELETE_SQL.contains("WHERE category_id = ?"), "{}", TASK_CATEGORY_PATTERNS_DELETE_SQL);
+        let insert = TASK_CATEGORY_PATTERNS_INSERT_SQL;
+        assert!(insert.contains("INSERT INTO task_category_patterns"), "{insert}");
+        assert_eq!(insert.matches('?').count(), 7, "{insert}");
+        assert!(TASK_CATEGORY_PATTERNS_LIST_SQL.contains("ORDER BY sort_order ASC"), "{}", TASK_CATEGORY_PATTERNS_LIST_SQL);
     }
 
     #[test]

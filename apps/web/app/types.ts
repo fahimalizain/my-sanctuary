@@ -75,3 +75,89 @@ export interface TaskListResponse {
 export interface DeleteListResponse {
   success: boolean;
 }
+
+// A title-matching regex pattern attached to a category
+// (`task_category_patterns` row shape, snake_case).
+export interface TaskCategoryPattern {
+  id: string;
+  category_id: string;
+  regex: string;
+  google_calendar_id: string | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// A category in the one-level taxonomy, as returned by the API
+// (`task_categories` row shape + patterns + inherited_list_id).
+// - Roots have `list_id` set; children store `list_id: null` and inherit
+//   the parent root's list via `inherited_list_id`.
+// - `untracked` is a system-seeded, undeletable root with `list_id: null`
+//   and `is_untracked: true` — never shown under a list.
+export interface Category {
+  id: string;
+  user_id: string;
+  list_id: string | null;
+  parent_id: string | null;
+  title: string;
+  slug: string;
+  color: string;
+  is_productive: boolean;
+  google_calendar_id: string | null;
+  google_color_id: string | null;
+  sort_order: number;
+  is_untracked: boolean;
+  created_at: string;
+  updated_at: string;
+  patterns: TaskCategoryPattern[];
+  inherited_list_id: string | null;
+}
+
+// The envelope returned by GET /api/categories
+export interface CategoriesResponse {
+  categories: Category[];
+}
+
+// The envelope returned by POST /api/categories and PATCH /api/categories/:id
+export interface CategoryResponse {
+  category: Category;
+}
+
+// The envelope returned by DELETE /api/categories/:id
+export interface DeleteCategoryResponse {
+  success: boolean;
+}
+
+// One pattern row of a create/update body
+export interface NewCategoryPatternInput {
+  regex: string;
+  google_calendar_id?: string | null;
+}
+
+// Request body for POST /api/categories. `list_id` is required for roots,
+// `parent_id` for children (never both).
+export interface NewCategoryInput {
+  title: string;
+  slug?: string;
+  color: string;
+  is_productive?: boolean;
+  google_calendar_id?: string | null;
+  google_color_id?: string | null;
+  list_id?: string | null;
+  parent_id?: string | null;
+  sort_order?: number;
+  is_untracked?: boolean;
+  patterns: NewCategoryPatternInput[];
+}
+
+// Request body for PATCH /api/categories/:id — every field optional;
+// `patterns` replaces the whole set when present.
+export interface UpdateCategoryInput {
+  title?: string;
+  color?: string;
+  is_productive?: boolean;
+  google_calendar_id?: string | null;
+  google_color_id?: string | null;
+  sort_order?: number;
+  patterns?: NewCategoryPatternInput[];
+}

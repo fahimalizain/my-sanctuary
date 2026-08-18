@@ -1,5 +1,6 @@
 mod auth;
 mod calendar;
+mod categories;
 mod cron;
 mod db;
 mod http;
@@ -80,6 +81,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .delete_async("/api/lists/:id", lists::delete_list)
         .options("/api/lists", auth::options)
         .options("/api/lists/:id", auth::options)
+        .get_async("/api/categories", categories::list_categories)
+        .post_async("/api/categories", categories::create_category)
+        .patch_async("/api/categories/:id", categories::update_category)
+        .delete_async("/api/categories/:id", categories::delete_category)
+        .options("/api/categories", auth::options)
+        .options("/api/categories/:id", auth::options)
         .run(req, env)
         .await
 }

@@ -12,23 +12,30 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTaskList,
-    NewToken, NewUser, NewWatchChannel, TaskList, UpdateTaskList, User, WatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent,
+    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, NewUser, NewWatchChannel,
+    TaskCategory, TaskCategoryPattern, TaskList, UpdateTaskCategory, UpdateTaskList, User,
+    WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskListRepo, TokenRepo,
-    UserRepo, WatchChannelRepo, CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
-    CALENDAR_GET_BY_ID_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
-    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
-    EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
-    EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_UPSERT_CHUNK_SIZE,
-    TASK_LIST_COUNT_BY_USER_ID_SQL, TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL,
-    TASK_LIST_GET_BY_ID_SQL, TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL,
-    TASK_LIST_UPDATE_SQL, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
-    USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL,
-    WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
-    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
-    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
+    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
+    TaskListRepo, TokenRepo, UserRepo, WatchChannelRepo, CALENDAR_DELETE_SQL,
+    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
+    CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
+    CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL,
+    EVENT_DELETE_STALE_SQL, EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
+    EVENT_UPSERT_CHUNK_SIZE, TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
+    TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
+    TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
+    TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
+    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
+    TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
+    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TOKEN_DELETE_SQL,
+    TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL,
+    USER_UPDATE_BY_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
+    WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, D1Type};
@@ -632,6 +639,240 @@ impl TaskListRepo for D1TaskListRepo {
             .map_err(backend)?;
         let row = stmt.first::<CountRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.count).unwrap_or(0))
+    }
+}
+
+/// `task_categories` + `task_category_patterns` persistence.
+pub struct D1TaskCategoryRepo {
+    db: D1Database,
+}
+
+impl D1TaskCategoryRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl TaskCategoryRepo for D1TaskCategoryRepo {
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<TaskCategory>(None).await.map_err(backend)
+    }
+
+    async fn insert(&self, category: NewTaskCategory) -> Result<TaskCategory, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        // Nullable columns bind NULL; `is_productive`/`is_untracked` are
+        // INTEGER 0/1 columns in D1.
+        let list_id = optional_text(category.list_id.as_deref());
+        let parent_id = optional_text(category.parent_id.as_deref());
+        let google_calendar_id = optional_text(category.google_calendar_id.as_deref());
+        let google_color_id = optional_text(category.google_color_id.as_deref());
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&category.user_id),
+                list_id,
+                parent_id,
+                D1Type::Text(&category.title),
+                D1Type::Text(&category.slug),
+                D1Type::Text(&category.color),
+                D1Type::Integer(i32::from(category.is_productive)),
+                google_calendar_id,
+                google_color_id,
+                D1Type::Integer(category.sort_order as i32),
+                D1Type::Integer(i32::from(category.is_untracked)),
+                D1Type::Text(&now),
+                D1Type::Text(&now),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        Ok(TaskCategory {
+            id: id.clone(),
+            user_id: category.user_id,
+            list_id: category.list_id,
+            parent_id: category.parent_id,
+            title: category.title,
+            slug: category.slug,
+            color: category.color,
+            is_productive: category.is_productive,
+            google_calendar_id: category.google_calendar_id,
+            google_color_id: category.google_color_id,
+            sort_order: category.sort_order,
+            is_untracked: category.is_untracked,
+            created_at: now.clone(),
+            updated_at: now,
+            deleted_at: None,
+        })
+    }
+
+    async fn update(
+        &self,
+        id: &str,
+        updates: &UpdateTaskCategory,
+    ) -> Result<Option<TaskCategory>, RepoError> {
+        // NULL binds flow through COALESCE and leave the column unchanged.
+        // `parent_id` is bound twice: once for the COALESCE and once for the
+        // CASE that NULLs `list_id` when a new parent is bound (children never
+        // store a list_id — they inherit on read).
+        let title = optional_text(updates.title.as_deref());
+        let slug = optional_text(updates.slug.as_deref());
+        let color = optional_text(updates.color.as_deref());
+        let is_productive = match updates.is_productive {
+            Some(value) => D1Type::Integer(i32::from(value)),
+            None => D1Type::Null,
+        };
+        let google_calendar_id = optional_text(updates.google_calendar_id.as_deref());
+        let google_color_id = optional_text(updates.google_color_id.as_deref());
+        let sort_order = match updates.sort_order {
+            Some(value) => D1Type::Integer(value as i32),
+            None => D1Type::Null,
+        };
+        let parent_id = updates.parent_id.as_deref();
+        let list_id = optional_text(updates.list_id.as_deref());
+        let now = now_rfc3339();
+        // A Vec (not an array) so the `parent_id` binding can be repeated
+        // (once for the COALESCE, once for the CASE WHEN ? IS NOT NULL).
+        let refs: Vec<D1Type> = vec![
+            title,
+            slug,
+            color,
+            is_productive,
+            google_calendar_id,
+            google_color_id,
+            sort_order,
+            optional_text(parent_id),
+            optional_text(parent_id),
+            list_id,
+            D1Type::Text(&now),
+            D1Type::Text(id),
+        ];
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_UPDATE_SQL)
+            .bind_refs(&refs)
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_DELETE_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn count_by_user_id(&self, user_id: &str) -> Result<i64, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_COUNT_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<CountRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.count).unwrap_or(0))
+    }
+
+    async fn count_children(&self, category_id: &str) -> Result<i64, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_COUNT_CHILDREN_SQL)
+            .bind_refs(&[D1Type::Text(category_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<CountRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.count).unwrap_or(0))
+    }
+
+    async fn get_untracked(&self, user_id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_GET_UNTRACKED_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        stmt.first::<TaskCategory>(None).await.map_err(backend)
+    }
+
+    async fn list_patterns_by_category_id(
+        &self,
+        category_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_PATTERNS_LIST_SQL)
+            .bind_refs(&[D1Type::Text(category_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn replace_patterns(
+        &self,
+        category_id: &str,
+        patterns: Vec<NewTaskCategoryPattern>,
+    ) -> Result<(), RepoError> {
+        let delete = self
+            .db
+            .prepare(TASK_CATEGORY_PATTERNS_DELETE_SQL)
+            .bind_refs(&[D1Type::Text(category_id)])
+            .map_err(backend)?;
+        run_stmt(delete).await?;
+        let now = now_rfc3339();
+        for (sort_order, pattern) in patterns.into_iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let stmt = self
+                .db
+                .prepare(TASK_CATEGORY_PATTERNS_INSERT_SQL)
+                .bind_refs(&[
+                    D1Type::Text(&id),
+                    D1Type::Text(category_id),
+                    D1Type::Text(&pattern.regex),
+                    optional_text(pattern.google_calendar_id.as_deref()),
+                    D1Type::Integer(sort_order as i32),
+                    D1Type::Text(&now),
+                    D1Type::Text(&now),
+                ])
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_patterns_by_category_id(&self, category_id: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_PATTERNS_DELETE_SQL)
+            .bind_refs(&[D1Type::Text(category_id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+}
+
+/// Binds an optional string as `D1Type::Text` or `D1Type::Null`.
+fn optional_text(value: Option<&str>) -> D1Type<'_> {
+    match value {
+        Some(value) => D1Type::Text(value),
+        None => D1Type::Null,
     }
 }
 

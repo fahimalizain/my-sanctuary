@@ -25,7 +25,7 @@
 use thiserror::Error;
 
 use crate::models::{NewTaskList, TaskList, UpdateTaskList};
-use crate::repo::{RepoError, TaskListRepo};
+use crate::repo::{RepoError, TaskCategoryRepo, TaskListRepo};
 
 /// The first-visit seed: the four default lists, `sort_order` 0..3.
 pub const SEED_LISTS: [(&str, &str, i64); 4] = [
@@ -46,6 +46,19 @@ pub enum ListsError {
     Conflict,
     #[error("database error: {0}")]
     Repo(#[from] RepoError),
+}
+
+/// `list_lists` seeds the category taxonomy too, so its errors fold into
+/// [`ListsError`] (same HTTP mapping: 400 / 404 / 409 / 500).
+impl From<crate::categories::CategoriesError> for ListsError {
+    fn from(err: crate::categories::CategoriesError) -> Self {
+        match err {
+            crate::categories::CategoriesError::Invalid(message) => ListsError::Invalid(message),
+            crate::categories::CategoriesError::NotFound => ListsError::NotFound,
+            crate::categories::CategoriesError::Conflict(_) => ListsError::Conflict,
+            crate::categories::CategoriesError::Repo(err) => ListsError::Repo(err),
+        }
+    }
 }
 
 /// Response envelope for `GET /api/lists`.
@@ -73,24 +86,36 @@ pub struct DeleteListResponse {
 /// row, minted by the repo), then the fresh rows are returned ordered by
 /// `sort_order` then `name`. A second call sees `count > 0` and never
 /// duplicates.
+///
+/// Once the lists are in place, the category taxonomy is seeded too:
+/// [`crate::categories::ensure_taxonomy`] inserts the four seed roots plus
+/// `untracked` when the user has zero living categories. This is the single
+/// seeding path — `GET /api/categories` intentionally does not seed, so
+/// parallel first-visit fetches can never double-seed.
 pub async fn list_lists(
-    repo: &dyn TaskListRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
 ) -> Result<TaskListsResponse, ListsError> {
-    if repo.count_by_user_id(user_id).await? == 0 {
+    if list_repo.count_by_user_id(user_id).await? == 0 {
         for (name, color, sort_order) in SEED_LISTS {
-            repo.insert(NewTaskList {
-                user_id: user_id.to_string(),
-                name: name.to_string(),
-                color: color.to_string(),
-                sort_order,
-            })
-            .await?;
+            list_repo
+                .insert(NewTaskList {
+                    user_id: user_id.to_string(),
+                    name: name.to_string(),
+                    color: color.to_string(),
+                    sort_order,
+                })
+                .await?;
         }
     }
-    Ok(TaskListsResponse {
-        lists: repo.list_by_user_id(user_id).await?,
-    })
+    let lists = list_repo.list_by_user_id(user_id).await?;
+    if !lists.is_empty() {
+        let categories = category_repo.list_by_user_id(user_id).await?;
+        crate::categories::ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id)
+            .await?;
+    }
+    Ok(TaskListsResponse { lists })
 }
 
 /// Creates a list for the user.
@@ -200,6 +225,11 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::models::{
+        NewTaskCategory, NewTaskCategoryPattern, TaskCategory, TaskCategoryPattern,
+        UpdateTaskCategory,
+    };
+    use crate::repo::TaskCategoryRepo;
 
     // ──────────────────────────────────────────
     // Fake
@@ -347,14 +377,152 @@ mod tests {
         }
     }
 
+    /// In-memory `TaskCategoryRepo` for the lists tests: no-op persistence
+    /// that records inserts (the taxonomy behaviour itself is tested in
+    /// `crate::categories`). `list_lists` needs the trait, so every method is
+    /// implemented against an empty store except the count/insert/patters
+    /// bookkeeping the seed path exercises.
+    struct FakeTaskCategoryRepo {
+        stored: Mutex<Vec<TaskCategory>>,
+        inserted: Mutex<Vec<NewTaskCategory>>,
+        patterns: Mutex<Vec<TaskCategoryPattern>>,
+        next_id: Mutex<u64>,
+    }
+
+    impl FakeTaskCategoryRepo {
+        fn new() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                inserted: Mutex::new(Vec::new()),
+                patterns: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+
+        fn inserted_patterns(&self) -> usize {
+            self.patterns.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TaskCategoryRepo for FakeTaskCategoryRepo {
+        async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .cloned()
+                .collect())
+        }
+
+        async fn get_by_id(&self, _id: &str) -> Result<Option<TaskCategory>, RepoError> {
+            Ok(None)
+        }
+
+        async fn insert(&self, category: NewTaskCategory) -> Result<TaskCategory, RepoError> {
+            let mut next = self.next_id.lock().unwrap();
+            let row = TaskCategory {
+                id: format!("cat-{next}"),
+                user_id: category.user_id.clone(),
+                list_id: category.list_id.clone(),
+                parent_id: category.parent_id.clone(),
+                title: category.title.clone(),
+                slug: category.slug.clone(),
+                color: category.color.clone(),
+                is_productive: category.is_productive,
+                google_calendar_id: category.google_calendar_id.clone(),
+                google_color_id: category.google_color_id.clone(),
+                sort_order: category.sort_order,
+                is_untracked: category.is_untracked,
+                created_at: "2026-08-18T00:00:00Z".to_string(),
+                updated_at: "2026-08-18T00:00:00Z".to_string(),
+                deleted_at: None,
+            };
+            *next += 1;
+            self.inserted.lock().unwrap().push(category);
+            self.stored.lock().unwrap().push(row.clone());
+            Ok(row)
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _updates: &UpdateTaskCategory,
+        ) -> Result<Option<TaskCategory>, RepoError> {
+            Ok(None)
+        }
+
+        async fn soft_delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn count_by_user_id(&self, user_id: &str) -> Result<i64, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .count() as i64)
+        }
+
+        async fn count_children(&self, _category_id: &str) -> Result<i64, RepoError> {
+            Ok(0)
+        }
+
+        async fn get_untracked(&self, _user_id: &str) -> Result<Option<TaskCategory>, RepoError> {
+            Ok(None)
+        }
+
+        async fn list_patterns_by_category_id(
+            &self,
+            _category_id: &str,
+        ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            Ok(Vec::new())
+        }
+
+        async fn replace_patterns(
+            &self,
+            _category_id: &str,
+            patterns: Vec<NewTaskCategoryPattern>,
+        ) -> Result<(), RepoError> {
+            self.patterns.lock().unwrap().extend(
+                patterns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(sort_order, input)| TaskCategoryPattern {
+                        id: format!("pat-{sort_order}"),
+                        category_id: "cat".to_string(),
+                        regex: input.regex,
+                        google_calendar_id: input.google_calendar_id,
+                        sort_order: sort_order as i64,
+                        created_at: "2026-08-18T00:00:00Z".to_string(),
+                        updated_at: "2026-08-18T00:00:00Z".to_string(),
+                    }),
+            );
+            Ok(())
+        }
+
+        async fn delete_patterns_by_category_id(&self, _category_id: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// Convenience: a fresh pair of repos for the seed tests.
+    fn repos() -> (FakeTaskListRepo, FakeTaskCategoryRepo) {
+        (FakeTaskListRepo::with(Vec::new()), FakeTaskCategoryRepo::new())
+    }
+
     // ──────────────────────────────────────────
     // Seeding
     // ──────────────────────────────────────────
 
     #[test]
     fn first_get_seeds_four_default_lists() {
-        let repo = FakeTaskListRepo::with(Vec::new());
-        let response = pollster::block_on(list_lists(&repo, "u-1")).unwrap();
+        let (repo, category_repo) = repos();
+        let response = pollster::block_on(list_lists(&repo, &category_repo, "u-1")).unwrap();
 
         let names: Vec<&str> = response.lists.iter().map(|list| list.name.as_str()).collect();
         assert_eq!(names, ["Work", "Fitness", "Family", "Personal"]);
@@ -367,13 +535,19 @@ mod tests {
 
     #[test]
     fn second_get_does_not_reseed() {
-        let repo = FakeTaskListRepo::with(Vec::new());
-        let first = pollster::block_on(list_lists(&repo, "u-1")).unwrap();
-        let second = pollster::block_on(list_lists(&repo, "u-1")).unwrap();
+        let (repo, category_repo) = repos();
+        let first = pollster::block_on(list_lists(&repo, &category_repo, "u-1")).unwrap();
+        let second = pollster::block_on(list_lists(&repo, &category_repo, "u-1")).unwrap();
 
         assert_eq!(first.lists.len(), 4);
         assert_eq!(second.lists.len(), 4, "no duplicate seeding");
         assert_eq!(repo.inserted.lock().unwrap().len(), 4, "exactly one seed");
+        assert_eq!(
+            category_repo.inserted.lock().unwrap().len(),
+            5,
+            "category seed (four roots + untracked) also runs once"
+        );
+        assert_eq!(category_repo.inserted_patterns(), 8, "two patterns per root");
     }
 
     #[test]
@@ -384,11 +558,15 @@ mod tests {
             FakeTaskListRepo::row("l-c", "u-1", "Beta", "#000000", 1),
             FakeTaskListRepo::row("l-d", "u-2", "Other", "#000000", 0),
         ]);
-        let response = pollster::block_on(list_lists(&repo, "u-1")).unwrap();
+        let category_repo = FakeTaskCategoryRepo::new();
+        let response = pollster::block_on(list_lists(&repo, &category_repo, "u-1")).unwrap();
 
         let ids: Vec<&str> = response.lists.iter().map(|list| list.id.as_str()).collect();
         assert_eq!(ids, ["l-b", "l-c", "l-a"]);
         assert_eq!(repo.inserted.lock().unwrap().len(), 0, "lists exist — no seed");
+        // No seed-name list ("Zzz"/"Alpha"/"Beta") → only untracked is seeded.
+        assert_eq!(category_repo.inserted.lock().unwrap().len(), 1);
+        assert_eq!(category_repo.inserted_patterns(), 0, "untracked has no patterns");
     }
 
     // ──────────────────────────────────────────

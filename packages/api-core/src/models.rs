@@ -286,6 +286,144 @@ pub struct UpdateTaskList {
     pub sort_order: Option<i64>,
 }
 
+/// A category in the one-level task taxonomy, as stored in `task_categories`.
+///
+/// Doubles as the D1 row projection: field names match the schema,
+/// `is_productive`/`is_untracked` deserialize from D1's `INTEGER 0/1` via
+/// [`de_d1_bool`], and the nullable columns stay `Option<String>` (`NULL` in
+/// D1). Not the HTTP response shape — [`crate::categories`] wraps rows into
+/// `CategoryView` (plus patterns and the inherited list id).
+///
+/// Tree rules (enforced by the service): a category is either a root
+/// (`parent_id` NULL) or a child of a root. `list_id` is meaningful only on
+/// roots; children store NULL and inherit the parent's list on read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCategory {
+    pub id: String,
+    pub user_id: String,
+    /// Root's owning list; NULL for children and for `untracked`.
+    pub list_id: Option<String>,
+    /// NULL for roots; otherwise the parent root's id.
+    pub parent_id: Option<String>,
+    pub title: String,
+    /// Unique per user among living categories; `work`/`fitness`/`family`/
+    /// `personal`/`untracked` for seeds.
+    pub slug: String,
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub color: String,
+    /// D1 stores this as `INTEGER 0/1`.
+    #[serde(default, deserialize_with = "de_d1_bool")]
+    pub is_productive: bool,
+    /// Optional Google Calendar id that anchors this category to a calendar.
+    pub google_calendar_id: Option<String>,
+    pub google_color_id: Option<String>,
+    pub sort_order: i64,
+    /// `1` only for the undeletable `untracked` sink category.
+    #[serde(default, deserialize_with = "de_d1_bool")]
+    pub is_untracked: bool,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+    /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
+    pub deleted_at: Option<String>,
+}
+
+/// Insert input for [`crate::repo::TaskCategoryRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskCategory {
+    pub user_id: String,
+    /// `Some` only for roots; children are stored with `None`.
+    pub list_id: Option<String>,
+    /// `Some` only for children (of a root).
+    pub parent_id: Option<String>,
+    pub title: String,
+    pub slug: String,
+    pub color: String,
+    pub is_productive: bool,
+    pub google_calendar_id: Option<String>,
+    pub google_color_id: Option<String>,
+    pub sort_order: i64,
+    /// `true` only for `untracked` (seeded by the system, never via the API).
+    pub is_untracked: bool,
+}
+
+/// Request body for `POST /api/categories`.
+///
+/// `is_untracked` is accepted so the service can reject it (400): the sink
+/// category is seeded by the system and never user-creatable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewTaskCategoryInput {
+    pub title: String,
+    /// Omitted (or empty) → derived from `title` via slugification.
+    pub slug: Option<String>,
+    pub color: String,
+    pub is_productive: Option<bool>,
+    pub google_calendar_id: Option<String>,
+    pub google_color_id: Option<String>,
+    /// Required for roots, forbidden for children (service 400).
+    pub list_id: Option<String>,
+    /// Required for children, forbidden for grandchildren (service 400).
+    pub parent_id: Option<String>,
+    pub sort_order: Option<i64>,
+    #[serde(default)]
+    pub is_untracked: Option<bool>,
+    #[serde(default)]
+    pub patterns: Vec<NewTaskCategoryPattern>,
+}
+
+/// Update input for [`crate::repo::TaskCategoryRepo::update`] (`PATCH
+/// /api/categories/:id`). `None` fields are left unchanged (COALESCE in SQL);
+/// the service rejects a body where every field is `None` (400).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateTaskCategory {
+    pub title: Option<String>,
+    pub slug: Option<String>,
+    pub color: Option<String>,
+    pub is_productive: Option<bool>,
+    pub google_calendar_id: Option<String>,
+    pub google_color_id: Option<String>,
+    /// `Some` only for roots; a child given a non-null `list_id` is a 400.
+    pub list_id: Option<String>,
+    /// `Some` moves this category under a root; never settable to a child.
+    pub parent_id: Option<String>,
+    pub sort_order: Option<i64>,
+    /// Accepted so the service can reject it (400).
+    pub is_untracked: Option<bool>,
+    /// `Some` replaces the category's whole pattern set; `None` leaves it.
+    #[serde(default)]
+    pub patterns: Option<Vec<NewTaskCategoryPattern>>,
+}
+
+/// A title-matching regex attached to a category, as stored in
+/// `task_category_patterns`. Doubles as the D1 row projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCategoryPattern {
+    pub id: String,
+    pub category_id: String,
+    /// The user-authored regex. Stored patterns are validated on write, but
+    /// the matcher skips any that fail to compile on read regardless.
+    pub regex: String,
+    /// When set, the pattern only applies to events from this Google calendar;
+    /// task titles (no calendar) skip it.
+    pub google_calendar_id: Option<String>,
+    pub sort_order: i64,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+}
+
+/// Insert input for one pattern row. `sort_order` is derived from the Vec
+/// index by the D1 implementation; ids/timestamps are generated there too.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewTaskCategoryPattern {
+    pub regex: String,
+    #[serde(default)]
+    pub google_calendar_id: Option<String>,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
@@ -483,6 +621,62 @@ mod tests {
                 sort_order: None
             }
         );
+    }
+
+    #[test]
+    fn task_category_deserializes_from_d1_row_shape() {
+        // D1 returns INTEGER 0/1 bools and NULL for the nullable columns.
+        let category: TaskCategory = serde_json::from_str(
+            r##"{
+                "id": "c-1", "user_id": "u-1", "list_id": "l-1", "parent_id": null,
+                "title": "Deep Work", "slug": "deep-work", "color": "#2a5c8a",
+                "is_productive": 1, "google_calendar_id": null, "google_color_id": null,
+                "sort_order": 0, "is_untracked": 0,
+                "created_at": "2026-08-18T00:00:00Z", "updated_at": "2026-08-18T00:00:00Z",
+                "deleted_at": null
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(category.list_id.as_deref(), Some("l-1"));
+        assert_eq!(category.parent_id, None);
+        assert!(category.is_productive);
+        assert!(!category.is_untracked);
+        assert_eq!(category.google_calendar_id, None);
+        assert_eq!(category.sort_order, 0);
+    }
+
+    #[test]
+    fn task_category_child_row_has_null_list_id() {
+        let category: TaskCategory = serde_json::from_str(
+            r##"{
+                "id": "c-2", "user_id": "u-1", "list_id": null, "parent_id": "c-1",
+                "title": "Code Reviews", "slug": "code-reviews", "color": "",
+                "is_productive": 0, "google_calendar_id": "work@x.com", "google_color_id": "7",
+                "sort_order": 1, "is_untracked": 0,
+                "created_at": "2026-08-18T00:00:00Z", "updated_at": "2026-08-18T00:00:00Z",
+                "deleted_at": null
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(category.list_id, None);
+        assert_eq!(category.parent_id.as_deref(), Some("c-1"));
+        assert_eq!(category.color, "", "color defaults to empty string");
+        assert_eq!(category.google_calendar_id.as_deref(), Some("work@x.com"));
+    }
+
+    #[test]
+    fn task_category_pattern_deserializes_from_d1_row_shape() {
+        let pattern: TaskCategoryPattern = serde_json::from_str(
+            r#"{
+                "id": "p-1", "category_id": "c-1", "regex": "^Work$",
+                "google_calendar_id": null, "sort_order": 0,
+                "created_at": "x", "updated_at": "x"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(pattern.regex, "^Work$");
+        assert_eq!(pattern.google_calendar_id, None);
+        assert_eq!(pattern.sort_order, 0);
     }
 
     #[test]

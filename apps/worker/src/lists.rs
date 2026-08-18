@@ -53,7 +53,9 @@ pub async fn list_lists(req: Request, ctx: RouteContext<Option<api_core::Config>
 
     let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
     let lists = crate::db::D1TaskListRepo::new(d1()?);
-    match api_core::list_lists(&lists, &user.id).await {
+    let categories = crate::db::D1TaskCategoryRepo::new(d1()?);
+    // Seeds the taxonomy (categories) on first visit too.
+    match api_core::list_lists(&lists, &categories, &user.id).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
