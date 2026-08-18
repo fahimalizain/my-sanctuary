@@ -49,6 +49,22 @@ export interface CalendarEventsResponse {
   source: 'cache' | string;
 }
 
+// A calendar from GET /api/calendar/calendars (picker-safe view).
+export interface GoogleCalendar {
+  id: string;
+  google_calendar_id: string;
+  summary: string;
+  time_zone: string;
+  is_primary: boolean;
+  access_role: string;
+  sync_enabled: boolean;
+}
+
+// The envelope returned by GET /api/calendar/calendars
+export interface CalendarsResponse {
+  calendars: GoogleCalendar[];
+}
+
 // A task list as stored in the backend (`task_lists` row shape, snake_case).
 // The UI `List` type above is a view of this used by the mock timeline.
 export interface TaskList {

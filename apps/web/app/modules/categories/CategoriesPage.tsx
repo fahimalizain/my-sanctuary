@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
+import { CalendarPicker } from '@/app/components/CalendarPicker';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -10,8 +11,10 @@ import {
 } from '@/components/ui/dialog';
 import { API_BASE_URL } from '@/lib/api';
 import type {
+  CalendarsResponse,
   CategoriesResponse,
   Category,
+  GoogleCalendar,
   NewCategoryInput,
   TaskList,
   TaskListsResponse,
@@ -77,6 +80,14 @@ export function CategoriesPage() {
   const [googleCalendarId, setGoogleCalendarId] = useState('');
   const [patterns, setPatterns] = useState<PatternDraft[]>([]);
 
+  // Google calendars for the pickers — fetched once per dialog open (never
+  // per keystroke / pattern add) and shared by every CalendarPicker. The
+  // API is cache-only after first import, so keeping the previous list
+  // across closes is fine; refetching each open is preferred.
+  const [calendars, setCalendars] = useState<GoogleCalendar[]>([]);
+  const [calendarsLoading, setCalendarsLoading] = useState(false);
+  const [calendarsError, setCalendarsError] = useState<string | null>(null);
+
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -116,6 +127,36 @@ export function CategoriesPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Calendars for the pickers: one request when the dialog opens, shared by
+  // every CalendarPicker instance. `form` changes identity only on
+  // open/close, so edits inside the dialog never refetch.
+  useEffect(() => {
+    if (form === null) return;
+    let cancelled = false;
+    setCalendarsLoading(true);
+    setCalendarsError(null);
+    fetch(`${API_BASE_URL}/api/calendar/calendars`, {
+      credentials: 'include',
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await readError(res));
+        const data = (await res.json()) as CalendarsResponse;
+        if (!cancelled) setCalendars(data.calendars ?? []);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setCalendarsError(
+          err instanceof Error ? err.message : 'Failed to load calendars',
+        );
+      })
+      .finally(() => {
+        if (!cancelled) setCalendarsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [form]);
 
   // ──────────────────────────────────────────
   // Category actions — same dialogs and bodies as ListsPage.
@@ -549,14 +590,16 @@ export function CategoriesPage() {
 
             <div className="space-y-2 mb-6">
               <label className="text-sm font-medium text-foreground">
-                Google Calendar id
+                Google Calendar
               </label>
-              <input
-                type="text"
+              <CalendarPicker
                 value={googleCalendarId}
-                onChange={(e) => setGoogleCalendarId(e.target.value)}
-                placeholder="Optional — links this category to a calendar"
-                className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+                onChange={setGoogleCalendarId}
+                calendars={calendars}
+                isLoading={calendarsLoading}
+                error={calendarsError}
+                placeholder="None — optional"
+                aria-label="Google Calendar"
               />
             </div>
 
@@ -596,14 +639,20 @@ export function CategoriesPage() {
                       <Trash2 className="h-4 w-4" />
                     </button>
                   </div>
-                  <input
-                    type="text"
+                  {/* Error text lives on the category-level picker only, so
+                      a failed fetch does not repeat the message once per
+                      pattern row. */}
+                  <CalendarPicker
+                    size="sm"
                     value={pattern.googleCalendarId}
-                    onChange={(e) =>
-                      updatePattern(index, { googleCalendarId: e.target.value })
+                    onChange={(id) =>
+                      updatePattern(index, { googleCalendarId: id })
                     }
-                    placeholder="Google Calendar id (optional — events only)"
-                    className="w-full px-3 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-xs"
+                    calendars={calendars}
+                    isLoading={calendarsLoading}
+                    error={null}
+                    placeholder="None — events only"
+                    aria-label={`Pattern ${index + 1} Google Calendar`}
                   />
                 </div>
               ))}
