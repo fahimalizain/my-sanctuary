@@ -129,6 +129,51 @@ pub async fn list_events(
     Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
 }
 
+/// `GET /api/calendar/calendars` → 200 `{"calendars":[...]}`.
+///
+/// Session-gated; refreshes the Google token when stale. Serves the user's
+/// imported calendars from the D1 cache — no Google calls once the store has
+/// rows; an empty store runs the same first-contact `calendarList` import
+/// as `GET /api/calendar/events` (no event sync, no watch setup).
+///
+/// Missing session or a failed token refresh → 401 `{"error":"unauthorized"}`;
+/// a `calendarList` import failure → 502 with Google's message; anything else
+/// → 500 `{"error":"failed to load calendars"}`.
+pub async fn list_calendars(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let tokens = crate::db::D1TokenRepo::new(d1()?);
+
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+        Ok(access) => access,
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            return unauthorized(&ctx);
+        }
+    };
+
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let response =
+        match api_core::list_calendars(&crate::http::WorkerHttp, &calendars, &access, &user_id)
+            .await
+        {
+            Ok(output) => Response::from_json(&output)?,
+            Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
+            Err(err) => {
+                console_log!("calendar: list_calendars failed: {err}");
+                return json_error(&ctx, 500, "failed to load calendars");
+            }
+        };
+    Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+}
+
 /// `POST /api/calendar/events` → 200 `{"event":{...},"source":"google"}`.
 ///
 /// Body: `{calendar_id, summary, description?, start, end}`. Creates the
