@@ -47,6 +47,8 @@ interface TaskFormState {
   mode: 'create' | 'edit';
   /** Edit target. */
   task?: TaskRecord;
+  /** Create destination. Always set when mode === 'create' on the board. */
+  createStatus?: TaskStatus;
 }
 
 // A drop onto an occupied In Progress column (ADR 0002 § UI): the move is NOT
@@ -573,8 +575,11 @@ export function BoardPage() {
   // Task actions (New Task + click-to-edit; no timer buttons this slice)
   // ──────────────────────────────────────────
 
-  const openCreateTask = () => {
-    setTaskForm({ mode: 'create' });
+  /** Opens the create dialog with the status pills locked to `status` —
+   *  the column whose + was tapped, or OPEN for the header New Task button
+   *  (which is the Backlog shortcut). */
+  const openCreateTask = (status: TaskStatus = 'OPEN') => {
+    setTaskForm({ mode: 'create', createStatus: status });
   };
 
   const openEditTask = (task: TaskRecord) => {
@@ -587,7 +592,12 @@ export function BoardPage() {
 
   // Persists the task. Returns an error message to show on the form (the
   // server explains 400s like "title does not match a category"), or null
-  // when the modal may close.
+  // when the modal may close. Create runs as create-then-move: POST /api/
+  // tasks always stamps OPEN (status is never in the body), and a
+  // non-Backlog destination is reached by an immediate follow-up /move that
+  // prepends (sort_order 0) — the same matrix the board drop uses. The move
+  // failure path closes the modal, raises the banner and leaves the orphan
+  // card OPEN in Backlog (the server-owned create is never deleted).
   const handleTaskSubmit = async (values: {
     title: string;
     description: string;
@@ -604,32 +614,114 @@ export function BoardPage() {
       priority: values.priority,
       difficulty: values.difficulty,
     };
-    const res =
-      taskForm.mode === 'create'
-        ? await fetch(`${API_BASE_URL}/api/tasks`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          })
-        : await fetch(`${API_BASE_URL}/api/tasks/${taskForm.task!.id}`, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-    if (!res.ok) {
-      return await readError(res);
+
+    // ── Edit (PATCH) — unchanged: merge the returned task, close.
+    if (taskForm.mode === 'edit') {
+      const res = await fetch(
+        `${API_BASE_URL}/api/tasks/${taskForm.task!.id}`,
+        {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!res.ok) {
+        return await readError(res);
+      }
+      const data = (await res.json()) as TaskResponse;
+      setTasks((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+      closeTaskForm();
+      return null;
+    }
+
+    // ── Create (POST always stamps OPEN on the server — `createStatus` only
+    //    decides whether a follow-up /move is needed, it never goes in the
+    //    request body).
+    const createRes = await fetch(`${API_BASE_URL}/api/tasks`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    // Create 400 etc.: return the error, the modal stays open on the form.
+    if (!createRes.ok) {
+      return await readError(createRes);
     }
     // The response carries the computed category — reuse it directly so the
-    // card lands in the right column instantly (creates prepend Backlog; the
-    // columns sort by `sort_order` anyway, and an untracked result — which
+    // card lands in the right column instantly (an untracked result — which
     // the server never returns on create — would stay hidden here).
-    const data = (await res.json()) as TaskResponse;
+    const data = (await createRes.json()) as TaskResponse;
+    const dest = taskForm.createStatus ?? 'OPEN';
+
+    // Destination is the create status itself: done, no useless same-status
+    // /move reorder. Card prepends Backlog.
+    if (dest === 'OPEN') {
+      setTasks((prev) => [data.task, ...prev]);
+      closeTaskForm();
+      return null;
+    }
+
+    // Otherwise create-then-move: optimistically place the card at the front
+    // of the destination column (sibling ranks untouched), then persist with
+    // ONE /move.
+    setTasks((prev) => [
+      { ...data.task, status: dest, sort_order: 0 },
+      ...prev,
+    ]);
+
+    let moveRes: Response;
+    try {
+      moveRes = await fetch(`${API_BASE_URL}/api/tasks/${data.task.id}/move`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: dest, sort_order: 0 }),
+      });
+    } catch (err) {
+      // Network failure: snap the created card back to OPEN/Backlog (the
+      // orphan stays — the server owns the create, nothing to undo), raise
+      // the banner, close the modal (slice 3 will intercept occupied In
+      // Progress before the write).
+      setTasks((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+      const message = err instanceof Error ? err.message : 'Move failed';
+      setActionError(message);
+      closeTaskForm();
+      return null;
+    }
+    // Move failure (409 on occupied In Progress this slice, 401 missing
+    // Google token, …): keep a `displaced` parked task when the body carries
+    // one (same rule as sendMoveRequest), snap the created card back to
+    // OPEN/Backlog, banner, close (null closes the modal).
+    if (!moveRes.ok) {
+      const failure = await readMoveError(moveRes);
+      setTasks((prev) =>
+        prev.map((entry) => {
+          if (failure.displaced && entry.id === failure.displaced.id) {
+            return failure.displaced;
+          }
+          if (entry.id === data.task.id) return data.task;
+          return entry;
+        }),
+      );
+      setActionError(failure.error);
+      closeTaskForm();
+      return null;
+    }
+    // Move success: merge the authoritative row (and any displaced task).
+    const moveData = (await moveRes.json()) as MoveTaskResponse;
     setTasks((prev) =>
-      taskForm.mode === 'create'
-        ? [data.task, ...prev]
-        : prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      prev.map((entry) => {
+        if (entry.id === moveData.task.id) return moveData.task;
+        if (moveData.displaced && entry.id === moveData.displaced.id) {
+          return moveData.displaced;
+        }
+        return entry;
+      }),
     );
     closeTaskForm();
     return null;
@@ -682,7 +774,7 @@ export function BoardPage() {
             </p>
           </div>
           <div className="flex gap-3">
-            <Button variant="outline" onClick={openCreateTask}>
+            <Button variant="outline" onClick={() => openCreateTask('OPEN')}>
               <Plus className="h-4 w-4 mr-2" />
               New Task
             </Button>
@@ -848,6 +940,7 @@ export function BoardPage() {
                     items={itemsByColumn[column.status]}
                     movingIds={movingIds}
                     onEditTask={openEditTask}
+                    onAddTask={openCreateTask}
                   />
                 ))}
               </div>
@@ -885,6 +978,9 @@ export function BoardPage() {
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
         task={taskForm?.mode === 'edit' ? taskForm.task : undefined}
+        createStatus={
+          taskForm?.mode === 'create' ? taskForm.createStatus : undefined
+        }
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
         onMove={handleMoveTask}

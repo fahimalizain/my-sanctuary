@@ -37,6 +37,10 @@ interface TaskModalProps {
   category?: TaskCategorySummary;
   /** The task being edited (undefined = create). */
   task?: TaskRecord;
+  /** Create-mode destination column. When set (and `task` is undefined),
+   *  Status pills render locked to this value. Omitted = today's create
+   *  (Lists page: no pills). */
+  createStatus?: TaskStatus;
   /** Persists the form. Return an error message to show on the form (e.g.
    *  the server's "title does not match a category"), or null to close. */
   onSubmit: (values: TaskFormValues) => Promise<string | null>;
@@ -82,6 +86,7 @@ export function TaskModal({
   open,
   onOpenChange,
   task,
+  createStatus,
   onSubmit,
   onDelete,
   onMove,
@@ -325,11 +330,15 @@ export function TaskModal({
               </div>
             </div>
 
-            {/* Status — edit only. With onMove, immediate column pills (a drop
-              with no drop position: always prepend). Without it, keep the
-              old read-only box so hypothetical callers stay intact. */}
-            {isEditing &&
-              (onMove ? (
+            {/* Status — edit mode: with onMove, immediate column pills (a drop
+              with no drop position: always prepend); without it, keep the
+              old read-only box so hypothetical callers stay intact. Create
+              mode: when `createStatus` is set (board column +), the same
+              five pills render locked to that destination — changing column
+              means Cancel and tapping another +. Omitted (Lists page) means
+              no Status section at all. */}
+            {isEditing ? (
+              onMove ? (
                 <div className="space-y-2 mb-6">
                   <label className="text-sm font-medium text-foreground flex items-center gap-2">
                     Status
@@ -367,7 +376,32 @@ export function TaskModal({
                     {task!.status}
                   </div>
                 </div>
-              ))}
+              )
+            ) : createStatus ? (
+              <div className="space-y-2 mb-6">
+                <label className="text-sm font-medium text-foreground flex items-center gap-2">
+                  Status
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {(Object.keys(statusConfig) as TaskStatus[]).map((status) => (
+                    <button
+                      key={status}
+                      type="button"
+                      disabled
+                      aria-label={`New task lands in ${statusConfig[status].label}`}
+                      className={cn(
+                        'flex items-center gap-2 px-4 py-2 rounded-xl border-2 text-sm font-medium transition-all disabled:cursor-not-allowed',
+                        createStatus === status
+                          ? 'bg-primary/10 border-primary text-primary'
+                          : 'bg-background border-input text-muted-foreground',
+                      )}
+                    >
+                      {statusConfig[status].label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
 
             {/* Category tag — edit mode only: the computed filing result of an
               existing task. Create is page-level and files by title match, so
