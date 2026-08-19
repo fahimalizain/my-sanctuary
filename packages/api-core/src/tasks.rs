@@ -669,6 +669,7 @@ pub async fn start_task(
             start: start_rfc3339,
             end: end_rfc3339,
             task_id: Some(task.id.clone()),
+            color_id: target.google_color_id,
         },
         now_unix,
     )
@@ -1685,6 +1686,9 @@ async fn resolve_target_calendar(
         .ok_or_else(|| TasksError::Invalid("no writable calendar".to_string()))?;
     Ok(TargetCalendar {
         calendar_id: target.id.clone(),
+        // The matched category's STORED color, or `None` for untracked /
+        // categories without one — the event insert omits `colorId` then.
+        google_color_id: category.and_then(|category| category.google_color_id.clone()),
     })
 }
 
@@ -1693,6 +1697,9 @@ async fn resolve_target_calendar(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetCalendar {
     calendar_id: String,
+    /// Stored `google_color_id` of the matched category; `None` when the
+    /// title is untracked or the category has no stored color.
+    google_color_id: Option<String>,
 }
 
 /// Whether a calendar looks writable: Google `access_role` is `owner` or
@@ -3438,6 +3445,8 @@ mod tests {
             task.id
         );
         assert!(body.get("private").is_none(), "carrier is shared, not private");
+        // The matched Work category's stored color (seed hex #2a5c8a → "9").
+        assert_eq!(body["colorId"], "9");
 
         // `started` log with the event's calendar + google ids.
         let inserted = logs.inserted.lock().unwrap().clone();
@@ -3489,6 +3498,45 @@ mod tests {
             Some("cal-work@example.com")
         );
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_omits_color_id_when_category_has_none() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        // Erase the stored color (direct store mutation — the fake's update
+        // is a stub), same pattern as the writable-calendar test.
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            let work = stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap();
+            work.google_color_id = None;
+        }
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            body.get("colorId").is_none(),
+            "no stored color → the event insert omits colorId"
+        );
     }
 
     #[test]
