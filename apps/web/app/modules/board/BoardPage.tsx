@@ -1,33 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
 import {
   DndContext,
   DragOverlay,
   PointerSensor,
   closestCorners,
-  useDroppable,
   useSensor,
   useSensors,
 } from '@dnd-kit/core';
 import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
-import {
-  SortableContext,
-  useSortable,
-  verticalListSortingStrategy,
-} from '@dnd-kit/sortable';
-import { CSS } from '@dnd-kit/utilities';
 import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { DisplaceDialog } from '@/app/components/DisplaceDialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
-import { cn } from '@/lib/utils';
 import type {
   CategoriesResponse,
   Category,
   MoveDisplaceInput,
-  MoveTaskError,
   MoveTaskInput,
   MoveTaskResponse,
   NewTaskInput,
@@ -40,91 +30,26 @@ import type {
   TasksResponse,
   UpdateTaskInput,
 } from '@/app/types';
-
-/** The /board search params — locked by ADR 0002 § Filters. All fields are
- *  optional; missing params mean "all". `category` is a comma-separated list
- *  of category ids; unknown ids are ignored by the page. */
-export type BoardSearch = {
-  priority?: TaskPriority;
-  difficulty?: TaskDifficulty;
-  category?: string; // comma-separated category ids
-};
-
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON. (Copied locally — ListsPage has
-// its own copy and this slice does not refactor it to share.)
-async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
-
-// Move failures can carry a `displaced` task (ADR 0002 § Move API): when the
-// start fails AFTER a successful displace, the parked task stays and the
-// client snaps only the moved card back. readError cannot express that, so
-// the move flow parses the full body instead.
-async function readMoveError(res: Response): Promise<MoveTaskError> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return {
-        error: (data as { error: string }).error,
-        displaced: (data as Partial<MoveTaskError>).displaced,
-      };
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return { error: `Request failed with status ${res.status}` };
-}
+import { BoardColumnView } from './BoardColumn';
+import { FilterPill } from './FilterPill';
+import { TaskCard } from './TaskCard';
+import {
+  COLUMNS,
+  COLUMN_ID_PREFIX,
+  TERMINAL_COLUMN_CAP,
+  readError,
+  readMoveError,
+  resolveSortOrder,
+} from './board-model';
+import type { BoardSearch } from './board-model';
 
 interface TaskFormState {
   mode: 'create' | 'edit';
   /** Edit target. */
   task?: TaskRecord;
+  /** Create destination. Always set when mode === 'create' on the board. */
+  createStatus?: TaskStatus;
 }
-
-interface BoardColumn {
-  title: string;
-  status: TaskStatus;
-  /** 2px accent strip on the column header only — the rest of the column
-   *  stays neutral (Categories style). */
-  accent: string;
-}
-
-// Column order and the status each one renders (ADR 0002 § Status model).
-const COLUMNS: BoardColumn[] = [
-  { title: 'Backlog', status: 'OPEN', accent: 'bg-muted-foreground/20' },
-  { title: 'Planned', status: 'PLANNED', accent: 'bg-sky-500' },
-  { title: 'In Progress', status: 'IN_PROGRESS', accent: 'bg-emerald-500' },
-  { title: 'Done', status: 'COMPLETED', accent: 'bg-sky-400' },
-  { title: 'Discarded', status: 'DISCARDED', accent: 'bg-rose-400' },
-];
-
-// Done / Discarded render at most this many filtered matches (ADR 0002
-// § Done/Discarded cap). Backlog / Planned / In Progress show all matches.
-const TERMINAL_COLUMN_CAP = 20;
-
-// Column droppables are registered under `column:<status>` so they can never
-// collide with a task UUID (ADR 0002 § DnD): `over.id` is either a task id or
-// a prefixed column id, never a bare status string.
-const COLUMN_ID_PREFIX = 'column:';
 
 // A drop onto an occupied In Progress column (ADR 0002 § UI): the move is NOT
 // applied optimistically yet — the user picks where the running task A is
@@ -136,44 +61,6 @@ interface DisplacePrompt {
   fromStatus: TaskStatus;
   /** The task (A) currently running — the one the dialog parks. */
   runningTask: TaskRecord;
-}
-
-/** Parses `destIndex` (a view index into the column's FILTERED, CAPPED
- *  display list, ADR 0002 § Filters) into the absolute `sort_order` to send.
- *  `remaining` is the dest column's displayed tasks minus the dragged id.
- *
- *  - Empty dest, or insert at the very top → the first visible card's rank
- *    (or 0). Prepend-compatible: the dropped card sorts first.
- *  - Middle → the hovered visible card's own rank (insert before it).
- *  - End → last visible rank + 1. Done/Discarded clamp at the rank of the
- *    20th visible match so the drop never lands past the capped window (the
- *    old last-visible card is pushed to #20 and off the board).
- *  - In Progress is a singleton: the rank is always 0. */
-function resolveSortOrder(
-  remaining: TaskRecord[],
-  destIndex: number,
-  destStatus: TaskStatus,
-): number {
-  if (destStatus === 'IN_PROGRESS') return 0;
-
-  if (remaining.length === 0 || destIndex <= 0) {
-    return remaining[0]?.sort_order ?? 0;
-  }
-
-  if (destIndex >= remaining.length) {
-    // Drop at the end of a capped terminal column: take the rank of the
-    // last visible card — the dropped card lands inside 0..19 and the old
-    // #20 slides off the board (ADR 0002 § Done/Discarded cap).
-    if (
-      (destStatus === 'COMPLETED' || destStatus === 'DISCARDED') &&
-      remaining.length >= TERMINAL_COLUMN_CAP
-    ) {
-      return remaining[TERMINAL_COLUMN_CAP - 1].sort_order;
-    }
-    return remaining[remaining.length - 1].sort_order + 1;
-  }
-
-  return remaining[destIndex].sort_order;
 }
 
 export function BoardPage() {
@@ -688,8 +575,11 @@ export function BoardPage() {
   // Task actions (New Task + click-to-edit; no timer buttons this slice)
   // ──────────────────────────────────────────
 
-  const openCreateTask = () => {
-    setTaskForm({ mode: 'create' });
+  /** Opens the create dialog with the status pills locked to `status` —
+   *  the column whose + was tapped, or OPEN for the header New Task button
+   *  (which is the Backlog shortcut). */
+  const openCreateTask = (status: TaskStatus = 'OPEN') => {
+    setTaskForm({ mode: 'create', createStatus: status });
   };
 
   const openEditTask = (task: TaskRecord) => {
@@ -702,14 +592,27 @@ export function BoardPage() {
 
   // Persists the task. Returns an error message to show on the form (the
   // server explains 400s like "title does not match a category"), or null
-  // when the modal may close.
-  const handleTaskSubmit = async (values: {
-    title: string;
-    description: string;
-    durationMinutes: number;
-    priority: TaskPriority;
-    difficulty: TaskDifficulty;
-  }): Promise<string | null> => {
+  // when the modal may close. Create runs as create-then-move: POST /api/
+  // tasks always stamps OPEN (status is never in the body), and a
+  // non-Backlog destination is reached by an immediate follow-up /move that
+  // prepends (sort_order 0) — the same matrix the board drop uses. Create
+  // into an OCCUPIED In Progress column carries `displace`: TaskModal opened
+  // the park dialog BEFORE the create write, so this only runs after the
+  // user confirmed where the runner goes (cancel never writes a thing). The
+  // move failure path closes the modal, raises the banner and leaves the
+  // orphan card OPEN in Backlog (the server-owned create is never deleted);
+  // a `displaced` failure body keeps the runner parked (same rule as
+  // sendMoveRequest), anything else full-restores the pre-move snapshot.
+  const handleTaskSubmit = async (
+    values: {
+      title: string;
+      description: string;
+      durationMinutes: number;
+      priority: TaskPriority;
+      difficulty: TaskDifficulty;
+    },
+    displace?: MoveDisplaceInput,
+  ): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
     const body: NewTaskInput | UpdateTaskInput = {
@@ -719,32 +622,132 @@ export function BoardPage() {
       priority: values.priority,
       difficulty: values.difficulty,
     };
-    const res =
-      taskForm.mode === 'create'
-        ? await fetch(`${API_BASE_URL}/api/tasks`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          })
-        : await fetch(`${API_BASE_URL}/api/tasks/${taskForm.task!.id}`, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-    if (!res.ok) {
-      return await readError(res);
+
+    // ── Edit (PATCH) — unchanged: merge the returned task, close.
+    if (taskForm.mode === 'edit') {
+      const res = await fetch(
+        `${API_BASE_URL}/api/tasks/${taskForm.task!.id}`,
+        {
+          method: 'PATCH',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!res.ok) {
+        return await readError(res);
+      }
+      const data = (await res.json()) as TaskResponse;
+      setTasks((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+      closeTaskForm();
+      return null;
+    }
+
+    // ── Create (POST always stamps OPEN on the server — `createStatus` only
+    //    decides whether a follow-up /move is needed, it never goes in the
+    //    request body).
+    const createRes = await fetch(`${API_BASE_URL}/api/tasks`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    // Create 400 etc.: return the error, the modal stays open on the form.
+    if (!createRes.ok) {
+      return await readError(createRes);
     }
     // The response carries the computed category — reuse it directly so the
-    // card lands in the right column instantly (creates prepend Backlog; the
-    // columns sort by `sort_order` anyway, and an untracked result — which
+    // card lands in the right column instantly (an untracked result — which
     // the server never returns on create — would stay hidden here).
-    const data = (await res.json()) as TaskResponse;
+    const data = (await createRes.json()) as TaskResponse;
+    const dest = taskForm.createStatus ?? 'OPEN';
+
+    // Destination is the create status itself: done, no useless same-status
+    // /move reorder. Card prepends Backlog.
+    if (dest === 'OPEN') {
+      setTasks((prev) => [data.task, ...prev]);
+      closeTaskForm();
+      return null;
+    }
+
+    // Otherwise create-then-move: optimistically place the card at the front
+    // of the destination column (sibling ranks untouched), then persist with
+    // ONE /move. With `displace` (occupied In Progress create) the runner is
+    // parked in the same optimistic frame — the dialog ran before the create
+    // write, so canceling never left a stray Backlog card to clean up.
+    const snapshotBeforeOptimistic = tasksRef.current;
+    const moveBody: MoveTaskInput = {
+      status: dest,
+      sort_order: 0,
+      ...(displace ? { displace } : {}),
+    };
+    setTasks((prev) => {
+      const next = prev.map((entry) =>
+        displace && entry.id === displace.id
+          ? {
+              ...entry,
+              status: displace.status,
+              sort_order: displace.sort_order,
+            }
+          : entry,
+      );
+      return [{ ...data.task, status: dest, sort_order: 0 }, ...next];
+    });
+
+    let moveRes: Response;
+    try {
+      moveRes = await fetch(`${API_BASE_URL}/api/tasks/${data.task.id}/move`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(moveBody),
+      });
+    } catch (err) {
+      // Network failure: restore the pre-move snapshot, then ensure the
+      // created card is present as OPEN/Backlog (the orphan stays — the
+      // server owns the create, nothing to undo). When displace was applied
+      // optimistically, this also restores the parked runner. Banner, close.
+      setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
+      const message = err instanceof Error ? err.message : 'Move failed';
+      setActionError(message);
+      closeTaskForm();
+      return null;
+    }
+    // Move failure (409 on occupied In Progress, 401 missing Google token,
+    // …): when the body carries a `displaced` row, the runner stays parked
+    // (same rule as sendMoveRequest) and only the created card snaps back to
+    // OPEN/Backlog; otherwise the full pre-move snapshot is restored with
+    // the created card prepended OPEN. Banner, close (null closes the modal).
+    if (!moveRes.ok) {
+      const failure = await readMoveError(moveRes);
+      if (failure.displaced) {
+        // A stays parked; B (new task) goes to OPEN/Backlog; every other
+        // card comes back from the snapshot (taken before B's insert).
+        setTasks(() => {
+          const base = snapshotBeforeOptimistic.map((entry) =>
+            entry.id === failure.displaced!.id ? failure.displaced! : entry,
+          );
+          return [data.task, ...base.filter((e) => e.id !== data.task.id)];
+        });
+      } else {
+        setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
+      }
+      setActionError(failure.error);
+      closeTaskForm();
+      return null;
+    }
+    // Move success: merge the authoritative row (and any displaced task).
+    const moveData = (await moveRes.json()) as MoveTaskResponse;
     setTasks((prev) =>
-      taskForm.mode === 'create'
-        ? [data.task, ...prev]
-        : prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      prev.map((entry) => {
+        if (entry.id === moveData.task.id) return moveData.task;
+        if (moveData.displaced && entry.id === moveData.displaced.id) {
+          return moveData.displaced;
+        }
+        return entry;
+      }),
     );
     closeTaskForm();
     return null;
@@ -797,7 +800,7 @@ export function BoardPage() {
             </p>
           </div>
           <div className="flex gap-3">
-            <Button variant="outline" onClick={openCreateTask}>
+            <Button variant="outline" onClick={() => openCreateTask('OPEN')}>
               <Plus className="h-4 w-4 mr-2" />
               New Task
             </Button>
@@ -963,6 +966,7 @@ export function BoardPage() {
                     items={itemsByColumn[column.status]}
                     movingIds={movingIds}
                     onEditTask={openEditTask}
+                    onAddTask={openCreateTask}
                   />
                 ))}
               </div>
@@ -1000,212 +1004,14 @@ export function BoardPage() {
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
         task={taskForm?.mode === 'edit' ? taskForm.task : undefined}
+        createStatus={
+          taskForm?.mode === 'create' ? taskForm.createStatus : undefined
+        }
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
         onMove={handleMoveTask}
         runningTask={runningTask}
       />
     </div>
-  );
-}
-
-/** A pill/toggle in the filter row — same shape as TaskModal's
- *  priority/difficulty chips; selected pills flip to the primary fill. */
-function FilterPill({
-  selected,
-  onClick,
-  children,
-}: {
-  selected: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'flex items-center gap-2 rounded-xl border-2 px-3 py-1.5 text-sm font-medium transition-all',
-        selected
-          ? 'bg-primary border-primary text-primary-foreground'
-          : 'bg-background border-input text-muted-foreground hover:border-primary/30',
-      )}
-    >
-      {children}
-    </button>
-  );
-}
-
-/** One board column: neutral surface with a 2px status accent on the header
- *  only. The count is the number of cards currently shown (after filter +
- *  cap) — never a `20 / 64` overflow hint. The whole section is the column
- *  droppable (`column:<status>`), so EMPTY columns accept a drop; the cards
- *  inside are a vertical SortableContext. */
-function BoardColumnView({
-  column,
-  tasks,
-  items,
-  movingIds,
-  onEditTask,
-}: {
-  column: BoardColumn;
-  tasks: TaskRecord[];
-  /** Displayed task ids — matched 1:1 with `tasks`, feeds SortableContext. */
-  items: string[];
-  /** Cards with a /move in flight: their drag handlers are disabled. */
-  movingIds: Set<string>;
-  onEditTask: (task: TaskRecord) => void;
-}) {
-  const columnDroppableId = `${COLUMN_ID_PREFIX}${column.status}`;
-  const { setNodeRef, isOver } = useDroppable({
-    id: columnDroppableId,
-    data: { type: 'column' },
-  });
-
-  return (
-    <section
-      ref={setNodeRef}
-      className={cn(
-        'flex min-w-[260px] flex-1 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
-        isOver ? 'border-primary/60 ring-2 ring-primary/20' : 'border-border',
-      )}
-    >
-      <header className="shrink-0 border-b border-border">
-        <div className={cn('h-0.5', column.accent)} />
-        <div className="flex items-center justify-between gap-2 px-4 py-3">
-          <h3 className="font-heading text-sm font-semibold text-foreground truncate">
-            {column.title}
-          </h3>
-          <span
-            className="flex-shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground"
-            aria-label={`${tasks.length} tasks`}
-          >
-            {tasks.length}
-          </span>
-        </div>
-      </header>
-
-      <SortableContext items={items} strategy={verticalListSortingStrategy}>
-        <div
-          className={cn(
-            'flex-1 space-y-2 p-3 transition-colors',
-            isOver && tasks.length === 0 && 'bg-muted/40 rounded-lg',
-          )}
-        >
-          {tasks.length > 0 ? (
-            tasks.map((task) => (
-              <SortableTaskCard
-                key={task.id}
-                task={task}
-                onEdit={onEditTask}
-                disabled={movingIds.has(task.id)}
-              />
-            ))
-          ) : (
-            <p className="text-sm text-muted-foreground italic">No tasks</p>
-          )}
-        </div>
-      </SortableContext>
-    </section>
-  );
-}
-
-/** The draggable wrapper of a card: applies the sortable transform while the
- *  card itself stays the plain TaskCard chip (click-to-edit, no timer
- *  buttons). While dragging, the original is dimmed — the DragOverlay copy
- *  is the card the pointer actually holds. */
-function SortableTaskCard({
-  task,
-  onEdit,
-  disabled,
-}: {
-  task: TaskRecord;
-  onEdit: (task: TaskRecord) => void;
-  disabled: boolean;
-}) {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({
-    id: task.id,
-    disabled,
-    data: { type: 'task' },
-  });
-
-  return (
-    <div
-      ref={setNodeRef}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
-      className={cn(isDragging && 'opacity-40')}
-      {...attributes}
-      {...listeners}
-    >
-      <TaskCard task={task} onEdit={onEdit} />
-    </div>
-  );
-}
-
-/** A light-surface task chip (the Lists chip on a light card, not the dark
- *  list-colored chip): title + duration + difficulty badge (medium/hard
- *  only) + priority dot + category swatch. The whole chip is the click
- *  target that opens the edit modal — no timer buttons in this slice. The
- *  drag overlay renders the same chip elevated (shadow/opacity), without a
- *  click target. */
-function TaskCard({
-  task,
-  onEdit,
-}: {
-  task: TaskRecord;
-  onEdit?: (task: TaskRecord) => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={() => onEdit?.(task)}
-      title={`${task.title} — ${task.duration_minutes} min, ${task.priority}${
-        task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''
-      }`}
-      className="flex w-full cursor-pointer items-center gap-1.5 rounded-lg border border-border/60 bg-background px-2.5 py-2 text-left transition-colors hover:border-primary/40 hover:bg-muted/40"
-    >
-      <span className="flex-1 min-w-0 text-sm text-foreground truncate">
-        {task.title}
-      </span>
-      <span className="flex-shrink-0 text-[10px] text-muted-foreground">
-        {task.duration_minutes} min
-      </span>
-      {task.difficulty === 'hard' || task.difficulty === 'medium' ? (
-        <span
-          className={cn(
-            'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] uppercase tracking-wide',
-            task.difficulty === 'hard'
-              ? 'bg-foreground/10 font-semibold text-foreground'
-              : 'bg-muted font-medium text-muted-foreground',
-          )}
-        >
-          {task.difficulty === 'hard' ? 'HARD' : 'MED'}
-        </span>
-      ) : null}
-      <span
-        className={cn(
-          'h-1.5 w-1.5 rounded-full flex-shrink-0',
-          task.priority === 'high'
-            ? 'bg-red-400'
-            : task.priority === 'medium'
-              ? 'bg-amber-400'
-              : 'bg-sky-400',
-        )}
-        aria-hidden
-      />
-      <span
-        className="h-2 w-2 rounded-full flex-shrink-0"
-        style={{ backgroundColor: task.category.color }}
-        title={task.category.title}
-        aria-hidden
-      />
-    </button>
   );
 }

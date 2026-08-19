@@ -37,9 +37,19 @@ interface TaskModalProps {
   category?: TaskCategorySummary;
   /** The task being edited (undefined = create). */
   task?: TaskRecord;
+  /** Create-mode destination column. When set (and `task` is undefined),
+   *  Status pills render locked to this value. Omitted = today's create
+   *  (Lists page: no pills). */
+  createStatus?: TaskStatus;
   /** Persists the form. Return an error message to show on the form (e.g.
-   *  the server's "title does not match a category"), or null to close. */
-  onSubmit: (values: TaskFormValues) => Promise<string | null>;
+   *  the server's "title does not match a category"), or null to close.
+   *  `displace` is only passed by create into an OCCUPIED In Progress
+   *  column, after the park dialog confirmed: the parent creates the task,
+   *  then follows with ONE /move carrying the parked runner. */
+  onSubmit: (
+    values: TaskFormValues,
+    displace?: MoveDisplaceInput,
+  ) => Promise<string | null>;
   /** Deletes the task (edit mode only). Return an error or null to close. */
   onDelete?: (taskId: string) => Promise<string | null>;
   /** Immediate status change (edit only). Return an error string to show on
@@ -82,6 +92,7 @@ export function TaskModal({
   open,
   onOpenChange,
   task,
+  createStatus,
   onSubmit,
   onDelete,
   onMove,
@@ -94,7 +105,12 @@ export function TaskModal({
   // unsaved edits. The status pills read `task.status` from props directly,
   // so they still follow the merged record.
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Parent closed the modal — the park dialog must close with it even
+      // when it was the one on screen (overlay close, ESC, parent unmount).
+      setDisplaceOpen(false);
+      return;
+    }
     setTitle(task?.title || '');
     setDescription(task?.description || '');
     setPriority(task?.priority || 'medium');
@@ -116,22 +132,40 @@ export function TaskModal({
   // Occupied In Progress: the park dialog is open, move not yet dispatched.
   const [displaceOpen, setDisplaceOpen] = useState(false);
 
-  const handleSave = async () => {
+  /** Persists the form via `onSubmit` — shared by the Save button and the
+   *  create-mode park-dialog confirm (which passes `displace`). */
+  const submitForm = async (displace?: MoveDisplaceInput) => {
     setSaving(true);
     setFormError(null);
-    const error = await onSubmit({
-      title,
-      description,
-      durationMinutes: parseInt(duration, 10) || 15,
-      priority,
-      difficulty,
-    });
+    const error = await onSubmit(
+      {
+        title,
+        description,
+        durationMinutes: parseInt(duration, 10) || 15,
+        priority,
+        difficulty,
+      },
+      displace,
+    );
     setSaving(false);
     if (error) {
       setFormError(error);
       return;
     }
     onOpenChange(false);
+  };
+
+  const handleSave = async () => {
+    // Create into an OCCUPIED In Progress column: park the runner BEFORE any
+    // write — no orphan Backlog card is ever created just to discover the
+    // slot is taken. Cancel stays on the form (nothing created); confirm
+    // re-enters this path with `displace` via submitForm. The Save button is
+    // disabled on an empty title, so the dialog only opens with a real one.
+    if (!isEditing && createStatus === 'IN_PROGRESS' && runningTask) {
+      setDisplaceOpen(true);
+      return;
+    }
+    await submitForm();
   };
 
   const handleDelete = async () => {
@@ -176,8 +210,22 @@ export function TaskModal({
   const handleDisplaceConfirm = (
     parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
   ) => {
-    if (!task || !runningTask) return;
+    if (!runningTask) return;
     setDisplaceOpen(false);
+    // Create mode: the park dialog opened BEFORE the create write
+    // (handleSave intercepted). Confirming now runs the same submit path as
+    // Save, with the displace attached — the parent creates then moves in
+    // one flow, so nothing was written while the dialog was open.
+    if (!task && createStatus === 'IN_PROGRESS') {
+      void submitForm({
+        id: runningTask.id,
+        status: parkStatus,
+        sort_order: 0,
+      });
+      return;
+    }
+    // Edit mode: immediate status change with displace (existing behavior).
+    if (!task) return;
     void runMove('IN_PROGRESS', {
       id: runningTask.id,
       status: parkStatus,
@@ -325,11 +373,15 @@ export function TaskModal({
               </div>
             </div>
 
-            {/* Status — edit only. With onMove, immediate column pills (a drop
-              with no drop position: always prepend). Without it, keep the
-              old read-only box so hypothetical callers stay intact. */}
-            {isEditing &&
-              (onMove ? (
+            {/* Status — edit mode: with onMove, immediate column pills (a drop
+              with no drop position: always prepend); without it, keep the
+              old read-only box so hypothetical callers stay intact. Create
+              mode: when `createStatus` is set (board column +), the same
+              five pills render locked to that destination — changing column
+              means Cancel and tapping another +. Omitted (Lists page) means
+              no Status section at all. */}
+            {isEditing ? (
+              onMove ? (
                 <div className="space-y-2 mb-6">
                   <label className="text-sm font-medium text-foreground flex items-center gap-2">
                     Status
@@ -367,7 +419,32 @@ export function TaskModal({
                     {task!.status}
                   </div>
                 </div>
-              ))}
+              )
+            ) : createStatus ? (
+              <div className="space-y-2 mb-6">
+                <label className="text-sm font-medium text-foreground flex items-center gap-2">
+                  Status
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {(Object.keys(statusConfig) as TaskStatus[]).map((status) => (
+                    <button
+                      key={status}
+                      type="button"
+                      disabled
+                      aria-label={`New task lands in ${statusConfig[status].label}`}
+                      className={cn(
+                        'flex items-center gap-2 px-4 py-2 rounded-xl border-2 text-sm font-medium transition-all disabled:cursor-not-allowed',
+                        createStatus === status
+                          ? 'bg-primary/10 border-primary text-primary'
+                          : 'bg-background border-input text-muted-foreground',
+                      )}
+                    >
+                      {statusConfig[status].label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
 
             {/* Category tag — edit mode only: the computed filing result of an
               existing task. Create is page-level and files by title match, so
@@ -435,7 +512,7 @@ export function TaskModal({
           if (!open) setDisplaceOpen(false);
         }}
         runningTitle={runningTask?.title ?? ''}
-        incomingTitle={task?.title ?? ''}
+        incomingTitle={title.trim() || 'this task'}
         onConfirm={handleDisplaceConfirm}
       />
     </>
