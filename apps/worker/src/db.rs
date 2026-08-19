@@ -32,8 +32,9 @@ use api_core::repo::{
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
-    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TASK_UPDATE_SQL,
-    TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
+    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
+    TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL,
+    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
     TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
     USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
     WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
@@ -926,7 +927,9 @@ impl TaskRepo for D1TaskRepo {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
         // This slice creates tasks in exactly one status; the literal is bound
-        // here (the schema's DEFAULT 'OPEN' is a backstop only).
+        // here (the schema's DEFAULT 'OPEN' is a backstop only). The caller
+        // (create_task) already shifted living OPEN peers, so `sort_order` is
+        // stored as given — always 0 today.
         let stmt = self
             .db
             .prepare(TASK_INSERT_SQL)
@@ -939,6 +942,7 @@ impl TaskRepo for D1TaskRepo {
                 D1Type::Text(&task.priority),
                 D1Type::Text(&task.difficulty),
                 D1Type::Text(api_core::TASK_STATUS_OPEN),
+                D1Type::Integer(task.sort_order as i32),
                 D1Type::Text(&now),
                 D1Type::Text(&now),
             ])
@@ -952,11 +956,30 @@ impl TaskRepo for D1TaskRepo {
             duration_minutes: task.duration_minutes,
             priority: task.priority,
             difficulty: task.difficulty,
+            sort_order: task.sort_order,
             status: api_core::TASK_STATUS_OPEN.to_string(),
             created_at: now.clone(),
             updated_at: now,
             deleted_at: None,
         })
+    }
+
+    async fn shift_sort_order(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_SHIFT_SORT_ORDER_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(status),
+                D1Type::Integer(from_inclusive as i32),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 
     async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError> {

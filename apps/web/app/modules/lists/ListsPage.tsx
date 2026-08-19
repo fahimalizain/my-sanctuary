@@ -729,10 +729,12 @@ function TaskChip({
           discarded
         </span>
       )}
-      {/* Actions — Start only on OPEN and only when the running slot is free;
-          Stop + Pause only while this task runs; Complete/Discard whenever
-          the task is not already in that terminal state */}
-      {task.status === 'OPEN' && (
+      {/* Actions — Start on OPEN and PLANNED (pause parks tasks in PLANNED,
+          so the Lists page must be able to restart them) and only when the
+          running slot is free; Stop + Pause only while this task runs;
+          Complete/Discard whenever the task is not already in that terminal
+          state */}
+      {(task.status === 'OPEN' || task.status === 'PLANNED') && (
         <button
           onClick={(e) => {
             e.stopPropagation();

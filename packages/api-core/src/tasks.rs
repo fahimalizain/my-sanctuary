@@ -17,7 +17,9 @@
 //!   `Untracked { conflict: true }` (cross-tree conflict), and a match on the
 //!   `untracked` sink itself are all invalid. A title matching only a root
 //!   whose children do not match is **allowed** (parent remainder).
-//! - Titles are not unique. Create always stores `status = "OPEN"`.
+//! - Titles are not unique. Create always stores `status = "OPEN"` and
+//!   **prepends Backlog**: the living OPEN rows of the user are shifted up one
+//!   (`sort_order + 1`), and the new task lands at `sort_order = 0`.
 //! - `duration_minutes` defaults to 15 and must be >= 1; `priority` must be
 //!   `high|medium|low` (default `medium`); `difficulty` must be
 //!   `easy|medium|hard` (default `easy`).
@@ -43,15 +45,18 @@
 //!   from the cache** — `calendar_events.task_id` set AND
 //!   `start_time <= now < end_time` — never from `tasks.status`.
 //! - `stop_task`/`pause_task` PATCH the event's end to now (start + 60s when
-//!   `now <= start`) and flip status to OPEN — even when no open event exists
-//!   for the task (the user closed it in Google): the flip is idempotent.
+//!   `now <= start`) and flip status back to OPEN (stop) or to PLANNED
+//!   (pause) — even when no open event exists for the task (the user closed
+//!   it in Google): the flip is idempotent.
 //! - `complete_task`/`discard_task` auto-stop a running event first (a
 //!   `stopped` log precedes the terminal log), then set the terminal status.
 //!   Repeating the same terminal action is an idempotent 200 no-op.
-//! - Start on COMPLETED/DISCARDED is a 400; missing/other-user/soft-deleted
-//!   tasks are 404.
+//! - Start on COMPLETED/DISCARDED is a 400 (unchanged until slice 2); start
+//!   on PLANNED is allowed, so a paused task restarts. Missing/other-user/
+//!   soft-deleted tasks are 404.
 //! - Every transition appends to `task_logs` (an audit trail, not a
-//!   timesheet): `started|stopped|paused|completed|discarded`.
+//!   timesheet): `started|stopped|paused|completed|discarded`, and later
+//!   `planned|unplanned|reopened` (slice 2).
 
 use thiserror::Error;
 
@@ -81,6 +86,9 @@ pub const TASK_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const TASK_STATUS_COMPLETED: &str = "COMPLETED";
 /// A discarded task.
 pub const TASK_STATUS_DISCARDED: &str = "DISCARDED";
+/// A paused task sitting in the Planned pile — `pause` lands here since the
+/// board slice, not back in Backlog.
+pub const TASK_STATUS_PLANNED: &str = "PLANNED";
 
 /// `task_logs.type` values (the audit trail is append-only).
 pub const TASK_LOG_STARTED: &str = "started";
@@ -88,6 +96,11 @@ pub const TASK_LOG_STOPPED: &str = "stopped";
 pub const TASK_LOG_PAUSED: &str = "paused";
 pub const TASK_LOG_COMPLETED: &str = "completed";
 pub const TASK_LOG_DISCARDED: &str = "discarded";
+/// `planned`/`unplanned`/`reopened` arrive with the move endpoint (slice 2);
+/// the constants exist now so the log vocabulary is complete.
+pub const TASK_LOG_PLANNED: &str = "planned";
+pub const TASK_LOG_UNPLANNED: &str = "unplanned";
+pub const TASK_LOG_REOPENED: &str = "reopened";
 
 /// Errors produced by the tasks service.
 ///
@@ -176,6 +189,9 @@ pub struct TaskView {
     pub duration_minutes: i64,
     pub priority: String,
     pub difficulty: String,
+    /// Per-user, per-status board rank (0 = front of the column). The frontend
+    /// needs it to render columns in order and, later, to place drops.
+    pub sort_order: i64,
     pub status: String,
     /// RFC 3339 instant.
     pub created_at: String,
@@ -251,6 +267,10 @@ pub async fn list_tasks(
 ///
 /// `ensure_taxonomy` runs first so the very first task of a fresh user finds
 /// a seeded matcher.
+///
+/// Ordering: the new task **prepends Backlog** — the user's living OPEN rows
+/// are shifted up by one (`sort_order >= 0`), then the task is inserted at
+/// `sort_order = 0`.
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -294,6 +314,12 @@ pub async fn create_task(
     // Validates the rules; the response view re-classifies the stored title.
     resolve_category(&title, &taxonomy)?;
 
+    // Prepend Backlog: every living OPEN row of the user moves up one so the
+    // new task can rank 0. Peers keep their `updated_at` — re-ranking is not
+    // a content change.
+    task_repo
+        .shift_sort_order(user_id, TASK_STATUS_OPEN, 0)
+        .await?;
     let task = task_repo
         .insert(NewTask {
             user_id: user_id.to_string(),
@@ -302,6 +328,7 @@ pub async fn create_task(
             duration_minutes,
             priority,
             difficulty,
+            sort_order: 0,
         })
         .await?;
     Ok(TaskResponse {
@@ -526,14 +553,16 @@ pub async fn stop_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_STOPPED,
+        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN,
     )
     .await
 }
 
 /// Pauses a task: identical to [`stop_task`] (the event's end is patched to
-/// now) except the log row says `paused`. Reopening later is simply Start
-/// again (logged `started`).
+/// now) except the log row says `paused` and the status lands **PLANNED**,
+/// not OPEN (ADR 0002: pause parks the task in the Planned pile). Reopening
+/// later is simply Start again — start already allows PLANNED (logged
+/// `started`).
 pub async fn pause_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -548,7 +577,7 @@ pub async fn pause_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_PAUSED,
+        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED,
     )
     .await
 }
@@ -598,6 +627,9 @@ pub async fn discard_task(
 }
 
 /// Shared stop/pause machinery (see [`stop_task`]).
+///
+/// `target_status` is the landing status: OPEN for stop, PLANNED for pause
+/// (mirrors `complete_or_discard`, where the caller picks the terminal state).
 async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -610,6 +642,7 @@ async fn stop_or_pause(
     task_id: &str,
     now_unix: i64,
     log_type: &str,
+    target_status: &str,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -630,7 +663,7 @@ async fn stop_or_pause(
         stop_running_event(http, calendars, events, access, user_id, task_id, now_unix).await?;
 
     let Some(updated) = task_repo
-        .set_status(task_id, TASK_STATUS_OPEN, &now_rfc3339)
+        .set_status(task_id, target_status, &now_rfc3339)
         .await?
     else {
         return Err(TasksError::NotFound);
@@ -878,6 +911,7 @@ fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
         duration_minutes: task.duration_minutes,
         priority: task.priority.clone(),
         difficulty: task.difficulty.clone(),
+        sort_order: task.sort_order,
         status: task.status.clone(),
         created_at: task.created_at.clone(),
         updated_at: task.updated_at.clone(),
@@ -1011,8 +1045,18 @@ mod tests {
                 .collect();
             // Mirrors TASK_LIST_BY_USER_ID_SQL (stable sort ties by id).
             rows.sort_by(|a, b| {
-                (b.updated_at.as_str(), b.created_at.as_str(), &b.id)
-                    .cmp(&(a.updated_at.as_str(), a.created_at.as_str(), &a.id))
+                (
+                    a.status.as_str(),
+                    a.sort_order,
+                    a.created_at.as_str(),
+                    &a.id,
+                )
+                    .cmp(&(
+                        b.status.as_str(),
+                        b.sort_order,
+                        b.created_at.as_str(),
+                        &b.id,
+                    ))
             });
             Ok(rows)
         }
@@ -1037,6 +1081,7 @@ mod tests {
                 duration_minutes: task.duration_minutes,
                 priority: task.priority.clone(),
                 difficulty: task.difficulty.clone(),
+                sort_order: task.sort_order,
                 status: TASK_STATUS_OPEN.to_string(),
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -1045,6 +1090,25 @@ mod tests {
             *next += 1;
             self.stored.lock().unwrap().push(row.clone());
             Ok(row)
+        }
+
+        async fn shift_sort_order(
+            &self,
+            user_id: &str,
+            status: &str,
+            from_inclusive: i64,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            for row in stored.iter_mut() {
+                if row.user_id == user_id
+                    && row.status == status
+                    && row.deleted_at.is_none()
+                    && row.sort_order >= from_inclusive
+                {
+                    row.sort_order += 1;
+                }
+            }
+            Ok(())
         }
 
         async fn update(
@@ -1421,6 +1485,23 @@ mod tests {
         assert_eq!(review.task.category.title, "Work");
         assert_ne!(work.task.id, review.task.id, "titles are not unique");
         assert_eq!(work.task.category.id, review.task.category.id);
+    }
+
+    #[test]
+    fn create_task_prepends_backlog_sort_order() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        let second = work_task(&lists, &categories, &tasks);
+
+        // The newest task sits at the front of the Backlog pile (0); the
+        // previous front task shifts one back. TaskView is a snapshot, so the
+        // shifted rank of `first` is asserted on the persisted row.
+        assert_eq!(second.sort_order, 0, "new task response ranks 0");
+        let stored = tasks.stored.lock().unwrap();
+        let first_row = stored.iter().find(|row| row.id == first.id).unwrap();
+        let second_row = stored.iter().find(|row| row.id == second.id).unwrap();
+        assert_eq!(second_row.sort_order, 0, "new task prepends Backlog");
+        assert_eq!(first_row.sort_order, 1, "existing OPEN task shifted up");
     }
 
     #[test]
@@ -2685,11 +2766,13 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        // ADR 0002: pause parks the task in the Planned pile, not Backlog.
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
         assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:23:20Z");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
-        // Ending the event also frees the one-running slot: a new start works.
+        // Ending the event also frees the one-running slot, and PLANNED is
+        // startable (only COMPLETED/DISCARDED 400): a new start works.
         let http = FakeHttp::new(vec![(
             "/events",
             200,

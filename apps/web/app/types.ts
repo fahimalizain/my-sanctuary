@@ -196,9 +196,15 @@ export interface TaskCategorySummary {
 }
 
 // A task as returned by the API: the `tasks` row shape (snake_case) plus the
-// computed `category`. `status` is driven by the timer endpoints:
-// "OPEN" | "IN_PROGRESS" | "COMPLETED" | "DISCARDED".
-export type TaskStatus = 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | 'DISCARDED';
+// computed `category`. `status` is driven by the timer endpoints: start →
+// "IN_PROGRESS", stop → "OPEN", pause → "PLANNED" (since ADR 0002),
+// complete/discard → their terminal states.
+export type TaskStatus =
+  | 'OPEN'
+  | 'PLANNED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'DISCARDED';
 
 export interface TaskRecord {
   id: string;
@@ -208,6 +214,9 @@ export interface TaskRecord {
   duration_minutes: number;
   priority: TaskPriority;
   difficulty: TaskDifficulty;
+  // Per-user, per-status board rank; 0 = front of the column (Backlog
+  // prepends). Part of the row since migration 0005.
+  sort_order: number;
   status: TaskStatus;
   created_at: string;
   updated_at: string;
