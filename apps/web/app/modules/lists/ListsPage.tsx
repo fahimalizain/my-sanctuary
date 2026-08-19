@@ -25,6 +25,7 @@ import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import type {
   NewTaskInput,
+  TaskDifficulty,
   TaskList,
   TaskListsResponse,
   TaskPriority,
@@ -286,6 +287,7 @@ export function ListsPage() {
     description: string;
     durationMinutes: number;
     priority: TaskPriority;
+    difficulty: TaskDifficulty;
   }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
@@ -294,6 +296,7 @@ export function ListsPage() {
       description: values.description,
       duration_minutes: values.durationMinutes,
       priority: values.priority,
+      difficulty: values.difficulty,
     };
     const res =
       taskForm.mode === 'create'
