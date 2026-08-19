@@ -18,8 +18,8 @@ use thiserror::Error;
 use crate::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
     NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Task,
-    TaskCategory, TaskCategoryPattern, TaskList, UpdateTask, UpdateTaskCategory, UpdateTaskList,
-    User, WatchChannel, NewWatchChannel,
+    TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTask, UpdateTaskCategory,
+    UpdateTaskList, User, WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -116,6 +116,14 @@ pub trait CalendarEventRepo: Send + Sync {
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
     async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError>;
+    /// Returns the *living* cached event by `(calendar_id, google_event_id)` —
+    /// the exit path (`stop_running_event`) resolves the event a `started` log
+    /// points at, then reads its `start_time` before PATCHing the end.
+    async fn get_by_calendar_and_google_id(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<Option<CalendarEvent>, RepoError>;
     /// Events that *overlap* the half-open `[start, end)` window:
     /// `start_time < end AND end_time > start` (multi-day events are not
     /// clipped at window edges).
@@ -128,8 +136,7 @@ pub trait CalendarEventRepo: Send + Sync {
     /// The user's *living* timed events (task-tagged, joined to their
     /// calendars) with `task_id` set AND `start_time <= now < end_time` —
     /// the derived "running" set (RFC 3339 UTC strings of this shape compare
-    /// lexicographically). At most one such event per user is expected;
-    /// callers use the emptiness check for the one-running-task rule.
+    /// lexicographically). At most one such event per user is expected.
     async fn list_running_by_user_id(
         &self,
         user_id: &str,
@@ -245,8 +252,14 @@ pub trait TaskCategoryRepo: Send + Sync {
 /// All deletes are SOFT: `deleted_at` is stamped, rows are never removed.
 #[async_trait(?Send)]
 pub trait TaskRepo: Send + Sync {
-    /// The user's living tasks, most recently updated/created first.
+    /// The user's living tasks, grouped per status and ranked inside it by
+    /// `sort_order` then `created_at` (per-status board order; the frontend
+    /// regroups by computed category anyway).
     async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Task>, RepoError>;
+    /// Every living `IN_PROGRESS` task across ALL users — the elongate cron's
+    /// work list (`tasks.status` is the one-running lock, slice 1, so a
+    /// stale/expired event cache neither adds nor drops work here).
+    async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError>;
     /// Returns the task with local `id`, or `None` when absent or soft-deleted.
     /// NOT user-scoped; callers must verify `row.user_id` (the service does).
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError>;
@@ -254,10 +267,32 @@ pub trait TaskRepo: Send + Sync {
     /// generates the UUID `id`, stamps `created_at`/`updated_at`, and forces
     /// `status = "OPEN"` (this slice creates no other status).
     async fn insert(&self, task: NewTask) -> Result<Task, RepoError>;
-    /// Updates `title`/`description`/`duration_minutes`/`priority` on a living
-    /// task (`None` fields are left unchanged; status is never touched here)
-    /// and returns the updated row, or `None` when the task is missing or
-    /// soft-deleted.
+    /// Shifts the living tasks of `user_id` in `status` whose `sort_order` is
+    /// `>= from_inclusive` up by one — the peer shift behind the Backlog
+    /// prepend (create) and the move endpoint's cross-column placement. Never
+    /// touches `updated_at`: re-ranking is not a content change.
+    async fn shift_sort_order(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+    ) -> Result<(), RepoError>;
+    /// Signed peer shift over the closed `[from_inclusive, to_inclusive]`
+    /// range (`delta` +1 up, -1 down) — the move endpoint's same-column
+    /// neighbor reorder (the moving task itself never falls inside its own
+    /// shift range). Never touches `updated_at`.
+    async fn shift_sort_order_by(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+        to_inclusive: i64,
+        delta: i64,
+    ) -> Result<(), RepoError>;
+    /// Updates `title`/`description`/`duration_minutes`/`priority`/
+    /// `difficulty` on a living task (`None` fields are left unchanged; status
+    /// is never touched here) and returns the updated row, or `None` when the
+    /// task is missing or soft-deleted.
     async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError>;
     /// Transitions `status` on a living task (slice 4 timer: start/stop/pause/
     /// complete/discard). Returns the updated row, or `None` when the task is
@@ -269,21 +304,31 @@ pub trait TaskRepo: Send + Sync {
         status: &str,
         now_rfc3339: &str,
     ) -> Result<Option<Task>, RepoError>;
+    /// Sets the task's board rank on a living task and returns the updated
+    /// row, or `None` when missing/soft-deleted. Deliberately touches NEITHER
+    /// `status` NOR `updated_at`: the move endpoint places cards (cross-column
+    /// via `set_status` first, then this) without marking them content-updated.
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
 
 /// Task audit-trail persistence (`task_logs` rows).
 ///
-/// Append-only by design — there is no update, delete, or even read method on
-/// the trait. The service logs transitions (started/stopped/paused/completed/
-/// discarded) and nothing ever mutates those rows.
+/// Append-only by design — nothing ever updates or deletes a row. The only
+/// read is [`TaskLogRepo::latest_started_by_task_id`]: closing a run PATCHes
+/// the Google event the task's most recent `started` row points at, so the
+/// timer never depends on the event window for identity.
 #[async_trait(?Send)]
 pub trait TaskLogRepo: Send + Sync {
     /// Inserts one log row. The D1 implementation generates the UUID `id` and
     /// the `created_at` timestamp; `at` (the transition instant) comes from
     /// the service. Returns the generated `id`.
     async fn insert(&self, log: NewTaskLog, now_rfc3339: &str) -> Result<String, RepoError>;
+    /// The task's most recent `started` row (ties broken by insertion time),
+    /// or `None` when the task never started. Its `calendar_id`/
+    /// `google_event_id` name the event the exit verbs PATCH.
+    async fn latest_started_by_task_id(&self, task_id: &str) -> Result<Option<TaskLog>, RepoError>;
 }
 
 /// Google Calendar watch channel persistence (`google_calendars_watch_channels`
@@ -426,6 +471,12 @@ pub const CALENDAR_DELETE_SQL: &str =
 
 pub const EVENT_GET_BY_ID_SQL: &str =
     "SELECT * FROM calendar_events WHERE id = ? AND deleted_at IS NULL";
+
+/// The exit path's event lookup: the living cached row a `started` log points
+/// at (its `start_time` decides the PATCH end / displace start, on the minute
+/// grid).
+pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
+    "SELECT * FROM calendar_events WHERE calendar_id = ? AND google_event_id = ? AND deleted_at IS NULL";
 
 /// Overlap semantics: an event intersects `[start, end)` when it begins before
 /// the window ends AND ends after it begins — multi-day and overnight events
@@ -669,22 +720,53 @@ pub const TASK_CATEGORY_PATTERNS_INSERT_SQL: &str = "
 // Task SQL
 // ──────────────────────────────────────────
 
-/// Living tasks for the user, most recently updated first (ties broken by
-/// creation time). No order outside the app's control: the frontend regroups
-/// by computed category anyway.
+/// Living tasks for the user, grouped per status and ranked inside it by
+/// `sort_order` (ties by creation time). The `sort_order` segment carries the
+/// per-status board rank; `status ASC` keeps each rank contiguous.
 pub const TASK_LIST_BY_USER_ID_SQL: &str =
-    "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC";
+    "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY status ASC, sort_order ASC, created_at ASC";
+
+/// The elongate cron's work list: every living IN_PROGRESS task, all users
+/// (the status is the one-running lock — soft-deleted rows are filtered).
+pub const TASK_LIST_IN_PROGRESS_SQL: &str =
+    "SELECT * FROM tasks WHERE status = 'IN_PROGRESS' AND deleted_at IS NULL";
 
 pub const TASK_GET_BY_ID_SQL: &str =
     "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL";
 
 /// Plain INSERT (no `ON CONFLICT`): tasks are user-authored, never upserted.
-/// The D1 implementation binds the UUID `id`, the timestamps, and the
-/// hardcoded `status = 'OPEN'` (this slice creates no other status).
+/// The D1 implementation binds the UUID `id`, the timestamps, the hardcoded
+/// `status = 'OPEN'`, and the caller-shifted `sort_order` — `create_task`
+/// shifts living OPEN peers up by one, then inserts at 0 (Backlog prepend).
 pub const TASK_INSERT_SQL: &str = "
-    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, difficulty, status, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
+
+/// The Backlog-prepend peer shift: every living task of the user in `status`
+/// ranked at or after `from_inclusive` moves up one. `updated_at` is left
+/// alone on purpose — re-ranking is a position change, not a content update.
+pub const TASK_SHIFT_SORT_ORDER_SQL: &str = "
+    UPDATE tasks
+    SET sort_order = sort_order + 1
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND sort_order >= ?
+";
+
+/// Signed peer shift over `[from_inclusive, to_inclusive]` (`delta` +1 up,
+/// -1 down) — the move endpoint's same-column neighbor reorder. The bounds
+/// keep the moving card out of its own shift: front drags shift `[new, old)`
+/// up, back drags shift `(old, new]` down. `updated_at` is left alone, same
+/// as `TASK_SHIFT_SORT_ORDER_SQL`.
+pub const TASK_SHIFT_SORT_ORDER_RANGE_SQL: &str = "
+    UPDATE tasks
+    SET sort_order = sort_order + ?
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND sort_order >= ? AND sort_order <= ?
+";
+
+/// Sets the task's board rank on a living row. No `status`, no `updated_at`:
+/// placement is a position change, not a content update.
+pub const TASK_SET_SORT_ORDER_SQL: &str =
+    "UPDATE tasks SET sort_order = ? WHERE id = ? AND deleted_at IS NULL";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). Status
 /// is intentionally not updatable — slice 4 adds the status transitions. The
@@ -697,6 +779,7 @@ pub const TASK_UPDATE_SQL: &str = "
         description = COALESCE(?, description),
         duration_minutes = COALESCE(?, duration_minutes),
         priority = COALESCE(?, priority),
+        difficulty = COALESCE(?, difficulty),
         updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
 ";
@@ -716,6 +799,16 @@ pub const TASK_SET_STATUS_SQL: &str =
 pub const TASK_LOG_INSERT_SQL: &str = "
     INSERT INTO task_logs (id, task_id, user_id, type, at, calendar_id, google_event_id, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+/// The exit verbs' event identity: the task's most recent `started` row (the
+/// `type` column is TEXT, so the literal needs no quotes gymnastics; ties by
+/// `created_at` keep the D1 insertion order).
+pub const TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL: &str = "
+    SELECT * FROM task_logs
+    WHERE task_id = ? AND type = 'started'
+    ORDER BY at DESC, created_at DESC
+    LIMIT 1
 ";
 
 // ──────────────────────────────────────────
@@ -1136,25 +1229,37 @@ mod tests {
     }
 
     #[test]
-    fn task_reads_filter_soft_deleted_rows_and_order_by_updated_then_created() {
+    fn task_reads_filter_soft_deleted_rows_and_order_by_status_sort_then_created() {
         assert!(TASK_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_LIST_BY_USER_ID_SQL);
         let order_start = TASK_LIST_BY_USER_ID_SQL
             .find("ORDER BY")
             .expect("has ORDER BY");
         assert_eq!(
             &TASK_LIST_BY_USER_ID_SQL[order_start..],
-            "ORDER BY updated_at DESC, created_at DESC"
+            "ORDER BY status ASC, sort_order ASC, created_at ASC"
         );
         assert!(TASK_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_GET_BY_ID_SQL);
     }
 
     #[test]
-    fn task_insert_binds_all_9_columns_with_status_open() {
+    fn task_list_in_progress_filters_status_and_living_rows() {
+        // The elongate cron's work list: IN_PROGRESS status is the lock
+        // (`status` TEXT compares to the quoted literal), soft-deleted rows
+        // are filtered, and there is deliberately no user filter — all users.
+        let sql = TASK_LIST_IN_PROGRESS_SQL;
+        assert!(sql.starts_with("SELECT * FROM tasks"), "{sql}");
+        assert!(sql.contains("status = 'IN_PROGRESS'"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("user_id"), "all users, not one: {sql}");
+    }
+
+    #[test]
+    fn task_insert_binds_all_11_columns_with_status_open() {
         assert!(TASK_INSERT_SQL.contains("INSERT INTO tasks"), "{}", TASK_INSERT_SQL);
         assert!(!TASK_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_INSERT_SQL);
         assert_eq!(
             TASK_INSERT_SQL.matches('?').count(),
-            9,
+            11,
             "one placeholder per column: {}",
             TASK_INSERT_SQL
         );
@@ -1163,10 +1268,47 @@ mod tests {
         assert!(TASK_INSERT_SQL.contains("status"), "{TASK_INSERT_SQL}");
         for column in [
             "id", "user_id", "title", "description", "duration_minutes",
-            "priority", "status", "created_at", "updated_at",
+            "priority", "difficulty", "status", "sort_order", "created_at",
+            "updated_at",
         ] {
             assert!(TASK_INSERT_SQL.contains(column), "missing {column}");
         }
+    }
+
+    #[test]
+    fn task_shift_sort_order_shifts_living_peers_without_touching_updated_at() {
+        let sql = TASK_SHIFT_SORT_ORDER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("sort_order = sort_order + 1"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("sort_order >= ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+    }
+
+    #[test]
+    fn task_set_sort_order_touches_only_rank_on_living_rows() {
+        let sql = TASK_SET_SORT_ORDER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("SET sort_order = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("status"), "placement never touches status: {sql}");
+        assert!(!sql.contains("updated_at"), "placement never bumps updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn task_shift_sort_order_range_binds_signed_delta_and_both_bounds() {
+        let sql = TASK_SHIFT_SORT_ORDER_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("sort_order = sort_order + ?"), "{sql}");
+        assert!(sql.contains("sort_order >= ? AND sort_order <= ?"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 5, "{sql}");
     }
 
     #[test]
@@ -1177,10 +1319,11 @@ mod tests {
         assert!(sql.contains("COALESCE(?, description)"), "{sql}");
         assert!(sql.contains("COALESCE(?, duration_minutes)"), "{sql}");
         assert!(sql.contains("COALESCE(?, priority)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, difficulty)"), "{sql}");
         assert!(!sql.contains("status"), "status is not updatable this slice: {sql}");
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
-        // 4 COALESCE binds + now + id: nothing else.
-        assert_eq!(sql.matches('?').count(), 6, "{sql}");
+        // 5 COALESCE binds + now + id: nothing else.
+        assert_eq!(sql.matches('?').count(), 7, "{sql}");
     }
 
     #[test]
@@ -1229,5 +1372,27 @@ mod tests {
             assert!(sql.contains(column), "missing {column} in {sql}");
         }
         assert_eq!(sql.matches('?').count(), 8, "{sql}");
+    }
+
+    #[test]
+    fn task_log_latest_started_query_filters_type_and_takes_newest() {
+        let sql = TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL;
+        assert!(sql.contains("SELECT * FROM task_logs"), "{sql}");
+        assert!(sql.contains("task_id = ?"), "{sql}");
+        assert!(sql.contains("type = 'started'"), "only started rows: {sql}");
+        assert!(
+            sql.contains("ORDER BY at DESC, created_at DESC"),
+            "{sql}"
+        );
+        assert!(sql.contains("LIMIT 1"), "{sql}");
+    }
+
+    #[test]
+    fn event_get_by_calendar_and_google_id_filters_living_rows() {
+        let sql = EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL;
+        assert!(sql.starts_with("SELECT * FROM calendar_events"), "{sql}");
+        assert!(sql.contains("calendar_id = ?"), "{sql}");
+        assert!(sql.contains("google_event_id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
     }
 }

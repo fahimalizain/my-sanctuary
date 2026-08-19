@@ -3,6 +3,7 @@ export interface Task {
   title: string;
   duration: number;
   priority: 'high' | 'medium' | 'low';
+  difficulty?: TaskDifficulty;
   completed?: boolean;
 }
 
@@ -179,6 +180,7 @@ export interface UpdateCategoryInput {
 }
 
 export type TaskPriority = 'high' | 'medium' | 'low';
+export type TaskDifficulty = 'easy' | 'medium' | 'hard';
 
 // The computed category attached to a task (`tasks` have no category_id
 // column — the server classifies the title and returns this summary). The
@@ -193,10 +195,24 @@ export interface TaskCategorySummary {
   color: string;
 }
 
+// Response of GET /api/tasks/classify?title=… — the title→category match the
+// create/update endpoints enforce, as a preview (never writes). Externally-
+// tagged serde enum: {"Matched":{"category":{...}}} or
+// {"Untracked":{"conflict":bool,"categories":[...]}}.
+export type ClassifyResponse =
+  | { Matched: { category: TaskCategorySummary } }
+  | { Untracked: { conflict: boolean; categories: TaskCategorySummary[] } };
+
 // A task as returned by the API: the `tasks` row shape (snake_case) plus the
-// computed `category`. `status` is driven by the timer endpoints:
-// "OPEN" | "IN_PROGRESS" | "COMPLETED" | "DISCARDED".
-export type TaskStatus = 'OPEN' | 'IN_PROGRESS' | 'COMPLETED' | 'DISCARDED';
+// computed `category`. `status` is driven by the timer endpoints: start →
+// "IN_PROGRESS", stop → "OPEN", pause → "PLANNED" (since ADR 0002),
+// complete/discard → their terminal states.
+export type TaskStatus =
+  | 'OPEN'
+  | 'PLANNED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'DISCARDED';
 
 export interface TaskRecord {
   id: string;
@@ -205,6 +221,10 @@ export interface TaskRecord {
   description: string;
   duration_minutes: number;
   priority: TaskPriority;
+  difficulty: TaskDifficulty;
+  // Per-user, per-status board rank; 0 = front of the column (Backlog
+  // prepends). Part of the row since migration 0005.
+  sort_order: number;
   status: TaskStatus;
   created_at: string;
   updated_at: string;
@@ -228,21 +248,61 @@ export interface DeleteTaskResponse {
 
 // Request body for POST /api/tasks. The title must uniquely match a
 // non-untracked category (the server decides and explains 400s); duration
-// defaults to 15 minutes, priority to 'medium'.
+// defaults to 15 minutes, priority to 'medium', difficulty to 'easy'.
 export interface NewTaskInput {
   title: string;
   description?: string;
   duration_minutes?: number;
   priority?: TaskPriority;
+  difficulty?: TaskDifficulty;
 }
 
 // Request body for PATCH /api/tasks/:id — every field optional. A present
 // `title` must uniquely match a non-untracked category. Status is never
 // updatable through PATCH: use the timer endpoints (start/stop/pause/
-// complete/discard) instead.
+// complete/discard) or the move endpoint instead.
 export interface UpdateTaskInput {
   title?: string;
   description?: string;
   duration_minutes?: number;
   priority?: TaskPriority;
+  difficulty?: TaskDifficulty;
+}
+
+// The optional `displace` sub-object of a move: parks the currently running
+// task (its landing status must be PLANNED/COMPLETED/DISCARDED — never
+// OPEN/IN_PROGRESS) before the moved task starts.
+export interface MoveDisplaceInput {
+  id: string;
+  status: 'PLANNED' | 'COMPLETED' | 'DISCARDED';
+  sort_order: number;
+}
+
+// Request body for POST /api/tasks/:id/move — the board drop. The server
+// dispatches the ADR 0002 transition matrix (start/stop/pause/complete/
+// discard/plan/unplan/reopen), then places the task at `sort_order` in the
+// target status. Same-status moves are reorders. `displace` is optional /
+// null and only valid when moving to IN_PROGRESS.
+export interface MoveTaskInput {
+  status: TaskStatus;
+  sort_order: number;
+  displace?: MoveDisplaceInput | null;
+}
+
+// The envelope returned by POST /api/tasks/:id/move: the moved task, the
+// optionally displaced (parked) task, and the Google event the dispatched
+// action touched. The move event carries extra internal cache fields; the
+// board only distinguishes null/event, so it is typed loosely.
+export interface MoveTaskResponse {
+  task: TaskRecord;
+  displaced: TaskRecord | null;
+  event: CalendarEvent | null;
+}
+
+// Start failure AFTER a successful displace: no rollback — the displaced
+// task stays parked, and `displaced` lets the client snap the moved card
+// back. All other errors stay `{ error: string }`.
+export interface MoveTaskError {
+  error: string;
+  displaced?: TaskRecord;
 }

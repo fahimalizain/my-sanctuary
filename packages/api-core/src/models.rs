@@ -437,15 +437,16 @@ pub struct NewTaskCategoryPattern {
 ///
 /// Doubles as the D1 row projection AND part of the API response payload:
 /// serde field names are snake_case and match the frontend `TaskRecord`
-/// (`title, description, duration_minutes, priority, status` plus ids and
-/// timestamps). Classification lives on the **category** side only — there is
-/// deliberately no `category_id`/`list_id` column; the service computes the
-/// category per title via `classify` and attaches it to the task view.
+/// (`title, description, duration_minutes, priority, difficulty, status` plus
+/// ids and timestamps). Classification lives on the **category** side only —
+/// there is deliberately no `category_id`/`list_id` column; the service
+/// computes the category per title via `classify` and attaches it to the task
+/// view.
 ///
 /// Create stamps `status = "OPEN"`. Transitions — `IN_PROGRESS`, back to
-/// `OPEN`, `COMPLETED`, `DISCARDED` — happen exclusively through the timer
-/// endpoints (start/stop/pause/complete/discard); the public `UpdateTask`
-/// has no status field.
+/// `OPEN` (stop), `PLANNED` (pause), `COMPLETED`, `DISCARDED` — happen
+/// exclusively through the timer endpoints (start/stop/pause/complete/
+/// discard); the public `UpdateTask` has no status field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -458,7 +459,14 @@ pub struct Task {
     pub duration_minutes: i64,
     /// `high|medium|low`; service enforces the enum (default `medium`).
     pub priority: String,
-    /// `OPEN` for every task in this slice; slice 4 adds transitions.
+    /// `easy|medium|hard`; service enforces the enum (default `easy`).
+    pub difficulty: String,
+    /// Per-user, per-status board rank (0 = front of the column). `default`
+    /// so a row JSON that predates migration 0005 (or omits the column) reads
+    /// as 0 — the schema default.
+    #[serde(default)]
+    pub sort_order: i64,
+    /// `OPEN` for every created task; the timer moves it through the states.
     pub status: String,
     /// RFC 3339 instant.
     pub created_at: String,
@@ -479,10 +487,15 @@ pub struct NewTask {
     pub description: String,
     pub duration_minutes: i64,
     pub priority: String,
+    pub difficulty: String,
+    /// Backlog rank; `create_task` always passes 0 (after shifting the living
+    /// OPEN peers up by one).
+    pub sort_order: i64,
 }
 
-/// Request body for `POST /api/tasks`. `duration_minutes`/`priority` default
-/// server-side (15, `medium`); `description` defaults to `""`.
+/// Request body for `POST /api/tasks`. `duration_minutes`/`priority`/
+/// `difficulty` default server-side (15, `medium`, `easy`); `description`
+/// defaults to `""`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewTaskInput {
     pub title: String,
@@ -492,6 +505,8 @@ pub struct NewTaskInput {
     pub duration_minutes: Option<i64>,
     #[serde(default)]
     pub priority: Option<String>,
+    #[serde(default)]
+    pub difficulty: Option<String>,
 }
 
 /// One entry of the task audit trail, as stored in `task_logs`.
@@ -546,6 +561,7 @@ pub struct UpdateTask {
     pub description: Option<String>,
     pub duration_minutes: Option<i64>,
     pub priority: Option<String>,
+    pub difficulty: Option<String>,
 }
 
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
@@ -817,7 +833,8 @@ mod tests {
             r##"{
                 "id": "t-1", "user_id": "u-1", "title": "Review | Work",
                 "description": null, "duration_minutes": 15, "priority": "high",
-                "status": "OPEN", "created_at": "2026-08-18T00:00:00Z",
+                "difficulty": "hard", "sort_order": 3, "status": "OPEN",
+                "created_at": "2026-08-18T00:00:00Z",
                 "updated_at": "2026-08-18T00:00:00Z", "deleted_at": null
             }"##,
         )
@@ -826,8 +843,27 @@ mod tests {
         assert_eq!(task.description, "", "NULL maps to empty string");
         assert_eq!(task.duration_minutes, 15);
         assert_eq!(task.priority, "high");
+        assert_eq!(task.difficulty, "hard");
+        assert_eq!(task.sort_order, 3, "rank is part of the row shape");
         assert_eq!(task.status, "OPEN");
         assert_eq!(task.deleted_at, None);
+    }
+
+    #[test]
+    fn task_sort_order_defaults_to_zero_when_omitted() {
+        // Rows created before migration 0005 (and any JSON that leaves the
+        // column out) must read as 0, matching the schema default.
+        let task: Task = serde_json::from_str(
+            r##"{
+                "id": "t-2", "user_id": "u-1", "title": "Old",
+                "description": null, "duration_minutes": 15, "priority": "low",
+                "difficulty": "easy", "status": "OPEN",
+                "created_at": "2026-08-18T00:00:00Z",
+                "updated_at": "2026-08-18T00:00:00Z", "deleted_at": null
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(task.sort_order, 0);
     }
 
     #[test]
@@ -839,6 +875,8 @@ mod tests {
             description: "Deep focus".to_string(),
             duration_minutes: 25,
             priority: "medium".to_string(),
+            difficulty: "easy".to_string(),
+            sort_order: 4,
             status: "OPEN".to_string(),
             created_at: "2026-08-18T00:00:00Z".to_string(),
             updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -853,6 +891,8 @@ mod tests {
             "description",
             "duration_minutes",
             "priority",
+            "difficulty",
+            "sort_order",
             "status",
             "created_at",
             "updated_at",
@@ -861,18 +901,21 @@ mod tests {
         }
         assert_eq!(value["duration_minutes"], 25);
         assert_eq!(value["priority"], "medium");
+        assert_eq!(value["difficulty"], "easy");
+        assert_eq!(value["sort_order"], 4);
         assert_eq!(value["status"], "OPEN");
     }
 
     #[test]
     fn new_task_input_defaults_to_none_for_optional_fields() {
         // A body with only the title must not fail: description/duration/
-        // priority default server-side.
+        // priority/difficulty default server-side.
         let input: NewTaskInput = serde_json::from_str(r#"{"title": "Work"}"#).unwrap();
         assert_eq!(input.title, "Work");
         assert_eq!(input.description, None);
         assert_eq!(input.duration_minutes, None);
         assert_eq!(input.priority, None);
+        assert_eq!(input.difficulty, None);
     }
 
     #[test]
@@ -886,6 +929,7 @@ mod tests {
                 description: None,
                 duration_minutes: None,
                 priority: None,
+                difficulty: None,
             }
         );
     }

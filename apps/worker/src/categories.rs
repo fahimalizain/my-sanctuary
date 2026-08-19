@@ -23,13 +23,13 @@ fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response
     json_error(ctx, 401, "unauthorized")
 }
 
-/// Builds a JSON `{"error": msg}` response with CORS headers.
+/// Builds a JSON `{"error": msg}` response with JSON + CORS headers.
 fn json_error(
     ctx: &RouteContext<Option<api_core::Config>>,
     status: u16,
     message: &str,
 ) -> Result<Response> {
-    let headers = crate::auth::cors_headers(crate::auth::frontend_url(ctx))?;
+    let headers = crate::auth::json_headers(crate::auth::frontend_url(ctx))?;
     let response = Response::from_json(&serde_json::json!({ "error": message }))?
         .with_status(status)
         .with_headers(headers);
@@ -75,7 +75,7 @@ pub async fn list_categories(
     match api_core::categories::list_categories(&d1(&ctx)?, &user.id).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,
             ))?))
         }
@@ -100,7 +100,7 @@ pub async fn create_category(
     match api_core::categories::create_category(&d1(&ctx)?, &lists_d1(&ctx)?, &user.id, &input).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,
             ))?))
         }
@@ -129,7 +129,7 @@ pub async fn update_category(
     match api_core::categories::update_category(&d1(&ctx)?, &lists_d1(&ctx)?, &user.id, id, &updates).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,
             ))?))
         }
@@ -154,7 +154,7 @@ pub async fn delete_category(
     match api_core::categories::delete_category(&d1(&ctx)?, &user.id, id, &now_rfc3339).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,
             ))?))
         }

@@ -14,7 +14,7 @@
 use api_core::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
     NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
-    NewWatchChannel, Task, TaskCategory, TaskCategoryPattern, TaskList, UpdateTask,
+    NewWatchChannel, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTask,
     UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
@@ -24,16 +24,21 @@ use api_core::repo::{
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
-    EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
+    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
+    EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
-    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
+    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
-    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL, TASK_UPDATE_SQL,
-    TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
+    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
+    TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL,
+    TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
+    TASK_SET_STATUS_SQL,
+    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
     TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
     USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
     WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
@@ -427,6 +432,19 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             .db
             .prepare(EVENT_GET_BY_ID_SQL)
             .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<CalendarEvent>(None).await.map_err(backend)
+    }
+
+    async fn get_by_calendar_and_google_id(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<Option<CalendarEvent>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(google_event_id)])
             .map_err(backend)?;
         stmt.first::<CalendarEvent>(None).await.map_err(backend)
     }
@@ -913,6 +931,13 @@ impl TaskRepo for D1TaskRepo {
         query_vec(stmt).await
     }
 
+    async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
+        // The elongate cron's work list: every living IN_PROGRESS row, all
+        // users (status is the one-running lock). No binds — `prepare`
+        // returns the statement directly when there is nothing to bind.
+        query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
         let stmt = self
             .db
@@ -926,7 +951,9 @@ impl TaskRepo for D1TaskRepo {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
         // This slice creates tasks in exactly one status; the literal is bound
-        // here (the schema's DEFAULT 'OPEN' is a backstop only).
+        // here (the schema's DEFAULT 'OPEN' is a backstop only). The caller
+        // (create_task) already shifted living OPEN peers, so `sort_order` is
+        // stored as given — always 0 today.
         let stmt = self
             .db
             .prepare(TASK_INSERT_SQL)
@@ -937,7 +964,9 @@ impl TaskRepo for D1TaskRepo {
                 D1Type::Text(&task.description),
                 D1Type::Integer(task.duration_minutes as i32),
                 D1Type::Text(&task.priority),
+                D1Type::Text(&task.difficulty),
                 D1Type::Text(api_core::TASK_STATUS_OPEN),
+                D1Type::Integer(task.sort_order as i32),
                 D1Type::Text(&now),
                 D1Type::Text(&now),
             ])
@@ -950,11 +979,56 @@ impl TaskRepo for D1TaskRepo {
             description: task.description,
             duration_minutes: task.duration_minutes,
             priority: task.priority,
+            difficulty: task.difficulty,
+            sort_order: task.sort_order,
             status: api_core::TASK_STATUS_OPEN.to_string(),
             created_at: now.clone(),
             updated_at: now,
             deleted_at: None,
         })
+    }
+
+    async fn shift_sort_order(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_SHIFT_SORT_ORDER_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(status),
+                D1Type::Integer(from_inclusive as i32),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn shift_sort_order_by(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+        to_inclusive: i64,
+        delta: i64,
+    ) -> Result<(), RepoError> {
+        // Signed peer shift over `[from_inclusive, to_inclusive]` — bound
+        // both ends so the moving card never shifts itself, regardless of
+        // the delta's sign.
+        let stmt = self
+            .db
+            .prepare(TASK_SHIFT_SORT_ORDER_RANGE_SQL)
+            .bind_refs(&[
+                D1Type::Integer(delta as i32),
+                D1Type::Text(user_id),
+                D1Type::Text(status),
+                D1Type::Integer(from_inclusive as i32),
+                D1Type::Integer(to_inclusive as i32),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 
     async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError> {
@@ -967,6 +1041,7 @@ impl TaskRepo for D1TaskRepo {
             None => D1Type::Null,
         };
         let priority = optional_text(updates.priority.as_deref());
+        let difficulty = optional_text(updates.difficulty.as_deref());
         let now = now_rfc3339();
         let stmt = self
             .db
@@ -976,6 +1051,7 @@ impl TaskRepo for D1TaskRepo {
                 description,
                 duration_minutes,
                 priority,
+                difficulty,
                 D1Type::Text(&now),
                 D1Type::Text(id),
             ])
@@ -994,6 +1070,18 @@ impl TaskRepo for D1TaskRepo {
             .db
             .prepare(TASK_SET_STATUS_SQL)
             .bind_refs(&[D1Type::Text(status), D1Type::Text(now_rfc3339), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError> {
+        // Placement only: no status, no `updated_at` (re-ranking is not a
+        // content change). The fresh row is re-read like `set_status` does.
+        let stmt = self
+            .db
+            .prepare(TASK_SET_SORT_ORDER_SQL)
+            .bind_refs(&[D1Type::Integer(sort_order as i32), D1Type::Text(id)])
             .map_err(backend)?;
         run_stmt(stmt).await?;
         self.get_by_id(id).await
@@ -1047,6 +1135,18 @@ impl TaskLogRepo for D1TaskLogRepo {
             return Err(RepoError::Backend(result.error().unwrap_or_default()));
         }
         Ok(id)
+    }
+
+    async fn latest_started_by_task_id(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskLog>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL)
+            .bind_refs(&[D1Type::Text(task_id)])
+            .map_err(backend)?;
+        stmt.first::<TaskLog>(None).await.map_err(backend)
     }
 }
 

@@ -29,6 +29,12 @@ pub(crate) fn cors_headers(origin: &str) -> Result<Headers> {
     Ok(headers)
 }
 
+pub(crate) fn json_headers(origin: &str) -> Result<Headers> {
+    let headers = cors_headers(origin)?;
+    headers.set("Content-Type", "application/json")?;
+    Ok(headers)
+}
+
 /// Builds a plain-text error response with CORS headers. When `clear_state` is
 /// set it also expires the `oauth_state` cookie (used after the state check
 /// passes, so a half-finished login never leaves a stale cookie behind).
@@ -88,14 +94,14 @@ pub(crate) fn session_user(req: &Request, config: Option<&api_core::Config>) -> 
 pub fn me(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let user = session_user(&req, ctx.data.as_ref());
     let response = Response::from_json(&api_core::MeResponse { user })?;
-    Ok(response.with_headers(cors_headers(frontend_url(&ctx))?))
+    Ok(response.with_headers(json_headers(frontend_url(&ctx))?))
 }
 
 /// `POST /auth/logout` → 200 `{"success":true}` plus a `Set-Cookie` that
 /// expires the session cookie.
 pub fn logout(_req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let secure = ctx.data.as_ref().map(|c| c.secure_cookie).unwrap_or(false);
-    let headers = cors_headers(frontend_url(&ctx))?;
+    let headers = json_headers(frontend_url(&ctx))?;
     headers.set("Set-Cookie", &api_core::clear_session_cookie_header(secure))?;
     let response = Response::from_json(&api_core::LogoutResponse { success: true })?;
     Ok(response.with_headers(headers))

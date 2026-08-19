@@ -19,13 +19,13 @@ fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response
     json_error(ctx, 401, "unauthorized")
 }
 
-/// Builds a JSON `{"error": msg}` response with CORS headers.
+/// Builds a JSON `{"error": msg}` response with JSON + CORS headers.
 fn json_error(
     ctx: &RouteContext<Option<api_core::Config>>,
     status: u16,
     message: &str,
 ) -> Result<Response> {
-    let headers = crate::auth::cors_headers(crate::auth::frontend_url(ctx))?;
+    let headers = crate::auth::json_headers(crate::auth::frontend_url(ctx))?;
     let response = Response::from_json(&serde_json::json!({ "error": message }))?
         .with_status(status)
         .with_headers(headers);
@@ -58,7 +58,7 @@ pub async fn list_lists(req: Request, ctx: RouteContext<Option<api_core::Config>
     match api_core::list_lists(&lists, &categories, &user.id).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -83,7 +83,7 @@ pub async fn create_list(
     match api_core::create_list(&lists, &user.id, &input.name, &input.color).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -112,7 +112,7 @@ pub async fn update_list(
     match api_core::update_list(&lists, &user.id, id, &updates).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -139,7 +139,7 @@ pub async fn delete_list(
     match api_core::delete_list(&lists, &user.id, id, &now_rfc3339).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
