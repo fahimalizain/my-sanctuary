@@ -37,13 +37,13 @@ fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response
     json_error(ctx, 401, "unauthorized")
 }
 
-/// Builds a JSON `{"error": msg}` response with CORS headers.
+/// Builds a JSON `{"error": msg}` response with JSON + CORS headers.
 fn json_error(
     ctx: &RouteContext<Option<api_core::Config>>,
     status: u16,
     message: &str,
 ) -> Result<Response> {
-    let headers = crate::auth::cors_headers(crate::auth::frontend_url(ctx))?;
+    let headers = crate::auth::json_headers(crate::auth::frontend_url(ctx))?;
     let response = Response::from_json(&serde_json::json!({ "error": message }))?
         .with_status(status)
         .with_headers(headers);
@@ -60,7 +60,7 @@ fn json_error_with_displaced(
     message: &str,
     displaced: &api_core::TaskView,
 ) -> Result<Response> {
-    let headers = crate::auth::cors_headers(crate::auth::frontend_url(ctx))?;
+    let headers = crate::auth::json_headers(crate::auth::frontend_url(ctx))?;
     let response = Response::from_json(&serde_json::json!({ "error": message, "displaced": displaced }))?
         .with_status(status)
         .with_headers(headers);
@@ -192,7 +192,7 @@ pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>
     match api_core::list_tasks(&lists_d1(&ctx)?, &categories_d1(&ctx)?, &d1(&ctx)?, &user.id).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -215,7 +215,7 @@ pub async fn create_task(
     match api_core::create_task(&lists_d1(&ctx)?, &categories_d1(&ctx)?, &d1(&ctx)?, &user.id, &input).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -241,7 +241,7 @@ pub async fn update_task(
     match api_core::update_task(&categories_d1(&ctx)?, &d1(&ctx)?, &user.id, id, &updates).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -264,7 +264,7 @@ pub async fn delete_task(
     match api_core::delete_task(&d1(&ctx)?, &user.id, id, &now_rfc3339).await {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
@@ -423,7 +423,7 @@ fn respond_action(
     match result {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(ctx))?))
         }
         Err(err) => map_error(ctx, err),
     }
@@ -515,7 +515,7 @@ pub async fn move_task(
     match result {
         Ok(response) => {
             let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),
     }
