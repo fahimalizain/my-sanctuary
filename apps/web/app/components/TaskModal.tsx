@@ -42,8 +42,14 @@ interface TaskModalProps {
    *  (Lists page: no pills). */
   createStatus?: TaskStatus;
   /** Persists the form. Return an error message to show on the form (e.g.
-   *  the server's "title does not match a category"), or null to close. */
-  onSubmit: (values: TaskFormValues) => Promise<string | null>;
+   *  the server's "title does not match a category"), or null to close.
+   *  `displace` is only passed by create into an OCCUPIED In Progress
+   *  column, after the park dialog confirmed: the parent creates the task,
+   *  then follows with ONE /move carrying the parked runner. */
+  onSubmit: (
+    values: TaskFormValues,
+    displace?: MoveDisplaceInput,
+  ) => Promise<string | null>;
   /** Deletes the task (edit mode only). Return an error or null to close. */
   onDelete?: (taskId: string) => Promise<string | null>;
   /** Immediate status change (edit only). Return an error string to show on
@@ -99,7 +105,12 @@ export function TaskModal({
   // unsaved edits. The status pills read `task.status` from props directly,
   // so they still follow the merged record.
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Parent closed the modal — the park dialog must close with it even
+      // when it was the one on screen (overlay close, ESC, parent unmount).
+      setDisplaceOpen(false);
+      return;
+    }
     setTitle(task?.title || '');
     setDescription(task?.description || '');
     setPriority(task?.priority || 'medium');
@@ -121,22 +132,40 @@ export function TaskModal({
   // Occupied In Progress: the park dialog is open, move not yet dispatched.
   const [displaceOpen, setDisplaceOpen] = useState(false);
 
-  const handleSave = async () => {
+  /** Persists the form via `onSubmit` — shared by the Save button and the
+   *  create-mode park-dialog confirm (which passes `displace`). */
+  const submitForm = async (displace?: MoveDisplaceInput) => {
     setSaving(true);
     setFormError(null);
-    const error = await onSubmit({
-      title,
-      description,
-      durationMinutes: parseInt(duration, 10) || 15,
-      priority,
-      difficulty,
-    });
+    const error = await onSubmit(
+      {
+        title,
+        description,
+        durationMinutes: parseInt(duration, 10) || 15,
+        priority,
+        difficulty,
+      },
+      displace,
+    );
     setSaving(false);
     if (error) {
       setFormError(error);
       return;
     }
     onOpenChange(false);
+  };
+
+  const handleSave = async () => {
+    // Create into an OCCUPIED In Progress column: park the runner BEFORE any
+    // write — no orphan Backlog card is ever created just to discover the
+    // slot is taken. Cancel stays on the form (nothing created); confirm
+    // re-enters this path with `displace` via submitForm. The Save button is
+    // disabled on an empty title, so the dialog only opens with a real one.
+    if (!isEditing && createStatus === 'IN_PROGRESS' && runningTask) {
+      setDisplaceOpen(true);
+      return;
+    }
+    await submitForm();
   };
 
   const handleDelete = async () => {
@@ -181,8 +210,22 @@ export function TaskModal({
   const handleDisplaceConfirm = (
     parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
   ) => {
-    if (!task || !runningTask) return;
+    if (!runningTask) return;
     setDisplaceOpen(false);
+    // Create mode: the park dialog opened BEFORE the create write
+    // (handleSave intercepted). Confirming now runs the same submit path as
+    // Save, with the displace attached — the parent creates then moves in
+    // one flow, so nothing was written while the dialog was open.
+    if (!task && createStatus === 'IN_PROGRESS') {
+      void submitForm({
+        id: runningTask.id,
+        status: parkStatus,
+        sort_order: 0,
+      });
+      return;
+    }
+    // Edit mode: immediate status change with displace (existing behavior).
+    if (!task) return;
     void runMove('IN_PROGRESS', {
       id: runningTask.id,
       status: parkStatus,
@@ -469,7 +512,7 @@ export function TaskModal({
           if (!open) setDisplaceOpen(false);
         }}
         runningTitle={runningTask?.title ?? ''}
-        incomingTitle={task?.title ?? ''}
+        incomingTitle={title.trim() || 'this task'}
         onConfirm={handleDisplaceConfirm}
       />
     </>
