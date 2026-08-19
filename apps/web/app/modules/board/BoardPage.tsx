@@ -173,8 +173,12 @@ export function BoardPage() {
     difficulty !== undefined ||
     selectedCategoryIds.length > 0;
 
-  // Merges the given fields into the URL search params; `undefined` fields
-  // are removed. `replace` keeps filter toggling out of the history stack.
+  // Merges the given fields into the URL search params. Only keys that are
+  // PRESENT in `updates` are touched: an explicitly `undefined` value removes
+  // the param (the "All" toggles and clearFilters), while omitted keys (e.g.
+  // `{ priority: 'high' }` from setPriorityFilter) leave the sibling params
+  // intact — otherwise priority and category could never be combined.
+  // `replace` keeps filter toggling out of the history stack.
   const updateSearch = useCallback(
     (updates: Partial<BoardSearch>) => {
       navigate({
@@ -182,20 +186,26 @@ export function BoardPage() {
         replace: true,
         search: (prev) => {
           const next: BoardSearch = { ...prev };
-          if (updates.priority === undefined) {
-            delete next.priority;
-          } else {
-            next.priority = updates.priority;
+          if ('priority' in updates) {
+            if (updates.priority === undefined) {
+              delete next.priority;
+            } else {
+              next.priority = updates.priority;
+            }
           }
-          if (updates.difficulty === undefined) {
-            delete next.difficulty;
-          } else {
-            next.difficulty = updates.difficulty;
+          if ('difficulty' in updates) {
+            if (updates.difficulty === undefined) {
+              delete next.difficulty;
+            } else {
+              next.difficulty = updates.difficulty;
+            }
           }
-          if (updates.category === undefined) {
-            delete next.category;
-          } else {
-            next.category = updates.category;
+          if ('category' in updates) {
+            if (updates.category === undefined) {
+              delete next.category;
+            } else {
+              next.category = updates.category;
+            }
           }
           return next;
         },
