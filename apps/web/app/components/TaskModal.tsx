@@ -88,9 +88,11 @@ export function TaskModal({
   runningTask,
 }: TaskModalProps) {
   const isEditing = !!task;
-  // (Re)initialize the form whenever the dialog opens for a different target;
-  // state is set here rather than in useState initializers so switching
-  // between tasks reopens with the right values.
+  // (Re)initialize the form when the dialog opens or the target task id
+  // changes — never on a new `task` object with the same id, or a /move
+  // merge (parent sets a fresh record with the new status) would clobber
+  // unsaved edits. The status pills read `task.status` from props directly,
+  // so they still follow the merged record.
   useEffect(() => {
     if (!open) return;
     setTitle(task?.title || '');
@@ -100,7 +102,7 @@ export function TaskModal({
     setDuration(String(task?.duration_minutes || 15));
     setFormError(null);
     setDisplaceOpen(false);
-  }, [open, task]);
+  }, [open, task?.id]);
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
