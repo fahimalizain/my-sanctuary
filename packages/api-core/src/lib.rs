@@ -6,6 +6,7 @@
 
 pub mod calendar;
 pub mod categories;
+pub mod google_color;
 pub mod lists;
 pub mod models;
 pub mod oauth;
@@ -30,6 +31,7 @@ pub use calendar::{
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
 };
+pub use google_color::{closest_google_color_id, parse_hex_rgb, GOOGLE_EVENT_COLORS, HexColorError};
 pub use health::{HealthResponse, VersionResponse};
 pub use lists::{
     create_list, delete_list, list_lists, update_list, DeleteListResponse, ListsError,

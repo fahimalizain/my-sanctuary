@@ -365,6 +365,11 @@ pub async fn create_event(
             "shared": { "sanctuary_task_id": task_id }
         });
     }
+    // The stored category color, copied verbatim by `start_task`. Never
+    // included for hand-created events (`None`) or when blank after trim.
+    if let Some(color_id) = input.color_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        payload["colorId"] = serde_json::json!(color_id);
+    }
     let body =
         serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
     let (status, response) = http.post_json(&url, &access.access_token, &body).await?;
@@ -3149,6 +3154,7 @@ mod tests {
             start: "2026-08-19T09:00:00Z".to_string(),
             end: "2026-08-19T10:00:00Z".to_string(),
             task_id: None,
+            color_id: None,
         }
     }
 
@@ -3198,11 +3204,59 @@ mod tests {
         assert_eq!(body["description"], "About things");
         assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
         assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z");
+        assert!(body.get("colorId").is_none(), "hand-created events carry no colorId");
 
         // Cache upsert happened with the mapped row.
         let (google_id, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
         assert_eq!(google_id, "google-evt-created");
         assert_eq!(upserted.calendar_id, "cal-1");
+    }
+
+    #[test]
+    fn create_with_color_id_sends_color_id() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            CREATED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let mut input = input();
+        input.color_id = Some("7".to_string());
+
+        pollster::block_on(create_event(&http, &calendars, &events, &access(), &input, NOW_UNIX))
+            .unwrap();
+
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["colorId"], "7");
+    }
+
+    #[test]
+    fn create_with_blank_color_id_omits_the_key() {
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        for blank in ["", "   ", "\t"] {
+            let http = FakeHttp::new(vec![(
+                "/calendars/primary%40example.com/events",
+                200,
+                CREATED_JSON,
+            )]);
+            let mut input = input();
+            input.color_id = Some(blank.to_string());
+
+            pollster::block_on(create_event(
+                &http, &calendars, &events, &access(), &input, NOW_UNIX,
+            ))
+            .unwrap();
+
+            let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                body.get("colorId").is_none(),
+                "blank color_id {blank:?} must omit the key"
+            );
+        }
     }
 
     #[test]

@@ -617,6 +617,11 @@ pub struct NewEventInput {
     /// carrier — slice 4). `None` for hand-created events.
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Google event `colorId` (`"1"`..=`"11"`). Omitted from the Google
+    /// payload when `None`. `start_task` copies the matched category's
+    /// stored `google_color_id`. Hand-created events leave this unset.
+    #[serde(default)]
+    pub color_id: Option<String>,
 }
 
 #[cfg(test)]

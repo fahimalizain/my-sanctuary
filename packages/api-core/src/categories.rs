@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use thiserror::Error;
 
+use crate::google_color::closest_google_color_id;
 use crate::lists::SEED_LISTS;
 use crate::models::{
     NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, TaskCategory,
@@ -280,7 +281,9 @@ pub async fn ensure_taxonomy(
                     color: list.color.clone(),
                     is_productive: matches!(name, "Work" | "Fitness"),
                     google_calendar_id: None,
-                    google_color_id: None,
+                    // Derived from the list's hex color (seed hexes are
+                    // valid `#rrggbb`); map errors instead of panicking.
+                    google_color_id: Some(map_color(&list.color)?),
                     sort_order: list.sort_order,
                     is_untracked: false,
                 })
@@ -420,7 +423,9 @@ pub async fn create_category(
         validate_pattern(pattern)?;
     }
     let google_calendar_id = normalize_optional(input.google_calendar_id.as_deref());
-    let google_color_id = normalize_optional(input.google_color_id.as_deref());
+    // The client's `google_color_id` is ignored: the stored id is derived
+    // from the (non-empty, hex) `color` above.
+    let google_color_id = Some(map_color(&color)?);
     let sort_order = input.sort_order.unwrap_or(0);
 
     let (parent_id, list_id, parent) = match input.parent_id.as_deref() {
@@ -512,6 +517,13 @@ pub async fn update_category(
     id: &str,
     updates: &UpdateTaskCategory,
 ) -> Result<CategoryResponse, CategoriesError> {
+    // Work on an owned clone — the caller's struct is never mutated. The
+    // client's `google_color_id` is not a write: the stored id is derived
+    // from `color` below (or preserved by the repo's COALESCE when `color`
+    // is absent), so it is cleared first. A body that sends *only*
+    // `google_color_id` therefore falls out as "nothing to update".
+    let mut updates = updates.clone();
+    updates.google_color_id = None;
     if updates.title.is_none()
         && updates.slug.is_none()
         && updates.color.is_none()
@@ -553,6 +565,9 @@ pub async fn update_category(
         if color.trim().is_empty() {
             return Err(CategoriesError::Invalid("color must not be empty".to_string()));
         }
+        // The stored google_color_id always derives from the hex color;
+        // `None` here would leave the old id via the repo's COALESCE.
+        updates.google_color_id = Some(map_color(color)?);
     }
     if let Some(slug) = updates.slug.as_deref() {
         let slug = slug.trim();
@@ -613,7 +628,7 @@ pub async fn update_category(
         }
     }
 
-    let Some(updated) = repo.update(id, updates).await? else {
+    let Some(updated) = repo.update(id, &updates).await? else {
         // Deleted between the read and the write.
         return Err(CategoriesError::NotFound);
     };
@@ -703,6 +718,16 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Maps a hex color to the nearest Google event colorId (`"1"`..=`"11"`).
+///
+/// The client's `google_color_id` is never trusted: create/update/seed all
+/// derive the stored id from the category's hex `color` through
+/// [`closest_google_color_id`]. Non-hex colors (not `#rgb` / `#rrggbb`) are
+/// rejected with `CategoriesError::Invalid`.
+fn map_color(color: &str) -> Result<String, CategoriesError> {
+    closest_google_color_id(color).map_err(|err| CategoriesError::Invalid(err.to_string()))
 }
 
 /// Normalizes a pattern set: trimmed regex, blank calendar ids → `None`.
@@ -1341,6 +1366,17 @@ mod tests {
         let family = categories.iter().find(|cat| cat.slug == "family").unwrap();
         assert!(!family.is_productive, "Family is not productive");
 
+        // Each root's stored google_color_id derives from its hex color.
+        for cat in categories.iter().filter(|cat| !cat.is_untracked) {
+            assert_eq!(
+                cat.google_color_id,
+                Some(closest_google_color_id(&cat.color).unwrap()),
+                "{} ({}) derives its google color id",
+                cat.title,
+                cat.color
+            );
+        }
+
         // Two patterns per root, none on untracked.
         let mut pattern_count = 0;
         for category in &categories {
@@ -1356,6 +1392,10 @@ mod tests {
         let untracked = categories.iter().find(|cat| cat.is_untracked).unwrap();
         assert_eq!(untracked.slug, "untracked");
         assert_eq!(untracked.list_id, None);
+        assert_eq!(
+            untracked.google_color_id, None,
+            "untracked has no color, so no derived google color id"
+        );
         assert_eq!(
             pollster::block_on(category_repo.list_patterns_by_category_id(&untracked.id))
                 .unwrap()
@@ -1409,6 +1449,10 @@ mod tests {
         let categories = pollster::block_on(category_repo.list_by_user_id("u-1")).unwrap();
         assert_eq!(categories.len(), 1);
         assert!(categories[0].is_untracked);
+        assert_eq!(
+            categories[0].google_color_id, None,
+            "untracked is inserted without a google color id"
+        );
     }
 
     // ──────────────────────────────────────────
@@ -1462,11 +1506,77 @@ mod tests {
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.slug, "deep-work", "slugified from the title");
         assert_eq!(category.color, "#2a5c8a");
+        assert_eq!(
+            category.google_color_id.as_deref(),
+            Some("9"),
+            "stored google_color_id derives from the hex color"
+        );
         assert!(category.is_productive);
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
         assert_eq!(category.list_id.as_deref(), Some("l-1"));
         assert_eq!(category.patterns.len(), 2);
         assert_eq!(category.patterns[0].regex, "^Deep Work$");
+    }
+
+    #[test]
+    fn create_derives_google_color_id_and_ignores_client_value() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
+        let mut new_input = input("Work", "#2a5c8a");
+        new_input.list_id = Some("l-1".to_string());
+        new_input.google_color_id = Some("1".to_string());
+
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
+        assert_eq!(
+            response.category.google_color_id.as_deref(),
+            Some("9"),
+            "the client's google_color_id is ignored in favor of the derived id"
+        );
+    }
+
+    #[test]
+    fn create_rejects_non_hex_colors() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
+        for bad in ["blue", "#gg0000", "2a5c8a"] {
+            let mut new_input = input("Work", bad);
+            new_input.list_id = Some("l-1".to_string());
+            assert!(
+                matches!(
+                    pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
+                    Err(CategoriesError::Invalid(message)) if message == "color must be #rgb or #rrggbb"
+                ),
+                "color {bad:?} must be rejected as non-hex"
+            );
+        }
+        // Empty color still fails first with the empty message: the empty
+        // check runs before the hex mapping.
+        let mut empty = input("Work", "  ");
+        empty.list_id = Some("l-1".to_string());
+        assert!(matches!(
+            pollster::block_on(create_category(&repo, &lists, "u-1", &empty)),
+            Err(CategoriesError::Invalid(message)) if message == "color must not be empty"
+        ));
+        assert_eq!(
+            pollster::block_on(repo.count_by_user_id("u-1")).unwrap(),
+            0,
+            "nothing persisted"
+        );
+    }
+
+    #[test]
+    fn create_accepts_shorthand_hex() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
+        let mut new_input = input("Work", "#abc");
+        new_input.list_id = Some("l-1".to_string());
+
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
+        assert_eq!(
+            response.category.google_color_id,
+            Some(closest_google_color_id("#abc").unwrap()),
+            "#rgb expands by doubling nibbles before mapping"
+        );
     }
 
     #[test]
@@ -1682,11 +1792,93 @@ mod tests {
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.color, "#3a3a3a");
+        assert_eq!(
+            category.google_color_id,
+            Some(closest_google_color_id("#3a3a3a").unwrap()),
+            "stored google_color_id derives from the new color"
+        );
         assert!(!category.is_productive);
         assert_eq!(category.slug, "work", "slug untouched when omitted");
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
         assert_eq!(category.patterns.len(), 1, "old patterns replaced");
         assert_eq!(category.patterns[0].regex, "^Deep Work$");
+    }
+
+    #[test]
+    fn update_derives_google_color_id_and_ignores_client_value() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            color: Some("#2a5c8a".to_string()),
+            google_color_id: Some("1".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
+        assert_eq!(
+            response.category.google_color_id.as_deref(),
+            Some("9"),
+            "the client's google_color_id is ignored; the id derives from the color"
+        );
+    }
+
+    #[test]
+    fn update_without_color_keeps_stored_google_color_id() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        // The fake `row()` helper hardcodes google_color_id None; seed the
+        // stored row directly.
+        repo.stored.lock().unwrap()[0].google_color_id = Some("7".to_string());
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            title: Some("Deep Work".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
+        assert_eq!(response.category.title, "Deep Work");
+        assert_eq!(
+            response.category.google_color_id.as_deref(),
+            Some("7"),
+            "COALESCE keeps the stored id when color is untouched"
+        );
+    }
+
+    #[test]
+    fn update_google_color_id_alone_is_nothing_to_update() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            google_color_id: Some("7".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+            Err(CategoriesError::Invalid(message)) if message == "nothing to update"
+        ));
+    }
+
+    #[test]
+    fn update_rejects_non_hex_color() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            color: Some("blue".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+            Err(CategoriesError::Invalid(message)) if message == "color must be #rgb or #rrggbb"
+        ));
+        // Nothing persisted: the stored row is untouched.
+        let stored = pollster::block_on(repo.get_by_id("root")).unwrap().unwrap();
+        assert_eq!(stored.color, "#2a5c8a");
+        assert_eq!(stored.google_color_id, None);
     }
 
     #[test]
