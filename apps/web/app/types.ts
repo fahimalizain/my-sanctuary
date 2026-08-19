@@ -3,6 +3,7 @@ export interface Task {
   title: string;
   duration: number;
   priority: 'high' | 'medium' | 'low';
+  difficulty?: TaskDifficulty;
   completed?: boolean;
 }
 

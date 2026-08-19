@@ -66,7 +66,13 @@ export const todayItems: TimelineItem[] = [
     startTime: '9:00 AM',
     endTime: '12:00 PM',
     tasks: [
-      { id: 't1', title: 'Review Q3 Roadmap', duration: 30, priority: 'high' },
+      {
+        id: 't1',
+        title: 'Review Q3 Roadmap',
+        duration: 30,
+        priority: 'high',
+        difficulty: 'medium',
+      },
       { id: 't2', title: 'Team Standup', duration: 45, priority: 'high' },
       {
         id: 't3',
@@ -79,6 +85,7 @@ export const todayItems: TimelineItem[] = [
         title: 'Design API Architecture',
         duration: 90,
         priority: 'high',
+        difficulty: 'hard',
       },
       {
         id: 't5',
@@ -104,7 +111,13 @@ export const todayItems: TimelineItem[] = [
     startTime: '12:00 PM',
     endTime: '2:00 PM',
     tasks: [
-      { id: 't9', title: 'Strength Training', duration: 90, priority: 'high' },
+      {
+        id: 't9',
+        title: 'Strength Training',
+        duration: 90,
+        priority: 'high',
+        difficulty: 'hard',
+      },
     ],
   } as TimeBlock,
   {
@@ -116,7 +129,13 @@ export const todayItems: TimelineItem[] = [
     endTime: '4:00 PM',
     tasks: [
       { id: 't10', title: 'Pick up groceries', duration: 30, priority: 'high' },
-      { id: 't11', title: 'Cook dinner', duration: 60, priority: 'medium' },
+      {
+        id: 't11',
+        title: 'Cook dinner',
+        duration: 60,
+        priority: 'medium',
+        difficulty: 'medium',
+      },
     ],
   } as TimeBlock,
   {
