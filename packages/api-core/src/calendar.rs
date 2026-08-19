@@ -1617,6 +1617,24 @@ mod tests {
             Ok(None)
         }
 
+        async fn get_by_calendar_and_google_id(
+            &self,
+            calendar_id: &str,
+            google_event_id: &str,
+        ) -> Result<Option<CalendarEvent>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| {
+                    event.deleted_at.is_none()
+                        && event.calendar_id == calendar_id
+                        && event.google_event_id == google_event_id
+                })
+                .cloned())
+        }
+
         async fn list_by_user_id_and_time_range(
             &self,
             user_id: &str,

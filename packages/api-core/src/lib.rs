@@ -47,7 +47,8 @@ pub use oauth::{
 pub use repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
     TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
-    CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
+    CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
+    EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
     TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
@@ -57,7 +58,7 @@ pub use repo::{
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
     TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
-    TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL,
+    TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
 };
 pub use tasks::{
     complete_task, create_task, delete_task, discard_task, list_tasks, move_task, pause_task,
@@ -73,5 +74,5 @@ pub use session::{
     LogoutResponse, MeResponse, SessionError, SessionUser, SESSION_COOKIE_NAME,
     SESSION_DURATION_SECS,
 };
-pub use time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+pub use time::{nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 pub use token::{refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS};

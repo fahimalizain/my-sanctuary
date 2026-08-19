@@ -16,6 +16,21 @@ pub fn unix_secs_to_rfc3339(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Snaps a Unix timestamp (seconds) to the nearest whole minute (half-up):
+/// seconds < 30 floor to the current minute, seconds >= 30 ceil to the next.
+///
+/// Every timer Google write (start/stop/pause/complete/discard/displace)
+/// lands on this minute grid so elapsed-time reports never show sub-minute
+/// blocks. The result is always `rem_euclid(60) == 0`.
+pub fn nearest_minute_unix(secs: i64) -> i64 {
+    let rem = secs.rem_euclid(60);
+    if rem < 30 {
+        secs - rem
+    } else {
+        secs - rem + 60
+    }
+}
+
 /// Converts a count of days since the Unix epoch to a `(year, month, day)`
 /// civil date using Howard Hinnant's `civil_from_days` algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -179,6 +194,72 @@ mod tests {
             unix_secs_to_rfc3339(now + 3599),
             "2023-11-14T23:13:19Z"
         );
+    }
+
+    #[test]
+    fn nearest_minute_floors_below_30_seconds() {
+        // 22:13:20 → 22:13:00 (floor).
+        assert_eq!(nearest_minute_unix(1_700_000_000), 1_700_000_000 - 20);
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(1_700_000_000)),
+            "2023-11-14T22:13:00Z"
+        );
+        // :00 stays put; :29 floors; :01 floors.
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(rfc3339_to_unix_secs("2023-11-14T22:13:00Z").unwrap())),
+            "2023-11-14T22:13:00Z"
+        );
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(rfc3339_to_unix_secs("2023-11-14T22:13:29Z").unwrap())),
+            "2023-11-14T22:13:00Z"
+        );
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(rfc3339_to_unix_secs("2023-11-14T22:13:01Z").unwrap())),
+            "2023-11-14T22:13:00Z"
+        );
+    }
+
+    #[test]
+    fn nearest_minute_ceils_at_30_seconds() {
+        // 22:13:30 → 22:14:00 (ceil).
+        let half_past = rfc3339_to_unix_secs("2023-11-14T22:13:30Z").unwrap();
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(half_past)),
+            "2023-11-14T22:14:00Z"
+        );
+        // :59 also ceils to the next minute.
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(half_past + 29)),
+            "2023-11-14T22:14:00Z"
+        );
+        // Rolls the hour/minute boundary.
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(
+                rfc3339_to_unix_secs("2023-11-14T22:59:30Z").unwrap()
+            )),
+            "2023-11-14T23:00:00Z"
+        );
+    }
+
+    #[test]
+    fn nearest_minute_handles_epoch_and_negatives() {
+        // Epoch is already on the grid. Negative instants use `rem_euclid`,
+        // so 23:59:30 (unix -30) and 23:59:59 (unix -1) are second 30/59 of
+        // the previous minute and ceil to the epoch, not toward -infinity.
+        assert_eq!(nearest_minute_unix(0), 0);
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(0)),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(nearest_minute_unix(-30), 0, "23:59:30 ceils to the epoch");
+        assert_eq!(nearest_minute_unix(-1), 0, "23:59:59 ceils to the epoch");
+        assert_eq!(nearest_minute_unix(-119), -120, "23:58:01 floors to 23:58:00");
+        assert_eq!(nearest_minute_unix(-120), -120, "already on the grid");
+        assert_eq!(
+            unix_secs_to_rfc3339(nearest_minute_unix(-119)),
+            "1969-12-31T23:58:00Z"
+        );
+        assert_eq!(nearest_minute_unix(30), 60);
     }
 
     #[test]
