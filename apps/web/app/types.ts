@@ -195,6 +195,14 @@ export interface TaskCategorySummary {
   color: string;
 }
 
+// Response of GET /api/tasks/classify?title=… — the title→category match the
+// create/update endpoints enforce, as a preview (never writes). Externally-
+// tagged serde enum: {"Matched":{"category":{...}}} or
+// {"Untracked":{"conflict":bool,"categories":[...]}}.
+export type ClassifyResponse =
+  | { Matched: { category: TaskCategorySummary } }
+  | { Untracked: { conflict: boolean; categories: TaskCategorySummary[] } };
+
 // A task as returned by the API: the `tasks` row shape (snake_case) plus the
 // computed `category`. `status` is driven by the timer endpoints: start →
 // "IN_PROGRESS", stop → "OPEN", pause → "PLANNED" (since ADR 0002),
