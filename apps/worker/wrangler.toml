@@ -16,7 +16,7 @@ database_name = "sanctuary-db"
 database_id = "7fcdb90e-d286-412d-9161-a63e62ebaf44"
 
 [build]
-command = "worker-build --release"
+command = "PATH=\"$HOME/.cargo/bin:$PATH\" worker-build --release"
 
 [assets]
 directory = "../../dist/apps/web"
