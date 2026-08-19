@@ -24,13 +24,13 @@ fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response
     json_error(ctx, 401, "unauthorized")
 }
 
-/// Builds a JSON `{"error": msg}` response with CORS headers.
+/// Builds a JSON `{"error": msg}` response with JSON + CORS headers.
 fn json_error(
     ctx: &RouteContext<Option<api_core::Config>>,
     status: u16,
     message: &str,
 ) -> Result<Response> {
-    let headers = crate::auth::cors_headers(crate::auth::frontend_url(ctx))?;
+    let headers = crate::auth::json_headers(crate::auth::frontend_url(ctx))?;
     let response = Response::from_json(&serde_json::json!({ "error": message }))?
         .with_status(status)
         .with_headers(headers);
@@ -126,7 +126,7 @@ pub async fn list_events(
         events: output.events,
         source: "cache".to_string(),
     })?;
-    Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+    Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
 }
 
 /// `GET /api/calendar/calendars` → 200 `{"calendars":[...]}`.
@@ -171,7 +171,7 @@ pub async fn list_calendars(
                 return json_error(&ctx, 500, "failed to load calendars");
             }
         };
-    Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+    Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
 }
 
 /// `POST /api/calendar/events` → 200 `{"event":{...},"source":"google"}`.
@@ -225,7 +225,7 @@ pub async fn create_event(
                 source: output.source,
             })?;
             Ok(response
-                .with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "calendar not found"),
         Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
