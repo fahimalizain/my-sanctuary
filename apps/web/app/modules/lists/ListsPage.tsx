@@ -24,6 +24,10 @@ import { useNavigate } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import type {
+  MoveDisplaceInput,
+  MoveTaskError,
+  MoveTaskInput,
+  MoveTaskResponse,
   NewTaskInput,
   TaskDifficulty,
   TaskList,
@@ -31,6 +35,7 @@ import type {
   TaskPriority,
   TaskRecord,
   TaskResponse,
+  TaskStatus,
   TasksResponse,
   UpdateTaskInput,
 } from '@/app/types';
@@ -57,6 +62,30 @@ async function readError(res: Response): Promise<string> {
   return `Request failed with status ${res.status}`;
 }
 
+// Move failures can carry a `displaced` task (ADR 0002 § Move API): when the
+// start fails AFTER a successful displace, the parked task stays and only the
+// moved task snaps back. Same page-local copy convention as `readError`
+// (BoardPage has its own).
+async function readMoveError(res: Response): Promise<MoveTaskError> {
+  try {
+    const data: unknown = await res.json();
+    if (
+      data &&
+      typeof data === 'object' &&
+      'error' in data &&
+      typeof (data as { error: unknown }).error === 'string'
+    ) {
+      return {
+        error: (data as { error: string }).error,
+        displaced: (data as Partial<MoveTaskError>).displaced,
+      };
+    }
+  } catch {
+    // Not JSON — fall through to the generic message.
+  }
+  return { error: `Request failed with status ${res.status}` };
+}
+
 interface ListFormState {
   mode: 'create' | 'edit';
   list?: TaskList;
@@ -78,6 +107,11 @@ export function ListsPage() {
   // array.
   const listsRef = useRef<TaskList[]>([]);
   listsRef.current = lists;
+  // Latest `tasks` for the async move flow, so the pre-move snapshot and the
+  // reverted card lookups never close over a stale array (same pattern as
+  // BoardPage).
+  const tasksRef = useRef<TaskRecord[]>([]);
+  tasksRef.current = tasks;
   const [isLoading, setIsLoading] = useState(true);
   // Load failures: only set from `load()`. Replaces the grid with the
   // error+retry banner when there are no lists to show.
@@ -157,6 +191,10 @@ export function ListsPage() {
   // Any task IN_PROGRESS means the single running slot is taken: every Start
   // button is disabled until a stop/pause/complete/discard frees it.
   const anyRunning = tasks.some((task) => task.status === 'IN_PROGRESS');
+  // The actual running task record — the task modal needs it to decide
+  // whether tapping In Progress must park someone first.
+  const runningTask =
+    tasks.find((task) => task.status === 'IN_PROGRESS') ?? null;
 
   const handleTaskAction = async (taskId: string, action: TaskAction) => {
     setActionError(null);
@@ -277,6 +315,87 @@ export function ListsPage() {
 
   const closeTaskForm = () => {
     setTaskForm(null);
+  };
+
+  /** TaskModal's immediate status change — the same /move contract as the
+   *  board: optimistic (this task → `status`, the parked runner → its park
+   *  status, both `sort_order: 0`), then one POST /api/tasks/:id/move.
+   *  Failure with a `displaced` task keeps A parked and snaps only this task
+   *  back; any other failure restores the full snapshot. Sets the banner and
+   *  returns the message for the form (null on success). */
+  const handleMoveTask = async (
+    taskId: string,
+    status: TaskStatus,
+    displace?: MoveDisplaceInput,
+  ): Promise<string | null> => {
+    setActionError(null);
+    const snapshot = tasksRef.current;
+    setTasks((prev) =>
+      prev.map((entry) => {
+        if (displace && entry.id === displace.id) {
+          return {
+            ...entry,
+            status: displace.status,
+            sort_order: displace.sort_order,
+          };
+        }
+        return entry.id === taskId
+          ? { ...entry, status, sort_order: 0 }
+          : entry;
+      }),
+    );
+    const body: MoveTaskInput = { status, sort_order: 0, displace };
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const failure = await readMoveError(res);
+        if (failure.displaced) {
+          // ADR 0002 § Move API: no rollback for A — it stays parked. Only
+          // the moved task goes back to where it was before.
+          setTasks((prev) =>
+            prev.map((entry) => {
+              if (entry.id === failure.displaced!.id) return failure.displaced!;
+              if (entry.id === taskId) {
+                return snapshot.find((snap) => snap.id === taskId) ?? entry;
+              }
+              return entry;
+            }),
+          );
+        } else {
+          setTasks(snapshot);
+        }
+        setActionError(failure.error);
+        return failure.error;
+      }
+      const data = (await res.json()) as MoveTaskResponse;
+      setTasks((prev) =>
+        prev.map((entry) => {
+          if (entry.id === data.task.id) return data.task;
+          if (data.displaced && entry.id === data.displaced.id) {
+            return data.displaced;
+          }
+          return entry;
+        }),
+      );
+      // Keep the modal's `task` prop in sync so the selected pill follows
+      // the server — the modal stays open after a status change.
+      setTaskForm((prev) =>
+        prev && prev.mode === 'edit' && prev.task?.id === data.task.id
+          ? { ...prev, task: data.task }
+          : prev,
+      );
+      return null;
+    } catch (err) {
+      setTasks(snapshot);
+      const message = err instanceof Error ? err.message : 'Move failed';
+      setActionError(message);
+      return message;
+    }
   };
 
   // Persists the task. Returns an error message to show on the form (the
@@ -519,13 +638,16 @@ export function ListsPage() {
         </DialogContent>
       </Dialog>
 
-      {/* New / Edit Task Dialog */}
+      {/* New / Edit Task Dialog — edit mode carries the immediate status
+          pills (onMove) and the running task for the park dialog */}
       <TaskModal
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
         task={taskForm?.mode === 'edit' ? taskForm.task : undefined}
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
+        onMove={handleMoveTask}
+        runningTask={runningTask}
       />
     </div>
   );

@@ -18,13 +18,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { DisplaceDialog } from '@/app/components/DisplaceDialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
@@ -32,6 +26,7 @@ import { cn } from '@/lib/utils';
 import type {
   CategoriesResponse,
   Category,
+  MoveDisplaceInput,
   MoveTaskError,
   MoveTaskInput,
   MoveTaskResponse,
@@ -444,15 +439,16 @@ export function BoardPage() {
    *  (caller has already snapshotted and decided what to send), then:
    *  - 200 → merge `response.task` (and `response.displaced`, if present);
    *  - failure with `displaced` in the body → the parked task A stays, only
-   *    the dragged card B is snapped back to its pre-drop snapshot;
+   *    the moved card B is snapped back to its pre-drop snapshot;
    *  - failure without `displaced` → restore the full snapshot.
-   *  Every failure raises the error banner. */
+   *  Every failure raises the error banner and returns the message (null on
+   *  success) so the task modal can show it on the form too. */
   const sendMoveRequest = async (
     taskId: string,
     body: MoveTaskInput,
     snapshot: TaskRecord[],
     onSuccess: (data: MoveTaskResponse) => void,
-  ) => {
+  ): Promise<string | null> => {
     setActionError(null);
     setMovingIds((prev) => new Set(prev).add(taskId));
     try {
@@ -480,12 +476,15 @@ export function BoardPage() {
           setTasks(snapshot);
         }
         setActionError(failure.error);
-        return;
+        return failure.error;
       }
       onSuccess((await res.json()) as MoveTaskResponse);
+      return null;
     } catch (err) {
       setTasks(snapshot);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      const message = err instanceof Error ? err.message : 'Move failed';
+      setActionError(message);
+      return message;
     } finally {
       setMovingIds((prev) => {
         const next = new Set(prev);
@@ -635,6 +634,56 @@ export function BoardPage() {
     });
   };
 
+  /** TaskModal's immediate status change (ADR 0002): a drop with no drop
+   *  position — always prepend, `sort_order: 0`. Optimistic, then ONE
+   *  `/move`; `sendMoveRequest` already owns the displaced-aware revert and
+   *  the banner. Returns the error message for the form (null on success).
+   *  The modal stays open; `task` in props updates via this merge. */
+  const handleMoveTask = async (
+    taskId: string,
+    status: TaskStatus,
+    displace?: MoveDisplaceInput,
+  ): Promise<string | null> => {
+    const snapshot = tasksRef.current;
+    setTasks((prev) =>
+      prev.map((entry) => {
+        if (displace && entry.id === displace.id) {
+          return {
+            ...entry,
+            status: displace.status,
+            sort_order: displace.sort_order,
+          };
+        }
+        return entry.id === taskId
+          ? { ...entry, status, sort_order: 0 }
+          : entry;
+      }),
+    );
+    return sendMoveRequest(
+      taskId,
+      { status, sort_order: 0, displace },
+      snapshot,
+      (data) => {
+        setTasks((prev) =>
+          prev.map((entry) => {
+            if (entry.id === data.task.id) return data.task;
+            if (data.displaced && entry.id === data.displaced.id) {
+              return data.displaced;
+            }
+            return entry;
+          }),
+        );
+        // Keep the modal's `task` prop in sync so the selected pill follows
+        // the server — the modal stays open after a status change.
+        setTaskForm((prev) =>
+          prev && prev.mode === 'edit' && prev.task?.id === data.task.id
+            ? { ...prev, task: data.task }
+            : prev,
+        );
+      },
+    );
+  };
+
   // ──────────────────────────────────────────
   // Task actions (New Task + click-to-edit; no timer buttons this slice)
   // ──────────────────────────────────────────
@@ -714,6 +763,11 @@ export function BoardPage() {
     closeTaskForm();
     return null;
   };
+
+  // The sole running task, if any (may be the task being edited). Decides
+  // whether tapping In Progress in the modal needs the park dialog.
+  const runningTask =
+    tasks.find((task) => task.status === 'IN_PROGRESS') ?? null;
 
   // The conflict dialog reads both titles from live state so they stay
   // correct even if the optimistic render happens first.
@@ -928,66 +982,28 @@ export function BoardPage() {
 
       {/* Occupied In Progress conflict dialog (ADR 0002 § UI): pick where the
           running task is parked. Cancel / overlay close drops the stash with
-          no request. */}
-      <Dialog
+          no request. Shared component — also used by the task modal's status
+          pills. */}
+      <DisplaceDialog
         open={displacePrompt !== null}
         onOpenChange={(open) => {
           if (!open) setDisplacePrompt(null);
         }}
-      >
-        <DialogContent className="sm:max-w-[420px] bg-card border-border">
-          <DialogHeader>
-            <DialogTitle className="text-foreground">
-              A task is already running
-            </DialogTitle>
-            <DialogDescription>
-              “{runningTaskTitle}” is in progress. Where should it be parked so
-              “{draggedTaskTitle}” can start?
-            </DialogDescription>
-          </DialogHeader>
+        runningTitle={runningTaskTitle || ''}
+        incomingTitle={draggedTaskTitle || ''}
+        onConfirm={confirmDisplace}
+      />
 
-          <div className="flex flex-wrap gap-2 pt-2">
-            <Button
-              onClick={() => confirmDisplace('PLANNED')}
-              className="bg-primary text-primary-foreground hover:bg-primary/90"
-            >
-              Planned
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => confirmDisplace('COMPLETED')}
-              className="border-input text-foreground hover:bg-muted"
-            >
-              Done
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => confirmDisplace('DISCARDED')}
-              className="border-input text-destructive hover:bg-destructive/10"
-            >
-              Discarded
-            </Button>
-          </div>
-
-          <div className="flex justify-end pt-1">
-            <Button
-              variant="ghost"
-              onClick={() => setDisplacePrompt(null)}
-              className="text-muted-foreground hover:bg-muted"
-            >
-              Cancel
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* New / Edit Task Dialog */}
+      {/* New / Edit Task Dialog — edit mode carries the immediate status
+          pills (onMove) and the running task for the park dialog */}
       <TaskModal
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
         task={taskForm?.mode === 'edit' ? taskForm.task : undefined}
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
+        onMove={handleMoveTask}
+        runningTask={runningTask}
       />
     </div>
   );
