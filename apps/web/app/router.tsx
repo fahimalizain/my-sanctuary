@@ -8,6 +8,8 @@ import { RootComponent } from './routes/__root';
 import { HomeComponent } from './routes/index';
 import { LoginComponent } from './routes/login';
 import { ListsComponent } from './routes/lists';
+import { BoardComponent } from './routes/board';
+import type { BoardSearch } from '@/app/modules/board';
 import { CategoriesComponent } from './routes/categories';
 import { CalendarComponent } from './routes/calendar';
 import { ConsistencyComponent } from './routes/consistency';
@@ -46,6 +48,36 @@ const listsRoute = createRoute({
   component: withAuth(ListsComponent),
 });
 
+// ADR 0002 § Filters: the board's filter state lives in the URL, so the
+// route validates the search shape itself. All params are optional; missing
+// params = all. Only the *shape* is enforced here — unknown category ids are
+// ignored by the page, which checks them against the loaded categories.
+const boardRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/board',
+  component: withAuth(BoardComponent),
+  validateSearch: (search: Record<string, unknown>): BoardSearch => ({
+    priority:
+      search.priority === 'high' ||
+      search.priority === 'medium' ||
+      search.priority === 'low'
+        ? search.priority
+        : undefined,
+    difficulty:
+      search.difficulty === 'easy' ||
+      search.difficulty === 'medium' ||
+      search.difficulty === 'hard'
+        ? search.difficulty
+        : undefined,
+    // Comma-separated category ids (e.g. "id1,id2"). Repeated params arrive
+    // as an array and non-strings are dropped — both fall back to no filter.
+    category:
+      typeof search.category === 'string' && search.category.length > 0
+        ? search.category
+        : undefined,
+  }),
+});
+
 const categoriesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/categories',
@@ -74,6 +106,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
   listsRoute,
+  boardRoute,
   categoriesRoute,
   calendarRoute,
   consistencyRoute,

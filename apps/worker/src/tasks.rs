@@ -1,25 +1,36 @@
-//! `/api/tasks/*` handlers: task CRUD (classified by title regex) plus the
-//! timer: start/stop/pause/complete/discard backed by Google Calendar events.
+//! `/api/tasks/*` handlers: task CRUD (classified by title regex), the timer
+//! (start/stop/pause/complete/discard), and the board move — all backed by
+//! Google Calendar events where the action touches Google.
 //!
 //! CRUD is session-gated via the session cookie only — like `/api/lists/*`
 //! and `/api/categories/*`. The timer actions additionally refresh the Google
 //! access token (like `/api/calendar/*`): a user whose token cannot be
 //! refreshed gets `401 {"error":"unauthorized"}`.
 //!
+//! The move endpoint uses a **per-action gate** (ADR 0002 § Move API): moves
+//! that would call Google — target IN_PROGRESS (start), leaving IN_PROGRESS
+//! (stop/pause/complete/discard), or any `displace` (parks the running task)
+//! — refresh the token like the timer verbs; status-only moves (plan/unplan/
+//! reopen/reorder/idle complete/discard) use the session cookie like CRUD.
+//! When a start fails after a successful displace there is NO rollback: the
+//! response is the inner error's status with `{"error": …, "displaced":
+//! TaskView}` so the client can snap the moved card back.
+//!
 //! The orchestration lives in `api_core::tasks` (pure, unit-tested); this
 //! file extracts the session user, wires the D1 repos, refreshes the OAuth
 //! token for the timer, and maps errors to HTTP responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid input (title/category rules, bad
-//! duration or priority, empty PATCH body, terminal-task transitions, no
-//! writable calendar), 404 not found (missing/soft-deleted/other-user task),
-//! 409 one-running-task conflict, 502 Google API failures, 500 logged
-//! database errors.
+//! duration or priority, empty PATCH body, terminal-task stop/pause, no
+//! writable calendar, move validation), 404 not found (missing/soft-deleted/
+//! other-user task), 409 one-running-task conflict, 502 Google API failures,
+//! 500 logged database errors.
 
 use worker::*;
 
 use api_core::models::{NewTaskInput, UpdateTask};
-use api_core::tasks::TasksError;
+use api_core::tasks::{MoveTaskInput, TasksError};
+use api_core::TaskRepo;
 
 /// 401 body for missing/invalid sessions and failed token refreshes.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -39,7 +50,28 @@ fn json_error(
     Ok(response)
 }
 
+/// Builds the move endpoint's honest partial-failure envelope:
+/// `{"error": msg, "displaced": TaskView}` — a displace succeeded but the
+/// subsequent start failed, so the parked task is returned (no rollback) and
+/// the client snaps the moved card back.
+fn json_error_with_displaced(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    status: u16,
+    message: &str,
+    displaced: &api_core::TaskView,
+) -> Result<Response> {
+    let headers = crate::auth::cors_headers(crate::auth::frontend_url(ctx))?;
+    let response = Response::from_json(&serde_json::json!({ "error": message, "displaced": displaced }))?
+        .with_status(status)
+        .with_headers(headers);
+    Ok(response)
+}
+
 /// Maps a service error to its HTTP response.
+///
+/// [`TasksError::AfterDisplace`] reuses the SAME status/message mapping as
+/// its inner error, but serializes `displaced` alongside `error` — the
+/// parked task stays and the client can snap the moved card back.
 fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: TasksError) -> Result<Response> {
     match err {
         TasksError::Invalid(message) => json_error(ctx, 400, &message),
@@ -57,6 +89,35 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: TasksError) -> R
             console_log!("tasks: calendar error: {err}");
             json_error(ctx, 500, "failed to update task")
         }
+        TasksError::AfterDisplace { displaced, source } => match *source {
+            TasksError::Invalid(message) => {
+                json_error_with_displaced(ctx, 400, &message, &displaced)
+            }
+            TasksError::NotFound => {
+                json_error_with_displaced(ctx, 404, "task not found", &displaced)
+            }
+            TasksError::Conflict => {
+                json_error_with_displaced(ctx, 409, "a task is already running", &displaced)
+            }
+            TasksError::GoogleApi(message) => {
+                json_error_with_displaced(ctx, 502, &message, &displaced)
+            }
+            TasksError::Repo(err) => {
+                console_log!("tasks: database error: {err}");
+                json_error_with_displaced(ctx, 500, "failed to load tasks", &displaced)
+            }
+            TasksError::Calendar(api_core::CalendarError::GoogleApi(message)) => {
+                json_error_with_displaced(ctx, 502, &message, &displaced)
+            }
+            TasksError::Calendar(err) => {
+                console_log!("tasks: calendar error: {err}");
+                json_error_with_displaced(ctx, 500, "failed to update task", &displaced)
+            }
+            TasksError::AfterDisplace { .. } => {
+                // Nested AfterDisplace is unreachable by construction.
+                json_error_with_displaced(ctx, 500, "failed to update task", &displaced)
+            }
+        },
     }
 }
 
@@ -260,8 +321,9 @@ async fn timer_access(
 ///
 /// Opens a Google Calendar event now → now + duration (summary = task title,
 /// `extendedProperties.shared.sanctuary_task_id` = task UUID) and marks the
-/// task IN_PROGRESS. 409 when another task is already running; 400 on
-/// COMPLETED/DISCARDED tasks or a missing writable calendar.
+/// task IN_PROGRESS. 409 when another task is already running; 400 on a
+/// missing writable calendar. Nothing is terminal since the board slice:
+/// starting a COMPLETED/DISCARDED task opens a NEW event (history stays).
 pub async fn start_task(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -366,3 +428,96 @@ fn respond_action(
         Err(err) => map_error(ctx, err),
     }
 }
+
+/// POST /api/tasks/:id/move → 200
+/// `{"task":{...},"displaced":{...}|null,"event":{...}|null}`.
+///
+/// The board drop (ADR 0002 § Move API): dispatches the transition matrix
+/// (start/stop/pause/complete/discard/plan/unplan/reopen) through the
+/// existing timer verbs, then places the task at `sort_order` in the target
+/// status. Same-status moves are reorders; IN_PROGRESS → IN_PROGRESS is a
+/// no-op. `displace` optionally parks the running task first (its landing
+/// status must be PLANNED/COMPLETED/DISCARDED), then starts the moved task.
+///
+/// The auth gate is **per action** (session + token refresh only when Google
+/// would be touched):
+/// - `needs_google`: target is IN_PROGRESS (start), the current status is
+///   IN_PROGRESS and the target is not (exit: stop/pause/complete/discard),
+///   or `displace` is present (parks a running task).
+/// - Otherwise the session cookie is enough, exactly like CRUD.
+///
+/// Body faults (unknown status, negative `sort_order`, bad `displace`
+/// fields, displace id not the running task) are 400; a missing/other-user/
+/// soft-deleted task is 404; a move to IN_PROGRESS while something runs and
+/// no `displace` is 409. When the start fails AFTER a successful displace
+/// there is no rollback — the parked task stays and the error body is
+/// `{"error": <inner message>, "displaced": TaskView}` (400/409/502).
+pub async fn move_task(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id") else {
+        return json_error(&ctx, 404, "task not found");
+    };
+    let input: MoveTaskInput = match req.json().await {
+        Ok(input) => input,
+        Err(_) => return json_error(&ctx, 400, "invalid body"),
+    };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let repos = timer_d1(&ctx)?;
+
+    // Load the task BEFORE choosing the gate: a missing/soft-deleted/
+    // other-user task is a plain 404, never a 401.
+    let task = match repos.tasks.get_by_id(id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return json_error(&ctx, 404, "task not found"),
+        Err(err) => return map_error(&ctx, TasksError::Repo(err)),
+    };
+    if task.user_id != user.id {
+        return json_error(&ctx, 404, "task not found");
+    }
+
+    let needs_google = input.status == api_core::TASK_STATUS_IN_PROGRESS
+        || (task.status == api_core::TASK_STATUS_IN_PROGRESS
+            && input.status != api_core::TASK_STATUS_IN_PROGRESS)
+        || input.displace.is_some();
+    let (http, access) = if needs_google {
+        let (_user_id, access) = match timer_access(&req, &ctx).await? {
+            Ok(gated) => gated,
+            Err(response) => return Ok(response),
+        };
+        (
+            Some(&crate::http::WorkerHttp as &dyn api_core::HttpClient),
+            Some(access),
+        )
+    } else {
+        (None, None)
+    };
+
+    let result = api_core::move_task(
+        http,
+        &repos.calendars,
+        &repos.events,
+        &repos.lists,
+        &repos.categories,
+        &repos.tasks,
+        &repos.logs,
+        access.as_ref(),
+        &user.id,
+        id,
+        now_unix,
+        &input,
+    )
+    .await;
+    match result {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::cors_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+

@@ -99,6 +99,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/api/tasks/:id/pause", tasks::pause_task)
         .post_async("/api/tasks/:id/complete", tasks::complete_task)
         .post_async("/api/tasks/:id/discard", tasks::discard_task)
+        .post_async("/api/tasks/:id/move", tasks::move_task)
         .options("/api/tasks", auth::options)
         .options("/api/tasks/:id", auth::options)
         .options("/api/tasks/:id/start", auth::options)
@@ -106,6 +107,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/tasks/:id/pause", auth::options)
         .options("/api/tasks/:id/complete", auth::options)
         .options("/api/tasks/:id/discard", auth::options)
+        .options("/api/tasks/:id/move", auth::options)
         .run(req, env)
         .await
 }

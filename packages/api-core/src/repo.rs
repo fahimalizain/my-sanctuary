@@ -245,7 +245,9 @@ pub trait TaskCategoryRepo: Send + Sync {
 /// All deletes are SOFT: `deleted_at` is stamped, rows are never removed.
 #[async_trait(?Send)]
 pub trait TaskRepo: Send + Sync {
-    /// The user's living tasks, most recently updated/created first.
+    /// The user's living tasks, grouped per status and ranked inside it by
+    /// `sort_order` then `created_at` (per-status board order; the frontend
+    /// regroups by computed category anyway).
     async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Task>, RepoError>;
     /// Returns the task with local `id`, or `None` when absent or soft-deleted.
     /// NOT user-scoped; callers must verify `row.user_id` (the service does).
@@ -254,6 +256,28 @@ pub trait TaskRepo: Send + Sync {
     /// generates the UUID `id`, stamps `created_at`/`updated_at`, and forces
     /// `status = "OPEN"` (this slice creates no other status).
     async fn insert(&self, task: NewTask) -> Result<Task, RepoError>;
+    /// Shifts the living tasks of `user_id` in `status` whose `sort_order` is
+    /// `>= from_inclusive` up by one — the peer shift behind the Backlog
+    /// prepend (create) and the move endpoint's cross-column placement. Never
+    /// touches `updated_at`: re-ranking is not a content change.
+    async fn shift_sort_order(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+    ) -> Result<(), RepoError>;
+    /// Signed peer shift over the closed `[from_inclusive, to_inclusive]`
+    /// range (`delta` +1 up, -1 down) — the move endpoint's same-column
+    /// neighbor reorder (the moving task itself never falls inside its own
+    /// shift range). Never touches `updated_at`.
+    async fn shift_sort_order_by(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+        to_inclusive: i64,
+        delta: i64,
+    ) -> Result<(), RepoError>;
     /// Updates `title`/`description`/`duration_minutes`/`priority`/
     /// `difficulty` on a living task (`None` fields are left unchanged; status
     /// is never touched here) and returns the updated row, or `None` when the
@@ -269,6 +293,11 @@ pub trait TaskRepo: Send + Sync {
         status: &str,
         now_rfc3339: &str,
     ) -> Result<Option<Task>, RepoError>;
+    /// Sets the task's board rank on a living task and returns the updated
+    /// row, or `None` when missing/soft-deleted. Deliberately touches NEITHER
+    /// `status` NOR `updated_at`: the move endpoint places cards (cross-column
+    /// via `set_status` first, then this) without marking them content-updated.
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
@@ -669,22 +698,48 @@ pub const TASK_CATEGORY_PATTERNS_INSERT_SQL: &str = "
 // Task SQL
 // ──────────────────────────────────────────
 
-/// Living tasks for the user, most recently updated first (ties broken by
-/// creation time). No order outside the app's control: the frontend regroups
-/// by computed category anyway.
+/// Living tasks for the user, grouped per status and ranked inside it by
+/// `sort_order` (ties by creation time). The `sort_order` segment carries the
+/// per-status board rank; `status ASC` keeps each rank contiguous.
 pub const TASK_LIST_BY_USER_ID_SQL: &str =
-    "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC, created_at DESC";
+    "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY status ASC, sort_order ASC, created_at ASC";
 
 pub const TASK_GET_BY_ID_SQL: &str =
     "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL";
 
 /// Plain INSERT (no `ON CONFLICT`): tasks are user-authored, never upserted.
-/// The D1 implementation binds the UUID `id`, the timestamps, and the
-/// hardcoded `status = 'OPEN'` (this slice creates no other status).
+/// The D1 implementation binds the UUID `id`, the timestamps, the hardcoded
+/// `status = 'OPEN'`, and the caller-shifted `sort_order` — `create_task`
+/// shifts living OPEN peers up by one, then inserts at 0 (Backlog prepend).
 pub const TASK_INSERT_SQL: &str = "
-    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, difficulty, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, difficulty, status, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
+
+/// The Backlog-prepend peer shift: every living task of the user in `status`
+/// ranked at or after `from_inclusive` moves up one. `updated_at` is left
+/// alone on purpose — re-ranking is a position change, not a content update.
+pub const TASK_SHIFT_SORT_ORDER_SQL: &str = "
+    UPDATE tasks
+    SET sort_order = sort_order + 1
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND sort_order >= ?
+";
+
+/// Signed peer shift over `[from_inclusive, to_inclusive]` (`delta` +1 up,
+/// -1 down) — the move endpoint's same-column neighbor reorder. The bounds
+/// keep the moving card out of its own shift: front drags shift `[new, old)`
+/// up, back drags shift `(old, new]` down. `updated_at` is left alone, same
+/// as `TASK_SHIFT_SORT_ORDER_SQL`.
+pub const TASK_SHIFT_SORT_ORDER_RANGE_SQL: &str = "
+    UPDATE tasks
+    SET sort_order = sort_order + ?
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND sort_order >= ? AND sort_order <= ?
+";
+
+/// Sets the task's board rank on a living row. No `status`, no `updated_at`:
+/// placement is a position change, not a content update.
+pub const TASK_SET_SORT_ORDER_SQL: &str =
+    "UPDATE tasks SET sort_order = ? WHERE id = ? AND deleted_at IS NULL";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). Status
 /// is intentionally not updatable — slice 4 adds the status transitions. The
@@ -1137,25 +1192,25 @@ mod tests {
     }
 
     #[test]
-    fn task_reads_filter_soft_deleted_rows_and_order_by_updated_then_created() {
+    fn task_reads_filter_soft_deleted_rows_and_order_by_status_sort_then_created() {
         assert!(TASK_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_LIST_BY_USER_ID_SQL);
         let order_start = TASK_LIST_BY_USER_ID_SQL
             .find("ORDER BY")
             .expect("has ORDER BY");
         assert_eq!(
             &TASK_LIST_BY_USER_ID_SQL[order_start..],
-            "ORDER BY updated_at DESC, created_at DESC"
+            "ORDER BY status ASC, sort_order ASC, created_at ASC"
         );
         assert!(TASK_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", TASK_GET_BY_ID_SQL);
     }
 
     #[test]
-    fn task_insert_binds_all_10_columns_with_status_open() {
+    fn task_insert_binds_all_11_columns_with_status_open() {
         assert!(TASK_INSERT_SQL.contains("INSERT INTO tasks"), "{}", TASK_INSERT_SQL);
         assert!(!TASK_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_INSERT_SQL);
         assert_eq!(
             TASK_INSERT_SQL.matches('?').count(),
-            10,
+            11,
             "one placeholder per column: {}",
             TASK_INSERT_SQL
         );
@@ -1164,10 +1219,47 @@ mod tests {
         assert!(TASK_INSERT_SQL.contains("status"), "{TASK_INSERT_SQL}");
         for column in [
             "id", "user_id", "title", "description", "duration_minutes",
-            "priority", "difficulty", "status", "created_at", "updated_at",
+            "priority", "difficulty", "status", "sort_order", "created_at",
+            "updated_at",
         ] {
             assert!(TASK_INSERT_SQL.contains(column), "missing {column}");
         }
+    }
+
+    #[test]
+    fn task_shift_sort_order_shifts_living_peers_without_touching_updated_at() {
+        let sql = TASK_SHIFT_SORT_ORDER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("sort_order = sort_order + 1"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("sort_order >= ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+    }
+
+    #[test]
+    fn task_set_sort_order_touches_only_rank_on_living_rows() {
+        let sql = TASK_SET_SORT_ORDER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("SET sort_order = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("status"), "placement never touches status: {sql}");
+        assert!(!sql.contains("updated_at"), "placement never bumps updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn task_shift_sort_order_range_binds_signed_delta_and_both_bounds() {
+        let sql = TASK_SHIFT_SORT_ORDER_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("sort_order = sort_order + ?"), "{sql}");
+        assert!(sql.contains("sort_order >= ? AND sort_order <= ?"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 5, "{sql}");
     }
 
     #[test]

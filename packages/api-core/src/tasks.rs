@@ -17,7 +17,9 @@
 //!   `Untracked { conflict: true }` (cross-tree conflict), and a match on the
 //!   `untracked` sink itself are all invalid. A title matching only a root
 //!   whose children do not match is **allowed** (parent remainder).
-//! - Titles are not unique. Create always stores `status = "OPEN"`.
+//! - Titles are not unique. Create always stores `status = "OPEN"` and
+//!   **prepends Backlog**: the living OPEN rows of the user are shifted up one
+//!   (`sort_order + 1`), and the new task lands at `sort_order = 0`.
 //! - `duration_minutes` defaults to 15 and must be >= 1; `priority` must be
 //!   `high|medium|low` (default `medium`); `difficulty` must be
 //!   `easy|medium|hard` (default `easy`).
@@ -43,15 +45,28 @@
 //!   from the cache** — `calendar_events.task_id` set AND
 //!   `start_time <= now < end_time` — never from `tasks.status`.
 //! - `stop_task`/`pause_task` PATCH the event's end to now (start + 60s when
-//!   `now <= start`) and flip status to OPEN — even when no open event exists
-//!   for the task (the user closed it in Google): the flip is idempotent.
+//!   `now <= start`) and flip status back to OPEN (stop) or to PLANNED
+//!   (pause) — even when no open event exists for the task (the user closed
+//!   it in Google): the flip is idempotent.
 //! - `complete_task`/`discard_task` auto-stop a running event first (a
 //!   `stopped` log precedes the terminal log), then set the terminal status.
 //!   Repeating the same terminal action is an idempotent 200 no-op.
-//! - Start on COMPLETED/DISCARDED is a 400; missing/other-user/soft-deleted
-//!   tasks are 404.
+//! - **Nothing is terminal** (ADR 0002): start on COMPLETED/DISCARDED is
+//!   allowed — a NEW calendar event opens and history stays. Stop/pause on a
+//!   COMPLETED/DISCARDED task stay invalid as verbs; reopen is the path back.
+//!   Missing/other-user/soft-deleted tasks are 404.
 //! - Every transition appends to `task_logs` (an audit trail, not a
-//!   timesheet): `started|stopped|paused|completed|discarded`.
+//!   timesheet): `started|stopped|paused|completed|discarded` plus the move
+//!   verbs `planned|unplanned|reopened`.
+//!
+//! Move ([`move_task`], ADR 0002 § Move API): the board drop dispatches the
+//! transition matrix (start/stop/pause/complete/discard/plan/unplan/reopen/
+//! reorder), then places the task at `sort_order` in the target status (peer
+//! shifts never touch `updated_at`, and the source column is never compacted).
+//! A same-status cross-card drag is a pure reorder. `displace` parks the
+//! running task first (PLANNED/COMPLETED/DISCARDED only), then starts the
+//! moved task; if that start fails the parked task STAYS — the error is
+//! [`TasksError::AfterDisplace`] and carries the displaced task's view.
 
 use thiserror::Error;
 
@@ -81,6 +96,9 @@ pub const TASK_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const TASK_STATUS_COMPLETED: &str = "COMPLETED";
 /// A discarded task.
 pub const TASK_STATUS_DISCARDED: &str = "DISCARDED";
+/// A paused task sitting in the Planned pile — `pause` lands here since the
+/// board slice, not back in Backlog.
+pub const TASK_STATUS_PLANNED: &str = "PLANNED";
 
 /// `task_logs.type` values (the audit trail is append-only).
 pub const TASK_LOG_STARTED: &str = "started";
@@ -88,6 +106,11 @@ pub const TASK_LOG_STOPPED: &str = "stopped";
 pub const TASK_LOG_PAUSED: &str = "paused";
 pub const TASK_LOG_COMPLETED: &str = "completed";
 pub const TASK_LOG_DISCARDED: &str = "discarded";
+/// `planned`/`unplanned`/`reopened` arrive with the move endpoint (slice 2);
+/// the constants exist now so the log vocabulary is complete.
+pub const TASK_LOG_PLANNED: &str = "planned";
+pub const TASK_LOG_UNPLANNED: &str = "unplanned";
+pub const TASK_LOG_REOPENED: &str = "reopened";
 
 /// Errors produced by the tasks service.
 ///
@@ -108,6 +131,17 @@ pub enum TasksError {
     Repo(#[from] RepoError),
     #[error("calendar error: {0}")]
     Calendar(CalendarError),
+    /// The move already parked `displaced` (its event is closed, it sits in
+    /// its new status/rank) when the subsequent start failed. Deliberately
+    /// NO rollback (ADR 0002): `displaced` stays parked and the worker
+    /// serializes `{"error": <inner>…, "displaced": TaskView}` so the client
+    /// can snap the moved card back.
+    #[error("move failed after displacing the running task")]
+    AfterDisplace {
+        displaced: TaskView,
+        #[source]
+        source: Box<TasksError>,
+    },
 }
 
 impl From<CalendarError> for TasksError {
@@ -164,6 +198,44 @@ pub struct TaskActionResponse {
     pub event: Option<CalendarEvent>,
 }
 
+/// Request body for `POST /api/tasks/:id/move` (ADR 0002 § Move API): the
+/// absolute `sort_order` to assign in the target `status`. `displace` is
+/// optional (omitted or explicit `null`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct MoveTaskInput {
+    /// One of `OPEN|PLANNED|IN_PROGRESS|COMPLETED|DISCARDED` (the service
+    /// validates; unknown values are 400).
+    pub status: String,
+    /// The absolute rank to assign in the target status (>= 0).
+    pub sort_order: i64,
+    /// When set: park the running task first (must be the currently running
+    /// task; its landing status must be PLANNED/COMPLETED/DISCARDED), then
+    /// start the moved task.
+    pub displace: Option<DisplaceInput>,
+}
+
+/// The `displace` sub-object: parks the running task at its own status/rank
+/// before the moved task starts. `status` is locked to
+/// `PLANNED|COMPLETED|DISCARDED` (never OPEN/IN_PROGRESS).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DisplaceInput {
+    /// Id of the currently running task (an open timed event whose
+    /// `task_id` matches); anything else is 400.
+    pub id: String,
+    pub status: String,
+    pub sort_order: i64,
+}
+
+/// Response envelope for `POST /api/tasks/:id/move`: the moved task plus the
+/// optionally displaced task and the Google event the dispatched action
+/// touched (the same `TaskActionResponse` family, plus `displaced`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MoveTaskResponse {
+    pub task: TaskView,
+    pub displaced: Option<TaskView>,
+    pub event: Option<CalendarEvent>,
+}
+
 /// HTTP shape of a task: every `tasks` column (minus `deleted_at`) plus the
 /// **computed** category summary — the client groups tasks by `category.id`
 /// without reimplementing the matcher.
@@ -176,6 +248,9 @@ pub struct TaskView {
     pub duration_minutes: i64,
     pub priority: String,
     pub difficulty: String,
+    /// Per-user, per-status board rank (0 = front of the column). The frontend
+    /// needs it to render columns in order and, later, to place drops.
+    pub sort_order: i64,
     pub status: String,
     /// RFC 3339 instant.
     pub created_at: String,
@@ -251,6 +326,10 @@ pub async fn list_tasks(
 ///
 /// `ensure_taxonomy` runs first so the very first task of a fresh user finds
 /// a seeded matcher.
+///
+/// Ordering: the new task **prepends Backlog** — the user's living OPEN rows
+/// are shifted up by one (`sort_order >= 0`), then the task is inserted at
+/// `sort_order = 0`.
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -294,6 +373,12 @@ pub async fn create_task(
     // Validates the rules; the response view re-classifies the stored title.
     resolve_category(&title, &taxonomy)?;
 
+    // Prepend Backlog: every living OPEN row of the user moves up one so the
+    // new task can rank 0. Peers keep their `updated_at` — re-ranking is not
+    // a content change.
+    task_repo
+        .shift_sort_order(user_id, TASK_STATUS_OPEN, 0)
+        .await?;
     let task = task_repo
         .insert(NewTask {
             user_id: user_id.to_string(),
@@ -302,6 +387,7 @@ pub async fn create_task(
             duration_minutes,
             priority,
             difficulty,
+            sort_order: 0,
         })
         .await?;
     Ok(TaskResponse {
@@ -414,18 +500,21 @@ pub async fn delete_task(
 /// IN_PROGRESS. The event's summary is the task **title** exactly and carries
 /// `extendedProperties.shared.sanctuary_task_id` = task UUID.
 ///
+/// **Nothing is terminal** (ADR 0002): starting a COMPLETED/DISCARDED task is
+/// allowed — a NEW event opens for the new chapter and the old logs/events
+/// stay. Start on PLANNED was always allowed, so a paused task restarts.
+///
 /// Order of operations:
 /// 1. Load the task — missing, soft-deleted, or another user's task → 404.
-/// 2. COMPLETED/DISCARDED tasks cannot start → 400.
-/// 3. If ANY open timed event exists for the user → 409 (`Conflict`) — even
+/// 2. If ANY open timed event exists for the user → 409 (`Conflict`) — even
 ///    when it belongs to this very task.
-/// 4. Classify the title (seeding the taxonomy like every other read) to pick
+/// 3. Classify the title (seeding the taxonomy like every other read) to pick
 ///    the category; its `google_calendar_id` is the calendar *candidate*.
-/// 5. Resolve the target calendar: the candidate when it exists for this
+/// 4. Resolve the target calendar: the candidate when it exists for this
 ///    user and is writable (`access_role` owner/writer), else the user's
 ///    primary calendar. No writable calendar → 400.
-/// 6. `create_event` (now … now + duration_minutes, task carrier attached).
-/// 7. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
+/// 5. `create_event` (now … now + duration_minutes, task carrier attached).
+/// 6. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
 ///    request.
 pub async fn start_task(
     http: &dyn HttpClient,
@@ -446,12 +535,8 @@ pub async fn start_task(
     if task.user_id != user_id {
         return Err(TasksError::NotFound);
     }
-    if task.status == TASK_STATUS_COMPLETED {
-        return Err(TasksError::Invalid("cannot start a completed task".to_string()));
-    }
-    if task.status == TASK_STATUS_DISCARDED {
-        return Err(TasksError::Invalid("cannot start a discarded task".to_string()));
-    }
+    // No status gate: start on COMPLETED/DISCARDED opens a NEW event (the
+    // board's reopen-by-start, ADR 0002) — history stays in the logs.
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     // Running is derived from the cache, never from `tasks.status`: any open
@@ -526,14 +611,16 @@ pub async fn stop_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_STOPPED,
+        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN,
     )
     .await
 }
 
 /// Pauses a task: identical to [`stop_task`] (the event's end is patched to
-/// now) except the log row says `paused`. Reopening later is simply Start
-/// again (logged `started`).
+/// now) except the log row says `paused` and the status lands **PLANNED**,
+/// not OPEN (ADR 0002: pause parks the task in the Planned pile). Reopening
+/// later is simply Start again — start already allows PLANNED (logged
+/// `started`).
 pub async fn pause_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -548,7 +635,7 @@ pub async fn pause_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_PAUSED,
+        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED,
     )
     .await
 }
@@ -598,6 +685,9 @@ pub async fn discard_task(
 }
 
 /// Shared stop/pause machinery (see [`stop_task`]).
+///
+/// `target_status` is the landing status: OPEN for stop, PLANNED for pause
+/// (mirrors `complete_or_discard`, where the caller picks the terminal state).
 async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -610,6 +700,7 @@ async fn stop_or_pause(
     task_id: &str,
     now_unix: i64,
     log_type: &str,
+    target_status: &str,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -630,7 +721,7 @@ async fn stop_or_pause(
         stop_running_event(http, calendars, events, access, user_id, task_id, now_unix).await?;
 
     let Some(updated) = task_repo
-        .set_status(task_id, TASK_STATUS_OPEN, &now_rfc3339)
+        .set_status(task_id, target_status, &now_rfc3339)
         .await?
     else {
         return Err(TasksError::NotFound);
@@ -777,6 +868,467 @@ async fn stop_running_event(
     ))
 }
 
+// ──────────────────────────────────────────
+// Move (ADR 0002 § Move API): POST /api/tasks/:id/move
+// ──────────────────────────────────────────
+
+/// Validates an incoming `MoveTaskInput` target status (unknown → 400).
+fn is_valid_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        TASK_STATUS_OPEN
+            | TASK_STATUS_PLANNED
+            | TASK_STATUS_IN_PROGRESS
+            | TASK_STATUS_COMPLETED
+            | TASK_STATUS_DISCARDED
+    )
+}
+
+/// The move endpoint's Google gate (mirrors the worker's `needs_google`):
+/// start, any exit from IN_PROGRESS, and the displace park all PATCH/create
+/// Google events and require a refreshable token. The session-only
+/// transitions (plan/unplan/reopen/reorder/idle complete/discard) must be
+/// able to run with both `None`.
+fn require_google<'a>(
+    http: Option<&'a dyn HttpClient>,
+    access: Option<&'a GoogleAccess>,
+) -> Result<(&'a dyn HttpClient, &'a GoogleAccess), TasksError> {
+    match (http, access) {
+        (Some(http), Some(access)) => Ok((http, access)),
+        // The worker gate decides `needs_google` from the same matrix; this
+        // is a "should not happen" backstop, not a user-facing path.
+        _ => Err(TasksError::Invalid(
+            "google access required for this move".to_string(),
+        )),
+    }
+}
+
+/// Applies the ADR 0002 transition matrix for `from → to` on `task_id` and
+/// returns the Google event the action touched (`None` for the status-only
+/// transitions). Reuses the existing timer verbs (start/stop/pause/complete/
+/// discard) so the Google writes stay in one place; plan/unplan/reopen and
+/// idle complete/discard are pure local transitions + audit logs.
+///
+/// `http`/`access` are only consumed by the Google-touching arms; the
+/// session-only arms work with both `None` (see [`require_google`]).
+async fn dispatch_matrix_action(
+    http: Option<&dyn HttpClient>,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: Option<&GoogleAccess>,
+    user_id: &str,
+    task_id: &str,
+    from: &str,
+    to: &str,
+    now_unix: i64,
+) -> Result<Option<CalendarEvent>, TasksError> {
+    // `to == IN_PROGRESS` is always start — the IN_PROGRESS → IN_PROGRESS
+    // no-op is short-circuited by the caller, so `from` is never
+    // IN_PROGRESS here.
+    match (from, to) {
+        (_, TASK_STATUS_IN_PROGRESS) => {
+            let (http, access) = require_google(http, access)?;
+            start_task(
+                http, calendars, events, list_repo, category_repo, task_repo, logs, access,
+                user_id, task_id, now_unix,
+            )
+            .await
+            .map(|response| response.event)
+        }
+        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN) => {
+            let (http, access) = require_google(http, access)?;
+            stop_task(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, now_unix,
+            )
+            .await
+            .map(|response| response.event)
+        }
+        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_PLANNED) => {
+            let (http, access) = require_google(http, access)?;
+            pause_task(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, now_unix,
+            )
+            .await
+            .map(|response| response.event)
+        }
+        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED) => {
+            let (http, access) = require_google(http, access)?;
+            complete_task(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, now_unix,
+            )
+            .await
+            .map(|response| response.event)
+        }
+        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_DISCARDED) => {
+            let (http, access) = require_google(http, access)?;
+            discard_task(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, now_unix,
+            )
+            .await
+            .map(|response| response.event)
+        }
+        // plan / unplan / reopen: status-only flips + audit logs, no Google.
+        (TASK_STATUS_OPEN, TASK_STATUS_PLANNED) => {
+            local_transition(
+                task_repo, logs, user_id, task_id, TASK_STATUS_PLANNED, TASK_LOG_PLANNED,
+                now_unix,
+            )
+            .await?;
+            Ok(None)
+        }
+        (TASK_STATUS_PLANNED, TASK_STATUS_OPEN) => {
+            local_transition(
+                task_repo, logs, user_id, task_id, TASK_STATUS_OPEN, TASK_LOG_UNPLANNED,
+                now_unix,
+            )
+            .await?;
+            Ok(None)
+        }
+        (TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED, TASK_STATUS_OPEN | TASK_STATUS_PLANNED) => {
+            local_transition(task_repo, logs, user_id, task_id, to, TASK_LOG_REOPENED, now_unix)
+                .await?;
+            Ok(None)
+        }
+        // complete / discard from any non-running status: no Google writes.
+        (_, TASK_STATUS_COMPLETED) => {
+            terminal_transition(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix,
+            )
+            .await
+        }
+        (_, TASK_STATUS_DISCARDED) => {
+            terminal_transition(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix,
+            )
+            .await
+        }
+        // The matrix's same-status cells are no-ops/reorders; reorders are
+        // handled by the caller, and the only same-status dispatch that can
+        // reach here is the displace park when the running task's stored
+        // status already equals its landing status (stale cache) — a no-op.
+        (from, to) if from == to => Ok(None),
+        // Every other cell of the 5×5 matrix is dispatched above; this is
+        // unreachable by construction.
+        (from, to) => Err(TasksError::Invalid(format!(
+            "unexpected move transition: {from} → {to}"
+        ))),
+    }
+}
+
+/// A pure local status flip + audit log (no Google writes) — the
+/// plan/unplan/reopen/idle-complete/discard legs of the matrix.
+async fn local_transition(
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    user_id: &str,
+    task_id: &str,
+    to_status: &str,
+    log_type: &str,
+    now_unix: i64,
+) -> Result<(), TasksError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    task_repo
+        .set_status(task_id, to_status, &now_rfc3339)
+        .await?
+        .ok_or(TasksError::NotFound)?;
+    logs.insert(
+        NewTaskLog {
+            task_id: task_id.to_string(),
+            user_id: user_id.to_string(),
+            r#type: log_type.to_string(),
+            at: now_rfc3339.clone(),
+            calendar_id: None,
+            google_event_id: None,
+        },
+        &now_rfc3339,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Complete/discard from a status other than IN_PROGRESS. Normally no Google
+/// writes (set status + terminal log only) — but if this non-IN_PROGRESS
+/// task still owns a running event (stale cache), the auto-stop applies and
+/// the full `complete_task`/`discard_task` (Google) is used.
+async fn terminal_transition(
+    http: Option<&dyn HttpClient>,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: Option<&GoogleAccess>,
+    user_id: &str,
+    task_id: &str,
+    target_status: &str,
+    log_type: &str,
+    now_unix: i64,
+) -> Result<Option<CalendarEvent>, TasksError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
+    if running.iter().any(|event| event.task_id == task_id) {
+        let (http, access) = require_google(http, access)?;
+        let response = if target_status == TASK_STATUS_COMPLETED {
+            complete_task(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, now_unix,
+            )
+            .await?
+        } else {
+            discard_task(
+                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                task_id, now_unix,
+            )
+            .await?
+        };
+        return Ok(response.event);
+    }
+    local_transition(task_repo, logs, user_id, task_id, target_status, log_type, now_unix).await?;
+    Ok(None)
+}
+
+/// Cross-column (or first-insert-into-a-column) placement: shift the target
+/// status's living peers with `sort_order >=` the insert up by one, then set
+/// the task's rank. The source column is deliberately NOT compacted (gaps
+/// are fine). Returns the freshly placed row.
+async fn place_at(
+    task_repo: &dyn TaskRepo,
+    user_id: &str,
+    task_id: &str,
+    target_status: &str,
+    sort_order: i64,
+) -> Result<Task, TasksError> {
+    task_repo
+        .shift_sort_order(user_id, target_status, sort_order)
+        .await?;
+    task_repo
+        .set_sort_order(task_id, sort_order)
+        .await?
+        .ok_or(TasksError::NotFound)
+}
+
+/// Same-column reorder: the card already occupies `task.sort_order`; move it
+/// to `new_sort_order`.
+/// - `new == old` → no-op, the row is returned unchanged.
+/// - `new < old` (toward the front): peers with `new <= rank < old` shift up.
+/// - `new > old` (toward the back): peers with `old < rank <= new` shift down.
+///
+/// The moving card is outside its own shift range in both directions, so the
+/// two statements never touch it.
+async fn reorder_in_place(
+    task_repo: &dyn TaskRepo,
+    user_id: &str,
+    task: &Task,
+    new_sort_order: i64,
+) -> Result<Task, TasksError> {
+    let old = task.sort_order;
+    if new_sort_order == old {
+        return Ok(task.clone());
+    }
+    let status = &task.status;
+    if new_sort_order < old {
+        task_repo
+            .shift_sort_order_by(user_id, status, new_sort_order, old - 1, 1)
+            .await?;
+    } else {
+        task_repo
+            .shift_sort_order_by(user_id, status, old + 1, new_sort_order, -1)
+            .await?;
+    }
+    task_repo
+        .set_sort_order(&task.id, new_sort_order)
+        .await?
+        .ok_or(TasksError::NotFound)
+}
+
+/// `POST /api/tasks/:id/move` — the board drop (ADR 0002 § Move API).
+///
+/// Dispatches the transition matrix for `task.status → input.status`
+/// (reusing `start_task`/`stop_task`/`pause_task`/`complete_task`/
+/// `discard_task` for the Google-touching legs, with plan/unplan/reopen
+/// as local flips), then places the task at `input.sort_order` in the target
+/// status. Same-status moves are pure reorders (the IN_PROGRESS → IN_PROGRESS
+/// case is a no-op that ignores `sort_order`).
+///
+/// `displace` (move to IN_PROGRESS only) parks the running task first:
+/// 1. `displace.id` must be the task with an open timed event (400
+///    `"displace id is not the running task"` otherwise).
+/// 2. Park A at `displace.status`/`displace.sort_order` (must be
+///    PLANNED/COMPLETED/DISCARDED — the matrix from IN_PROGRESS).
+/// 3. `start_task(B)`, then place B.
+/// 4. If step 3 fails: [`TasksError::AfterDisplace`] — A STAYS parked
+///    (no rollback) and the error carries A's view.
+///
+/// `http`/`access` are `Option` because status-only moves (plan/unplan/
+/// reopen/reorder/idle complete/discard) never touch Google; the worker
+/// passes both only when its `needs_google` gate fires (target IN_PROGRESS,
+/// leaving IN_PROGRESS, or any displace).
+///
+/// Validation: unknown `status` → 400; negative `sort_order` → 400;
+/// `displace.status` outside PLANNED/COMPLETED/DISCARDED → 400; move to
+/// IN_PROGRESS without `displace` while something runs → 409 (from
+/// `start_task`); missing/other-user/soft-deleted task → 404.
+pub async fn move_task(
+    http: Option<&dyn HttpClient>,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    access: Option<&GoogleAccess>,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+    input: &MoveTaskInput,
+) -> Result<MoveTaskResponse, TasksError> {
+    if !is_valid_task_status(&input.status) {
+        return Err(TasksError::Invalid("unknown task status".to_string()));
+    }
+    if input.sort_order < 0 {
+        return Err(TasksError::Invalid(
+            "sort_order must not be negative".to_string(),
+        ));
+    }
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    // `displace` parks the runner so the moved task can start — it only makes
+    // sense on a move TO IN_PROGRESS (the conflict dialog's one move call).
+    if input.displace.is_some() && input.status != TASK_STATUS_IN_PROGRESS {
+        return Err(TasksError::Invalid(
+            "displace is only allowed when moving to in progress".to_string(),
+        ));
+    }
+    if let Some(displace) = &input.displace {
+        if displace.sort_order < 0 {
+            return Err(TasksError::Invalid(
+                "sort_order must not be negative".to_string(),
+            ));
+        }
+        if !matches!(
+            displace.status.as_str(),
+            TASK_STATUS_PLANNED | TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED
+        ) {
+            return Err(TasksError::Invalid(
+                "displace status must be planned, completed, or discarded".to_string(),
+            ));
+        }
+    }
+
+    // The matrix's IN_PROGRESS → IN_PROGRESS no-op: nothing happens, the
+    // current task is returned as-is, `sort_order` is ignored.
+    if task.status == TASK_STATUS_IN_PROGRESS && input.status == TASK_STATUS_IN_PROGRESS {
+        let taxonomy = load_taxonomy(category_repo, user_id).await?;
+        return Ok(MoveTaskResponse {
+            task: to_view(&task, &taxonomy),
+            displaced: None,
+            event: None,
+        });
+    }
+
+    // ── Displace flow: park A, then start B ──
+    if let Some(displace) = &input.displace {
+        let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+        let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
+        if !running.iter().any(|event| event.task_id == displace.id) {
+            return Err(TasksError::Invalid(
+                "displace id is not the running task".to_string(),
+            ));
+        }
+        let Some(displaced_task) = task_repo.get_by_id(&displace.id).await? else {
+            return Err(TasksError::Invalid(
+                "displace id is not the running task".to_string(),
+            ));
+        };
+        // Park A (matrix from IN_PROGRESS: pause/complete/discard), then rank.
+        // A failure here is a plain error — nothing was started yet.
+        dispatch_matrix_action(
+            http, calendars, events, list_repo, category_repo, task_repo, logs, access,
+            user_id, &displaced_task.id, &displaced_task.status, &displace.status, now_unix,
+        )
+        .await?;
+        let displaced_row = place_at(
+            task_repo,
+            user_id,
+            &displaced_task.id,
+            &displace.status,
+            displace.sort_order,
+        )
+        .await?;
+
+        // Start B, then rank B. A start failure is an HONEST partial failure:
+        // A stays parked (no rollback) and `AfterDisplace` carries A's view.
+        match dispatch_matrix_action(
+            http, calendars, events, list_repo, category_repo, task_repo, logs, access,
+            user_id, task_id, &task.status, TASK_STATUS_IN_PROGRESS, now_unix,
+        )
+        .await
+        {
+            Ok(event) => {
+                let row = place_at(
+                    task_repo,
+                    user_id,
+                    task_id,
+                    TASK_STATUS_IN_PROGRESS,
+                    input.sort_order,
+                )
+                .await?;
+                let taxonomy = load_taxonomy(category_repo, user_id).await?;
+                Ok(MoveTaskResponse {
+                    task: to_view(&row, &taxonomy),
+                    displaced: Some(to_view(&displaced_row, &taxonomy)),
+                    event,
+                })
+            }
+            Err(inner) => {
+                let taxonomy = load_taxonomy(category_repo, user_id).await?;
+                Err(TasksError::AfterDisplace {
+                    displaced: to_view(&displaced_row, &taxonomy),
+                    source: Box::new(inner),
+                })
+            }
+        }
+    } else if task.status == input.status {
+        // Same column: pure reorder (the moving card keeps its status; rank
+        // shifts neighbors only when it actually changes position).
+        let row = reorder_in_place(task_repo, user_id, &task, input.sort_order).await?;
+        let taxonomy = load_taxonomy(category_repo, user_id).await?;
+        Ok(MoveTaskResponse {
+            task: to_view(&row, &taxonomy),
+            displaced: None,
+            event: None,
+        })
+    } else {
+        // Cross-column: dispatch the matrix action, then place.
+        let event = dispatch_matrix_action(
+            http, calendars, events, list_repo, category_repo, task_repo, logs, access,
+            user_id, task_id, &task.status, &input.status, now_unix,
+        )
+        .await?;
+        let row = place_at(task_repo, user_id, task_id, &input.status, input.sort_order).await?;
+        let taxonomy = load_taxonomy(category_repo, user_id).await?;
+        Ok(MoveTaskResponse {
+            task: to_view(&row, &taxonomy),
+            displaced: None,
+            event,
+        })
+    }
+}
+
 /// Loads the taxonomy, seeding it first (same count-gated path as
 /// `list_tasks`/`create_task`; the gate keeps the first Lists visit order).
 async fn load_taxonomy_seeded(
@@ -878,6 +1430,7 @@ fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
         duration_minutes: task.duration_minutes,
         priority: task.priority.clone(),
         difficulty: task.difficulty.clone(),
+        sort_order: task.sort_order,
         status: task.status.clone(),
         created_at: task.created_at.clone(),
         updated_at: task.updated_at.clone(),
@@ -1011,8 +1564,18 @@ mod tests {
                 .collect();
             // Mirrors TASK_LIST_BY_USER_ID_SQL (stable sort ties by id).
             rows.sort_by(|a, b| {
-                (b.updated_at.as_str(), b.created_at.as_str(), &b.id)
-                    .cmp(&(a.updated_at.as_str(), a.created_at.as_str(), &a.id))
+                (
+                    a.status.as_str(),
+                    a.sort_order,
+                    a.created_at.as_str(),
+                    &a.id,
+                )
+                    .cmp(&(
+                        b.status.as_str(),
+                        b.sort_order,
+                        b.created_at.as_str(),
+                        &b.id,
+                    ))
             });
             Ok(rows)
         }
@@ -1037,6 +1600,7 @@ mod tests {
                 duration_minutes: task.duration_minutes,
                 priority: task.priority.clone(),
                 difficulty: task.difficulty.clone(),
+                sort_order: task.sort_order,
                 status: TASK_STATUS_OPEN.to_string(),
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -1045,6 +1609,41 @@ mod tests {
             *next += 1;
             self.stored.lock().unwrap().push(row.clone());
             Ok(row)
+        }
+
+        async fn shift_sort_order(
+            &self,
+            user_id: &str,
+            status: &str,
+            from_inclusive: i64,
+        ) -> Result<(), RepoError> {
+            // Same semantics as TASK_SHIFT_SORT_ORDER_SQL: `i64::MAX` opens
+            // the range top for the +1 shift.
+            self.shift_sort_order_by(user_id, status, from_inclusive, i64::MAX, 1)
+                .await
+        }
+
+        async fn shift_sort_order_by(
+            &self,
+            user_id: &str,
+            status: &str,
+            from_inclusive: i64,
+            to_inclusive: i64,
+            delta: i64,
+        ) -> Result<(), RepoError> {
+            // Mirrors TASK_SHIFT_SORT_ORDER_RANGE_SQL.
+            let mut stored = self.stored.lock().unwrap();
+            for row in stored.iter_mut() {
+                if row.user_id == user_id
+                    && row.status == status
+                    && row.deleted_at.is_none()
+                    && row.sort_order >= from_inclusive
+                    && row.sort_order <= to_inclusive
+                {
+                    row.sort_order += delta;
+                }
+            }
+            Ok(())
         }
 
         async fn update(
@@ -1093,6 +1692,20 @@ mod tests {
             };
             row.status = status.to_string();
             row.updated_at = now_rfc3339.to_string();
+            Ok(Some(row.clone()))
+        }
+
+        async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError> {
+            // Mirrors TASK_SET_SORT_ORDER_SQL: rank only — no status, no
+            // `updated_at`.
+            let mut stored = self.stored.lock().unwrap();
+            let Some(row) = stored
+                .iter_mut()
+                .find(|row| row.id == id && row.deleted_at.is_none())
+            else {
+                return Ok(None);
+            };
+            row.sort_order = sort_order;
             Ok(Some(row.clone()))
         }
 
@@ -1421,6 +2034,23 @@ mod tests {
         assert_eq!(review.task.category.title, "Work");
         assert_ne!(work.task.id, review.task.id, "titles are not unique");
         assert_eq!(work.task.category.id, review.task.category.id);
+    }
+
+    #[test]
+    fn create_task_prepends_backlog_sort_order() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        let second = work_task(&lists, &categories, &tasks);
+
+        // The newest task sits at the front of the Backlog pile (0); the
+        // previous front task shifts one back. TaskView is a snapshot, so the
+        // shifted rank of `first` is asserted on the persisted row.
+        assert_eq!(second.sort_order, 0, "new task response ranks 0");
+        let stored = tasks.stored.lock().unwrap();
+        let first_row = stored.iter().find(|row| row.id == first.id).unwrap();
+        let second_row = stored.iter().find(|row| row.id == second.id).unwrap();
+        assert_eq!(second_row.sort_order, 0, "new task prepends Backlog");
+        assert_eq!(first_row.sort_order, 1, "existing OPEN task shifted up");
     }
 
     #[test]
@@ -2450,7 +3080,9 @@ mod tests {
     }
 
     #[test]
-    fn start_completed_task_is_invalid() {
+    fn start_completed_task_opens_a_new_event() {
+        // ADR 0002: nothing is terminal — starting a COMPLETED task opens a
+        // NEW event (the reopen-by-start chapter); history stays.
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
@@ -2461,18 +3093,27 @@ mod tests {
         // fake's `set_status` is the same statement the service uses).
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
 
-        let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(start_task(
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
-        .unwrap_err();
-        assert!(matches!(err, TasksError::Invalid(m) if m == "cannot start a completed task"));
-        assert!(http.posts.lock().unwrap().is_empty());
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        let event = response.event.expect("start on a completed task opens a NEW event");
+        assert_eq!(event.google_event_id, "g-1");
+        assert_eq!(event.task_id, task.id);
+        assert_eq!(logs.inserted.lock().unwrap().last().unwrap().r#type, TASK_LOG_STARTED);
+        assert!(http.posts.lock().unwrap().len() == 1, "exactly the new insert");
     }
 
     #[test]
-    fn start_discarded_task_is_invalid() {
+    fn start_discarded_task_opens_a_new_event() {
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
@@ -2480,13 +3121,22 @@ mod tests {
         let logs = FakeTaskLogRepo::default();
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_DISCARDED, NOW)).unwrap();
 
-        let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(start_task(
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
-        .unwrap_err();
-        assert!(matches!(err, TasksError::Invalid(m) if m == "cannot start a discarded task"));
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        let event = response.event.expect("start on a discarded task opens a NEW event");
+        assert_eq!(event.google_event_id, "g-1");
+        assert_eq!(event.task_id, task.id);
+        assert_eq!(logs.inserted.lock().unwrap().last().unwrap().r#type, TASK_LOG_STARTED);
     }
 
     #[test]
@@ -2685,11 +3335,13 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        // ADR 0002: pause parks the task in the Planned pile, not Backlog.
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
         assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:23:20Z");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
-        // Ending the event also frees the one-running slot: a new start works.
+        // Ending the event also frees the one-running slot; a new start works
+        // (start is allowed from any status since the board slice).
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -2897,5 +3549,743 @@ mod tests {
             "nope", NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
+    }
+
+    // ──────────────────────────────────────────
+    // move_task (ADR 0002 § Move API)
+    // ──────────────────────────────────────────
+
+    /// Calls `move_task` for `u-1` at `NOW_UNIX` with no displace.
+    fn move_to(
+        http: &FakeHttp,
+        calendars: &FakeCalendarRepo,
+        events: &FakeEventRepo,
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        tasks: &FakeTaskRepo,
+        logs: &FakeTaskLogRepo,
+        access: Option<&GoogleAccess>,
+        task_id: &str,
+        status: &str,
+        sort_order: i64,
+    ) -> Result<MoveTaskResponse, TasksError> {
+        pollster::block_on(move_task(
+            Some(http),
+            calendars,
+            events,
+            lists,
+            categories,
+            tasks,
+            logs,
+            access,
+            "u-1",
+            task_id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: status.to_string(),
+                sort_order,
+                displace: None,
+            },
+        ))
+    }
+
+    /// Starts `task_id` against the default Google stack (writable primary
+    /// calendar, one `/events` route) and returns the fresh fakes — the
+    /// running-task setup behind the exit/displace tests.
+    fn start_running(
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        tasks: &FakeTaskRepo,
+        task_id: &str,
+    ) -> (FakeHttp, FakeCalendarRepo, FakeEventRepo, FakeTaskLogRepo) {
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(task_id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, lists, categories, tasks, &logs,
+            &access(), "u-1", task_id, NOW_UNIX,
+        ))
+        .unwrap();
+        (http, calendars, events, logs)
+    }
+
+    #[test]
+    fn move_open_to_planned_is_plan() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let peer = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Park the peer in PLANNED first (session-only, no Google).
+        let parked = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &peer.id, TASK_STATUS_PLANNED, 0,
+        )
+        .unwrap();
+        assert_eq!(parked.task.status, TASK_STATUS_PLANNED);
+
+        // Plan `task` at the front: the PLANNED peer shifts up to 1.
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &task.id, TASK_STATUS_PLANNED, 0,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(response.task.sort_order, 0);
+        assert!(response.displaced.is_none());
+        assert!(response.event.is_none());
+
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == task.id).unwrap().sort_order, 0);
+        assert_eq!(
+            stored.iter().find(|row| row.id == peer.id).unwrap().sort_order,
+            1,
+            "PLANNED peer shifted up by the insertion"
+        );
+        drop(stored);
+
+        assert!(http.posts.lock().unwrap().is_empty(), "plan touches no Google");
+        assert!(http.patches.lock().unwrap().is_empty(), "plan touches no Google");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_PLANNED, "{inserted:?}");
+    }
+
+    #[test]
+    fn move_planned_to_open_is_unplan() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let planned = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &task.id, TASK_STATUS_PLANNED, 0,
+        )
+        .unwrap();
+        assert_eq!(planned.task.status, TASK_STATUS_PLANNED);
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &task.id, TASK_STATUS_OPEN, 0,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 0);
+        assert!(response.event.is_none());
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_UNPLANNED, "{inserted:?}");
+        assert!(http.posts.lock().unwrap().is_empty(), "unplan touches no Google");
+    }
+
+    #[test]
+    fn move_completed_to_planned_is_reopen() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        let http = FakeHttp::new(vec![]);
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &task.id, TASK_STATUS_PLANNED, 0,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_REOPENED, "{inserted:?}");
+        assert!(http.posts.lock().unwrap().is_empty(), "reopen touches no Google");
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_open_to_in_progress_is_start() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+        )]);
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, 0,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        let event = response.event.expect("start leg returns the created event");
+        assert_eq!(event.task_id, task.id);
+        assert!(response.displaced.is_none());
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_STARTED, "{inserted:?}");
+    }
+
+    #[test]
+    fn move_in_progress_to_planned_is_pause() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &task.id);
+        drop(_start_http);
+
+        let pause_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:23:20Z"),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            pause_unix,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: 0,
+                displace: None,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        let event = response.event.expect("pause leg patches and returns the event");
+        assert_eq!(event.end_time, "2023-11-14T22:23:20Z");
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "exit from IN_PROGRESS patches");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_PAUSED, "{inserted:?}");
+    }
+
+    #[test]
+    fn move_in_progress_to_open_is_stop() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &task.id);
+        drop(_start_http);
+
+        let stop_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            stop_unix,
+            &MoveTaskInput {
+                status: TASK_STATUS_OPEN.to_string(),
+                sort_order: 4,
+                displace: None,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 4, "stop then place at the request rank");
+        assert!(response.event.is_some(), "stop leg returns the patched event");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_STOPPED, "{inserted:?}");
+    }
+
+    #[test]
+    fn move_to_in_progress_without_displace_conflicts() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        let second = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Fitness"),
+        ))
+        .unwrap()
+        .task;
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &first.id);
+        drop(_start_http);
+
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &second.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 0,
+                displace: None,
+            },
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Conflict), "got {err:?}");
+        assert!(http.posts.lock().unwrap().is_empty(), "no insert attempted");
+        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only the first event");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN
+        );
+    }
+
+    #[test]
+    fn move_to_in_progress_with_displace_parks_then_starts() {
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        // Route order matters: the patch URL contains "/events" too. The
+        // patch echo returns end = NOW (the real Google echo of `stop`), so
+        // the cache sees A no longer running and B's start is free.
+        let http = FakeHttp::new(vec![
+            ("/events/g-1", 200, &patched_event_json(&a.id, NOW, NOW)),
+            (
+                "/events",
+                200,
+                &created_event_json(&b.id, NOW, "2023-11-14T22:28:20Z"),
+            ),
+        ]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &b.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 0,
+                displace: Some(DisplaceInput {
+                    id: a.id.clone(),
+                    status: TASK_STATUS_PLANNED.to_string(),
+                    sort_order: 0,
+                }),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.id, b.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(response.task.sort_order, 0);
+        let displaced = response.displaced.expect("A is returned as displaced");
+        assert_eq!(displaced.id, a.id);
+        assert_eq!(displaced.status, TASK_STATUS_PLANNED);
+        assert_eq!(displaced.sort_order, 0);
+        let event = response.event.expect("B's new event");
+        assert_eq!(event.task_id, b.id);
+
+        // Persisted state: A parked, B running, one patch + one insert.
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
+            TASK_STATUS_PLANNED
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "A's event closed");
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's event inserted");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "paused", "started"], "{inserted:?}");
+    }
+
+    #[test]
+    fn move_displace_then_start_failure_keeps_displaced() {
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        // A's park patch succeeds (echo end = NOW, so the cache frees the
+        // slot); B's start insert then fails with a Google 400.
+        let http = FakeHttp::new(vec![
+            ("/events/g-1", 200, &patched_event_json(&a.id, NOW, NOW)),
+            ("/events", 400, r#"{"error":"invalid"}"#),
+        ]);
+        let err = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &b.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 0,
+                displace: Some(DisplaceInput {
+                    id: a.id.clone(),
+                    status: TASK_STATUS_PLANNED.to_string(),
+                    sort_order: 0,
+                }),
+            },
+        ))
+        .unwrap_err();
+        let TasksError::AfterDisplace { displaced, source } = err else {
+            panic!("expected AfterDisplace, got {err:?}");
+        };
+        assert_eq!(displaced.id, a.id, "the parked task is reported");
+        assert_eq!(displaced.status, TASK_STATUS_PLANNED);
+        let message = match source.as_ref() {
+            TasksError::GoogleApi(message) => message,
+            other => panic!("inner error is {other:?}"),
+        };
+        assert_eq!(message, "google events.insert returned 400");
+
+        // A STAYS parked (no rollback); B never started; nothing is running.
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
+            TASK_STATUS_PLANNED,
+            "displaced task stays parked after the failed start"
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN
+        );
+        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only A's closed-event echo");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
+        assert!(
+            pollster::block_on(events.list_running_by_user_id(
+                "u-1",
+                &unix_secs_to_rfc3339(NOW_UNIX + 360),
+            ))
+            .unwrap()
+            .is_empty(),
+            "A's event is closed, nothing runs"
+        );
+    }
+
+    #[test]
+    fn move_displace_wrong_id_is_invalid() {
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        // `displace.id` = the moved task itself, which is NOT running → 400.
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &b.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 0,
+                displace: Some(DisplaceInput {
+                    id: b.id.clone(),
+                    status: TASK_STATUS_PLANNED.to_string(),
+                    sort_order: 0,
+                }),
+            },
+        ))
+        .unwrap_err();
+        let message = match &err {
+            TasksError::Invalid(message) => message.as_str(),
+            other => panic!("expected the locked displace error, got {other:?}"),
+        };
+        assert_eq!(message, "displace id is not the running task");
+        assert!(http.posts.lock().unwrap().is_empty(), "nothing dispatched");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS,
+            "A untouched"
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN,
+            "B untouched"
+        );
+
+        // With nothing running at all, any displace id fails the same way.
+        let (lists2, categories2, tasks2) = seeded();
+        let c = work_task(&lists2, &categories2, &tasks2);
+        let calendars2 = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events2 = FakeEventRepo::new();
+        let logs2 = FakeTaskLogRepo::default();
+        let err = pollster::block_on(move_task(
+            Some(&http),
+            &calendars2,
+            &events2,
+            &lists2,
+            &categories2,
+            &tasks2,
+            &logs2,
+            Some(&access()),
+            "u-1",
+            &c.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 0,
+                displace: Some(DisplaceInput {
+                    id: "nope".to_string(),
+                    status: TASK_STATUS_PLANNED.to_string(),
+                    sort_order: 0,
+                }),
+            },
+        ))
+        .unwrap_err();
+        let message = match &err {
+            TasksError::Invalid(message) => message.as_str(),
+            other => panic!("expected the locked displace error, got {other:?}"),
+        };
+        assert_eq!(message, "displace id is not the running task");
+    }
+
+    #[test]
+    fn move_same_column_reorder_shifts_neighbors() {
+        let (lists, categories, tasks) = seeded();
+        // Create C then B then A: create prepends, so A=0, B=1, C=2.
+        let c = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let a = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Drag A (rank 0) down to rank 2: the peers in (0, 2] shift down one.
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &a.id, TASK_STATUS_OPEN, 2,
+        )
+        .unwrap();
+        assert_eq!(response.task.sort_order, 2);
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 2);
+        assert_eq!(rank(&b.id), 0, "B shifts down one");
+        assert_eq!(rank(&c.id), 1, "C shifts down one");
+        drop(stored);
+
+        // And back up: A (rank 2) to rank 0 — peers in [0, 2) shift up one.
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &a.id, TASK_STATUS_OPEN, 0,
+        )
+        .unwrap();
+        assert_eq!(response.task.sort_order, 0);
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == a.id).unwrap().sort_order, 0);
+        assert_eq!(stored.iter().find(|row| row.id == b.id).unwrap().sort_order, 1);
+        assert_eq!(stored.iter().find(|row| row.id == c.id).unwrap().sort_order, 2);
+        drop(stored);
+
+        // Reorder is log-free and Google-free.
+        assert!(logs.inserted.lock().unwrap().is_empty(), "reorder logs nothing");
+        assert!(http.posts.lock().unwrap().is_empty());
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_in_progress_to_in_progress_is_noop() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &task.id);
+        drop(_start_http);
+
+        let http = FakeHttp::new(vec![]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            None, // the no-op never dispatches, so even Google-less works
+            "u-1",
+            &task.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 99,
+                displace: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(response.task.id, task.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(response.task.sort_order, 0, "sort_order ignored by the no-op");
+        assert!(response.displaced.is_none());
+        assert!(response.event.is_none());
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "only the original start log");
+        assert!(http.posts.lock().unwrap().is_empty());
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_validates_status_rank_and_displace() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let unknown = MoveTaskInput {
+            status: "GONE".to_string(),
+            sort_order: 0,
+            displace: None,
+        };
+        let err = pollster::block_on(move_task(
+            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            "u-1", &task.id, NOW_UNIX, &unknown,
+        ))
+        .unwrap_err();
+        let message = match &err {
+            TasksError::Invalid(message) => message.as_str(),
+            other => panic!("expected the unknown-status error, got {other:?}"),
+        };
+        assert_eq!(message, "unknown task status");
+
+        let negative = MoveTaskInput {
+            status: TASK_STATUS_OPEN.to_string(),
+            sort_order: -1,
+            displace: None,
+        };
+        let err = pollster::block_on(move_task(
+            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            "u-1", &task.id, NOW_UNIX, &negative,
+        ))
+        .unwrap_err();
+        let message = match &err {
+            TasksError::Invalid(message) => message.as_str(),
+            other => panic!("expected the negative-rank error, got {other:?}"),
+        };
+        assert_eq!(message, "sort_order must not be negative");
+
+        // displace.status is locked to PLANNED/COMPLETED/DISCARDED.
+        let bad_displace = MoveTaskInput {
+            status: TASK_STATUS_IN_PROGRESS.to_string(),
+            sort_order: 0,
+            displace: Some(DisplaceInput {
+                id: "x".to_string(),
+                status: TASK_STATUS_OPEN.to_string(),
+                sort_order: 0,
+            }),
+        };
+        let err = pollster::block_on(move_task(
+            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            "u-1", &task.id, NOW_UNIX, &bad_displace,
+        ))
+        .unwrap_err();
+        let message = match &err {
+            TasksError::Invalid(message) => message.as_str(),
+            other => panic!("expected the displace-status error, got {other:?}"),
+        };
+        assert_eq!(message, "displace status must be planned, completed, or discarded");
+
+        // displace only makes sense when the target is IN_PROGRESS.
+        let misplaced = MoveTaskInput {
+            status: TASK_STATUS_COMPLETED.to_string(),
+            sort_order: 0,
+            displace: Some(DisplaceInput {
+                id: "x".to_string(),
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: 0,
+            }),
+        };
+        let err = pollster::block_on(move_task(
+            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            "u-1", &task.id, NOW_UNIX, &misplaced,
+        ))
+        .unwrap_err();
+        let message = match &err {
+            TasksError::Invalid(message) => message.as_str(),
+            other => panic!("expected the misplaced-displace error, got {other:?}"),
+        };
+        assert_eq!(message, "displace is only allowed when moving to in progress");
+
+        assert_eq!(tasks.stored.lock().unwrap().len(), 1, "nothing changed");
+    }
+
+    #[test]
+    fn move_missing_or_other_users_task_is_not_found() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+        let input = MoveTaskInput {
+            status: TASK_STATUS_OPEN.to_string(),
+            sort_order: 0,
+            displace: None,
+        };
+
+        assert!(matches!(
+            pollster::block_on(move_task(
+                Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs,
+                None, "u-2", &task.id, NOW_UNIX, &input,
+            )),
+            Err(TasksError::NotFound)
+        ));
+        assert!(matches!(
+            pollster::block_on(move_task(
+                Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs,
+                None, "u-1", "nope", NOW_UNIX, &input,
+            )),
+            Err(TasksError::NotFound)
+        ));
     }
 }
