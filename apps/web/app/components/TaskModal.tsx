@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Clock, Flag, Tag } from 'lucide-react';
+import { Clock, Flag, Gauge, Tag } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -11,6 +11,7 @@ import {
 import { cn } from '@/lib/utils';
 import type {
   TaskCategorySummary,
+  TaskDifficulty,
   TaskPriority,
   TaskRecord,
 } from '@/app/types';
@@ -20,6 +21,7 @@ interface TaskFormValues {
   description: string;
   durationMinutes: number;
   priority: TaskPriority;
+  difficulty: TaskDifficulty;
 }
 
 interface TaskModalProps {
@@ -45,6 +47,12 @@ const priorityConfig: Record<TaskPriority, { label: string }> = {
   high: { label: 'High' },
 };
 
+const difficultyConfig: Record<TaskDifficulty, { label: string }> = {
+  easy: { label: 'Easy' },
+  medium: { label: 'Medium' },
+  hard: { label: 'Hard' },
+};
+
 export function TaskModal({
   open,
   onOpenChange,
@@ -61,6 +69,7 @@ export function TaskModal({
     setTitle(task?.title || '');
     setDescription(task?.description || '');
     setPriority(task?.priority || 'medium');
+    setDifficulty(task?.difficulty || 'easy');
     setDuration(String(task?.duration_minutes || 15));
     setFormError(null);
   }, [open, task]);
@@ -68,6 +77,7 @@ export function TaskModal({
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState<TaskPriority>('medium');
+  const [difficulty, setDifficulty] = useState<TaskDifficulty>('easy');
   const [duration, setDuration] = useState('15');
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -80,6 +90,7 @@ export function TaskModal({
       description,
       durationMinutes: parseInt(duration, 10) || 15,
       priority,
+      difficulty,
     });
     setSaving(false);
     if (error) {
@@ -187,6 +198,31 @@ export function TaskModal({
                   )}
                 >
                   {priorityConfig[p].label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Difficulty Selection */}
+          <div className="space-y-2 mb-5">
+            <label className="text-sm font-medium text-foreground flex items-center gap-2">
+              <Gauge className="h-4 w-4 text-muted-foreground" />
+              Difficulty
+            </label>
+            <div className="flex gap-2">
+              {(Object.keys(difficultyConfig) as TaskDifficulty[]).map((d) => (
+                <button
+                  key={d}
+                  type="button"
+                  onClick={() => setDifficulty(d)}
+                  className={cn(
+                    'flex items-center gap-2 px-4 py-2 rounded-xl border-2 text-sm font-medium transition-all',
+                    difficulty === d
+                      ? 'bg-primary/10 border-primary text-primary'
+                      : 'bg-background border-input text-muted-foreground hover:border-primary/30',
+                  )}
+                >
+                  {difficultyConfig[d].label}
                 </button>
               ))}
             </div>

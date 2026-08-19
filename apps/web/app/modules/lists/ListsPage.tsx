@@ -25,6 +25,7 @@ import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import type {
   NewTaskInput,
+  TaskDifficulty,
   TaskList,
   TaskListsResponse,
   TaskPriority,
@@ -286,6 +287,7 @@ export function ListsPage() {
     description: string;
     durationMinutes: number;
     priority: TaskPriority;
+    difficulty: TaskDifficulty;
   }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
@@ -294,6 +296,7 @@ export function ListsPage() {
       description: values.description,
       duration_minutes: values.durationMinutes,
       priority: values.priority,
+      difficulty: values.difficulty,
     };
     const res =
       taskForm.mode === 'create'
@@ -677,7 +680,9 @@ function TaskChip({
     <div
       onClick={() => onEdit(task)}
       className="flex w-full cursor-pointer items-center gap-1.5 rounded-lg bg-black/25 px-2.5 py-1.5 text-left hover:bg-black/35 transition-colors"
-      title={`${task.title} — ${task.duration_minutes} min, ${task.priority}`}
+      title={`${task.title} — ${task.duration_minutes} min, ${task.priority}${
+        task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''
+      }`}
     >
       <span className="flex-1 min-w-0 text-xs text-primary-foreground/90 truncate">
         {task.title}
@@ -685,6 +690,18 @@ function TaskChip({
       <span className="flex-shrink-0 text-[10px] text-primary-foreground/60">
         {task.duration_minutes} min
       </span>
+      {task.difficulty === 'hard' || task.difficulty === 'medium' ? (
+        <span
+          className={cn(
+            'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] uppercase tracking-wide',
+            task.difficulty === 'hard'
+              ? 'bg-primary-foreground/25 font-semibold text-primary-foreground/90'
+              : 'bg-primary-foreground/15 font-medium text-primary-foreground/70',
+          )}
+        >
+          {task.difficulty === 'hard' ? 'HARD' : 'MED'}
+        </span>
+      ) : null}
       <span
         className={cn(
           'h-1.5 w-1.5 rounded-full flex-shrink-0',

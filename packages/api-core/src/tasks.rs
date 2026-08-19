@@ -19,7 +19,8 @@
 //!   whose children do not match is **allowed** (parent remainder).
 //! - Titles are not unique. Create always stores `status = "OPEN"`.
 //! - `duration_minutes` defaults to 15 and must be >= 1; `priority` must be
-//!   `high|medium|low` (default `medium`).
+//!   `high|medium|low` (default `medium`); `difficulty` must be
+//!   `easy|medium|hard` (default `easy`).
 //! - Delete is SOFT; a missing/soft-deleted/other-user task is always
 //!   [`TasksError::NotFound`].
 //! - List returns each living task with its **computed** category
@@ -174,6 +175,7 @@ pub struct TaskView {
     pub description: String,
     pub duration_minutes: i64,
     pub priority: String,
+    pub difficulty: String,
     pub status: String,
     /// RFC 3339 instant.
     pub created_at: String,
@@ -245,6 +247,7 @@ pub async fn list_tasks(
 /// - `duration_minutes` defaults to [`DEFAULT_DURATION_MINUTES`] and must be
 ///   at least [`MIN_DURATION_MINUTES`].
 /// - `priority` defaults to `medium` and must be `high|medium|low`.
+/// - `difficulty` defaults to `easy` and must be `easy|medium|hard`.
 ///
 /// `ensure_taxonomy` runs first so the very first task of a fresh user finds
 /// a seeded matcher.
@@ -273,6 +276,16 @@ pub async fn create_task(
             "priority must be one of high, medium, low".to_string(),
         ));
     }
+    let difficulty = input
+        .difficulty
+        .as_deref()
+        .unwrap_or("easy")
+        .to_string();
+    if !is_valid_difficulty(&difficulty) {
+        return Err(TasksError::Invalid(
+            "difficulty must be one of easy, medium, hard".to_string(),
+        ));
+    }
 
     let lists = list_repo.list_by_user_id(user_id).await?;
     let categories = category_repo.list_by_user_id(user_id).await?;
@@ -288,6 +301,7 @@ pub async fn create_task(
             description: input.description.as_deref().unwrap_or("").trim().to_string(),
             duration_minutes,
             priority,
+            difficulty,
         })
         .await?;
     Ok(TaskResponse {
@@ -295,14 +309,15 @@ pub async fn create_task(
     })
 }
 
-/// Updates a task's `title`/`description`/`duration_minutes`/`priority`
-/// (`None` = unchanged; status is never updated this slice).
+/// Updates a task's `title`/`description`/`duration_minutes`/`priority`/
+/// `difficulty` (`None` = unchanged; status is never updated this slice).
 ///
 /// - A body with nothing to update is 400.
 /// - When `title` is present it must be non-blank AND uniquely match a
 ///   non-untracked category (same rules as create, same messages).
 /// - `duration_minutes` must be >= 1 when present; `priority` must be
-///   `high|medium|low` when present.
+///   `high|medium|low` when present; `difficulty` must be
+///   `easy|medium|hard` when present.
 /// - A missing, soft-deleted, or another user's task is 404.
 pub async fn update_task(
     category_repo: &dyn TaskCategoryRepo,
@@ -315,6 +330,7 @@ pub async fn update_task(
         && updates.description.is_none()
         && updates.duration_minutes.is_none()
         && updates.priority.is_none()
+        && updates.difficulty.is_none()
     {
         return Err(TasksError::Invalid("nothing to update".to_string()));
     }
@@ -327,6 +343,13 @@ pub async fn update_task(
         if !is_valid_priority(priority) {
             return Err(TasksError::Invalid(
                 "priority must be one of high, medium, low".to_string(),
+            ));
+        }
+    }
+    if let Some(difficulty) = updates.difficulty.as_deref() {
+        if !is_valid_difficulty(difficulty) {
+            return Err(TasksError::Invalid(
+                "difficulty must be one of easy, medium, hard".to_string(),
             ));
         }
     }
@@ -828,6 +851,10 @@ fn is_valid_priority(priority: &str) -> bool {
     matches!(priority, "high" | "medium" | "low")
 }
 
+fn is_valid_difficulty(difficulty: &str) -> bool {
+    matches!(difficulty, "easy" | "medium" | "hard")
+}
+
 fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
     let outcome = classify(&task.title, None, &taxonomy.matchers);
     let category = match &outcome {
@@ -850,6 +877,7 @@ fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
         description: task.description.clone(),
         duration_minutes: task.duration_minutes,
         priority: task.priority.clone(),
+        difficulty: task.difficulty.clone(),
         status: task.status.clone(),
         created_at: task.created_at.clone(),
         updated_at: task.updated_at.clone(),
@@ -1008,6 +1036,7 @@ mod tests {
                 description: task.description.clone(),
                 duration_minutes: task.duration_minutes,
                 priority: task.priority.clone(),
+                difficulty: task.difficulty.clone(),
                 status: TASK_STATUS_OPEN.to_string(),
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -1041,6 +1070,9 @@ mod tests {
             }
             if let Some(priority) = &updates.priority {
                 row.priority = priority.clone();
+            }
+            if let Some(difficulty) = &updates.difficulty {
+                row.difficulty = difficulty.clone();
             }
             row.updated_at = "2026-08-18T01:00:00Z".to_string();
             Ok(Some(row.clone()))
@@ -1339,6 +1371,7 @@ mod tests {
             description: None,
             duration_minutes: None,
             priority: None,
+            difficulty: None,
         }
     }
 
@@ -1376,6 +1409,7 @@ mod tests {
         assert_eq!(work.task.status, "OPEN");
         assert_eq!(work.task.duration_minutes, 15, "duration defaults to 15");
         assert_eq!(work.task.priority, "medium", "priority defaults to medium");
+        assert_eq!(work.task.difficulty, "easy", "difficulty defaults to easy");
         assert_eq!(work.task.category.title, "Work");
         assert!(!work.task.category.is_untracked);
         assert!(work.task.category.inherited_list_id.is_some(), "root owns a list");
@@ -1486,6 +1520,7 @@ mod tests {
             description: None,
             duration_minutes: Some(0),
             priority: None,
+            difficulty: None,
         };
         let err = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &zero_duration,
@@ -1498,13 +1533,53 @@ mod tests {
             description: None,
             duration_minutes: None,
             priority: Some("urgent".to_string()),
+            difficulty: None,
         };
         let err = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &bad_priority,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "priority must be one of high, medium, low"));
+
+        // No case-coercion: uppercase and non-enum values are 400 too.
+        for difficulty in ["HARD", "urgent"] {
+            let bad_difficulty = NewTaskInput {
+                title: "Work".to_string(),
+                description: None,
+                duration_minutes: None,
+                priority: None,
+                difficulty: Some(difficulty.to_string()),
+            };
+            let err = pollster::block_on(create_task(
+                &lists, &categories, &tasks, "u-1", &bad_difficulty,
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, TasksError::Invalid(m) if m == "difficulty must be one of easy, medium, hard"),
+                "{difficulty} is invalid"
+            );
+        }
         assert_eq!(tasks.stored.lock().unwrap().len(), 0, "nothing persisted");
+    }
+
+    #[test]
+    fn create_stores_explicit_difficulty() {
+        let (lists, categories, tasks) = seeded();
+        let input = NewTaskInput {
+            title: "Work".to_string(),
+            description: None,
+            duration_minutes: None,
+            priority: None,
+            difficulty: Some("medium".to_string()),
+        };
+        let response = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input,
+        ))
+        .unwrap();
+        assert_eq!(
+            response.task.difficulty, "medium",
+            "explicit difficulty is stored, not overwritten by the default"
+        );
     }
 
     #[test]
@@ -1595,6 +1670,7 @@ mod tests {
             description: Some("Deep focus session".to_string()),
             duration_minutes: Some(25),
             priority: Some("high".to_string()),
+            difficulty: Some("hard".to_string()),
         };
         let response = pollster::block_on(update_task(
             &categories, &tasks, "u-1", &created.id, &updates,
@@ -1603,6 +1679,7 @@ mod tests {
         assert_eq!(response.task.description, "Deep focus session");
         assert_eq!(response.task.duration_minutes, 25);
         assert_eq!(response.task.priority, "high");
+        assert_eq!(response.task.difficulty, "hard");
         assert_eq!(response.task.category.id, created.category.id, "category preserved");
     }
 
@@ -1633,6 +1710,16 @@ mod tests {
         assert!(matches!(
             pollster::block_on(update_task(&categories, &tasks, "u-1", &created.id, &bad_priority)),
             Err(TasksError::Invalid(m)) if m == "priority must be one of high, medium, low"
+        ));
+        // Difficulty alone in the body is still a valid update; only the value
+        // is rejected (no case-coercion for HARD).
+        let bad_difficulty = UpdateTask {
+            difficulty: Some("HARD".to_string()),
+            ..UpdateTask::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_task(&categories, &tasks, "u-1", &created.id, &bad_difficulty)),
+            Err(TasksError::Invalid(m)) if m == "difficulty must be one of easy, medium, hard"
         ));
     }
 

@@ -3,6 +3,7 @@ export interface Task {
   title: string;
   duration: number;
   priority: 'high' | 'medium' | 'low';
+  difficulty?: TaskDifficulty;
   completed?: boolean;
 }
 
@@ -179,6 +180,7 @@ export interface UpdateCategoryInput {
 }
 
 export type TaskPriority = 'high' | 'medium' | 'low';
+export type TaskDifficulty = 'easy' | 'medium' | 'hard';
 
 // The computed category attached to a task (`tasks` have no category_id
 // column — the server classifies the title and returns this summary). The
@@ -205,6 +207,7 @@ export interface TaskRecord {
   description: string;
   duration_minutes: number;
   priority: TaskPriority;
+  difficulty: TaskDifficulty;
   status: TaskStatus;
   created_at: string;
   updated_at: string;
@@ -228,12 +231,13 @@ export interface DeleteTaskResponse {
 
 // Request body for POST /api/tasks. The title must uniquely match a
 // non-untracked category (the server decides and explains 400s); duration
-// defaults to 15 minutes, priority to 'medium'.
+// defaults to 15 minutes, priority to 'medium', difficulty to 'easy'.
 export interface NewTaskInput {
   title: string;
   description?: string;
   duration_minutes?: number;
   priority?: TaskPriority;
+  difficulty?: TaskDifficulty;
 }
 
 // Request body for PATCH /api/tasks/:id — every field optional. A present
@@ -245,4 +249,5 @@ export interface UpdateTaskInput {
   description?: string;
   duration_minutes?: number;
   priority?: TaskPriority;
+  difficulty?: TaskDifficulty;
 }
