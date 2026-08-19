@@ -198,6 +198,33 @@ pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>
     }
 }
 
+/// `GET /api/tasks/classify?title=…` → 200 `ClassifyResponse`. A read: runs
+/// the title→category matcher the create/update endpoints enforce, but never
+/// writes. Used by the TaskModal's blur preview. Blank title → 400 (same
+/// rule as create). Seeds the taxonomy (count-gated) so a first-visit caller
+/// still has a matcher — same as `list_tasks`.
+pub async fn classify_title(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+        return unauthorized(&ctx);
+    };
+    let title = req
+        .url()?
+        .query_pairs()
+        .find(|(k, _)| k == "title")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    match api_core::classify_title(&lists_d1(&ctx)?, &categories_d1(&ctx)?, &user.id, &title).await {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+
 /// `POST /api/tasks` → 200 `{"task":{...}}`. Body: `{title, description?,
 /// duration_minutes?, priority?, difficulty?}`. The title must uniquely match
 /// a non-untracked category (400 otherwise, with the reason in `error`).

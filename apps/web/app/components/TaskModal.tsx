@@ -9,6 +9,10 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { DisplaceDialog } from './DisplaceDialog';
+import {
+  useTitleClassification,
+  type ClassifyStatus,
+} from '@/app/hooks/useTitleClassification';
 import { cn } from '@/lib/utils';
 import type {
   MoveDisplaceInput,
@@ -109,6 +113,7 @@ export function TaskModal({
       // Parent closed the modal — the park dialog must close with it even
       // when it was the one on screen (overlay close, ESC, parent unmount).
       setDisplaceOpen(false);
+      setBlurredTitle(null);
       return;
     }
     setTitle(task?.title || '');
@@ -118,6 +123,7 @@ export function TaskModal({
     setDuration(String(task?.duration_minutes || 15));
     setFormError(null);
     setDisplaceOpen(false);
+    setBlurredTitle(null);
   }, [open, task?.id]);
 
   const [title, setTitle] = useState('');
@@ -131,6 +137,20 @@ export function TaskModal({
   const [movingStatus, setMovingStatus] = useState(false);
   // Occupied In Progress: the park dialog is open, move not yet dispatched.
   const [displaceOpen, setDisplaceOpen] = useState(false);
+  // Title snapshot at the last blur — the classify-preview hook fires off it
+  // (null until the first blur, reset on every open/task switch).
+  const [blurredTitle, setBlurredTitle] = useState<string | null>(null);
+
+  // Blur-preview of where the title will be filed (GET /api/tasks/classify).
+  // Advisory only — the server stays the authority on Save. resetKey changes
+  // on open/close and task.id, so the hook self-resets there.
+  const classifyStatus: ClassifyStatus = useTitleClassification({
+    title,
+    blurredTitle,
+    initialTitle: isEditing ? task!.title : undefined,
+    active: open,
+    resetKey: `${open}:${task?.id ?? 'new'}`,
+  });
 
   /** Persists the form via `onSubmit` — shared by the Save button and the
    *  create-mode park-dialog confirm (which passes `displace`). */
@@ -267,6 +287,7 @@ export function TaskModal({
                 type="text"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
+                onBlur={() => setBlurredTitle(title)}
                 placeholder={
                   isEditing
                     ? 'What needs to be done?'
@@ -274,10 +295,54 @@ export function TaskModal({
                 }
                 className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
               />
-              {!isEditing && (
+              {/* Classification preview — fires on blur, advisory only. The
+                edit-mode stored category tag below stays the current truth. */}
+              {classifyStatus.state === 'idle' && !isEditing && (
                 <p className="text-xs text-muted-foreground">
                   The title must match exactly one category — the server
                   explains if it does not.
+                </p>
+              )}
+              {classifyStatus.state === 'loading' && (
+                <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin inline text-muted-foreground" />
+                  Checking…
+                </p>
+              )}
+              {classifyStatus.state === 'matched' && (
+                <p
+                  className={cn(
+                    'text-xs flex items-center gap-1.5',
+                    isEditing &&
+                      classifyStatus.category.id !== task!.category.id
+                      ? 'text-foreground'
+                      : 'text-muted-foreground',
+                  )}
+                >
+                  <span
+                    className="inline-block h-2.5 w-2.5 rounded-full align-middle"
+                    style={{
+                      backgroundColor: classifyStatus.category.color,
+                    }}
+                  />
+                  {isEditing && classifyStatus.category.id !== task!.category.id
+                    ? `Will refile to ${classifyStatus.category.title}`
+                    : `Files to ${classifyStatus.category.title}`}
+                </p>
+              )}
+              {classifyStatus.state === 'nomatch' && (
+                <p className="text-xs text-destructive">
+                  No category matches — Save will fail
+                </p>
+              )}
+              {classifyStatus.state === 'conflict' && (
+                <p className="text-xs text-destructive">
+                  Matches{' '}
+                  {classifyStatus.categories
+                    .map((c) => c.title)
+                    .join(', ')
+                    .replace(/, ([^,]*)$/, ' and $1')}{' '}
+                  — be more specific
                 </p>
               )}
             </div>
@@ -493,7 +558,13 @@ export function TaskModal({
                 </Button>
                 <Button
                   onClick={handleSave}
-                  disabled={!title.trim() || saving || movingStatus}
+                  disabled={
+                    !title.trim() ||
+                    saving ||
+                    movingStatus ||
+                    classifyStatus.state === 'nomatch' ||
+                    classifyStatus.state === 'conflict'
+                  }
                   className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                 >
                   {isEditing ? 'Save Changes' : 'Create Task'}

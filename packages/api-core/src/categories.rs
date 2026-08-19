@@ -133,11 +133,15 @@ pub enum ClassifyOutcome {
 ///    is NOT a conflict.
 /// 5. After reduction: 0 matches → `Untracked { conflict: false }`; 1 match →
 ///    that category; 2+ → `Untracked { conflict: true }`.
-pub fn classify(
+///
+/// Computes the reduced match set [`classify`] decides on: every category
+/// whose patterns match the title, minus parents beaten by their own
+/// children (rule 4), in input order.
+pub(crate) fn reduced_matches<'a>(
     title: &str,
     event_google_calendar_id: Option<&str>,
-    categories: &[CategoryWithPatterns],
-) -> ClassifyOutcome {
+    categories: &'a [CategoryWithPatterns],
+) -> Vec<&'a CategoryWithPatterns> {
     let mut matched: Vec<&CategoryWithPatterns> = Vec::new();
     for category in categories {
         let matches = category.patterns.iter().any(|pattern| {
@@ -165,13 +169,61 @@ pub fn classify(
         .filter_map(|category| category.parent_id.as_deref())
         .collect();
     matched.retain(|category| !parent_ids.contains(category.category_id.as_str()));
+    matched
+}
 
+/// Classifies a title (task title or event summary) into exactly one
+/// category.
+///
+/// Reduction rules (locked):
+/// 1. Every stored pattern is compiled; invalid stored regexes are skipped.
+/// 2. A pattern with `google_calendar_id` set only applies when the caller
+///    supplies a matching event calendar id. When `event_google_calendar_id`
+///    is `None` (tasks), scoped patterns are skipped entirely.
+/// 3. All matching categories are collected (a category matches when any of
+///    its patterns matches).
+/// 4. If a child and its own parent both match, the parent is dropped — that
+///    is NOT a conflict.
+/// 5. After reduction: 0 matches → `Untracked { conflict: false }`; 1 match →
+///    that category; 2+ → `Untracked { conflict: true }`.
+pub fn classify(
+    title: &str,
+    event_google_calendar_id: Option<&str>,
+    categories: &[CategoryWithPatterns],
+) -> ClassifyOutcome {
+    let matched = reduced_matches(title, event_google_calendar_id, categories);
     match matched.len() {
         0 => ClassifyOutcome::Untracked { conflict: false },
         1 => ClassifyOutcome::Matched {
             category_id: matched[0].category_id.clone(),
         },
         _ => ClassifyOutcome::Untracked { conflict: true },
+    }
+}
+
+/// Reduced match set of [`classify`]: the category ids that would match
+/// after the child-beats-parent rule, in input order. Len 0 = no match,
+/// 1 = unique match, 2+ = conflict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClassifyDetail {
+    pub matched: Vec<String>,
+}
+
+/// Classifies a title into its reduced match set, naming every matching
+/// category id (so callers can report a conflict's categories).
+///
+/// Same reduction rules as [`classify`]; this is [`reduced_matches`] as
+/// owned ids.
+pub fn classify_detailed(
+    title: &str,
+    event_google_calendar_id: Option<&str>,
+    categories: &[CategoryWithPatterns],
+) -> ClassifyDetail {
+    ClassifyDetail {
+        matched: reduced_matches(title, event_google_calendar_id, categories)
+            .into_iter()
+            .map(|category| category.category_id.clone())
+            .collect(),
     }
 }
 
@@ -1194,6 +1246,61 @@ mod tests {
         assert_eq!(
             classify("Work", None, &only_bad),
             ClassifyOutcome::Untracked { conflict: false }
+        );
+    }
+
+    #[test]
+    fn classify_detailed_names_the_unique_match() {
+        let categories = vec![cat_with_patterns(
+            "work",
+            None,
+            &["^Work$", "^.* [|] Work$"],
+        )];
+        assert_eq!(
+            classify_detailed("Work", None, &categories),
+            ClassifyDetail {
+                matched: vec!["work".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn classify_detailed_no_match_is_empty() {
+        let categories = vec![cat_with_patterns("work", None, &["^Work$"])];
+        assert_eq!(
+            classify_detailed("asdf", None, &categories),
+            ClassifyDetail {
+                matched: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_detailed_two_sibling_matches_name_both_in_input_order() {
+        let categories = vec![
+            cat_with_patterns("work", None, &["^Never$"]),
+            cat_with_patterns("a", Some("work"), &["^Work$"]),
+            cat_with_patterns("b", Some("work"), &["^Work$"]),
+        ];
+        assert_eq!(
+            classify_detailed("Work", None, &categories),
+            ClassifyDetail {
+                matched: vec!["a".to_string(), "b".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn classify_detailed_child_beats_own_parent() {
+        let categories = vec![
+            cat_with_patterns("work", None, &["^Work$"]),
+            cat_with_patterns("coding", Some("work"), &["^Work$"]),
+        ];
+        assert_eq!(
+            classify_detailed("Work", None, &categories),
+            ClassifyDetail {
+                matched: vec!["coding".to_string()]
+            }
         );
     }
 

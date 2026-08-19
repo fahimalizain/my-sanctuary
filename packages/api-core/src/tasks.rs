@@ -86,7 +86,9 @@
 use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
-use crate::categories::{ensure_taxonomy, classify, CategoryWithPatterns, ClassifyOutcome};
+use crate::categories::{
+    classify, classify_detailed, ensure_taxonomy, CategoryWithPatterns, ClassifyOutcome,
+};
 use crate::config::OAuthConfig;
 use crate::models::{
     CalendarEvent, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task, TaskCategory,
@@ -330,6 +332,85 @@ pub async fn list_tasks(
         .map(|task| to_view(task, &taxonomy))
         .collect();
     Ok(TasksResponse { tasks: views })
+}
+
+/// Response envelope for the classify endpoint. The status line states
+/// drive the TaskModal: matched → "Files to ● X"; untracked(conflict=false)
+/// → "No category matches — Save will fail"; untracked(conflict=true) →
+/// "Matches A and B — be more specific" (categories names them).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum ClassifyResponse {
+    Matched { category: TaskCategorySummary },
+    /// `conflict: true` when several categories matched (names them in
+    /// `categories`); `false` when nothing matched. The untracked sink
+    /// can never match (it has no patterns), so it never appears here.
+    Untracked { conflict: bool, categories: Vec<TaskCategorySummary> },
+}
+
+/// Classifies a title against the user's taxonomy for the modal's blur
+/// preview. A read — never writes task rows.
+///
+/// - A blank title is 400 (same rule as create).
+/// - 0 matches → `Untracked { conflict: false }`.
+/// - 1 match → `Matched`, unless the match is the `untracked` sink
+///   (impossible per the locked rules; checked defensively like `to_view`)
+///   — then `Untracked { conflict: false }`.
+/// - 2+ matches → `Untracked { conflict: true }` naming every match.
+pub async fn classify_title(
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    user_id: &str,
+    title: &str,
+) -> Result<ClassifyResponse, TasksError> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err(TasksError::Invalid("title must not be empty".to_string()));
+    }
+    // Same count-gated load as create: seed on first visit, then read.
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+    let detail = classify_detailed(&title, None, &taxonomy.matchers);
+    let response = match detail.matched.len() {
+        0 => ClassifyResponse::Untracked {
+            conflict: false,
+            categories: Vec::new(),
+        },
+        1 => {
+            let id = &detail.matched[0];
+            let category = taxonomy
+                .categories
+                .iter()
+                .find(|category| &category.id == id);
+            match category {
+                Some(category) if !category.is_untracked => ClassifyResponse::Matched {
+                    category: summary_for(category, &taxonomy.categories),
+                },
+                // The sink (or a vanished category — impossible in one run,
+                // but never panic on a read): report no match.
+                _ => ClassifyResponse::Untracked {
+                    conflict: false,
+                    categories: Vec::new(),
+                },
+            }
+        }
+        _ => ClassifyResponse::Untracked {
+            conflict: true,
+            categories: detail
+                .matched
+                .iter()
+                .filter_map(|id| {
+                    taxonomy
+                        .categories
+                        .iter()
+                        .find(|category| &category.id == id)
+                        // The sink cannot match (no patterns); skip it
+                        // defensively so a conflict never names it.
+                        .filter(|category| !category.is_untracked)
+                        .map(|category| summary_for(category, &taxonomy.categories))
+                })
+                .collect(),
+        },
+    };
+    Ok(response)
 }
 
 /// Creates a task (always `status = "OPEN"`).
@@ -2478,6 +2559,76 @@ mod tests {
             5,
             "four roots + untracked seeded"
         );
+    }
+
+    // ──────────────────────────────────────────
+    // Classify (blur preview)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn classify_title_blank_title_is_invalid() {
+        let (lists, categories, _tasks) = seeded();
+        for title in ["", "   "] {
+            let err =
+                pollster::block_on(classify_title(&lists, &categories, "u-1", title)).unwrap_err();
+            assert!(
+                matches!(err, TasksError::Invalid(m) if m == "title must not be empty"),
+                "{title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_title_unique_match_returns_the_category_summary() {
+        let (lists, categories, _tasks) = seeded();
+        let response =
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "Work")).unwrap();
+        match response {
+            ClassifyResponse::Matched { category } => {
+                assert_eq!(category.title, "Work");
+                assert!(!category.is_untracked);
+                assert!(category.inherited_list_id.is_some(), "root owns a list");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_no_match_reports_untracked_without_conflict() {
+        let (lists, categories, _tasks) = seeded();
+        let response =
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "asdf")).unwrap();
+        assert_eq!(
+            response,
+            ClassifyResponse::Untracked {
+                conflict: false,
+                categories: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_title_two_roots_conflict_names_both_categories() {
+        let (lists, categories, _tasks) = seeded();
+        // Give Fitness the same pattern as Work so "Work" matches two roots
+        // (mirrors create_title_matching_two_roots_is_invalid).
+        let ids = category_ids_by_slug(&categories);
+        pollster::block_on(categories.replace_patterns(&ids["fitness"], vec![pattern("^Work$")]))
+            .unwrap();
+        let response =
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "Work")).unwrap();
+        match response {
+            ClassifyResponse::Untracked {
+                conflict: true,
+                categories,
+            } => {
+                assert_eq!(categories.len(), 2);
+                let mut titles: Vec<&str> = categories.iter().map(|c| c.title.as_str()).collect();
+                titles.sort();
+                assert_eq!(titles, vec!["Fitness", "Work"]);
+            }
+            other => panic!("expected untracked conflict, got {other:?}"),
+        }
     }
 
     // ──────────────────────────────────────────
