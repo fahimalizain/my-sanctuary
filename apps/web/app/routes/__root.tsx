@@ -14,7 +14,7 @@ declare const __APP_VERSION__: string;
 
 const navItems = [
   { path: '/', label: 'Home', icon: Home },
-  { path: '/lists', label: 'Lists', icon: LayoutGrid },
+  { path: '/board', label: 'Board', icon: LayoutGrid },
   { path: '/calendar', label: 'Calendar', icon: CalendarDays },
   { path: '/consistency', label: 'Consistency', icon: Target },
   { path: '/settings', label: 'Settings', icon: Settings },
@@ -29,10 +29,10 @@ function Navigation() {
   // animate in from 0,0 on first paint.
   const [pillReady, setPillReady] = useState(false);
 
-  // The Lists entry also covers the dedicated categories editor.
+  // The Board entry also covers the dedicated categories editor.
   const activeIndex = navItems.findIndex((item) =>
-    item.path === '/lists'
-      ? location.pathname === '/lists' || location.pathname === '/categories'
+    item.path === '/board'
+      ? location.pathname === '/board' || location.pathname === '/categories'
       : location.pathname === item.path,
   );
 
