@@ -31,6 +31,48 @@ pub fn nearest_minute_unix(secs: i64) -> i64 {
     }
 }
 
+/// The elongate cron's target: the instant `now_unix + 5 minutes` (the slack)
+/// ceiled up onto the 5-minute grid (multiples of 300) **as seen by the
+/// event calendar's IANA time zone**.
+///
+/// The zone is resolved to a fixed UTC offset via [`resolve_tz_offset`] — no
+/// TZ database (api-core stays native-testable and small on wasm). The
+/// conversion is `local = instant + offset`, ceil the local wall clock,
+/// `instant' = ceiled_local - offset`.
+///
+/// Note: every common civil offset is a whole number of minutes and almost
+/// always a multiple of 5 minutes (e.g. `Asia/Kolkata`'s `+05:30` is
+/// `19_800 = 66 * 300`), so for those zones the result is numerically
+/// identical to a plain UTC ceil — the two grids are the same set of
+/// instants. The zone plumbing still matters for spec fidelity ("use the
+/// calendar TZ") and for any future non-multiple offset.
+pub fn ceil_5min_unix_in_zone(now_unix: i64, iana_tz: &str) -> i64 {
+    let offset = resolve_tz_offset(iana_tz);
+    let local = now_unix + 300 + offset;
+    let rem = local.rem_euclid(300);
+    let ceiled_local = if rem == 0 { local } else { local + 300 - rem };
+    ceiled_local - offset
+}
+
+/// Resolves an IANA time zone to a fixed UTC offset in seconds.
+///
+/// Locked table (empty/unknown zones fall back to UTC — offset 0):
+/// - the UTC family (`UTC`, `Etc/UTC`, `Etc/GMT`, `Z`, `GMT`) and the empty
+///   string → 0
+/// - `Asia/Kolkata` / `Asia/Calcutta` → `+19800` (the production calendar)
+/// - `Asia/Dubai` → `+14400` (cheap fixed-offset addition)
+/// - anything else → 0 (UTC fallback, locked)
+///
+/// No DST-aware zones are modeled; a zone not listed simply behaves as UTC.
+fn resolve_tz_offset(iana_tz: &str) -> i64 {
+    match iana_tz {
+        "" | "UTC" | "Etc/UTC" | "Etc/GMT" | "Z" | "GMT" => 0,
+        "Asia/Kolkata" | "Asia/Calcutta" => 19_800, // +05:30 (production)
+        "Asia/Dubai" => 14_400,                     // +04:00
+        _ => 0,
+    }
+}
+
 /// Converts a count of days since the Unix epoch to a `(year, month, day)`
 /// civil date using Howard Hinnant's `civil_from_days` algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -260,6 +302,78 @@ mod tests {
             "1969-12-31T23:58:00Z"
         );
         assert_eq!(nearest_minute_unix(30), 60);
+    }
+
+    #[test]
+    fn ceil_5min_adds_slack_and_ceils_in_utc() {
+        // 2026-08-19T11:12:55Z + 5 min = 11:17:55Z → ceil 11:20:00Z.
+        let now = rfc3339_to_unix_secs("2026-08-19T11:12:55Z").unwrap();
+        assert_eq!(
+            unix_secs_to_rfc3339(ceil_5min_unix_in_zone(now, "UTC")),
+            "2026-08-19T11:20:00Z"
+        );
+    }
+
+    #[test]
+    fn ceil_5min_stays_put_when_slack_lands_on_grid() {
+        // 11:15:00Z + 5 min = 11:20:00Z — already on the 5-min grid.
+        let now = rfc3339_to_unix_secs("2026-08-19T11:15:00Z").unwrap();
+        assert_eq!(
+            unix_secs_to_rfc3339(ceil_5min_unix_in_zone(now, "UTC")),
+            "2026-08-19T11:20:00Z"
+        );
+    }
+
+    #[test]
+    fn ceil_5min_rolls_across_midnight() {
+        // 23:58:40Z + 5 min = 00:03:40Z → ceil 00:05:00Z next day.
+        let now = rfc3339_to_unix_secs("2026-08-19T23:58:40Z").unwrap();
+        assert_eq!(
+            unix_secs_to_rfc3339(ceil_5min_unix_in_zone(now, "UTC")),
+            "2026-08-20T00:05:00Z"
+        );
+    }
+
+    #[test]
+    fn ceil_5min_matches_utc_for_kolkata_since_offset_is_a_5min_multiple() {
+        // Asia/Kolkata is +05:30 = 19_800s = 66 * 300, so the 5-minute UTC
+        // grid and the IST 5-minute grid are the SAME set of instants — the
+        // unix result must match UTC exactly even though the local wall clock
+        // reads 16:50 there. (No test can make a multiple-of-5-min offset
+        // diverge; the zone path is exercised for spec fidelity.)
+        let now = rfc3339_to_unix_secs("2026-08-19T11:12:55Z").unwrap();
+        let utc = ceil_5min_unix_in_zone(now, "UTC");
+        let ist = ceil_5min_unix_in_zone(now, "Asia/Kolkata");
+        assert_eq!(ist, utc, "Kolkata offset is a 5-min multiple");
+        assert_eq!(
+            unix_secs_to_rfc3339(ist),
+            "2026-08-19T11:20:00Z",
+            "and IST local of that instant is 16:50:00"
+        );
+        // The stored instant viewed in IST: 16:47:55 + 5 min → 16:50:00.
+        assert_eq!(unix_secs_to_rfc3339(ist + 19_800), "2026-08-19T16:50:00Z");
+    }
+
+    #[test]
+    fn ceil_5min_empty_and_unknown_zones_fallback_to_utc() {
+        let now = rfc3339_to_unix_secs("2026-08-19T11:12:55Z").unwrap();
+        let utc = ceil_5min_unix_in_zone(now, "UTC");
+        assert_eq!(ceil_5min_unix_in_zone(now, ""), utc, "empty → UTC");
+        assert_eq!(ceil_5min_unix_in_zone(now, "Etc/UTC"), utc);
+        assert_eq!(ceil_5min_unix_in_zone(now, "Etc/GMT"), utc);
+        assert_eq!(ceil_5min_unix_in_zone(now, "America/New_York"), utc, "unknown → UTC");
+        assert_eq!(ceil_5min_unix_in_zone(now, "bogus"), utc);
+    }
+
+    #[test]
+    fn tz_offset_resolver_is_fixed_offsets_or_utc_fallback() {
+        for utc in ["", "UTC", "Etc/UTC", "Etc/GMT", "Z", "GMT"] {
+            assert_eq!(resolve_tz_offset(utc), 0, "{utc:?} → 0");
+        }
+        assert_eq!(resolve_tz_offset("Asia/Kolkata"), 19_800);
+        assert_eq!(resolve_tz_offset("Asia/Calcutta"), 19_800);
+        assert_eq!(resolve_tz_offset("Asia/Dubai"), 14_400);
+        assert_eq!(resolve_tz_offset("America/New_York"), 0, "unmodeled zone → UTC fallback");
     }
 
     #[test]

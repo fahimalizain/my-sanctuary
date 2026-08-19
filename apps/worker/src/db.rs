@@ -31,7 +31,8 @@ use api_core::repo::{
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
-    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
+    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
     TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL,
@@ -928,6 +929,13 @@ impl TaskRepo for D1TaskRepo {
             .bind_refs(&[D1Type::Text(user_id)])
             .map_err(backend)?;
         query_vec(stmt).await
+    }
+
+    async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
+        // The elongate cron's work list: every living IN_PROGRESS row, all
+        // users (status is the one-running lock). No binds — `prepare`
+        // returns the statement directly when there is nothing to bind.
+        query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {

@@ -66,6 +66,12 @@
 //! - Every transition appends to `task_logs` (an audit trail, not a
 //!   timesheet): `started|stopped|paused|completed|discarded` plus the move
 //!   verbs `planned|unplanned|reopened`.
+//! - The `*/2` elongate cron ([`run_elongate_cron`]) grows every living
+//!   IN_PROGRESS task's event end to `max(current, ceil-5min(now + 5min)` in
+//!   the event calendar's TZ) so the live calendar block never looks
+//!   finished. Never shrink (the exit verbs snap the end back to actuals on
+//!   close — that may shrink and is correct), never recreate a missing
+//!   event, never touch status: IN_PROGRESS stays the lock.
 //!
 //! Move ([`move_task`], ADR 0002 § Move API): the board drop dispatches the
 //! transition matrix (start/stop/pause/complete/discard/plan/unplan/reopen/
@@ -81,6 +87,7 @@ use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{ensure_taxonomy, classify, CategoryWithPatterns, ClassifyOutcome};
+use crate::config::OAuthConfig;
 use crate::models::{
     CalendarEvent, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task, TaskCategory,
     UpdateTask,
@@ -88,10 +95,12 @@ use crate::models::{
 use crate::oauth::HttpClient;
 use crate::repo::{
     CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo, TaskListRepo, TaskLogRepo,
-    TaskRepo,
+    TaskRepo, TokenRepo,
 };
-use crate::time::{nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
-use crate::token::GoogleAccess;
+use crate::time::{
+    ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
+};
+use crate::token::{refresh_if_needed, GoogleAccess};
 
 /// Default planned duration for a new task, in minutes.
 pub const DEFAULT_DURATION_MINUTES: i64 = 15;
@@ -921,6 +930,148 @@ async fn stop_running_event(
 }
 
 // ──────────────────────────────────────────
+// Elongate cron (slice 2): grow IN_PROGRESS events every 2 minutes
+// ──────────────────────────────────────────
+
+/// Outcome of one elongate cron run: counters plus human-readable failures —
+/// a failure for one task never fails the whole job.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ElongateReport {
+    /// Tasks whose Google event end was extended in this run.
+    pub elongated: usize,
+    /// Tasks skipped: no started log / empty ids / missing cache row, an
+    /// unparseable stored end, Google 404 (the event is gone), or a current
+    /// end already at/after the target (never shrink).
+    pub skipped: usize,
+    /// Human-readable failures; empty when everything worked.
+    pub errors: Vec<String>,
+}
+
+/// The elongate cron (triggered by the `*/2 * * * *` schedule): while a task
+/// stays IN_PROGRESS, grow its Google event so the live calendar block does
+/// not look finished.
+///
+/// Target: `end = max(current_end, ceil_5min(now + 5min)` in the event
+/// calendar's IANA time zone), persisted as a UTC `…Z` string via
+/// `unix_secs_to_rfc3339` — the same persistence as every other timer write.
+///
+/// Per task, in order:
+/// 1. `refresh_if_needed` for the task's owner. On failure the task is
+///    skipped entirely (one error) — other users still elongate.
+/// 2. Resolve the cached event through the task's latest `started` log
+///    (`latest_started_event`, the same path as the exit verbs). No log /
+///    empty ids / missing cache row → skipped: the event is gone, never
+///    recreate it, never flip status.
+/// 3. Parse `event.end_time` (handles `+05:30` cache rows). Unparseable →
+///    skipped.
+/// 4. Load the event's calendar for `time_zone`; a missing calendar or an
+///    empty/unknown zone falls back to UTC.
+/// 5. PATCH only when `target > current_end` (never shrink). A Google 404 →
+///    skipped (the event vanished; never recreate). Other errors are
+///    collected and the loop continues.
+///
+/// Status is deliberately never touched here: IN_PROGRESS rows are the only
+/// work list, and only the exit verbs own the status flip.
+pub async fn run_elongate_cron(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    logs: &dyn TaskLogRepo,
+    tasks: &dyn TaskRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    now_unix: i64,
+) -> ElongateReport {
+    let mut report = ElongateReport::default();
+    let running = match tasks.list_in_progress().await {
+        Ok(running) => running,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("list_in_progress failed: {err}"));
+            return report;
+        }
+    };
+
+    for task in &running {
+        let access = match refresh_if_needed(http, tokens, oauth, &task.user_id, now_unix).await {
+            Ok(access) => access,
+            Err(err) => {
+                report.errors.push(format!(
+                    "token refresh failed for user {} (task {}): {err}",
+                    task.user_id, task.id
+                ));
+                continue;
+            }
+        };
+        // The event a run is attached to, resolved through the started log —
+        // a missing log/ids/cache row means there is nothing to grow: skip
+        // (do not recreate the event, do not flip status).
+        let event = match latest_started_event(logs, events, &task.id).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                report.skipped += 1;
+                continue;
+            }
+            Err(err) => {
+                report.errors.push(format!(
+                    "started-log lookup failed for task {}: {err}",
+                    task.id
+                ));
+                continue;
+            }
+        };
+        let Some(current_end_unix) = rfc3339_to_unix_secs(&event.end_time) else {
+            report.skipped += 1;
+            continue;
+        };
+        // The calendar's IANA time_zone decides the 5-minute grid (the offset
+        // resolver falls back to UTC for empty/missing/unknown zones).
+        let time_zone = match calendars.get_by_id(&event.calendar_id).await {
+            Ok(Some(cal)) => cal.time_zone,
+            Ok(None) => "UTC".to_string(),
+            Err(err) => {
+                report.errors.push(format!(
+                    "calendar lookup failed for task {} (calendar {}): {err}",
+                    task.id, event.calendar_id
+                ));
+                "UTC".to_string()
+            }
+        };
+        let target_unix = ceil_5min_unix_in_zone(now_unix, &time_zone);
+        if current_end_unix >= target_unix {
+            // Never shrink: the event already covers the target instant.
+            report.skipped += 1;
+            continue;
+        }
+        match patch_event(
+            http,
+            calendars,
+            events,
+            &access,
+            &event.calendar_id,
+            &event.google_event_id,
+            &unix_secs_to_rfc3339(target_unix),
+            now_unix,
+        )
+        .await
+        {
+            Ok(_) => report.elongated += 1,
+            // The event is gone on Google's side (404): skip — never
+            // recreate it, never touch the status.
+            Err(CalendarError::GoogleApi(message)) if message.contains("404") => {
+                report.skipped += 1;
+            }
+            Err(err) => report.errors.push(format!(
+                "elongate failed for task {} (event {}): {err}",
+                task.id, event.google_event_id
+            )),
+        }
+    }
+    report
+}
+
+// ──────────────────────────────────────────
 // Move (ADR 0002 § Move API): POST /api/tasks/:id/move
 // ──────────────────────────────────────────
 
@@ -1598,12 +1749,14 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        GoogleCalendar, NewCalendar, NewCalendarEvent, NewTaskCategory, NewTaskCategoryInput,
-        NewTaskCategoryPattern, NewTaskList, TaskCategory, TaskCategoryPattern, TaskList, TaskLog,
-        UpdateTaskCategory, UpdateTaskList,
+        GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
+        NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, NewTaskList, NewToken,
+        TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTaskCategory, UpdateTaskList,
     };
     use crate::oauth::{HttpClient, HttpError};
-    use crate::repo::{CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo};
+    use crate::repo::{
+        CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo, TokenRepo,
+    };
 
     // ──────────────────────────────────────────
     // Fakes
@@ -1652,6 +1805,19 @@ mod tests {
                     ))
             });
             Ok(rows)
+        }
+
+        async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
+            // Mirrors TASK_LIST_IN_PROGRESS_SQL: living rows with the
+            // IN_PROGRESS status, across all users.
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.status == TASK_STATUS_IN_PROGRESS && row.deleted_at.is_none())
+                .cloned()
+                .collect())
         }
 
         async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
@@ -2924,6 +3090,71 @@ mod tests {
         }
     }
 
+    /// Token repo for the elongate cron tests: returns a stored token per
+    /// user (expiring far in the future, so `refresh_if_needed` never POSTs)
+    /// — or `None` for users without one, which fails that user's refresh
+    /// without touching anyone else.
+    struct FakeTokenRepo {
+        stored: Mutex<HashMap<String, GoogleOAuthToken>>,
+    }
+
+    impl FakeTokenRepo {
+        fn with(tokens: Vec<GoogleOAuthToken>) -> Self {
+            let stored = tokens
+                .into_iter()
+                .map(|token| (token.user_id.clone(), token))
+                .collect();
+            Self {
+                stored: Mutex::new(stored),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TokenRepo for FakeTokenRepo {
+        async fn get_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<GoogleOAuthToken>, RepoError> {
+            Ok(self.stored.lock().unwrap().get(user_id).cloned())
+        }
+
+        async fn upsert(&self, _token: NewToken) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _user_id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// A stored OAuth token for `user_id` whose expiry is centuries out, so
+    /// `refresh_if_needed` returns it as-is (no refresh POST).
+    fn fresh_token(user_id: &str, access_token: &str) -> GoogleOAuthToken {
+        GoogleOAuthToken {
+            id: format!("tok-{user_id}"),
+            user_id: user_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expiry: "2099-01-01T00:00:00Z".to_string(),
+            token_type: "Bearer".to_string(),
+            scope: Some("calendar".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// OAuth client credentials for `run_elongate_cron` tests; the fresh
+    /// tokens above mean `refresh_if_needed` never uses them.
+    fn oauth_config() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "client-id.apps.googleusercontent.com".to_string(),
+            client_secret: "client-secret".to_string(),
+            redirect_url: "http://localhost:5173/auth/google/callback".to_string(),
+        }
+    }
+
     /// Creates a "Work" task for `u-1` on the seeded taxonomy and returns its
     /// view (the persisted row is reachable through `tasks`).
     fn work_task(
@@ -2949,6 +3180,66 @@ mod tests {
         format!(
             r#"{{"id":"g-1","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
         )
+    }
+
+    /// `patched_event_json` for a specific Google event id (the multi-user
+    /// elongate tests need more than the fixed `g-1`).
+    fn patched_event_json_for(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+        )
+    }
+
+    /// A cached `calendar_events` row the elongate cron resolves through a
+    /// task's `started` log.
+    fn cached_event(
+        calendar_id: &str,
+        google_id: &str,
+        task_id: &str,
+        start: &str,
+        end: &str,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            id: "evt-1".to_string(),
+            calendar_id: calendar_id.to_string(),
+            google_event_id: google_id.to_string(),
+            google_etag: String::new(),
+            google_updated_at: String::new(),
+            last_synced_at: "2026-08-18T00:00:00Z".to_string(),
+            title: "Work".to_string(),
+            description: String::new(),
+            start_time: start.to_string(),
+            end_time: end.to_string(),
+            recurrence: String::new(),
+            task_id: task_id.to_string(),
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// Inserts the `started` log row that ties `task_id` to a cached event —
+    /// the event identity the exit verbs and the elongate cron resolve.
+    fn log_started(
+        logs: &FakeTaskLogRepo,
+        task_id: &str,
+        user_id: &str,
+        at: &str,
+        calendar_id: &str,
+        google_id: &str,
+    ) {
+        pollster::block_on(logs.insert(
+            NewTaskLog {
+                task_id: task_id.to_string(),
+                user_id: user_id.to_string(),
+                r#type: TASK_LOG_STARTED.to_string(),
+                at: at.to_string(),
+                calendar_id: Some(calendar_id.to_string()),
+                google_event_id: Some(google_id.to_string()),
+            },
+            at,
+        ))
+        .unwrap();
     }
 
     // ──────────────────────────────────────────
@@ -3767,6 +4058,402 @@ mod tests {
             "nope", NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
+    }
+
+    // ──────────────────────────────────────────
+    // run_elongate_cron
+    // ──────────────────────────────────────────
+
+    /// Marks `task_id` IN_PROGRESS and attaches the started log + cached
+    /// event (calendar `cal-primary@example.com`, google event `g-1`) — the
+    /// elongate cron's work item. `tz` is the calendar's `time_zone` column,
+    /// `end` the stored event end.
+    fn elongate_setup(
+        tasks: &FakeTaskRepo,
+        task_id: &str,
+        tz: &str,
+        end: &str,
+    ) -> (FakeCalendarRepo, FakeEventRepo, FakeTaskLogRepo) {
+        pollster::block_on(tasks.set_status(task_id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let mut cal = calendar("primary@example.com", true);
+        cal.time_zone = tz.to_string();
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-1",
+            task_id,
+            NOW_SNAPPED,
+            end,
+        ));
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, task_id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        (calendars, events, logs)
+    }
+
+    /// Runs `run_elongate_cron` with the standard fresh token for `u-1` and
+    /// one in-progress task; returns the report.
+    fn elongate(
+        http: &FakeHttp,
+        calendars: &FakeCalendarRepo,
+        events: &FakeEventRepo,
+        logs: &FakeTaskLogRepo,
+        tasks: &FakeTaskRepo,
+        tokens: &FakeTokenRepo,
+        now_unix: i64,
+    ) -> ElongateReport {
+        pollster::block_on(run_elongate_cron(
+            http, calendars, events, logs, tasks, tokens, &oauth_config(), now_unix,
+        ))
+    }
+
+    #[test]
+    fn elongate_patches_end_when_event_fell_behind_the_target() {
+        // A 15-minute event started 20 minutes ago (end 22:08:00 is past)
+        // while the task stayed IN_PROGRESS: the cron extends it.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // now 22:13:20 + 5 min = 22:18:20 → ceil 22:20:00Z, persisted UTC Z.
+        let (url, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events/g-1"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:20:00Z");
+        // The Google echo landed in the cache with the new end.
+        assert_eq!(events.stored.lock().unwrap()[0].end_time, "2023-11-14T22:20:00Z");
+        // Status untouched — the exit verbs own the flip.
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_skips_when_event_end_still_covers_target() {
+        // First minutes of a 15-minute task: the planned end (22:28:00) is
+        // still ahead of the target (22:20:00) — nothing to extend.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:28:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        // No routes: any HTTP call would panic "no route for …".
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no PATCH");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_never_shrinks_a_previously_elongated_end() {
+        // A previous elongation pushed the end to 23:30:00 (far beyond the
+        // current target) — the cron must not pull it back.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T23:30:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1, "never shrink");
+        assert!(http.patches.lock().unwrap().is_empty(), "no PATCH");
+        assert_eq!(
+            events.stored.lock().unwrap()[0].end_time,
+            "2023-11-14T23:30:00Z",
+            "cached end untouched"
+        );
+    }
+
+    #[test]
+    fn elongate_skips_task_without_started_log() {
+        // The task never started (no `started` log, no event): skip — do not
+        // recreate the event, do not flip status.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no HTTP");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS,
+            "status untouched"
+        );
+    }
+
+    #[test]
+    fn elongate_skips_when_cached_event_is_missing() {
+        // The `started` log names an event that is gone from the cache (the
+        // user deleted it in Google): skip, never recreate.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new(); // no cached row
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, &task.id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no HTTP");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_skips_unparseable_end_time() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "not-a-date");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no HTTP");
+    }
+
+    #[test]
+    fn elongate_skips_on_google_404_and_keeps_status() {
+        // The event vanished on Google's side: 404 → skip (never recreate,
+        // never flip status).
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![("/events/g-1", 404, r#"{"error":"not found"}"#)]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1, "404 is a skip, not an error");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_uses_calendar_time_zone() {
+        // Asia/Kolkata's +05:30 (19_800s = 66 * 300) is a multiple of 5
+        // minutes, so the IST 5-minute grid is numerically the same set of
+        // instants as UTC's — the zone path (offset → local ceil → convert
+        // back) must not shift the target.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "Asia/Kolkata", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 22:18:20Z + 05:30 = 03:48:20 IST (next day) → ceil 03:50:00 IST =
+        // 22:20:00Z — the same instant as the UTC ceil (the offset is a
+        // multiple of 5 minutes, so both grids share the same instants).
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:20:00Z");
+    }
+
+    #[test]
+    fn elongate_target_with_empty_calendar_tz_falls_back_to_utc() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1, "empty TZ behaves as UTC");
+        let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:20:00Z");
+    }
+
+    #[test]
+    fn elongate_token_failure_for_one_user_does_not_abort_the_rest() {
+        let (lists, categories, tasks) = seeded();
+        let task_a = work_task(&lists, &categories, &tasks);
+        // u-2's task inserts straight into the repo (no taxonomy needed).
+        let task_b = pollster::block_on(tasks.insert(NewTask {
+            user_id: "u-2".to_string(),
+            title: "Fitness".to_string(),
+            description: String::new(),
+            duration_minutes: DEFAULT_DURATION_MINUTES,
+            priority: "medium".to_string(),
+            difficulty: "easy".to_string(),
+            sort_order: 0,
+        }))
+        .unwrap();
+        for task_id in [&task_a.id, &task_b.id] {
+            pollster::block_on(tasks.set_status(task_id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        }
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-1",
+            &task_a.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-2",
+            &task_b.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, &task_a.id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        log_started(&logs, &task_b.id, "u-2", NOW, "cal-primary@example.com", "g-2");
+        // u-1 has NO token → its refresh fails; u-2 proceeds.
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-2", "at-b")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-2",
+            200,
+            &patched_event_json_for("g-2", &task_b.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1, "u-2's event extended despite u-1's failure");
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("u-1"), "{}", report.errors[0]);
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "only u-2's event patched");
+        assert!(patches[0].0.contains("g-2"), "{}", patches[0].0);
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task_a.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task_b.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_extends_both_dirty_in_progress_tasks() {
+        // Two IN_PROGRESS rows at once (dirty data — status is the lock, not
+        // an event window): both elongate.
+        let (lists, categories, tasks) = seeded();
+        let task_a = work_task(&lists, &categories, &tasks);
+        let task_b = pollster::block_on(tasks.insert(NewTask {
+            user_id: "u-2".to_string(),
+            title: "Fitness".to_string(),
+            description: String::new(),
+            duration_minutes: DEFAULT_DURATION_MINUTES,
+            priority: "medium".to_string(),
+            difficulty: "easy".to_string(),
+            sort_order: 0,
+        }))
+        .unwrap();
+        for task_id in [&task_a.id, &task_b.id] {
+            pollster::block_on(tasks.set_status(task_id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        }
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-1",
+            &task_a.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-2",
+            &task_b.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, &task_a.id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        log_started(&logs, &task_b.id, "u-2", NOW, "cal-primary@example.com", "g-2");
+        let tokens = FakeTokenRepo::with(vec![
+            fresh_token("u-1", "at-a"),
+            fresh_token("u-2", "at-b"),
+        ]);
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json(&task_a.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+            ),
+            (
+                "/events/g-2",
+                200,
+                &patched_event_json_for("g-2", &task_b.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+            ),
+        ]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 2, "both IN_PROGRESS rows grow");
+        assert_eq!(report.skipped, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(http.patches.lock().unwrap().len(), 2);
     }
 
     // ──────────────────────────────────────────
