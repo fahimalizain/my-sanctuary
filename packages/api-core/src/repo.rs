@@ -254,10 +254,10 @@ pub trait TaskRepo: Send + Sync {
     /// generates the UUID `id`, stamps `created_at`/`updated_at`, and forces
     /// `status = "OPEN"` (this slice creates no other status).
     async fn insert(&self, task: NewTask) -> Result<Task, RepoError>;
-    /// Updates `title`/`description`/`duration_minutes`/`priority` on a living
-    /// task (`None` fields are left unchanged; status is never touched here)
-    /// and returns the updated row, or `None` when the task is missing or
-    /// soft-deleted.
+    /// Updates `title`/`description`/`duration_minutes`/`priority`/
+    /// `difficulty` on a living task (`None` fields are left unchanged; status
+    /// is never touched here) and returns the updated row, or `None` when the
+    /// task is missing or soft-deleted.
     async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError>;
     /// Transitions `status` on a living task (slice 4 timer: start/stop/pause/
     /// complete/discard). Returns the updated row, or `None` when the task is
@@ -682,8 +682,8 @@ pub const TASK_GET_BY_ID_SQL: &str =
 /// The D1 implementation binds the UUID `id`, the timestamps, and the
 /// hardcoded `status = 'OPEN'` (this slice creates no other status).
 pub const TASK_INSERT_SQL: &str = "
-    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, difficulty, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). Status
@@ -697,6 +697,7 @@ pub const TASK_UPDATE_SQL: &str = "
         description = COALESCE(?, description),
         duration_minutes = COALESCE(?, duration_minutes),
         priority = COALESCE(?, priority),
+        difficulty = COALESCE(?, difficulty),
         updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
 ";
@@ -1149,12 +1150,12 @@ mod tests {
     }
 
     #[test]
-    fn task_insert_binds_all_9_columns_with_status_open() {
+    fn task_insert_binds_all_10_columns_with_status_open() {
         assert!(TASK_INSERT_SQL.contains("INSERT INTO tasks"), "{}", TASK_INSERT_SQL);
         assert!(!TASK_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_INSERT_SQL);
         assert_eq!(
             TASK_INSERT_SQL.matches('?').count(),
-            9,
+            10,
             "one placeholder per column: {}",
             TASK_INSERT_SQL
         );
@@ -1163,7 +1164,7 @@ mod tests {
         assert!(TASK_INSERT_SQL.contains("status"), "{TASK_INSERT_SQL}");
         for column in [
             "id", "user_id", "title", "description", "duration_minutes",
-            "priority", "status", "created_at", "updated_at",
+            "priority", "difficulty", "status", "created_at", "updated_at",
         ] {
             assert!(TASK_INSERT_SQL.contains(column), "missing {column}");
         }
@@ -1177,10 +1178,11 @@ mod tests {
         assert!(sql.contains("COALESCE(?, description)"), "{sql}");
         assert!(sql.contains("COALESCE(?, duration_minutes)"), "{sql}");
         assert!(sql.contains("COALESCE(?, priority)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, difficulty)"), "{sql}");
         assert!(!sql.contains("status"), "status is not updatable this slice: {sql}");
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
-        // 4 COALESCE binds + now + id: nothing else.
-        assert_eq!(sql.matches('?').count(), 6, "{sql}");
+        // 5 COALESCE binds + now + id: nothing else.
+        assert_eq!(sql.matches('?').count(), 7, "{sql}");
     }
 
     #[test]

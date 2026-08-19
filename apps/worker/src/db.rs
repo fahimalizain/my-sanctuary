@@ -937,6 +937,7 @@ impl TaskRepo for D1TaskRepo {
                 D1Type::Text(&task.description),
                 D1Type::Integer(task.duration_minutes as i32),
                 D1Type::Text(&task.priority),
+                D1Type::Text(&task.difficulty),
                 D1Type::Text(api_core::TASK_STATUS_OPEN),
                 D1Type::Text(&now),
                 D1Type::Text(&now),
@@ -950,6 +951,7 @@ impl TaskRepo for D1TaskRepo {
             description: task.description,
             duration_minutes: task.duration_minutes,
             priority: task.priority,
+            difficulty: task.difficulty,
             status: api_core::TASK_STATUS_OPEN.to_string(),
             created_at: now.clone(),
             updated_at: now,
@@ -967,6 +969,7 @@ impl TaskRepo for D1TaskRepo {
             None => D1Type::Null,
         };
         let priority = optional_text(updates.priority.as_deref());
+        let difficulty = optional_text(updates.difficulty.as_deref());
         let now = now_rfc3339();
         let stmt = self
             .db
@@ -976,6 +979,7 @@ impl TaskRepo for D1TaskRepo {
                 description,
                 duration_minutes,
                 priority,
+                difficulty,
                 D1Type::Text(&now),
                 D1Type::Text(id),
             ])

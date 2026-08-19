@@ -138,8 +138,8 @@ pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>
 }
 
 /// `POST /api/tasks` → 200 `{"task":{...}}`. Body: `{title, description?,
-/// duration_minutes?, priority?}`. The title must uniquely match a
-/// non-untracked category (400 otherwise, with the reason in `error`).
+/// duration_minutes?, priority?, difficulty?}`. The title must uniquely match
+/// a non-untracked category (400 otherwise, with the reason in `error`).
 pub async fn create_task(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
