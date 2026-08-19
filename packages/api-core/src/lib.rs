@@ -47,7 +47,8 @@ pub use oauth::{
 pub use repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
     TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
-    CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
+    CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
+    EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
     TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
@@ -57,21 +58,25 @@ pub use repo::{
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
     TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
-    TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL,
+    TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
 };
 pub use tasks::{
     complete_task, create_task, delete_task, discard_task, list_tasks, move_task, pause_task,
-    start_task, stop_task, update_task, DeleteTaskResponse, DisplaceInput, MoveTaskInput,
-    MoveTaskResponse, TaskActionResponse, TaskCategorySummary, TaskResponse, TasksError,
-    TasksResponse, TaskView, DEFAULT_DURATION_MINUTES, MIN_DURATION_MINUTES, TASK_LOG_COMPLETED,
-    TASK_LOG_DISCARDED, TASK_LOG_PAUSED, TASK_LOG_PLANNED, TASK_LOG_REOPENED, TASK_LOG_STARTED,
-    TASK_LOG_STOPPED, TASK_LOG_UNPLANNED, TASK_STATUS_COMPLETED, TASK_STATUS_DISCARDED,
-    TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED,
+    run_elongate_cron, start_task, stop_task, update_task, DeleteTaskResponse, DisplaceInput,
+    ElongateReport, MoveTaskInput, MoveTaskResponse, TaskActionResponse, TaskCategorySummary,
+    TaskResponse, TasksError, TasksResponse, TaskView, DEFAULT_DURATION_MINUTES,
+    MIN_DURATION_MINUTES, TASK_LOG_COMPLETED, TASK_LOG_DISCARDED, TASK_LOG_PAUSED,
+    TASK_LOG_PLANNED, TASK_LOG_REOPENED, TASK_LOG_STARTED, TASK_LOG_STOPPED, TASK_LOG_UNPLANNED,
+    TASK_STATUS_COMPLETED, TASK_STATUS_DISCARDED, TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN,
+    TASK_STATUS_PLANNED,
 };
 pub use session::{
     clear_session_cookie_header, cookie_value_from_header, seal, session_cookie_header, unseal,
     LogoutResponse, MeResponse, SessionError, SessionUser, SESSION_COOKIE_NAME,
     SESSION_DURATION_SECS,
 };
-pub use time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+pub use time::{
+    ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
+};
 pub use token::{refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS};

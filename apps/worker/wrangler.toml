@@ -24,4 +24,4 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/auth/*", "/health", "/version"]
 
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["*/2 * * * *", "*/15 * * * *"]

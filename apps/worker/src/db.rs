@@ -14,7 +14,7 @@
 use api_core::models::{
     CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
     NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
-    NewWatchChannel, Task, TaskCategory, TaskCategoryPattern, TaskList, UpdateTask,
+    NewWatchChannel, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTask,
     UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
@@ -24,17 +24,20 @@ use api_core::repo::{
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
-    EVENT_GET_BY_ID_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
+    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
+    EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
-    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
+    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
     TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL,
-    TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL,
+    TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
+    TASK_SET_STATUS_SQL,
     TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
     TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
     USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
@@ -429,6 +432,19 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             .db
             .prepare(EVENT_GET_BY_ID_SQL)
             .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<CalendarEvent>(None).await.map_err(backend)
+    }
+
+    async fn get_by_calendar_and_google_id(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<Option<CalendarEvent>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(google_event_id)])
             .map_err(backend)?;
         stmt.first::<CalendarEvent>(None).await.map_err(backend)
     }
@@ -915,6 +931,13 @@ impl TaskRepo for D1TaskRepo {
         query_vec(stmt).await
     }
 
+    async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
+        // The elongate cron's work list: every living IN_PROGRESS row, all
+        // users (status is the one-running lock). No binds — `prepare`
+        // returns the statement directly when there is nothing to bind.
+        query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
         let stmt = self
             .db
@@ -1112,6 +1135,18 @@ impl TaskLogRepo for D1TaskLogRepo {
             return Err(RepoError::Backend(result.error().unwrap_or_default()));
         }
         Ok(id)
+    }
+
+    async fn latest_started_by_task_id(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskLog>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL)
+            .bind_refs(&[D1Type::Text(task_id)])
+            .map_err(backend)?;
+        stmt.first::<TaskLog>(None).await.map_err(backend)
     }
 }
 

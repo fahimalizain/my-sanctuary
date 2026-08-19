@@ -32,8 +32,9 @@
 //!   listing is a read, not a validation.
 //!
 //! Timer rules (locked):
-//! - `start_task` opens a Google Calendar event `now … now + duration_minutes`
-//!   with `extendedProperties.shared.sanctuary_task_id` = task UUID (never
+//! - `start_task` opens a Google Calendar event on the **minute grid**
+//!   (`T … T + duration_minutes` where `T = nearest_minute_unix(now)`) with
+//!   `extendedProperties.shared.sanctuary_task_id` = task UUID (never
 //!   `private`, never a description footer). Summary is the task **title**
 //!   exactly — no `| Category` suffix.
 //! - Calendar pick: the matched category's `google_calendar_id` **when that
@@ -41,13 +42,20 @@
 //!   (`access_role` `owner` or `writer`); otherwise the user's **primary**
 //!   calendar. No writable calendar → 400.
 //! - One running task per user: a second start raises [`TasksError::Conflict`]
-//!   (409) even when the same task is already running. "Running" is **derived
-//!   from the cache** — `calendar_events.task_id` set AND
-//!   `start_time <= now < end_time` — never from `tasks.status`.
-//! - `stop_task`/`pause_task` PATCH the event's end to now (start + 60s when
-//!   `now <= start`) and flip status back to OPEN (stop) or to PLANNED
-//!   (pause) — even when no open event exists for the task (the user closed
-//!   it in Google): the flip is idempotent.
+//!   (409) even when the same task is already running. **`tasks.status ==
+//!   "IN_PROGRESS"` is the only lock** — the start gate scans the user's
+//!   living tasks by status, never the event window.
+//! - Every timer Google write snaps to the nearest minute: `start_task`
+//!   creates at `T … T + duration_minutes`, and all exit verbs
+//!   (`stop_task`/`pause_task`/`complete_task`/`discard_task`, and the
+//!   displace park) PATCH the event's end to snapped `T` (`start + 60s` when
+//!   `T <= start`, keeping the event valid).
+//! - Exit verbs resolve the event to PATCH through the task's **latest
+//!   `started` log** (`calendar_id` + `google_event_id`) — never through the
+//!   running-event window — so a run whose event end already passed still
+//!   closes. Missing log / empty ids / Google 404 → today's idempotent
+//!   status-only flip: OPEN (stop) or PLANNED (pause), terminal status for
+//!   complete/discard.
 //! - `complete_task`/`discard_task` auto-stop a running event first (a
 //!   `stopped` log precedes the terminal log), then set the terminal status.
 //!   Repeating the same terminal action is an idempotent 200 no-op.
@@ -58,20 +66,28 @@
 //! - Every transition appends to `task_logs` (an audit trail, not a
 //!   timesheet): `started|stopped|paused|completed|discarded` plus the move
 //!   verbs `planned|unplanned|reopened`.
+//! - The `*/2` elongate cron ([`run_elongate_cron`]) grows every living
+//!   IN_PROGRESS task's event end to `max(current, ceil-5min(now + 5min)` in
+//!   the event calendar's TZ) so the live calendar block never looks
+//!   finished. Never shrink (the exit verbs snap the end back to actuals on
+//!   close — that may shrink and is correct), never recreate a missing
+//!   event, never touch status: IN_PROGRESS stays the lock.
 //!
 //! Move ([`move_task`], ADR 0002 § Move API): the board drop dispatches the
 //! transition matrix (start/stop/pause/complete/discard/plan/unplan/reopen/
 //! reorder), then places the task at `sort_order` in the target status (peer
 //! shifts never touch `updated_at`, and the source column is never compacted).
 //! A same-status cross-card drag is a pure reorder. `displace` parks the
-//! running task first (PLANNED/COMPLETED/DISCARDED only), then starts the
-//! moved task; if that start fails the parked task STAYS — the error is
+//! running task first (PLANNED/COMPLETED/DISCARDED only — `displace.id` must
+//! be the task whose **status** is IN_PROGRESS), then starts the moved task;
+//! if that start fails the parked task STAYS — the error is
 //! [`TasksError::AfterDisplace`] and carries the displaced task's view.
 
 use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{ensure_taxonomy, classify, CategoryWithPatterns, ClassifyOutcome};
+use crate::config::OAuthConfig;
 use crate::models::{
     CalendarEvent, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task, TaskCategory,
     UpdateTask,
@@ -79,10 +95,12 @@ use crate::models::{
 use crate::oauth::HttpClient;
 use crate::repo::{
     CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo, TaskListRepo, TaskLogRepo,
-    TaskRepo,
+    TaskRepo, TokenRepo,
 };
-use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
-use crate::token::GoogleAccess;
+use crate::time::{
+    ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
+};
+use crate::token::{refresh_if_needed, GoogleAccess};
 
 /// Default planned duration for a new task, in minutes.
 pub const DEFAULT_DURATION_MINUTES: i64 = 15;
@@ -90,7 +108,8 @@ pub const DEFAULT_DURATION_MINUTES: i64 = 15;
 pub const MIN_DURATION_MINUTES: i64 = 1;
 /// The status every created task gets.
 pub const TASK_STATUS_OPEN: &str = "OPEN";
-/// A running task (an open timed event exists in the cache).
+/// A running task — **the one-running-task lock** (a second start is 409
+/// while any living task carries this status, whatever the event cache says).
 pub const TASK_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// A finished task.
 pub const TASK_STATUS_COMPLETED: &str = "COMPLETED";
@@ -219,8 +238,9 @@ pub struct MoveTaskInput {
 /// `PLANNED|COMPLETED|DISCARDED` (never OPEN/IN_PROGRESS).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct DisplaceInput {
-    /// Id of the currently running task (an open timed event whose
-    /// `task_id` matches); anything else is 400.
+    /// Id of the currently running task (its `tasks.status` row is
+    /// IN_PROGRESS — the status lock, not the event window); anything else
+    /// is 400.
     pub id: String,
     pub status: String,
     pub sort_order: i64,
@@ -506,14 +526,16 @@ pub async fn delete_task(
 ///
 /// Order of operations:
 /// 1. Load the task — missing, soft-deleted, or another user's task → 404.
-/// 2. If ANY open timed event exists for the user → 409 (`Conflict`) — even
-///    when it belongs to this very task.
+/// 2. If ANY living task of the user has `status == IN_PROGRESS` → 409
+///    (`Conflict`) — even when it is this very task. **Status is the only
+///    lock**: the event window is never consulted here.
 /// 3. Classify the title (seeding the taxonomy like every other read) to pick
 ///    the category; its `google_calendar_id` is the calendar *candidate*.
 /// 4. Resolve the target calendar: the candidate when it exists for this
 ///    user and is writable (`access_role` owner/writer), else the user's
 ///    primary calendar. No writable calendar → 400.
-/// 5. `create_event` (now … now + duration_minutes, task carrier attached).
+/// 5. `create_event` on the minute grid (`T … T + duration_minutes`,
+///    `T = nearest_minute_unix(now)`, task carrier attached).
 /// 6. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
 ///    request.
 pub async fn start_task(
@@ -539,17 +561,21 @@ pub async fn start_task(
     // board's reopen-by-start, ADR 0002) — history stays in the logs.
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    // Running is derived from the cache, never from `tasks.status`: any open
-    // timed event blocks a new start, whatever this task's stored status.
-    let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
-    if !running.is_empty() {
+    // The one-running-task lock is `tasks.status == IN_PROGRESS` — never the
+    // event window, so a stale/expired cache can neither block nor free a
+    // start.
+    let living = task_repo.list_by_user_id(user_id).await?;
+    if living.iter().any(|task| task.status == TASK_STATUS_IN_PROGRESS) {
         return Err(TasksError::Conflict);
     }
 
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
     let target = resolve_target_calendar(calendars, &taxonomy, &task.title, user_id).await?;
 
-    let end_rfc3339 = unix_secs_to_rfc3339(now_unix + task.duration_minutes * 60);
+    // Timer Google writes snap to the nearest minute.
+    let t_unix = nearest_minute_unix(now_unix);
+    let start_rfc3339 = unix_secs_to_rfc3339(t_unix);
+    let end_rfc3339 = unix_secs_to_rfc3339(t_unix + task.duration_minutes * 60);
     let output = create_event(
         http,
         calendars,
@@ -559,7 +585,7 @@ pub async fn start_task(
             calendar_id: target.calendar_id.clone(),
             summary: task.title.clone(),
             description: None,
-            start: now_rfc3339.clone(),
+            start: start_rfc3339,
             end: end_rfc3339,
             task_id: Some(task.id.clone()),
         },
@@ -718,7 +744,7 @@ async fn stop_or_pause(
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let (patched, at, calendar_id, google_event_id) =
-        stop_running_event(http, calendars, events, access, user_id, task_id, now_unix).await?;
+        stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
 
     let Some(updated) = task_repo
         .set_status(task_id, target_status, &now_rfc3339)
@@ -781,7 +807,7 @@ async fn complete_or_discard(
     // Auto-stop: a running event is closed first, and that close is logged
     // (`stopped`) before the terminal log.
     let (patched, at, calendar_id, google_event_id) =
-        stop_running_event(http, calendars, events, access, user_id, task_id, now_unix).await?;
+        stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
     if let Some(_event) = &patched {
         logs.insert(
             NewTaskLog {
@@ -823,33 +849,58 @@ async fn complete_or_discard(
     })
 }
 
-/// Finds the task's open timed event in the user's running set and PATCHes
-/// its end to now (or `start + 60s` when `now <= start`, keeping the Google
-/// event valid). Returns the patched event (None when the task has no open
-/// event — the user closed it in Google), the closing instant, and the
-/// calendar/google ids for the log row.
+/// Resolves the cached event a task's latest `started` log points at, for the
+/// exit verbs and the displace park: `None` when the task never started, the
+/// log carries no ids, or the cached row is gone (the user closed the event
+/// in Google).
+async fn latest_started_event(
+    logs: &dyn TaskLogRepo,
+    events: &dyn CalendarEventRepo,
+    task_id: &str,
+) -> Result<Option<CalendarEvent>, RepoError> {
+    let Some(log) = logs.latest_started_by_task_id(task_id).await? else {
+        return Ok(None);
+    };
+    if log.calendar_id.is_empty() || log.google_event_id.is_empty() {
+        return Ok(None);
+    }
+    events
+        .get_by_calendar_and_google_id(&log.calendar_id, &log.google_event_id)
+        .await
+}
+
+/// Closes the task's run: PATCHes the end of the event its latest `started`
+/// log points at to snapped `T` (or `start + 60s` when `T <= start`, keeping
+/// the Google event valid — the invert guard, on the minute grid). Returns
+/// the patched event (None on the idempotent no-event path), the closing
+/// instant, and the calendar/google ids for the log row.
+///
+/// The event is resolved through the **log**, never through
+/// `list_running_by_user_id`, so a run whose event window already lapsed
+/// still closes. A missing log / empty ids / missing cached row / Google 404
+/// all land on the no-event path: the status flip still happens.
 async fn stop_running_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    logs: &dyn TaskLogRepo,
     access: &GoogleAccess,
-    user_id: &str,
     task_id: &str,
     now_unix: i64,
 ) -> Result<(Option<CalendarEvent>, String, Option<String>, Option<String>), TasksError> {
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
-    let Some(found) = running.into_iter().find(|event| event.task_id == task_id) else {
-        return Ok((None, now_rfc3339, None, None));
+    let snapped_rfc3339 = unix_secs_to_rfc3339(nearest_minute_unix(now_unix));
+    let Some(found) = latest_started_event(logs, events, task_id).await? else {
+        return Ok((None, snapped_rfc3339, None, None));
     };
     let start_unix = rfc3339_to_unix_secs(&found.start_time).unwrap_or(now_unix);
-    let end_unix = if now_unix <= start_unix {
+    let snapped = nearest_minute_unix(now_unix);
+    let end_unix = if snapped <= start_unix {
         start_unix + 60
     } else {
-        now_unix
+        snapped
     };
     let end_rfc3339 = unix_secs_to_rfc3339(end_unix);
-    let output = patch_event(
+    let output = match patch_event(
         http,
         calendars,
         events,
@@ -859,13 +910,165 @@ async fn stop_running_event(
         &end_rfc3339,
         now_unix,
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        // The event is gone on Google's side (404): fall through to the
+        // idempotent status-only flip — never fail a stop/complete on a
+        // ghost event.
+        Err(CalendarError::GoogleApi(message)) if message.contains("404") => {
+            return Ok((None, snapped_rfc3339, None, None));
+        }
+        Err(err) => return Err(TasksError::from(err)),
+    };
     Ok((
         Some(output.event),
         end_rfc3339,
         Some(found.calendar_id),
         Some(found.google_event_id),
     ))
+}
+
+// ──────────────────────────────────────────
+// Elongate cron (slice 2): grow IN_PROGRESS events every 2 minutes
+// ──────────────────────────────────────────
+
+/// Outcome of one elongate cron run: counters plus human-readable failures —
+/// a failure for one task never fails the whole job.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ElongateReport {
+    /// Tasks whose Google event end was extended in this run.
+    pub elongated: usize,
+    /// Tasks skipped: no started log / empty ids / missing cache row, an
+    /// unparseable stored end, Google 404 (the event is gone), or a current
+    /// end already at/after the target (never shrink).
+    pub skipped: usize,
+    /// Human-readable failures; empty when everything worked.
+    pub errors: Vec<String>,
+}
+
+/// The elongate cron (triggered by the `*/2 * * * *` schedule): while a task
+/// stays IN_PROGRESS, grow its Google event so the live calendar block does
+/// not look finished.
+///
+/// Target: `end = max(current_end, ceil_5min(now + 5min)` in the event
+/// calendar's IANA time zone), persisted as a UTC `…Z` string via
+/// `unix_secs_to_rfc3339` — the same persistence as every other timer write.
+///
+/// Per task, in order:
+/// 1. `refresh_if_needed` for the task's owner. On failure the task is
+///    skipped entirely (one error) — other users still elongate.
+/// 2. Resolve the cached event through the task's latest `started` log
+///    (`latest_started_event`, the same path as the exit verbs). No log /
+///    empty ids / missing cache row → skipped: the event is gone, never
+///    recreate it, never flip status.
+/// 3. Parse `event.end_time` (handles `+05:30` cache rows). Unparseable →
+///    skipped.
+/// 4. Load the event's calendar for `time_zone`; a missing calendar or an
+///    empty/unknown zone falls back to UTC.
+/// 5. PATCH only when `target > current_end` (never shrink). A Google 404 →
+///    skipped (the event vanished; never recreate). Other errors are
+///    collected and the loop continues.
+///
+/// Status is deliberately never touched here: IN_PROGRESS rows are the only
+/// work list, and only the exit verbs own the status flip.
+pub async fn run_elongate_cron(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    logs: &dyn TaskLogRepo,
+    tasks: &dyn TaskRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    now_unix: i64,
+) -> ElongateReport {
+    let mut report = ElongateReport::default();
+    let running = match tasks.list_in_progress().await {
+        Ok(running) => running,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("list_in_progress failed: {err}"));
+            return report;
+        }
+    };
+
+    for task in &running {
+        let access = match refresh_if_needed(http, tokens, oauth, &task.user_id, now_unix).await {
+            Ok(access) => access,
+            Err(err) => {
+                report.errors.push(format!(
+                    "token refresh failed for user {} (task {}): {err}",
+                    task.user_id, task.id
+                ));
+                continue;
+            }
+        };
+        // The event a run is attached to, resolved through the started log —
+        // a missing log/ids/cache row means there is nothing to grow: skip
+        // (do not recreate the event, do not flip status).
+        let event = match latest_started_event(logs, events, &task.id).await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                report.skipped += 1;
+                continue;
+            }
+            Err(err) => {
+                report.errors.push(format!(
+                    "started-log lookup failed for task {}: {err}",
+                    task.id
+                ));
+                continue;
+            }
+        };
+        let Some(current_end_unix) = rfc3339_to_unix_secs(&event.end_time) else {
+            report.skipped += 1;
+            continue;
+        };
+        // The calendar's IANA time_zone decides the 5-minute grid (the offset
+        // resolver falls back to UTC for empty/missing/unknown zones).
+        let time_zone = match calendars.get_by_id(&event.calendar_id).await {
+            Ok(Some(cal)) => cal.time_zone,
+            Ok(None) => "UTC".to_string(),
+            Err(err) => {
+                report.errors.push(format!(
+                    "calendar lookup failed for task {} (calendar {}): {err}",
+                    task.id, event.calendar_id
+                ));
+                "UTC".to_string()
+            }
+        };
+        let target_unix = ceil_5min_unix_in_zone(now_unix, &time_zone);
+        if current_end_unix >= target_unix {
+            // Never shrink: the event already covers the target instant.
+            report.skipped += 1;
+            continue;
+        }
+        match patch_event(
+            http,
+            calendars,
+            events,
+            &access,
+            &event.calendar_id,
+            &event.google_event_id,
+            &unix_secs_to_rfc3339(target_unix),
+            now_unix,
+        )
+        .await
+        {
+            Ok(_) => report.elongated += 1,
+            // The event is gone on Google's side (404): skip — never
+            // recreate it, never touch the status.
+            Err(CalendarError::GoogleApi(message)) if message.contains("404") => {
+                report.skipped += 1;
+            }
+            Err(err) => report.errors.push(format!(
+                "elongate failed for task {} (event {}): {err}",
+                task.id, event.google_event_id
+            )),
+        }
+    }
+    report
 }
 
 // ──────────────────────────────────────────
@@ -1056,10 +1259,14 @@ async fn local_transition(
     Ok(())
 }
 
-/// Complete/discard from a status other than IN_PROGRESS. Normally no Google
-/// writes (set status + terminal log only) — but if this non-IN_PROGRESS
-/// task still owns a running event (stale cache), the auto-stop applies and
-/// the full `complete_task`/`discard_task` (Google) is used.
+/// Complete/discard from a status other than IN_PROGRESS: no Google writes
+/// (set status + terminal log only — idle complete/discard stay local).
+///
+/// Status is the lock: only a task whose **status** is IN_PROGRESS has a
+/// living timer, so a leftover event window in the cache never triggers a
+/// Google auto-stop here. (The matrix already routes true IN_PROGRESS →
+/// COMPLETED/DISCARDED to `complete_task`/`discard_task`; this arm is a
+/// backstop only.)
 async fn terminal_transition(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1074,9 +1281,12 @@ async fn terminal_transition(
     log_type: &str,
     now_unix: i64,
 ) -> Result<Option<CalendarEvent>, TasksError> {
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
-    if running.iter().any(|event| event.task_id == task_id) {
+    // Status is the lock: a non-IN_PROGRESS row has no living timer, even if
+    // a stale event window lingers in the cache — no Google writes.
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    if task.status == TASK_STATUS_IN_PROGRESS {
         let (http, access) = require_google(http, access)?;
         let response = if target_status == TASK_STATUS_COMPLETED {
             complete_task(
@@ -1161,11 +1371,13 @@ async fn reorder_in_place(
 /// case is a no-op that ignores `sort_order`).
 ///
 /// `displace` (move to IN_PROGRESS only) parks the running task first:
-/// 1. `displace.id` must be the task with an open timed event (400
-///    `"displace id is not the running task"` otherwise).
+/// 1. `displace.id` must be the task whose **status** is IN_PROGRESS — the
+///    status lock, never the event window (400 `"displace id is not the
+///    running task"` otherwise).
 /// 2. Park A at `displace.status`/`displace.sort_order` (must be
 ///    PLANNED/COMPLETED/DISCARDED — the matrix from IN_PROGRESS).
-/// 3. `start_task(B)`, then place B.
+/// 3. `start_task(B)` on the minute grid (`B.start = A.end` — snapped `T`,
+///    or `A.start + 60` under the invert guard), then place B.
 /// 4. If step 3 fails: [`TasksError::AfterDisplace`] — A STAYS parked
 ///    (no rollback) and the error carries A's view.
 ///
@@ -1242,18 +1454,31 @@ pub async fn move_task(
 
     // ── Displace flow: park A, then start B ──
     if let Some(displace) = &input.displace {
-        let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-        let running = events.list_running_by_user_id(user_id, &now_rfc3339).await?;
-        if !running.iter().any(|event| event.task_id == displace.id) {
-            return Err(TasksError::Invalid(
-                "displace id is not the running task".to_string(),
-            ));
-        }
+        // `displace.id` must be the task whose STATUS is IN_PROGRESS (the
+        // lock) — the event window is never consulted, so a stale/expired
+        // event can neither block the displace nor falsify the identity.
         let Some(displaced_task) = task_repo.get_by_id(&displace.id).await? else {
             return Err(TasksError::Invalid(
                 "displace id is not the running task".to_string(),
             ));
         };
+        if displaced_task.user_id != user_id || displaced_task.status != TASK_STATUS_IN_PROGRESS {
+            return Err(TasksError::Invalid(
+                "displace id is not the running task".to_string(),
+            ));
+        }
+        // B's start instant on the minute grid (rule: `A.end == B.start`):
+        // snapped T, or `A.start + 60` when T has not passed A's start (the
+        // same invert guard the park PATCH applies, so the two agree).
+        let displaced_start_unix = latest_started_event(logs, events, &displaced_task.id)
+            .await?
+            .and_then(|event| rfc3339_to_unix_secs(&event.start_time));
+        let t_unix = nearest_minute_unix(now_unix);
+        let b_start_unix = match displaced_start_unix {
+            Some(start) if t_unix <= start => start + 60,
+            _ => t_unix,
+        };
+
         // Park A (matrix from IN_PROGRESS: pause/complete/discard), then rank.
         // A failure here is a plain error — nothing was started yet.
         dispatch_matrix_action(
@@ -1274,7 +1499,7 @@ pub async fn move_task(
         // A stays parked (no rollback) and `AfterDisplace` carries A's view.
         match dispatch_matrix_action(
             http, calendars, events, list_repo, category_repo, task_repo, logs, access,
-            user_id, task_id, &task.status, TASK_STATUS_IN_PROGRESS, now_unix,
+            user_id, task_id, &task.status, TASK_STATUS_IN_PROGRESS, b_start_unix,
         )
         .await
         {
@@ -1524,12 +1749,14 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        GoogleCalendar, NewCalendar, NewCalendarEvent, NewTaskCategory, NewTaskCategoryInput,
-        NewTaskCategoryPattern, NewTaskList, TaskCategory, TaskCategoryPattern, TaskList,
-        UpdateTaskCategory, UpdateTaskList,
+        GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
+        NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, NewTaskList, NewToken,
+        TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTaskCategory, UpdateTaskList,
     };
     use crate::oauth::{HttpClient, HttpError};
-    use crate::repo::{CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo};
+    use crate::repo::{
+        CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo, TokenRepo,
+    };
 
     // ──────────────────────────────────────────
     // Fakes
@@ -1578,6 +1805,19 @@ mod tests {
                     ))
             });
             Ok(rows)
+        }
+
+        async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
+            // Mirrors TASK_LIST_IN_PROGRESS_SQL: living rows with the
+            // IN_PROGRESS status, across all users.
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.status == TASK_STATUS_IN_PROGRESS && row.deleted_at.is_none())
+                .cloned()
+                .collect())
         }
 
         async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
@@ -2556,8 +2796,13 @@ mod tests {
         }
     }
 
-    const NOW_UNIX: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z
+    const NOW_UNIX: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z (the raw clock)
     const NOW: &str = "2023-11-14T22:13:20Z";
+    /// `NOW_UNIX` snapped to the nearest minute — every timer Google write
+    /// lands here (22:13:20 → 22:13:00).
+    const NOW_SNAPPED: &str = "2023-11-14T22:13:00Z";
+    /// Snapped 15-minute end (`T + DEFAULT_DURATION_MINUTES * 60`).
+    const NOW_END: &str = "2023-11-14T22:28:00Z";
 
     fn access() -> GoogleAccess {
         GoogleAccess {
@@ -2736,6 +2981,25 @@ mod tests {
             Ok(None)
         }
 
+        async fn get_by_calendar_and_google_id(
+            &self,
+            calendar_id: &str,
+            google_event_id: &str,
+        ) -> Result<Option<CalendarEvent>, RepoError> {
+            // Same semantics as EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL.
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| {
+                    event.deleted_at.is_none()
+                        && event.calendar_id == calendar_id
+                        && event.google_event_id == google_event_id
+                })
+                .cloned())
+        }
+
         async fn list_by_user_id_and_time_range(
             &self,
             _user_id: &str,
@@ -2800,6 +3064,95 @@ mod tests {
             self.inserted.lock().unwrap().push(log);
             Ok("log-1".to_string())
         }
+
+        async fn latest_started_by_task_id(
+            &self,
+            task_id: &str,
+        ) -> Result<Option<TaskLog>, RepoError> {
+            // Mirrors TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL: scan the
+            // inserted rows in reverse for the task's newest `started` row and
+            // synthesize a `TaskLog` from the insert input.
+            let inserted = self.inserted.lock().unwrap();
+            Ok(inserted
+                .iter()
+                .rev()
+                .find(|log| log.task_id == task_id && log.r#type == TASK_LOG_STARTED)
+                .map(|log| TaskLog {
+                    id: "log-1".to_string(),
+                    task_id: log.task_id.clone(),
+                    user_id: log.user_id.clone(),
+                    r#type: log.r#type.clone(),
+                    at: log.at.clone(),
+                    calendar_id: log.calendar_id.clone().unwrap_or_default(),
+                    google_event_id: log.google_event_id.clone().unwrap_or_default(),
+                    created_at: log.at.clone(),
+                }))
+        }
+    }
+
+    /// Token repo for the elongate cron tests: returns a stored token per
+    /// user (expiring far in the future, so `refresh_if_needed` never POSTs)
+    /// — or `None` for users without one, which fails that user's refresh
+    /// without touching anyone else.
+    struct FakeTokenRepo {
+        stored: Mutex<HashMap<String, GoogleOAuthToken>>,
+    }
+
+    impl FakeTokenRepo {
+        fn with(tokens: Vec<GoogleOAuthToken>) -> Self {
+            let stored = tokens
+                .into_iter()
+                .map(|token| (token.user_id.clone(), token))
+                .collect();
+            Self {
+                stored: Mutex::new(stored),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TokenRepo for FakeTokenRepo {
+        async fn get_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<GoogleOAuthToken>, RepoError> {
+            Ok(self.stored.lock().unwrap().get(user_id).cloned())
+        }
+
+        async fn upsert(&self, _token: NewToken) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _user_id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// A stored OAuth token for `user_id` whose expiry is centuries out, so
+    /// `refresh_if_needed` returns it as-is (no refresh POST).
+    fn fresh_token(user_id: &str, access_token: &str) -> GoogleOAuthToken {
+        GoogleOAuthToken {
+            id: format!("tok-{user_id}"),
+            user_id: user_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expiry: "2099-01-01T00:00:00Z".to_string(),
+            token_type: "Bearer".to_string(),
+            scope: Some("calendar".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// OAuth client credentials for `run_elongate_cron` tests; the fresh
+    /// tokens above mean `refresh_if_needed` never uses them.
+    fn oauth_config() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "client-id.apps.googleusercontent.com".to_string(),
+            client_secret: "client-secret".to_string(),
+            redirect_url: "http://localhost:5173/auth/google/callback".to_string(),
+        }
     }
 
     /// Creates a "Work" task for `u-1` on the seeded taxonomy and returns its
@@ -2829,6 +3182,66 @@ mod tests {
         )
     }
 
+    /// `patched_event_json` for a specific Google event id (the multi-user
+    /// elongate tests need more than the fixed `g-1`).
+    fn patched_event_json_for(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+        )
+    }
+
+    /// A cached `calendar_events` row the elongate cron resolves through a
+    /// task's `started` log.
+    fn cached_event(
+        calendar_id: &str,
+        google_id: &str,
+        task_id: &str,
+        start: &str,
+        end: &str,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            id: "evt-1".to_string(),
+            calendar_id: calendar_id.to_string(),
+            google_event_id: google_id.to_string(),
+            google_etag: String::new(),
+            google_updated_at: String::new(),
+            last_synced_at: "2026-08-18T00:00:00Z".to_string(),
+            title: "Work".to_string(),
+            description: String::new(),
+            start_time: start.to_string(),
+            end_time: end.to_string(),
+            recurrence: String::new(),
+            task_id: task_id.to_string(),
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// Inserts the `started` log row that ties `task_id` to a cached event —
+    /// the event identity the exit verbs and the elongate cron resolve.
+    fn log_started(
+        logs: &FakeTaskLogRepo,
+        task_id: &str,
+        user_id: &str,
+        at: &str,
+        calendar_id: &str,
+        google_id: &str,
+    ) {
+        pollster::block_on(logs.insert(
+            NewTaskLog {
+                task_id: task_id.to_string(),
+                user_id: user_id.to_string(),
+                r#type: TASK_LOG_STARTED.to_string(),
+                at: at.to_string(),
+                calendar_id: Some(calendar_id.to_string()),
+                google_event_id: Some(google_id.to_string()),
+            },
+            at,
+        ))
+        .unwrap();
+    }
+
     // ──────────────────────────────────────────
     // start_task
     // ──────────────────────────────────────────
@@ -2844,11 +3257,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(
-                &task.id,
-                "2023-11-14T22:13:20Z",
-                "2023-11-14T22:28:20Z",
-            ),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
 
         let response = pollster::block_on(start_task(
@@ -2862,12 +3271,16 @@ mod tests {
         let event = response.event.expect("start always returns the event");
         assert_eq!(event.google_event_id, "g-1");
         assert_eq!(event.task_id, task.id, "carrier mapped onto the cache row");
-        assert_eq!(event.start_time, NOW);
-        assert_eq!(event.end_time, "2023-11-14T22:28:20Z", "now + 15 min");
+        // Timer Google writes snap to the nearest minute: 22:13:20 → 22:13:00.
+        assert_eq!(event.start_time, NOW_SNAPPED);
+        assert_eq!(event.end_time, NOW_END, "snapped now + 15 min");
 
-        // Summary is the title EXACTLY — no `| Category` suffix.
+        // The POST body carries the same snapped window.
         let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["start"]["dateTime"], NOW_SNAPPED);
+        assert_eq!(body["end"]["dateTime"], NOW_END);
+        // Summary is the title EXACTLY — no `| Category` suffix.
         assert_eq!(body["summary"], "Work");
         assert_eq!(
             body["extendedProperties"]["shared"]["sanctuary_task_id"],
@@ -2909,7 +3322,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
 
         let response = pollster::block_on(start_task(
@@ -2946,7 +3359,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -2966,12 +3379,15 @@ mod tests {
             },
         ]);
         // Fresh event/log fakes: the previous scenario left an event running.
+        // Status is the lock now, so the row's IN_PROGRESS from scenario 1 is
+        // reset first (the equivalent of the old cache-freshness reset).
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_OPEN, NOW)).unwrap();
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3026,7 +3442,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&first.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&first.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3062,7 +3478,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3077,6 +3493,41 @@ mod tests {
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Conflict));
+    }
+
+    #[test]
+    fn start_conflicts_via_status_lock_even_without_running_event() {
+        // The one-running lock is `tasks.status == IN_PROGRESS`, never the
+        // event window: a task whose status says IN_PROGRESS but that has no
+        // living timed event (stale/missing cache) still blocks a second
+        // start.
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        let second = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Fitness"),
+        ))
+        .unwrap()
+        .task;
+        // Mark IN_PROGRESS directly — no event cache, no started log.
+        pollster::block_on(tasks.set_status(&first.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+        let err = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &second.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::Conflict), "got {err:?}");
+        assert!(http.posts.lock().unwrap().is_empty(), "no insert attempted");
+        assert!(events.upserted.lock().unwrap().is_empty(), "nothing cached");
+        assert!(logs.inserted.lock().unwrap().is_empty(), "nothing logged");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
+            TASK_STATUS_OPEN
+        );
     }
 
     #[test]
@@ -3096,7 +3547,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3124,7 +3575,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3201,7 +3652,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3209,12 +3660,12 @@ mod tests {
         ))
         .unwrap();
 
-        // Stop 5 minutes later.
+        // Stop 5 minutes later (22:18:20 → snapped 22:18:00).
         let stop_unix = NOW_UNIX + 300;
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &categories, &tasks, &logs,
@@ -3224,19 +3675,19 @@ mod tests {
 
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
         let event = response.event.expect("stop returns the patched event");
-        assert_eq!(event.end_time, "2023-11-14T22:18:20Z");
+        assert_eq!(event.end_time, "2023-11-14T22:18:00Z", "PATCH end snaps");
 
         let patches = http.patches.lock().unwrap();
         assert_eq!(patches.len(), 1);
         let (url, body) = patches.first().unwrap().clone();
         assert!(url.contains("primary%40example.com/events/g-1"), "{url}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:18:20Z");
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:18:00Z");
 
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.len(), 2, "started then stopped");
         assert_eq!(inserted[1].r#type, TASK_LOG_STOPPED);
-        assert_eq!(inserted[1].at, "2023-11-14T22:18:20Z", "log at the patched end");
+        assert_eq!(inserted[1].at, "2023-11-14T22:18:00Z", "log at the patched end");
     }
 
     #[test]
@@ -3249,7 +3700,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3257,11 +3708,13 @@ mod tests {
         ))
         .unwrap();
 
-        // Stop at the exact start instant: `now <= start` → end = start + 60s.
+        // Stop at 22:13:20 (20s after the snapped 22:13:00 start): snapped
+        // T = 22:13:00 <= start → end = start + 60s = 22:14:00 (the invert
+        // guard, on the minute grid).
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:14:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &categories, &tasks, &logs,
@@ -3270,13 +3723,13 @@ mod tests {
         .unwrap();
 
         let event = response.event.expect("patched event returned");
-        assert_eq!(event.end_time, "2023-11-14T22:14:20Z", "start + 60s");
+        assert_eq!(event.end_time, "2023-11-14T22:14:00Z", "start + 60s");
         let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:14:20Z");
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:14:00Z");
         assert_eq!(
             logs.inserted.lock().unwrap()[1].at,
-            "2023-11-14T22:14:20Z"
+            "2023-11-14T22:14:00Z"
         );
     }
 
@@ -3306,6 +3759,61 @@ mod tests {
     }
 
     #[test]
+    fn stop_after_event_window_elapsed_still_patches_via_started_log() {
+        // The old exit path scanned `list_running` (`start <= now < end`), so
+        // a stop after the duration elapsed found no event and skipped the
+        // PATCH. The exit now resolves the event through the task's latest
+        // `started` log — the run closes even when the cached end is in the
+        // past.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Expire the cached window: the event ended 10 minutes ago.
+        {
+            let mut stored = events.stored.lock().unwrap();
+            let event = stored.iter_mut().find(|row| row.task_id == task.id).unwrap();
+            event.end_time = "2023-11-14T22:03:00Z".to_string();
+        }
+
+        // Stop at 22:13:20: snapped T = 22:13:00 == start → end = start + 60
+        // = 22:14:00 — the PATCH happens regardless of the stale end.
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "exit PATCHes via the started log");
+        let (_, body) = patches.first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:14:00Z");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted[1].r#type, TASK_LOG_STOPPED);
+        assert_eq!(inserted[1].calendar_id.as_deref(), Some("cal-primary@example.com"));
+        assert_eq!(inserted[1].google_event_id.as_deref(), Some("g-1"));
+    }
+
+    #[test]
     fn pause_patches_end_and_logs_paused() {
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
@@ -3315,7 +3823,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3323,11 +3831,12 @@ mod tests {
         ))
         .unwrap();
 
+        // Pause 10 minutes later (22:23:20 → snapped 22:23:00).
         let pause_unix = NOW_UNIX + 600;
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:23:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
         )]);
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &categories, &tasks, &logs,
@@ -3337,7 +3846,7 @@ mod tests {
 
         // ADR 0002: pause parks the task in the Planned pile, not Backlog.
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
-        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:23:20Z");
+        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:23:00Z", "PATCH end snaps");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
         // Ending the event also frees the one-running slot; a new start works
@@ -3345,7 +3854,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, "2023-11-14T22:23:20Z", "2023-11-14T22:38:20Z"),
+            &created_event_json(&task.id, "2023-11-14T22:23:00Z", "2023-11-14T22:38:00Z"),
         )]);
         let restarted = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3387,7 +3896,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3399,7 +3908,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &categories, &tasks, &logs,
@@ -3408,7 +3917,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
-        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:18:20Z");
+        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:18:00Z", "PATCH end snaps");
         assert_eq!(http.patches.lock().unwrap().len(), 1, "auto-stop patched");
 
         // Log order: started, stopped, completed.
@@ -3477,7 +3986,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
@@ -3489,7 +3998,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &categories, &tasks, &logs,
@@ -3552,6 +4061,402 @@ mod tests {
     }
 
     // ──────────────────────────────────────────
+    // run_elongate_cron
+    // ──────────────────────────────────────────
+
+    /// Marks `task_id` IN_PROGRESS and attaches the started log + cached
+    /// event (calendar `cal-primary@example.com`, google event `g-1`) — the
+    /// elongate cron's work item. `tz` is the calendar's `time_zone` column,
+    /// `end` the stored event end.
+    fn elongate_setup(
+        tasks: &FakeTaskRepo,
+        task_id: &str,
+        tz: &str,
+        end: &str,
+    ) -> (FakeCalendarRepo, FakeEventRepo, FakeTaskLogRepo) {
+        pollster::block_on(tasks.set_status(task_id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let mut cal = calendar("primary@example.com", true);
+        cal.time_zone = tz.to_string();
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-1",
+            task_id,
+            NOW_SNAPPED,
+            end,
+        ));
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, task_id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        (calendars, events, logs)
+    }
+
+    /// Runs `run_elongate_cron` with the standard fresh token for `u-1` and
+    /// one in-progress task; returns the report.
+    fn elongate(
+        http: &FakeHttp,
+        calendars: &FakeCalendarRepo,
+        events: &FakeEventRepo,
+        logs: &FakeTaskLogRepo,
+        tasks: &FakeTaskRepo,
+        tokens: &FakeTokenRepo,
+        now_unix: i64,
+    ) -> ElongateReport {
+        pollster::block_on(run_elongate_cron(
+            http, calendars, events, logs, tasks, tokens, &oauth_config(), now_unix,
+        ))
+    }
+
+    #[test]
+    fn elongate_patches_end_when_event_fell_behind_the_target() {
+        // A 15-minute event started 20 minutes ago (end 22:08:00 is past)
+        // while the task stayed IN_PROGRESS: the cron extends it.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // now 22:13:20 + 5 min = 22:18:20 → ceil 22:20:00Z, persisted UTC Z.
+        let (url, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events/g-1"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:20:00Z");
+        // The Google echo landed in the cache with the new end.
+        assert_eq!(events.stored.lock().unwrap()[0].end_time, "2023-11-14T22:20:00Z");
+        // Status untouched — the exit verbs own the flip.
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_skips_when_event_end_still_covers_target() {
+        // First minutes of a 15-minute task: the planned end (22:28:00) is
+        // still ahead of the target (22:20:00) — nothing to extend.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:28:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        // No routes: any HTTP call would panic "no route for …".
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no PATCH");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_never_shrinks_a_previously_elongated_end() {
+        // A previous elongation pushed the end to 23:30:00 (far beyond the
+        // current target) — the cron must not pull it back.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T23:30:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1, "never shrink");
+        assert!(http.patches.lock().unwrap().is_empty(), "no PATCH");
+        assert_eq!(
+            events.stored.lock().unwrap()[0].end_time,
+            "2023-11-14T23:30:00Z",
+            "cached end untouched"
+        );
+    }
+
+    #[test]
+    fn elongate_skips_task_without_started_log() {
+        // The task never started (no `started` log, no event): skip — do not
+        // recreate the event, do not flip status.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no HTTP");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS,
+            "status untouched"
+        );
+    }
+
+    #[test]
+    fn elongate_skips_when_cached_event_is_missing() {
+        // The `started` log names an event that is gone from the cache (the
+        // user deleted it in Google): skip, never recreate.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new(); // no cached row
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, &task.id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no HTTP");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_skips_unparseable_end_time() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "not-a-date");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(http.patches.lock().unwrap().is_empty(), "no HTTP");
+    }
+
+    #[test]
+    fn elongate_skips_on_google_404_and_keeps_status() {
+        // The event vanished on Google's side: 404 → skip (never recreate,
+        // never flip status).
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![("/events/g-1", 404, r#"{"error":"not found"}"#)]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 0);
+        assert_eq!(report.skipped, 1, "404 is a skip, not an error");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_uses_calendar_time_zone() {
+        // Asia/Kolkata's +05:30 (19_800s = 66 * 300) is a multiple of 5
+        // minutes, so the IST 5-minute grid is numerically the same set of
+        // instants as UTC's — the zone path (offset → local ceil → convert
+        // back) must not shift the target.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "Asia/Kolkata", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 22:18:20Z + 05:30 = 03:48:20 IST (next day) → ceil 03:50:00 IST =
+        // 22:20:00Z — the same instant as the UTC ceil (the offset is a
+        // multiple of 5 minutes, so both grids share the same instants).
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:20:00Z");
+    }
+
+    #[test]
+    fn elongate_target_with_empty_calendar_tz_falls_back_to_utc() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (calendars, events, logs) =
+            elongate_setup(&tasks, &task.id, "", "2023-11-14T22:08:00Z");
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1, "empty TZ behaves as UTC");
+        let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:20:00Z");
+    }
+
+    #[test]
+    fn elongate_token_failure_for_one_user_does_not_abort_the_rest() {
+        let (lists, categories, tasks) = seeded();
+        let task_a = work_task(&lists, &categories, &tasks);
+        // u-2's task inserts straight into the repo (no taxonomy needed).
+        let task_b = pollster::block_on(tasks.insert(NewTask {
+            user_id: "u-2".to_string(),
+            title: "Fitness".to_string(),
+            description: String::new(),
+            duration_minutes: DEFAULT_DURATION_MINUTES,
+            priority: "medium".to_string(),
+            difficulty: "easy".to_string(),
+            sort_order: 0,
+        }))
+        .unwrap();
+        for task_id in [&task_a.id, &task_b.id] {
+            pollster::block_on(tasks.set_status(task_id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        }
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-1",
+            &task_a.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-2",
+            &task_b.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, &task_a.id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        log_started(&logs, &task_b.id, "u-2", NOW, "cal-primary@example.com", "g-2");
+        // u-1 has NO token → its refresh fails; u-2 proceeds.
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-2", "at-b")]);
+        let http = FakeHttp::new(vec![(
+            "/events/g-2",
+            200,
+            &patched_event_json_for("g-2", &task_b.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+        )]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 1, "u-2's event extended despite u-1's failure");
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("u-1"), "{}", report.errors[0]);
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "only u-2's event patched");
+        assert!(patches[0].0.contains("g-2"), "{}", patches[0].0);
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task_a.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&task_b.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+    }
+
+    #[test]
+    fn elongate_extends_both_dirty_in_progress_tasks() {
+        // Two IN_PROGRESS rows at once (dirty data — status is the lock, not
+        // an event window): both elongate.
+        let (lists, categories, tasks) = seeded();
+        let task_a = work_task(&lists, &categories, &tasks);
+        let task_b = pollster::block_on(tasks.insert(NewTask {
+            user_id: "u-2".to_string(),
+            title: "Fitness".to_string(),
+            description: String::new(),
+            duration_minutes: DEFAULT_DURATION_MINUTES,
+            priority: "medium".to_string(),
+            difficulty: "easy".to_string(),
+            sort_order: 0,
+        }))
+        .unwrap();
+        for task_id in [&task_a.id, &task_b.id] {
+            pollster::block_on(tasks.set_status(task_id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        }
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-1",
+            &task_a.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        events.stored.lock().unwrap().push(cached_event(
+            "cal-primary@example.com",
+            "g-2",
+            &task_b.id,
+            NOW_SNAPPED,
+            "2023-11-14T22:08:00Z",
+        ));
+        let logs = FakeTaskLogRepo::default();
+        log_started(&logs, &task_a.id, "u-1", NOW, "cal-primary@example.com", "g-1");
+        log_started(&logs, &task_b.id, "u-2", NOW, "cal-primary@example.com", "g-2");
+        let tokens = FakeTokenRepo::with(vec![
+            fresh_token("u-1", "at-a"),
+            fresh_token("u-2", "at-b"),
+        ]);
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json(&task_a.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+            ),
+            (
+                "/events/g-2",
+                200,
+                &patched_event_json_for("g-2", &task_b.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
+            ),
+        ]);
+
+        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+
+        assert_eq!(report.elongated, 2, "both IN_PROGRESS rows grow");
+        assert_eq!(report.skipped, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(http.patches.lock().unwrap().len(), 2);
+    }
+
+    // ──────────────────────────────────────────
     // move_task (ADR 0002 § Move API)
     // ──────────────────────────────────────────
 
@@ -3604,7 +4509,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(task_id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(task_id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, lists, categories, tasks, &logs,
@@ -3719,7 +4624,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events",
             200,
-            &created_event_json(&task.id, NOW, "2023-11-14T22:28:20Z"),
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
 
         let response = move_to(
@@ -3747,7 +4652,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:23:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
         )]);
         let response = pollster::block_on(move_task(
             Some(&http),
@@ -3771,7 +4676,7 @@ mod tests {
 
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
         let event = response.event.expect("pause leg patches and returns the event");
-        assert_eq!(event.end_time, "2023-11-14T22:23:20Z");
+        assert_eq!(event.end_time, "2023-11-14T22:23:00Z", "PATCH end snaps");
         assert_eq!(http.patches.lock().unwrap().len(), 1, "exit from IN_PROGRESS patches");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_PAUSED, "{inserted:?}");
@@ -3789,7 +4694,7 @@ mod tests {
         let http = FakeHttp::new(vec![(
             "/events/g-1",
             200,
-            &patched_event_json(&task.id, NOW, "2023-11-14T22:18:20Z"),
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(move_task(
             Some(&http),
@@ -3869,15 +4774,20 @@ mod tests {
             start_running(&lists, &categories, &tasks, &a.id);
         drop(_start_http);
 
-        // Route order matters: the patch URL contains "/events" too. The
-        // patch echo returns end = NOW (the real Google echo of `stop`), so
-        // the cache sees A no longer running and B's start is free.
+        // Route order matters: the patch URL contains "/events" too. A's park
+        // PATCHes end to 22:14:00 (the invert guard: snapped T = 22:13:00 ==
+        // A.start → end = A.start + 60); B starts at the same instant on the
+        // minute grid (rule: A.end == B.start).
         let http = FakeHttp::new(vec![
-            ("/events/g-1", 200, &patched_event_json(&a.id, NOW, NOW)),
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
+            ),
             (
                 "/events",
                 200,
-                &created_event_json(&b.id, NOW, "2023-11-14T22:28:20Z"),
+                &created_event_json(&b.id, "2023-11-14T22:14:00Z", "2023-11-14T22:29:00Z"),
             ),
         ]);
         let response = pollster::block_on(move_task(
@@ -3939,10 +4849,14 @@ mod tests {
             start_running(&lists, &categories, &tasks, &a.id);
         drop(_start_http);
 
-        // A's park patch succeeds (echo end = NOW, so the cache frees the
-        // slot); B's start insert then fails with a Google 400.
+        // A's park patch succeeds (echo end = 22:14:00 — the invert guard on
+        // the minute grid); B's start insert then fails with a Google 400.
         let http = FakeHttp::new(vec![
-            ("/events/g-1", 200, &patched_event_json(&a.id, NOW, NOW)),
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
+            ),
             ("/events", 400, r#"{"error":"invalid"}"#),
         ]);
         let err = pollster::block_on(move_task(
@@ -4088,6 +5002,86 @@ mod tests {
             other => panic!("expected the locked displace error, got {other:?}"),
         };
         assert_eq!(message, "displace id is not the running task");
+    }
+
+    #[test]
+    fn move_displace_succeeds_when_running_events_end_is_in_the_past() {
+        // The production 400 this slice fixes: A's stored status is
+        // IN_PROGRESS but its cached event window already lapsed, so the old
+        // `list_running` check rejected the displace. Status is the lock now:
+        // the displace proceeds and A's run closes via its started log.
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        // Expire A's cached event end (as if the original duration passed
+        // while the row stayed IN_PROGRESS) — `list_running` would not find
+        // it anymore.
+        {
+            let mut stored = events.stored.lock().unwrap();
+            let event = stored.iter_mut().find(|row| row.task_id == a.id).unwrap();
+            event.end_time = "2023-11-14T21:00:00Z".to_string();
+        }
+
+        // A's park PATCHes end to 22:14:00 (invert guard: snapped T =
+        // 22:13:00 == the snapped A.start → end = A.start + 60); B starts at
+        // the same instant.
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &created_event_json(&b.id, "2023-11-14T22:14:00Z", "2023-11-14T22:29:00Z"),
+            ),
+        ]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &b.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: 0,
+                displace: Some(DisplaceInput {
+                    id: a.id.clone(),
+                    status: TASK_STATUS_PLANNED.to_string(),
+                    sort_order: 0,
+                }),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.id, b.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(
+            response.displaced.expect("A is returned as displaced").id,
+            a.id
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
+            TASK_STATUS_PLANNED,
+            "A parked despite the expired window"
+        );
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS
+        );
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "A's event closed via the log");
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's event inserted");
     }
 
     #[test]
