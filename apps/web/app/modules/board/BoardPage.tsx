@@ -1,7 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  closestCorners,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
+import {
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
@@ -9,6 +32,9 @@ import { cn } from '@/lib/utils';
 import type {
   CategoriesResponse,
   Category,
+  MoveTaskError,
+  MoveTaskInput,
+  MoveTaskResponse,
   NewTaskInput,
   TaskDifficulty,
   TaskListsResponse,
@@ -49,6 +75,30 @@ async function readError(res: Response): Promise<string> {
   return `Request failed with status ${res.status}`;
 }
 
+// Move failures can carry a `displaced` task (ADR 0002 § Move API): when the
+// start fails AFTER a successful displace, the parked task stays and the
+// client snaps only the moved card back. readError cannot express that, so
+// the move flow parses the full body instead.
+async function readMoveError(res: Response): Promise<MoveTaskError> {
+  try {
+    const data: unknown = await res.json();
+    if (
+      data &&
+      typeof data === 'object' &&
+      'error' in data &&
+      typeof (data as { error: unknown }).error === 'string'
+    ) {
+      return {
+        error: (data as { error: string }).error,
+        displaced: (data as Partial<MoveTaskError>).displaced,
+      };
+    }
+  } catch {
+    // Not JSON — fall through to the generic message.
+  }
+  return { error: `Request failed with status ${res.status}` };
+}
+
 interface TaskFormState {
   mode: 'create' | 'edit';
   /** Edit target. */
@@ -76,6 +126,61 @@ const COLUMNS: BoardColumn[] = [
 // § Done/Discarded cap). Backlog / Planned / In Progress show all matches.
 const TERMINAL_COLUMN_CAP = 20;
 
+// Column droppables are registered under `column:<status>` so they can never
+// collide with a task UUID (ADR 0002 § DnD): `over.id` is either a task id or
+// a prefixed column id, never a bare status string.
+const COLUMN_ID_PREFIX = 'column:';
+
+// A drop onto an occupied In Progress column (ADR 0002 § UI): the move is NOT
+// applied optimistically yet — the user picks where the running task A is
+// parked, then a single `/move` with `displace` runs. Cancel drops the stash.
+interface DisplacePrompt {
+  /** The dragged task (B) trying to enter In Progress. */
+  taskId: string;
+  /** B's status before the drop (used to describe the move). */
+  fromStatus: TaskStatus;
+  /** The task (A) currently running — the one the dialog parks. */
+  runningTask: TaskRecord;
+}
+
+/** Parses `destIndex` (a view index into the column's FILTERED, CAPPED
+ *  display list, ADR 0002 § Filters) into the absolute `sort_order` to send.
+ *  `remaining` is the dest column's displayed tasks minus the dragged id.
+ *
+ *  - Empty dest, or insert at the very top → the first visible card's rank
+ *    (or 0). Prepend-compatible: the dropped card sorts first.
+ *  - Middle → the hovered visible card's own rank (insert before it).
+ *  - End → last visible rank + 1. Done/Discarded clamp at the rank of the
+ *    20th visible match so the drop never lands past the capped window (the
+ *    old last-visible card is pushed to #20 and off the board).
+ *  - In Progress is a singleton: the rank is always 0. */
+function resolveSortOrder(
+  remaining: TaskRecord[],
+  destIndex: number,
+  destStatus: TaskStatus,
+): number {
+  if (destStatus === 'IN_PROGRESS') return 0;
+
+  if (remaining.length === 0 || destIndex <= 0) {
+    return remaining[0]?.sort_order ?? 0;
+  }
+
+  if (destIndex >= remaining.length) {
+    // Drop at the end of a capped terminal column: take the rank of the
+    // last visible card — the dropped card lands inside 0..19 and the old
+    // #20 slides off the board (ADR 0002 § Done/Discarded cap).
+    if (
+      (destStatus === 'COMPLETED' || destStatus === 'DISCARDED') &&
+      remaining.length >= TERMINAL_COLUMN_CAP
+    ) {
+      return remaining[TERMINAL_COLUMN_CAP - 1].sort_order;
+    }
+    return remaining[remaining.length - 1].sort_order + 1;
+  }
+
+  return remaining[destIndex].sort_order;
+}
+
 export function BoardPage() {
   const navigate = useNavigate();
   const { priority, difficulty, category } = useSearch({ from: '/board' });
@@ -89,16 +194,38 @@ export function BoardPage() {
   // array.
   const listsRef = useRef<TaskListsResponse['lists']>([]);
   listsRef.current = lists;
+  // Same pattern for `tasks`: the async move flow reads the pre-drop snapshot
+  // and looks up the dropped card from the latest render, never a stale one.
+  const tasksRef = useRef<TaskRecord[]>([]);
+  tasksRef.current = tasks;
   const [isLoading, setIsLoading] = useState(true);
   // Load failures: only set from `load()`. Replaces the board with the
   // error+retry banner when there are no lists to show.
   const [loadError, setLoadError] = useState<string | null>(null);
-  // Action failures (delete 409, etc.): rendered as a banner above the
+  // Action failures (move 409, etc.): rendered as a banner above the
   // still-visible board — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
 
   // Task dialog state.
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
+
+  // Drag state (ADR 0002 § DnD).
+  const [activeDrag, setActiveDrag] = useState<TaskRecord | null>(null);
+  // Cards with a /move request in flight — dragging them again is ignored
+  // until the response lands (no queuing).
+  const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
+  // Occupied In Progress conflict stash; non-null renders the park dialog.
+  const [displacePrompt, setDisplacePrompt] = useState<DisplacePrompt | null>(
+    null,
+  );
+
+  // PointerSensor with an 8px activation distance: a plain click still opens
+  // the edit modal, and only a real 8px+ movement starts a drag (ADR 0002
+  // § DnD). Sensors live on the cards, so grabbing the scroll gutter or the
+  // column headers still scrolls the board horizontally.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+  );
 
   const load = useCallback(() => {
     // Full-page loader only when the board is empty (first load, or a retry
@@ -233,10 +360,14 @@ export function BoardPage() {
   };
 
   const clearFilters = () =>
-    updateSearch({ priority: undefined, difficulty: undefined, category: undefined });
+    updateSearch({
+      priority: undefined,
+      difficulty: undefined,
+      category: undefined,
+    });
 
   // ──────────────────────────────────────────
-  // Columns: filter → sort → cap (display only; no /move in this slice)
+  // Columns: filter → sort → cap (display + drag targets)
   // ──────────────────────────────────────────
 
   const matchesFilters = useCallback(
@@ -258,7 +389,8 @@ export function BoardPage() {
 
   // Filter the column's tasks (AND), sort by `sort_order ASC` (tie-break
   // `created_at`), then cap Done/Discarded at 20 matches. Untracked tasks
-  // stay hidden, the same as Lists.
+  // stay hidden, the same as Lists. This is the DISPLAYED list: drops,
+  // reorders and the cap are all relative to it (ADR 0002 § Filters).
   const tasksForColumn = useCallback(
     (status: TaskStatus): TaskRecord[] => {
       const matches = tasks.filter(
@@ -279,6 +411,229 @@ export function BoardPage() {
     },
     [tasks, matchesFilters],
   );
+
+  // Task ids per column for the SortableContexts — always in sync with what
+  // is rendered, so dnd-kit never sorts a card it cannot measure.
+  const itemsByColumn = useMemo((): Record<TaskStatus, string[]> => {
+    const items = {
+      OPEN: [] as string[],
+      PLANNED: [] as string[],
+      IN_PROGRESS: [] as string[],
+      COMPLETED: [] as string[],
+      DISCARDED: [] as string[],
+    };
+    for (const column of COLUMNS) {
+      items[column.status] = tasksForColumn(column.status).map(
+        (task) => task.id,
+      );
+    }
+    return items;
+  }, [tasksForColumn]);
+
+  // ──────────────────────────────────────────
+  // Drag + optimistic move (ADR 0002 § DnD, § UI)
+  // ──────────────────────────────────────────
+
+  const handleDragStart = (event: DragStartEvent) => {
+    const task = tasksRef.current.find((entry) => entry.id === event.active.id);
+    // Unknown (e.g. deleted while dragging) — show nothing in the overlay.
+    setActiveDrag(task ?? null);
+  };
+
+  /** One negotiated `/move` request. Applies the OPTIMISTIC change first
+   *  (caller has already snapshotted and decided what to send), then:
+   *  - 200 → merge `response.task` (and `response.displaced`, if present);
+   *  - failure with `displaced` in the body → the parked task A stays, only
+   *    the dragged card B is snapped back to its pre-drop snapshot;
+   *  - failure without `displaced` → restore the full snapshot.
+   *  Every failure raises the error banner. */
+  const sendMoveRequest = async (
+    taskId: string,
+    body: MoveTaskInput,
+    snapshot: TaskRecord[],
+    onSuccess: (data: MoveTaskResponse) => void,
+  ) => {
+    setActionError(null);
+    setMovingIds((prev) => new Set(prev).add(taskId));
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const failure = await readMoveError(res);
+        if (failure.displaced) {
+          // ADR 0002 § Move API: no rollback for A — it stays parked. Only
+          // the moved card goes back to where it was before the drop.
+          setTasks((prev) =>
+            prev.map((entry) => {
+              if (entry.id === failure.displaced!.id) return failure.displaced!;
+              if (entry.id === taskId) {
+                return snapshot.find((snap) => snap.id === taskId) ?? entry;
+              }
+              return entry;
+            }),
+          );
+        } else {
+          setTasks(snapshot);
+        }
+        setActionError(failure.error);
+        return;
+      }
+      onSuccess((await res.json()) as MoveTaskResponse);
+    } catch (err) {
+      setTasks(snapshot);
+      setActionError(err instanceof Error ? err.message : 'Move failed');
+    } finally {
+      setMovingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(taskId);
+        return next;
+      });
+    }
+  };
+
+  /** Normal drop path (no conflict): optimistically move the card, then
+   *  persist. Dropped-card status/sort_order are set directly; sibling
+   *  ranks are left alone until the response lands, so a moment of two cards
+   *  at the same rank is fine (tasksForColumn re-sorts immediately). */
+  const performMove = async (
+    taskId: string,
+    destStatus: TaskStatus,
+    destSortOrder: number,
+  ) => {
+    const snapshot = tasksRef.current;
+    setTasks((prev) =>
+      prev.map((entry) =>
+        entry.id === taskId
+          ? { ...entry, status: destStatus, sort_order: destSortOrder }
+          : entry,
+      ),
+    );
+    await sendMoveRequest(
+      taskId,
+      { status: destStatus, sort_order: destSortOrder },
+      snapshot,
+      (data) => {
+        setTasks((prev) =>
+          prev.map((entry) => {
+            if (entry.id === data.task.id) return data.task;
+            if (data.displaced && entry.id === data.displaced.id) {
+              return data.displaced;
+            }
+            return entry;
+          }),
+        );
+      },
+    );
+  };
+
+  /** Resolves a drop against the displayed (filtered + capped) lists and
+   *  either starts the optimistic move, opens the displace dialog, or does
+   *  nothing (dropped back onto its own slot). */
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    setActiveDrag(null);
+    if (!over || typeof active.id !== 'string') return;
+    const activeId = active.id;
+
+    const activeTask = tasksRef.current.find((task) => task.id === activeId);
+    if (!activeTask) return;
+
+    // `over` is either a card (task id) or a column (`column:<status>`).
+    const overId = over.id;
+    let destStatus: TaskStatus;
+    let destIndex: number; // view index in the dest column's displayed list
+    if (typeof overId === 'string' && overId.startsWith(COLUMN_ID_PREFIX)) {
+      destStatus = overId.slice(COLUMN_ID_PREFIX.length) as TaskStatus;
+      destIndex = tasksForColumn(destStatus).length; // end (0 when empty)
+    } else if (typeof overId === 'string') {
+      const overTask = tasksRef.current.find((task) => task.id === overId);
+      if (!overTask) return;
+      destStatus = overTask.status;
+      const destShown = tasksForColumn(destStatus);
+      destIndex = destShown.findIndex((task) => task.id === overId);
+      if (destIndex === -1) return; // not displayed (filtered out) — ignore
+    } else {
+      return;
+    }
+
+    const destShown = tasksForColumn(destStatus);
+    const remaining = destShown.filter((task) => task.id !== activeId);
+    const destSortOrder = resolveSortOrder(remaining, destIndex, destStatus);
+
+    // Same column + same slot = no movement: never call the API (In Progress
+    // singleton drops land here too — there is only slot 0).
+    if (destStatus === activeTask.status) {
+      const oldIndex = destShown.findIndex((task) => task.id === activeId);
+      const slot = destIndex >= remaining.length ? remaining.length : destIndex;
+      if (oldIndex !== -1 && slot === oldIndex) return;
+    }
+
+    // Occupied In Progress (ADR 0002 § UI): the optimistic move is NOT
+    // applied. Stash the drop and ask where the running task goes.
+    if (destStatus === 'IN_PROGRESS') {
+      const runningTask = tasksRef.current.find(
+        (task) => task.status === 'IN_PROGRESS' && task.id !== activeId,
+      );
+      if (runningTask) {
+        setDisplacePrompt({
+          taskId: activeId,
+          fromStatus: activeTask.status,
+          runningTask,
+        });
+        return;
+      }
+    }
+
+    void performMove(activeId, destStatus, destSortOrder);
+  };
+
+  /** Confirm in the conflict dialog: park the running task A at the chosen
+   *  status (prepend, rank 0 — displacement has no drop position), move B to
+   *  In Progress, then ONE `/move` carrying both halves via `displace`. */
+  const confirmDisplace = (
+    parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
+  ) => {
+    const prompt = displacePrompt;
+    if (!prompt) return;
+    setDisplacePrompt(null);
+
+    const snapshot = tasksRef.current;
+    setTasks((prev) =>
+      prev.map((entry) => {
+        if (entry.id === prompt.runningTask.id) {
+          return { ...entry, status: parkStatus, sort_order: 0 };
+        }
+        if (entry.id === prompt.taskId) {
+          return { ...entry, status: 'IN_PROGRESS', sort_order: 0 };
+        }
+        return entry;
+      }),
+    );
+    const body: MoveTaskInput = {
+      status: 'IN_PROGRESS',
+      sort_order: 0,
+      displace: {
+        id: prompt.runningTask.id,
+        status: parkStatus,
+        sort_order: 0,
+      },
+    };
+    void sendMoveRequest(prompt.taskId, body, snapshot, (data) => {
+      setTasks((prev) =>
+        prev.map((entry) => {
+          if (entry.id === data.task.id) return data.task;
+          if (data.displaced && entry.id === data.displaced.id) {
+            return data.displaced;
+          }
+          return entry;
+        }),
+      );
+    });
+  };
 
   // ──────────────────────────────────────────
   // Task actions (New Task + click-to-edit; no timer buttons this slice)
@@ -360,6 +715,19 @@ export function BoardPage() {
     return null;
   };
 
+  // The conflict dialog reads both titles from live state so they stay
+  // correct even if the optimistic render happens first.
+  const runningTaskTitle =
+    displacePrompt &&
+    (
+      tasks.find((task) => task.id === displacePrompt.runningTask.id) ??
+      displacePrompt.runningTask
+    ).title;
+  const draggedTaskTitle =
+    displacePrompt &&
+    (tasks.find((task) => task.id === displacePrompt.taskId)?.title ??
+      'this task');
+
   return (
     <div className="min-h-screen bg-cream">
       {/* pb-28 clears the floating nav, so the last cards stay reachable */}
@@ -407,7 +775,7 @@ export function BoardPage() {
           </div>
         )}
 
-        {/* Action error banner (e.g. a delete 409) — the board stays mounted */}
+        {/* Action error banner (e.g. a failed move) — the board stays mounted */}
         {actionError && (
           <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
             <p className="text-sm">{actionError}</p>
@@ -523,20 +891,95 @@ export function BoardPage() {
             </section>
 
             {/* Five status columns, horizontal scroll on narrow screens.
-                No drag in this slice — cards are click-to-edit only. */}
-            <div className="flex gap-6 overflow-x-auto pb-4">
-              {COLUMNS.map((column) => (
-                <BoardColumnView
-                  key={column.status}
-                  column={column}
-                  tasks={tasksForColumn(column.status)}
-                  onEditTask={openEditTask}
-                />
-              ))}
-            </div>
+                DndContext wraps the scroll row: cards start a drag after an
+                8px press-move, the scroll gutter and headers still pan. */}
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCorners}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
+              onDragCancel={() => setActiveDrag(null)}
+            >
+              <div className="flex gap-6 overflow-x-auto pb-4">
+                {COLUMNS.map((column) => (
+                  <BoardColumnView
+                    key={column.status}
+                    column={column}
+                    tasks={tasksForColumn(column.status)}
+                    items={itemsByColumn[column.status]}
+                    movingIds={movingIds}
+                    onEditTask={openEditTask}
+                  />
+                ))}
+              </div>
+
+              {/* Slightly elevated copy of the card following the pointer */}
+              <DragOverlay>
+                {activeDrag && (
+                  <div className="cursor-grabbing opacity-90 shadow-2xl ring-1 ring-border/60 rounded-lg">
+                    <TaskCard task={activeDrag} />
+                  </div>
+                )}
+              </DragOverlay>
+            </DndContext>
           </>
         )}
       </div>
+
+      {/* Occupied In Progress conflict dialog (ADR 0002 § UI): pick where the
+          running task is parked. Cancel / overlay close drops the stash with
+          no request. */}
+      <Dialog
+        open={displacePrompt !== null}
+        onOpenChange={(open) => {
+          if (!open) setDisplacePrompt(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-[420px] bg-card border-border">
+          <DialogHeader>
+            <DialogTitle className="text-foreground">
+              A task is already running
+            </DialogTitle>
+            <DialogDescription>
+              “{runningTaskTitle}” is in progress. Where should it be parked so
+              “{draggedTaskTitle}” can start?
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-wrap gap-2 pt-2">
+            <Button
+              onClick={() => confirmDisplace('PLANNED')}
+              className="bg-primary text-primary-foreground hover:bg-primary/90"
+            >
+              Planned
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => confirmDisplace('COMPLETED')}
+              className="border-input text-foreground hover:bg-muted"
+            >
+              Done
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => confirmDisplace('DISCARDED')}
+              className="border-input text-destructive hover:bg-destructive/10"
+            >
+              Discarded
+            </Button>
+          </div>
+
+          <div className="flex justify-end pt-1">
+            <Button
+              variant="ghost"
+              onClick={() => setDisplacePrompt(null)}
+              className="text-muted-foreground hover:bg-muted"
+            >
+              Cancel
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* New / Edit Task Dialog */}
       <TaskModal
@@ -579,18 +1022,38 @@ function FilterPill({
 
 /** One board column: neutral surface with a 2px status accent on the header
  *  only. The count is the number of cards currently shown (after filter +
- *  cap) — never a `20 / 64` overflow hint. */
+ *  cap) — never a `20 / 64` overflow hint. The whole section is the column
+ *  droppable (`column:<status>`), so EMPTY columns accept a drop; the cards
+ *  inside are a vertical SortableContext. */
 function BoardColumnView({
   column,
   tasks,
+  items,
+  movingIds,
   onEditTask,
 }: {
   column: BoardColumn;
   tasks: TaskRecord[];
+  /** Displayed task ids — matched 1:1 with `tasks`, feeds SortableContext. */
+  items: string[];
+  /** Cards with a /move in flight: their drag handlers are disabled. */
+  movingIds: Set<string>;
   onEditTask: (task: TaskRecord) => void;
 }) {
+  const columnDroppableId = `${COLUMN_ID_PREFIX}${column.status}`;
+  const { setNodeRef, isOver } = useDroppable({
+    id: columnDroppableId,
+    data: { type: 'column' },
+  });
+
   return (
-    <section className="flex min-w-[260px] flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
+    <section
+      ref={setNodeRef}
+      className={cn(
+        'flex min-w-[260px] flex-1 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
+        isOver ? 'border-primary/60 ring-2 ring-primary/20' : 'border-border',
+      )}
+    >
       <header className="shrink-0 border-b border-border">
         <div className={cn('h-0.5', column.accent)} />
         <div className="flex items-center justify-between gap-2 px-4 py-3">
@@ -606,34 +1069,87 @@ function BoardColumnView({
         </div>
       </header>
 
-      <div className="flex-1 space-y-2 p-3">
-        {tasks.length > 0 ? (
-          tasks.map((task) => (
-            <TaskCard key={task.id} task={task} onEdit={onEditTask} />
-          ))
-        ) : (
-          <p className="text-sm text-muted-foreground italic">No tasks</p>
-        )}
-      </div>
+      <SortableContext items={items} strategy={verticalListSortingStrategy}>
+        <div
+          className={cn(
+            'flex-1 space-y-2 p-3 transition-colors',
+            isOver && tasks.length === 0 && 'bg-muted/40 rounded-lg',
+          )}
+        >
+          {tasks.length > 0 ? (
+            tasks.map((task) => (
+              <SortableTaskCard
+                key={task.id}
+                task={task}
+                onEdit={onEditTask}
+                disabled={movingIds.has(task.id)}
+              />
+            ))
+          ) : (
+            <p className="text-sm text-muted-foreground italic">No tasks</p>
+          )}
+        </div>
+      </SortableContext>
     </section>
+  );
+}
+
+/** The draggable wrapper of a card: applies the sortable transform while the
+ *  card itself stays the plain TaskCard chip (click-to-edit, no timer
+ *  buttons). While dragging, the original is dimmed — the DragOverlay copy
+ *  is the card the pointer actually holds. */
+function SortableTaskCard({
+  task,
+  onEdit,
+  disabled,
+}: {
+  task: TaskRecord;
+  onEdit: (task: TaskRecord) => void;
+  disabled: boolean;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: task.id,
+    disabled,
+    data: { type: 'task' },
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn(isDragging && 'opacity-40')}
+      {...attributes}
+      {...listeners}
+    >
+      <TaskCard task={task} onEdit={onEdit} />
+    </div>
   );
 }
 
 /** A light-surface task chip (the Lists chip on a light card, not the dark
  *  list-colored chip): title + duration + difficulty badge (medium/hard
  *  only) + priority dot + category swatch. The whole chip is the click
- *  target that opens the edit modal — no timer buttons in this slice. */
+ *  target that opens the edit modal — no timer buttons in this slice. The
+ *  drag overlay renders the same chip elevated (shadow/opacity), without a
+ *  click target. */
 function TaskCard({
   task,
   onEdit,
 }: {
   task: TaskRecord;
-  onEdit: (task: TaskRecord) => void;
+  onEdit?: (task: TaskRecord) => void;
 }) {
   return (
     <button
       type="button"
-      onClick={() => onEdit(task)}
+      onClick={() => onEdit?.(task)}
       title={`${task.title} — ${task.duration_minutes} min, ${task.priority}${
         task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''
       }`}
