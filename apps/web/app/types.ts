@@ -252,11 +252,49 @@ export interface NewTaskInput {
 // Request body for PATCH /api/tasks/:id — every field optional. A present
 // `title` must uniquely match a non-untracked category. Status is never
 // updatable through PATCH: use the timer endpoints (start/stop/pause/
-// complete/discard) instead.
+// complete/discard) or the move endpoint instead.
 export interface UpdateTaskInput {
   title?: string;
   description?: string;
   duration_minutes?: number;
   priority?: TaskPriority;
   difficulty?: TaskDifficulty;
+}
+
+// The optional `displace` sub-object of a move: parks the currently running
+// task (its landing status must be PLANNED/COMPLETED/DISCARDED — never
+// OPEN/IN_PROGRESS) before the moved task starts.
+export interface MoveDisplaceInput {
+  id: string;
+  status: 'PLANNED' | 'COMPLETED' | 'DISCARDED';
+  sort_order: number;
+}
+
+// Request body for POST /api/tasks/:id/move — the board drop. The server
+// dispatches the ADR 0002 transition matrix (start/stop/pause/complete/
+// discard/plan/unplan/reopen), then places the task at `sort_order` in the
+// target status. Same-status moves are reorders. `displace` is optional /
+// null and only valid when moving to IN_PROGRESS.
+export interface MoveTaskInput {
+  status: TaskStatus;
+  sort_order: number;
+  displace?: MoveDisplaceInput | null;
+}
+
+// The envelope returned by POST /api/tasks/:id/move: the moved task, the
+// optionally displaced (parked) task, and the Google event the dispatched
+// action touched. The move event carries extra internal cache fields; the
+// board only distinguishes null/event, so it is typed loosely.
+export interface MoveTaskResponse {
+  task: TaskRecord;
+  displaced: TaskRecord | null;
+  event: CalendarEvent | null;
+}
+
+// Start failure AFTER a successful displace: no rollback — the displaced
+// task stays parked, and `displaced` lets the client snap the moved card
+// back. All other errors stay `{ error: string }`.
+export interface MoveTaskError {
+  error: string;
+  displaced?: TaskRecord;
 }

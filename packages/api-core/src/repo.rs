@@ -258,13 +258,25 @@ pub trait TaskRepo: Send + Sync {
     async fn insert(&self, task: NewTask) -> Result<Task, RepoError>;
     /// Shifts the living tasks of `user_id` in `status` whose `sort_order` is
     /// `>= from_inclusive` up by one — the peer shift behind the Backlog
-    /// prepend (create) and, later, the move endpoint's placement. Never
+    /// prepend (create) and the move endpoint's cross-column placement. Never
     /// touches `updated_at`: re-ranking is not a content change.
     async fn shift_sort_order(
         &self,
         user_id: &str,
         status: &str,
         from_inclusive: i64,
+    ) -> Result<(), RepoError>;
+    /// Signed peer shift over the closed `[from_inclusive, to_inclusive]`
+    /// range (`delta` +1 up, -1 down) — the move endpoint's same-column
+    /// neighbor reorder (the moving task itself never falls inside its own
+    /// shift range). Never touches `updated_at`.
+    async fn shift_sort_order_by(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+        to_inclusive: i64,
+        delta: i64,
     ) -> Result<(), RepoError>;
     /// Updates `title`/`description`/`duration_minutes`/`priority`/
     /// `difficulty` on a living task (`None` fields are left unchanged; status
@@ -281,6 +293,11 @@ pub trait TaskRepo: Send + Sync {
         status: &str,
         now_rfc3339: &str,
     ) -> Result<Option<Task>, RepoError>;
+    /// Sets the task's board rank on a living task and returns the updated
+    /// row, or `None` when missing/soft-deleted. Deliberately touches NEITHER
+    /// `status` NOR `updated_at`: the move endpoint places cards (cross-column
+    /// via `set_status` first, then this) without marking them content-updated.
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
@@ -707,6 +724,22 @@ pub const TASK_SHIFT_SORT_ORDER_SQL: &str = "
     SET sort_order = sort_order + 1
     WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND sort_order >= ?
 ";
+
+/// Signed peer shift over `[from_inclusive, to_inclusive]` (`delta` +1 up,
+/// -1 down) — the move endpoint's same-column neighbor reorder. The bounds
+/// keep the moving card out of its own shift: front drags shift `[new, old)`
+/// up, back drags shift `(old, new]` down. `updated_at` is left alone, same
+/// as `TASK_SHIFT_SORT_ORDER_SQL`.
+pub const TASK_SHIFT_SORT_ORDER_RANGE_SQL: &str = "
+    UPDATE tasks
+    SET sort_order = sort_order + ?
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND sort_order >= ? AND sort_order <= ?
+";
+
+/// Sets the task's board rank on a living row. No `status`, no `updated_at`:
+/// placement is a position change, not a content update.
+pub const TASK_SET_SORT_ORDER_SQL: &str =
+    "UPDATE tasks SET sort_order = ? WHERE id = ? AND deleted_at IS NULL";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). Status
 /// is intentionally not updatable — slice 4 adds the status transitions. The
@@ -1203,6 +1236,30 @@ mod tests {
         assert!(sql.contains("sort_order >= ?"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
         assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+    }
+
+    #[test]
+    fn task_set_sort_order_touches_only_rank_on_living_rows() {
+        let sql = TASK_SET_SORT_ORDER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("SET sort_order = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("status"), "placement never touches status: {sql}");
+        assert!(!sql.contains("updated_at"), "placement never bumps updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn task_shift_sort_order_range_binds_signed_delta_and_both_bounds() {
+        let sql = TASK_SHIFT_SORT_ORDER_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("sort_order = sort_order + ?"), "{sql}");
+        assert!(sql.contains("sort_order >= ? AND sort_order <= ?"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 5, "{sql}");
     }
 
     #[test]

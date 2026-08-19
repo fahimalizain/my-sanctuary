@@ -56,15 +56,16 @@ pub use repo::{
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
+    TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
     TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL,
 };
 pub use tasks::{
-    complete_task, create_task, delete_task, discard_task, list_tasks, pause_task, start_task,
-    stop_task, update_task, DeleteTaskResponse, TaskActionResponse, TaskCategorySummary,
-    TaskResponse, TasksError, TasksResponse, TaskView, DEFAULT_DURATION_MINUTES,
-    MIN_DURATION_MINUTES, TASK_LOG_COMPLETED, TASK_LOG_DISCARDED, TASK_LOG_PAUSED,
-    TASK_LOG_PLANNED, TASK_LOG_REOPENED, TASK_LOG_STARTED, TASK_LOG_STOPPED,
-    TASK_LOG_UNPLANNED, TASK_STATUS_COMPLETED, TASK_STATUS_DISCARDED,
+    complete_task, create_task, delete_task, discard_task, list_tasks, move_task, pause_task,
+    start_task, stop_task, update_task, DeleteTaskResponse, DisplaceInput, MoveTaskInput,
+    MoveTaskResponse, TaskActionResponse, TaskCategorySummary, TaskResponse, TasksError,
+    TasksResponse, TaskView, DEFAULT_DURATION_MINUTES, MIN_DURATION_MINUTES, TASK_LOG_COMPLETED,
+    TASK_LOG_DISCARDED, TASK_LOG_PAUSED, TASK_LOG_PLANNED, TASK_LOG_REOPENED, TASK_LOG_STARTED,
+    TASK_LOG_STOPPED, TASK_LOG_UNPLANNED, TASK_STATUS_COMPLETED, TASK_STATUS_DISCARDED,
     TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED,
 };
 pub use session::{

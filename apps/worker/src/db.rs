@@ -33,7 +33,8 @@ use api_core::repo::{
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
-    TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL,
+    TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL,
+    TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_SET_STATUS_SQL,
     TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
     TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
     USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
@@ -982,6 +983,31 @@ impl TaskRepo for D1TaskRepo {
         run_stmt(stmt).await
     }
 
+    async fn shift_sort_order_by(
+        &self,
+        user_id: &str,
+        status: &str,
+        from_inclusive: i64,
+        to_inclusive: i64,
+        delta: i64,
+    ) -> Result<(), RepoError> {
+        // Signed peer shift over `[from_inclusive, to_inclusive]` — bound
+        // both ends so the moving card never shifts itself, regardless of
+        // the delta's sign.
+        let stmt = self
+            .db
+            .prepare(TASK_SHIFT_SORT_ORDER_RANGE_SQL)
+            .bind_refs(&[
+                D1Type::Integer(delta as i32),
+                D1Type::Text(user_id),
+                D1Type::Text(status),
+                D1Type::Integer(from_inclusive as i32),
+                D1Type::Integer(to_inclusive as i32),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
     async fn update(&self, id: &str, updates: &UpdateTask) -> Result<Option<Task>, RepoError> {
         // NULL binds flow through COALESCE and leave the column unchanged;
         // status is deliberately not bound (this slice has no transitions).
@@ -1021,6 +1047,18 @@ impl TaskRepo for D1TaskRepo {
             .db
             .prepare(TASK_SET_STATUS_SQL)
             .bind_refs(&[D1Type::Text(status), D1Type::Text(now_rfc3339), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError> {
+        // Placement only: no status, no `updated_at` (re-ranking is not a
+        // content change). The fresh row is re-read like `set_status` does.
+        let stmt = self
+            .db
+            .prepare(TASK_SET_SORT_ORDER_SQL)
+            .bind_refs(&[D1Type::Integer(sort_order as i32), D1Type::Text(id)])
             .map_err(backend)?;
         run_stmt(stmt).await?;
         self.get_by_id(id).await
