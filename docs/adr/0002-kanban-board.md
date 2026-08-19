@@ -38,30 +38,30 @@ Replace Lists in the nav with a five-column status board at `/board`. The follow
 - New status `PLANNED`. Constant `TASK_STATUS_PLANNED = "PLANNED"` (alongside the four existing constants).
 - Column map:
 
-| Column       | Status        |
-| ------------ | ------------- |
-| Backlog      | `OPEN`        |
-| Planned      | `PLANNED`     |
-| In Progress  | `IN_PROGRESS` |
-| Done         | `COMPLETED`   |
-| Discarded    | `DISCARDED`   |
+| Column      | Status        |
+| ----------- | ------------- |
+| Backlog     | `OPEN`        |
+| Planned     | `PLANNED`     |
+| In Progress | `IN_PROGRESS` |
+| Done        | `COMPLETED`   |
+| Discarded   | `DISCARDED`   |
 
 - Create still stamps `OPEN`. New tasks prepend to Backlog (`sort_order = 0`, shift peers).
 - **Nothing is terminal.** Any task may move to any column.
 - Lift: start on `COMPLETED`/`DISCARDED` becomes allowed (a new calendar event is created; history stays).
-- Lift: stop/pause on `COMPLETED`/`DISCARDED` stay invalid as *verbs* if the task is not running — reopen is the path back. (If the task is `IN_PROGRESS`, stop/pause/complete/discard work as today.)
+- Lift: stop/pause on `COMPLETED`/`DISCARDED` stay invalid as _verbs_ if the task is not running — reopen is the path back. (If the task is `IN_PROGRESS`, stop/pause/complete/discard work as today.)
 - `pause` **changes landing status** from `OPEN` to `PLANNED`. This is an API contract change: the Lists page still calls pause, and those tasks become `PLANNED`. `stop` still lands `OPEN`.
 - New log types: `planned`, `unplanned`, `reopened` (plus the existing `started|stopped|paused|completed|discarded`).
 
 ### Transition matrix (board drop → action)
 
-| From \ To      | OPEN                 | PLANNED                  | IN_PROGRESS | COMPLETED        | DISCARDED        |
-| -------------- | -------------------- | ------------------------ | ----------- | ---------------- | ---------------- |
-| `OPEN`         | reorder              | plan                     | start       | complete         | discard          |
-| `PLANNED`      | unplan               | reorder                  | start       | complete         | discard          |
-| `IN_PROGRESS`  | stop                 | pause                    | no-op       | complete         | discard          |
-| `COMPLETED`    | reopen → `OPEN`      | reopen → `PLANNED`       | start       | no-op/reorder    | discard          |
-| `DISCARDED`    | reopen → `OPEN`      | reopen → `PLANNED`       | start       | complete         | no-op/reorder    |
+| From \ To     | OPEN            | PLANNED            | IN_PROGRESS | COMPLETED     | DISCARDED     |
+| ------------- | --------------- | ------------------ | ----------- | ------------- | ------------- |
+| `OPEN`        | reorder         | plan               | start       | complete      | discard       |
+| `PLANNED`     | unplan          | reorder            | start       | complete      | discard       |
+| `IN_PROGRESS` | stop            | pause              | no-op       | complete      | discard       |
+| `COMPLETED`   | reopen → `OPEN` | reopen → `PLANNED` | start       | no-op/reorder | discard       |
+| `DISCARDED`   | reopen → `OPEN` | reopen → `PLANNED` | start       | complete      | no-op/reorder |
 
 Google side effects:
 
@@ -100,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 - Incoming moves into Done/Discarded are **clamped into the visible window**: the resulting view index is always `0..min(len, 19)`. Never land at #20+.
 - Insert: drop index if provided, else **prepend (0)**. Complete / discard / displacement (no drop) prepend.
 - Inserting into a full window pushes the old last-visible card to #20 (off the board). Eviction is silent; the row stays in the DB.
-- Moving a visible card *out* of Done/Discarded lets #20 slide back into view (first-20-by-rank of the current filter).
+- Moving a visible card _out_ of Done/Discarded lets #20 slide back into view (first-20-by-rank of the current filter).
 - No "show more".
 
 ### Filters
