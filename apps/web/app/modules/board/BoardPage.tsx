@@ -33,6 +33,7 @@ import type {
 import { BoardColumnView } from './BoardColumn';
 import { FilterPill } from './FilterPill';
 import { TaskCard } from './TaskCard';
+import { categoryMatchesSelection } from './board-filters';
 import {
   COLUMNS,
   COLUMN_ID_PREFIX,
@@ -259,15 +260,23 @@ export function BoardPage() {
       if (difficulty !== undefined && task.difficulty !== difficulty) {
         return false;
       }
+      // Category matches against the EXPANDED selection: each explicit id
+      // plus the living children of any explicit root (ADR 0002 § Filters,
+      // amended 2026-08-20). Unknown ids were already dropped when parsing
+      // `selectedCategoryIds`; expanding a known parent adds its children
+      // even if they were never in the URL.
       if (
-        selectedCategoryIds.length > 0 &&
-        !selectedCategoryIds.includes(task.category.id)
+        !categoryMatchesSelection(
+          task.category.id,
+          selectedCategoryIds,
+          categories,
+        )
       ) {
         return false;
       }
       return true;
     },
-    [priority, difficulty, selectedCategoryIds],
+    [priority, difficulty, selectedCategoryIds, categories],
   );
 
   // Filter the column's tasks (AND), sort by `sort_order ASC` (tie-break

@@ -7,6 +7,10 @@ Date: 2026-08-19
 > their status column. § Out of scope and § UI are amended accordingly; the
 > hiding rule now applies to Lists only.
 
+> Amendment (2026-08-20): board category filter is a searchable checkbox
+> combobox; selecting a root includes its living children. § Filters and
+> § UI are amended.
+
 ## Context
 
 `/lists` is a list-colored pile of tasks. We are replacing it in the nav with a status kanban at `/board`. This ADR is slice 0 of 5: it locks the design for the board. Nothing is implemented yet; later slices implement against this document the same way ADR 0001 was the source of truth for watch channels.
@@ -109,11 +113,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 
 ### Filters
 
-- Category (multi-select by category id), Priority (single or all), Difficulty (single or all). Combined with **AND**.
+- Category is multi-select by explicit category id. Priority (single or all) and Difficulty (single or all) combine with **AND**. Within categories, a task matches if its computed category id is in the **expanded** set: each explicit id plus the living children of any explicit root. One-level tree only.
+- The URL stores explicit ids only (`/board?category=id,id`). Selecting a parent writes that parent id, not the children. A child id that is already implied by a selected parent is a no-op extra and is never rewritten away.
+- Unknown category ids are ignored. Default (no params) = all.
 - **Filter first, then cap**: Done/Discarded take the first 20 matches.
 - Positions (drop, prepend, 20-cap, reorder) are **view-relative**. `sort_order` is spliced so the card appears at that view index. Non-matches keep their relative order; do not compact a whole column because a filter is on.
 - No filter = the unfiltered 0–19 rule.
-- Persist in the URL: `/board?priority=high&difficulty=hard&category=id,id`. Unknown category ids are ignored. Default (no params) = all.
 - `GET /api/tasks` stays "all living tasks". The client filters and caps. No new query params on the tasks list API.
 
 ### Move API
@@ -151,7 +156,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 - Board header: **New Task** + **Edit Categories** (no New List).
 - New Task = the existing `TaskModal`; creates `OPEN`; prepends Backlog.
 - Click card = `TaskModal`. **No** Play/Pause/Stop/Complete/Discard buttons on the card. The drop is the action.
-- Untracked tasks are visible in their status column. The Untracked sink is not offered as a category filter chip; a living-category filter still excludes them (`task.category.id` will not match). `?category=<untracked-sink-id>` still matches if present in the URL. Lists continue to hide them.
+- Filter chrome is one wrapping horizontal row: Priority and Difficulty stay All+value pills (single-select). Category is a searchable checkbox combobox grouped by list then root/children (same tree as `/categories`). Untracked is not offered in the picker; `?category=<untracked-sink-id>` still matches if present in the URL.
+- Category trigger label: no explicit ids → "All"; one → that category's title; many → "N categories" (explicit ids only, not the expanded set).
+- Checking a parent shows its children as checked+disabled. Instant apply; the panel stays open. Panel "Clear all" clears categories only; the page-level "Clear filters" clears priority + difficulty + categories.
+- Untracked tasks are visible in their status column. A living-category filter still excludes them (`task.category.id` will not match the expanded set). Lists continue to hide them.
 - Always **optimistic**. On failure: snap the dragged card back + error banner. A displaced task A stays parked if the start failed.
 - Occupied In Progress: `onDragEnd` does **not** apply the optimistic move. Stash `{ taskId, from }`, open a small dialog: move the old task to Planned / Done / Discarded. Confirm → one `move` with `displace`. Cancel → nothing.
 - Five columns, horizontal scroll on narrow screens (column min-width ~260px). Pad the bottom for the floating nav. No mobile-only column picker.
