@@ -234,25 +234,29 @@ export function CategoryPicker({
             : 'bg-background border-input text-muted-foreground hover:border-primary/30',
         )}
       >
-        <span className="truncate">{selected?.title ?? 'No category'}</span>
-        {hasLock && (
-          <span
-            role="button"
-            tabIndex={-1}
-            aria-label="Remove category lock"
-            onClick={handleClearLock}
-            className="rounded-full p-1 -mr-1 text-primary-foreground/80 transition-colors hover:bg-black/10 hover:text-primary-foreground"
-          >
-            <X className="h-4 w-4 shrink-0" aria-hidden />
-          </span>
-        )}
-        <ChevronDown
-          className={cn(
-            'h-4 w-4 shrink-0 transition-transform',
-            open && 'rotate-180',
+        <span className="min-w-0 flex-1 truncate">
+          {selected?.title ?? 'No category'}
+        </span>
+        <span className="flex shrink-0 items-center gap-1">
+          {hasLock && (
+            <span
+              role="button"
+              tabIndex={-1}
+              aria-label="Remove category lock"
+              onClick={handleClearLock}
+              className="rounded-full p-1 -mr-1 text-primary-foreground/80 transition-colors hover:bg-black/10 hover:text-primary-foreground"
+            >
+              <X className="h-4 w-4 shrink-0" aria-hidden />
+            </span>
           )}
-          aria-hidden
-        />
+          <ChevronDown
+            className={cn(
+              'h-4 w-4 shrink-0 transition-transform',
+              open && 'rotate-180',
+            )}
+            aria-hidden
+          />
+        </span>
       </button>
 
       {open && (
