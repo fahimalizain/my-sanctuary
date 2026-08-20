@@ -14,21 +14,23 @@ import { DisplaceDialog } from '@/app/components/DisplaceDialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
-import type {
-  CategoriesResponse,
-  Category,
-  MoveDisplaceInput,
-  MoveTaskInput,
-  MoveTaskResponse,
-  NewTaskInput,
-  TaskDifficulty,
-  TaskListsResponse,
-  TaskPriority,
-  TaskRecord,
-  TaskResponse,
-  TaskStatus,
-  TasksResponse,
-  UpdateTaskInput,
+import {
+  TASK_PRIORITIES,
+  TASK_PRIORITY_LABELS,
+  type CategoriesResponse,
+  type Category,
+  type MoveDisplaceInput,
+  type MoveTaskInput,
+  type MoveTaskResponse,
+  type NewTaskInput,
+  type TaskDifficulty,
+  type TaskListsResponse,
+  type TaskPriority,
+  type TaskRecord,
+  type TaskResponse,
+  type TaskStatus,
+  type TasksResponse,
+  type UpdateTaskInput,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
 import { CategoryFilter } from './CategoryFilter';
@@ -912,17 +914,15 @@ export function BoardPage() {
                   >
                     All
                   </FilterPill>
-                  {(['high', 'medium', 'low'] as TaskPriority[]).map(
-                    (value) => (
-                      <FilterPill
-                        key={value}
-                        selected={priority === value}
-                        onClick={() => setPriorityFilter(value)}
-                      >
-                        {value[0].toUpperCase() + value.slice(1)}
-                      </FilterPill>
-                    ),
-                  )}
+                  {TASK_PRIORITIES.map((value) => (
+                    <FilterPill
+                      key={value}
+                      selected={priority === value}
+                      onClick={() => setPriorityFilter(value)}
+                    >
+                      {TASK_PRIORITY_LABELS[value]}
+                    </FilterPill>
+                  ))}
                 </div>
               </div>
 

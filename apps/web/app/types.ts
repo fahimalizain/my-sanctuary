@@ -182,6 +182,14 @@ export interface UpdateCategoryInput {
 export type TaskPriority = 'high' | 'medium' | 'low';
 export type TaskDifficulty = 'easy' | 'medium' | 'hard';
 
+export const TASK_PRIORITIES: TaskPriority[] = ['high', 'medium', 'low'];
+
+export const TASK_PRIORITY_LABELS: Record<TaskPriority, string> = {
+  high: 'P0',
+  medium: 'P1',
+  low: 'P2',
+};
+
 // The computed category attached to a task (`tasks` have no category_id
 // column — the server classifies the title and returns this summary). The
 // frontend groups tasks under `category.id`.
