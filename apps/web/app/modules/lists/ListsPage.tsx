@@ -826,7 +826,7 @@ function TaskChip({
       }${task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''}`}
     >
       <span className="flex-1 min-w-0 text-xs text-primary-foreground/90 truncate">
-        {task.title}
+        {task.display_title}
       </span>
       <span className="flex-shrink-0 text-[10px] text-primary-foreground/60">
         {task.duration_minutes} min
@@ -888,7 +888,7 @@ function TaskChip({
             anyRunning &&
               'cursor-not-allowed opacity-40 hover:bg-transparent hover:text-primary-foreground/70',
           )}
-          aria-label={`Start ${task.title}`}
+          aria-label={`Start ${task.display_title}`}
           title={anyRunning ? 'Another task is running' : 'Start'}
         >
           <Play className="h-3 w-3" />
@@ -902,7 +902,7 @@ function TaskChip({
               onStop(task.id);
             }}
             className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
-            aria-label={`Stop ${task.title}`}
+            aria-label={`Stop ${task.display_title}`}
             title="Stop"
           >
             <Square className="h-3 w-3" />
@@ -913,7 +913,7 @@ function TaskChip({
               onPause(task.id);
             }}
             className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
-            aria-label={`Pause ${task.title}`}
+            aria-label={`Pause ${task.display_title}`}
             title="Pause"
           >
             <Pause className="h-3 w-3" />
@@ -927,7 +927,7 @@ function TaskChip({
             onComplete(task.id);
           }}
           className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
-          aria-label={`Complete ${task.title}`}
+          aria-label={`Complete ${task.display_title}`}
           title="Complete"
         >
           <Check className="h-3 w-3" />
@@ -940,7 +940,7 @@ function TaskChip({
             onDiscard(task.id);
           }}
           className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
-          aria-label={`Discard ${task.title}`}
+          aria-label={`Discard ${task.display_title}`}
           title="Discard"
         >
           <X className="h-3 w-3" />

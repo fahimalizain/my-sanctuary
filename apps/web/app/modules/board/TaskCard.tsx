@@ -83,7 +83,7 @@ export function TaskCard({
       />
       <span className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 py-2">
         <span className="min-w-0 text-sm text-foreground line-clamp-2 break-words">
-          {task.title}
+          {task.display_title}
         </span>
         <span className="flex min-w-0 items-center gap-1.5">
           <span className="flex-shrink-0 text-[10px] text-muted-foreground">
