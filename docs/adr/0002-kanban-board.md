@@ -16,6 +16,16 @@ Date: 2026-08-19
 > rewritten — create is unranked capture. No-drop `/move` defaults and timer
 > verb landings are amended in follow-up commits of this change.
 
+> Amendment (2026-08-20): `/move` `sort_order` is now **optional** — omitted
+> (or null) means "no drop position" and the server applies a per-column
+> default instead of rejecting or guessing: OPEN and PLANNED append at
+> `max + 1` (mover excluded), except a pause (PLANNED from IN_PROGRESS) and
+> every displace park, which prepend 0; COMPLETED/DISCARDED/IN_PROGRESS
+> prepend 0. A same-status move with omitted `sort_order` is a no-op — the
+> row is returned unchanged, never moved to the tail. Drops still send an
+> absolute view-relative `sort_order`; § Move API and § Done / Discarded cap
+> are amended accordingly.
+
 ## Context
 
 `/lists` is a list-colored pile of tasks. We are replacing it in the nav with a status kanban at `/board`. This ADR is slice 0 of 5: it locks the design for the board. Nothing is implemented yet; later slices implement against this document the same way ADR 0001 was the source of truth for watch channels.
@@ -111,7 +121,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 - Rank **is** the cap. The board renders the first 20 of the **filtered** list (`sort_order` ascending among matches).
 - Membership is not recency. A matching card at unfiltered #25 can appear when a filter is on.
 - Incoming moves into Done/Discarded are **clamped into the visible window**: the resulting view index is always `0..min(len, 19)`. Never land at #20+.
-- Insert: drop index if provided, else **prepend (0)**. Complete / discard / displacement (no drop) prepend.
+- Insert: drop index if provided, else the column default (Done/Discarded:
+  prepend 0 — see § Move API for the full default table). Complete /
+  discard / displacement (no drop) prepend; unplan / reopen-to-OPEN /
+  plan-via-modal (no drop) append.
 - Inserting into a full window pushes the old last-visible card to #20 (off the board). Eviction is silent; the row stays in the DB.
 - Moving a visible card _out_ of Done/Discarded lets #20 slide back into view (first-20-by-rank of the current filter).
 - No "show more".
@@ -129,7 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 ### Move API
 
 - New endpoint: `POST /api/tasks/:id/move`.
-- Body:
+- Body (`sort_order` is optional in both places):
 
 ```json
 {
@@ -139,11 +152,29 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 }
 ```
 
-`displace` is optional (omitted or explicit `null`).
+`displace` is optional (omitted or explicit `null`). `sort_order` omitted
+(or `null`) = **no drop position**; the server applies the column default
+instead of a client-chosen rank:
 
-- Same status = reorder only (shift peers).
+| Target status | Omitted `sort_order` default |
+| ------------- | ---------------------------- |
+| `OPEN` (any from) | append — `max(sort_order) + 1` of the mover-excluded living `OPEN` pile (0 when empty) |
+| `PLANNED` from `IN_PROGRESS` (pause) | prepend `0` |
+| `PLANNED` otherwise | append — `max + 1` over the mover-excluded living `PLANNED` pile |
+| `COMPLETED` / `DISCARDED` | prepend `0` |
+| `IN_PROGRESS` | `0` |
+
+The append max **excludes the moving task id** — after the dispatch the mover
+already sits in the target status holding a leftover rank from its source
+column, which must not inflate its own append target. `displace.sort_order`
+omitted always prepends `0` (the park is always from `IN_PROGRESS`). A
+same-status move with omitted `sort_order` is a **no-op**: the row is returned
+unchanged and never sent to the tail (IN_PROGRESS → IN_PROGRESS ignores rank
+entirely, sent or not).
+
+- Same status = reorder only (shift peers) when a `sort_order` is sent.
 - Different status = dispatch the matrix action, then place at `sort_order` in the target status (shift living peers in that status with `sort_order >=` the insert).
-- The client sends an **absolute** `sort_order` (the integer to assign). The server does not receive the filter set.
+- Drops send an **absolute** `sort_order` (the integer to assign). The server does not receive the filter set.
 - Existing timer verbs stay (`/start` `/stop` `/pause` `/complete` `/discard`). The `pause` landing change (→ `PLANNED`) applies to the verb too.
 - Auth gate: session + token refresh, same as other timer actions, when the move touches Google (start, or leaving `IN_PROGRESS`). Status-only moves (plan/unplan/reopen/reorder/idle complete/discard) use the session-only gate like CRUD. In short: **if the dispatched action would call Google, require a refreshable token (401 otherwise); otherwise a session cookie is enough.**
 - One running task remains. `move` to `IN_PROGRESS` without `displace` while something is running → 409 `"a task is already running"`.

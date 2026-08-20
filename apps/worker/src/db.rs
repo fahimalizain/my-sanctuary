@@ -1112,13 +1112,21 @@ impl TaskRepo for D1TaskRepo {
         &self,
         user_id: &str,
         status: &str,
+        exclude_id: Option<&str>,
     ) -> Result<Option<i64>, RepoError> {
         // The append target: highest living `sort_order` of the pile, `None`
-        // when empty (`LIMIT 1` + `first`). Mirrors the get-by-id reads.
+        // when empty (`LIMIT 1` + `first`). `exclude_id` keeps the mover's
+        // leftover rank out of its own append target; `unwrap_or("")` binds
+        // an empty string for `create_task`, which never matches a UUID.
+        // Mirrors the get-by-id reads.
         let stmt = self
             .db
             .prepare(TASK_MAX_SORT_ORDER_SQL)
-            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(status)])
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(status),
+                D1Type::Text(exclude_id.unwrap_or("")),
+            ])
             .map_err(backend)?;
         let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.sort_order))

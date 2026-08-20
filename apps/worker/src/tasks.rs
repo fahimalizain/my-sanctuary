@@ -462,9 +462,13 @@ fn respond_action(
 /// The board drop (ADR 0002 § Move API): dispatches the transition matrix
 /// (start/stop/pause/complete/discard/plan/unplan/reopen) through the
 /// existing timer verbs, then places the task at `sort_order` in the target
-/// status. Same-status moves are reorders; IN_PROGRESS → IN_PROGRESS is a
-/// no-op. `displace` optionally parks the running task first (its landing
-/// status must be PLANNED/COMPLETED/DISCARDED), then starts the moved task.
+/// status. `sort_order` is optional: omitted (or null) means "no drop
+/// position" and the server applies the column default (OPEN/PLANNED append
+/// except a pause prepends; Done/Discarded/In Progress prepend; same-status
+/// omit is a no-op). Same-status moves with a rank are reorders;
+/// IN_PROGRESS → IN_PROGRESS is always a no-op. `displace` optionally parks
+/// the running task first (its landing status must be
+/// PLANNED/COMPLETED/DISCARDED), then starts the moved task.
 ///
 /// The auth gate is **per action** (session + token refresh only when Google
 /// would be touched):

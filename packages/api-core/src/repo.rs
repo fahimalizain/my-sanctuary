@@ -316,13 +316,16 @@ pub trait TaskRepo: Send + Sync {
     /// via `set_status` first, then this) without marking them content-updated.
     async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError>;
     /// Highest living `sort_order` for `user_id` in `status`, or `None` when
-    /// that pile is empty. Soft-deleted rows and other users/statuses are
-    /// ignored. Used by `create_task` (and later by no-drop `/move` / timer
-    /// verbs) to append: `max.map(|m| m + 1).unwrap_or(0)`.
+    /// that pile is empty. Soft-deleted rows, other users/statuses, and the
+    /// `exclude_id` row (when `Some`) are ignored — the no-drop `/move`
+    /// passes the moving task id so its leftover rank from the source column
+    /// never inflates its own append target. Used by `create_task` (`None`)
+    /// and the no-drop `/move` to append: `max.map(|m| m + 1).unwrap_or(0)`.
     async fn max_sort_order(
         &self,
         user_id: &str,
         status: &str,
+        exclude_id: Option<&str>,
     ) -> Result<Option<i64>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
@@ -796,12 +799,14 @@ pub const TASK_SET_SORT_ORDER_SQL: &str =
     "UPDATE tasks SET sort_order = ? WHERE id = ? AND deleted_at IS NULL";
 
 /// The highest living `sort_order` in the user's `status` pile — the append
-/// target behind `create_task` (and later the no-drop `/move` / timer
-/// verbs). `LIMIT 1` over `MAX()` so an empty pile reads as `None` via
-/// `first()`, matching the other get-by-id queries.
+/// target behind `create_task` and the no-drop `/move` (which binds its own
+/// id to the `id != ?` filter so the mover's leftover rank never inflates
+/// its own append target; `create_task` binds an empty string, which never
+/// matches a UUID). `LIMIT 1` over `MAX()` so an empty pile reads as `None`
+/// via `first()`, matching the other get-by-id queries.
 pub const TASK_MAX_SORT_ORDER_SQL: &str = "
     SELECT sort_order FROM tasks
-    WHERE user_id = ? AND status = ? AND deleted_at IS NULL
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND id != ?
     ORDER BY sort_order DESC
     LIMIT 1
 ";
