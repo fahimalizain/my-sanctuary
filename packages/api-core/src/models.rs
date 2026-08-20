@@ -491,8 +491,9 @@ pub struct NewTask {
     pub duration_minutes: i64,
     pub priority: String,
     pub difficulty: String,
-    /// Backlog rank; `create_task` always passes 0 (after shifting the living
-    /// OPEN peers up by one).
+    /// Backlog rank; `create_task` passes the append rank —
+    /// `max(sort_order)+1` for the user's living OPEN rows, or 0 when the
+    /// pile is empty (peers are never shifted).
     pub sort_order: i64,
 }
 

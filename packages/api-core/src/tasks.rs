@@ -19,8 +19,9 @@
 //!   `untracked` sink itself are all invalid. A title matching only a root
 //!   whose children do not match is **allowed** (parent remainder).
 //! - Titles are not unique. Create always stores `status = "OPEN"` and
-//!   **prepends Backlog**: the living OPEN rows of the user are shifted up one
-//!   (`sort_order + 1`), and the new task lands at `sort_order = 0`.
+//!   **appends Backlog**: the new task lands at `max(sort_order)+1` (0 when
+//!   the pile is empty). Living OPEN rows keep their ranks — create is
+//!   unranked capture, never a peer shift.
 //! - `duration_minutes` defaults to 15 and must be >= 1; `priority` must be
 //!   `high|medium|low` (default `medium`); `difficulty` must be
 //!   `easy|medium|hard` (default `easy`).
@@ -141,6 +142,12 @@ pub const TASK_LOG_DISCARDED: &str = "discarded";
 pub const TASK_LOG_PLANNED: &str = "planned";
 pub const TASK_LOG_UNPLANNED: &str = "unplanned";
 pub const TASK_LOG_REOPENED: &str = "reopened";
+
+/// The append rank for a new card: `max + 1`, or 0 when the pile is empty.
+/// Slices 2–3 reuse this for the no-drop `/move` and timer-verb landings.
+fn append_rank(max: Option<i64>) -> i64 {
+    max.map(|m| m + 1).unwrap_or(0)
+}
 
 /// Errors produced by the tasks service.
 ///
@@ -438,9 +445,10 @@ pub async fn classify_title(
 /// `ensure_taxonomy` runs first so the very first task of a fresh user finds
 /// a seeded matcher.
 ///
-/// Ordering: the new task **prepends Backlog** — the user's living OPEN rows
-/// are shifted up by one (`sort_order >= 0`), then the task is inserted at
-/// `sort_order = 0`.
+/// Ordering: the new task **appends Backlog** — it lands at
+/// `max(sort_order)+1` for the user's living OPEN rows (0 when the pile is
+/// empty). Peers are left in place: create is unranked capture, so rank 0
+/// stays the task that has waited longest (migration 0005 backfill).
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -484,11 +492,11 @@ pub async fn create_task(
     // Validates the rules; the response view re-classifies the stored title.
     resolve_category(&title, &taxonomy)?;
 
-    // Prepend Backlog: every living OPEN row of the user moves up one so the
-    // new task can rank 0. Peers keep their `updated_at` — re-ranking is not
-    // a content change.
-    task_repo
-        .shift_sort_order(user_id, TASK_STATUS_OPEN, 0)
+    // Append Backlog: the new task lands at max(sort_order)+1 (0 on an empty
+    // pile). Living OPEN peers keep their ranks and `updated_at` — create is
+    // unranked capture, never a peer shift.
+    let max = task_repo
+        .max_sort_order(user_id, TASK_STATUS_OPEN)
         .await?;
     let task = task_repo
         .insert(NewTask {
@@ -498,7 +506,7 @@ pub async fn create_task(
             duration_minutes,
             priority,
             difficulty,
-            sort_order: 0,
+            sort_order: append_rank(max),
         })
         .await?;
     Ok(TaskResponse {
@@ -2086,6 +2094,25 @@ mod tests {
             Ok(Some(row.clone()))
         }
 
+        async fn max_sort_order(
+            &self,
+            user_id: &str,
+            status: &str,
+        ) -> Result<Option<i64>, RepoError> {
+            // Mirrors TASK_MAX_SORT_ORDER_SQL: the highest living `sort_order`
+            // of the user+status pile, or `None` when the pile is empty.
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.user_id == user_id && row.status == status && row.deleted_at.is_none()
+                })
+                .map(|row| row.sort_order)
+                .max())
+        }
+
         async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
             if let Some(row) = self
                 .stored
@@ -2454,20 +2481,61 @@ mod tests {
     }
 
     #[test]
-    fn create_task_prepends_backlog_sort_order() {
+    fn create_task_appends_backlog_sort_order() {
         let (lists, categories, tasks) = seeded();
         let first = work_task(&lists, &categories, &tasks);
         let second = work_task(&lists, &categories, &tasks);
+        let third = work_task(&lists, &categories, &tasks);
 
-        // The newest task sits at the front of the Backlog pile (0); the
-        // previous front task shifts one back. TaskView is a snapshot, so the
-        // shifted rank of `first` is asserted on the persisted row.
-        assert_eq!(second.sort_order, 0, "new task response ranks 0");
+        // The first task lands at the front of the Backlog pile (0); every
+        // later create appends at max(sort_order)+1 without touching peers.
+        // TaskView is a snapshot, so the persisted rows are asserted too.
+        assert_eq!(first.sort_order, 0, "first task ranks 0 on an empty pile");
+        assert_eq!(second.sort_order, 1, "second task appends at max+1");
+        assert_eq!(third.sort_order, 2, "third task appends at max+1");
         let stored = tasks.stored.lock().unwrap();
-        let first_row = stored.iter().find(|row| row.id == first.id).unwrap();
-        let second_row = stored.iter().find(|row| row.id == second.id).unwrap();
-        assert_eq!(second_row.sort_order, 0, "new task prepends Backlog");
-        assert_eq!(first_row.sort_order, 1, "existing OPEN task shifted up");
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&first.id), 0, "first task stays at the front");
+        assert_eq!(rank(&second.id), 1, "second task stays at rank 1");
+        assert_eq!(rank(&third.id), 2, "third task stays at rank 2");
+    }
+
+    #[test]
+    fn create_append_rank_ignores_other_users_open_tasks() {
+        let (lists, categories, tasks) = seeded();
+        // Another user's living OPEN pile must not inflate this user's
+        // append rank (max_sort_order is user-scoped).
+        pollster::block_on(create_task(&lists, &categories, &tasks, "u-2", &input("Work")))
+            .unwrap();
+        let first = work_task(&lists, &categories, &tasks);
+        assert_eq!(first.sort_order, 0, "u-1's first task still ranks 0");
+    }
+
+    #[test]
+    fn create_append_rank_ignores_non_open_living_rows() {
+        let (lists, categories, tasks) = seeded();
+        let planned = work_task(&lists, &categories, &tasks);
+        // A living non-OPEN row must not inflate the OPEN max.
+        pollster::block_on(tasks.set_status(&planned.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        let first = work_task(&lists, &categories, &tasks);
+        assert_eq!(first.sort_order, 0, "OPEN pile was empty, new task ranks 0");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(
+            stored.iter().find(|row| row.id == planned.id).unwrap().sort_order,
+            0,
+            "PLANNED row keeps its own rank"
+        );
+    }
+
+    #[test]
+    fn create_append_rank_ignores_soft_deleted_open_rows() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.soft_delete(&first.id, "2026-08-18T02:00:00Z")).unwrap();
+        let second = work_task(&lists, &categories, &tasks);
+        assert_eq!(second.sort_order, 0, "soft-deleted OPEN row does not inflate the max");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == second.id).unwrap().sort_order, 0);
     }
 
     #[test]
@@ -5680,10 +5748,10 @@ mod tests {
     #[test]
     fn move_same_column_reorder_shifts_neighbors() {
         let (lists, categories, tasks) = seeded();
-        // Create C then B then A: create prepends, so A=0, B=1, C=2.
-        let c = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
+        // Create A then B then C: create appends, so A=0, B=1, C=2.
         let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let c = work_task(&lists, &categories, &tasks);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();

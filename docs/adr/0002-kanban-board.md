@@ -11,6 +11,11 @@ Date: 2026-08-19
 > combobox; selecting a root includes its living children. § Filters and
 > § UI are amended.
 
+> Amendment (2026-08-20): create now **appends** Backlog (`max(sort_order)+1`),
+> so rank 0 stays "the task I've had longest". Existing OPEN ranks are not
+> rewritten — create is unranked capture. No-drop `/move` defaults and timer
+> verb landings are amended in follow-up commits of this change.
+
 ## Context
 
 `/lists` is a list-colored pile of tasks. We are replacing it in the nav with a status kanban at `/board`. This ADR is slice 0 of 5: it locks the design for the board. Nothing is implemented yet; later slices implement against this document the same way ADR 0001 was the source of truth for watch channels.
@@ -54,7 +59,7 @@ Replace Lists in the nav with a five-column status board at `/board`. The follow
 | Done        | `COMPLETED`   |
 | Discarded   | `DISCARDED`   |
 
-- Create still stamps `OPEN`. New tasks prepend to Backlog (`sort_order = 0`, shift peers).
+- Create still stamps `OPEN`. New tasks append to Backlog (`sort_order = max(sort_order) + 1`; peers are never shifted; an empty pile takes 0).
 - **Nothing is terminal.** Any task may move to any column.
 - Lift: start on `COMPLETED`/`DISCARDED` becomes allowed (a new calendar event is created; history stays).
 - Lift: stop/pause on `COMPLETED`/`DISCARDED` stay invalid as _verbs_ if the task is not running — reopen is the path back. (If the task is `IN_PROGRESS`, stop/pause/complete/discard work as today.)
@@ -98,7 +103,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
   - `IN_PROGRESS`: whatever exists (at most one — rank is irrelevant, assign 0).
   - `COMPLETED` / `DISCARDED`: `updated_at DESC` → 0..n — today's "most recent" become the front of the rank.
   - `PLANNED`: none exist yet.
-- Create: prepend Backlog (`sort_order = 0`, increment the other living `OPEN` rows for that user).
+- Create: append Backlog (`sort_order = max(sort_order) + 1` for the user's living `OPEN` rows; 0 when the pile is empty; no peer shift).
 - Index `(user_id, status, sort_order)` is part of the contract (see DDL above).
 
 ### Done / Discarded cap
@@ -154,7 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 - Nav: replace Lists (`/lists`) with **Board** (`/board`). The pill is also active on `/categories` (same as Lists today in `apps/web/app/routes/__root.tsx`).
 - `/lists` remains routed and implemented; not linked.
 - Board header: **New Task** + **Edit Categories** (no New List).
-- New Task = the existing `TaskModal`; creates `OPEN`; prepends Backlog.
+- New Task = the existing `TaskModal`; creates `OPEN`; appends Backlog.
 - Click card = `TaskModal`. **No** Play/Pause/Stop/Complete/Discard buttons on the card. The drop is the action.
 - Filter chrome is one wrapping horizontal row: Priority and Difficulty stay All+value pills (single-select). Category is a searchable checkbox combobox grouped by list then root/children (same tree as `/categories`). Untracked is not offered in the picker; `?category=<untracked-sink-id>` still matches if present in the URL.
 - Category trigger label: no explicit ids → "All"; one → that category's title; many → "N categories" (explicit ids only, not the expanded set).
