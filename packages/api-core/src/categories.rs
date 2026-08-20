@@ -190,6 +190,40 @@ pub(crate) fn reduced_matches<'a>(
     matched
 }
 
+/// First pattern of `category` whose regex matches `title` under `scope`,
+/// walking patterns in stored `sort_order` (the repo's `ORDER BY sort_order
+/// ASC`, so the caller's vec order is already ascending).
+///
+/// Same compile/skip + scope rules as rule 2 of [`reduced_matches`]: invalid
+/// stored regexes are skipped, and under [`CalendarScope::Ignore`] the
+/// pattern's own `google_calendar_id` is not consulted — a scoped pattern
+/// still matches. The pattern's `google_calendar_id` is returned as-is
+/// (even `None`): it is the caller's write destination, never a gate, so a
+/// first match without a calendar does NOT fall through to a later matching
+/// pattern that has one.
+pub(crate) fn first_matching_pattern<'a>(
+    title: &str,
+    scope: CalendarScope<'_>,
+    category: &'a CategoryWithPatterns,
+) -> Option<&'a TaskCategoryPattern> {
+    category.patterns.iter().find(|pattern| {
+        // Rule 2: only an Event scope with a different pattern calendar
+        // skips the pattern. Ignore (tasks) never looks at the field, and
+        // unscoped patterns match under any scope.
+        if let CalendarScope::Event { google_calendar_id } = scope {
+            if let Some(scoped) = pattern.google_calendar_id.as_deref() {
+                if scoped != google_calendar_id {
+                    return false;
+                }
+            }
+        }
+        match Regex::new(pattern.regex.trim()) {
+            Ok(regex) => regex.is_match(title),
+            Err(_) => false, // skip invalid stored regexes on read
+        }
+    })
+}
+
 /// Classifies a title (task title or event summary) into exactly one
 /// category.
 ///
@@ -1329,6 +1363,62 @@ mod tests {
         assert_eq!(
             classify("Work", CalendarScope::Ignore, &only_bad),
             ClassifyOutcome::Untracked { conflict: false }
+        );
+    }
+
+    #[test]
+    fn first_matching_pattern_takes_first_by_sort_order_not_first_with_calendar() {
+        // Sort 0 matches without a calendar; sort 1 also matches but names a
+        // calendar. The walker must return the first MATCH, and the caller
+        // takes its (empty) calendar id — never skipping ahead to sort 1.
+        let mut category = cat_with_patterns("work", None, &["^Work$", "^.*Work.*$"]);
+        category.patterns[1].google_calendar_id = Some("later@example.com".to_string());
+        let first = first_matching_pattern("Work", CalendarScope::Ignore, &category).unwrap();
+        assert_eq!(first.regex, "^Work$");
+        assert_eq!(first.google_calendar_id, None);
+    }
+
+    #[test]
+    fn first_matching_pattern_ignore_matches_scoped_only_pattern() {
+        // The SpicyHome case: the only pattern carries a write-destination
+        // calendar id, but task titles match on regex alone.
+        let mut category = cat_with_patterns("spicyhome", None, &["^.* [|] SpicyHome$"]);
+        category.patterns[0].google_calendar_id = Some("spicy@example.com".to_string());
+
+        let first = first_matching_pattern("Test | SpicyHome", CalendarScope::Ignore, &category);
+        assert_eq!(
+            first.map(|pattern| pattern.google_calendar_id.as_deref()),
+            Some(Some("spicy@example.com")),
+            "Ignore matches the scoped pattern and hands back its calendar"
+        );
+
+        // Under an Event scope for a different calendar the pattern is
+        // skipped; for its own calendar it matches.
+        assert!(
+            first_matching_pattern(
+                "Test | SpicyHome",
+                CalendarScope::Event { google_calendar_id: "other@example.com" },
+                &category
+            )
+            .is_none()
+        );
+        let scoped = first_matching_pattern(
+            "Test | SpicyHome",
+            CalendarScope::Event { google_calendar_id: "spicy@example.com" },
+            &category,
+        );
+        assert_eq!(scoped.map(|pattern| pattern.regex.as_str()), Some("^.* [|] SpicyHome$"));
+    }
+
+    #[test]
+    fn first_matching_pattern_skips_invalid_regexes() {
+        let category = cat_with_patterns("work", None, &["[unclosed", "^Work$"]);
+        let first = first_matching_pattern("Work", CalendarScope::Ignore, &category).unwrap();
+        assert_eq!(first.regex, "^Work$");
+        let only_bad = cat_with_patterns("work", None, &["("]);
+        assert!(
+            first_matching_pattern("Work", CalendarScope::Ignore, &only_bad).is_none(),
+            "a category with only invalid stored regexes has no matching pattern"
         );
     }
 
