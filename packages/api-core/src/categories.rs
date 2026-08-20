@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use thiserror::Error;
 
+use crate::google_color::closest_google_color_id;
 use crate::lists::SEED_LISTS;
 use crate::models::{
     NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, TaskCategory,
@@ -119,14 +120,28 @@ pub enum ClassifyOutcome {
     Untracked { conflict: bool },
 }
 
+/// The caller's inbound calendar context for [`classify`]. Decides whether
+/// a pattern's `google_calendar_id` gates the match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarScope<'a> {
+    /// Tasks (and any caller with no inbound calendar). Pattern
+    /// `google_calendar_id` does not affect the match — regex only.
+    Ignore,
+    /// Incoming events. A pattern with `google_calendar_id` set matches
+    /// only when it equals this id. Unscoped patterns still match any calendar.
+    Event { google_calendar_id: &'a str },
+}
+
 /// Classifies a title (task title or event summary) into exactly one
 /// category.
 ///
 /// Reduction rules (locked):
 /// 1. Every stored pattern is compiled; invalid stored regexes are skipped.
-/// 2. A pattern with `google_calendar_id` set only applies when the caller
-///    supplies a matching event calendar id. When `event_google_calendar_id`
-///    is `None` (tasks), scoped patterns are skipped entirely.
+/// 2. Under [`CalendarScope::Ignore`] (tasks), `pattern.google_calendar_id`
+///    is not consulted — matching is regex only. Under
+///    [`CalendarScope::Event`], a pattern with `google_calendar_id` set
+///    applies only when it equals the caller's calendar id; unscoped
+///    patterns still match any calendar.
 /// 3. All matching categories are collected (a category matches when any of
 ///    its patterns matches).
 /// 4. If a child and its own parent both match, the parent is dropped — that
@@ -135,21 +150,24 @@ pub enum ClassifyOutcome {
 ///    that category; 2+ → `Untracked { conflict: true }`.
 ///
 /// Computes the reduced match set [`classify`] decides on: every category
-/// whose patterns match the title, minus parents beaten by their own
-/// children (rule 4), in input order.
+/// whose patterns match the title under `scope`, minus parents beaten by
+/// their own children (rule 4), in input order.
 pub(crate) fn reduced_matches<'a>(
     title: &str,
-    event_google_calendar_id: Option<&str>,
+    scope: CalendarScope<'_>,
     categories: &'a [CategoryWithPatterns],
 ) -> Vec<&'a CategoryWithPatterns> {
     let mut matched: Vec<&CategoryWithPatterns> = Vec::new();
     for category in categories {
         let matches = category.patterns.iter().any(|pattern| {
-            // Calendar-scoped patterns only apply to that calendar's events;
-            // task titles (None) never match them.
-            if let Some(scoped) = pattern.google_calendar_id.as_deref() {
-                if event_google_calendar_id != Some(scoped) {
-                    return false;
+            // Rule 2: only an Event scope with a different pattern calendar
+            // skips the pattern. Ignore (tasks) never looks at the field, and
+            // unscoped patterns match under any scope.
+            if let CalendarScope::Event { google_calendar_id } = scope {
+                if let Some(scoped) = pattern.google_calendar_id.as_deref() {
+                    if scoped != google_calendar_id {
+                        return false;
+                    }
                 }
             }
             match Regex::new(pattern.regex.trim()) {
@@ -172,14 +190,50 @@ pub(crate) fn reduced_matches<'a>(
     matched
 }
 
+/// First pattern of `category` whose regex matches `title` under `scope`,
+/// walking patterns in stored `sort_order` (the repo's `ORDER BY sort_order
+/// ASC`, so the caller's vec order is already ascending).
+///
+/// Same compile/skip + scope rules as rule 2 of [`reduced_matches`]: invalid
+/// stored regexes are skipped, and under [`CalendarScope::Ignore`] the
+/// pattern's own `google_calendar_id` is not consulted — a scoped pattern
+/// still matches. The pattern's `google_calendar_id` is returned as-is
+/// (even `None`): it is the caller's write destination, never a gate, so a
+/// first match without a calendar does NOT fall through to a later matching
+/// pattern that has one.
+pub(crate) fn first_matching_pattern<'a>(
+    title: &str,
+    scope: CalendarScope<'_>,
+    category: &'a CategoryWithPatterns,
+) -> Option<&'a TaskCategoryPattern> {
+    category.patterns.iter().find(|pattern| {
+        // Rule 2: only an Event scope with a different pattern calendar
+        // skips the pattern. Ignore (tasks) never looks at the field, and
+        // unscoped patterns match under any scope.
+        if let CalendarScope::Event { google_calendar_id } = scope {
+            if let Some(scoped) = pattern.google_calendar_id.as_deref() {
+                if scoped != google_calendar_id {
+                    return false;
+                }
+            }
+        }
+        match Regex::new(pattern.regex.trim()) {
+            Ok(regex) => regex.is_match(title),
+            Err(_) => false, // skip invalid stored regexes on read
+        }
+    })
+}
+
 /// Classifies a title (task title or event summary) into exactly one
 /// category.
 ///
 /// Reduction rules (locked):
 /// 1. Every stored pattern is compiled; invalid stored regexes are skipped.
-/// 2. A pattern with `google_calendar_id` set only applies when the caller
-///    supplies a matching event calendar id. When `event_google_calendar_id`
-///    is `None` (tasks), scoped patterns are skipped entirely.
+/// 2. Under [`CalendarScope::Ignore`] (tasks), `pattern.google_calendar_id`
+///    is not consulted — matching is regex only. Under
+///    [`CalendarScope::Event`], a pattern with `google_calendar_id` set
+///    applies only when it equals the caller's calendar id; unscoped
+///    patterns still match any calendar.
 /// 3. All matching categories are collected (a category matches when any of
 ///    its patterns matches).
 /// 4. If a child and its own parent both match, the parent is dropped — that
@@ -188,10 +242,10 @@ pub(crate) fn reduced_matches<'a>(
 ///    that category; 2+ → `Untracked { conflict: true }`.
 pub fn classify(
     title: &str,
-    event_google_calendar_id: Option<&str>,
+    scope: CalendarScope<'_>,
     categories: &[CategoryWithPatterns],
 ) -> ClassifyOutcome {
-    let matched = reduced_matches(title, event_google_calendar_id, categories);
+    let matched = reduced_matches(title, scope, categories);
     match matched.len() {
         0 => ClassifyOutcome::Untracked { conflict: false },
         1 => ClassifyOutcome::Matched {
@@ -216,11 +270,11 @@ pub struct ClassifyDetail {
 /// owned ids.
 pub fn classify_detailed(
     title: &str,
-    event_google_calendar_id: Option<&str>,
+    scope: CalendarScope<'_>,
     categories: &[CategoryWithPatterns],
 ) -> ClassifyDetail {
     ClassifyDetail {
-        matched: reduced_matches(title, event_google_calendar_id, categories)
+        matched: reduced_matches(title, scope, categories)
             .into_iter()
             .map(|category| category.category_id.clone())
             .collect(),
@@ -280,7 +334,9 @@ pub async fn ensure_taxonomy(
                     color: list.color.clone(),
                     is_productive: matches!(name, "Work" | "Fitness"),
                     google_calendar_id: None,
-                    google_color_id: None,
+                    // Derived from the list's hex color (seed hexes are
+                    // valid `#rrggbb`); map errors instead of panicking.
+                    google_color_id: Some(map_color(&list.color)?),
                     sort_order: list.sort_order,
                     is_untracked: false,
                 })
@@ -365,6 +421,16 @@ pub async fn list_categories(
         })
         .collect();
 
+    // Every living category's patterns in one query, grouped by category
+    // (kills the old per-category N+1: one patterns SELECT per category).
+    let mut patterns_by_category: HashMap<String, Vec<TaskCategoryPattern>> = HashMap::new();
+    for pattern in repo.list_patterns_by_user_id(user_id).await? {
+        patterns_by_category
+            .entry(pattern.category_id.clone())
+            .or_default()
+            .push(pattern);
+    }
+
     let mut views = Vec::with_capacity(categories.len());
     for category in &categories {
         let inherited_list_id = match category.parent_id.as_deref() {
@@ -373,7 +439,7 @@ pub async fn list_categories(
                 .map(|list_id| (*list_id).to_string()),
             None => category.list_id.clone(),
         };
-        let patterns = repo.list_patterns_by_category_id(&category.id).await?;
+        let patterns = patterns_by_category.remove(&category.id).unwrap_or_default();
         views.push(to_view(category, inherited_list_id, patterns));
     }
     Ok(CategoriesResponse { categories: views })
@@ -420,7 +486,9 @@ pub async fn create_category(
         validate_pattern(pattern)?;
     }
     let google_calendar_id = normalize_optional(input.google_calendar_id.as_deref());
-    let google_color_id = normalize_optional(input.google_color_id.as_deref());
+    // The client's `google_color_id` is ignored: the stored id is derived
+    // from the (non-empty, hex) `color` above.
+    let google_color_id = Some(map_color(&color)?);
     let sort_order = input.sort_order.unwrap_or(0);
 
     let (parent_id, list_id, parent) = match input.parent_id.as_deref() {
@@ -512,6 +580,13 @@ pub async fn update_category(
     id: &str,
     updates: &UpdateTaskCategory,
 ) -> Result<CategoryResponse, CategoriesError> {
+    // Work on an owned clone — the caller's struct is never mutated. The
+    // client's `google_color_id` is not a write: the stored id is derived
+    // from `color` below (or preserved by the repo's COALESCE when `color`
+    // is absent), so it is cleared first. A body that sends *only*
+    // `google_color_id` therefore falls out as "nothing to update".
+    let mut updates = updates.clone();
+    updates.google_color_id = None;
     if updates.title.is_none()
         && updates.slug.is_none()
         && updates.color.is_none()
@@ -553,6 +628,9 @@ pub async fn update_category(
         if color.trim().is_empty() {
             return Err(CategoriesError::Invalid("color must not be empty".to_string()));
         }
+        // The stored google_color_id always derives from the hex color;
+        // `None` here would leave the old id via the repo's COALESCE.
+        updates.google_color_id = Some(map_color(color)?);
     }
     if let Some(slug) = updates.slug.as_deref() {
         let slug = slug.trim();
@@ -613,7 +691,7 @@ pub async fn update_category(
         }
     }
 
-    let Some(updated) = repo.update(id, updates).await? else {
+    let Some(updated) = repo.update(id, &updates).await? else {
         // Deleted between the read and the write.
         return Err(CategoriesError::NotFound);
     };
@@ -705,6 +783,16 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Maps a hex color to the nearest Google event colorId (`"1"`..=`"11"`).
+///
+/// The client's `google_color_id` is never trusted: create/update/seed all
+/// derive the stored id from the category's hex `color` through
+/// [`closest_google_color_id`]. Non-hex colors (not `#rgb` / `#rrggbb`) are
+/// rejected with `CategoriesError::Invalid`.
+fn map_color(color: &str) -> Result<String, CategoriesError> {
+    closest_google_color_id(color).map_err(|err| CategoriesError::Invalid(err.to_string()))
+}
+
 /// Normalizes a pattern set: trimmed regex, blank calendar ids → `None`.
 fn normalize_patterns(patterns: &[NewTaskCategoryPattern]) -> Vec<NewTaskCategoryPattern> {
     patterns
@@ -753,6 +841,11 @@ mod tests {
         patterns: Mutex<HashMap<String, Vec<TaskCategoryPattern>>>,
         inserted: Mutex<Vec<NewTaskCategory>>,
         next_id: Mutex<u64>,
+        // Call counters locking the N+1 regression: `list_categories` must
+        // never fall back to per-category pattern queries.
+        list_by_user_id_calls: Mutex<usize>,
+        list_patterns_by_user_id_calls: Mutex<usize>,
+        list_patterns_by_category_id_calls: Mutex<usize>,
     }
 
     impl FakeTaskCategoryRepo {
@@ -762,6 +855,9 @@ mod tests {
                 patterns: Mutex::new(HashMap::new()),
                 inserted: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                list_by_user_id_calls: Mutex::new(0),
+                list_patterns_by_user_id_calls: Mutex::new(0),
+                list_patterns_by_category_id_calls: Mutex::new(0),
             }
         }
 
@@ -806,6 +902,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl TaskCategoryRepo for FakeTaskCategoryRepo {
         async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+            *self.list_by_user_id_calls.lock().unwrap() += 1;
             let mut rows: Vec<TaskCategory> = self
                 .stored
                 .lock()
@@ -950,6 +1047,7 @@ mod tests {
             &self,
             category_id: &str,
         ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            *self.list_patterns_by_category_id_calls.lock().unwrap() += 1;
             let mut rows = self
                 .patterns
                 .lock()
@@ -958,6 +1056,36 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             rows.sort_by_key(|row| row.sort_order);
+            Ok(rows)
+        }
+
+        async fn list_patterns_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            *self.list_patterns_by_user_id_calls.lock().unwrap() += 1;
+            // Mirrors TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL: only living
+            // categories' patterns, ordered by category then sort_order.
+            let living: Vec<String> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .map(|row| row.id.clone())
+                .collect();
+            let patterns = self.patterns.lock().unwrap();
+            let mut rows: Vec<TaskCategoryPattern> = living
+                .iter()
+                .filter_map(|category_id| patterns.get(category_id))
+                .flatten()
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                a.category_id
+                    .cmp(&b.category_id)
+                    .then_with(|| a.sort_order.cmp(&b.sort_order))
+            });
             Ok(rows)
         }
 
@@ -1158,11 +1286,11 @@ mod tests {
     fn exact_title_matches_root_seed_pattern() {
         let categories = vec![cat_with_patterns("work", None, &["^Work$", "^.* [|] Work$"])];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "work".to_string() }
         );
         assert_eq!(
-            classify("Review Q3 | Work", None, &categories),
+            classify("Review Q3 | Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "work".to_string() }
         );
     }
@@ -1171,7 +1299,7 @@ mod tests {
     fn unmatched_title_is_untracked_without_conflict() {
         let categories = vec![cat_with_patterns("work", None, &["^Work$"])];
         assert_eq!(
-            classify("asdf", None, &categories),
+            classify("asdf", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Untracked { conflict: false }
         );
     }
@@ -1183,7 +1311,7 @@ mod tests {
             cat_with_patterns("coding", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "coding".to_string() }
         );
     }
@@ -1195,7 +1323,7 @@ mod tests {
             cat_with_patterns("fitness", None, &["^Work$"]),
         ];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Untracked { conflict: true }
         );
     }
@@ -1208,29 +1336,68 @@ mod tests {
             cat_with_patterns("b", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Untracked { conflict: true }
         );
     }
 
     #[test]
-    fn calendar_scoped_pattern_is_skipped_without_calendar_context() {
+    fn ignore_matches_pattern_that_has_a_calendar_id() {
+        // The SpicyHome case: the only pattern carries a write-destination
+        // calendar id, but task titles match on regex alone.
+        let mut scoped = cat_with_patterns("spicyhome", None, &["^.* [|] SpicyHome$"]);
+        scoped.patterns[0].google_calendar_id = Some("dest@example.com".to_string());
+
+        assert_eq!(
+            classify("Test | SpicyHome", CalendarScope::Ignore, &[scoped.clone()]),
+            ClassifyOutcome::Matched { category_id: "spicyhome".to_string() },
+            "task titles match scoped patterns on regex only"
+        );
+
+        // A category with two patterns, only the scoped one matching, still
+        // matches under Ignore.
+        let mut mixed = cat_with_patterns("work", None, &["^Never$", "^Work$"]);
+        mixed.patterns[1].google_calendar_id = Some("dest@example.com".to_string());
+        assert_eq!(
+            classify("Work", CalendarScope::Ignore, &[mixed]),
+            ClassifyOutcome::Matched { category_id: "work".to_string() }
+        );
+    }
+
+    #[test]
+    fn event_scope_still_filters_scoped_patterns() {
         let mut scoped = cat_with_patterns("work", None, &["^Work$"]);
         scoped.patterns[0].google_calendar_id = Some("cal-1".to_string());
 
         assert_eq!(
-            classify("Work", None, &[scoped.clone()]),
+            classify(
+                "Work",
+                CalendarScope::Event { google_calendar_id: "other-cal" },
+                &[scoped.clone()]
+            ),
             ClassifyOutcome::Untracked { conflict: false },
-            "task titles (None) never match calendar-scoped patterns"
+            "an Event scope for a different calendar skips the scoped pattern"
         );
         assert_eq!(
-            classify("Work", Some("other-cal"), &[scoped.clone()]),
-            ClassifyOutcome::Untracked { conflict: false },
-            "a different calendar does not match"
+            classify(
+                "Work",
+                CalendarScope::Event { google_calendar_id: "cal-1" },
+                &[scoped.clone()]
+            ),
+            ClassifyOutcome::Matched { category_id: "work".to_string() },
+            "an Event scope for the pattern's calendar matches it"
         );
+
+        // An unscoped pattern still matches events from any calendar.
+        let unscoped = cat_with_patterns("family", None, &["^Family$"]);
         assert_eq!(
-            classify("Work", Some("cal-1"), &[scoped]),
-            ClassifyOutcome::Matched { category_id: "work".to_string() }
+            classify(
+                "Family",
+                CalendarScope::Event { google_calendar_id: "other-cal" },
+                &[unscoped]
+            ),
+            ClassifyOutcome::Matched { category_id: "family".to_string() },
+            "unscoped patterns match under any Event scope"
         );
     }
 
@@ -1238,14 +1405,70 @@ mod tests {
     fn invalid_stored_regexes_are_skipped_on_read() {
         let categories = vec![cat_with_patterns("work", None, &["[unclosed", "^Work$"])];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "work".to_string() },
             "the valid sibling pattern still matches"
         );
         let only_bad = vec![cat_with_patterns("work", None, &["("])];
         assert_eq!(
-            classify("Work", None, &only_bad),
+            classify("Work", CalendarScope::Ignore, &only_bad),
             ClassifyOutcome::Untracked { conflict: false }
+        );
+    }
+
+    #[test]
+    fn first_matching_pattern_takes_first_by_sort_order_not_first_with_calendar() {
+        // Sort 0 matches without a calendar; sort 1 also matches but names a
+        // calendar. The walker must return the first MATCH, and the caller
+        // takes its (empty) calendar id — never skipping ahead to sort 1.
+        let mut category = cat_with_patterns("work", None, &["^Work$", "^.*Work.*$"]);
+        category.patterns[1].google_calendar_id = Some("later@example.com".to_string());
+        let first = first_matching_pattern("Work", CalendarScope::Ignore, &category).unwrap();
+        assert_eq!(first.regex, "^Work$");
+        assert_eq!(first.google_calendar_id, None);
+    }
+
+    #[test]
+    fn first_matching_pattern_ignore_matches_scoped_only_pattern() {
+        // The SpicyHome case: the only pattern carries a write-destination
+        // calendar id, but task titles match on regex alone.
+        let mut category = cat_with_patterns("spicyhome", None, &["^.* [|] SpicyHome$"]);
+        category.patterns[0].google_calendar_id = Some("spicy@example.com".to_string());
+
+        let first = first_matching_pattern("Test | SpicyHome", CalendarScope::Ignore, &category);
+        assert_eq!(
+            first.map(|pattern| pattern.google_calendar_id.as_deref()),
+            Some(Some("spicy@example.com")),
+            "Ignore matches the scoped pattern and hands back its calendar"
+        );
+
+        // Under an Event scope for a different calendar the pattern is
+        // skipped; for its own calendar it matches.
+        assert!(
+            first_matching_pattern(
+                "Test | SpicyHome",
+                CalendarScope::Event { google_calendar_id: "other@example.com" },
+                &category
+            )
+            .is_none()
+        );
+        let scoped = first_matching_pattern(
+            "Test | SpicyHome",
+            CalendarScope::Event { google_calendar_id: "spicy@example.com" },
+            &category,
+        );
+        assert_eq!(scoped.map(|pattern| pattern.regex.as_str()), Some("^.* [|] SpicyHome$"));
+    }
+
+    #[test]
+    fn first_matching_pattern_skips_invalid_regexes() {
+        let category = cat_with_patterns("work", None, &["[unclosed", "^Work$"]);
+        let first = first_matching_pattern("Work", CalendarScope::Ignore, &category).unwrap();
+        assert_eq!(first.regex, "^Work$");
+        let only_bad = cat_with_patterns("work", None, &["("]);
+        assert!(
+            first_matching_pattern("Work", CalendarScope::Ignore, &only_bad).is_none(),
+            "a category with only invalid stored regexes has no matching pattern"
         );
     }
 
@@ -1257,7 +1480,7 @@ mod tests {
             &["^Work$", "^.* [|] Work$"],
         )];
         assert_eq!(
-            classify_detailed("Work", None, &categories),
+            classify_detailed("Work", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: vec!["work".to_string()]
             }
@@ -1268,7 +1491,7 @@ mod tests {
     fn classify_detailed_no_match_is_empty() {
         let categories = vec![cat_with_patterns("work", None, &["^Work$"])];
         assert_eq!(
-            classify_detailed("asdf", None, &categories),
+            classify_detailed("asdf", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: Vec::new()
             }
@@ -1283,7 +1506,7 @@ mod tests {
             cat_with_patterns("b", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify_detailed("Work", None, &categories),
+            classify_detailed("Work", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: vec!["a".to_string(), "b".to_string()]
             }
@@ -1297,7 +1520,7 @@ mod tests {
             cat_with_patterns("coding", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify_detailed("Work", None, &categories),
+            classify_detailed("Work", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: vec!["coding".to_string()]
             }
@@ -1341,6 +1564,17 @@ mod tests {
         let family = categories.iter().find(|cat| cat.slug == "family").unwrap();
         assert!(!family.is_productive, "Family is not productive");
 
+        // Each root's stored google_color_id derives from its hex color.
+        for cat in categories.iter().filter(|cat| !cat.is_untracked) {
+            assert_eq!(
+                cat.google_color_id,
+                Some(closest_google_color_id(&cat.color).unwrap()),
+                "{} ({}) derives its google color id",
+                cat.title,
+                cat.color
+            );
+        }
+
         // Two patterns per root, none on untracked.
         let mut pattern_count = 0;
         for category in &categories {
@@ -1356,6 +1590,10 @@ mod tests {
         let untracked = categories.iter().find(|cat| cat.is_untracked).unwrap();
         assert_eq!(untracked.slug, "untracked");
         assert_eq!(untracked.list_id, None);
+        assert_eq!(
+            untracked.google_color_id, None,
+            "untracked has no color, so no derived google color id"
+        );
         assert_eq!(
             pollster::block_on(category_repo.list_patterns_by_category_id(&untracked.id))
                 .unwrap()
@@ -1409,6 +1647,10 @@ mod tests {
         let categories = pollster::block_on(category_repo.list_by_user_id("u-1")).unwrap();
         assert_eq!(categories.len(), 1);
         assert!(categories[0].is_untracked);
+        assert_eq!(
+            categories[0].google_color_id, None,
+            "untracked is inserted without a google color id"
+        );
     }
 
     // ──────────────────────────────────────────
@@ -1444,6 +1686,54 @@ mod tests {
         assert_eq!(by_id("sink").inherited_list_id, None);
     }
 
+    #[test]
+    fn list_categories_loads_all_patterns_in_one_query() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("a", "u-1", Some("l-1"), None, "Alpha", "alpha", false, false, 0),
+            FakeTaskCategoryRepo::row("b", "u-1", Some("l-1"), None, "Beta", "beta", false, false, 1),
+            FakeTaskCategoryRepo::row("c", "u-1", Some("l-1"), None, "Gamma", "gamma", false, false, 2),
+            FakeTaskCategoryRepo::row("theirs", "u-2", Some("l-9"), None, "Theirs", "theirs", false, false, 0),
+        ]);
+        pollster::block_on(repo.replace_patterns(
+            "a",
+            vec![pattern("^Alpha$"), pattern("^.* [|] Alpha$")],
+        ))
+        .unwrap();
+        pollster::block_on(repo.replace_patterns("b", vec![pattern("^Beta$")])).unwrap();
+        pollster::block_on(repo.replace_patterns("theirs", vec![pattern("^Theirs$")])).unwrap();
+
+        let response = pollster::block_on(list_categories(&repo, "u-1")).unwrap();
+        assert_eq!(response.categories.len(), 3, "u-2's category must not leak");
+
+        let by_id = |id: &str| {
+            response
+                .categories
+                .iter()
+                .find(|view| view.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        let alpha = by_id("a");
+        assert_eq!(alpha.patterns.len(), 2);
+        assert_eq!(alpha.patterns[0].regex, "^Alpha$");
+        assert_eq!(alpha.patterns[0].sort_order, 0);
+        assert_eq!(alpha.patterns[1].regex, "^.* [|] Alpha$");
+        assert_eq!(alpha.patterns[1].sort_order, 1);
+        let beta = by_id("b");
+        assert_eq!(beta.patterns.len(), 1);
+        assert_eq!(beta.patterns[0].regex, "^Beta$");
+        assert_eq!(by_id("c").patterns.len(), 0, "empty category keeps an empty vec");
+
+        // The N+1 regression lock: one categories query + one bulk patterns
+        // query, and never a per-category pattern query.
+        assert_eq!(*repo.list_by_user_id_calls.lock().unwrap(), 1);
+        assert_eq!(*repo.list_patterns_by_user_id_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *repo.list_patterns_by_category_id_calls.lock().unwrap(),
+            0,
+            "list_categories must never fall back to per-category pattern queries"
+        );
+    }
+
     // ──────────────────────────────────────────
     // Create
     // ──────────────────────────────────────────
@@ -1462,11 +1752,77 @@ mod tests {
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.slug, "deep-work", "slugified from the title");
         assert_eq!(category.color, "#2a5c8a");
+        assert_eq!(
+            category.google_color_id.as_deref(),
+            Some("9"),
+            "stored google_color_id derives from the hex color"
+        );
         assert!(category.is_productive);
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
         assert_eq!(category.list_id.as_deref(), Some("l-1"));
         assert_eq!(category.patterns.len(), 2);
         assert_eq!(category.patterns[0].regex, "^Deep Work$");
+    }
+
+    #[test]
+    fn create_derives_google_color_id_and_ignores_client_value() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
+        let mut new_input = input("Work", "#2a5c8a");
+        new_input.list_id = Some("l-1".to_string());
+        new_input.google_color_id = Some("1".to_string());
+
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
+        assert_eq!(
+            response.category.google_color_id.as_deref(),
+            Some("9"),
+            "the client's google_color_id is ignored in favor of the derived id"
+        );
+    }
+
+    #[test]
+    fn create_rejects_non_hex_colors() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
+        for bad in ["blue", "#gg0000", "2a5c8a"] {
+            let mut new_input = input("Work", bad);
+            new_input.list_id = Some("l-1".to_string());
+            assert!(
+                matches!(
+                    pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
+                    Err(CategoriesError::Invalid(message)) if message == "color must be #rgb or #rrggbb"
+                ),
+                "color {bad:?} must be rejected as non-hex"
+            );
+        }
+        // Empty color still fails first with the empty message: the empty
+        // check runs before the hex mapping.
+        let mut empty = input("Work", "  ");
+        empty.list_id = Some("l-1".to_string());
+        assert!(matches!(
+            pollster::block_on(create_category(&repo, &lists, "u-1", &empty)),
+            Err(CategoriesError::Invalid(message)) if message == "color must not be empty"
+        ));
+        assert_eq!(
+            pollster::block_on(repo.count_by_user_id("u-1")).unwrap(),
+            0,
+            "nothing persisted"
+        );
+    }
+
+    #[test]
+    fn create_accepts_shorthand_hex() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
+        let mut new_input = input("Work", "#abc");
+        new_input.list_id = Some("l-1".to_string());
+
+        let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
+        assert_eq!(
+            response.category.google_color_id,
+            Some(closest_google_color_id("#abc").unwrap()),
+            "#rgb expands by doubling nibbles before mapping"
+        );
     }
 
     #[test]
@@ -1682,11 +2038,93 @@ mod tests {
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.color, "#3a3a3a");
+        assert_eq!(
+            category.google_color_id,
+            Some(closest_google_color_id("#3a3a3a").unwrap()),
+            "stored google_color_id derives from the new color"
+        );
         assert!(!category.is_productive);
         assert_eq!(category.slug, "work", "slug untouched when omitted");
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
         assert_eq!(category.patterns.len(), 1, "old patterns replaced");
         assert_eq!(category.patterns[0].regex, "^Deep Work$");
+    }
+
+    #[test]
+    fn update_derives_google_color_id_and_ignores_client_value() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            color: Some("#2a5c8a".to_string()),
+            google_color_id: Some("1".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
+        assert_eq!(
+            response.category.google_color_id.as_deref(),
+            Some("9"),
+            "the client's google_color_id is ignored; the id derives from the color"
+        );
+    }
+
+    #[test]
+    fn update_without_color_keeps_stored_google_color_id() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        // The fake `row()` helper hardcodes google_color_id None; seed the
+        // stored row directly.
+        repo.stored.lock().unwrap()[0].google_color_id = Some("7".to_string());
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            title: Some("Deep Work".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
+        assert_eq!(response.category.title, "Deep Work");
+        assert_eq!(
+            response.category.google_color_id.as_deref(),
+            Some("7"),
+            "COALESCE keeps the stored id when color is untouched"
+        );
+    }
+
+    #[test]
+    fn update_google_color_id_alone_is_nothing_to_update() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            google_color_id: Some("7".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+            Err(CategoriesError::Invalid(message)) if message == "nothing to update"
+        ));
+    }
+
+    #[test]
+    fn update_rejects_non_hex_color() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
+        ]);
+        let lists = FakeTaskListRepo::new();
+        let updates = UpdateTaskCategory {
+            color: Some("blue".to_string()),
+            ..UpdateTaskCategory::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+            Err(CategoriesError::Invalid(message)) if message == "color must be #rgb or #rrggbb"
+        ));
+        // Nothing persisted: the stored row is untouched.
+        let stored = pollster::block_on(repo.get_by_id("root")).unwrap().unwrap();
+        assert_eq!(stored.color, "#2a5c8a");
+        assert_eq!(stored.google_color_id, None);
     }
 
     #[test]

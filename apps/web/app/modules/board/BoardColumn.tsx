@@ -44,7 +44,7 @@ export function BoardColumnView({
     <section
       ref={setNodeRef}
       className={cn(
-        'flex min-w-[260px] flex-1 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
+        'flex w-[260px] shrink-0 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
         isOver ? 'border-primary/60 ring-2 ring-primary/20' : 'border-border',
       )}
     >

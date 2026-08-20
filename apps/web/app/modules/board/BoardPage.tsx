@@ -14,29 +14,34 @@ import { DisplaceDialog } from '@/app/components/DisplaceDialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
-import type {
-  CategoriesResponse,
-  Category,
-  MoveDisplaceInput,
-  MoveTaskInput,
-  MoveTaskResponse,
-  NewTaskInput,
-  TaskDifficulty,
-  TaskListsResponse,
-  TaskPriority,
-  TaskRecord,
-  TaskResponse,
-  TaskStatus,
-  TasksResponse,
-  UpdateTaskInput,
+import {
+  TASK_PRIORITIES,
+  TASK_PRIORITY_LABELS,
+  type CategoriesResponse,
+  type Category,
+  type MoveDisplaceInput,
+  type MoveTaskInput,
+  type MoveTaskResponse,
+  type NewTaskInput,
+  type TaskDifficulty,
+  type TaskListsResponse,
+  type TaskPriority,
+  type TaskRecord,
+  type TaskResponse,
+  type TaskStatus,
+  type TasksResponse,
+  type UpdateTaskInput,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
+import { CategoryFilter } from './CategoryFilter';
 import { FilterPill } from './FilterPill';
 import { TaskCard } from './TaskCard';
+import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
 import {
   COLUMNS,
   COLUMN_ID_PREFIX,
   TERMINAL_COLUMN_CAP,
+  defaultMoveRank,
   readError,
   readMoveError,
   resolveSortOrder,
@@ -155,8 +160,9 @@ export function BoardPage() {
   // ──────────────────────────────────────────
 
   // Filter chips are built from the loaded categories; untracked is a
-  // system category that is never offered as a filter (it is also hidden
-  // from the columns themselves).
+  // system category that is never offered as a filter chip. Untracked
+  // cards are not hidden from the columns, and a `?category=` URL that
+  // names the sink still matches (the sink id is in `categories`).
   const filterableCategories = useMemo(
     () => categories.filter((cat) => !cat.is_untracked),
     [categories],
@@ -229,15 +235,13 @@ export function BoardPage() {
   const setDifficultyFilter = (value: TaskDifficulty | undefined) =>
     updateSearch({ difficulty: value });
 
+  // Explicit ids only — a click on a row implied by a selected parent is a
+  // no-op (`toggleCategoryId`), so implied ids never leak into the URL and
+  // the URL never rewrites an implied child out (ADR 0002 § Filters).
   const toggleCategoryFilter = (id: string) => {
-    const next = new Set(selectedCategoryIds);
-    if (next.has(id)) {
-      next.delete(id);
-    } else {
-      next.add(id);
-    }
+    const next = toggleCategoryId(selectedCategoryIds, id, categories);
     updateSearch({
-      category: next.size > 0 ? [...next].join(',') : undefined,
+      category: next.length > 0 ? next.join(',') : undefined,
     });
   };
 
@@ -258,28 +262,33 @@ export function BoardPage() {
       if (difficulty !== undefined && task.difficulty !== difficulty) {
         return false;
       }
+      // Category matches against the EXPANDED selection: each explicit id
+      // plus the living children of any explicit root (ADR 0002 § Filters,
+      // amended 2026-08-20). Unknown ids were already dropped when parsing
+      // `selectedCategoryIds`; expanding a known parent adds its children
+      // even if they were never in the URL.
       if (
-        selectedCategoryIds.length > 0 &&
-        !selectedCategoryIds.includes(task.category.id)
+        !categoryMatchesSelection(
+          task.category.id,
+          selectedCategoryIds,
+          categories,
+        )
       ) {
         return false;
       }
       return true;
     },
-    [priority, difficulty, selectedCategoryIds],
+    [priority, difficulty, selectedCategoryIds, categories],
   );
 
   // Filter the column's tasks (AND), sort by `sort_order ASC` (tie-break
-  // `created_at`), then cap Done/Discarded at 20 matches. Untracked tasks
-  // stay hidden, the same as Lists. This is the DISPLAYED list: drops,
+  // `created_at`), then cap Done/Discarded at 20 matches — untracked
+  // cards count like any other. This is the DISPLAYED list: drops,
   // reorders and the cap are all relative to it (ADR 0002 § Filters).
   const tasksForColumn = useCallback(
     (status: TaskStatus): TaskRecord[] => {
       const matches = tasks.filter(
-        (task) =>
-          task.status === status &&
-          !task.category.is_untracked &&
-          matchesFilters(task),
+        (task) => task.status === status && matchesFilters(task),
       );
       matches.sort(
         (a, b) =>
@@ -478,8 +487,9 @@ export function BoardPage() {
   };
 
   /** Confirm in the conflict dialog: park the running task A at the chosen
-   *  status (prepend, rank 0 — displacement has no drop position), move B to
-   *  In Progress, then ONE `/move` carrying both halves via `displace`. */
+   *  status (no drop — `sort_order` omitted, the park always prepends),
+   *  move B to In Progress (rank 0), then ONE `/move` carrying both halves
+   *  via `displace`. */
   const confirmDisplace = (
     parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
   ) => {
@@ -501,11 +511,9 @@ export function BoardPage() {
     );
     const body: MoveTaskInput = {
       status: 'IN_PROGRESS',
-      sort_order: 0,
       displace: {
         id: prompt.runningTask.id,
         status: parkStatus,
-        sort_order: 0,
       },
     };
     void sendMoveRequest(prompt.taskId, body, snapshot, (data) => {
@@ -521,34 +529,48 @@ export function BoardPage() {
     });
   };
 
-  /** TaskModal's immediate status change (ADR 0002): a drop with no drop
-   *  position — always prepend, `sort_order: 0`. Optimistic, then ONE
-   *  `/move`; `sendMoveRequest` already owns the displaced-aware revert and
-   *  the banner. Returns the error message for the form (null on success).
-   *  The modal stays open; `task` in props updates via this merge. */
+  /** TaskModal's immediate status change (ADR 0002 § UI): a drop with no
+   *  drop position — `sort_order` is OMITTED and the server applies the
+   *  column default (`defaultMoveRank` mirrors it for the optimistic frame:
+   *  OPEN appends, pause prepends Planned, complete/discard prepend).
+   *  Optimistic, then ONE `/move`; `sendMoveRequest` already owns the
+   *  displaced-aware revert and the banner. Returns the error message for
+   *  the form (null on success). The modal stays open; `task` in props
+   *  updates via this merge. */
   const handleMoveTask = async (
     taskId: string,
     status: TaskStatus,
     displace?: MoveDisplaceInput,
   ): Promise<string | null> => {
     const snapshot = tasksRef.current;
+    const current = snapshot.find((entry) => entry.id === taskId);
+    const destRank = defaultMoveRank(
+      current?.status ?? status,
+      status,
+      snapshot,
+      taskId,
+    );
+    // No-drop: omit `displace.sort_order` too — the park always prepends.
+    const park = displace
+      ? { id: displace.id, status: displace.status }
+      : undefined;
     setTasks((prev) =>
       prev.map((entry) => {
         if (displace && entry.id === displace.id) {
           return {
             ...entry,
             status: displace.status,
-            sort_order: displace.sort_order,
+            sort_order: 0,
           };
         }
         return entry.id === taskId
-          ? { ...entry, status, sort_order: 0 }
+          ? { ...entry, status, sort_order: destRank }
           : entry;
       }),
     );
     return sendMoveRequest(
       taskId,
-      { status, sort_order: 0, displace },
+      { status, displace: park },
       snapshot,
       (data) => {
         setTasks((prev) =>
@@ -595,12 +617,13 @@ export function BoardPage() {
   // when the modal may close. Create runs as create-then-move: POST /api/
   // tasks always stamps OPEN (status is never in the body), and a
   // non-Backlog destination is reached by an immediate follow-up /move that
-  // prepends (sort_order 0) — the same matrix the board drop uses. Create
-  // into an OCCUPIED In Progress column carries `displace`: TaskModal opened
-  // the park dialog BEFORE the create write, so this only runs after the
-  // user confirmed where the runner goes (cancel never writes a thing). The
-  // move failure path closes the modal, raises the banner and leaves the
-  // orphan card OPEN in Backlog (the server-owned create is never deleted);
+  // OMITS sort_order — the server applies the column default, the same
+  // matrix the board drop uses. Create into an OCCUPIED In Progress column
+  // carries `displace`: TaskModal opened the park dialog BEFORE the create
+  // write, so this only runs after the user confirmed where the runner goes
+  // (cancel never writes a thing). The move failure path closes the modal,
+  // raises the banner and leaves the orphan card OPEN in Backlog at the
+  // server-assigned append rank (the server-owned create is never deleted);
   // a `displaced` failure body keeps the runner parked (same rule as
   // sendMoveRequest), anything else full-restores the pre-move snapshot.
   const handleTaskSubmit = async (
@@ -659,29 +682,41 @@ export function BoardPage() {
       return await readError(createRes);
     }
     // The response carries the computed category — reuse it directly so the
-    // card lands in the right column instantly (an untracked result — which
-    // the server never returns on create — would stay hidden here).
+    // card lands in the right column instantly. The server never returns an
+    // untracked result on create (create stays strict).
     const data = (await createRes.json()) as TaskResponse;
     const dest = taskForm.createStatus ?? 'OPEN';
 
     // Destination is the create status itself: done, no useless same-status
-    // /move reorder. Card prepends Backlog.
+    // /move reorder. The server already returned the append rank (create
+    // appends Backlog); the column sorts by `sort_order`, so the card lands
+    // at the back automatically.
     if (dest === 'OPEN') {
       setTasks((prev) => [data.task, ...prev]);
       closeTaskForm();
       return null;
     }
 
-    // Otherwise create-then-move: optimistically place the card at the front
-    // of the destination column (sibling ranks untouched), then persist with
-    // ONE /move. With `displace` (occupied In Progress create) the runner is
-    // parked in the same optimistic frame — the dialog ran before the create
-    // write, so canceling never left a stray Backlog card to clean up.
+    // Otherwise create-then-move: optimistically place the card at the
+    // server's column default for a create (OPEN → dest; `defaultMoveRank`
+    // mirrors it — do NOT hardcode 0, a Planned-append dest would flash the
+    // card at the head), then persist with ONE /move that OMITS sort_order.
+    // With `displace` (occupied In Progress create) the runner is parked in
+    // the same optimistic frame — the dialog ran before the create write, so
+    // canceling never left a stray Backlog card to clean up.
     const snapshotBeforeOptimistic = tasksRef.current;
+    const destRank = defaultMoveRank(
+      'OPEN',
+      dest,
+      snapshotBeforeOptimistic,
+      data.task.id,
+    );
+    const park = displace
+      ? { id: displace.id, status: displace.status }
+      : undefined;
     const moveBody: MoveTaskInput = {
       status: dest,
-      sort_order: 0,
-      ...(displace ? { displace } : {}),
+      ...(park ? { displace: park } : {}),
     };
     setTasks((prev) => {
       const next = prev.map((entry) =>
@@ -689,11 +724,11 @@ export function BoardPage() {
           ? {
               ...entry,
               status: displace.status,
-              sort_order: displace.sort_order,
+              sort_order: 0,
             }
           : entry,
       );
-      return [{ ...data.task, status: dest, sort_order: 0 }, ...next];
+      return [{ ...data.task, status: dest, sort_order: destRank }, ...next];
     });
 
     let moveRes: Response;
@@ -706,9 +741,10 @@ export function BoardPage() {
       });
     } catch (err) {
       // Network failure: restore the pre-move snapshot, then ensure the
-      // created card is present as OPEN/Backlog (the orphan stays — the
-      // server owns the create, nothing to undo). When displace was applied
-      // optimistically, this also restores the parked runner. Banner, close.
+      // created card is present as OPEN/Backlog at the server-assigned
+      // append rank (the orphan stays — the server owns the create, nothing
+      // to undo). When displace was applied optimistically, this also
+      // restores the parked runner. Banner, close.
       setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
       const message = err instanceof Error ? err.message : 'Move failed';
       setActionError(message);
@@ -718,13 +754,15 @@ export function BoardPage() {
     // Move failure (409 on occupied In Progress, 401 missing Google token,
     // …): when the body carries a `displaced` row, the runner stays parked
     // (same rule as sendMoveRequest) and only the created card snaps back to
-    // OPEN/Backlog; otherwise the full pre-move snapshot is restored with
-    // the created card prepended OPEN. Banner, close (null closes the modal).
+    // OPEN/Backlog (keeping its append rank); otherwise the full pre-move
+    // snapshot is restored with the created card OPEN at its append rank.
+    // Banner, close (null closes the modal).
     if (!moveRes.ok) {
       const failure = await readMoveError(moveRes);
       if (failure.displaced) {
-        // A stays parked; B (new task) goes to OPEN/Backlog; every other
-        // card comes back from the snapshot (taken before B's insert).
+        // A stays parked; B (new task) goes back to OPEN/Backlog at the
+        // append rank the server assigned on create; every other card comes
+        // back from the snapshot (taken before B's insert).
         setTasks(() => {
           const base = snapshotBeforeOptimistic.map((entry) =>
             entry.id === failure.displaced!.id ? failure.displaced! : entry,
@@ -786,11 +824,10 @@ export function BoardPage() {
       'this task');
 
   return (
-    <div className="min-h-screen bg-cream">
-      {/* pb-28 clears the floating nav, so the last cards stay reachable */}
-      <div className="max-w-7xl mx-auto px-6 py-8 pb-28">
+    <div className="flex min-h-screen flex-col bg-cream">
+      <div className="mx-auto w-full max-w-7xl px-6 pt-8">
         {/* Header */}
-        <header className="flex items-center justify-between mb-8">
+        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="font-heading text-3xl font-bold text-foreground mb-2">
               Board
@@ -799,7 +836,7 @@ export function BoardPage() {
               Backlog, Planned, In Progress, Done, Discarded
             </p>
           </div>
-          <div className="flex gap-3">
+          <div className="flex shrink-0 gap-3">
             <Button variant="outline" onClick={() => openCreateTask('OPEN')}>
               <Plus className="h-4 w-4 mr-2" />
               New Task
@@ -860,129 +897,134 @@ export function BoardPage() {
             flight, or a load error that replaced the board). Action errors
             never unmount it. */}
         {(lists.length > 0 || (!isLoading && !loadError)) && (
-          <>
-            {/* URL filters — priority / difficulty are single-select with an
-                All option, category is multi-select. Combined with AND. */}
-            <section className="mb-6 space-y-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          /* URL filters — one wrapping horizontal row (ADR 0002 § UI):
+                Priority and Difficulty are single-select All+value pills;
+                Category is a searchable checkbox combobox grouped by list →
+                root → children. Filters combine with AND. */
+          <section className="mb-6 space-y-3">
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+              <div className="flex flex-col items-start gap-1.5">
+                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Priority
                 </span>
-                <FilterPill
-                  selected={priority === undefined}
-                  onClick={() => setPriorityFilter(undefined)}
-                >
-                  All
-                </FilterPill>
-                {(['high', 'medium', 'low'] as TaskPriority[]).map((value) => (
+                <div className="flex flex-wrap items-center gap-2">
                   <FilterPill
-                    key={value}
-                    selected={priority === value}
-                    onClick={() => setPriorityFilter(value)}
+                    selected={priority === undefined}
+                    onClick={() => setPriorityFilter(undefined)}
                   >
-                    {value[0].toUpperCase() + value.slice(1)}
+                    All
                   </FilterPill>
-                ))}
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Difficulty
-                </span>
-                <FilterPill
-                  selected={difficulty === undefined}
-                  onClick={() => setDifficultyFilter(undefined)}
-                >
-                  All
-                </FilterPill>
-                {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
-                  (value) => (
+                  {TASK_PRIORITIES.map((value) => (
                     <FilterPill
                       key={value}
-                      selected={difficulty === value}
-                      onClick={() => setDifficultyFilter(value)}
+                      selected={priority === value}
+                      onClick={() => setPriorityFilter(value)}
                     >
-                      {value[0].toUpperCase() + value.slice(1)}
+                      {TASK_PRIORITY_LABELS[value]}
                     </FilterPill>
-                  ),
-                )}
+                  ))}
+                </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              <div className="flex flex-col items-start gap-1.5">
+                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Difficulty
+                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <FilterPill
+                    selected={difficulty === undefined}
+                    onClick={() => setDifficultyFilter(undefined)}
+                  >
+                    All
+                  </FilterPill>
+                  {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
+                    (value) => (
+                      <FilterPill
+                        key={value}
+                        selected={difficulty === value}
+                        onClick={() => setDifficultyFilter(value)}
+                      >
+                        {value[0].toUpperCase() + value.slice(1)}
+                      </FilterPill>
+                    ),
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-col items-start gap-1.5">
+                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Category
                 </span>
                 {filterableCategories.length > 0 ? (
-                  filterableCategories.map((cat) => (
-                    <FilterPill
-                      key={cat.id}
-                      selected={selectedCategoryIds.includes(cat.id)}
-                      onClick={() => toggleCategoryFilter(cat.id)}
-                    >
-                      <span
-                        className="h-2 w-2 rounded-full"
-                        style={{ backgroundColor: cat.color }}
-                        aria-hidden
-                      />
-                      {cat.title}
-                    </FilterPill>
-                  ))
+                  <CategoryFilter
+                    lists={lists}
+                    categories={categories}
+                    selectedIds={selectedCategoryIds}
+                    onToggle={toggleCategoryFilter}
+                    onClear={() => updateSearch({ category: undefined })}
+                  />
                 ) : (
                   <span className="text-sm text-muted-foreground italic">
                     No categories yet
                   </span>
                 )}
               </div>
+            </div>
 
-              {hasActiveFilters && (
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={clearFilters}
-                    className="text-sm font-medium text-primary hover:underline"
-                  >
-                    Clear filters
-                  </button>
-                </div>
-              )}
-            </section>
-
-            {/* Five status columns, horizontal scroll on narrow screens.
-                DndContext wraps the scroll row: cards start a drag after an
-                8px press-move, the scroll gutter and headers still pan. */}
-            <DndContext
-              sensors={sensors}
-              collisionDetection={closestCorners}
-              onDragStart={handleDragStart}
-              onDragEnd={handleDragEnd}
-              onDragCancel={() => setActiveDrag(null)}
-            >
-              <div className="flex gap-6 overflow-x-auto pb-4">
-                {COLUMNS.map((column) => (
-                  <BoardColumnView
-                    key={column.status}
-                    column={column}
-                    tasks={tasksForColumn(column.status)}
-                    items={itemsByColumn[column.status]}
-                    movingIds={movingIds}
-                    onEditTask={openEditTask}
-                    onAddTask={openCreateTask}
-                  />
-                ))}
+            {hasActiveFilters && (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="text-sm font-medium text-primary hover:underline"
+                >
+                  Clear filters
+                </button>
               </div>
-
-              {/* Slightly elevated copy of the card following the pointer */}
-              <DragOverlay>
-                {activeDrag && (
-                  <div className="cursor-grabbing opacity-90 shadow-2xl ring-1 ring-border/60 rounded-lg">
-                    <TaskCard task={activeDrag} />
-                  </div>
-                )}
-              </DragOverlay>
-            </DndContext>
-          </>
+            )}
+          </section>
         )}
       </div>
+
+      {(lists.length > 0 || (!isLoading && !loadError)) && (
+        /* Five status columns. The scroller fills leftover viewport
+                height so empty space below the columns still pans. Columns
+                are a fixed 260px; the row stays centered and overflow-x
+                on narrow screens. mb-24 sits the scrollbar just above
+                the floating nav. */
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCorners}
+          onDragStart={handleDragStart}
+          onDragEnd={handleDragEnd}
+          onDragCancel={() => setActiveDrag(null)}
+        >
+          <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
+            <div className="mx-auto flex min-h-full w-max gap-6 px-6">
+              {COLUMNS.map((column) => (
+                <BoardColumnView
+                  key={column.status}
+                  column={column}
+                  tasks={tasksForColumn(column.status)}
+                  items={itemsByColumn[column.status]}
+                  movingIds={movingIds}
+                  onEditTask={openEditTask}
+                  onAddTask={openCreateTask}
+                />
+              ))}
+            </div>
+          </div>
+
+          {/* Slightly elevated copy of the card following the pointer */}
+          <DragOverlay>
+            {activeDrag && (
+              <div className="cursor-grabbing opacity-90 shadow-2xl ring-1 ring-border/60 rounded-lg">
+                <TaskCard task={activeDrag} />
+              </div>
+            )}
+          </DragOverlay>
+        </DndContext>
+      )}
 
       {/* Occupied In Progress conflict dialog (ADR 0002 § UI): pick where the
           running task is parked. Cancel / overlay close drops the stash with

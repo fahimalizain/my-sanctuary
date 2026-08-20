@@ -6,6 +6,7 @@
 
 pub mod calendar;
 pub mod categories;
+pub mod google_color;
 pub mod lists;
 pub mod models;
 pub mod oauth;
@@ -30,6 +31,7 @@ pub use calendar::{
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
 };
+pub use google_color::{closest_google_color_id, parse_hex_rgb, GOOGLE_EVENT_COLORS, HexColorError};
 pub use health::{HealthResponse, VersionResponse};
 pub use lists::{
     create_list, delete_list, list_lists, update_list, DeleteListResponse, ListsError,
@@ -37,8 +39,8 @@ pub use lists::{
 };
 pub use categories::{
     classify, create_category, delete_category, ensure_taxonomy, list_categories, slugify,
-    update_category, CategoriesError, CategoriesResponse, CategoryResponse, CategoryView,
-    CategoryWithPatterns, ClassifyOutcome, DeleteCategoryResponse, MAX_PATTERN_LEN,
+    update_category, CalendarScope, CategoriesError, CategoriesResponse, CategoryResponse,
+    CategoryView, CategoryWithPatterns, ClassifyOutcome, DeleteCategoryResponse, MAX_PATTERN_LEN,
 };
 pub use oauth::{
     authorization_url, exchange_and_login, generate_state, HttpClient, HttpError, OAuthError,
@@ -57,7 +59,7 @@ pub use repo::{
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
-    TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
+    TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
     TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
 };

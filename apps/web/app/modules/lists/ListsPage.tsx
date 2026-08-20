@@ -23,21 +23,25 @@ import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import type {
-  MoveDisplaceInput,
-  MoveTaskError,
-  MoveTaskInput,
-  MoveTaskResponse,
-  NewTaskInput,
-  TaskDifficulty,
-  TaskList,
-  TaskListsResponse,
-  TaskPriority,
-  TaskRecord,
-  TaskResponse,
-  TaskStatus,
-  TasksResponse,
-  UpdateTaskInput,
+// Lists is unlinked from the nav; one shared helper is fine to import across
+// modules — no new package.
+import { defaultMoveRank } from '../board/board-model';
+import {
+  TASK_PRIORITY_LABELS,
+  type MoveDisplaceInput,
+  type MoveTaskError,
+  type MoveTaskInput,
+  type MoveTaskResponse,
+  type NewTaskInput,
+  type TaskDifficulty,
+  type TaskList,
+  type TaskListsResponse,
+  type TaskPriority,
+  type TaskRecord,
+  type TaskResponse,
+  type TaskStatus,
+  type TasksResponse,
+  type UpdateTaskInput,
 } from '@/app/types';
 
 // Timer actions map to the same POST endpoints; the server explains 409s.
@@ -142,8 +146,8 @@ export function ListsPage() {
     // inserts the default lists AND the category taxonomy), so the tasks
     // request must run after it — their computed categories depend on the
     // seeded taxonomy, and GET /api/tasks also runs the count-gated seed (a
-    // no-op once lists seeded). The board hides untracked tasks, so the
-    // categories endpoint is never needed here.
+    // no-op once lists seeded). Lists hide untracked tasks (no list to
+    // belong to), so the categories endpoint is never needed here.
     fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
       .then(async (listsRes) => {
         if (!listsRes.ok) throw new Error(await readError(listsRes));
@@ -318,11 +322,13 @@ export function ListsPage() {
   };
 
   /** TaskModal's immediate status change — the same /move contract as the
-   *  board: optimistic (this task → `status`, the parked runner → its park
-   *  status, both `sort_order: 0`), then one POST /api/tasks/:id/move.
-   *  Failure with a `displaced` task keeps A parked and snaps only this task
-   *  back; any other failure restores the full snapshot. Sets the banner and
-   *  returns the message for the form (null on success). */
+   *  board: no drop position, so `sort_order` is OMITTED and the server
+   *  applies the column default (`defaultMoveRank` mirrors it for the
+   *  optimistic frame — the moved card to its default rank, the parked
+   *  runner to 0), then one POST /api/tasks/:id/move. Failure with a
+   *  `displaced` task keeps A parked and snaps only this task back; any
+   *  other failure restores the full snapshot. Sets the banner and returns
+   *  the message for the form (null on success). */
   const handleMoveTask = async (
     taskId: string,
     status: TaskStatus,
@@ -330,21 +336,32 @@ export function ListsPage() {
   ): Promise<string | null> => {
     setActionError(null);
     const snapshot = tasksRef.current;
+    const current = snapshot.find((entry) => entry.id === taskId);
+    const destRank = defaultMoveRank(
+      current?.status ?? status,
+      status,
+      snapshot,
+      taskId,
+    );
+    // No-drop: omit `displace.sort_order` too — the park always prepends.
+    const park = displace
+      ? { id: displace.id, status: displace.status }
+      : undefined;
     setTasks((prev) =>
       prev.map((entry) => {
         if (displace && entry.id === displace.id) {
           return {
             ...entry,
             status: displace.status,
-            sort_order: displace.sort_order,
+            sort_order: 0,
           };
         }
         return entry.id === taskId
-          ? { ...entry, status, sort_order: 0 }
+          ? { ...entry, status, sort_order: destRank }
           : entry;
       }),
     );
-    const body: MoveTaskInput = { status, sort_order: 0, displace };
+    const body: MoveTaskInput = { status, displace: park };
     try {
       const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
         method: 'POST',
@@ -802,9 +819,11 @@ function TaskChip({
     <div
       onClick={() => onEdit(task)}
       className="flex w-full cursor-pointer items-center gap-1.5 rounded-lg bg-black/25 px-2.5 py-1.5 text-left hover:bg-black/35 transition-colors"
-      title={`${task.title} — ${task.duration_minutes} min, ${task.priority}${
-        task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''
-      }`}
+      title={`${task.title} — ${task.duration_minutes} min${
+        task.priority !== 'low'
+          ? `, ${TASK_PRIORITY_LABELS[task.priority]}`
+          : ''
+      }${task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''}`}
     >
       <span className="flex-1 min-w-0 text-xs text-primary-foreground/90 truncate">
         {task.title}
@@ -824,17 +843,18 @@ function TaskChip({
           {task.difficulty === 'hard' ? 'HARD' : 'MED'}
         </span>
       ) : null}
-      <span
-        className={cn(
-          'h-1.5 w-1.5 rounded-full flex-shrink-0',
-          task.priority === 'high'
-            ? 'bg-red-400'
-            : task.priority === 'medium'
-              ? 'bg-amber-400'
-              : 'bg-sky-400',
-        )}
-        aria-hidden
-      />
+      {task.priority === 'high' || task.priority === 'medium' ? (
+        <span
+          className={cn(
+            'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-semibold tracking-wide',
+            task.priority === 'high'
+              ? 'bg-red-400/25 text-red-200'
+              : 'bg-amber-400/25 text-amber-200',
+          )}
+        >
+          {TASK_PRIORITY_LABELS[task.priority]}
+        </span>
+      ) : null}
       {/* Status badge — only for states that changed the task's look */}
       {isRunning && (
         <span className="flex-shrink-0 rounded-full bg-emerald-400/30 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-emerald-100">

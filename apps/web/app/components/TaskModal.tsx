@@ -14,13 +14,15 @@ import {
   type ClassifyStatus,
 } from '@/app/hooks/useTitleClassification';
 import { cn } from '@/lib/utils';
-import type {
-  MoveDisplaceInput,
-  TaskCategorySummary,
-  TaskDifficulty,
-  TaskPriority,
-  TaskRecord,
-  TaskStatus,
+import {
+  TASK_PRIORITIES,
+  TASK_PRIORITY_LABELS,
+  type MoveDisplaceInput,
+  type TaskCategorySummary,
+  type TaskDifficulty,
+  type TaskPriority,
+  type TaskRecord,
+  type TaskStatus,
 } from '@/app/types';
 
 interface TaskFormValues {
@@ -58,8 +60,8 @@ interface TaskModalProps {
   onDelete?: (taskId: string) => Promise<string | null>;
   /** Immediate status change (edit only). Return an error string to show on
    *  the form, or null on success. `displace` is set when the user confirmed
-   *  parking the current runner. sort_order is always 0 (prepend — no drop).
-   *  When omitted, Status renders read-only. */
+   *  parking the current runner. sort_order is omitted — no drop: the server
+   *  applies the column default. When omitted, Status renders read-only. */
   onMove?: (
     taskId: string,
     status: TaskStatus,
@@ -69,12 +71,6 @@ interface TaskModalProps {
    *  decide whether tapping In Progress needs the park dialog. */
   runningTask?: TaskRecord | null;
 }
-
-const priorityConfig: Record<TaskPriority, { label: string }> = {
-  low: { label: 'Low' },
-  medium: { label: 'Medium' },
-  high: { label: 'High' },
-};
 
 const difficultyConfig: Record<TaskDifficulty, { label: string }> = {
   easy: { label: 'Easy' },
@@ -240,7 +236,6 @@ export function TaskModal({
       void submitForm({
         id: runningTask.id,
         status: parkStatus,
-        sort_order: 0,
       });
       return;
     }
@@ -249,35 +244,35 @@ export function TaskModal({
     void runMove('IN_PROGRESS', {
       id: runningTask.id,
       status: parkStatus,
-      sort_order: 0,
     });
   };
 
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-[480px] p-0 gap-0 overflow-hidden bg-card border-border">
+        <DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[480px] bg-card border-border">
           {/* Header accent bar — edit mode uses the task's computed category
             color; create has no category anchor (no color is fine) */}
           <div
-            className="h-2"
+            className="h-2 shrink-0"
             style={{
               backgroundColor: isEditing ? task!.category.color : undefined,
             }}
           />
 
-          <div className="p-6">
-            <DialogHeader className="mb-6">
-              <DialogTitle className="text-foreground">
-                {isEditing ? 'Edit Task' : 'New Task'}
-              </DialogTitle>
-              <DialogDescription>
-                {isEditing
-                  ? 'Update the details of your task below.'
-                  : 'Tasks are filed by their title — type a title that matches a category.'}
-              </DialogDescription>
-            </DialogHeader>
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
+            <DialogTitle className="text-foreground">
+              {isEditing ? 'Edit Task' : 'New Task'}
+            </DialogTitle>
+            <DialogDescription>
+              {isEditing
+                ? 'Update the details of your task below.'
+                : 'Tasks are filed by their title — type a title that matches a category.'}
+            </DialogDescription>
+          </DialogHeader>
+          <hr className="shrink-0 border-border" />
 
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
             {/* Task Title */}
             <div className="space-y-2 mb-5">
               <label className="text-sm font-medium text-foreground">
@@ -303,6 +298,14 @@ export function TaskModal({
                   explains if it does not.
                 </p>
               )}
+              {classifyStatus.state === 'idle' &&
+                isEditing &&
+                task!.category.is_untracked && (
+                  <p className="text-xs text-muted-foreground">
+                    Retitle to match a living category to save. Move and delete
+                    still work.
+                  </p>
+                )}
               {classifyStatus.state === 'loading' && (
                 <p className="text-xs text-muted-foreground flex items-center gap-1.5">
                   <Loader2 className="h-3.5 w-3.5 animate-spin inline text-muted-foreground" />
@@ -371,7 +374,7 @@ export function TaskModal({
                 Priority
               </label>
               <div className="flex gap-2">
-                {(Object.keys(priorityConfig) as TaskPriority[]).map((p) => (
+                {TASK_PRIORITIES.map((p) => (
                   <button
                     key={p}
                     type="button"
@@ -383,7 +386,7 @@ export function TaskModal({
                         : 'bg-background border-input text-muted-foreground hover:border-primary/30',
                     )}
                   >
-                    {priorityConfig[p].label}
+                    {TASK_PRIORITY_LABELS[p]}
                   </button>
                 ))}
               </div>
@@ -439,12 +442,13 @@ export function TaskModal({
             </div>
 
             {/* Status — edit mode: with onMove, immediate column pills (a drop
-              with no drop position: always prepend); without it, keep the
-              old read-only box so hypothetical callers stay intact. Create
-              mode: when `createStatus` is set (board column +), the same
-              five pills render locked to that destination — changing column
-              means Cancel and tapping another +. Omitted (Lists page) means
-              no Status section at all. */}
+              with no drop position: `sort_order` is omitted and the server
+              applies the column default); without it, keep the old read-only
+              box so hypothetical callers stay intact. Create mode: when
+              `createStatus` is set (board column +), the same five pills
+              render locked to that destination — changing column means
+              Cancel and tapping another +. Omitted (Lists page) means no
+              Status section at all. */}
             {isEditing ? (
               onMove ? (
                 <div className="space-y-2 mb-6">
@@ -532,44 +536,46 @@ export function TaskModal({
             {formError && (
               <p className="mb-4 text-sm text-destructive">{formError}</p>
             )}
+          </div>
 
-            {/* Actions */}
-            <div className="flex items-center justify-between pt-4 border-t border-border">
-              {isEditing ? (
-                <Button
-                  variant="ghost"
-                  onClick={handleDelete}
-                  disabled={saving || movingStatus}
-                  className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                >
-                  Delete
-                </Button>
-              ) : (
-                <div />
-              )}
-              <div className="flex gap-3">
-                <Button
-                  variant="outline"
-                  onClick={() => onOpenChange(false)}
-                  disabled={saving}
-                  className="border-input text-foreground hover:bg-muted"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={handleSave}
-                  disabled={
-                    !title.trim() ||
-                    saving ||
-                    movingStatus ||
-                    classifyStatus.state === 'nomatch' ||
-                    classifyStatus.state === 'conflict'
-                  }
-                  className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-                >
-                  {isEditing ? 'Save Changes' : 'Create Task'}
-                </Button>
-              </div>
+          <div className="flex shrink-0 items-center justify-between border-t border-border px-6 py-4">
+            {isEditing ? (
+              <Button
+                variant="ghost"
+                onClick={handleDelete}
+                disabled={saving || movingStatus}
+                className="text-destructive hover:text-destructive hover:bg-destructive/10"
+              >
+                Delete
+              </Button>
+            ) : (
+              <div />
+            )}
+            <div className="flex gap-3">
+              <Button
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={saving}
+                className="border-input text-foreground hover:bg-muted"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleSave}
+                disabled={
+                  !title.trim() ||
+                  saving ||
+                  movingStatus ||
+                  classifyStatus.state === 'nomatch' ||
+                  classifyStatus.state === 'conflict' ||
+                  (isEditing &&
+                    task!.category.is_untracked &&
+                    classifyStatus.state !== 'matched')
+                }
+                className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {isEditing ? 'Save Changes' : 'Create Task'}
+              </Button>
             </div>
           </div>
         </DialogContent>

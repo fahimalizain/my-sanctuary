@@ -30,12 +30,14 @@ use api_core::repo::{
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
-    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
+    TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_LIST_SQL,
+    TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
-    TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL,
+    TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
+    TASK_SHIFT_SORT_ORDER_SQL,
     TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
     TASK_SET_STATUS_SQL,
     TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
@@ -547,6 +549,13 @@ struct CountRow {
     pub count: i64,
 }
 
+/// Row projection for the `SELECT sort_order … LIMIT 1` statements (one
+/// column only — no point deserializing a full `Task`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct SortOrderRow {
+    pub sort_order: i64,
+}
+
 /// `task_lists` table persistence.
 pub struct D1TaskListRepo {
     db: D1Database,
@@ -859,6 +868,18 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
         query_vec(stmt).await
     }
 
+    async fn list_patterns_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
     async fn replace_patterns(
         &self,
         category_id: &str,
@@ -952,8 +973,8 @@ impl TaskRepo for D1TaskRepo {
         let now = now_rfc3339();
         // This slice creates tasks in exactly one status; the literal is bound
         // here (the schema's DEFAULT 'OPEN' is a backstop only). The caller
-        // (create_task) already shifted living OPEN peers, so `sort_order` is
-        // stored as given — always 0 today.
+        // (create_task) never shifts peers: `sort_order` is the append rank —
+        // 0 on an empty Backlog, otherwise max(sort_order)+1.
         let stmt = self
             .db
             .prepare(TASK_INSERT_SQL)
@@ -1085,6 +1106,30 @@ impl TaskRepo for D1TaskRepo {
             .map_err(backend)?;
         run_stmt(stmt).await?;
         self.get_by_id(id).await
+    }
+
+    async fn max_sort_order(
+        &self,
+        user_id: &str,
+        status: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<Option<i64>, RepoError> {
+        // The append target: highest living `sort_order` of the pile, `None`
+        // when empty (`LIMIT 1` + `first`). `exclude_id` keeps the mover's
+        // leftover rank out of its own append target; `unwrap_or("")` binds
+        // an empty string for `create_task`, which never matches a UUID.
+        // Mirrors the get-by-id reads.
+        let stmt = self
+            .db
+            .prepare(TASK_MAX_SORT_ORDER_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(status),
+                D1Type::Text(exclude_id.unwrap_or("")),
+            ])
+            .map_err(backend)?;
+        let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.sort_order))
     }
 
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {

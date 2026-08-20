@@ -24,6 +24,12 @@
       "options": {
         "script": "preview"
       }
+    },
+    "test": {
+      "executor": "nx:run-script",
+      "options": {
+        "script": "test"
+      }
     }
   }
 }

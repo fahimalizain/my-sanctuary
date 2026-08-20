@@ -182,6 +182,14 @@ export interface UpdateCategoryInput {
 export type TaskPriority = 'high' | 'medium' | 'low';
 export type TaskDifficulty = 'easy' | 'medium' | 'hard';
 
+export const TASK_PRIORITIES: TaskPriority[] = ['high', 'medium', 'low'];
+
+export const TASK_PRIORITY_LABELS: Record<TaskPriority, string> = {
+  high: 'P0',
+  medium: 'P1',
+  low: 'P2',
+};
+
 // The computed category attached to a task (`tasks` have no category_id
 // column — the server classifies the title and returns this summary). The
 // frontend groups tasks under `category.id`.
@@ -271,21 +279,27 @@ export interface UpdateTaskInput {
 
 // The optional `displace` sub-object of a move: parks the currently running
 // task (its landing status must be PLANNED/COMPLETED/DISCARDED — never
-// OPEN/IN_PROGRESS) before the moved task starts.
+// OPEN/IN_PROGRESS) before the moved task starts. `sort_order` is optional:
+// drops send an absolute rank; no-drop callers (modal pills, the conflict
+// dialog) omit it and the server applies the column default (the park always
+// prepends).
 export interface MoveDisplaceInput {
   id: string;
   status: 'PLANNED' | 'COMPLETED' | 'DISCARDED';
-  sort_order: number;
+  sort_order?: number;
 }
 
 // Request body for POST /api/tasks/:id/move — the board drop. The server
 // dispatches the ADR 0002 transition matrix (start/stop/pause/complete/
 // discard/plan/unplan/reopen), then places the task at `sort_order` in the
-// target status. Same-status moves are reorders. `displace` is optional /
-// null and only valid when moving to IN_PROGRESS.
+// target status. Same-status moves are reorders. `sort_order` is optional:
+// drops send an absolute rank; no-drop callers (modal status pills, column+
+// create-then-move, displace parks) omit it and the server applies the
+// column default. `displace` is optional / null and only valid when moving
+// to IN_PROGRESS.
 export interface MoveTaskInput {
   status: TaskStatus;
-  sort_order: number;
+  sort_order?: number;
   displace?: MoveDisplaceInput | null;
 }
 

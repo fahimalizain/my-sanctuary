@@ -414,8 +414,11 @@ pub struct TaskCategoryPattern {
     /// The user-authored regex. Stored patterns are validated on write, but
     /// the matcher skips any that fail to compile on read regardless.
     pub regex: String,
-    /// When set, the pattern only applies to events from this Google calendar;
-    /// task titles (no calendar) skip it.
+    /// Write destination for tasks whose titles match, and the inbound
+    /// Event filter for a future event classifier. The matcher consults it
+    /// only under [`crate::categories::CalendarScope::Event`];
+    /// [`crate::categories::CalendarScope::Ignore`] (task titles) matches on
+    /// regex alone.
     pub google_calendar_id: Option<String>,
     pub sort_order: i64,
     /// RFC 3339 instant.
@@ -488,8 +491,9 @@ pub struct NewTask {
     pub duration_minutes: i64,
     pub priority: String,
     pub difficulty: String,
-    /// Backlog rank; `create_task` always passes 0 (after shifting the living
-    /// OPEN peers up by one).
+    /// Backlog rank; `create_task` passes the append rank —
+    /// `max(sort_order)+1` for the user's living OPEN rows, or 0 when the
+    /// pile is empty (peers are never shifted).
     pub sort_order: i64,
 }
 
@@ -617,6 +621,11 @@ pub struct NewEventInput {
     /// carrier — slice 4). `None` for hand-created events.
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Google event `colorId` (`"1"`..=`"11"`). Omitted from the Google
+    /// payload when `None`. `start_task` copies the matched category's
+    /// stored `google_color_id`. Hand-created events leave this unset.
+    #[serde(default)]
+    pub color_id: Option<String>,
 }
 
 #[cfg(test)]
