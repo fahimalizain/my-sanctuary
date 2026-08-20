@@ -155,8 +155,9 @@ export function BoardPage() {
   // ──────────────────────────────────────────
 
   // Filter chips are built from the loaded categories; untracked is a
-  // system category that is never offered as a filter (it is also hidden
-  // from the columns themselves).
+  // system category that is never offered as a filter chip. Untracked
+  // cards are not hidden from the columns, and a `?category=` URL that
+  // names the sink still matches (the sink id is in `categories`).
   const filterableCategories = useMemo(
     () => categories.filter((cat) => !cat.is_untracked),
     [categories],
@@ -270,16 +271,13 @@ export function BoardPage() {
   );
 
   // Filter the column's tasks (AND), sort by `sort_order ASC` (tie-break
-  // `created_at`), then cap Done/Discarded at 20 matches. Untracked tasks
-  // stay hidden, the same as Lists. This is the DISPLAYED list: drops,
+  // `created_at`), then cap Done/Discarded at 20 matches — untracked
+  // cards count like any other. This is the DISPLAYED list: drops,
   // reorders and the cap are all relative to it (ADR 0002 § Filters).
   const tasksForColumn = useCallback(
     (status: TaskStatus): TaskRecord[] => {
       const matches = tasks.filter(
-        (task) =>
-          task.status === status &&
-          !task.category.is_untracked &&
-          matchesFilters(task),
+        (task) => task.status === status && matchesFilters(task),
       );
       matches.sort(
         (a, b) =>
@@ -659,8 +657,8 @@ export function BoardPage() {
       return await readError(createRes);
     }
     // The response carries the computed category — reuse it directly so the
-    // card lands in the right column instantly (an untracked result — which
-    // the server never returns on create — would stay hidden here).
+    // card lands in the right column instantly. The server never returns an
+    // untracked result on create (create stays strict).
     const data = (await createRes.json()) as TaskResponse;
     const dest = taskForm.createStatus ?? 'OPEN';
 

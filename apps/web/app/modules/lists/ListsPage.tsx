@@ -142,8 +142,8 @@ export function ListsPage() {
     // inserts the default lists AND the category taxonomy), so the tasks
     // request must run after it — their computed categories depend on the
     // seeded taxonomy, and GET /api/tasks also runs the count-gated seed (a
-    // no-op once lists seeded). The board hides untracked tasks, so the
-    // categories endpoint is never needed here.
+    // no-op once lists seeded). Lists hide untracked tasks (no list to
+    // belong to), so the categories endpoint is never needed here.
     fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
       .then(async (listsRes) => {
         if (!listsRes.ok) throw new Error(await readError(listsRes));

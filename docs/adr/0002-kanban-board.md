@@ -3,6 +3,10 @@
 Status: Accepted
 Date: 2026-08-19
 
+> Amendment (2026-08-20): untracked tasks are now visible on the board in
+> their status column. § Out of scope and § UI are amended accordingly; the
+> hiding rule now applies to Lists only.
+
 ## Context
 
 `/lists` is a list-colored pile of tasks. We are replacing it in the nav with a status kanban at `/board`. This ADR is slice 0 of 5: it locks the design for the board. Nothing is implemented yet; later slices implement against this document the same way ADR 0001 was the source of truth for watch channels.
@@ -25,7 +29,7 @@ Replace Lists in the nav with a five-column status board at `/board`. The follow
 
 - Deleting Lists code or the `/lists` route.
 - List CRUD on the Board (stays on the unlinked `/lists`).
-- Untracked tasks (stay hidden, same as Lists).
+- Untracked tasks stay hidden on Lists (they have no list to belong to); their board visibility is specified in § UI.
 - Changing Home / FocusTimer (still mock).
 - A "show more" for Done/Discarded overflow.
 - The 0.x `@dnd-kit/react` rewrite.
@@ -147,7 +151,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 - Board header: **New Task** + **Edit Categories** (no New List).
 - New Task = the existing `TaskModal`; creates `OPEN`; prepends Backlog.
 - Click card = `TaskModal`. **No** Play/Pause/Stop/Complete/Discard buttons on the card. The drop is the action.
-- Untracked tasks hidden.
+- Untracked tasks are visible in their status column. The Untracked sink is not offered as a category filter chip; a living-category filter still excludes them (`task.category.id` will not match). `?category=<untracked-sink-id>` still matches if present in the URL. Lists continue to hide them.
 - Always **optimistic**. On failure: snap the dragged card back + error banner. A displaced task A stays parked if the start failed.
 - Occupied In Progress: `onDragEnd` does **not** apply the optimistic move. Stash `{ taskId, from }`, open a small dialog: move the old task to Planned / Done / Discarded. Confirm → one `move` with `displace`. Cancel → nothing.
 - Five columns, horizontal scroll on narrow screens (column min-width ~260px). Pad the bottom for the floating nav. No mobile-only column picker.
