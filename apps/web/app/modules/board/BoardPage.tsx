@@ -958,10 +958,10 @@ export function BoardPage() {
 
       {(lists.length > 0 || (!isLoading && !loadError)) && (
         /* Five status columns. The scroller fills leftover viewport
-                height so empty space below the columns still pans. On wide
-                screens the row grows (capped) and stays centered; on narrow
-                screens min-width 260px columns overflow-x. mb-24 sits the
-                scrollbar just above the floating nav. */
+                height so empty space below the columns still pans. Columns
+                are a fixed 260px; the row stays centered and overflow-x
+                on narrow screens. mb-24 sits the scrollbar just above
+                the floating nav. */
         <DndContext
           sensors={sensors}
           collisionDetection={closestCorners}
@@ -970,7 +970,7 @@ export function BoardPage() {
           onDragCancel={() => setActiveDrag(null)}
         >
           <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
-            <div className="mx-auto flex min-h-full w-max min-w-[min(100%,1600px)] gap-6 px-6">
+            <div className="mx-auto flex min-h-full w-max gap-6 px-6">
               {COLUMNS.map((column) => (
                 <BoardColumnView
                   key={column.status}
