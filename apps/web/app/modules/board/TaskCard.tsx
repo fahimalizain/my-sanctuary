@@ -93,9 +93,17 @@ export function TaskCard({
         )}
         aria-hidden
       />
+      {/* Blank color (untracked sink / some children) falls back to muted. */}
       <span
-        className="h-2 w-2 rounded-full flex-shrink-0"
-        style={{ backgroundColor: task.category.color }}
+        className={cn(
+          'h-2 w-2 rounded-full flex-shrink-0',
+          !task.category.color.trim() && 'bg-muted-foreground/40',
+        )}
+        style={
+          task.category.color.trim()
+            ? { backgroundColor: task.category.color }
+            : undefined
+        }
         title={task.category.title}
         aria-hidden
       />

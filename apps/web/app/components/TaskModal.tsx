@@ -303,6 +303,14 @@ export function TaskModal({
                   explains if it does not.
                 </p>
               )}
+              {classifyStatus.state === 'idle' &&
+                isEditing &&
+                task!.category.is_untracked && (
+                  <p className="text-xs text-muted-foreground">
+                    Retitle to match a living category to save. Move and delete
+                    still work.
+                  </p>
+                )}
               {classifyStatus.state === 'loading' && (
                 <p className="text-xs text-muted-foreground flex items-center gap-1.5">
                   <Loader2 className="h-3.5 w-3.5 animate-spin inline text-muted-foreground" />
@@ -563,7 +571,10 @@ export function TaskModal({
                     saving ||
                     movingStatus ||
                     classifyStatus.state === 'nomatch' ||
-                    classifyStatus.state === 'conflict'
+                    classifyStatus.state === 'conflict' ||
+                    (isEditing &&
+                      task!.category.is_untracked &&
+                      classifyStatus.state !== 'matched')
                   }
                   className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                 >
