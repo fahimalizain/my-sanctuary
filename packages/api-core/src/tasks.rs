@@ -89,6 +89,8 @@
 //! if that start fails the parked task STAYS — the error is
 //! [`TasksError::AfterDisplace`] and carries the displaced task's view.
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
@@ -99,7 +101,7 @@ use crate::categories::{
 use crate::config::OAuthConfig;
 use crate::models::{
     CalendarEvent, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task, TaskCategory,
-    UpdateTask,
+    TaskCategoryPattern, UpdateTask,
 };
 use crate::oauth::HttpClient;
 use crate::repo::{
@@ -305,7 +307,8 @@ pub struct TaskCategorySummary {
 }
 
 /// All living categories plus the matcher set built from their patterns, in
-/// one round-trip pair — the unit of work for every classify here.
+/// one round-trip pair (list + bulk patterns) — the unit of work for every
+/// classify here.
 struct Taxonomy {
     categories: Vec<TaskCategory>,
     matchers: Vec<CategoryWithPatterns>,
@@ -1846,16 +1849,27 @@ fn resolve_category(title: &str, taxonomy: &Taxonomy) -> Result<String, TasksErr
     }
 }
 
-/// Loads the living categories AND their patterns in one pass, mirroring the
-/// two queries `list_categories` performs per category (list + patterns).
+/// Loads living categories and their patterns in two queries (list + bulk
+/// patterns), matching `list_categories`.
 async fn load_taxonomy(
     category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
 ) -> Result<Taxonomy, RepoError> {
     let categories = category_repo.list_by_user_id(user_id).await?;
+
+    // Every living category's patterns in one query, grouped by category
+    // (kills the old per-category N+1: one patterns SELECT per category).
+    let mut patterns_by_category: HashMap<String, Vec<TaskCategoryPattern>> = HashMap::new();
+    for pattern in category_repo.list_patterns_by_user_id(user_id).await? {
+        patterns_by_category
+            .entry(pattern.category_id.clone())
+            .or_default()
+            .push(pattern);
+    }
+
     let mut matchers = Vec::with_capacity(categories.len());
     for category in &categories {
-        let patterns = category_repo.list_patterns_by_category_id(&category.id).await?;
+        let patterns = patterns_by_category.remove(&category.id).unwrap_or_default();
         matchers.push(CategoryWithPatterns {
             category_id: category.id.clone(),
             parent_id: category.parent_id.clone(),
@@ -2177,6 +2191,11 @@ mod tests {
         stored: Mutex<Vec<TaskCategory>>,
         patterns: Mutex<HashMap<String, Vec<TaskCategoryPattern>>>,
         next_id: Mutex<u64>,
+        // Call counters locking the N+1 regression: `load_taxonomy` must
+        // never fall back to per-category pattern queries.
+        list_by_user_id_calls: Mutex<usize>,
+        list_patterns_by_user_id_calls: Mutex<usize>,
+        list_patterns_by_category_id_calls: Mutex<usize>,
     }
 
     impl FakeTaskCategoryRepo {
@@ -2185,6 +2204,9 @@ mod tests {
                 stored: Mutex::new(Vec::new()),
                 patterns: Mutex::new(HashMap::new()),
                 next_id: Mutex::new(1),
+                list_by_user_id_calls: Mutex::new(0),
+                list_patterns_by_user_id_calls: Mutex::new(0),
+                list_patterns_by_category_id_calls: Mutex::new(0),
             }
         }
 
@@ -2203,6 +2225,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl TaskCategoryRepo for FakeTaskCategoryRepo {
         async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+            *self.list_by_user_id_calls.lock().unwrap() += 1;
             let mut rows: Vec<TaskCategory> = self
                 .stored
                 .lock()
@@ -2289,6 +2312,7 @@ mod tests {
             &self,
             category_id: &str,
         ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            *self.list_patterns_by_category_id_calls.lock().unwrap() += 1;
             let mut rows = self
                 .patterns
                 .lock()
@@ -2297,6 +2321,36 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             rows.sort_by_key(|row| row.sort_order);
+            Ok(rows)
+        }
+
+        async fn list_patterns_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            *self.list_patterns_by_user_id_calls.lock().unwrap() += 1;
+            // Mirrors TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL: only living
+            // categories' patterns, ordered by category then sort_order.
+            let living: Vec<String> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .map(|row| row.id.clone())
+                .collect();
+            let patterns = self.patterns.lock().unwrap();
+            let mut rows: Vec<TaskCategoryPattern> = living
+                .iter()
+                .filter_map(|category_id| patterns.get(category_id))
+                .flatten()
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                a.category_id
+                    .cmp(&b.category_id)
+                    .then_with(|| a.sort_order.cmp(&b.sort_order))
+            });
             Ok(rows)
         }
 
@@ -2906,6 +2960,24 @@ mod tests {
         pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
         let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-2")).unwrap();
         assert!(response.tasks.is_empty());
+    }
+
+    #[test]
+    fn list_tasks_loads_taxonomy_patterns_in_one_query() {
+        let (lists, categories, tasks) = seeded();
+        // Seed path already queried; isolate the list_tasks call.
+        *categories.list_by_user_id_calls.lock().unwrap() = 0;
+        *categories.list_patterns_by_user_id_calls.lock().unwrap() = 0;
+        *categories.list_patterns_by_category_id_calls.lock().unwrap() = 0;
+
+        pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1")).unwrap();
+
+        assert_eq!(*categories.list_patterns_by_user_id_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *categories.list_patterns_by_category_id_calls.lock().unwrap(),
+            0,
+            "load_taxonomy must never fall back to per-category pattern queries"
+        );
     }
 
     // ──────────────────────────────────────────

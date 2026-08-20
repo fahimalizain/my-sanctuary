@@ -30,7 +30,8 @@ use api_core::repo::{
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
-    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
+    TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_LIST_SQL,
+    TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
@@ -855,6 +856,18 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
             .db
             .prepare(TASK_CATEGORY_PATTERNS_LIST_SQL)
             .bind_refs(&[D1Type::Text(category_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_patterns_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
             .map_err(backend)?;
         query_vec(stmt).await
     }
