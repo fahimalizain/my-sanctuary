@@ -227,14 +227,14 @@ export function CategoryPicker({
         aria-expanded={open}
         aria-label="Lock a category"
         className={cn(
-          'flex w-full items-center justify-between gap-2 rounded-xl border-2 px-4 py-3 text-sm font-medium transition-all',
+          'flex w-full items-center justify-between gap-2 rounded-xl border-2 px-4 py-3 text-sm font-medium transition-all text-left',
           disabled && 'cursor-not-allowed opacity-60',
           selected
             ? 'bg-primary border-primary text-primary-foreground'
             : 'bg-background border-input text-muted-foreground hover:border-primary/30',
         )}
       >
-        <span className="min-w-0 flex-1 truncate">
+        <span className="min-w-0 flex-1 truncate text-left">
           {selected?.title ?? 'No category'}
         </span>
         <span className="flex shrink-0 items-center gap-1">
