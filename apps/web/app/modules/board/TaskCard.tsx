@@ -1,7 +1,7 @@
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { cn } from '@/lib/utils';
-import type { TaskRecord } from '@/app/types';
+import { TASK_PRIORITY_LABELS, type TaskRecord } from '@/app/types';
 
 /** The draggable wrapper of a card: applies the sortable transform while the
  *  card itself stays the plain TaskCard chip (click-to-edit, no timer
@@ -43,11 +43,13 @@ export function SortableTaskCard({
 }
 
 /** A light-surface task chip (the Lists chip on a light card, not the dark
- *  list-colored chip): title + duration + difficulty badge (medium/hard
- *  only) + priority dot + category swatch. The whole chip is the click
- *  target that opens the edit modal — no timer buttons in this slice. The
- *  drag overlay renders the same chip elevated (shadow/opacity), without a
- *  click target. */
+ *  list-colored chip): category color as a left-edge ribbon; title wraps
+ *  up to two lines then ellipsizes; duration + difficulty badge
+ *  (medium/hard only) + P0/P1 (P2 hidden like easy) + category pill
+ *  (untracked hidden) on the row below.
+ *  The whole chip is the click target that opens the edit modal — no timer
+ *  buttons in this slice. The drag overlay renders the same chip elevated
+ *  (shadow/opacity), without a click target. */
 export function TaskCard({
   task,
   onEdit,
@@ -55,58 +57,69 @@ export function TaskCard({
   task: TaskRecord;
   onEdit?: (task: TaskRecord) => void;
 }) {
+  const categoryColor = task.category.color.trim();
+
   return (
     <button
       type="button"
       onClick={() => onEdit?.(task)}
-      title={`${task.title} — ${task.duration_minutes} min, ${task.priority}${
-        task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''
+      title={`${task.title} — ${task.duration_minutes} min${
+        task.priority !== 'low'
+          ? `, ${TASK_PRIORITY_LABELS[task.priority]}`
+          : ''
+      }${task.difficulty !== 'easy' ? `, ${task.difficulty}` : ''}${
+        task.category.title ? `, ${task.category.title}` : ''
       }`}
-      className="flex w-full cursor-pointer items-center gap-1.5 rounded-lg border border-border/60 bg-background px-2.5 py-2 text-left transition-colors hover:border-primary/40 hover:bg-muted/40"
+      className="flex w-full cursor-pointer overflow-hidden rounded-lg border border-border/60 bg-background text-left transition-colors hover:border-primary/40 hover:bg-muted/40"
     >
-      <span className="flex-1 min-w-0 text-sm text-foreground truncate">
-        {task.title}
-      </span>
-      <span className="flex-shrink-0 text-[10px] text-muted-foreground">
-        {task.duration_minutes} min
-      </span>
-      {task.difficulty === 'hard' || task.difficulty === 'medium' ? (
-        <span
-          className={cn(
-            'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] uppercase tracking-wide',
-            task.difficulty === 'hard'
-              ? 'bg-foreground/10 font-semibold text-foreground'
-              : 'bg-muted font-medium text-muted-foreground',
-          )}
-        >
-          {task.difficulty === 'hard' ? 'HARD' : 'MED'}
-        </span>
-      ) : null}
-      <span
-        className={cn(
-          'h-1.5 w-1.5 rounded-full flex-shrink-0',
-          task.priority === 'high'
-            ? 'bg-red-400'
-            : task.priority === 'medium'
-              ? 'bg-amber-400'
-              : 'bg-sky-400',
-        )}
-        aria-hidden
-      />
       {/* Blank color (untracked sink / some children) falls back to muted. */}
       <span
         className={cn(
-          'h-2 w-2 rounded-full flex-shrink-0',
-          !task.category.color.trim() && 'bg-muted-foreground/40',
+          'w-1 shrink-0 self-stretch',
+          !categoryColor && 'bg-muted-foreground/40',
         )}
-        style={
-          task.category.color.trim()
-            ? { backgroundColor: task.category.color }
-            : undefined
-        }
-        title={task.category.title}
+        style={categoryColor ? { backgroundColor: categoryColor } : undefined}
         aria-hidden
       />
+      <span className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 py-2">
+        <span className="min-w-0 text-sm text-foreground line-clamp-2 break-words">
+          {task.title}
+        </span>
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="flex-shrink-0 text-[10px] text-muted-foreground">
+            {task.duration_minutes} min
+          </span>
+          {task.difficulty === 'hard' || task.difficulty === 'medium' ? (
+            <span
+              className={cn(
+                'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] uppercase tracking-wide',
+                task.difficulty === 'hard'
+                  ? 'bg-foreground/10 font-semibold text-foreground'
+                  : 'bg-muted font-medium text-muted-foreground',
+              )}
+            >
+              {task.difficulty === 'hard' ? 'HARD' : 'MED'}
+            </span>
+          ) : null}
+          {task.priority === 'high' || task.priority === 'medium' ? (
+            <span
+              className={cn(
+                'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-semibold tracking-wide',
+                task.priority === 'high'
+                  ? 'bg-red-400/15 text-red-500'
+                  : 'bg-amber-400/15 text-amber-600',
+              )}
+            >
+              {TASK_PRIORITY_LABELS[task.priority]}
+            </span>
+          ) : null}
+          {task.category.title && !task.category.is_untracked ? (
+            <span className="ml-auto min-w-0 truncate rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground">
+              {task.category.title}
+            </span>
+          ) : null}
+        </span>
+      </span>
     </button>
   );
 }

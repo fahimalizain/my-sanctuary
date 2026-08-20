@@ -14,13 +14,15 @@ import {
   type ClassifyStatus,
 } from '@/app/hooks/useTitleClassification';
 import { cn } from '@/lib/utils';
-import type {
-  MoveDisplaceInput,
-  TaskCategorySummary,
-  TaskDifficulty,
-  TaskPriority,
-  TaskRecord,
-  TaskStatus,
+import {
+  TASK_PRIORITIES,
+  TASK_PRIORITY_LABELS,
+  type MoveDisplaceInput,
+  type TaskCategorySummary,
+  type TaskDifficulty,
+  type TaskPriority,
+  type TaskRecord,
+  type TaskStatus,
 } from '@/app/types';
 
 interface TaskFormValues {
@@ -69,12 +71,6 @@ interface TaskModalProps {
    *  decide whether tapping In Progress needs the park dialog. */
   runningTask?: TaskRecord | null;
 }
-
-const priorityConfig: Record<TaskPriority, { label: string }> = {
-  low: { label: 'Low' },
-  medium: { label: 'Medium' },
-  high: { label: 'High' },
-};
 
 const difficultyConfig: Record<TaskDifficulty, { label: string }> = {
   easy: { label: 'Easy' },
@@ -378,7 +374,7 @@ export function TaskModal({
                 Priority
               </label>
               <div className="flex gap-2">
-                {(Object.keys(priorityConfig) as TaskPriority[]).map((p) => (
+                {TASK_PRIORITIES.map((p) => (
                   <button
                     key={p}
                     type="button"
@@ -390,7 +386,7 @@ export function TaskModal({
                         : 'bg-background border-input text-muted-foreground hover:border-primary/30',
                     )}
                   >
-                    {priorityConfig[p].label}
+                    {TASK_PRIORITY_LABELS[p]}
                   </button>
                 ))}
               </div>

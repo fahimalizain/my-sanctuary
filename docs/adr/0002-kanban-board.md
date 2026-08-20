@@ -32,6 +32,10 @@ Date: 2026-08-19
 > row is returned unchanged, never moved to the tail. Drops still send an
 > absolute view-relative `sort_order`; § Move API and § Done / Discarded cap
 > are amended accordingly.
+>
+> Amendment (2026-08-20): priority is labeled **P0 / P1 / P2** in the UI
+> (`high` → P0, `medium` → P1, `low` → P2). Stored values stay
+> `high|medium|low`. § UI is amended.
 
 ## Context
 
@@ -225,7 +229,7 @@ entirely, sent or not).
 - Always **optimistic**. On failure: snap the dragged card back + error banner. A displaced task A stays parked if the start failed.
 - Occupied In Progress: `onDragEnd` does **not** apply the optimistic move. Stash `{ taskId, from }`, open a small dialog: move the old task to Planned / Done / Discarded. Confirm → one `move` with `displace`. Cancel → nothing.
 - Five columns, horizontal scroll on narrow screens (column min-width ~260px). Pad the bottom for the floating nav. No mobile-only column picker.
-- Neutral columns (Categories style: cream page, `rounded-xl`, `border-border`). Thin status accent on the header only. Color lives on the card: title, duration, priority dot, difficulty badge, category swatch (the Lists chip on a light surface).
+- Neutral columns (Categories style: cream page, `rounded-xl`, `border-border`). Thin status accent on the header only. Color lives on the card: title, duration, P0/P1 priority badge (P2 hidden like easy), difficulty badge, category color as a left-edge ribbon, category name pill (untracked hidden).
 - Column count = cards **currently shown** (after filter + cap). No `20 / 64` overflow hint.
 - Load: `GET /api/lists` first (seeds the taxonomy), then `GET /api/tasks` + `GET /api/categories` (filter options). Same sequential seed rule as `ListsPage`.
 
