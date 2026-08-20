@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
+import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { CalendarPicker } from '@/app/components/CalendarPicker';
 import { Button } from '@/components/ui/button';
 import {
@@ -9,6 +9,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { useNavigate, useRouter } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import type {
   CalendarsResponse,
@@ -56,6 +57,8 @@ interface CategoryFormState {
 }
 
 export function CategoriesPage() {
+  const router = useRouter();
+  const navigate = useNavigate();
   const [lists, setLists] = useState<TaskList[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   // Latest `lists` for the dependency-free `load` callback below (writing a
@@ -157,6 +160,17 @@ export function CategoriesPage() {
       cancelled = true;
     };
   }, [form]);
+
+  // Header back button: leave through real in-app history when there is one
+  // (Board/Lists → Edit Categories); a direct load on /categories has none,
+  // so fall back to the Board tab.
+  const handleBack = () => {
+    if (router.history.canGoBack()) {
+      router.history.back();
+    } else {
+      navigate({ to: '/board' });
+    }
+  };
 
   // ──────────────────────────────────────────
   // Category actions — same dialogs and bodies as ListsPage.
@@ -315,9 +329,21 @@ export function CategoriesPage() {
         {/* Header */}
         <header className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="font-heading text-3xl font-bold text-foreground mb-2">
-              Categories
-            </h1>
+            <div className="flex items-center gap-2 mb-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Go back"
+                className="-ml-2"
+                onClick={handleBack}
+              >
+                <ArrowLeft className="h-5 w-5" />
+              </Button>
+              <h1 className="font-heading text-3xl font-bold text-foreground">
+                Categories
+              </h1>
+            </div>
             <p className="text-muted-foreground">
               The taxonomy that files tasks into lists
             </p>
