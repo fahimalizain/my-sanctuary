@@ -483,6 +483,29 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn list_patterns_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            // Flat storage: match on the user's living categories' ids.
+            let living: Vec<String> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .map(|row| row.id.clone())
+                .collect();
+            Ok(self
+                .patterns
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|pattern| living.contains(&pattern.category_id))
+                .cloned()
+                .collect())
+        }
+
         async fn replace_patterns(
             &self,
             _category_id: &str,

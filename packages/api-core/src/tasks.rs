@@ -2300,6 +2300,35 @@ mod tests {
             Ok(rows)
         }
 
+        async fn list_patterns_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            // Mirrors TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL: only living
+            // categories' patterns, ordered by category then sort_order.
+            let living: Vec<String> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .map(|row| row.id.clone())
+                .collect();
+            let patterns = self.patterns.lock().unwrap();
+            let mut rows: Vec<TaskCategoryPattern> = living
+                .iter()
+                .filter_map(|category_id| patterns.get(category_id))
+                .flatten()
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                a.category_id
+                    .cmp(&b.category_id)
+                    .then_with(|| a.sort_order.cmp(&b.sort_order))
+            });
+            Ok(rows)
+        }
+
         async fn replace_patterns(
             &self,
             category_id: &str,

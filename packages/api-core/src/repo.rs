@@ -232,6 +232,12 @@ pub trait TaskCategoryRepo: Send + Sync {
         &self,
         category_id: &str,
     ) -> Result<Vec<TaskCategoryPattern>, RepoError>;
+    /// Every living category's patterns for the user, ordered by category then
+    /// `sort_order`. Categories with no patterns are absent from the result.
+    async fn list_patterns_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError>;
     /// HARD-deletes the existing patterns and inserts `patterns` in order
     /// (each gets `sort_order` = its Vec index). The D1 implementation
     /// generates UUID ids and timestamps.
@@ -703,6 +709,18 @@ pub const TASK_CATEGORY_GET_UNTRACKED_SQL: &str = "
 pub const TASK_CATEGORY_PATTERNS_LIST_SQL: &str =
     "SELECT * FROM task_category_patterns WHERE category_id = ? ORDER BY sort_order ASC";
 
+/// Every living category's patterns for the user in one statement: the
+/// patterns table has no `user_id` column, so the JOIN onto `task_categories`
+/// carries the user scope and the soft-delete filter (categories with no
+/// patterns are simply absent from the result).
+pub const TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL: &str = "
+    SELECT p.*
+    FROM task_category_patterns p
+    INNER JOIN task_categories c ON c.id = p.category_id
+    WHERE c.user_id = ? AND c.deleted_at IS NULL
+    ORDER BY p.category_id, p.sort_order ASC
+";
+
 /// HARD delete: replace_patterns wipes then re-inserts, so stale rows must
 /// actually disappear (same rule as watch channels — but note the FKs here
 /// are plain, so a hard delete is also required on category delete).
@@ -1167,6 +1185,18 @@ mod tests {
         assert!(insert.contains("INSERT INTO task_category_patterns"), "{insert}");
         assert_eq!(insert.matches('?').count(), 7, "{insert}");
         assert!(TASK_CATEGORY_PATTERNS_LIST_SQL.contains("ORDER BY sort_order ASC"), "{}", TASK_CATEGORY_PATTERNS_LIST_SQL);
+    }
+
+    #[test]
+    fn task_category_patterns_by_user_join_living_categories() {
+        // The bulk list has no user_id column of its own: the JOIN onto
+        // task_categories carries the user scope and the soft-delete filter.
+        let sql = TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL;
+        assert!(sql.contains("INNER JOIN task_categories c ON c.id = p.category_id"), "{sql}");
+        assert!(sql.contains("c.user_id = ?"), "{sql}");
+        assert!(sql.contains("c.deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("ORDER BY p.category_id, p.sort_order ASC"), "{sql}");
+        assert!(!sql.contains("p.user_id"), "patterns table has no user_id: {sql}");
     }
 
     #[test]
