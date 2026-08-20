@@ -554,14 +554,9 @@ export function CategoriesPage() {
         onOpenChange={(open) => !open && closeForm()}
       >
         <DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[560px] bg-card border-border">
-          <div
-            className="h-2 shrink-0"
-            style={{ backgroundColor: color }}
-          />
+          <div className="h-2 shrink-0" style={{ backgroundColor: color }} />
           <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
-            <DialogTitle className="text-foreground">
-              {dialogTitle}
-            </DialogTitle>
+            <DialogTitle className="text-foreground">{dialogTitle}</DialogTitle>
             <DialogDescription>
               {form?.mode === 'edit'
                 ? 'Update the category and its title-matching patterns.'
@@ -570,7 +565,6 @@ export function CategoriesPage() {
           </DialogHeader>
           <hr className="shrink-0 border-border" />
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
-
             <div className="space-y-2 mb-5">
               <label className="text-sm font-medium text-foreground">
                 Title
@@ -703,21 +697,21 @@ export function CategoriesPage() {
           </div>
 
           <div className="flex shrink-0 justify-end gap-3 border-t border-border px-6 py-4">
-              <Button
-                variant="outline"
-                onClick={closeForm}
-                className="border-input text-foreground hover:bg-muted"
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={handleCategorySubmit}
-                disabled={!title.trim() || saving}
-                className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {saving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                {form?.mode === 'edit' ? 'Save Changes' : 'Create Category'}
-              </Button>
+            <Button
+              variant="outline"
+              onClick={closeForm}
+              className="border-input text-foreground hover:bg-muted"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleCategorySubmit}
+              disabled={!title.trim() || saving}
+              className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {saving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              {form?.mode === 'edit' ? 'Save Changes' : 'Create Category'}
+            </Button>
           </div>
         </DialogContent>
       </Dialog>

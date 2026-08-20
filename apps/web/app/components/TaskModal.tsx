@@ -544,44 +544,44 @@ export function TaskModal({
           </div>
 
           <div className="flex shrink-0 items-center justify-between border-t border-border px-6 py-4">
-              {isEditing ? (
-                <Button
-                  variant="ghost"
-                  onClick={handleDelete}
-                  disabled={saving || movingStatus}
-                  className="text-destructive hover:text-destructive hover:bg-destructive/10"
-                >
-                  Delete
-                </Button>
-              ) : (
-                <div />
-              )}
-              <div className="flex gap-3">
-                <Button
-                  variant="outline"
-                  onClick={() => onOpenChange(false)}
-                  disabled={saving}
-                  className="border-input text-foreground hover:bg-muted"
-                >
-                  Cancel
-                </Button>
-                <Button
-                  onClick={handleSave}
-                  disabled={
-                    !title.trim() ||
-                    saving ||
-                    movingStatus ||
-                    classifyStatus.state === 'nomatch' ||
-                    classifyStatus.state === 'conflict' ||
-                    (isEditing &&
-                      task!.category.is_untracked &&
-                      classifyStatus.state !== 'matched')
-                  }
-                  className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-                >
-                  {isEditing ? 'Save Changes' : 'Create Task'}
-                </Button>
-              </div>
+            {isEditing ? (
+              <Button
+                variant="ghost"
+                onClick={handleDelete}
+                disabled={saving || movingStatus}
+                className="text-destructive hover:text-destructive hover:bg-destructive/10"
+              >
+                Delete
+              </Button>
+            ) : (
+              <div />
+            )}
+            <div className="flex gap-3">
+              <Button
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={saving}
+                className="border-input text-foreground hover:bg-muted"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleSave}
+                disabled={
+                  !title.trim() ||
+                  saving ||
+                  movingStatus ||
+                  classifyStatus.state === 'nomatch' ||
+                  classifyStatus.state === 'conflict' ||
+                  (isEditing &&
+                    task!.category.is_untracked &&
+                    classifyStatus.state !== 'matched')
+                }
+                className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {isEditing ? 'Save Changes' : 'Create Task'}
+              </Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>

@@ -10,10 +10,7 @@ import '../styles/globals.css';
 import { Home, LayoutGrid, CalendarDays, Target, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ReloadPrompt } from '@/app/components/ReloadPrompt';
-import {
-  NAV_LABEL_MIN_WIDTH_PX,
-  navPillDestination,
-} from '@/app/nav-pill';
+import { NAV_LABEL_MIN_WIDTH_PX, navPillDestination } from '@/app/nav-pill';
 declare const __APP_VERSION__: string;
 
 const navItems = [
@@ -126,9 +123,7 @@ function Navigation() {
   // re-measure on the media query itself so the pill tracks it even when
   // the row ResizeObserver fires late.
   useEffect(() => {
-    const mql = window.matchMedia(
-      `(min-width: ${NAV_LABEL_MIN_WIDTH_PX}px)`,
-    );
+    const mql = window.matchMedia(`(min-width: ${NAV_LABEL_MIN_WIDTH_PX}px)`);
     const onChange = () => measure();
     mql.addEventListener('change', onChange);
     return () => mql.removeEventListener('change', onChange);

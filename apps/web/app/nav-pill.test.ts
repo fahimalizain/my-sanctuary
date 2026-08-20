@@ -1,9 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  NAV_LABEL_MIN_WIDTH_PX,
-  navPillDestination,
-} from './nav-pill';
+import { NAV_LABEL_MIN_WIDTH_PX, navPillDestination } from './nav-pill';
 
 // ── NAV_LABEL_MIN_WIDTH_PX ──────────────────────────────────────────────
 
