@@ -116,6 +116,7 @@ use crate::models::{
     TaskCategoryPattern, UpdateTask,
 };
 use crate::oauth::HttpClient;
+use crate::pattern_gen::{emit_affixes, fill_regex, split_hole};
 use crate::repo::{
     CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo, TaskListRepo, TaskLogRepo,
     TaskRepo, TokenRepo,
@@ -388,42 +389,98 @@ pub async fn list_tasks(
 /// drive the TaskModal: matched → "Files to ● X"; untracked(conflict=false)
 /// → "No category matches — Save will fail"; untracked(conflict=true) →
 /// "Matches A and B — be more specific" (categories names them).
+///
+/// Every variant carries the chrome and the two views the modal needs:
+/// `prefix`/`suffix` are the fixed text around the title's slot (empty when
+/// there is none), `persist_title` is what a save would store (a filled
+/// string we guarantee files to the category), and `display_title` is what
+/// the input shows (`""` when the hole is untouched, so the FE disables
+/// Save on it).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ClassifyResponse {
-    Matched { category: TaskCategorySummary },
+    Matched {
+        category: TaskCategorySummary,
+        prefix: String,
+        suffix: String,
+        persist_title: String,
+        display_title: String,
+    },
     /// `conflict: true` when several categories matched (names them in
-    /// `categories`); `false` when nothing matched. The untracked sink
-    /// can never match (it has no patterns), so it never appears here.
-    Untracked { conflict: bool, categories: Vec<TaskCategorySummary> },
+    /// `categories`); `false` when nothing matched (including the no-hole
+    /// locked categories). The untracked sink can never match (it has no
+    /// patterns), so it never appears here.
+    Untracked {
+        conflict: bool,
+        categories: Vec<TaskCategorySummary>,
+        prefix: String,
+        suffix: String,
+        persist_title: String,
+        display_title: String,
+    },
 }
 
 /// Classifies a title against the user's taxonomy for the modal's blur
 /// preview. A read — never writes task rows.
 ///
-/// - A blank title is 400 (same rule as create).
-/// - 0 matches → `Untracked { conflict: false }`.
-/// - 1 match → `Matched`, unless the match is the `untracked` sink
-///   (impossible per the locked rules; checked defensively like `to_view`)
-///   — then `Untracked { conflict: false }`.
-/// - 2+ matches → `Untracked { conflict: true }` naming every match.
+/// `title` is always passed (the caller may send `""`); it is trimmed.
+/// `category_id` optionally locks the classification to one category:
+///
+/// - **No lock** (`None`): a blank title is 400 (same rule as create).
+///   0 matches → `Untracked { conflict: false }`; 1 match → `Matched`,
+///   unless the match is the `untracked` sink (impossible per the locked
+///   rules; checked defensively like `to_view`) — then
+///   `Untracked { conflict: false }`; 2+ matches →
+///   `Untracked { conflict: true }` naming every match. A `Matched` carries
+///   the affixes split from the first matching pattern's hole (no chrome and
+///   the title as display when the pattern has no hole).
+/// - **Locked** (`Some(id)`): `id` must resolve to a living, non-untracked
+///   category of this user — a missing / other-user / untracked id is
+///   `Invalid("category not found")`, deliberately NOT `NotFound` (the worker
+///   maps that to "task not found"). A blank title is allowed and previews
+///   the category's canonical chrome. A title that already uniquely files to
+///   the category is kept as-is (identity); otherwise it is filled into the
+///   category's first hole-bearing pattern. A category with no hole to fill
+///   reports `Untracked { conflict: false }` for a title that does not file.
 pub async fn classify_title(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
     title: &str,
+    category_id: Option<&str>,
 ) -> Result<ClassifyResponse, TasksError> {
     let title = title.trim().to_string();
+    // Same count-gated load as create: seed on first visit, then read.
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+
+    let Some(lock) = category_id else {
+        return classify_unlocked(&title, &taxonomy);
+    };
+
+    // Resolve the lock in the user's living taxonomy (`load_taxonomy` already
+    // filtered `list_by_user_id`, so another user's id is simply absent). The
+    // untracked sink is not a valid lock target.
+    let category = taxonomy
+        .categories
+        .iter()
+        .find(|category| category.id == lock && !category.is_untracked)
+        .ok_or_else(|| TasksError::Invalid("category not found".to_string()))?;
+    let matcher = taxonomy
+        .matchers
+        .iter()
+        .find(|matcher| matcher.category_id == category.id)
+        .expect("load_taxonomy builds a matcher for every category");
+    classify_locked(&title, category, matcher, &taxonomy)
+}
+
+/// The no-lock classify rules (rule 1): the pre-slice behavior plus the
+/// affix/persist/display fields. `title` is trimmed and must be non-blank.
+fn classify_unlocked(title: &str, taxonomy: &Taxonomy) -> Result<ClassifyResponse, TasksError> {
     if title.is_empty() {
         return Err(TasksError::Invalid("title must not be empty".to_string()));
     }
-    // Same count-gated load as create: seed on first visit, then read.
-    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
-    let detail = classify_detailed(&title, CalendarScope::Ignore, &taxonomy.matchers);
+    let detail = classify_detailed(title, CalendarScope::Ignore, &taxonomy.matchers);
     let response = match detail.matched.len() {
-        0 => ClassifyResponse::Untracked {
-            conflict: false,
-            categories: Vec::new(),
-        },
+        0 => untracked(title, false, Vec::new()),
         1 => {
             let id = &detail.matched[0];
             let category = taxonomy
@@ -431,20 +488,30 @@ pub async fn classify_title(
                 .iter()
                 .find(|category| &category.id == id);
             match category {
-                Some(category) if !category.is_untracked => ClassifyResponse::Matched {
-                    category: summary_for(category, &taxonomy.categories),
-                },
+                Some(category) if !category.is_untracked => {
+                    let matcher = taxonomy
+                        .matchers
+                        .iter()
+                        .find(|matcher| &matcher.category_id == id)
+                        .expect("load_taxonomy builds a matcher for every category");
+                    let (prefix, suffix, display) = split_affixes(title, matcher);
+                    ClassifyResponse::Matched {
+                        category: summary_for(category, &taxonomy.categories),
+                        prefix,
+                        suffix,
+                        persist_title: title.to_string(),
+                        display_title: display,
+                    }
+                }
                 // The sink (or a vanished category — impossible in one run,
                 // but never panic on a read): report no match.
-                _ => ClassifyResponse::Untracked {
-                    conflict: false,
-                    categories: Vec::new(),
-                },
+                _ => untracked(title, false, Vec::new()),
             }
         }
-        _ => ClassifyResponse::Untracked {
-            conflict: true,
-            categories: detail
+        _ => untracked(
+            title,
+            true,
+            detail
                 .matched
                 .iter()
                 .filter_map(|id| {
@@ -458,9 +525,177 @@ pub async fn classify_title(
                         .map(|category| summary_for(category, &taxonomy.categories))
                 })
                 .collect(),
-        },
+        ),
     };
     Ok(response)
+}
+
+/// The locked classify rules (rule 2): the title (possibly blank) is filed
+/// into the locked category — identity when it already files, otherwise the
+/// first hole of the category's first hole-bearing pattern.
+fn classify_locked(
+    title: &str,
+    category: &TaskCategory,
+    matcher: &CategoryWithPatterns,
+    taxonomy: &Taxonomy,
+) -> Result<ClassifyResponse, TasksError> {
+    let summary = summary_for(category, &taxonomy.categories);
+
+    // Identity path: a non-blank title that already uniquely files to C keeps
+    // its exact spelling — persist = title — with the affixes as ACTUALLY
+    // spelled under C's first matching pattern ("… | SpicyHome" stays compact,
+    // never re-emitted as " | Spicy Home").
+    let unique_to_c = !title.is_empty()
+        && matches!(
+            classify(title, CalendarScope::Ignore, &taxonomy.matchers),
+            ClassifyOutcome::Matched { category_id } if category_id == category.id
+        );
+    if unique_to_c {
+        let (prefix, suffix, display) = split_affixes(title, matcher);
+        return Ok(ClassifyResponse::Matched {
+            category: summary,
+            prefix,
+            suffix,
+            persist_title: title.to_string(),
+            display_title: display,
+        });
+    }
+
+    // C's FIRST hole-bearing pattern, walked in stored vec order (= the repo's
+    // `sort_order`); a pattern is hole-bearing iff `emit_affixes` returns
+    // `Some`. An invalid stored regex is skipped, exactly like matching.
+    let hole_pattern = matcher.patterns.iter().find(|pattern| {
+        matches!(emit_affixes(&pattern.regex), Ok(Some(_)))
+    });
+    let Some(pattern) = hole_pattern else {
+        // A no-hole category outside the identity case has nothing to file the
+        // title into: report untracked with the title as-is.
+        return Ok(untracked(title, false, Vec::new()));
+    };
+
+    // The guaranteed chrome — the `find` above only kept hole-bearing
+    // patterns whose affixes emit cleanly.
+    let (prefix, suffix) = emit_affixes(&pattern.regex)
+        .ok()
+        .flatten()
+        .expect("hole-bearing patterns always emit affixes");
+
+    if title.is_empty() {
+        // Blank + lock + hole: preview the canonical chrome. persist is the
+        // chrome itself and display is "" so the FE disables Save until the
+        // hole is filled.
+        let preview = format!("{prefix}{suffix}");
+        return Ok(if files_to(&preview, category, &taxonomy.matchers) {
+            ClassifyResponse::Matched {
+                category: summary,
+                prefix,
+                suffix,
+                persist_title: preview,
+                display_title: String::new(),
+            }
+        } else {
+            untracked_with(&preview, false, Vec::new(), prefix, suffix)
+        });
+    }
+
+    // Non-blank title outside the identity case: fill C's first hole with it.
+    // A fill failure (e.g. a newline in a default `.` hole) is a 400 carrying
+    // the fill engine's message.
+    let persist_title = fill_regex(&pattern.regex, title)
+        .map_err(|err| TasksError::Invalid(err.to_string()))?;
+
+    // Actual chrome: the filled string always lies in L(P), so split it at the
+    // hole for the real spelling — a title already in L(P) round-trips.
+    let (split_prefix, split_suffix, hole) = match split_hole(&pattern.regex, &persist_title) {
+        Ok(split) => (split.prefix, split.suffix, split.hole),
+        // Defensive: the fill always matches its pattern, so NoMatch/NoHole
+        // here is unreachable — degrade to identity chrome.
+        Err(_) => (String::new(), String::new(), persist_title.clone()),
+    };
+
+    // Confirm the filled title files to C; a cross-tree overlap (a sibling or
+    // other category that also matches) reports as an untracked conflict
+    // naming the actual categories.
+    if files_to(&persist_title, category, &taxonomy.matchers) {
+        Ok(ClassifyResponse::Matched {
+            category: summary,
+            prefix: split_prefix,
+            suffix: split_suffix,
+            persist_title,
+            display_title: hole,
+        })
+    } else {
+        let detail = classify_detailed(&persist_title, CalendarScope::Ignore, &taxonomy.matchers);
+        let conflicting: Vec<TaskCategorySummary> = detail
+            .matched
+            .iter()
+            .filter_map(|id| {
+                taxonomy
+                    .categories
+                    .iter()
+                    .find(|entry| entry.id == *id)
+                    .filter(|entry| !entry.is_untracked)
+                    .map(|entry| summary_for(entry, &taxonomy.categories))
+            })
+            .collect();
+        Ok(untracked_with(
+            &persist_title,
+            !detail.matched.is_empty(),
+            conflicting,
+            split_prefix,
+            split_suffix,
+        ))
+    }
+}
+
+/// Whether `title` uniquely classifies to `category` (the reduced match set is
+/// exactly this one category).
+fn files_to(title: &str, category: &TaskCategory, matchers: &[CategoryWithPatterns]) -> bool {
+    matches!(
+        classify(title, CalendarScope::Ignore, matchers),
+        ClassifyOutcome::Matched { category_id } if category_id == category.id
+    )
+}
+
+/// The chrome around `title` as ACTUALLY spelled under the first matching
+/// pattern of `matcher`, returned as `(prefix, suffix, display)` — `display`
+/// is the text the hole absorbed. A missing pattern, a hole-less pattern
+/// (`NoHole`), or a defensive non-match (`NoMatch`) all degrade to no chrome
+/// with the title itself as the display value.
+fn split_affixes(title: &str, matcher: &CategoryWithPatterns) -> (String, String, String) {
+    let Some(pattern) = first_matching_pattern(title, CalendarScope::Ignore, matcher) else {
+        return (String::new(), String::new(), title.to_string());
+    };
+    match split_hole(&pattern.regex, title) {
+        Ok(split) => (split.prefix, split.suffix, split.hole),
+        Err(_) => (String::new(), String::new(), title.to_string()),
+    }
+}
+
+/// An `Untracked` response with no chrome and the title as both views (the
+/// no-lock untracked cases carry no pattern to split on).
+fn untracked(title: &str, conflict: bool, categories: Vec<TaskCategorySummary>) -> ClassifyResponse {
+    untracked_with(title, conflict, categories, String::new(), String::new())
+}
+
+/// An `Untracked` response with explicit chrome (used by the locked path
+/// fallbacks, where a real preview might exist). `display` stays the title:
+/// an untracked result has no hole to show.
+fn untracked_with(
+    title: &str,
+    conflict: bool,
+    categories: Vec<TaskCategorySummary>,
+    prefix: String,
+    suffix: String,
+) -> ClassifyResponse {
+    ClassifyResponse::Untracked {
+        conflict,
+        categories,
+        prefix,
+        suffix,
+        persist_title: title.to_string(),
+        display_title: title.to_string(),
+    }
 }
 
 /// Creates a task (always `status = "OPEN"`).
@@ -2901,11 +3136,11 @@ mod tests {
     // ──────────────────────────────────────────
 
     #[test]
-    fn classify_title_blank_title_is_invalid() {
+    fn classify_title_blank_title_is_invalid_without_a_lock() {
         let (lists, categories, _tasks) = seeded();
         for title in ["", "   "] {
-            let err =
-                pollster::block_on(classify_title(&lists, &categories, "u-1", title)).unwrap_err();
+            let err = pollster::block_on(classify_title(&lists, &categories, "u-1", title, None))
+                .unwrap_err();
             assert!(
                 matches!(err, TasksError::Invalid(m) if m == "title must not be empty"),
                 "{title:?}"
@@ -2917,12 +3152,23 @@ mod tests {
     fn classify_title_unique_match_returns_the_category_summary() {
         let (lists, categories, _tasks) = seeded();
         let response =
-            pollster::block_on(classify_title(&lists, &categories, "u-1", "Work")).unwrap();
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "Work", None)).unwrap();
         match response {
-            ClassifyResponse::Matched { category } => {
+            ClassifyResponse::Matched {
+                category,
+                prefix,
+                suffix,
+                persist_title,
+                display_title,
+            } => {
                 assert_eq!(category.title, "Work");
                 assert!(!category.is_untracked);
                 assert!(category.inherited_list_id.is_some(), "root owns a list");
+                // `^Work$` has no hole: no chrome, identity views.
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, "");
+                assert_eq!(persist_title, "Work");
+                assert_eq!(display_title, "Work");
             }
             other => panic!("expected Matched, got {other:?}"),
         }
@@ -2932,12 +3178,16 @@ mod tests {
     fn classify_title_no_match_reports_untracked_without_conflict() {
         let (lists, categories, _tasks) = seeded();
         let response =
-            pollster::block_on(classify_title(&lists, &categories, "u-1", "asdf")).unwrap();
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "asdf", None)).unwrap();
         assert_eq!(
             response,
             ClassifyResponse::Untracked {
                 conflict: false,
-                categories: Vec::new()
+                categories: Vec::new(),
+                prefix: String::new(),
+                suffix: String::new(),
+                persist_title: "asdf".to_string(),
+                display_title: "asdf".to_string(),
             }
         );
     }
@@ -2951,18 +3201,198 @@ mod tests {
         pollster::block_on(categories.replace_patterns(&ids["fitness"], vec![pattern("^Work$")]))
             .unwrap();
         let response =
-            pollster::block_on(classify_title(&lists, &categories, "u-1", "Work")).unwrap();
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "Work", None)).unwrap();
         match response {
             ClassifyResponse::Untracked {
                 conflict: true,
                 categories,
+                prefix,
+                suffix,
+                persist_title,
+                display_title,
             } => {
                 assert_eq!(categories.len(), 2);
                 let mut titles: Vec<&str> = categories.iter().map(|c| c.title.as_str()).collect();
                 titles.sort();
                 assert_eq!(titles, vec!["Fitness", "Work"]);
+                // Untracked conflicts carry no chrome and identity views.
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, "");
+                assert_eq!(persist_title, "Work");
+                assert_eq!(display_title, "Work");
             }
             other => panic!("expected untracked conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_unlocked_pipe_suffix_reports_chrome_and_hole() {
+        let (lists, categories, _tasks) = seeded();
+        let response =
+            pollster::block_on(classify_title(&lists, &categories, "u-1", "Test | Work", None))
+                .unwrap();
+        match response {
+            ClassifyResponse::Matched {
+                category,
+                prefix,
+                suffix,
+                persist_title,
+                display_title,
+            } => {
+                assert_eq!(category.title, "Work");
+                // `^.* [|] Work$` splits at the leading hole.
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, " | Work");
+                assert_eq!(display_title, "Test");
+                assert_eq!(persist_title, "Test | Work");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_unlocked_keeps_the_children_actual_suffix() {
+        let (lists, categories, _tasks) = seeded();
+        let child = spicyhome_child(&lists, &categories, None, None);
+        let response = pollster::block_on(classify_title(
+            &lists,
+            &categories,
+            "u-1",
+            "Hello! | SpicyHome",
+            None,
+        ))
+        .unwrap();
+        match response {
+            ClassifyResponse::Matched {
+                category,
+                prefix,
+                suffix,
+                display_title,
+                ..
+            } => {
+                assert_eq!(category.id, child.id);
+                // The actual spelling from the split — not the canonical
+                // " | Spicy Home" the first alternative would emit.
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, " | SpicyHome");
+                assert_eq!(display_title, "Hello!");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_locked_other_title_fills_the_hole() {
+        let (lists, categories, _tasks) = seeded();
+        let child = spicyhome_child(&lists, &categories, None, None);
+        // "Work" files to Work, not to the locked SpicyHome: it is filled into
+        // the child's hole — and it must NOT snap back to Work.
+        let response = pollster::block_on(classify_title(
+            &lists,
+            &categories,
+            "u-1",
+            "Work",
+            Some(&child.id),
+        ))
+        .unwrap();
+        match response {
+            ClassifyResponse::Matched {
+                category,
+                prefix,
+                suffix,
+                persist_title,
+                display_title,
+            } => {
+                assert_eq!(category.id, child.id);
+                assert_eq!(category.title, "SpicyHome");
+                // The child's single `^.* [|] SpicyHome$` pattern (no
+                // alternation) fills to the compact spelling.
+                assert_eq!(persist_title, "Work | SpicyHome");
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, " | SpicyHome");
+                assert_eq!(display_title, "Work");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_locked_blank_previews_the_chrome() {
+        let (lists, categories, _tasks) = seeded();
+        let child = spicyhome_child(&lists, &categories, None, None);
+        let response = pollster::block_on(classify_title(
+            &lists,
+            &categories,
+            "u-1",
+            "",
+            Some(&child.id),
+        ))
+        .unwrap();
+        match response {
+            ClassifyResponse::Matched {
+                category,
+                prefix,
+                suffix,
+                persist_title,
+                display_title,
+            } => {
+                assert_eq!(category.id, child.id);
+                // emit_affixes(`^.* [|] SpicyHome$`) → ("", " | SpicyHome").
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, " | SpicyHome");
+                assert_eq!(persist_title, " | SpicyHome", "persist = prefix + suffix");
+                assert_eq!(display_title, "", "blank hole shows nothing to save");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_locked_identity_keeps_compact_suffix() {
+        let (lists, categories, _tasks) = seeded();
+        let child = spicyhome_child(&lists, &categories, None, None);
+        let response = pollster::block_on(classify_title(
+            &lists,
+            &categories,
+            "u-1",
+            "Hello! | SpicyHome",
+            Some(&child.id),
+        ))
+        .unwrap();
+        match response {
+            ClassifyResponse::Matched {
+                category,
+                prefix,
+                suffix,
+                persist_title,
+                display_title,
+            } => {
+                assert_eq!(category.id, child.id);
+                assert_eq!(persist_title, "Hello! | SpicyHome", "identity persist");
+                assert_eq!(prefix, "");
+                assert_eq!(suffix, " | SpicyHome", "actual spelling preserved");
+                assert_eq!(display_title, "Hello!");
+            }
+            other => panic!("expected Matched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_title_locked_unknown_category_is_invalid() {
+        let (lists, categories, _tasks) = seeded();
+        for id in ["missing-category", ""] {
+            let err = pollster::block_on(classify_title(
+                &lists,
+                &categories,
+                "u-1",
+                "Work",
+                Some(id),
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, TasksError::Invalid(m) if m == "category not found"),
+                "{id:?}"
+            );
         }
     }
 
