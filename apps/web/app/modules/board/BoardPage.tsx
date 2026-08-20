@@ -957,7 +957,7 @@ export function BoardPage() {
       </div>
 
       {(lists.length > 0 || (!isLoading && !loadError)) && (
-            /* Five status columns. The scroller fills leftover viewport
+        /* Five status columns. The scroller fills leftover viewport
                 height so empty space below the columns still pans. Columns
                 are a fixed 260px; the row stays centered and overflow-x
                 on narrow screens. mb-24 sits the scrollbar just above
@@ -970,7 +970,7 @@ export function BoardPage() {
           onDragCancel={() => setActiveDrag(null)}
         >
           <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
-                <div className="mx-auto flex min-h-full w-max gap-6 px-6">
+            <div className="mx-auto flex min-h-full w-max gap-6 px-6">
               {COLUMNS.map((column) => (
                 <BoardColumnView
                   key={column.status}
