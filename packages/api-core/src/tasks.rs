@@ -315,7 +315,13 @@ pub struct MoveTaskResponse {
 pub struct TaskView {
     pub id: String,
     pub user_id: String,
+    /// The stored full string — always the authority (what a PATCH round-trips).
     pub title: String,
+    /// The **computed** display form: the hole split off `title` under the
+    /// category's first matching pattern ("Review Q3 | Work" → "Review Q3").
+    /// Never null: a patternless match (e.g. "Work"), untracked, or conflict
+    /// all keep `title` verbatim.
+    pub display_title: String,
     pub description: String,
     pub duration_minutes: i64,
     pub priority: String,
@@ -2168,23 +2174,48 @@ fn is_valid_difficulty(difficulty: &str) -> bool {
 
 fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
     let outcome = classify(&task.title, CalendarScope::Ignore, &taxonomy.matchers);
-    let category = match &outcome {
-        ClassifyOutcome::Matched { category_id } => taxonomy
-            .categories
-            .iter()
-            .find(|category| category.id == *category_id)
-            // A task matched a category that vanished between the pattern
-            // build and here (impossible in one run, but never panic on read):
-            // fall back to the untracked sink.
-            .map(|category| summary_for(category, &taxonomy.categories))
-            .or_else(|| untracked_summary(&taxonomy.categories)),
-        ClassifyOutcome::Untracked { .. } => untracked_summary(&taxonomy.categories),
+    // Resolve the category AND the display_title together: a Matched,
+    // non-untracked category splits its first matching pattern's hole off the
+    // title ("Review Q3 | Work" → "Review Q3"); every other outcome — no
+    // pattern, no hole, untracked, conflict — keeps the title verbatim.
+    let (category, display_title) = match &outcome {
+        ClassifyOutcome::Matched { category_id } => {
+            let category = taxonomy
+                .categories
+                .iter()
+                .find(|category| category.id == *category_id)
+                // A task matched a category that vanished between the pattern
+                // build and here (impossible in one run, but never panic on read):
+                // fall back to the untracked sink.
+                .map(|category| summary_for(category, &taxonomy.categories))
+                .or_else(|| untracked_summary(&taxonomy.categories));
+            match category {
+                Some(category) if !category.is_untracked => {
+                    // `load_taxonomy` builds a matcher for every living
+                    // category, so the lookup cannot fail; `split_affixes`
+                    // degrades to `title` when the pattern has no hole.
+                    let display_title = taxonomy
+                        .matchers
+                        .iter()
+                        .find(|matcher| matcher.category_id == category.id)
+                        .map(|matcher| split_affixes(&task.title, matcher).2)
+                        .unwrap_or_else(|| task.title.clone());
+                    (Some(category), display_title)
+                }
+                _ => (category, task.title.clone()),
+            }
+        }
+        ClassifyOutcome::Untracked { .. } => (
+            untracked_summary(&taxonomy.categories),
+            task.title.clone(),
+        ),
     };
     let category = category.expect("ensure_taxonomy guarantees the untracked sink exists");
     TaskView {
         id: task.id.clone(),
         user_id: task.user_id.clone(),
         title: task.title.clone(),
+        display_title,
         description: task.description.clone(),
         duration_minutes: task.duration_minutes,
         priority: task.priority.clone(),
@@ -2876,6 +2907,10 @@ mod tests {
         assert_eq!(work.task.category.title, "Work");
         assert!(!work.task.category.is_untracked);
         assert!(work.task.category.inherited_list_id.is_some(), "root owns a list");
+        // display_title mirrors the stored title: the exact `^Work$` pattern
+        // has no hole to split off.
+        assert_eq!(work.task.title, "Work");
+        assert_eq!(work.task.display_title, "Work");
 
         let review = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Review Q3 | Work"),
@@ -2884,6 +2919,42 @@ mod tests {
         assert_eq!(review.task.category.title, "Work");
         assert_ne!(work.task.id, review.task.id, "titles are not unique");
         assert_eq!(work.task.category.id, review.task.category.id);
+        // The stored title stays the full string; display_title is the hole
+        // split off by the `^.* [|] Work$` pattern.
+        assert_eq!(review.task.title, "Review Q3 | Work");
+        assert_eq!(review.task.display_title, "Review Q3");
+    }
+
+    #[test]
+    fn create_carries_display_title() {
+        let (lists, categories, tasks) = seeded();
+
+        // Exact root match: no hole, so display == title.
+        let work = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Work"),
+        ))
+        .unwrap();
+        assert_eq!(work.task.title, "Work");
+        assert_eq!(work.task.display_title, "Work");
+
+        // Pipe suffix on a root: the `.*` hole absorbs the prefix.
+        let test = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Test | Work"),
+        ))
+        .unwrap();
+        assert_eq!(test.task.title, "Test | Work", "title stays the stored full string");
+        assert_eq!(test.task.display_title, "Test");
+
+        // A child-filed title splits its own pattern's hole ("Hello! | SpicyHome"
+        // files to the SpicyHome child's `^.* [|] SpicyHome$`, never to Work).
+        spicyhome_child(&lists, &categories, None, None);
+        let child = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Hello! | SpicyHome"),
+        ))
+        .unwrap();
+        assert_eq!(child.task.category.title, "SpicyHome");
+        assert_eq!(child.task.title, "Hello! | SpicyHome");
+        assert_eq!(child.task.display_title, "Hello!");
     }
 
     #[test]

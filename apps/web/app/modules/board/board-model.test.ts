@@ -16,6 +16,7 @@ function task(
     id,
     user_id: 'u1',
     title: 'Work',
+    display_title: 'Work',
     description: '',
     duration_minutes: 15,
     priority: 'medium',

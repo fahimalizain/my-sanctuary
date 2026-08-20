@@ -225,7 +225,12 @@ export type TaskStatus =
 export interface TaskRecord {
   id: string;
   user_id: string;
+  // The stored full string — always the authority.
   title: string;
+  // Computed by the API: the hole split off `title` under the category's
+  // first matching pattern ("Review Q3 | Work" → "Review Q3"). Never null; a
+  // patternless match (e.g. "Work"), untracked, or conflict keep `title`.
+  display_title: string;
   description: string;
   duration_minutes: number;
   priority: TaskPriority;
