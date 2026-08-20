@@ -31,9 +31,10 @@ import type {
   UpdateTaskInput,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
+import { CategoryFilter } from './CategoryFilter';
 import { FilterPill } from './FilterPill';
 import { TaskCard } from './TaskCard';
-import { categoryMatchesSelection } from './board-filters';
+import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
 import {
   COLUMNS,
   COLUMN_ID_PREFIX,
@@ -231,15 +232,13 @@ export function BoardPage() {
   const setDifficultyFilter = (value: TaskDifficulty | undefined) =>
     updateSearch({ difficulty: value });
 
+  // Explicit ids only — a click on a row implied by a selected parent is a
+  // no-op (`toggleCategoryId`), so implied ids never leak into the URL and
+  // the URL never rewrites an implied child out (ADR 0002 § Filters).
   const toggleCategoryFilter = (id: string) => {
-    const next = new Set(selectedCategoryIds);
-    if (next.has(id)) {
-      next.delete(id);
-    } else {
-      next.add(id);
-    }
+    const next = toggleCategoryId(selectedCategoryIds, id, categories);
     updateSearch({
-      category: next.size > 0 ? [...next].join(',') : undefined,
+      category: next.length > 0 ? next.join(',') : undefined,
     });
   };
 
@@ -868,77 +867,76 @@ export function BoardPage() {
             never unmount it. */}
         {(lists.length > 0 || (!isLoading && !loadError)) && (
           <>
-            {/* URL filters — priority / difficulty are single-select with an
-                All option, category is multi-select. Combined with AND. */}
+            {/* URL filters — one wrapping horizontal row (ADR 0002 § UI):
+                Priority and Difficulty are single-select All+value pills;
+                Category is a searchable checkbox combobox grouped by list →
+                root → children. Filters combine with AND. */}
             <section className="mb-6 space-y-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Priority
-                </span>
-                <FilterPill
-                  selected={priority === undefined}
-                  onClick={() => setPriorityFilter(undefined)}
-                >
-                  All
-                </FilterPill>
-                {(['high', 'medium', 'low'] as TaskPriority[]).map((value) => (
-                  <FilterPill
-                    key={value}
-                    selected={priority === value}
-                    onClick={() => setPriorityFilter(value)}
-                  >
-                    {value[0].toUpperCase() + value.slice(1)}
-                  </FilterPill>
-                ))}
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Difficulty
-                </span>
-                <FilterPill
-                  selected={difficulty === undefined}
-                  onClick={() => setDifficultyFilter(undefined)}
-                >
-                  All
-                </FilterPill>
-                {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
-                  (value) => (
-                    <FilterPill
-                      key={value}
-                      selected={difficulty === value}
-                      onClick={() => setDifficultyFilter(value)}
-                    >
-                      {value[0].toUpperCase() + value.slice(1)}
-                    </FilterPill>
-                  ),
-                )}
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Category
-                </span>
-                {filterableCategories.length > 0 ? (
-                  filterableCategories.map((cat) => (
-                    <FilterPill
-                      key={cat.id}
-                      selected={selectedCategoryIds.includes(cat.id)}
-                      onClick={() => toggleCategoryFilter(cat.id)}
-                    >
-                      <span
-                        className="h-2 w-2 rounded-full"
-                        style={{ backgroundColor: cat.color }}
-                        aria-hidden
-                      />
-                      {cat.title}
-                    </FilterPill>
-                  ))
-                ) : (
-                  <span className="text-sm text-muted-foreground italic">
-                    No categories yet
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Priority
                   </span>
-                )}
+                  <FilterPill
+                    selected={priority === undefined}
+                    onClick={() => setPriorityFilter(undefined)}
+                  >
+                    All
+                  </FilterPill>
+                  {(['high', 'medium', 'low'] as TaskPriority[]).map(
+                    (value) => (
+                      <FilterPill
+                        key={value}
+                        selected={priority === value}
+                        onClick={() => setPriorityFilter(value)}
+                      >
+                        {value[0].toUpperCase() + value.slice(1)}
+                      </FilterPill>
+                    ),
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Difficulty
+                  </span>
+                  <FilterPill
+                    selected={difficulty === undefined}
+                    onClick={() => setDifficultyFilter(undefined)}
+                  >
+                    All
+                  </FilterPill>
+                  {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
+                    (value) => (
+                      <FilterPill
+                        key={value}
+                        selected={difficulty === value}
+                        onClick={() => setDifficultyFilter(value)}
+                      >
+                        {value[0].toUpperCase() + value.slice(1)}
+                      </FilterPill>
+                    ),
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Category
+                  </span>
+                  {filterableCategories.length > 0 ? (
+                    <CategoryFilter
+                      lists={lists}
+                      categories={categories}
+                      selectedIds={selectedCategoryIds}
+                      onToggle={toggleCategoryFilter}
+                      onClear={() => updateSearch({ category: undefined })}
+                    />
+                  ) : (
+                    <span className="text-sm text-muted-foreground italic">
+                      No categories yet
+                    </span>
+                  )}
+                </div>
               </div>
 
               {hasActiveFilters && (

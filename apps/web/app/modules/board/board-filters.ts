@@ -61,6 +61,25 @@ export function isImpliedByParent(
 }
 
 /**
+ * Toggle an explicit id. If the id is implied by a selected parent, return
+ * the same ids unchanged (click is a no-op). Otherwise add or remove `id`.
+ * Never inserts children when adding a parent.
+ */
+export function toggleCategoryId(
+  selectedIds: readonly string[],
+  id: string,
+  categories: readonly Category[],
+): string[] {
+  if (isImpliedByParent(id, selectedIds, categories)) {
+    return [...selectedIds];
+  }
+  if (selectedIds.includes(id)) {
+    return selectedIds.filter((selected) => selected !== id);
+  }
+  return [...selectedIds, id];
+}
+
+/**
  * 0 explicit ids → "All"
  * 1 → that category's title (fallback to the raw id if the row is missing)
  * N → `${n} categories`

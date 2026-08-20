@@ -8,6 +8,7 @@ import {
   childIdsOf,
   expandCategorySelection,
   isImpliedByParent,
+  toggleCategoryId,
 } from './board-filters';
 
 // ── Fixtures (inline — never import mock-data) ───────────────────────────
@@ -252,6 +253,52 @@ test('isImpliedByParent: false for roots, untracked and unknown ids', () => {
   assert.equal(isImpliedByParent('root-dev', ['root-dev'], categories), false);
   assert.equal(isImpliedByParent('untracked', ['root-dev'], categories), false);
   assert.equal(isImpliedByParent('ghost', ['root-dev'], categories), false);
+});
+
+// ── toggleCategoryId ─────────────────────────────────────────────────────
+
+test('toggleCategoryId: toggling a parent on adds only the parent id', () => {
+  assert.deepEqual(toggleCategoryId([], 'root-dev', categories), ['root-dev']);
+  assert.deepEqual(toggleCategoryId(['root-life'], 'root-dev', categories), [
+    'root-life',
+    'root-dev',
+  ]);
+});
+
+test('toggleCategoryId: toggling a parent off removes it', () => {
+  assert.deepEqual(
+    toggleCategoryId(['root-dev', 'root-life'], 'root-dev', categories),
+    ['root-life'],
+  );
+  assert.deepEqual(toggleCategoryId(['root-dev'], 'root-dev', categories), []);
+});
+
+test('toggleCategoryId: toggling an implied child is a no-op', () => {
+  // Never adds the implied id to the URL…
+  assert.deepEqual(
+    toggleCategoryId(['root-dev'], 'child-frontend', categories),
+    ['root-dev'],
+  );
+  // …and never rewrites an implied id out of the URL.
+  assert.deepEqual(
+    toggleCategoryId(
+      ['root-dev', 'child-frontend'],
+      'child-frontend',
+      categories,
+    ),
+    ['root-dev', 'child-frontend'],
+  );
+});
+
+test('toggleCategoryId: toggling a free child adds or removes just that id', () => {
+  assert.deepEqual(toggleCategoryId(['root-dev'], 'child-ui', categories), [
+    'root-dev',
+    'child-ui',
+  ]);
+  assert.deepEqual(
+    toggleCategoryId(['root-dev', 'child-ui'], 'child-ui', categories),
+    ['root-dev'],
+  );
 });
 
 // ── categoryTriggerLabel ─────────────────────────────────────────────────
