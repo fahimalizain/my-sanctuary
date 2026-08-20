@@ -37,6 +37,11 @@ Date: 2026-08-19
 > (`high` → P0, `medium` → P1, `low` → P2). Stored values stay
 > `high|medium|low`. § UI is amended.
 
+> Amendment (2026-08-20): start opens a **fixed** `T … T + 15` live marker on
+> the minute grid — independent of `duration_minutes`, which stays the card's
+> planned estimate. § Decision → Google side effects is amended; the elongate
+> cron and the exit verbs are unchanged.
+
 ## Context
 
 `/lists` is a list-colored pile of tasks. We are replacing it in the nav with a status kanban at `/board`. This ADR is slice 0 of 5: it locks the design for the board. Nothing is implemented yet; later slices implement against this document the same way ADR 0001 was the source of truth for watch channels.
@@ -118,7 +123,7 @@ is never double-placed — the slice-2 omit-pause peer shift (old Planned peer
 
 Google side effects:
 
-- **start**: create event `now … now + duration` (existing `start_task`). 409 if any running event exists unless `displace` is provided (see Move API).
+- **start**: create event `now … now + 15` — a fixed live marker (`START_EVENT_MINUTES`), not `duration_minutes`. 409 if any running event exists unless `displace` is provided (see Move API).
 - **Every exit from `IN_PROGRESS`** (stop / pause / complete / discard): PATCH the open event end to now (existing auto-stop). No new event.
 - **plan / unplan / reopen / reorder / complete-or-discard when not running**: no Google writes.
 - Reopen is a new chapter, not an undo. Old completed/discarded logs and closed events stay.

@@ -367,7 +367,8 @@ async fn timer_access(
 
 /// POST /api/tasks/:id/start → 200 `{"task":{...},"event":{...}}`.
 ///
-/// Opens a Google Calendar event now → now + duration (summary = task title,
+/// Opens a Google Calendar event now → now + 15 min — a fixed live marker,
+/// independent of `duration_minutes` — (summary = task title,
 /// `extendedProperties.shared.sanctuary_task_id` = task UUID) and marks the
 /// task IN_PROGRESS. 409 when another task is already running; 400 on a
 /// missing writable calendar. Nothing is terminal since the board slice:
