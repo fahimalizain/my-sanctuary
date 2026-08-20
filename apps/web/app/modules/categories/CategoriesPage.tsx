@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
+import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { CalendarPicker } from '@/app/components/CalendarPicker';
 import { Button } from '@/components/ui/button';
 import {
@@ -9,6 +9,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { useNavigate, useRouter } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import type {
   CalendarsResponse,
@@ -56,6 +57,8 @@ interface CategoryFormState {
 }
 
 export function CategoriesPage() {
+  const router = useRouter();
+  const navigate = useNavigate();
   const [lists, setLists] = useState<TaskList[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   // Latest `lists` for the dependency-free `load` callback below (writing a
@@ -157,6 +160,17 @@ export function CategoriesPage() {
       cancelled = true;
     };
   }, [form]);
+
+  // Header back button: leave through real in-app history when there is one
+  // (Board/Lists → Edit Categories); a direct load on /categories has none,
+  // so fall back to the Board tab.
+  const handleBack = () => {
+    if (router.history.canGoBack()) {
+      router.history.back();
+    } else {
+      navigate({ to: '/board' });
+    }
+  };
 
   // ──────────────────────────────────────────
   // Category actions — same dialogs and bodies as ListsPage.
@@ -315,9 +329,21 @@ export function CategoriesPage() {
         {/* Header */}
         <header className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="font-heading text-3xl font-bold text-foreground mb-2">
-              Categories
-            </h1>
+            <div className="flex items-center gap-2 mb-2">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Go back"
+                className="-ml-2"
+                onClick={handleBack}
+              >
+                <ArrowLeft className="h-5 w-5" />
+              </Button>
+              <h1 className="font-heading text-3xl font-bold text-foreground">
+                Categories
+              </h1>
+            </div>
             <p className="text-muted-foreground">
               The taxonomy that files tasks into lists
             </p>
@@ -527,20 +553,18 @@ export function CategoriesPage() {
         open={form !== null}
         onOpenChange={(open) => !open && closeForm()}
       >
-        <DialogContent className="sm:max-w-[560px] p-0 gap-0 overflow-hidden bg-card border-border">
-          <div className="h-2" style={{ backgroundColor: color }} />
-          <div className="p-6 max-h-[80vh] overflow-y-auto">
-            <DialogHeader className="mb-6">
-              <DialogTitle className="text-foreground">
-                {dialogTitle}
-              </DialogTitle>
-              <DialogDescription>
-                {form?.mode === 'edit'
-                  ? 'Update the category and its title-matching patterns.'
-                  : 'Categories group tasks; patterns classify titles into them.'}
-              </DialogDescription>
-            </DialogHeader>
-
+        <DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[560px] bg-card border-border">
+          <div className="h-2 shrink-0" style={{ backgroundColor: color }} />
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
+            <DialogTitle className="text-foreground">{dialogTitle}</DialogTitle>
+            <DialogDescription>
+              {form?.mode === 'edit'
+                ? 'Update the category and its title-matching patterns.'
+                : 'Categories group tasks; patterns classify titles into them.'}
+            </DialogDescription>
+          </DialogHeader>
+          <hr className="shrink-0 border-border" />
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
             <div className="space-y-2 mb-5">
               <label className="text-sm font-medium text-foreground">
                 Title
@@ -670,24 +694,24 @@ export function CategoriesPage() {
             {formError && (
               <p className="mb-4 text-sm text-destructive">{formError}</p>
             )}
+          </div>
 
-            <div className="flex justify-end gap-3">
-              <Button
-                variant="outline"
-                onClick={closeForm}
-                className="border-input text-foreground hover:bg-muted"
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={handleCategorySubmit}
-                disabled={!title.trim() || saving}
-                className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {saving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                {form?.mode === 'edit' ? 'Save Changes' : 'Create Category'}
-              </Button>
-            </div>
+          <div className="flex shrink-0 justify-end gap-3 border-t border-border px-6 py-4">
+            <Button
+              variant="outline"
+              onClick={closeForm}
+              className="border-input text-foreground hover:bg-muted"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleCategorySubmit}
+              disabled={!title.trim() || saving}
+              className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {saving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+              {form?.mode === 'edit' ? 'Save Changes' : 'Create Category'}
+            </Button>
           </div>
         </DialogContent>
       </Dialog>
