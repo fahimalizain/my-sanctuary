@@ -19,8 +19,9 @@
 //!   `untracked` sink itself are all invalid. A title matching only a root
 //!   whose children do not match is **allowed** (parent remainder).
 //! - Titles are not unique. Create always stores `status = "OPEN"` and
-//!   **prepends Backlog**: the living OPEN rows of the user are shifted up one
-//!   (`sort_order + 1`), and the new task lands at `sort_order = 0`.
+//!   **appends Backlog**: the new task lands at `max(sort_order)+1` (0 when
+//!   the pile is empty). Living OPEN rows keep their ranks — create is
+//!   unranked capture, never a peer shift.
 //! - `duration_minutes` defaults to 15 and must be >= 1; `priority` must be
 //!   `high|medium|low` (default `medium`); `difficulty` must be
 //!   `easy|medium|hard` (default `easy`).
@@ -62,6 +63,12 @@
 //!   closes. Missing log / empty ids / Google 404 → today's idempotent
 //!   status-only flip: OPEN (stop) or PLANNED (pause), terminal status for
 //!   complete/discard.
+//! - Raw timer verbs rank on a **real status transition only** (ADR 0002 §
+//!   Timer verb landings): `/stop` appends OPEN (`max + 1` over the
+//!   mover-excluded living OPEN pile), `/pause` prepends PLANNED, and
+//!   `/complete`/`/discard` prepend their terminal pile. Already in the
+//!   landing status → no re-rank (stop/pause still log; complete/discard
+//!   are the idempotent 200 no-op). `start_task` never ranks.
 //! - `complete_task`/`discard_task` auto-stop a running event first (a
 //!   `stopped` log precedes the terminal log), then set the terminal status.
 //!   Repeating the same terminal action is an idempotent 200 no-op.
@@ -81,8 +88,13 @@
 //!
 //! Move ([`move_task`], ADR 0002 § Move API): the board drop dispatches the
 //! transition matrix (start/stop/pause/complete/discard/plan/unplan/reopen/
-//! reorder), then places the task at `sort_order` in the target status (peer
-//! shifts never touch `updated_at`, and the source column is never compacted).
+//! reorder — the exit legs run the INNER unplaced helpers, so a pause via
+//! `/move` is never double-placed), then places the task at `sort_order` in
+//! the target status (peer shifts never touch `updated_at`, and the source
+//! column is never compacted).
+//! Omitted `sort_order` = no drop position: the server applies the column
+//! default ([`default_move_rank`]) — OPEN/PLANNED append except a pause
+//! prepends, Done/Discarded/In Progress prepend; same-status omit is a no-op.
 //! A same-status cross-card drag is a pure reorder. `displace` parks the
 //! running task first (PLANNED/COMPLETED/DISCARDED only — `displace.id` must
 //! be the task whose **status** is IN_PROGRESS), then starts the moved task;
@@ -141,6 +153,28 @@ pub const TASK_LOG_DISCARDED: &str = "discarded";
 pub const TASK_LOG_PLANNED: &str = "planned";
 pub const TASK_LOG_UNPLANNED: &str = "unplanned";
 pub const TASK_LOG_REOPENED: &str = "reopened";
+
+/// The append rank for a new card: `max + 1`, or 0 when the pile is empty.
+/// Slices 2–3 reuse this for the no-drop `/move` and timer-verb landings.
+fn append_rank(max: Option<i64>) -> i64 {
+    max.map(|m| m + 1).unwrap_or(0)
+}
+
+/// The column default for a no-drop `/move` (ADR 0002 § Move API): OPEN and
+/// PLANNED append at `max + 1` — except a pause (`PLANNED` from
+/// IN_PROGRESS), which prepends 0; every other target prepends 0. `max` is
+/// the highest living rank of the mover-excluded target pile; callers only
+/// query it when this default appends (OPEN, or PLANNED not from
+/// IN_PROGRESS). The target status is already validated by the caller.
+fn default_move_rank(from: &str, to: &str, max: Option<i64>) -> i64 {
+    match to {
+        TASK_STATUS_OPEN => append_rank(max),
+        TASK_STATUS_PLANNED if from == TASK_STATUS_IN_PROGRESS => 0,
+        TASK_STATUS_PLANNED => append_rank(max),
+        TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED | TASK_STATUS_IN_PROGRESS => 0,
+        _ => 0, // status already validated
+    }
+}
 
 /// Errors produced by the tasks service.
 ///
@@ -236,8 +270,11 @@ pub struct MoveTaskInput {
     /// One of `OPEN|PLANNED|IN_PROGRESS|COMPLETED|DISCARDED` (the service
     /// validates; unknown values are 400).
     pub status: String,
-    /// The absolute rank to assign in the target status (>= 0).
-    pub sort_order: i64,
+    /// Absolute rank in the target status. Omitted / null = no drop
+    /// position: the server applies the column default (see
+    /// `default_move_rank`).
+    #[serde(default)]
+    pub sort_order: Option<i64>,
     /// When set: park the running task first (must be the currently running
     /// task; its landing status must be PLANNED/COMPLETED/DISCARDED), then
     /// start the moved task.
@@ -254,7 +291,10 @@ pub struct DisplaceInput {
     /// is 400.
     pub id: String,
     pub status: String,
-    pub sort_order: i64,
+    /// Absolute rank in `status`. Omitted / null = prepend `0` (the park is
+    /// always from IN_PROGRESS, whose column default never appends).
+    #[serde(default)]
+    pub sort_order: Option<i64>,
 }
 
 /// Response envelope for `POST /api/tasks/:id/move`: the moved task plus the
@@ -438,9 +478,10 @@ pub async fn classify_title(
 /// `ensure_taxonomy` runs first so the very first task of a fresh user finds
 /// a seeded matcher.
 ///
-/// Ordering: the new task **prepends Backlog** — the user's living OPEN rows
-/// are shifted up by one (`sort_order >= 0`), then the task is inserted at
-/// `sort_order = 0`.
+/// Ordering: the new task **appends Backlog** — it lands at
+/// `max(sort_order)+1` for the user's living OPEN rows (0 when the pile is
+/// empty). Peers are left in place: create is unranked capture, so rank 0
+/// stays the task that has waited longest (migration 0005 backfill).
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -484,11 +525,12 @@ pub async fn create_task(
     // Validates the rules; the response view re-classifies the stored title.
     resolve_category(&title, &taxonomy)?;
 
-    // Prepend Backlog: every living OPEN row of the user moves up one so the
-    // new task can rank 0. Peers keep their `updated_at` — re-ranking is not
-    // a content change.
-    task_repo
-        .shift_sort_order(user_id, TASK_STATUS_OPEN, 0)
+    // Append Backlog: the new task lands at max(sort_order)+1 (0 on an empty
+    // pile). Living OPEN peers keep their ranks and `updated_at` — create is
+    // unranked capture, never a peer shift. No row is excluded: the task
+    // does not exist yet.
+    let max = task_repo
+        .max_sort_order(user_id, TASK_STATUS_OPEN, None)
         .await?;
     let task = task_repo
         .insert(NewTask {
@@ -498,7 +540,7 @@ pub async fn create_task(
             duration_minutes,
             priority,
             difficulty,
-            sort_order: 0,
+            sort_order: append_rank(max),
         })
         .await?;
     Ok(TaskResponse {
@@ -719,6 +761,11 @@ pub async fn start_task(
 /// `now <= start`) and flips status back to OPEN. The status flip is
 /// idempotent — when the user already closed the event in Google, stop only
 /// rewrites the status and appends a `stopped` log.
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition
+/// (IN_PROGRESS → OPEN) the task **appends Backlog** — `max(sort_order)+1`
+/// of the living OPEN pile excluding itself, so its leftover IN_PROGRESS
+/// rank never inflates the append target. Already OPEN → no re-rank.
 pub async fn stop_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -733,7 +780,7 @@ pub async fn stop_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN,
+        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true,
     )
     .await
 }
@@ -743,6 +790,10 @@ pub async fn stop_task(
 /// not OPEN (ADR 0002: pause parks the task in the Planned pile). Reopening
 /// later is simply Start again — start already allows PLANNED (logged
 /// `started`).
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition
+/// (IN_PROGRESS → PLANNED) the task **prepends Planned** (rank 0 — peers
+/// shift up). Already PLANNED → no re-rank.
 pub async fn pause_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -757,7 +808,7 @@ pub async fn pause_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED,
+        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true,
     )
     .await
 }
@@ -765,6 +816,9 @@ pub async fn pause_task(
 /// Completes a task: auto-stops a running event first (a `stopped` log
 /// precedes the `completed` log), then sets COMPLETED. Already COMPLETED is
 /// an idempotent 200 no-op.
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
+/// **prepends Done** (rank 0 — peers shift up). Already COMPLETED → no re-rank.
 pub async fn complete_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -779,7 +833,7 @@ pub async fn complete_task(
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED,
+        now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true,
     )
     .await
 }
@@ -787,6 +841,10 @@ pub async fn complete_task(
 /// Discards a task: auto-stops a running event first (a `stopped` log
 /// precedes the `discarded` log), then sets DISCARDED. Already DISCARDED is
 /// an idempotent 200 no-op.
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
+/// **prepends Discarded** (rank 0 — peers shift up). Already DISCARDED → no
+/// re-rank.
 pub async fn discard_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -801,7 +859,7 @@ pub async fn discard_task(
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED,
+        now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true,
     )
     .await
 }
@@ -810,6 +868,13 @@ pub async fn discard_task(
 ///
 /// `target_status` is the landing status: OPEN for stop, PLANNED for pause
 /// (mirrors `complete_or_discard`, where the caller picks the terminal state).
+///
+/// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
+/// from the raw endpoints — on a real transition stop appends OPEN
+/// (`max + 1` over the mover-excluded pile) and pause prepends PLANNED;
+/// already in the landing status → the row is returned as set, no re-rank
+/// (and the log behavior is unchanged). `false` from [`dispatch_matrix_action`]
+/// / the displace park — `/move` places exactly once afterwards.
 async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -823,6 +888,7 @@ async fn stop_or_pause(
     now_unix: i64,
     log_type: &str,
     target_status: &str,
+    place: bool,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -861,14 +927,40 @@ async fn stop_or_pause(
     )
     .await?;
 
+    // Verb landing on a real transition only: stop appends OPEN
+    // (mover-excluded max + 1 — the row already sits in OPEN holding its
+    // leftover IN_PROGRESS rank, which must not inflate its own target),
+    // pause prepends PLANNED. Already in the landing status → the row as
+    // set, no re-rank.
+    let placed = if place && task.status != target_status {
+        let rank = if target_status == TASK_STATUS_OPEN {
+            let max = task_repo
+                .max_sort_order(user_id, TASK_STATUS_OPEN, Some(task_id))
+                .await?;
+            append_rank(max)
+        } else {
+            0 // pause prepends Planned
+        };
+        place_at(task_repo, user_id, task_id, target_status, rank).await?
+    } else {
+        updated
+    };
+
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
-        task: to_view(&updated, &taxonomy),
+        task: to_view(&placed, &taxonomy),
         event: patched,
     })
 }
 
 /// Shared complete/discard machinery (see [`complete_task`]).
+///
+/// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
+/// from the raw endpoints — on a real transition the task prepends its
+/// terminal pile (rank 0, peers shift up); already in the target status the
+/// idempotent no-op above returns the row unchanged. `false` from
+/// [`dispatch_matrix_action`] / [`terminal_transition`] — `/move` places
+/// exactly once afterwards.
 async fn complete_or_discard(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -882,6 +974,7 @@ async fn complete_or_discard(
     now_unix: i64,
     target_status: &str,
     log_type: &str,
+    place: bool,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -938,9 +1031,18 @@ async fn complete_or_discard(
     )
     .await?;
 
+    // Verb landing (ADR 0002 § Timer verb landings): on a real transition the
+    // task prepends its terminal pile. The already-in-target no-op above
+    // returned early, so a `place: true` here is always a real transition.
+    let placed = if place {
+        place_at(task_repo, user_id, task_id, target_status, 0).await?
+    } else {
+        updated
+    };
+
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
-        task: to_view(&updated, &taxonomy),
+        task: to_view(&placed, &taxonomy),
         event: patched,
     })
 }
@@ -1204,8 +1306,10 @@ fn require_google<'a>(
 
 /// Applies the ADR 0002 transition matrix for `from → to` on `task_id` and
 /// returns the Google event the action touched (`None` for the status-only
-/// transitions). Reuses the existing timer verbs (start/stop/pause/complete/
-/// discard) so the Google writes stay in one place; plan/unplan/reopen and
+/// transitions). Reuses the existing timer machinery — start, and the exit
+/// verbs as the INNER unplaced helpers (see [`stop_or_pause`] /
+/// [`complete_or_discard`], `place: false`) — so the Google writes stay in
+/// one place while `/move` still places exactly once; plan/unplan/reopen and
 /// idle complete/discard are pure local transitions + audit logs.
 ///
 /// `http`/`access` are only consumed by the Google-touching arms; the
@@ -1240,36 +1344,39 @@ async fn dispatch_matrix_action(
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN) => {
             let (http, access) = require_google(http, access)?;
-            stop_task(
+            // The INNER unplaced helper: the verb landing belongs to the raw
+            // /stop endpoint only — `/move` places exactly once afterwards,
+            // so a stop via the board is never double-placed.
+            stop_or_pause(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, false,
             )
             .await
             .map(|response| response.event)
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_PLANNED) => {
             let (http, access) = require_google(http, access)?;
-            pause_task(
+            stop_or_pause(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
             )
             .await
             .map(|response| response.event)
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED) => {
             let (http, access) = require_google(http, access)?;
-            complete_task(
+            complete_or_discard(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
             )
             .await
             .map(|response| response.event)
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_DISCARDED) => {
             let (http, access) = require_google(http, access)?;
-            discard_task(
+            complete_or_discard(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
             )
             .await
             .map(|response| response.event)
@@ -1361,8 +1468,8 @@ async fn local_transition(
 /// Status is the lock: only a task whose **status** is IN_PROGRESS has a
 /// living timer, so a leftover event window in the cache never triggers a
 /// Google auto-stop here. (The matrix already routes true IN_PROGRESS →
-/// COMPLETED/DISCARDED to `complete_task`/`discard_task`; this arm is a
-/// backstop only.)
+/// COMPLETED/DISCARDED to the inner unplaced [`complete_or_discard`]; this
+/// arm is a backstop only — it never places, `/move` owns the rank.)
 async fn terminal_transition(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1384,19 +1491,24 @@ async fn terminal_transition(
     };
     if task.status == TASK_STATUS_IN_PROGRESS {
         let (http, access) = require_google(http, access)?;
-        let response = if target_status == TASK_STATUS_COMPLETED {
-            complete_task(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
-            )
-            .await?
-        } else {
-            discard_task(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
-            )
-            .await?
-        };
+        // The INNER unplaced helper (see [`complete_or_discard`]): the verb
+        // landing belongs to the raw endpoints only — `/move` places once.
+        let response = complete_or_discard(
+            http,
+            calendars,
+            events,
+            category_repo,
+            task_repo,
+            logs,
+            access,
+            user_id,
+            task_id,
+            now_unix,
+            target_status,
+            log_type,
+            false,
+        )
+        .await?;
         return Ok(response.event);
     }
     local_transition(task_repo, logs, user_id, task_id, target_status, log_type, now_unix).await?;
@@ -1460,18 +1572,28 @@ async fn reorder_in_place(
 /// `POST /api/tasks/:id/move` — the board drop (ADR 0002 § Move API).
 ///
 /// Dispatches the transition matrix for `task.status → input.status`
-/// (reusing `start_task`/`stop_task`/`pause_task`/`complete_task`/
-/// `discard_task` for the Google-touching legs, with plan/unplan/reopen
-/// as local flips), then places the task at `input.sort_order` in the target
-/// status. Same-status moves are pure reorders (the IN_PROGRESS → IN_PROGRESS
-/// case is a no-op that ignores `sort_order`).
+/// (reusing `start_task` and the INNER unplaced stop/pause/complete/discard
+/// helpers for the Google-touching legs, with plan/unplan/reopen as local
+/// flips), then places the task at `input.sort_order` in the target status —
+/// exactly once, which is why the dispatched exits never place themselves.
+/// Same-status moves are pure reorders (the IN_PROGRESS → IN_PROGRESS case
+/// is a no-op that ignores `sort_order`).
+///
+/// Omitted `sort_order` (null or absent) means "no drop position": the server
+/// applies the column default from [`default_move_rank`] — OPEN and PLANNED
+/// append (`max + 1` over the mover-excluded pile, so the mover's leftover
+/// rank never inflates its own target), except a pause (PLANNED from
+/// IN_PROGRESS) which prepends 0; COMPLETED/DISCARDED/IN_PROGRESS prepend 0.
+/// A same-status move with omitted `sort_order` is a no-op (the row is
+/// returned unchanged, never sent to the tail).
 ///
 /// `displace` (move to IN_PROGRESS only) parks the running task first:
 /// 1. `displace.id` must be the task whose **status** is IN_PROGRESS — the
 ///    status lock, never the event window (400 `"displace id is not the
 ///    running task"` otherwise).
 /// 2. Park A at `displace.status`/`displace.sort_order` (must be
-///    PLANNED/COMPLETED/DISCARDED — the matrix from IN_PROGRESS).
+///    PLANNED/COMPLETED/DISCARDED — the matrix from IN_PROGRESS; omitted
+///    rank prepends 0).
 /// 3. `start_task(B)` on the minute grid (`B.start = A.end` — snapped `T`,
 ///    or `A.start + 60` under the invert guard), then place B.
 /// 4. If step 3 fails: [`TasksError::AfterDisplace`] — A STAYS parked
@@ -1482,10 +1604,11 @@ async fn reorder_in_place(
 /// passes both only when its `needs_google` gate fires (target IN_PROGRESS,
 /// leaving IN_PROGRESS, or any displace).
 ///
-/// Validation: unknown `status` → 400; negative `sort_order` → 400;
-/// `displace.status` outside PLANNED/COMPLETED/DISCARDED → 400; move to
-/// IN_PROGRESS without `displace` while something runs → 409 (from
-/// `start_task`); missing/other-user/soft-deleted task → 404.
+/// Validation: unknown `status` → 400; negative `sort_order` → 400
+/// (`None` is not negative); `displace.status` outside
+/// PLANNED/COMPLETED/DISCARDED → 400; move to IN_PROGRESS without
+/// `displace` while something runs → 409 (from `start_task`);
+/// missing/other-user/soft-deleted task → 404.
 pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1503,10 +1626,12 @@ pub async fn move_task(
     if !is_valid_task_status(&input.status) {
         return Err(TasksError::Invalid("unknown task status".to_string()));
     }
-    if input.sort_order < 0 {
-        return Err(TasksError::Invalid(
-            "sort_order must not be negative".to_string(),
-        ));
+    if let Some(sort_order) = input.sort_order {
+        if sort_order < 0 {
+            return Err(TasksError::Invalid(
+                "sort_order must not be negative".to_string(),
+            ));
+        }
     }
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -1522,10 +1647,12 @@ pub async fn move_task(
         ));
     }
     if let Some(displace) = &input.displace {
-        if displace.sort_order < 0 {
-            return Err(TasksError::Invalid(
-                "sort_order must not be negative".to_string(),
-            ));
+        if let Some(sort_order) = displace.sort_order {
+            if sort_order < 0 {
+                return Err(TasksError::Invalid(
+                    "sort_order must not be negative".to_string(),
+                ));
+            }
         }
         if !matches!(
             displace.status.as_str(),
@@ -1535,6 +1662,19 @@ pub async fn move_task(
                 "displace status must be planned, completed, or discarded".to_string(),
             ));
         }
+    }
+
+    // Same-status + no drop position: nothing happens, the current task is
+    // returned as-is — never secretly sent to the tail. (The matrix's
+    // IN_PROGRESS → IN_PROGRESS branch below is the same no-op for that
+    // column even when a rank IS sent.)
+    if task.status == input.status && input.sort_order.is_none() {
+        let taxonomy = load_taxonomy(category_repo, user_id).await?;
+        return Ok(MoveTaskResponse {
+            task: to_view(&task, &taxonomy),
+            displaced: None,
+            event: None,
+        });
     }
 
     // The matrix's IN_PROGRESS → IN_PROGRESS no-op: nothing happens, the
@@ -1576,23 +1716,32 @@ pub async fn move_task(
         };
 
         // Park A (matrix from IN_PROGRESS: pause/complete/discard), then rank.
-        // A failure here is a plain error — nothing was started yet.
+        // A failure here is a plain error — nothing was started yet. An
+        // omitted park rank prepends 0 (the park always comes from
+        // IN_PROGRESS, whose column default never appends).
         dispatch_matrix_action(
             http, calendars, events, list_repo, category_repo, task_repo, logs, access,
             user_id, &displaced_task.id, &displaced_task.status, &displace.status, now_unix,
         )
         .await?;
+        let park_rank = displace.sort_order.unwrap_or(0);
         let displaced_row = place_at(
             task_repo,
             user_id,
             &displaced_task.id,
             &displace.status,
-            displace.sort_order,
+            park_rank,
         )
         .await?;
 
         // Start B, then rank B. A start failure is an HONEST partial failure:
         // A stays parked (no rollback) and `AfterDisplace` carries A's view.
+        // B's omitted rank resolves through the same column default — to
+        // IN_PROGRESS that is always 0.
+        let b_rank = match input.sort_order {
+            Some(sort_order) => sort_order,
+            None => default_move_rank(&task.status, TASK_STATUS_IN_PROGRESS, None),
+        };
         match dispatch_matrix_action(
             http, calendars, events, list_repo, category_repo, task_repo, logs, access,
             user_id, task_id, &task.status, TASK_STATUS_IN_PROGRESS, b_start_unix,
@@ -1605,7 +1754,7 @@ pub async fn move_task(
                     user_id,
                     task_id,
                     TASK_STATUS_IN_PROGRESS,
-                    input.sort_order,
+                    b_rank,
                 )
                 .await?;
                 let taxonomy = load_taxonomy(category_repo, user_id).await?;
@@ -1625,8 +1774,11 @@ pub async fn move_task(
         }
     } else if task.status == input.status {
         // Same column: pure reorder (the moving card keeps its status; rank
-        // shifts neighbors only when it actually changes position).
-        let row = reorder_in_place(task_repo, user_id, &task, input.sort_order).await?;
+        // shifts neighbors only when it actually changes position). Omitted
+        // `sort_order` already returned as a no-op above, so a rank is
+        // guaranteed here.
+        let row = reorder_in_place(task_repo, user_id, &task, input.sort_order.unwrap_or(0))
+            .await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
             task: to_view(&row, &taxonomy),
@@ -1634,13 +1786,34 @@ pub async fn move_task(
             event: None,
         })
     } else {
-        // Cross-column: dispatch the matrix action, then place.
+        // Cross-column: dispatch the matrix action, then place. Omitted
+        // `sort_order` resolves to the column default (append for OPEN /
+        // PLANNED except a pause, prepend 0 elsewhere) — the max is queried
+        // only when the default appends, and the mover excludes itself so
+        // its leftover rank from the source column never inflates its own
+        // append target.
+        let rank = match input.sort_order {
+            Some(sort_order) => sort_order,
+            None => {
+                let needs_max = input.status == TASK_STATUS_OPEN
+                    || (input.status == TASK_STATUS_PLANNED
+                        && task.status != TASK_STATUS_IN_PROGRESS);
+                let max = if needs_max {
+                    task_repo
+                        .max_sort_order(user_id, &input.status, Some(task_id))
+                        .await?
+                } else {
+                    None
+                };
+                default_move_rank(&task.status, &input.status, max)
+            }
+        };
         let event = dispatch_matrix_action(
             http, calendars, events, list_repo, category_repo, task_repo, logs, access,
             user_id, task_id, &task.status, &input.status, now_unix,
         )
         .await?;
-        let row = place_at(task_repo, user_id, task_id, &input.status, input.sort_order).await?;
+        let row = place_at(task_repo, user_id, task_id, &input.status, rank).await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
             task: to_view(&row, &taxonomy),
@@ -2086,6 +2259,31 @@ mod tests {
             Ok(Some(row.clone()))
         }
 
+        async fn max_sort_order(
+            &self,
+            user_id: &str,
+            status: &str,
+            exclude_id: Option<&str>,
+        ) -> Result<Option<i64>, RepoError> {
+            // Mirrors TASK_MAX_SORT_ORDER_SQL: the highest living `sort_order`
+            // of the user+status pile, or `None` when the pile is empty.
+            // `exclude_id` keeps the mover's leftover rank out of its own
+            // append target (the SQL's `AND id != ?`).
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.user_id == user_id
+                        && row.status == status
+                        && row.deleted_at.is_none()
+                        && exclude_id.map_or(true, |excluded| row.id != excluded)
+                })
+                .map(|row| row.sort_order)
+                .max())
+        }
+
         async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
             if let Some(row) = self
                 .stored
@@ -2454,20 +2652,61 @@ mod tests {
     }
 
     #[test]
-    fn create_task_prepends_backlog_sort_order() {
+    fn create_task_appends_backlog_sort_order() {
         let (lists, categories, tasks) = seeded();
         let first = work_task(&lists, &categories, &tasks);
         let second = work_task(&lists, &categories, &tasks);
+        let third = work_task(&lists, &categories, &tasks);
 
-        // The newest task sits at the front of the Backlog pile (0); the
-        // previous front task shifts one back. TaskView is a snapshot, so the
-        // shifted rank of `first` is asserted on the persisted row.
-        assert_eq!(second.sort_order, 0, "new task response ranks 0");
+        // The first task lands at the front of the Backlog pile (0); every
+        // later create appends at max(sort_order)+1 without touching peers.
+        // TaskView is a snapshot, so the persisted rows are asserted too.
+        assert_eq!(first.sort_order, 0, "first task ranks 0 on an empty pile");
+        assert_eq!(second.sort_order, 1, "second task appends at max+1");
+        assert_eq!(third.sort_order, 2, "third task appends at max+1");
         let stored = tasks.stored.lock().unwrap();
-        let first_row = stored.iter().find(|row| row.id == first.id).unwrap();
-        let second_row = stored.iter().find(|row| row.id == second.id).unwrap();
-        assert_eq!(second_row.sort_order, 0, "new task prepends Backlog");
-        assert_eq!(first_row.sort_order, 1, "existing OPEN task shifted up");
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&first.id), 0, "first task stays at the front");
+        assert_eq!(rank(&second.id), 1, "second task stays at rank 1");
+        assert_eq!(rank(&third.id), 2, "third task stays at rank 2");
+    }
+
+    #[test]
+    fn create_append_rank_ignores_other_users_open_tasks() {
+        let (lists, categories, tasks) = seeded();
+        // Another user's living OPEN pile must not inflate this user's
+        // append rank (max_sort_order is user-scoped).
+        pollster::block_on(create_task(&lists, &categories, &tasks, "u-2", &input("Work")))
+            .unwrap();
+        let first = work_task(&lists, &categories, &tasks);
+        assert_eq!(first.sort_order, 0, "u-1's first task still ranks 0");
+    }
+
+    #[test]
+    fn create_append_rank_ignores_non_open_living_rows() {
+        let (lists, categories, tasks) = seeded();
+        let planned = work_task(&lists, &categories, &tasks);
+        // A living non-OPEN row must not inflate the OPEN max.
+        pollster::block_on(tasks.set_status(&planned.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        let first = work_task(&lists, &categories, &tasks);
+        assert_eq!(first.sort_order, 0, "OPEN pile was empty, new task ranks 0");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(
+            stored.iter().find(|row| row.id == planned.id).unwrap().sort_order,
+            0,
+            "PLANNED row keeps its own rank"
+        );
+    }
+
+    #[test]
+    fn create_append_rank_ignores_soft_deleted_open_rows() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.soft_delete(&first.id, "2026-08-18T02:00:00Z")).unwrap();
+        let second = work_task(&lists, &categories, &tasks);
+        assert_eq!(second.sort_order, 0, "soft-deleted OPEN row does not inflate the max");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == second.id).unwrap().sort_order, 0);
     }
 
     #[test]
@@ -4475,6 +4714,132 @@ mod tests {
         assert!(matches!(err, TasksError::Invalid(_)), "got {err:?}");
     }
 
+    #[test]
+    fn stop_appends_open_on_transition() {
+        // A real stop (IN_PROGRESS → OPEN) appends Backlog: the leftover
+        // IN_PROGRESS rank 0 must not win, and the living OPEN peer keeps
+        // its rank — the stopped task lands at max+1 = 2.
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        let stop_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &a.id, stop_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 2, "stop appends after the OPEN peer");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 2);
+        assert_eq!(rank(&b.id), 1, "the untouched OPEN peer keeps its rank");
+        drop(stored);
+    }
+
+    #[test]
+    fn stop_already_open_does_not_rerank() {
+        // Stop on an already-OPEN task keeps its rank (the log behavior on
+        // this path is unchanged — only placement is skipped).
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &b.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 1, "already-OPEN stop does not re-rank");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == a.id).unwrap().sort_order, 0);
+        assert_eq!(stored.iter().find(|row| row.id == b.id).unwrap().sort_order, 1);
+        drop(stored);
+    }
+
+    #[test]
+    fn pause_prepends_planned_on_transition() {
+        // A real pause (IN_PROGRESS → PLANNED) prepends: rank 0, and the
+        // old PLANNED peer shifts to 1.
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        // Seed a PLANNED peer at 0 (dummy row: set_status + rank).
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &task.id);
+        drop(_start_http);
+
+        let pause_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
+        )]);
+        let response = pollster::block_on(pause_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, pause_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(response.task.sort_order, 0, "pause prepends Planned");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&task.id), 0);
+        assert_eq!(rank(&peer.id), 1, "the PLANNED peer shifts down one");
+        drop(stored);
+    }
+
+    #[test]
+    fn pause_already_planned_does_not_rerank() {
+        // Pause on an already-PLANNED task keeps its rank (no prepend, the
+        // peer stays put — only placement is skipped).
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 1)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(pause_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(response.task.sort_order, 1, "already-PLANNED pause does not re-rank");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&peer.id), 0);
+        assert_eq!(rank(&task.id), 1);
+        drop(stored);
+    }
+
     // ──────────────────────────────────────────
     // complete / discard
     // ──────────────────────────────────────────
@@ -4567,6 +4932,65 @@ mod tests {
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
         assert_eq!(logs.inserted.lock().unwrap().len(), 1, "no extra log");
+    }
+
+    #[test]
+    fn complete_prepends_on_transition() {
+        // A real complete (OPEN → COMPLETED) prepends Done: rank 0, and the
+        // old COMPLETED peer shifts to 1.
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        // Seed a COMPLETED peer at 0 (dummy row: set_status + rank).
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(response.task.sort_order, 0, "complete prepends Done");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&task.id), 0);
+        assert_eq!(rank(&peer.id), 1, "the COMPLETED peer shifts down one");
+        drop(stored);
+    }
+
+    #[test]
+    fn complete_already_completed_is_still_noop() {
+        // The idempotent no-op never re-ranks: a COMPLETED row sitting at
+        // rank 3 stays at 3 through a second complete.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 3)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(
+            response.task.sort_order, 3,
+            "idempotent complete keeps the rank"
+        );
+        assert_eq!(logs.inserted.lock().unwrap().len(), 0, "no log row");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == task.id).unwrap().sort_order, 3);
+        drop(stored);
     }
 
     #[test]
@@ -5065,7 +5489,7 @@ mod tests {
         access: Option<&GoogleAccess>,
         task_id: &str,
         status: &str,
-        sort_order: i64,
+        sort_order: Option<i64>,
     ) -> Result<MoveTaskResponse, TasksError> {
         pollster::block_on(move_task(
             Some(http),
@@ -5125,7 +5549,7 @@ mod tests {
         // Park the peer in PLANNED first (session-only, no Google).
         let parked = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &peer.id, TASK_STATUS_PLANNED, 0,
+            &peer.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
         assert_eq!(parked.task.status, TASK_STATUS_PLANNED);
@@ -5133,7 +5557,7 @@ mod tests {
         // Plan `task` at the front: the PLANNED peer shifts up to 1.
         let response = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &task.id, TASK_STATUS_PLANNED, 0,
+            &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
@@ -5167,14 +5591,14 @@ mod tests {
 
         let planned = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &task.id, TASK_STATUS_PLANNED, 0,
+            &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
         assert_eq!(planned.task.status, TASK_STATUS_PLANNED);
 
         let response = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &task.id, TASK_STATUS_OPEN, 0,
+            &task.id, TASK_STATUS_OPEN, Some(0),
         )
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -5197,7 +5621,7 @@ mod tests {
 
         let response = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &task.id, TASK_STATUS_PLANNED, 0,
+            &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
@@ -5222,7 +5646,7 @@ mod tests {
 
         let response = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
-            Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, 0,
+            Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
@@ -5261,7 +5685,7 @@ mod tests {
             pause_unix,
             &MoveTaskInput {
                 status: TASK_STATUS_PLANNED.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: None,
             },
         ))
@@ -5303,7 +5727,7 @@ mod tests {
             stop_unix,
             &MoveTaskInput {
                 status: TASK_STATUS_OPEN.to_string(),
-                sort_order: 4,
+                sort_order: Some(4),
                 displace: None,
             },
         ))
@@ -5344,7 +5768,7 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: None,
             },
         ))
@@ -5397,11 +5821,11 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: Some(DisplaceInput {
                     id: a.id.clone(),
                     status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: 0,
+                    sort_order: Some(0),
                 }),
             },
         ))
@@ -5466,11 +5890,11 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: Some(DisplaceInput {
                     id: a.id.clone(),
                     status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: 0,
+                    sort_order: Some(0),
                 }),
             },
         ))
@@ -5535,11 +5959,11 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: Some(DisplaceInput {
                     id: b.id.clone(),
                     status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: 0,
+                    sort_order: Some(0),
                 }),
             },
         ))
@@ -5581,11 +6005,11 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: Some(DisplaceInput {
                     id: "nope".to_string(),
                     status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: 0,
+                    sort_order: Some(0),
                 }),
             },
         ))
@@ -5648,11 +6072,11 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
                 displace: Some(DisplaceInput {
                     id: a.id.clone(),
                     status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: 0,
+                    sort_order: Some(0),
                 }),
             },
         ))
@@ -5680,10 +6104,10 @@ mod tests {
     #[test]
     fn move_same_column_reorder_shifts_neighbors() {
         let (lists, categories, tasks) = seeded();
-        // Create C then B then A: create prepends, so A=0, B=1, C=2.
-        let c = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
+        // Create A then B then C: create appends, so A=0, B=1, C=2.
         let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let c = work_task(&lists, &categories, &tasks);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -5692,7 +6116,7 @@ mod tests {
         // Drag A (rank 0) down to rank 2: the peers in (0, 2] shift down one.
         let response = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &a.id, TASK_STATUS_OPEN, 2,
+            &a.id, TASK_STATUS_OPEN, Some(2),
         )
         .unwrap();
         assert_eq!(response.task.sort_order, 2);
@@ -5706,7 +6130,7 @@ mod tests {
         // And back up: A (rank 2) to rank 0 — peers in [0, 2) shift up one.
         let response = move_to(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            &a.id, TASK_STATUS_OPEN, 0,
+            &a.id, TASK_STATUS_OPEN, Some(0),
         )
         .unwrap();
         assert_eq!(response.task.sort_order, 0);
@@ -5745,7 +6169,7 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: 99,
+                sort_order: Some(99),
                 displace: None,
             },
         ))
@@ -5771,7 +6195,7 @@ mod tests {
 
         let unknown = MoveTaskInput {
             status: "GONE".to_string(),
-            sort_order: 0,
+            sort_order: Some(0),
             displace: None,
         };
         let err = pollster::block_on(move_task(
@@ -5787,7 +6211,7 @@ mod tests {
 
         let negative = MoveTaskInput {
             status: TASK_STATUS_OPEN.to_string(),
-            sort_order: -1,
+            sort_order: Some(-1),
             displace: None,
         };
         let err = pollster::block_on(move_task(
@@ -5804,11 +6228,11 @@ mod tests {
         // displace.status is locked to PLANNED/COMPLETED/DISCARDED.
         let bad_displace = MoveTaskInput {
             status: TASK_STATUS_IN_PROGRESS.to_string(),
-            sort_order: 0,
+            sort_order: Some(0),
             displace: Some(DisplaceInput {
                 id: "x".to_string(),
                 status: TASK_STATUS_OPEN.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
             }),
         };
         let err = pollster::block_on(move_task(
@@ -5825,11 +6249,11 @@ mod tests {
         // displace only makes sense when the target is IN_PROGRESS.
         let misplaced = MoveTaskInput {
             status: TASK_STATUS_COMPLETED.to_string(),
-            sort_order: 0,
+            sort_order: Some(0),
             displace: Some(DisplaceInput {
                 id: "x".to_string(),
                 status: TASK_STATUS_PLANNED.to_string(),
-                sort_order: 0,
+                sort_order: Some(0),
             }),
         };
         let err = pollster::block_on(move_task(
@@ -5856,7 +6280,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
         let input = MoveTaskInput {
             status: TASK_STATUS_OPEN.to_string(),
-            sort_order: 0,
+            sort_order: Some(0),
             displace: None,
         };
 
@@ -5874,5 +6298,289 @@ mod tests {
             )),
             Err(TasksError::NotFound)
         ));
+    }
+
+    // ──────────────────────────────────────────
+    // move_task: omitted sort_order (no-drop column defaults)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn move_omit_sort_order_appends_open() {
+        // Unplan / reopen-to-OPEN with no drop position appends: the mover is
+        // excluded from the max, so its leftover PLANNED rank never inflates
+        // the OPEN append target.
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Plan A with an explicit drop (0 is fine).
+        let planned = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &a.id, TASK_STATUS_PLANNED, Some(0),
+        )
+        .unwrap();
+        assert_eq!(planned.task.status, TASK_STATUS_PLANNED);
+
+        // Unplan A back to OPEN with NO drop position: it appends after the
+        // living OPEN peers (B holds 1), landing at 2 — not at its leftover
+        // PLANNED rank and not at the tail of an inflated max.
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &a.id, TASK_STATUS_OPEN, None,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 2, "reopen appends after living OPEN peers");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 2);
+        assert_eq!(rank(&b.id), 1, "the untouched OPEN peer keeps its rank");
+        drop(stored);
+    }
+
+    #[test]
+    fn move_omit_sort_order_appends_planned() {
+        // Plan via move with no drop position: from OPEN (not IN_PROGRESS)
+        // the PLANNED default is append, so a fresh pile puts A at 0 and B
+        // appends at 1 without shifting A.
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let first = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &a.id, TASK_STATUS_PLANNED, None,
+        )
+        .unwrap();
+        assert_eq!(
+            first.task.sort_order,
+            0,
+            "first plan lands at the front of an empty Planned pile"
+        );
+
+        let second = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &b.id, TASK_STATUS_PLANNED, None,
+        )
+        .unwrap();
+        assert_eq!(second.task.sort_order, 1, "second plan appends at max+1");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 0, "the first plan keeps its rank");
+        assert_eq!(rank(&b.id), 1, "the second plan appends behind it");
+        drop(stored);
+    }
+
+    #[test]
+    fn move_omit_sort_order_pauses_to_front_of_planned() {
+        // Pause (IN_PROGRESS → PLANNED) with no drop position PREPENDS: the
+        // paused task takes 0 and the old Planned peer shifts to 1.
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Seed a PLANNED peer at 0 (plan via move with an explicit drop).
+        let planned = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &peer.id, TASK_STATUS_PLANNED, Some(0),
+        )
+        .unwrap();
+        assert_eq!(planned.task.sort_order, 0);
+
+        // Start `task`, then pause it to PLANNED with no drop position.
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &task.id);
+        drop(_start_http);
+        let pause_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            pause_unix,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: None,
+                displace: None,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(response.task.sort_order, 0, "pause prepends to Planned");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(
+            stored.iter().find(|row| row.id == peer.id).unwrap().sort_order,
+            1,
+            "the old Planned peer shifts down one"
+        );
+        drop(stored);
+    }
+
+    #[test]
+    fn move_omit_sort_order_prepends_completed() {
+        // Complete via move with no drop position prepends 0; an existing
+        // COMPLETED peer shifts to 1.
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Seed a COMPLETED peer at 0 (dummy row: set_status + rank).
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &task.id, TASK_STATUS_COMPLETED, None,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(response.task.sort_order, 0, "complete prepends to Done");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(
+            stored.iter().find(|row| row.id == peer.id).unwrap().sort_order,
+            1,
+            "the old COMPLETED peer shifts down one"
+        );
+        drop(stored);
+    }
+
+    #[test]
+    fn move_same_status_omit_is_noop() {
+        // Same-status move with no drop position returns the row unchanged —
+        // never sent to the tail, no peer shift, no log.
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &b.id, TASK_STATUS_OPEN, None,
+        )
+        .unwrap();
+        assert_eq!(response.task.id, b.id);
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 1, "same-status omit does not reorder");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 0);
+        assert_eq!(rank(&b.id), 1);
+        drop(stored);
+        assert!(logs.inserted.lock().unwrap().is_empty(), "no-op logs nothing");
+        assert!(http.posts.lock().unwrap().is_empty());
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_omit_deserializes_from_json_without_field() {
+        // The worker accepts a body with no sort_order at all (and a
+        // displace with no sort_order): both deserialize to `None`.
+        let input: MoveTaskInput = serde_json::from_str(r#"{"status":"OPEN"}"#).unwrap();
+        assert_eq!(input.status, "OPEN");
+        assert!(input.sort_order.is_none(), "omitted sort_order deserializes to None");
+        assert!(input.displace.is_none());
+
+        let displaced: MoveTaskInput =
+            serde_json::from_str(r#"{"status":"IN_PROGRESS","displace":{"id":"t","status":"PLANNED"}}"#)
+                .unwrap();
+        let displace = displaced.displace.expect("displace is present");
+        assert_eq!(displace.id, "t");
+        assert!(displace.sort_order.is_none(), "omitted displace.sort_order deserializes to None");
+    }
+
+    #[test]
+    fn move_displace_omit_sort_order_prepends_planned() {
+        // The conflict-dialog displace with no drop position parks the
+        // running task at the front of its landing pile (prepend 0).
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        // A parked at 22:14:00 (the invert guard: snapped T == A.start →
+        // end = A.start + 60); B starts at the same instant on the minute
+        // grid.
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &created_event_json(&b.id, "2023-11-14T22:14:00Z", "2023-11-14T22:29:00Z"),
+            ),
+        ]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            Some(&access()),
+            "u-1",
+            &b.id,
+            NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: None,
+                displace: Some(DisplaceInput {
+                    id: a.id.clone(),
+                    status: TASK_STATUS_PLANNED.to_string(),
+                    sort_order: None,
+                }),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.id, b.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(response.task.sort_order, 0, "B ranks 0 in In Progress");
+        let displaced = response.displaced.expect("A is returned as displaced");
+        assert_eq!(displaced.id, a.id);
+        assert_eq!(displaced.status, TASK_STATUS_PLANNED);
+        assert_eq!(displaced.sort_order, 0, "A is parked at the front of Planned");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == a.id).unwrap().sort_order, 0);
+        assert_eq!(stored.iter().find(|row| row.id == b.id).unwrap().sort_order, 0);
+        drop(stored);
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "A's event closed");
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's event inserted");
     }
 }

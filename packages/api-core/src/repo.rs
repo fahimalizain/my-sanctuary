@@ -274,9 +274,9 @@ pub trait TaskRepo: Send + Sync {
     /// `status = "OPEN"` (this slice creates no other status).
     async fn insert(&self, task: NewTask) -> Result<Task, RepoError>;
     /// Shifts the living tasks of `user_id` in `status` whose `sort_order` is
-    /// `>= from_inclusive` up by one — the peer shift behind the Backlog
-    /// prepend (create) and the move endpoint's cross-column placement. Never
-    /// touches `updated_at`: re-ranking is not a content change.
+    /// `>= from_inclusive` up by one — the peer shift behind the move
+    /// endpoint's cross-column placement. Never touches `updated_at`:
+    /// re-ranking is not a content change.
     async fn shift_sort_order(
         &self,
         user_id: &str,
@@ -315,6 +315,18 @@ pub trait TaskRepo: Send + Sync {
     /// `status` NOR `updated_at`: the move endpoint places cards (cross-column
     /// via `set_status` first, then this) without marking them content-updated.
     async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<Option<Task>, RepoError>;
+    /// Highest living `sort_order` for `user_id` in `status`, or `None` when
+    /// that pile is empty. Soft-deleted rows, other users/statuses, and the
+    /// `exclude_id` row (when `Some`) are ignored — the no-drop `/move`
+    /// passes the moving task id so its leftover rank from the source column
+    /// never inflates its own append target. Used by `create_task` (`None`)
+    /// and the no-drop `/move` to append: `max.map(|m| m + 1).unwrap_or(0)`.
+    async fn max_sort_order(
+        &self,
+        user_id: &str,
+        status: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<Option<i64>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
@@ -754,14 +766,14 @@ pub const TASK_GET_BY_ID_SQL: &str =
 
 /// Plain INSERT (no `ON CONFLICT`): tasks are user-authored, never upserted.
 /// The D1 implementation binds the UUID `id`, the timestamps, the hardcoded
-/// `status = 'OPEN'`, and the caller-shifted `sort_order` — `create_task`
-/// shifts living OPEN peers up by one, then inserts at 0 (Backlog prepend).
+/// `status = 'OPEN'`, and the append `sort_order` — `create_task` queries
+/// `max(sort_order)+1` (0 on an empty Backlog) and never shifts peers.
 pub const TASK_INSERT_SQL: &str = "
     INSERT INTO tasks (id, user_id, title, description, duration_minutes, priority, difficulty, status, sort_order, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
-/// The Backlog-prepend peer shift: every living task of the user in `status`
+/// The cross-column peer shift: every living task of the user in `status`
 /// ranked at or after `from_inclusive` moves up one. `updated_at` is left
 /// alone on purpose — re-ranking is a position change, not a content update.
 pub const TASK_SHIFT_SORT_ORDER_SQL: &str = "
@@ -785,6 +797,19 @@ pub const TASK_SHIFT_SORT_ORDER_RANGE_SQL: &str = "
 /// placement is a position change, not a content update.
 pub const TASK_SET_SORT_ORDER_SQL: &str =
     "UPDATE tasks SET sort_order = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// The highest living `sort_order` in the user's `status` pile — the append
+/// target behind `create_task` and the no-drop `/move` (which binds its own
+/// id to the `id != ?` filter so the mover's leftover rank never inflates
+/// its own append target; `create_task` binds an empty string, which never
+/// matches a UUID). `LIMIT 1` over `MAX()` so an empty pile reads as `None`
+/// via `first()`, matching the other get-by-id queries.
+pub const TASK_MAX_SORT_ORDER_SQL: &str = "
+    SELECT sort_order FROM tasks
+    WHERE user_id = ? AND status = ? AND deleted_at IS NULL AND id != ?
+    ORDER BY sort_order DESC
+    LIMIT 1
+";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). Status
 /// is intentionally not updatable — slice 4 adds the status transitions. The

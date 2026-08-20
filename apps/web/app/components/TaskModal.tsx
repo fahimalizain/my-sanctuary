@@ -58,8 +58,8 @@ interface TaskModalProps {
   onDelete?: (taskId: string) => Promise<string | null>;
   /** Immediate status change (edit only). Return an error string to show on
    *  the form, or null on success. `displace` is set when the user confirmed
-   *  parking the current runner. sort_order is always 0 (prepend — no drop).
-   *  When omitted, Status renders read-only. */
+   *  parking the current runner. sort_order is omitted — no drop: the server
+   *  applies the column default. When omitted, Status renders read-only. */
   onMove?: (
     taskId: string,
     status: TaskStatus,
@@ -240,7 +240,6 @@ export function TaskModal({
       void submitForm({
         id: runningTask.id,
         status: parkStatus,
-        sort_order: 0,
       });
       return;
     }
@@ -249,7 +248,6 @@ export function TaskModal({
     void runMove('IN_PROGRESS', {
       id: runningTask.id,
       status: parkStatus,
-      sort_order: 0,
     });
   };
 
@@ -448,12 +446,13 @@ export function TaskModal({
             </div>
 
             {/* Status — edit mode: with onMove, immediate column pills (a drop
-              with no drop position: always prepend); without it, keep the
-              old read-only box so hypothetical callers stay intact. Create
-              mode: when `createStatus` is set (board column +), the same
-              five pills render locked to that destination — changing column
-              means Cancel and tapping another +. Omitted (Lists page) means
-              no Status section at all. */}
+              with no drop position: `sort_order` is omitted and the server
+              applies the column default); without it, keep the old read-only
+              box so hypothetical callers stay intact. Create mode: when
+              `createStatus` is set (board column +), the same five pills
+              render locked to that destination — changing column means
+              Cancel and tapping another +. Omitted (Lists page) means no
+              Status section at all. */}
             {isEditing ? (
               onMove ? (
                 <div className="space-y-2 mb-6">

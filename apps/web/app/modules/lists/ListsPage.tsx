@@ -23,6 +23,9 @@ import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
 import { cn } from '@/lib/utils';
+// Lists is unlinked from the nav; one shared helper is fine to import across
+// modules — no new package.
+import { defaultMoveRank } from '../board/board-model';
 import type {
   MoveDisplaceInput,
   MoveTaskError,
@@ -318,11 +321,13 @@ export function ListsPage() {
   };
 
   /** TaskModal's immediate status change — the same /move contract as the
-   *  board: optimistic (this task → `status`, the parked runner → its park
-   *  status, both `sort_order: 0`), then one POST /api/tasks/:id/move.
-   *  Failure with a `displaced` task keeps A parked and snaps only this task
-   *  back; any other failure restores the full snapshot. Sets the banner and
-   *  returns the message for the form (null on success). */
+   *  board: no drop position, so `sort_order` is OMITTED and the server
+   *  applies the column default (`defaultMoveRank` mirrors it for the
+   *  optimistic frame — the moved card to its default rank, the parked
+   *  runner to 0), then one POST /api/tasks/:id/move. Failure with a
+   *  `displaced` task keeps A parked and snaps only this task back; any
+   *  other failure restores the full snapshot. Sets the banner and returns
+   *  the message for the form (null on success). */
   const handleMoveTask = async (
     taskId: string,
     status: TaskStatus,
@@ -330,21 +335,32 @@ export function ListsPage() {
   ): Promise<string | null> => {
     setActionError(null);
     const snapshot = tasksRef.current;
+    const current = snapshot.find((entry) => entry.id === taskId);
+    const destRank = defaultMoveRank(
+      current?.status ?? status,
+      status,
+      snapshot,
+      taskId,
+    );
+    // No-drop: omit `displace.sort_order` too — the park always prepends.
+    const park = displace
+      ? { id: displace.id, status: displace.status }
+      : undefined;
     setTasks((prev) =>
       prev.map((entry) => {
         if (displace && entry.id === displace.id) {
           return {
             ...entry,
             status: displace.status,
-            sort_order: displace.sort_order,
+            sort_order: 0,
           };
         }
         return entry.id === taskId
-          ? { ...entry, status, sort_order: 0 }
+          ? { ...entry, status, sort_order: destRank }
           : entry;
       }),
     );
-    const body: MoveTaskInput = { status, sort_order: 0, displace };
+    const body: MoveTaskInput = { status, displace: park };
     try {
       const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
         method: 'POST',
