@@ -11,6 +11,7 @@ Date: 2026-08-20
 > - `2c60579 feat(api): add regex hole fill and extract`
 > - `da60b12 feat(api): return classify affixes and honor category lock`
 > - `cf39c36 feat(api): add display_title to task views`
+> - `dc381ed fix(web): snap title input to display_title after classify`
 > - plus the TaskModal / CategoryPicker slices.
 >
 > There is no implementation slice left to schedule — every § below is a
@@ -311,6 +312,30 @@ The shipped `apps/web/app/components/TaskModal.tsx` + `CategoryPicker.tsx`:
   The live input is tracked so a response that lands after the user typed past
   its snapshot is dropped; an empty title fires **only when locked** (empty +
   no lock stays idle, matching the server's 400 rule).
+- **Create/unlocked blur snap**: an _unlocked_ classify that returns `Matched`
+  with non-empty chrome (prefix or suffix) collapses the visible input to the
+  hole once its response lands — the create-mode counterpart of edit-open.
+  The effect in `TaskModal.tsx` fires only while the live, trimmed input is
+  still exactly the blurred `persist_title` and that string is not already
+  `display_title`; it never fires with no chrome (`Work` against `^Work$`) or
+  after the user typed past the classify. When it does fire:
+  1. It sets the input to `display_title` (`S | SpicyHome` → `S`), so the
+     suffix is not painted twice.
+  2. It sets `lockId` to the matched `category.id`, so a later blur of just the
+     hole stays filed — an unlocked re-classify of `S` would no-match and drop
+     the chrome.
+  3. It leaves `classifyTitle` as the **full** `persist_title` string. The
+     lock change re-fires classify as identity (full title + lock), preserving
+     the user's suffix spelling — ` | SpicyHome`, never the first-alternative
+     ` | Spicy Home`.
+  4. It sets `lastClassifyRef = { input: display_title, lock: category.id }`
+     so Save's `corresponds` check still holds for the snapped state.
+- **Hook stale-drop exemption**: `useTitleClassification` keeps a response
+  when the live input equals the result's `display_title` and the classified
+  snapshot equals its `persist_title` — the same hole-visible / full-string-
+  classified shape as the edit-open seed. Without this exemption, the classify
+  re-fire after the snap (and its lock change) would be dropped as stale and
+  the chrome would vanish.
 - **Edit-open**: the first classify sends the stored **full `task.title`**
   (marked as the seed, exempt from stale-drop) while the input shows
   `display_title`. This is what prevents first-alternative canonicalization:
@@ -374,6 +399,10 @@ Home` on the server, destroying the user's spelling with no visible cause.
   something else was tried and **reverted after grilling** — the shipped
   behavior is identity-if-files-to-C else fill-under-C, never a silent
   re-target.
+- **Leave the full string in the input and only paint chrome** instead of
+  snapping to the hole: `S | SpicyHome` stays in the input while the frozen
+  ` | SpicyHome` chrome renders beside it — the suffix appears twice. The
+  shipped snap collapses the input to the hole and locks the match instead.
 - **Capture groups for extracting the hole:** groups only _name_ a span of the
   matched text; they add no information here, because we already know _which
   HIR node_ is the hole and can slice exactly its consumed span via anchored
@@ -418,6 +447,7 @@ root and `^.* [|] (SpicyHome|Spicy Home)$`-style patterns for SpicyHome, with
 | Unlocked `Work`                                                                              | persist=Work, display=Work, no chrome (`^Work$` has no hole); picker autofills Work after blur (but never locks)                                                                               |
 | Unlocked `Test \| Work`                                                                      | persist as typed `Test \| Work`, display=Test, suffix=` \| Work` (actually split); picker autofills Work                                                                                       |
 | Unlocked `Hello! \| SpicyHome`                                                               | persist as typed, display=Hello!, the **actual** split suffix ` \| SpicyHome` — never the first-alt ` \| Spicy Home`                                                                           |
+| Unlocked blur `S \| SpicyHome`                                                               | persist as typed; input **snaps** to `S`; chrome suffix ` \| SpicyHome`; picker/lock becomes SpicyHome so a later blur of `S` does not nomatch                                                 |
 | Unlocked `asdf`                                                                              | Untracked (no conflict), no chrome; Save fails with "Title does not match a category"                                                                                                          |
 | Unlocked two-root conflict (both Work and SpicyHome match)                                   | Untracked{conflict}, `categories` names both; Save fails with "Matches A and B — be more specific"                                                                                             |
 | Lock SpicyHome + `Work`                                                                      | fill SpicyHome's first hole-bearing pattern → `Work \| SpicyHome` (or its first alternative `Work \| Spicy Home`); does **not** snap to the Work root                                          |
