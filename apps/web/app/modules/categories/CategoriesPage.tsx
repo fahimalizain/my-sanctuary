@@ -553,19 +553,23 @@ export function CategoriesPage() {
         open={form !== null}
         onOpenChange={(open) => !open && closeForm()}
       >
-        <DialogContent className="sm:max-w-[560px] p-0 gap-0 overflow-hidden bg-card border-border">
-          <div className="h-2" style={{ backgroundColor: color }} />
-          <div className="p-6 max-h-[80vh] overflow-y-auto">
-            <DialogHeader className="mb-6">
-              <DialogTitle className="text-foreground">
-                {dialogTitle}
-              </DialogTitle>
-              <DialogDescription>
-                {form?.mode === 'edit'
-                  ? 'Update the category and its title-matching patterns.'
-                  : 'Categories group tasks; patterns classify titles into them.'}
-              </DialogDescription>
-            </DialogHeader>
+        <DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[560px] bg-card border-border">
+          <div
+            className="h-2 shrink-0"
+            style={{ backgroundColor: color }}
+          />
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
+            <DialogTitle className="text-foreground">
+              {dialogTitle}
+            </DialogTitle>
+            <DialogDescription>
+              {form?.mode === 'edit'
+                ? 'Update the category and its title-matching patterns.'
+                : 'Categories group tasks; patterns classify titles into them.'}
+            </DialogDescription>
+          </DialogHeader>
+          <hr className="shrink-0 border-border" />
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
 
             <div className="space-y-2 mb-5">
               <label className="text-sm font-medium text-foreground">
@@ -696,8 +700,9 @@ export function CategoriesPage() {
             {formError && (
               <p className="mb-4 text-sm text-destructive">{formError}</p>
             )}
+          </div>
 
-            <div className="flex justify-end gap-3">
+          <div className="flex shrink-0 justify-end gap-3 border-t border-border px-6 py-4">
               <Button
                 variant="outline"
                 onClick={closeForm}
@@ -713,7 +718,6 @@ export function CategoriesPage() {
                 {saving && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                 {form?.mode === 'edit' ? 'Save Changes' : 'Create Category'}
               </Button>
-            </div>
           </div>
         </DialogContent>
       </Dialog>

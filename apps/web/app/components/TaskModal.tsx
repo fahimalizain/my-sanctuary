@@ -256,28 +256,29 @@ export function TaskModal({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-[480px] p-0 gap-0 overflow-hidden bg-card border-border">
+        <DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[480px] bg-card border-border">
           {/* Header accent bar — edit mode uses the task's computed category
             color; create has no category anchor (no color is fine) */}
           <div
-            className="h-2"
+            className="h-2 shrink-0"
             style={{
               backgroundColor: isEditing ? task!.category.color : undefined,
             }}
           />
 
-          <div className="p-6">
-            <DialogHeader className="mb-6">
-              <DialogTitle className="text-foreground">
-                {isEditing ? 'Edit Task' : 'New Task'}
-              </DialogTitle>
-              <DialogDescription>
-                {isEditing
-                  ? 'Update the details of your task below.'
-                  : 'Tasks are filed by their title — type a title that matches a category.'}
-              </DialogDescription>
-            </DialogHeader>
+          <DialogHeader className="shrink-0 px-6 pt-6 pb-4">
+            <DialogTitle className="text-foreground">
+              {isEditing ? 'Edit Task' : 'New Task'}
+            </DialogTitle>
+            <DialogDescription>
+              {isEditing
+                ? 'Update the details of your task below.'
+                : 'Tasks are filed by their title — type a title that matches a category.'}
+            </DialogDescription>
+          </DialogHeader>
+          <hr className="shrink-0 border-border" />
 
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
             {/* Task Title */}
             <div className="space-y-2 mb-5">
               <label className="text-sm font-medium text-foreground">
@@ -540,9 +541,9 @@ export function TaskModal({
             {formError && (
               <p className="mb-4 text-sm text-destructive">{formError}</p>
             )}
+          </div>
 
-            {/* Actions */}
-            <div className="flex items-center justify-between pt-4 border-t border-border">
+          <div className="flex shrink-0 items-center justify-between border-t border-border px-6 py-4">
               {isEditing ? (
                 <Button
                   variant="ghost"
@@ -581,7 +582,6 @@ export function TaskModal({
                   {isEditing ? 'Save Changes' : 'Create Task'}
                 </Button>
               </div>
-            </div>
           </div>
         </DialogContent>
       </Dialog>

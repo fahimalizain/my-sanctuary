@@ -792,11 +792,10 @@ export function BoardPage() {
       'this task');
 
   return (
-    <div className="min-h-screen bg-cream">
-      {/* pb-28 clears the floating nav, so the last cards stay reachable */}
-      <div className="max-w-7xl mx-auto px-6 py-8 pb-28">
+    <div className="flex min-h-screen flex-col bg-cream">
+      <div className="mx-auto w-full max-w-7xl px-6 pt-8">
         {/* Header */}
-        <header className="flex items-center justify-between mb-8">
+        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h1 className="font-heading text-3xl font-bold text-foreground mb-2">
               Board
@@ -805,7 +804,7 @@ export function BoardPage() {
               Backlog, Planned, In Progress, Done, Discarded
             </p>
           </div>
-          <div className="flex gap-3">
+          <div className="flex shrink-0 gap-3">
             <Button variant="outline" onClick={() => openCreateTask('OPEN')}>
               <Plus className="h-4 w-4 mr-2" />
               New Task
@@ -866,61 +865,64 @@ export function BoardPage() {
             flight, or a load error that replaced the board). Action errors
             never unmount it. */}
         {(lists.length > 0 || (!isLoading && !loadError)) && (
-          <>
-            {/* URL filters — one wrapping horizontal row (ADR 0002 § UI):
+            /* URL filters — one wrapping horizontal row (ADR 0002 § UI):
                 Priority and Difficulty are single-select All+value pills;
                 Category is a searchable checkbox combobox grouped by list →
-                root → children. Filters combine with AND. */}
+                root → children. Filters combine with AND. */
             <section className="mb-6 space-y-3">
               <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="flex flex-col items-start gap-1.5">
+                  <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                     Priority
                   </span>
-                  <FilterPill
-                    selected={priority === undefined}
-                    onClick={() => setPriorityFilter(undefined)}
-                  >
-                    All
-                  </FilterPill>
-                  {(['high', 'medium', 'low'] as TaskPriority[]).map(
-                    (value) => (
-                      <FilterPill
-                        key={value}
-                        selected={priority === value}
-                        onClick={() => setPriorityFilter(value)}
-                      >
-                        {value[0].toUpperCase() + value.slice(1)}
-                      </FilterPill>
-                    ),
-                  )}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <FilterPill
+                      selected={priority === undefined}
+                      onClick={() => setPriorityFilter(undefined)}
+                    >
+                      All
+                    </FilterPill>
+                    {(['high', 'medium', 'low'] as TaskPriority[]).map(
+                      (value) => (
+                        <FilterPill
+                          key={value}
+                          selected={priority === value}
+                          onClick={() => setPriorityFilter(value)}
+                        >
+                          {value[0].toUpperCase() + value.slice(1)}
+                        </FilterPill>
+                      ),
+                    )}
+                  </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="flex flex-col items-start gap-1.5">
+                  <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                     Difficulty
                   </span>
-                  <FilterPill
-                    selected={difficulty === undefined}
-                    onClick={() => setDifficultyFilter(undefined)}
-                  >
-                    All
-                  </FilterPill>
-                  {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
-                    (value) => (
-                      <FilterPill
-                        key={value}
-                        selected={difficulty === value}
-                        onClick={() => setDifficultyFilter(value)}
-                      >
-                        {value[0].toUpperCase() + value.slice(1)}
-                      </FilterPill>
-                    ),
-                  )}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <FilterPill
+                      selected={difficulty === undefined}
+                      onClick={() => setDifficultyFilter(undefined)}
+                    >
+                      All
+                    </FilterPill>
+                    {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
+                      (value) => (
+                        <FilterPill
+                          key={value}
+                          selected={difficulty === value}
+                          onClick={() => setDifficultyFilter(value)}
+                        >
+                          {value[0].toUpperCase() + value.slice(1)}
+                        </FilterPill>
+                      ),
+                    )}
+                  </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="w-20 shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="flex flex-col items-start gap-1.5">
+                  <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                     Category
                   </span>
                   {filterableCategories.length > 0 ? (
@@ -951,10 +953,15 @@ export function BoardPage() {
                 </div>
               )}
             </section>
+        )}
+      </div>
 
-            {/* Five status columns, horizontal scroll on narrow screens.
-                DndContext wraps the scroll row: cards start a drag after an
-                8px press-move, the scroll gutter and headers still pan. */}
+      {(lists.length > 0 || (!isLoading && !loadError)) && (
+            /* Five status columns. The scroller fills leftover viewport
+                height so empty space below the columns still pans. On wide
+                screens the row grows (capped) and stays centered; on narrow
+                screens min-width 260px columns overflow-x. mb-24 sits the
+                scrollbar just above the floating nav. */
             <DndContext
               sensors={sensors}
               collisionDetection={closestCorners}
@@ -962,7 +969,8 @@ export function BoardPage() {
               onDragEnd={handleDragEnd}
               onDragCancel={() => setActiveDrag(null)}
             >
-              <div className="flex gap-6 overflow-x-auto pb-4">
+              <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
+                <div className="mx-auto flex min-h-full w-max min-w-[min(100%,1600px)] gap-6 px-6">
                 {COLUMNS.map((column) => (
                   <BoardColumnView
                     key={column.status}
@@ -974,6 +982,7 @@ export function BoardPage() {
                     onAddTask={openCreateTask}
                   />
                 ))}
+                </div>
               </div>
 
               {/* Slightly elevated copy of the card following the pointer */}
@@ -985,9 +994,7 @@ export function BoardPage() {
                 )}
               </DragOverlay>
             </DndContext>
-          </>
-        )}
-      </div>
+      )}
 
       {/* Occupied In Progress conflict dialog (ADR 0002 § UI): pick where the
           running task is parked. Cancel / overlay close drops the stash with
