@@ -12,21 +12,16 @@
       "envFile": "${workspaceFolder}/.env",
       "serverReadyAction": {
         "action": "startDebugging",
-        "name": "Web: Chrome",
+        "name": "Web: Integrated Browser",
         "pattern": "Local:.*(https?://[a-zA-Z0-9.:]+)"
       }
     },
     {
-      "type": "chrome",
+      "type": "editor-browser",
       "request": "launch",
-      "name": "Web: Chrome",
+      "name": "Web: Integrated Browser",
       "url": "http://localhost:5173",
-      "webRoot": "${workspaceFolder}/apps/web",
-      "userDataDir": "${workspaceFolder}/.vscode/chrome-debug-profile",
-      "runtimeArgs": [
-        "--test-type",
-        "--disable-blink-features=AutomationControlled"
-      ]
+      "webRoot": "${workspaceFolder}/apps/web"
     },
     {
       "type": "node-terminal",
