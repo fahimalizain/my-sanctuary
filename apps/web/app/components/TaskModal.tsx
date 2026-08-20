@@ -242,6 +242,33 @@ export function TaskModal({
     resetKey: `${open}:${task?.id ?? 'new'}`,
   });
 
+  // Snap-to-hole: after an unlocked classify match carries chrome, collapse
+  // the input's full typed string down to the server's `display_title` (e.g.
+  // "S | SpicyHome" → "S") — otherwise the chrome paints "| SpicyHome" while
+  // the input still holds the full string, and the user sees the suffix twice.
+  // Locking the match keeps the result on screen: an unlocked re-classify of
+  // just the hole would miss and wipe the chrome. `classifyTitle` stays the
+  // full blurred string — the lock change re-fires classify with it, which
+  // resolves as identity, so the persisted spelling is preserved as typed.
+  // Only snap while the visible title is still the persist string — never
+  // after the user typed past the result, and never when there is no chrome.
+  useEffect(() => {
+    if (
+      classifyStatus.state !== 'matched' ||
+      lockId !== null ||
+      (classifyStatus.prefix === '' && classifyStatus.suffix === '') ||
+      title.trim() !== classifyStatus.persistTitle.trim() ||
+      title.trim() === classifyStatus.displayTitle.trim()
+    ) {
+      return;
+    }
+    const snapped = classifyStatus.displayTitle;
+    const lock = classifyStatus.category.id;
+    setTitle(snapped);
+    setLockId(lock);
+    lastClassifyRef.current = { input: snapped, lock };
+  }, [classifyStatus, lockId, title]);
+
   // What the picker shows vs. what the API gets: the explicit lock always
   // wins; when unlocked (picker "No category"), a unique classify match still
   // shows in the combobox as a type-first autofill. It is never sent as

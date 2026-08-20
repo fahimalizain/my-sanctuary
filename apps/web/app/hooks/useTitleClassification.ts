@@ -150,9 +150,24 @@ export function useTitleClassification({
         }
         const data = (await res.json()) as ClassifyResponse;
         if (!mountedRef.current) return;
+        // The snap shape: the modal collapsed the input to the hole
+        // (`display_title`) while this request was in flight for the full
+        // string (`persist_title`) — the live title legitimately differs from
+        // the classified snapshot, as with the edit-open seed, so the
+        // response must not be dropped as stale.
+        const result = 'Matched' in data ? data.Matched : data.Untracked;
+        const liveIsSnappedHole =
+          titleRef.current.trim() === result.display_title.trim() &&
+          trimmed === result.persist_title.trim();
         // The user typed past the snapshot we classified — drop the stale
-        // result instead of repainting it (never for the seed).
-        if (!isSeed && titleRef.current.trim() !== trimmed) {
+        // result instead of repainting it (exempt the seed and the snapped
+        // hole, where the live input differs from the classified string by
+        // design).
+        if (
+          !isSeed &&
+          !liveIsSnappedHole &&
+          titleRef.current.trim() !== trimmed
+        ) {
           setStatus({ state: 'idle' });
           return;
         }
