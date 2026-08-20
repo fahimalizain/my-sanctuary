@@ -35,7 +35,8 @@
 //!
 //! Timer rules (locked):
 //! - `start_task` opens a Google Calendar event on the **minute grid**
-//!   (`T … T + duration_minutes` where `T = nearest_minute_unix(now)`) with
+//!   (`T … T + START_EVENT_MINUTES` — 15, independent of
+//!   `task.duration_minutes` — where `T = nearest_minute_unix(now)`) with
 //!   `extendedProperties.shared.sanctuary_task_id` = task UUID (never
 //!   `private`, never a description footer). Summary is the task **title**
 //!   exactly — no `| Category` suffix.
@@ -53,7 +54,8 @@
 //!   "IN_PROGRESS"` is the only lock** — the start gate scans the user's
 //!   living tasks by status, never the event window.
 //! - Every timer Google write snaps to the nearest minute: `start_task`
-//!   creates at `T … T + duration_minutes`, and all exit verbs
+//!   creates at `T … T + START_EVENT_MINUTES` (15, independent of
+//!   `duration_minutes`), and all exit verbs
 //!   (`stop_task`/`pause_task`/`complete_task`/`discard_task`, and the
 //!   displace park) PATCH the event's end to snapped `T` (`start + 60s` when
 //!   `T <= start`, keeping the event valid).
@@ -128,6 +130,9 @@ use crate::token::{refresh_if_needed, GoogleAccess};
 
 /// Default planned duration for a new task, in minutes.
 pub const DEFAULT_DURATION_MINUTES: i64 = 15;
+/// Fixed initial Google event window on start, in minutes. Independent of
+/// `task.duration_minutes`, which is only a planned estimate on the card.
+pub const START_EVENT_MINUTES: i64 = 15;
 /// Minimum planned duration, in minutes.
 pub const MIN_DURATION_MINUTES: i64 = 1;
 /// The status every created task gets.
@@ -912,8 +917,9 @@ pub async fn delete_task(
 ///    this user and is writable (`access_role` owner/writer); a missing or
 ///    read-only named calendar goes to the user's primary calendar, never to
 ///    the next inheritance slot. No writable calendar → 400.
-/// 5. `create_event` on the minute grid (`T … T + duration_minutes`,
-///    `T = nearest_minute_unix(now)`, task carrier attached).
+/// 5. `create_event` on the minute grid (`T … T + START_EVENT_MINUTES` — 15,
+///    independent of `task.duration_minutes` — `T = nearest_minute_unix(now)`,
+///    task carrier attached).
 /// 6. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
 ///    request.
 pub async fn start_task(
@@ -950,10 +956,12 @@ pub async fn start_task(
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
     let target = resolve_target_calendar(calendars, &taxonomy, &task.title, user_id).await?;
 
-    // Timer Google writes snap to the nearest minute.
+    // Timer Google writes snap to the nearest minute. The event is a fixed
+    // live marker the elongate cron grows — `duration_minutes` is only a
+    // planned estimate on the card and never sizes this window.
     let t_unix = nearest_minute_unix(now_unix);
     let start_rfc3339 = unix_secs_to_rfc3339(t_unix);
-    let end_rfc3339 = unix_secs_to_rfc3339(t_unix + task.duration_minutes * 60);
+    let end_rfc3339 = unix_secs_to_rfc3339(t_unix + START_EVENT_MINUTES * 60);
     let output = create_event(
         http,
         calendars,
@@ -3806,7 +3814,7 @@ mod tests {
     /// `NOW_UNIX` snapped to the nearest minute — every timer Google write
     /// lands here (22:13:20 → 22:13:00).
     const NOW_SNAPPED: &str = "2023-11-14T22:13:00Z";
-    /// Snapped 15-minute end (`T + DEFAULT_DURATION_MINUTES * 60`).
+    /// Snapped 15-minute end (`T + START_EVENT_MINUTES * 60`).
     const NOW_END: &str = "2023-11-14T22:28:00Z";
 
     fn access() -> GoogleAccess {
@@ -4340,6 +4348,52 @@ mod tests {
         assert_eq!(inserted[0].at, NOW);
         assert_eq!(inserted[0].calendar_id.as_deref(), Some("cal-primary@example.com"));
         assert_eq!(inserted[0].google_event_id.as_deref(), Some("g-1"));
+    }
+
+    #[test]
+    fn start_opens_fixed_15min_window_regardless_of_duration() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        // A 45-minute plan must NOT size the event: the live block is a fixed
+        // marker the elongate cron grows, not a reservation of the estimate.
+        pollster::block_on(update_task(
+            &categories,
+            &tasks,
+            "u-1",
+            &task.id,
+            &UpdateTask {
+                duration_minutes: Some(45),
+                ..UpdateTask::default()
+            },
+        ))
+        .unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // The estimate is untouched by start; the event window ignores it.
+        assert_eq!(response.task.duration_minutes, 45, "plan estimate untouched");
+        let event = response.event.expect("start always returns the event");
+        assert_eq!(event.start_time, NOW_SNAPPED);
+        assert_eq!(event.end_time, NOW_END, "fixed 15 min window, not duration");
+
+        // The POST body carries the same fixed snapped window.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["start"]["dateTime"], NOW_SNAPPED);
+        assert_eq!(body["end"]["dateTime"], NOW_END);
     }
 
     #[test]
@@ -6156,6 +6210,44 @@ mod tests {
         assert!(response.displaced.is_none());
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_STARTED, "{inserted:?}");
+    }
+
+    #[test]
+    fn move_to_in_progress_opens_fixed_15min_window() {
+        // Board start leg (`to == IN_PROGRESS` → `start_task`) sizes the event
+        // from `START_EVENT_MINUTES`, never from the card's estimate.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(update_task(
+            &categories,
+            &tasks,
+            "u-1",
+            &task.id,
+            &UpdateTask {
+                duration_minutes: Some(45),
+                ..UpdateTask::default()
+            },
+        ))
+        .unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, Some(0),
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(response.task.duration_minutes, 45, "plan estimate untouched");
+        let event = response.event.expect("start leg returns the created event");
+        assert_eq!(event.start_time, NOW_SNAPPED);
+        assert_eq!(event.end_time, NOW_END, "fixed 15 min window, not duration");
     }
 
     #[test]
