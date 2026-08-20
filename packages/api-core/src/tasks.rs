@@ -10,8 +10,9 @@
 //!
 //! Domain rules (locked):
 //! - Tasks carry NO `category_id`/`list_id`. The category is **computed** per
-//!   title via [`crate::categories::classify`] with `event_google_calendar_id
-//!   = None` (calendar-scoped patterns never match task titles).
+//!   title via [`crate::categories::classify`] with [`CalendarScope::Ignore`]:
+//!   a pattern's `google_calendar_id` is a write destination, never an inbound
+//!   filter, so calendar-scoped patterns match task titles on regex alone.
 //! - Create/update reject a title that does not uniquely match a non-untracked
 //!   category (400). `Untracked { conflict: false }` (0 matches),
 //!   `Untracked { conflict: true }` (cross-tree conflict), and a match on the
@@ -87,7 +88,8 @@ use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{
-    classify, classify_detailed, ensure_taxonomy, CategoryWithPatterns, ClassifyOutcome,
+    classify, classify_detailed, ensure_taxonomy, CalendarScope, CategoryWithPatterns,
+    ClassifyOutcome,
 };
 use crate::config::OAuthConfig;
 use crate::models::{
@@ -368,7 +370,7 @@ pub async fn classify_title(
     }
     // Same count-gated load as create: seed on first visit, then read.
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
-    let detail = classify_detailed(&title, None, &taxonomy.matchers);
+    let detail = classify_detailed(&title, CalendarScope::Ignore, &taxonomy.matchers);
     let response = match detail.matched.len() {
         0 => ClassifyResponse::Untracked {
             conflict: false,
@@ -1661,7 +1663,7 @@ async fn resolve_target_calendar(
     user_id: &str,
 ) -> Result<TargetCalendar, TasksError> {
     let user_cals = calendars.list_by_user_id(user_id).await?;
-    let category = match classify(title, None, &taxonomy.matchers) {
+    let category = match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
         ClassifyOutcome::Matched { category_id } => taxonomy
             .categories
             .iter()
@@ -1721,7 +1723,7 @@ fn is_valid_difficulty(difficulty: &str) -> bool {
 }
 
 fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
-    let outcome = classify(&task.title, None, &taxonomy.matchers);
+    let outcome = classify(&task.title, CalendarScope::Ignore, &taxonomy.matchers);
     let category = match &outcome {
         ClassifyOutcome::Matched { category_id } => taxonomy
             .categories
@@ -1791,7 +1793,7 @@ fn summary_for(category: &TaskCategory, categories: &[TaskCategory]) -> TaskCate
 /// remainder) resolves to the root — `classify` already drops parents beaten
 /// by their own children, so a single leftover match is always OK here.
 fn resolve_category(title: &str, taxonomy: &Taxonomy) -> Result<String, TasksError> {
-    match classify(title, None, &taxonomy.matchers) {
+    match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
         ClassifyOutcome::Matched { category_id } => {
             if taxonomy
                 .categories

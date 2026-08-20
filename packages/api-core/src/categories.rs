@@ -120,14 +120,28 @@ pub enum ClassifyOutcome {
     Untracked { conflict: bool },
 }
 
+/// The caller's inbound calendar context for [`classify`]. Decides whether
+/// a pattern's `google_calendar_id` gates the match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalendarScope<'a> {
+    /// Tasks (and any caller with no inbound calendar). Pattern
+    /// `google_calendar_id` does not affect the match — regex only.
+    Ignore,
+    /// Incoming events. A pattern with `google_calendar_id` set matches
+    /// only when it equals this id. Unscoped patterns still match any calendar.
+    Event { google_calendar_id: &'a str },
+}
+
 /// Classifies a title (task title or event summary) into exactly one
 /// category.
 ///
 /// Reduction rules (locked):
 /// 1. Every stored pattern is compiled; invalid stored regexes are skipped.
-/// 2. A pattern with `google_calendar_id` set only applies when the caller
-///    supplies a matching event calendar id. When `event_google_calendar_id`
-///    is `None` (tasks), scoped patterns are skipped entirely.
+/// 2. Under [`CalendarScope::Ignore`] (tasks), `pattern.google_calendar_id`
+///    is not consulted — matching is regex only. Under
+///    [`CalendarScope::Event`], a pattern with `google_calendar_id` set
+///    applies only when it equals the caller's calendar id; unscoped
+///    patterns still match any calendar.
 /// 3. All matching categories are collected (a category matches when any of
 ///    its patterns matches).
 /// 4. If a child and its own parent both match, the parent is dropped — that
@@ -136,21 +150,24 @@ pub enum ClassifyOutcome {
 ///    that category; 2+ → `Untracked { conflict: true }`.
 ///
 /// Computes the reduced match set [`classify`] decides on: every category
-/// whose patterns match the title, minus parents beaten by their own
-/// children (rule 4), in input order.
+/// whose patterns match the title under `scope`, minus parents beaten by
+/// their own children (rule 4), in input order.
 pub(crate) fn reduced_matches<'a>(
     title: &str,
-    event_google_calendar_id: Option<&str>,
+    scope: CalendarScope<'_>,
     categories: &'a [CategoryWithPatterns],
 ) -> Vec<&'a CategoryWithPatterns> {
     let mut matched: Vec<&CategoryWithPatterns> = Vec::new();
     for category in categories {
         let matches = category.patterns.iter().any(|pattern| {
-            // Calendar-scoped patterns only apply to that calendar's events;
-            // task titles (None) never match them.
-            if let Some(scoped) = pattern.google_calendar_id.as_deref() {
-                if event_google_calendar_id != Some(scoped) {
-                    return false;
+            // Rule 2: only an Event scope with a different pattern calendar
+            // skips the pattern. Ignore (tasks) never looks at the field, and
+            // unscoped patterns match under any scope.
+            if let CalendarScope::Event { google_calendar_id } = scope {
+                if let Some(scoped) = pattern.google_calendar_id.as_deref() {
+                    if scoped != google_calendar_id {
+                        return false;
+                    }
                 }
             }
             match Regex::new(pattern.regex.trim()) {
@@ -178,9 +195,11 @@ pub(crate) fn reduced_matches<'a>(
 ///
 /// Reduction rules (locked):
 /// 1. Every stored pattern is compiled; invalid stored regexes are skipped.
-/// 2. A pattern with `google_calendar_id` set only applies when the caller
-///    supplies a matching event calendar id. When `event_google_calendar_id`
-///    is `None` (tasks), scoped patterns are skipped entirely.
+/// 2. Under [`CalendarScope::Ignore`] (tasks), `pattern.google_calendar_id`
+///    is not consulted — matching is regex only. Under
+///    [`CalendarScope::Event`], a pattern with `google_calendar_id` set
+///    applies only when it equals the caller's calendar id; unscoped
+///    patterns still match any calendar.
 /// 3. All matching categories are collected (a category matches when any of
 ///    its patterns matches).
 /// 4. If a child and its own parent both match, the parent is dropped — that
@@ -189,10 +208,10 @@ pub(crate) fn reduced_matches<'a>(
 ///    that category; 2+ → `Untracked { conflict: true }`.
 pub fn classify(
     title: &str,
-    event_google_calendar_id: Option<&str>,
+    scope: CalendarScope<'_>,
     categories: &[CategoryWithPatterns],
 ) -> ClassifyOutcome {
-    let matched = reduced_matches(title, event_google_calendar_id, categories);
+    let matched = reduced_matches(title, scope, categories);
     match matched.len() {
         0 => ClassifyOutcome::Untracked { conflict: false },
         1 => ClassifyOutcome::Matched {
@@ -217,11 +236,11 @@ pub struct ClassifyDetail {
 /// owned ids.
 pub fn classify_detailed(
     title: &str,
-    event_google_calendar_id: Option<&str>,
+    scope: CalendarScope<'_>,
     categories: &[CategoryWithPatterns],
 ) -> ClassifyDetail {
     ClassifyDetail {
-        matched: reduced_matches(title, event_google_calendar_id, categories)
+        matched: reduced_matches(title, scope, categories)
             .into_iter()
             .map(|category| category.category_id.clone())
             .collect(),
@@ -1183,11 +1202,11 @@ mod tests {
     fn exact_title_matches_root_seed_pattern() {
         let categories = vec![cat_with_patterns("work", None, &["^Work$", "^.* [|] Work$"])];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "work".to_string() }
         );
         assert_eq!(
-            classify("Review Q3 | Work", None, &categories),
+            classify("Review Q3 | Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "work".to_string() }
         );
     }
@@ -1196,7 +1215,7 @@ mod tests {
     fn unmatched_title_is_untracked_without_conflict() {
         let categories = vec![cat_with_patterns("work", None, &["^Work$"])];
         assert_eq!(
-            classify("asdf", None, &categories),
+            classify("asdf", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Untracked { conflict: false }
         );
     }
@@ -1208,7 +1227,7 @@ mod tests {
             cat_with_patterns("coding", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "coding".to_string() }
         );
     }
@@ -1220,7 +1239,7 @@ mod tests {
             cat_with_patterns("fitness", None, &["^Work$"]),
         ];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Untracked { conflict: true }
         );
     }
@@ -1233,29 +1252,68 @@ mod tests {
             cat_with_patterns("b", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Untracked { conflict: true }
         );
     }
 
     #[test]
-    fn calendar_scoped_pattern_is_skipped_without_calendar_context() {
+    fn ignore_matches_pattern_that_has_a_calendar_id() {
+        // The SpicyHome case: the only pattern carries a write-destination
+        // calendar id, but task titles match on regex alone.
+        let mut scoped = cat_with_patterns("spicyhome", None, &["^.* [|] SpicyHome$"]);
+        scoped.patterns[0].google_calendar_id = Some("dest@example.com".to_string());
+
+        assert_eq!(
+            classify("Test | SpicyHome", CalendarScope::Ignore, &[scoped.clone()]),
+            ClassifyOutcome::Matched { category_id: "spicyhome".to_string() },
+            "task titles match scoped patterns on regex only"
+        );
+
+        // A category with two patterns, only the scoped one matching, still
+        // matches under Ignore.
+        let mut mixed = cat_with_patterns("work", None, &["^Never$", "^Work$"]);
+        mixed.patterns[1].google_calendar_id = Some("dest@example.com".to_string());
+        assert_eq!(
+            classify("Work", CalendarScope::Ignore, &[mixed]),
+            ClassifyOutcome::Matched { category_id: "work".to_string() }
+        );
+    }
+
+    #[test]
+    fn event_scope_still_filters_scoped_patterns() {
         let mut scoped = cat_with_patterns("work", None, &["^Work$"]);
         scoped.patterns[0].google_calendar_id = Some("cal-1".to_string());
 
         assert_eq!(
-            classify("Work", None, &[scoped.clone()]),
+            classify(
+                "Work",
+                CalendarScope::Event { google_calendar_id: "other-cal" },
+                &[scoped.clone()]
+            ),
             ClassifyOutcome::Untracked { conflict: false },
-            "task titles (None) never match calendar-scoped patterns"
+            "an Event scope for a different calendar skips the scoped pattern"
         );
         assert_eq!(
-            classify("Work", Some("other-cal"), &[scoped.clone()]),
-            ClassifyOutcome::Untracked { conflict: false },
-            "a different calendar does not match"
+            classify(
+                "Work",
+                CalendarScope::Event { google_calendar_id: "cal-1" },
+                &[scoped.clone()]
+            ),
+            ClassifyOutcome::Matched { category_id: "work".to_string() },
+            "an Event scope for the pattern's calendar matches it"
         );
+
+        // An unscoped pattern still matches events from any calendar.
+        let unscoped = cat_with_patterns("family", None, &["^Family$"]);
         assert_eq!(
-            classify("Work", Some("cal-1"), &[scoped]),
-            ClassifyOutcome::Matched { category_id: "work".to_string() }
+            classify(
+                "Family",
+                CalendarScope::Event { google_calendar_id: "other-cal" },
+                &[unscoped]
+            ),
+            ClassifyOutcome::Matched { category_id: "family".to_string() },
+            "unscoped patterns match under any Event scope"
         );
     }
 
@@ -1263,13 +1321,13 @@ mod tests {
     fn invalid_stored_regexes_are_skipped_on_read() {
         let categories = vec![cat_with_patterns("work", None, &["[unclosed", "^Work$"])];
         assert_eq!(
-            classify("Work", None, &categories),
+            classify("Work", CalendarScope::Ignore, &categories),
             ClassifyOutcome::Matched { category_id: "work".to_string() },
             "the valid sibling pattern still matches"
         );
         let only_bad = vec![cat_with_patterns("work", None, &["("])];
         assert_eq!(
-            classify("Work", None, &only_bad),
+            classify("Work", CalendarScope::Ignore, &only_bad),
             ClassifyOutcome::Untracked { conflict: false }
         );
     }
@@ -1282,7 +1340,7 @@ mod tests {
             &["^Work$", "^.* [|] Work$"],
         )];
         assert_eq!(
-            classify_detailed("Work", None, &categories),
+            classify_detailed("Work", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: vec!["work".to_string()]
             }
@@ -1293,7 +1351,7 @@ mod tests {
     fn classify_detailed_no_match_is_empty() {
         let categories = vec![cat_with_patterns("work", None, &["^Work$"])];
         assert_eq!(
-            classify_detailed("asdf", None, &categories),
+            classify_detailed("asdf", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: Vec::new()
             }
@@ -1308,7 +1366,7 @@ mod tests {
             cat_with_patterns("b", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify_detailed("Work", None, &categories),
+            classify_detailed("Work", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: vec!["a".to_string(), "b".to_string()]
             }
@@ -1322,7 +1380,7 @@ mod tests {
             cat_with_patterns("coding", Some("work"), &["^Work$"]),
         ];
         assert_eq!(
-            classify_detailed("Work", None, &categories),
+            classify_detailed("Work", CalendarScope::Ignore, &categories),
             ClassifyDetail {
                 matched: vec!["coding".to_string()]
             }

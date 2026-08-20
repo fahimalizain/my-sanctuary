@@ -414,8 +414,11 @@ pub struct TaskCategoryPattern {
     /// The user-authored regex. Stored patterns are validated on write, but
     /// the matcher skips any that fail to compile on read regardless.
     pub regex: String,
-    /// When set, the pattern only applies to events from this Google calendar;
-    /// task titles (no calendar) skip it.
+    /// Write destination for tasks whose titles match, and the inbound
+    /// Event filter for a future event classifier. The matcher consults it
+    /// only under [`crate::categories::CalendarScope::Event`];
+    /// [`crate::categories::CalendarScope::Ignore`] (task titles) matches on
+    /// regex alone.
     pub google_calendar_id: Option<String>,
     pub sort_order: i64,
     /// RFC 3339 instant.
