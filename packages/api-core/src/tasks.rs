@@ -10,8 +10,9 @@
 //!
 //! Domain rules (locked):
 //! - Tasks carry NO `category_id`/`list_id`. The category is **computed** per
-//!   title via [`crate::categories::classify`] with `event_google_calendar_id
-//!   = None` (calendar-scoped patterns never match task titles).
+//!   title via [`crate::categories::classify`] with [`CalendarScope::Ignore`]:
+//!   a pattern's `google_calendar_id` is a write destination, never an inbound
+//!   filter, so calendar-scoped patterns match task titles on regex alone.
 //! - Create/update reject a title that does not uniquely match a non-untracked
 //!   category (400). `Untracked { conflict: false }` (0 matches),
 //!   `Untracked { conflict: true }` (cross-tree conflict), and a match on the
@@ -37,10 +38,15 @@
 //!   `extendedProperties.shared.sanctuary_task_id` = task UUID (never
 //!   `private`, never a description footer). Summary is the task **title**
 //!   exactly — no `| Category` suffix.
-//! - Calendar pick: the matched category's `google_calendar_id` **when that
-//!   calendar exists for this user, is not soft-deleted, and is writable**
-//!   (`access_role` `owner` or `writer`); otherwise the user's **primary**
-//!   calendar. No writable calendar → 400.
+//! - Calendar pick: `wanted` is the first non-empty of the matched
+//!   category's first regex-matching pattern's `google_calendar_id` (patterns
+//!   walked in stored `sort_order`), the matched category's
+//!   `google_calendar_id`, and the parent root's `google_calendar_id` (a
+//!   child's match only — one-level tree). The started event lands on `wanted`
+//!   **when that calendar exists for this user, is not soft-deleted, and is
+//!   writable** (`access_role` `owner` or `writer`); a missing or read-only
+//!   named calendar never falls through to the next inheritance slot — it
+//!   goes to the user's **primary** calendar. No writable calendar → 400.
 //! - One running task per user: a second start raises [`TasksError::Conflict`]
 //!   (409) even when the same task is already running. **`tasks.status ==
 //!   "IN_PROGRESS"` is the only lock** — the start gate scans the user's
@@ -87,7 +93,8 @@ use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{
-    classify, classify_detailed, ensure_taxonomy, CategoryWithPatterns, ClassifyOutcome,
+    classify, classify_detailed, ensure_taxonomy, first_matching_pattern, CalendarScope,
+    CategoryWithPatterns, ClassifyOutcome,
 };
 use crate::config::OAuthConfig;
 use crate::models::{
@@ -368,7 +375,7 @@ pub async fn classify_title(
     }
     // Same count-gated load as create: seed on first visit, then read.
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
-    let detail = classify_detailed(&title, None, &taxonomy.matchers);
+    let detail = classify_detailed(&title, CalendarScope::Ignore, &taxonomy.matchers);
     let response = match detail.matched.len() {
         0 => ClassifyResponse::Untracked {
             conflict: false,
@@ -611,10 +618,14 @@ pub async fn delete_task(
 ///    (`Conflict`) — even when it is this very task. **Status is the only
 ///    lock**: the event window is never consulted here.
 /// 3. Classify the title (seeding the taxonomy like every other read) to pick
-///    the category; its `google_calendar_id` is the calendar *candidate*.
-/// 4. Resolve the target calendar: the candidate when it exists for this
-///    user and is writable (`access_role` owner/writer), else the user's
-///    primary calendar. No writable calendar → 400.
+///    the category.
+/// 4. Resolve the target calendar: `wanted` is the first non-empty of the
+///    first regex-matching pattern's `google_calendar_id` (in stored
+///    `sort_order`), the matched category's `google_calendar_id`, the parent
+///    root's `google_calendar_id`. Use `wanted` when that calendar exists for
+///    this user and is writable (`access_role` owner/writer); a missing or
+///    read-only named calendar goes to the user's primary calendar, never to
+///    the next inheritance slot. No writable calendar → 400.
 /// 5. `create_event` on the minute grid (`T … T + duration_minutes`,
 ///    `T = nearest_minute_unix(now)`, task carrier attached).
 /// 6. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
@@ -1650,10 +1661,17 @@ async fn load_taxonomy_seeded(
 }
 
 /// Resolves the Google calendar a started event lands on (locked rule):
-/// the matched category's `google_calendar_id` when that calendar exists for
-/// the user, is not soft-deleted (`list_by_user_id` already filters), and is
-/// writable (`access_role` owner/writer); otherwise the user's **primary**
-/// calendar (also writable). No writable calendar → 400.
+/// `wanted` is the first non-empty of the matched category's first
+/// regex-matching pattern's `google_calendar_id` (patterns walked in stored
+/// `sort_order` — a first match WITHOUT a calendar does not skip ahead to a
+/// later matching pattern that has one), the matched category's
+/// `google_calendar_id`, and the parent root's `google_calendar_id` (a
+/// child's match only; a root match has no parent slot). The started event
+/// lands on `wanted` when that calendar exists for the user, is not
+/// soft-deleted (`list_by_user_id` already filters), and is writable
+/// (`access_role` owner/writer); a missing or read-only named calendar falls
+/// back to the user's **primary** calendar (also writable), never to the
+/// next inheritance slot. No writable calendar → 400.
 async fn resolve_target_calendar(
     calendars: &dyn CalendarRepo,
     taxonomy: &Taxonomy,
@@ -1661,23 +1679,39 @@ async fn resolve_target_calendar(
     user_id: &str,
 ) -> Result<TargetCalendar, TasksError> {
     let user_cals = calendars.list_by_user_id(user_id).await?;
-    let category = match classify(title, None, &taxonomy.matchers) {
+    let category = match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
         ClassifyOutcome::Matched { category_id } => taxonomy
             .categories
             .iter()
             .find(|category| category.id == category_id),
-        // A title that matches nothing (or conflicts) falls back to the
-        // primary calendar: starting is a read, never a validation.
+        // A title that matches nothing (or conflicts) has no inheritance
+        // chain — `wanted` stays None and the primary fallback below runs:
+        // starting is a read, never a validation.
         ClassifyOutcome::Untracked { .. } => None,
     };
-    let candidate = category
-        .and_then(|category| category.google_calendar_id.as_deref())
+    let matcher = category.and_then(|category| {
+        taxonomy
+            .matchers
+            .iter()
+            .find(|matcher| matcher.category_id == category.id)
+    });
+    // One-level tree: `parent_id` is at most a root.
+    let parent = category
+        .and_then(|category| category.parent_id.as_deref())
+        .and_then(|parent_id| taxonomy.categories.iter().find(|entry| entry.id == parent_id));
+    let wanted = matcher
+        .and_then(|matcher| first_matching_pattern(title, CalendarScope::Ignore, matcher))
+        .and_then(|pattern| pattern.google_calendar_id.as_deref())
+        .or_else(|| category.and_then(|category| category.google_calendar_id.as_deref()))
+        .or_else(|| parent.and_then(|parent| parent.google_calendar_id.as_deref()));
+    let target = wanted
+        // A named-but-missing or read-only calendar never falls through to
+        // the next inheritance slot: straight to the user's primary.
         .and_then(|wanted| {
             user_cals
                 .iter()
                 .find(|cal| cal.google_calendar_id == wanted && is_writable(cal))
-        });
-    let target = candidate
+        })
         .or_else(|| {
             user_cals
                 .iter()
@@ -1688,6 +1722,7 @@ async fn resolve_target_calendar(
         calendar_id: target.id.clone(),
         // The matched category's STORED color, or `None` for untracked /
         // categories without one — the event insert omits `colorId` then.
+        // Never inherited from the pattern or the parent.
         google_color_id: category.and_then(|category| category.google_color_id.clone()),
     })
 }
@@ -1721,7 +1756,7 @@ fn is_valid_difficulty(difficulty: &str) -> bool {
 }
 
 fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
-    let outcome = classify(&task.title, None, &taxonomy.matchers);
+    let outcome = classify(&task.title, CalendarScope::Ignore, &taxonomy.matchers);
     let category = match &outcome {
         ClassifyOutcome::Matched { category_id } => taxonomy
             .categories
@@ -1791,7 +1826,7 @@ fn summary_for(category: &TaskCategory, categories: &[TaskCategory]) -> TaskCate
 /// remainder) resolves to the root — `classify` already drops parents beaten
 /// by their own children, so a single leftover match is always OK here.
 fn resolve_category(title: &str, taxonomy: &Taxonomy) -> Result<String, TasksError> {
-    match classify(title, None, &taxonomy.matchers) {
+    match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
         ClassifyOutcome::Matched { category_id } => {
             if taxonomy
                 .categories
@@ -3325,6 +3360,43 @@ mod tests {
             .task
     }
 
+    /// Creates the SpicyHome child under the seeded Work root for `u-1` with
+    /// the single `^.* [|] SpicyHome$` pattern, returning its category view.
+    /// `pattern_calendar`/`category_calendar` set the child's pattern /
+    /// category calendar ids (`None` for absent) — the inheritance-chain
+    /// fixture shared by the calendar-pick tests.
+    fn spicyhome_child(
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        pattern_calendar: Option<&str>,
+        category_calendar: Option<&str>,
+    ) -> crate::categories::CategoryView {
+        let ids = category_ids_by_slug(categories);
+        pollster::block_on(crate::categories::create_category(
+            categories,
+            lists,
+            "u-1",
+            &NewTaskCategoryInput {
+                title: "SpicyHome".to_string(),
+                slug: None,
+                color: "#2a5c8a".to_string(),
+                is_productive: None,
+                google_calendar_id: category_calendar.map(str::to_string),
+                google_color_id: None,
+                list_id: None,
+                parent_id: Some(ids["work"].clone()),
+                sort_order: None,
+                is_untracked: None,
+                patterns: vec![NewTaskCategoryPattern {
+                    regex: "^.* [|] SpicyHome$".to_string(),
+                    google_calendar_id: pattern_calendar.map(str::to_string),
+                }],
+            },
+        ))
+        .unwrap()
+        .category
+    }
+
     /// The Google `events.insert` echo for `task_id`, `start` and `end` — the
     /// exact shape Google returns (including the shared carrier).
     fn created_event_json(task_id: &str, start: &str, end: &str) -> String {
@@ -3496,6 +3568,256 @@ mod tests {
         assert_eq!(
             logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
             Some("cal-work@example.com")
+        );
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_uses_first_matching_pattern_calendar_over_category_and_parent() {
+        // The SpicyHome case: the child has no category calendar, the parent
+        // root names one, and the matching pattern carries the destination.
+        // The pattern slot wins the inheritance chain.
+        let (lists, categories, tasks) = seeded();
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap()
+                .google_calendar_id = Some("work@example.com".to_string());
+        }
+        spicyhome_child(&lists, &categories, Some("spicy@example.com"), None);
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+        ))
+        .unwrap()
+        .task;
+
+        // All three named calendars exist and are writable, so the pattern
+        // win is unambiguous.
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            calendar("work@example.com", false),
+            calendar("spicy@example.com", false),
+        ]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("spicy%40example.com/events"), "{url}");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
+            Some("cal-spicy@example.com")
+        );
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_uses_category_calendar_when_matching_pattern_has_none() {
+        // The matching pattern names no calendar (its None is taken as-is),
+        // so the chain falls to the child category.
+        let (lists, categories, tasks) = seeded();
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap()
+                .google_calendar_id = Some("work@example.com".to_string());
+        }
+        spicyhome_child(&lists, &categories, None, Some("child@example.com"));
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+        ))
+        .unwrap()
+        .task;
+
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            calendar("work@example.com", false),
+            calendar("child@example.com", false),
+        ]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("child%40example.com/events"), "{url}");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
+            Some("cal-child@example.com")
+        );
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_uses_parent_calendar_when_child_and_pattern_have_none() {
+        // Neither the matching pattern nor the child category names a
+        // calendar, so the chain falls to the parent root.
+        let (lists, categories, tasks) = seeded();
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap()
+                .google_calendar_id = Some("work@example.com".to_string());
+        }
+        spicyhome_child(&lists, &categories, None, None);
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+        ))
+        .unwrap()
+        .task;
+
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            calendar("work@example.com", false),
+        ]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("work%40example.com/events"), "{url}");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
+            Some("cal-work@example.com")
+        );
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_takes_first_matching_pattern_even_when_it_has_no_calendar() {
+        // Two patterns both match "Work": sort 0 names no calendar, sort 1
+        // names one. The first MATCH wins — its None falls through to the
+        // category, never ahead to sort 1.
+        let (lists, categories, tasks) = seeded();
+        let ids = category_ids_by_slug(&categories);
+        pollster::block_on(categories.replace_patterns(
+            &ids["work"],
+            vec![
+                NewTaskCategoryPattern {
+                    regex: "^Work$".to_string(),
+                    google_calendar_id: None,
+                },
+                NewTaskCategoryPattern {
+                    regex: "^.*Work.*$".to_string(),
+                    google_calendar_id: Some("later@example.com".to_string()),
+                },
+            ],
+        ))
+        .unwrap();
+        {
+            let mut stored = categories.stored.lock().unwrap();
+            stored
+                .iter_mut()
+                .find(|row| row.slug == "work" && row.user_id == "u-1")
+                .unwrap()
+                .google_calendar_id = Some("cat@example.com".to_string());
+        }
+        let task = work_task(&lists, &categories, &tasks);
+
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            calendar("cat@example.com", false),
+            calendar("later@example.com", false),
+        ]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("cat%40example.com/events"), "{url}");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
+            Some("cal-cat@example.com")
+        );
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn start_unwritable_pattern_calendar_jumps_to_primary_not_next_slot() {
+        // The pattern names a reader-only calendar; the child category names
+        // a writable one. The named destination is used as-is or NOT AT ALL:
+        // a read-only pattern calendar goes to primary, never walking on to
+        // the category slot.
+        let (lists, categories, tasks) = seeded();
+        spicyhome_child(&lists, &categories, Some("spicy@example.com"), Some("child@example.com"));
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+        ))
+        .unwrap()
+        .task;
+
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("primary@example.com", true),
+            GoogleCalendar {
+                access_role: "reader".to_string(),
+                ..calendar("spicy@example.com", false)
+            },
+            calendar("child@example.com", false),
+        ]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com/events"), "{url}");
+        assert_eq!(
+            logs.inserted.lock().unwrap()[0].calendar_id.as_deref(),
+            Some("cal-primary@example.com")
         );
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
     }

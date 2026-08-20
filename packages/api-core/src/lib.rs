@@ -39,8 +39,8 @@ pub use lists::{
 };
 pub use categories::{
     classify, create_category, delete_category, ensure_taxonomy, list_categories, slugify,
-    update_category, CategoriesError, CategoriesResponse, CategoryResponse, CategoryView,
-    CategoryWithPatterns, ClassifyOutcome, DeleteCategoryResponse, MAX_PATTERN_LEN,
+    update_category, CalendarScope, CategoriesError, CategoriesResponse, CategoryResponse,
+    CategoryView, CategoryWithPatterns, ClassifyOutcome, DeleteCategoryResponse, MAX_PATTERN_LEN,
 };
 pub use oauth::{
     authorization_url, exchange_and_login, generate_state, HttpClient, HttpError, OAuthError,
