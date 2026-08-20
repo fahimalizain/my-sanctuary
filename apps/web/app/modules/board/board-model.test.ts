@@ -7,7 +7,9 @@ import { defaultMoveRank } from './board-model';
 
 let seq = 0;
 
-function task(overrides: Partial<TaskRecord> & { status: TaskStatus }): TaskRecord {
+function task(
+  overrides: Partial<TaskRecord> & { status: TaskStatus },
+): TaskRecord {
   const id = overrides.id ?? `task-${++seq}`;
   const { status, ...rest } = overrides;
   return {

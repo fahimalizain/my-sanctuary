@@ -141,7 +141,9 @@ export function defaultMoveRank(
 ): number {
   const max = tasks.reduce<number | null>((highest, task) => {
     if (task.status !== to || task.id === excludeId) return highest;
-    return highest === null ? task.sort_order : Math.max(highest, task.sort_order);
+    return highest === null
+      ? task.sort_order
+      : Math.max(highest, task.sort_order);
   }, null);
   const append = (maxOrNull: number | null) =>
     maxOrNull === null ? 0 : maxOrNull + 1;

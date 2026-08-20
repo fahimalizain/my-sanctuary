@@ -90,12 +90,12 @@ status transition**. A verb repeated while already in its landing status
 keeps the current rank (stop/pause still log and rewrite the status as
 today; complete/discard stay the idempotent 200 no-op).
 
-| Verb | Target | Rank |
-| ---- | ------ | ---- |
-| `/stop` | `OPEN` | append — `max(sort_order) + 1` of the mover-excluded living `OPEN` pile (0 when empty) |
-| `/pause` | `PLANNED` | prepend `0` |
-| `/complete` | `COMPLETED` | prepend `0` |
-| `/discard` | `DISCARDED` | prepend `0` |
+| Verb        | Target      | Rank                                                                                   |
+| ----------- | ----------- | -------------------------------------------------------------------------------------- |
+| `/stop`     | `OPEN`      | append — `max(sort_order) + 1` of the mover-excluded living `OPEN` pile (0 when empty) |
+| `/pause`    | `PLANNED`   | prepend `0`                                                                            |
+| `/complete` | `COMPLETED` | prepend `0`                                                                            |
+| `/discard`  | `DISCARDED` | prepend `0`                                                                            |
 
 `start_task` never re-ranks. `/move` still places exactly once: its
 dispatched exits run the inner (unplaced) helpers, so a pause via the board
@@ -182,13 +182,13 @@ CREATE INDEX IF NOT EXISTS idx_tasks_user_status_sort
 (or `null`) = **no drop position**; the server applies the column default
 instead of a client-chosen rank:
 
-| Target status | Omitted `sort_order` default |
-| ------------- | ---------------------------- |
-| `OPEN` (any from) | append — `max(sort_order) + 1` of the mover-excluded living `OPEN` pile (0 when empty) |
-| `PLANNED` from `IN_PROGRESS` (pause) | prepend `0` |
-| `PLANNED` otherwise | append — `max + 1` over the mover-excluded living `PLANNED` pile |
-| `COMPLETED` / `DISCARDED` | prepend `0` |
-| `IN_PROGRESS` | `0` |
+| Target status                        | Omitted `sort_order` default                                                           |
+| ------------------------------------ | -------------------------------------------------------------------------------------- |
+| `OPEN` (any from)                    | append — `max(sort_order) + 1` of the mover-excluded living `OPEN` pile (0 when empty) |
+| `PLANNED` from `IN_PROGRESS` (pause) | prepend `0`                                                                            |
+| `PLANNED` otherwise                  | append — `max + 1` over the mover-excluded living `PLANNED` pile                       |
+| `COMPLETED` / `DISCARDED`            | prepend `0`                                                                            |
+| `IN_PROGRESS`                        | `0`                                                                                    |
 
 The append max **excludes the moving task id** — after the dispatch the mover
 already sits in the target status holding a leftover rank from its source
