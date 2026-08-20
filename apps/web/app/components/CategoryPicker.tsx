@@ -1,13 +1,5 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
-import { createPortal } from 'react-dom';
-import { ChevronDown } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronDown, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Category, TaskList } from '@/app/types';
 import { buildCategoryTree } from '@/app/modules/board/board-filters';
@@ -36,8 +28,13 @@ type Section = {
 interface CategoryPickerProps {
   lists: TaskList[];
   categories: Category[];
-  /** The locked category id, or `null` for "No category" (unlocked). */
+  /** The id shown as selected: an explicit user lock, or (when unlocked) the
+   *  category a unique classify match found. Never sent to the API by itself
+   *  — only the lock is. */
   selectedId: string | null;
+  /** True only for an explicit user lock (`lockId !== null`) — drives the
+   *  clear X on the trigger. A classify-only suggestion has no X. */
+  hasLock: boolean;
   /** `null` clears the lock. */
   onSelect: (id: string | null) => void;
   disabled?: boolean;
@@ -47,6 +44,7 @@ export function CategoryPicker({
   lists,
   categories,
   selectedId,
+  hasLock,
   onSelect,
   disabled,
 }: CategoryPickerProps) {
@@ -55,12 +53,6 @@ export function CategoryPicker({
   // Index into the panel's flat list: 0 = the "No category" row, 1+ = the
   // tree rows in visual order (-1 = none).
   const [highlight, setHighlight] = useState(-1);
-  // Fixed position of the portaled panel, from the trigger rect.
-  const [pos, setPos] = useState<{
-    top: number;
-    left: number;
-    width: number;
-  } | null>(null);
 
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -139,34 +131,10 @@ export function CategoryPicker({
     [treeRowCount],
   );
 
-  // Position the panel from the trigger rect. Recompute on open, scroll
-  // (capture), resize and query changes (the list height changes with the
-  // results). Flips above when there is not enough room below.
-  useLayoutEffect(() => {
-    if (!open) return;
-    const position = () => {
-      const trigger = triggerRef.current;
-      const panel = panelRef.current;
-      if (!trigger || !panel) return;
-      const rect = trigger.getBoundingClientRect();
-      const width = Math.max(rect.width, 18 * 16); // min-width 18rem
-      const gap = 8;
-      const height = panel.offsetHeight;
-      const spaceBelow = window.innerHeight - rect.bottom;
-      const top =
-        spaceBelow >= height + gap
-          ? rect.bottom + gap
-          : Math.max(gap, rect.top - height - gap);
-      setPos({ top, left: rect.left, width });
-    };
-    position();
-    window.addEventListener('scroll', position, true);
-    window.addEventListener('resize', position);
-    return () => {
-      window.removeEventListener('scroll', position, true);
-      window.removeEventListener('resize', position);
-    };
-  }, [open, query]);
+  // The panel renders `absolute` under the trigger inside its `relative`
+  // wrapper, so it scrolls with the modal's content container and needs no
+  // viewport math. Clicks on it stay inside DialogContent, so the Radix
+  // dialog's outside-click handler never closes the modal on us.
 
   // Outside click (mousedown, ignoring trigger + panel) closes without
   // stealing focus from the control the user actually clicked.
@@ -241,8 +209,15 @@ export function CategoryPicker({
     close(true);
   };
 
+  /** Clear the lock from the trigger X. `stopPropagation` keeps the click
+   *  from reaching the trigger's own onClick, so the panel never toggles. */
+  const handleClearLock = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    onSelect(null);
+  };
+
   return (
-    <>
+    <div className="relative">
       <button
         ref={triggerRef}
         type="button"
@@ -260,6 +235,17 @@ export function CategoryPicker({
         )}
       >
         <span className="truncate">{selected?.title ?? 'No category'}</span>
+        {hasLock && (
+          <span
+            role="button"
+            tabIndex={-1}
+            aria-label="Remove category lock"
+            onClick={handleClearLock}
+            className="rounded-full p-1 -mr-1 text-primary-foreground/80 transition-colors hover:bg-black/10 hover:text-primary-foreground"
+          >
+            <X className="h-4 w-4 shrink-0" aria-hidden />
+          </span>
+        )}
         <ChevronDown
           className={cn(
             'h-4 w-4 shrink-0 transition-transform',
@@ -269,104 +255,97 @@ export function CategoryPicker({
         />
       </button>
 
-      {open &&
-        createPortal(
+      {open && (
+        <div
+          ref={panelRef}
+          role="listbox"
+          aria-label="Categories"
+          className="absolute left-0 right-0 z-50 mt-2 rounded-xl border border-border bg-card p-2 shadow-lg"
+        >
+          {/* Search + the explicit clear row (above the tree, always
+              visible so the lock can be released without a match). */}
+          <div className="flex items-center gap-2 pb-2">
+            <input
+              ref={searchRef}
+              type="text"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search categories"
+              aria-label="Search categories"
+              className="w-full rounded-xl border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+            />
+          </div>
+
+          {/* "No category" — the explicit empty state / clear row. */}
           <div
-            ref={panelRef}
-            role="listbox"
-            aria-label="Categories"
-            className="fixed z-50 rounded-xl border border-border bg-card p-2 shadow-lg"
-            style={
-              pos
-                ? { top: pos.top, left: pos.left, width: pos.width }
-                : { visibility: 'hidden' }
-            }
+            role="option"
+            aria-selected={selectedId === null}
+            data-row-index={0}
+            onClick={() => {
+              onSelect(null);
+              close(true);
+            }}
+            className={cn(
+              'flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm border-b border-border mb-1',
+              highlight === 0 && 'bg-muted',
+              selectedId === null
+                ? 'text-primary font-medium'
+                : 'text-muted-foreground hover:bg-muted',
+            )}
           >
-            {/* Search + the explicit clear row (above the tree, always
-                visible so the lock can be released without a match). */}
-            <div className="flex items-center gap-2 pb-2">
-              <input
-                ref={searchRef}
-                type="text"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search categories"
-                aria-label="Search categories"
-                className="w-full rounded-xl border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-              />
-            </div>
+            <span
+              className="h-2 w-2 shrink-0 rounded-full bg-muted-foreground/40"
+              aria-hidden
+            />
+            <span className="min-w-0 flex-1 truncate">No category</span>
+          </div>
 
-            {/* "No category" — the explicit empty state / clear row. */}
-            <div
-              role="option"
-              aria-selected={selectedId === null}
-              data-row-index={0}
-              onClick={() => {
-                onSelect(null);
-                close(true);
-              }}
-              className={cn(
-                'flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm border-b border-border mb-1',
-                highlight === 0 && 'bg-muted',
-                selectedId === null
-                  ? 'text-primary font-medium'
-                  : 'cursor-pointer text-muted-foreground hover:bg-muted',
-              )}
-            >
-              <span
-                className="h-2 w-2 shrink-0 rounded-full bg-muted-foreground/40"
-                aria-hidden
-              />
-              <span className="min-w-0 flex-1 truncate">No category</span>
-            </div>
-
-            {/* List headings are labels only — not selectable. */}
-            <div ref={listRef} className="max-h-56 overflow-y-auto">
-              {rows.length === 0 ? (
-                <p className="px-2 py-3 text-sm text-muted-foreground italic">
-                  {query ? 'No categories match' : 'No categories yet'}
-                </p>
-              ) : (
-                sections.map((section) => (
-                  <div key={section.listId}>
-                    <div className="px-2 pt-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                      {section.listName}
-                    </div>
-                    {section.entries.map((entry) => (
-                      <div
-                        key={entry.row.id}
-                        role="option"
-                        aria-selected={selectedId === entry.row.id}
-                        data-row-index={entry.index}
-                        onClick={() => handleRowClick(entry.row)}
-                        className={cn(
-                          'flex items-center gap-2 rounded-lg pr-2 py-1.5 text-sm text-foreground cursor-pointer',
-                          entry.indented ? 'pl-6' : 'pl-2',
-                          entry.index === highlight && 'bg-muted',
-                          selectedId === entry.row.id &&
-                            'text-primary font-medium',
-                          entry.index !== highlight &&
-                            selectedId !== entry.row.id &&
-                            'hover:bg-muted',
-                        )}
-                      >
-                        <span
-                          className="h-2 w-2 shrink-0 rounded-full"
-                          style={{ backgroundColor: entry.row.color }}
-                          aria-hidden
-                        />
-                        <span className="min-w-0 flex-1 truncate">
-                          {entry.row.title}
-                        </span>
-                      </div>
-                    ))}
+          {/* List headings are labels only — not selectable. */}
+          <div ref={listRef} className="max-h-56 overflow-y-auto">
+            {rows.length === 0 ? (
+              <p className="px-2 py-3 text-sm text-muted-foreground italic">
+                {query ? 'No categories match' : 'No categories yet'}
+              </p>
+            ) : (
+              sections.map((section) => (
+                <div key={section.listId}>
+                  <div className="px-2 pt-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    {section.listName}
                   </div>
-                ))
-              )}
-            </div>
-          </div>,
-          document.body,
-        )}
-    </>
+                  {section.entries.map((entry) => (
+                    <div
+                      key={entry.row.id}
+                      role="option"
+                      aria-selected={selectedId === entry.row.id}
+                      data-row-index={entry.index}
+                      onClick={() => handleRowClick(entry.row)}
+                      className={cn(
+                        'flex items-center gap-2 rounded-lg pr-2 py-1.5 text-sm text-foreground cursor-pointer',
+                        entry.indented ? 'pl-6' : 'pl-2',
+                        entry.index === highlight && 'bg-muted',
+                        selectedId === entry.row.id &&
+                          'text-primary font-medium',
+                        entry.index !== highlight &&
+                          selectedId !== entry.row.id &&
+                          'hover:bg-muted',
+                      )}
+                    >
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ backgroundColor: entry.row.color }}
+                        aria-hidden
+                      />
+                      <span className="min-w-0 flex-1 truncate">
+                        {entry.row.title}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

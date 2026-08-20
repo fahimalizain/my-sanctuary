@@ -136,7 +136,7 @@ export function TaskModal({
       // when it was the one on screen (overlay close, ESC, parent unmount).
       setDisplaceOpen(false);
       setClassifyTitle(null);
-      setCategoryId(null);
+      setLockId(null);
       lastClassifyRef.current = null;
       return;
     }
@@ -152,7 +152,7 @@ export function TaskModal({
     if (task) {
       // A tracked edit locks to its computed category; untracked has no lock.
       const lock = task.category.is_untracked ? null : task.category.id;
-      setCategoryId(lock);
+      setLockId(lock);
       // Edit-open identity (critical): the FIRST classify sends the stored
       // FULL `task.title`, not the hole — classifying the hole would fill it
       // and can canonicalize the affixes (e.g. "… | SpicyHome" → "Spicy Home").
@@ -161,7 +161,7 @@ export function TaskModal({
       lastClassifyRef.current = { input: task.display_title, lock };
       setClassifyTitle(task.title);
     } else {
-      setCategoryId(null);
+      setLockId(null);
       lastClassifyRef.current = null;
       setClassifyTitle(null);
     }
@@ -214,9 +214,11 @@ export function TaskModal({
   // Occupied In Progress: the park dialog is open, move not yet dispatched.
   const [displaceOpen, setDisplaceOpen] = useState(false);
 
-  // The category lock: a selected category means classify runs with
-  // `category_id=` and affixes are shown around the hole.
-  const [categoryId, setCategoryId] = useState<string | null>(null);
+  // The category lock: an explicit user pick. Passed as `category_id` to
+  // classify, so a locked title persists its affixes (e.g. "Work | SpicyHome")
+  // and a locked empty title is a legal classify. `null` = unlocked: classify
+  // runs title-only.
+  const [lockId, setLockId] = useState<string | null>(null);
   // The title snapshot the classify-hook fires on: set on blur (the hole),
   // on edit-open (the stored full title), and on lock change (the hole).
   const [classifyTitle, setClassifyTitle] = useState<string | null>(null);
@@ -228,15 +230,25 @@ export function TaskModal({
 
   // Blur-preview of where the title will be filed (GET /api/tasks/classify).
   // Advisory only — the server stays the authority on Save. resetKey changes
-  // on open/close and task.id, so the hook self-resets there.
+  // on open/close and task.id, so the hook self-resets there. Only the
+  // explicit lock is sent — autofill (a classify match without a lock) must
+  // NOT send `category_id`, or it would lock the task and freeze the chrome.
   const classifyStatus: ClassifyStatus = useTitleClassification({
     title,
     classifyTitle,
-    categoryId,
+    categoryId: lockId,
     initialTitle: isEditing ? task!.title : undefined,
     active: open,
     resetKey: `${open}:${task?.id ?? 'new'}`,
   });
+
+  // What the picker shows vs. what the API gets: the explicit lock always
+  // wins; when unlocked (picker "No category"), a unique classify match still
+  // shows in the combobox as a type-first autofill. It is never sent as
+  // `category_id` (only `lockId` is).
+  const pickerSelectedId =
+    lockId ??
+    (classifyStatus.state === 'matched' ? classifyStatus.category.id : null);
 
   /** The chrome (prefix/suffix) around the hole from the latest classify.
    *  Loading/idle carry none; matched/nomatch/conflict all carry the affixes
@@ -252,8 +264,8 @@ export function TaskModal({
 
   // The "Files to ● X" hint target: a lock always names its category; an
   // unlocked match names the classify result.
-  const lockedCategory = categoryId
-    ? (categories.find((entry) => entry.id === categoryId) ?? null)
+  const lockedCategory = lockId
+    ? (categories.find((entry) => entry.id === lockId) ?? null)
     : null;
   const hintCategory =
     lockedCategory ??
@@ -280,20 +292,20 @@ export function TaskModal({
     const last = lastClassifyRef.current;
     const corresponds =
       last !== null &&
-      last.lock === categoryId &&
+      last.lock === lockId &&
       last.input.trim() === title.trim();
     let persistTitle: string;
     if (
       classifyStatus.state === 'matched' &&
       corresponds &&
-      (categoryId === null || classifyStatus.category.id === categoryId)
+      (lockId === null || classifyStatus.category.id === lockId)
     ) {
       persistTitle = classifyStatus.persistTitle;
     } else {
       // The user typed (or changed the lock) since the last classify, or the
       // state is idle (create without a blur, or a degraded preview) — verify
       // right before persisting.
-      const fresh = await classifyOnce(title, categoryId);
+      const fresh = await classifyOnce(title, lockId);
       if (fresh && 'Matched' in fresh) {
         persistTitle = fresh.Matched.persist_title;
       } else if (fresh && 'Untracked' in fresh && fresh.Untracked.conflict) {
@@ -350,12 +362,12 @@ export function TaskModal({
   const handleSelectCategory = (id: string | null) => {
     lastClassifyRef.current = { input: title, lock: id };
     setClassifyTitle(title);
-    setCategoryId(id);
+    setLockId(id);
   };
 
   // Track the input at blur so Save can tell a stale classify apart.
   const handleTitleBlur = () => {
-    lastClassifyRef.current = { input: title, lock: categoryId };
+    lastClassifyRef.current = { input: title, lock: lockId };
     setClassifyTitle(title);
   };
 
@@ -448,16 +460,10 @@ export function TaskModal({
           <hr className="shrink-0 border-border" />
 
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
-            {/* Task Title — the category lock above, then one field that reads
-                [chrome prefix][hole][chrome suffix] */}
+            {/* Task Title — one field that reads [chrome prefix][hole][chrome
+                suffix]. The category lock picker lives BELOW it (after the
+                classify hints), so the title reads first. */}
             <div className="space-y-2 mb-5">
-              <CategoryPicker
-                lists={lists}
-                categories={categories}
-                selectedId={categoryId}
-                onSelect={handleSelectCategory}
-              />
-
               <label className="text-sm font-medium text-foreground">
                 Task Name
               </label>
@@ -515,7 +521,7 @@ export function TaskModal({
               )}
               {/* A lock always has a target — show it while the preview is
                   idle (before the first classify settles). */}
-              {categoryId !== null &&
+              {lockId !== null &&
                 lockedCategory !== null &&
                 classifyStatus.state === 'idle' && (
                   <p className="text-xs text-muted-foreground flex items-center gap-1.5">
@@ -556,6 +562,23 @@ export function TaskModal({
                     still work.
                   </p>
                 )}
+            </div>
+
+            {/* Category — the lock picker sits after the title + its classify
+                hints, before Description. `selectedId` is the picker view
+                (lock, or an unlocked classify match shown as autofill); only
+                an explicit lock (`hasLock`) gets the clear X. */}
+            <div className="space-y-2 mb-5">
+              <label className="text-sm font-medium text-foreground">
+                Category
+              </label>
+              <CategoryPicker
+                lists={lists}
+                categories={categories}
+                selectedId={pickerSelectedId}
+                hasLock={lockId !== null}
+                onSelect={handleSelectCategory}
+              />
             </div>
 
             {/* Description */}
