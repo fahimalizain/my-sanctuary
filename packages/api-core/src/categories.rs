@@ -421,6 +421,16 @@ pub async fn list_categories(
         })
         .collect();
 
+    // Every living category's patterns in one query, grouped by category
+    // (kills the old per-category N+1: one patterns SELECT per category).
+    let mut patterns_by_category: HashMap<String, Vec<TaskCategoryPattern>> = HashMap::new();
+    for pattern in repo.list_patterns_by_user_id(user_id).await? {
+        patterns_by_category
+            .entry(pattern.category_id.clone())
+            .or_default()
+            .push(pattern);
+    }
+
     let mut views = Vec::with_capacity(categories.len());
     for category in &categories {
         let inherited_list_id = match category.parent_id.as_deref() {
@@ -429,7 +439,7 @@ pub async fn list_categories(
                 .map(|list_id| (*list_id).to_string()),
             None => category.list_id.clone(),
         };
-        let patterns = repo.list_patterns_by_category_id(&category.id).await?;
+        let patterns = patterns_by_category.remove(&category.id).unwrap_or_default();
         views.push(to_view(category, inherited_list_id, patterns));
     }
     Ok(CategoriesResponse { categories: views })
@@ -831,6 +841,11 @@ mod tests {
         patterns: Mutex<HashMap<String, Vec<TaskCategoryPattern>>>,
         inserted: Mutex<Vec<NewTaskCategory>>,
         next_id: Mutex<u64>,
+        // Call counters locking the N+1 regression: `list_categories` must
+        // never fall back to per-category pattern queries.
+        list_by_user_id_calls: Mutex<usize>,
+        list_patterns_by_user_id_calls: Mutex<usize>,
+        list_patterns_by_category_id_calls: Mutex<usize>,
     }
 
     impl FakeTaskCategoryRepo {
@@ -840,6 +855,9 @@ mod tests {
                 patterns: Mutex::new(HashMap::new()),
                 inserted: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                list_by_user_id_calls: Mutex::new(0),
+                list_patterns_by_user_id_calls: Mutex::new(0),
+                list_patterns_by_category_id_calls: Mutex::new(0),
             }
         }
 
@@ -884,6 +902,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl TaskCategoryRepo for FakeTaskCategoryRepo {
         async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+            *self.list_by_user_id_calls.lock().unwrap() += 1;
             let mut rows: Vec<TaskCategory> = self
                 .stored
                 .lock()
@@ -1028,6 +1047,7 @@ mod tests {
             &self,
             category_id: &str,
         ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            *self.list_patterns_by_category_id_calls.lock().unwrap() += 1;
             let mut rows = self
                 .patterns
                 .lock()
@@ -1036,6 +1056,36 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             rows.sort_by_key(|row| row.sort_order);
+            Ok(rows)
+        }
+
+        async fn list_patterns_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+            *self.list_patterns_by_user_id_calls.lock().unwrap() += 1;
+            // Mirrors TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL: only living
+            // categories' patterns, ordered by category then sort_order.
+            let living: Vec<String> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .map(|row| row.id.clone())
+                .collect();
+            let patterns = self.patterns.lock().unwrap();
+            let mut rows: Vec<TaskCategoryPattern> = living
+                .iter()
+                .filter_map(|category_id| patterns.get(category_id))
+                .flatten()
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                a.category_id
+                    .cmp(&b.category_id)
+                    .then_with(|| a.sort_order.cmp(&b.sort_order))
+            });
             Ok(rows)
         }
 
@@ -1634,6 +1684,54 @@ mod tests {
         );
         assert_eq!(by_id("child").list_id, None, "stored column stays NULL");
         assert_eq!(by_id("sink").inherited_list_id, None);
+    }
+
+    #[test]
+    fn list_categories_loads_all_patterns_in_one_query() {
+        let repo = FakeTaskCategoryRepo::with(vec![
+            FakeTaskCategoryRepo::row("a", "u-1", Some("l-1"), None, "Alpha", "alpha", false, false, 0),
+            FakeTaskCategoryRepo::row("b", "u-1", Some("l-1"), None, "Beta", "beta", false, false, 1),
+            FakeTaskCategoryRepo::row("c", "u-1", Some("l-1"), None, "Gamma", "gamma", false, false, 2),
+            FakeTaskCategoryRepo::row("theirs", "u-2", Some("l-9"), None, "Theirs", "theirs", false, false, 0),
+        ]);
+        pollster::block_on(repo.replace_patterns(
+            "a",
+            vec![pattern("^Alpha$"), pattern("^.* [|] Alpha$")],
+        ))
+        .unwrap();
+        pollster::block_on(repo.replace_patterns("b", vec![pattern("^Beta$")])).unwrap();
+        pollster::block_on(repo.replace_patterns("theirs", vec![pattern("^Theirs$")])).unwrap();
+
+        let response = pollster::block_on(list_categories(&repo, "u-1")).unwrap();
+        assert_eq!(response.categories.len(), 3, "u-2's category must not leak");
+
+        let by_id = |id: &str| {
+            response
+                .categories
+                .iter()
+                .find(|view| view.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        let alpha = by_id("a");
+        assert_eq!(alpha.patterns.len(), 2);
+        assert_eq!(alpha.patterns[0].regex, "^Alpha$");
+        assert_eq!(alpha.patterns[0].sort_order, 0);
+        assert_eq!(alpha.patterns[1].regex, "^.* [|] Alpha$");
+        assert_eq!(alpha.patterns[1].sort_order, 1);
+        let beta = by_id("b");
+        assert_eq!(beta.patterns.len(), 1);
+        assert_eq!(beta.patterns[0].regex, "^Beta$");
+        assert_eq!(by_id("c").patterns.len(), 0, "empty category keeps an empty vec");
+
+        // The N+1 regression lock: one categories query + one bulk patterns
+        // query, and never a per-category pattern query.
+        assert_eq!(*repo.list_by_user_id_calls.lock().unwrap(), 1);
+        assert_eq!(*repo.list_patterns_by_user_id_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *repo.list_patterns_by_category_id_calls.lock().unwrap(),
+            0,
+            "list_categories must never fall back to per-category pattern queries"
+        );
     }
 
     // ──────────────────────────────────────────
