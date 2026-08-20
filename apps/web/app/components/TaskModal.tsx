@@ -104,10 +104,9 @@ async function classifyOnce(
   lock: string | null,
 ): Promise<ClassifyResponse | null> {
   try {
-    const res = await fetch(
-      `${API_BASE_URL}${buildClassifyUrl(text, lock)}`,
-      { credentials: 'include' },
-    );
+    const res = await fetch(`${API_BASE_URL}${buildClassifyUrl(text, lock)}`, {
+      credentials: 'include',
+    });
     if (!res.ok) return null;
     return (await res.json()) as ClassifyResponse;
   } catch {
@@ -474,9 +473,7 @@ export function TaskModal({
                   onChange={(e) => setTitle(e.target.value)}
                   onBlur={handleTitleBlur}
                   placeholder={
-                    isEditing
-                      ? 'What needs to be done?'
-                      : `e.g. Review Q3`
+                    isEditing ? 'What needs to be done?' : `e.g. Review Q3`
                   }
                   className={cn(
                     'flex-1 min-w-0 bg-transparent py-3 focus:outline-none',
@@ -504,9 +501,7 @@ export function TaskModal({
                 <p
                   className={cn(
                     'text-xs flex items-center gap-1.5',
-                    willRefile
-                      ? 'text-foreground'
-                      : 'text-muted-foreground',
+                    willRefile ? 'text-foreground' : 'text-muted-foreground',
                   )}
                 >
                   <span

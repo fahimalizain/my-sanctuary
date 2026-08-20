@@ -81,7 +81,11 @@ export function CategoryPicker({
       listName: group.list.name,
       entries: group.roots.flatMap((root) => [
         {
-          row: { id: root.category.id, title: root.category.title, color: root.category.color },
+          row: {
+            id: root.category.id,
+            title: root.category.title,
+            color: root.category.color,
+          },
           indented: false,
           index: index++,
         },
@@ -255,9 +259,7 @@ export function CategoryPicker({
             : 'bg-background border-input text-muted-foreground hover:border-primary/30',
         )}
       >
-        <span className="truncate">
-          {selected?.title ?? 'No category'}
-        </span>
+        <span className="truncate">{selected?.title ?? 'No category'}</span>
         <ChevronDown
           className={cn(
             'h-4 w-4 shrink-0 transition-transform',
