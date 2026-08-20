@@ -39,6 +39,7 @@ import {
   COLUMNS,
   COLUMN_ID_PREFIX,
   TERMINAL_COLUMN_CAP,
+  defaultMoveRank,
   readError,
   readMoveError,
   resolveSortOrder,
@@ -484,8 +485,9 @@ export function BoardPage() {
   };
 
   /** Confirm in the conflict dialog: park the running task A at the chosen
-   *  status (prepend, rank 0 — displacement has no drop position), move B to
-   *  In Progress, then ONE `/move` carrying both halves via `displace`. */
+   *  status (no drop — `sort_order` omitted, the park always prepends),
+   *  move B to In Progress (rank 0), then ONE `/move` carrying both halves
+   *  via `displace`. */
   const confirmDisplace = (
     parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
   ) => {
@@ -507,11 +509,9 @@ export function BoardPage() {
     );
     const body: MoveTaskInput = {
       status: 'IN_PROGRESS',
-      sort_order: 0,
       displace: {
         id: prompt.runningTask.id,
         status: parkStatus,
-        sort_order: 0,
       },
     };
     void sendMoveRequest(prompt.taskId, body, snapshot, (data) => {
@@ -527,34 +527,48 @@ export function BoardPage() {
     });
   };
 
-  /** TaskModal's immediate status change (ADR 0002): a drop with no drop
-   *  position — always prepend, `sort_order: 0`. Optimistic, then ONE
-   *  `/move`; `sendMoveRequest` already owns the displaced-aware revert and
-   *  the banner. Returns the error message for the form (null on success).
-   *  The modal stays open; `task` in props updates via this merge. */
+  /** TaskModal's immediate status change (ADR 0002 § UI): a drop with no
+   *  drop position — `sort_order` is OMITTED and the server applies the
+   *  column default (`defaultMoveRank` mirrors it for the optimistic frame:
+   *  OPEN appends, pause prepends Planned, complete/discard prepend).
+   *  Optimistic, then ONE `/move`; `sendMoveRequest` already owns the
+   *  displaced-aware revert and the banner. Returns the error message for
+   *  the form (null on success). The modal stays open; `task` in props
+   *  updates via this merge. */
   const handleMoveTask = async (
     taskId: string,
     status: TaskStatus,
     displace?: MoveDisplaceInput,
   ): Promise<string | null> => {
     const snapshot = tasksRef.current;
+    const current = snapshot.find((entry) => entry.id === taskId);
+    const destRank = defaultMoveRank(
+      current?.status ?? status,
+      status,
+      snapshot,
+      taskId,
+    );
+    // No-drop: omit `displace.sort_order` too — the park always prepends.
+    const park = displace
+      ? { id: displace.id, status: displace.status }
+      : undefined;
     setTasks((prev) =>
       prev.map((entry) => {
         if (displace && entry.id === displace.id) {
           return {
             ...entry,
             status: displace.status,
-            sort_order: displace.sort_order,
+            sort_order: 0,
           };
         }
         return entry.id === taskId
-          ? { ...entry, status, sort_order: 0 }
+          ? { ...entry, status, sort_order: destRank }
           : entry;
       }),
     );
     return sendMoveRequest(
       taskId,
-      { status, sort_order: 0, displace },
+      { status, displace: park },
       snapshot,
       (data) => {
         setTasks((prev) =>
@@ -601,12 +615,13 @@ export function BoardPage() {
   // when the modal may close. Create runs as create-then-move: POST /api/
   // tasks always stamps OPEN (status is never in the body), and a
   // non-Backlog destination is reached by an immediate follow-up /move that
-  // prepends (sort_order 0) — the same matrix the board drop uses. Create
-  // into an OCCUPIED In Progress column carries `displace`: TaskModal opened
-  // the park dialog BEFORE the create write, so this only runs after the
-  // user confirmed where the runner goes (cancel never writes a thing). The
-  // move failure path closes the modal, raises the banner and leaves the
-  // orphan card OPEN in Backlog (the server-owned create is never deleted);
+  // OMITS sort_order — the server applies the column default, the same
+  // matrix the board drop uses. Create into an OCCUPIED In Progress column
+  // carries `displace`: TaskModal opened the park dialog BEFORE the create
+  // write, so this only runs after the user confirmed where the runner goes
+  // (cancel never writes a thing). The move failure path closes the modal,
+  // raises the banner and leaves the orphan card OPEN in Backlog at the
+  // server-assigned append rank (the server-owned create is never deleted);
   // a `displaced` failure body keeps the runner parked (same rule as
   // sendMoveRequest), anything else full-restores the pre-move snapshot.
   const handleTaskSubmit = async (
@@ -671,23 +686,35 @@ export function BoardPage() {
     const dest = taskForm.createStatus ?? 'OPEN';
 
     // Destination is the create status itself: done, no useless same-status
-    // /move reorder. Card prepends Backlog.
+    // /move reorder. The server already returned the append rank (create
+    // appends Backlog); the column sorts by `sort_order`, so the card lands
+    // at the back automatically.
     if (dest === 'OPEN') {
       setTasks((prev) => [data.task, ...prev]);
       closeTaskForm();
       return null;
     }
 
-    // Otherwise create-then-move: optimistically place the card at the front
-    // of the destination column (sibling ranks untouched), then persist with
-    // ONE /move. With `displace` (occupied In Progress create) the runner is
-    // parked in the same optimistic frame — the dialog ran before the create
-    // write, so canceling never left a stray Backlog card to clean up.
+    // Otherwise create-then-move: optimistically place the card at the
+    // server's column default for a create (OPEN → dest; `defaultMoveRank`
+    // mirrors it — do NOT hardcode 0, a Planned-append dest would flash the
+    // card at the head), then persist with ONE /move that OMITS sort_order.
+    // With `displace` (occupied In Progress create) the runner is parked in
+    // the same optimistic frame — the dialog ran before the create write, so
+    // canceling never left a stray Backlog card to clean up.
     const snapshotBeforeOptimistic = tasksRef.current;
+    const destRank = defaultMoveRank(
+      'OPEN',
+      dest,
+      snapshotBeforeOptimistic,
+      data.task.id,
+    );
+    const park = displace
+      ? { id: displace.id, status: displace.status }
+      : undefined;
     const moveBody: MoveTaskInput = {
       status: dest,
-      sort_order: 0,
-      ...(displace ? { displace } : {}),
+      ...(park ? { displace: park } : {}),
     };
     setTasks((prev) => {
       const next = prev.map((entry) =>
@@ -695,11 +722,11 @@ export function BoardPage() {
           ? {
               ...entry,
               status: displace.status,
-              sort_order: displace.sort_order,
+              sort_order: 0,
             }
           : entry,
       );
-      return [{ ...data.task, status: dest, sort_order: 0 }, ...next];
+      return [{ ...data.task, status: dest, sort_order: destRank }, ...next];
     });
 
     let moveRes: Response;
@@ -712,9 +739,10 @@ export function BoardPage() {
       });
     } catch (err) {
       // Network failure: restore the pre-move snapshot, then ensure the
-      // created card is present as OPEN/Backlog (the orphan stays — the
-      // server owns the create, nothing to undo). When displace was applied
-      // optimistically, this also restores the parked runner. Banner, close.
+      // created card is present as OPEN/Backlog at the server-assigned
+      // append rank (the orphan stays — the server owns the create, nothing
+      // to undo). When displace was applied optimistically, this also
+      // restores the parked runner. Banner, close.
       setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
       const message = err instanceof Error ? err.message : 'Move failed';
       setActionError(message);
@@ -724,13 +752,15 @@ export function BoardPage() {
     // Move failure (409 on occupied In Progress, 401 missing Google token,
     // …): when the body carries a `displaced` row, the runner stays parked
     // (same rule as sendMoveRequest) and only the created card snaps back to
-    // OPEN/Backlog; otherwise the full pre-move snapshot is restored with
-    // the created card prepended OPEN. Banner, close (null closes the modal).
+    // OPEN/Backlog (keeping its append rank); otherwise the full pre-move
+    // snapshot is restored with the created card OPEN at its append rank.
+    // Banner, close (null closes the modal).
     if (!moveRes.ok) {
       const failure = await readMoveError(moveRes);
       if (failure.displaced) {
-        // A stays parked; B (new task) goes to OPEN/Backlog; every other
-        // card comes back from the snapshot (taken before B's insert).
+        // A stays parked; B (new task) goes back to OPEN/Backlog at the
+        // append rank the server assigned on create; every other card comes
+        // back from the snapshot (taken before B's insert).
         setTasks(() => {
           const base = snapshotBeforeOptimistic.map((entry) =>
             entry.id === failure.displaced!.id ? failure.displaced! : entry,

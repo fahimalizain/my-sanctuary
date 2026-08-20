@@ -122,3 +122,37 @@ export function resolveSortOrder(
 
   return remaining[destIndex].sort_order;
 }
+
+/** Mirrors the Rust `default_move_rank` (ADR 0002 § Move API): the column
+ *  default for a no-drop `/move`. The max is computed over ALL tasks of the
+ *  target status (the server queries the whole column, not the filtered
+ *  view), excluding `excludeId` so a mover's leftover rank never inflates
+ *  its own append target.
+ *
+ *  - `OPEN` → `max + 1` (or 0 on an empty pile)
+ *  - `PLANNED` from `IN_PROGRESS` (pause) → 0 (prepend)
+ *  - `PLANNED` otherwise → `max + 1` (or 0)
+ *  - `COMPLETED` / `DISCARDED` / `IN_PROGRESS` → 0 (prepend) */
+export function defaultMoveRank(
+  from: TaskStatus,
+  to: TaskStatus,
+  tasks: TaskRecord[],
+  excludeId: string,
+): number {
+  const max = tasks.reduce<number | null>((highest, task) => {
+    if (task.status !== to || task.id === excludeId) return highest;
+    return highest === null ? task.sort_order : Math.max(highest, task.sort_order);
+  }, null);
+  const append = (maxOrNull: number | null) =>
+    maxOrNull === null ? 0 : maxOrNull + 1;
+  switch (to) {
+    case 'OPEN':
+      return append(max);
+    case 'PLANNED':
+      return from === 'IN_PROGRESS' ? 0 : append(max);
+    case 'COMPLETED':
+    case 'DISCARDED':
+    case 'IN_PROGRESS':
+      return 0;
+  }
+}

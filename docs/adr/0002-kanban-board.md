@@ -13,8 +13,15 @@ Date: 2026-08-19
 
 > Amendment (2026-08-20): create now **appends** Backlog (`max(sort_order)+1`),
 > so rank 0 stays "the task I've had longest". Existing OPEN ranks are not
-> rewritten — create is unranked capture. No-drop `/move` defaults and timer
-> verb landings are amended in follow-up commits of this change.
+> rewritten — create is unranked capture. No-drop `/move` defaults (§ Move
+> API) and timer verb landings (§ Timer verb landings) are amended below.
+
+> Amendment (2026-08-20): timer verbs re-rank **only on a real status
+> transition** — `/stop` appends OPEN, `/pause` prepends Planned, `/complete`
+> and `/discard` prepend. Repeating a verb already in its landing status
+> never re-ranks. Board and Lists no-drop callers (modal status pills,
+> column+ create-then-move, displace parks) omit `sort_order`; drops still
+> send an absolute view-relative index.
 
 > Amendment (2026-08-20): `/move` `sort_order` is now **optional** — omitted
 > (or null) means "no drop position" and the server applies a per-column
@@ -75,6 +82,25 @@ Replace Lists in the nav with a five-column status board at `/board`. The follow
 - Lift: stop/pause on `COMPLETED`/`DISCARDED` stay invalid as _verbs_ if the task is not running — reopen is the path back. (If the task is `IN_PROGRESS`, stop/pause/complete/discard work as today.)
 - `pause` **changes landing status** from `OPEN` to `PLANNED`. This is an API contract change: the Lists page still calls pause, and those tasks become `PLANNED`. `stop` still lands `OPEN`.
 - New log types: `planned`, `unplanned`, `reopened` (plus the existing `started|stopped|paused|completed|discarded`).
+
+### Timer verb landings
+
+The raw timer verbs rank like a no-drop `/move` — but **only on a real
+status transition**. A verb repeated while already in its landing status
+keeps the current rank (stop/pause still log and rewrite the status as
+today; complete/discard stay the idempotent 200 no-op).
+
+| Verb | Target | Rank |
+| ---- | ------ | ---- |
+| `/stop` | `OPEN` | append — `max(sort_order) + 1` of the mover-excluded living `OPEN` pile (0 when empty) |
+| `/pause` | `PLANNED` | prepend `0` |
+| `/complete` | `COMPLETED` | prepend `0` |
+| `/discard` | `DISCARDED` | prepend `0` |
+
+`start_task` never re-ranks. `/move` still places exactly once: its
+dispatched exits run the inner (unplaced) helpers, so a pause via the board
+is never double-placed — the slice-2 omit-pause peer shift (old Planned peer
+→ 1) stays the contract.
 
 ### Transition matrix (board drop → action)
 
@@ -190,7 +216,7 @@ entirely, sent or not).
 - Nav: replace Lists (`/lists`) with **Board** (`/board`). The pill is also active on `/categories` (same as Lists today in `apps/web/app/routes/__root.tsx`).
 - `/lists` remains routed and implemented; not linked.
 - Board header: **New Task** + **Edit Categories** (no New List).
-- New Task = the existing `TaskModal`; creates `OPEN`; appends Backlog.
+- New Task = the existing `TaskModal`; creates `OPEN`; appends Backlog. The modal status pills and the column+ create-then-move are **no-drop moves**: they omit `sort_order` and the server applies the column default. Drops still send an absolute view-relative `sort_order`.
 - Click card = `TaskModal`. **No** Play/Pause/Stop/Complete/Discard buttons on the card. The drop is the action.
 - Filter chrome is one wrapping horizontal row: Priority and Difficulty stay All+value pills (single-select). Category is a searchable checkbox combobox grouped by list then root/children (same tree as `/categories`). Untracked is not offered in the picker; `?category=<untracked-sink-id>` still matches if present in the URL.
 - Category trigger label: no explicit ids → "All"; one → that category's title; many → "N categories" (explicit ids only, not the expanded set).

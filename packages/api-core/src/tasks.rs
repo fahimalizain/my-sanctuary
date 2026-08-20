@@ -63,6 +63,12 @@
 //!   closes. Missing log / empty ids / Google 404 → today's idempotent
 //!   status-only flip: OPEN (stop) or PLANNED (pause), terminal status for
 //!   complete/discard.
+//! - Raw timer verbs rank on a **real status transition only** (ADR 0002 §
+//!   Timer verb landings): `/stop` appends OPEN (`max + 1` over the
+//!   mover-excluded living OPEN pile), `/pause` prepends PLANNED, and
+//!   `/complete`/`/discard` prepend their terminal pile. Already in the
+//!   landing status → no re-rank (stop/pause still log; complete/discard
+//!   are the idempotent 200 no-op). `start_task` never ranks.
 //! - `complete_task`/`discard_task` auto-stop a running event first (a
 //!   `stopped` log precedes the terminal log), then set the terminal status.
 //!   Repeating the same terminal action is an idempotent 200 no-op.
@@ -82,8 +88,10 @@
 //!
 //! Move ([`move_task`], ADR 0002 § Move API): the board drop dispatches the
 //! transition matrix (start/stop/pause/complete/discard/plan/unplan/reopen/
-//! reorder), then places the task at `sort_order` in the target status (peer
-//! shifts never touch `updated_at`, and the source column is never compacted).
+//! reorder — the exit legs run the INNER unplaced helpers, so a pause via
+//! `/move` is never double-placed), then places the task at `sort_order` in
+//! the target status (peer shifts never touch `updated_at`, and the source
+//! column is never compacted).
 //! Omitted `sort_order` = no drop position: the server applies the column
 //! default ([`default_move_rank`]) — OPEN/PLANNED append except a pause
 //! prepends, Done/Discarded/In Progress prepend; same-status omit is a no-op.
@@ -753,6 +761,11 @@ pub async fn start_task(
 /// `now <= start`) and flips status back to OPEN. The status flip is
 /// idempotent — when the user already closed the event in Google, stop only
 /// rewrites the status and appends a `stopped` log.
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition
+/// (IN_PROGRESS → OPEN) the task **appends Backlog** — `max(sort_order)+1`
+/// of the living OPEN pile excluding itself, so its leftover IN_PROGRESS
+/// rank never inflates the append target. Already OPEN → no re-rank.
 pub async fn stop_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -767,7 +780,7 @@ pub async fn stop_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN,
+        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true,
     )
     .await
 }
@@ -777,6 +790,10 @@ pub async fn stop_task(
 /// not OPEN (ADR 0002: pause parks the task in the Planned pile). Reopening
 /// later is simply Start again — start already allows PLANNED (logged
 /// `started`).
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition
+/// (IN_PROGRESS → PLANNED) the task **prepends Planned** (rank 0 — peers
+/// shift up). Already PLANNED → no re-rank.
 pub async fn pause_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -791,7 +808,7 @@ pub async fn pause_task(
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED,
+        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true,
     )
     .await
 }
@@ -799,6 +816,9 @@ pub async fn pause_task(
 /// Completes a task: auto-stops a running event first (a `stopped` log
 /// precedes the `completed` log), then sets COMPLETED. Already COMPLETED is
 /// an idempotent 200 no-op.
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
+/// **prepends Done** (rank 0 — peers shift up). Already COMPLETED → no re-rank.
 pub async fn complete_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -813,7 +833,7 @@ pub async fn complete_task(
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED,
+        now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true,
     )
     .await
 }
@@ -821,6 +841,10 @@ pub async fn complete_task(
 /// Discards a task: auto-stops a running event first (a `stopped` log
 /// precedes the `discarded` log), then sets DISCARDED. Already DISCARDED is
 /// an idempotent 200 no-op.
+///
+/// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
+/// **prepends Discarded** (rank 0 — peers shift up). Already DISCARDED → no
+/// re-rank.
 pub async fn discard_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -835,7 +859,7 @@ pub async fn discard_task(
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
-        now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED,
+        now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true,
     )
     .await
 }
@@ -844,6 +868,13 @@ pub async fn discard_task(
 ///
 /// `target_status` is the landing status: OPEN for stop, PLANNED for pause
 /// (mirrors `complete_or_discard`, where the caller picks the terminal state).
+///
+/// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
+/// from the raw endpoints — on a real transition stop appends OPEN
+/// (`max + 1` over the mover-excluded pile) and pause prepends PLANNED;
+/// already in the landing status → the row is returned as set, no re-rank
+/// (and the log behavior is unchanged). `false` from [`dispatch_matrix_action`]
+/// / the displace park — `/move` places exactly once afterwards.
 async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -857,6 +888,7 @@ async fn stop_or_pause(
     now_unix: i64,
     log_type: &str,
     target_status: &str,
+    place: bool,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -895,14 +927,40 @@ async fn stop_or_pause(
     )
     .await?;
 
+    // Verb landing on a real transition only: stop appends OPEN
+    // (mover-excluded max + 1 — the row already sits in OPEN holding its
+    // leftover IN_PROGRESS rank, which must not inflate its own target),
+    // pause prepends PLANNED. Already in the landing status → the row as
+    // set, no re-rank.
+    let placed = if place && task.status != target_status {
+        let rank = if target_status == TASK_STATUS_OPEN {
+            let max = task_repo
+                .max_sort_order(user_id, TASK_STATUS_OPEN, Some(task_id))
+                .await?;
+            append_rank(max)
+        } else {
+            0 // pause prepends Planned
+        };
+        place_at(task_repo, user_id, task_id, target_status, rank).await?
+    } else {
+        updated
+    };
+
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
-        task: to_view(&updated, &taxonomy),
+        task: to_view(&placed, &taxonomy),
         event: patched,
     })
 }
 
 /// Shared complete/discard machinery (see [`complete_task`]).
+///
+/// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
+/// from the raw endpoints — on a real transition the task prepends its
+/// terminal pile (rank 0, peers shift up); already in the target status the
+/// idempotent no-op above returns the row unchanged. `false` from
+/// [`dispatch_matrix_action`] / [`terminal_transition`] — `/move` places
+/// exactly once afterwards.
 async fn complete_or_discard(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -916,6 +974,7 @@ async fn complete_or_discard(
     now_unix: i64,
     target_status: &str,
     log_type: &str,
+    place: bool,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -972,9 +1031,18 @@ async fn complete_or_discard(
     )
     .await?;
 
+    // Verb landing (ADR 0002 § Timer verb landings): on a real transition the
+    // task prepends its terminal pile. The already-in-target no-op above
+    // returned early, so a `place: true` here is always a real transition.
+    let placed = if place {
+        place_at(task_repo, user_id, task_id, target_status, 0).await?
+    } else {
+        updated
+    };
+
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
-        task: to_view(&updated, &taxonomy),
+        task: to_view(&placed, &taxonomy),
         event: patched,
     })
 }
@@ -1238,8 +1306,10 @@ fn require_google<'a>(
 
 /// Applies the ADR 0002 transition matrix for `from → to` on `task_id` and
 /// returns the Google event the action touched (`None` for the status-only
-/// transitions). Reuses the existing timer verbs (start/stop/pause/complete/
-/// discard) so the Google writes stay in one place; plan/unplan/reopen and
+/// transitions). Reuses the existing timer machinery — start, and the exit
+/// verbs as the INNER unplaced helpers (see [`stop_or_pause`] /
+/// [`complete_or_discard`], `place: false`) — so the Google writes stay in
+/// one place while `/move` still places exactly once; plan/unplan/reopen and
 /// idle complete/discard are pure local transitions + audit logs.
 ///
 /// `http`/`access` are only consumed by the Google-touching arms; the
@@ -1274,36 +1344,39 @@ async fn dispatch_matrix_action(
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN) => {
             let (http, access) = require_google(http, access)?;
-            stop_task(
+            // The INNER unplaced helper: the verb landing belongs to the raw
+            // /stop endpoint only — `/move` places exactly once afterwards,
+            // so a stop via the board is never double-placed.
+            stop_or_pause(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, false,
             )
             .await
             .map(|response| response.event)
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_PLANNED) => {
             let (http, access) = require_google(http, access)?;
-            pause_task(
+            stop_or_pause(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
             )
             .await
             .map(|response| response.event)
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED) => {
             let (http, access) = require_google(http, access)?;
-            complete_task(
+            complete_or_discard(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
             )
             .await
             .map(|response| response.event)
         }
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_DISCARDED) => {
             let (http, access) = require_google(http, access)?;
-            discard_task(
+            complete_or_discard(
                 http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
+                task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
             )
             .await
             .map(|response| response.event)
@@ -1395,8 +1468,8 @@ async fn local_transition(
 /// Status is the lock: only a task whose **status** is IN_PROGRESS has a
 /// living timer, so a leftover event window in the cache never triggers a
 /// Google auto-stop here. (The matrix already routes true IN_PROGRESS →
-/// COMPLETED/DISCARDED to `complete_task`/`discard_task`; this arm is a
-/// backstop only.)
+/// COMPLETED/DISCARDED to the inner unplaced [`complete_or_discard`]; this
+/// arm is a backstop only — it never places, `/move` owns the rank.)
 async fn terminal_transition(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1418,19 +1491,24 @@ async fn terminal_transition(
     };
     if task.status == TASK_STATUS_IN_PROGRESS {
         let (http, access) = require_google(http, access)?;
-        let response = if target_status == TASK_STATUS_COMPLETED {
-            complete_task(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
-            )
-            .await?
-        } else {
-            discard_task(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
-                task_id, now_unix,
-            )
-            .await?
-        };
+        // The INNER unplaced helper (see [`complete_or_discard`]): the verb
+        // landing belongs to the raw endpoints only — `/move` places once.
+        let response = complete_or_discard(
+            http,
+            calendars,
+            events,
+            category_repo,
+            task_repo,
+            logs,
+            access,
+            user_id,
+            task_id,
+            now_unix,
+            target_status,
+            log_type,
+            false,
+        )
+        .await?;
         return Ok(response.event);
     }
     local_transition(task_repo, logs, user_id, task_id, target_status, log_type, now_unix).await?;
@@ -1494,11 +1572,12 @@ async fn reorder_in_place(
 /// `POST /api/tasks/:id/move` — the board drop (ADR 0002 § Move API).
 ///
 /// Dispatches the transition matrix for `task.status → input.status`
-/// (reusing `start_task`/`stop_task`/`pause_task`/`complete_task`/
-/// `discard_task` for the Google-touching legs, with plan/unplan/reopen
-/// as local flips), then places the task at `input.sort_order` in the target
-/// status. Same-status moves are pure reorders (the IN_PROGRESS → IN_PROGRESS
-/// case is a no-op that ignores `sort_order`).
+/// (reusing `start_task` and the INNER unplaced stop/pause/complete/discard
+/// helpers for the Google-touching legs, with plan/unplan/reopen as local
+/// flips), then places the task at `input.sort_order` in the target status —
+/// exactly once, which is why the dispatched exits never place themselves.
+/// Same-status moves are pure reorders (the IN_PROGRESS → IN_PROGRESS case
+/// is a no-op that ignores `sort_order`).
 ///
 /// Omitted `sort_order` (null or absent) means "no drop position": the server
 /// applies the column default from [`default_move_rank`] — OPEN and PLANNED
@@ -4635,6 +4714,132 @@ mod tests {
         assert!(matches!(err, TasksError::Invalid(_)), "got {err:?}");
     }
 
+    #[test]
+    fn stop_appends_open_on_transition() {
+        // A real stop (IN_PROGRESS → OPEN) appends Backlog: the leftover
+        // IN_PROGRESS rank 0 must not win, and the living OPEN peer keeps
+        // its rank — the stopped task lands at max+1 = 2.
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_start_http);
+
+        let stop_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &a.id, stop_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 2, "stop appends after the OPEN peer");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 2);
+        assert_eq!(rank(&b.id), 1, "the untouched OPEN peer keeps its rank");
+        drop(stored);
+    }
+
+    #[test]
+    fn stop_already_open_does_not_rerank() {
+        // Stop on an already-OPEN task keeps its rank (the log behavior on
+        // this path is unchanged — only placement is skipped).
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &b.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(response.task.sort_order, 1, "already-OPEN stop does not re-rank");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == a.id).unwrap().sort_order, 0);
+        assert_eq!(stored.iter().find(|row| row.id == b.id).unwrap().sort_order, 1);
+        drop(stored);
+    }
+
+    #[test]
+    fn pause_prepends_planned_on_transition() {
+        // A real pause (IN_PROGRESS → PLANNED) prepends: rank 0, and the
+        // old PLANNED peer shifts to 1.
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        // Seed a PLANNED peer at 0 (dummy row: set_status + rank).
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &task.id);
+        drop(_start_http);
+
+        let pause_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
+        )]);
+        let response = pollster::block_on(pause_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, pause_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(response.task.sort_order, 0, "pause prepends Planned");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&task.id), 0);
+        assert_eq!(rank(&peer.id), 1, "the PLANNED peer shifts down one");
+        drop(stored);
+    }
+
+    #[test]
+    fn pause_already_planned_does_not_rerank() {
+        // Pause on an already-PLANNED task keeps its rank (no prepend, the
+        // peer stays put — only placement is skipped).
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 1)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(pause_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(response.task.sort_order, 1, "already-PLANNED pause does not re-rank");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&peer.id), 0);
+        assert_eq!(rank(&task.id), 1);
+        drop(stored);
+    }
+
     // ──────────────────────────────────────────
     // complete / discard
     // ──────────────────────────────────────────
@@ -4727,6 +4932,65 @@ mod tests {
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
         assert_eq!(logs.inserted.lock().unwrap().len(), 1, "no extra log");
+    }
+
+    #[test]
+    fn complete_prepends_on_transition() {
+        // A real complete (OPEN → COMPLETED) prepends Done: rank 0, and the
+        // old COMPLETED peer shifts to 1.
+        let (lists, categories, tasks) = seeded();
+        let peer = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks);
+        // Seed a COMPLETED peer at 0 (dummy row: set_status + rank).
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(response.task.sort_order, 0, "complete prepends Done");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&task.id), 0);
+        assert_eq!(rank(&peer.id), 1, "the COMPLETED peer shifts down one");
+        drop(stored);
+    }
+
+    #[test]
+    fn complete_already_completed_is_still_noop() {
+        // The idempotent no-op never re-ranks: a COMPLETED row sitting at
+        // rank 3 stays at 3 through a second complete.
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 3)).unwrap();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(
+            response.task.sort_order, 3,
+            "idempotent complete keeps the rank"
+        );
+        assert_eq!(logs.inserted.lock().unwrap().len(), 0, "no log row");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(stored.iter().find(|row| row.id == task.id).unwrap().sort_order, 3);
+        drop(stored);
     }
 
     #[test]
