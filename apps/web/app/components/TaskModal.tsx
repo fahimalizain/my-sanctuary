@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Clock, Flag, Gauge, Loader2, Tag } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Clock, Flag, Gauge, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -8,18 +8,26 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { CategoryPicker } from './CategoryPicker';
 import { DisplaceDialog } from './DisplaceDialog';
 import {
   useTitleClassification,
   type ClassifyStatus,
 } from '@/app/hooks/useTitleClassification';
+import { buildClassifyUrl } from '@/app/hooks/classify-url';
 import { cn } from '@/lib/utils';
+import { API_BASE_URL } from '@/lib/api';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
+  type CategoriesResponse,
+  type Category,
+  type ClassifyResponse,
   type MoveDisplaceInput,
   type TaskCategorySummary,
   type TaskDifficulty,
+  type TaskList,
+  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskStatus,
@@ -88,6 +96,25 @@ const statusConfig: Record<TaskStatus, { label: string }> = {
   DISCARDED: { label: 'Discarded' },
 };
 
+/** One-shot classify for Save: `GET /api/tasks/classify?title=&category_id=`.
+ *  Returns null on any HTTP/network failure (callers surface their own
+ *  message). */
+async function classifyOnce(
+  text: string,
+  lock: string | null,
+): Promise<ClassifyResponse | null> {
+  try {
+    const res = await fetch(
+      `${API_BASE_URL}${buildClassifyUrl(text, lock)}`,
+      { credentials: 'include' },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as ClassifyResponse;
+  } catch {
+    return null;
+  }
+}
+
 export function TaskModal({
   open,
   onOpenChange,
@@ -109,18 +136,72 @@ export function TaskModal({
       // Parent closed the modal — the park dialog must close with it even
       // when it was the one on screen (overlay close, ESC, parent unmount).
       setDisplaceOpen(false);
-      setBlurredTitle(null);
+      setClassifyTitle(null);
+      setCategoryId(null);
+      lastClassifyRef.current = null;
       return;
     }
-    setTitle(task?.title || '');
+    // The visible hole: create starts empty; edit opens with the computed
+    // `display_title` (the split-off hole), never the stored full title.
+    setTitle(task?.display_title || '');
     setDescription(task?.description || '');
     setPriority(task?.priority || 'medium');
     setDifficulty(task?.difficulty || 'easy');
     setDuration(String(task?.duration_minutes || 15));
     setFormError(null);
     setDisplaceOpen(false);
-    setBlurredTitle(null);
+    if (task) {
+      // A tracked edit locks to its computed category; untracked has no lock.
+      const lock = task.category.is_untracked ? null : task.category.id;
+      setCategoryId(lock);
+      // Edit-open identity (critical): the FIRST classify sends the stored
+      // FULL `task.title`, not the hole — classifying the hole would fill it
+      // and can canonicalize the affixes (e.g. "… | SpicyHome" → "Spicy Home").
+      // `lastClassifyRef.input` marks the current input at classify time so
+      // Save knows the untouched seed corresponds to this classify.
+      lastClassifyRef.current = { input: task.display_title, lock };
+      setClassifyTitle(task.title);
+    } else {
+      setCategoryId(null);
+      lastClassifyRef.current = null;
+      setClassifyTitle(null);
+    }
   }, [open, task?.id]);
+
+  // The modal owns its picker data: it fetches lists + categories on open
+  // (ListsPage does not load categories today), so callers need no new props.
+  const [lists, setLists] = useState<TaskList[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLists([]);
+    setCategories([]);
+    void Promise.all([
+      fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' }),
+      fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' }),
+    ])
+      .then(async ([listsRes, catsRes]) => {
+        if (cancelled) return;
+        const listsData = listsRes.ok
+          ? ((await listsRes.json()) as TaskListsResponse)
+          : null;
+        const catsData = catsRes.ok
+          ? ((await catsRes.json()) as CategoriesResponse)
+          : null;
+        setLists(listsData?.lists ?? []);
+        setCategories(catsData?.categories ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLists([]);
+          setCategories([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -133,29 +214,101 @@ export function TaskModal({
   const [movingStatus, setMovingStatus] = useState(false);
   // Occupied In Progress: the park dialog is open, move not yet dispatched.
   const [displaceOpen, setDisplaceOpen] = useState(false);
-  // Title snapshot at the last blur — the classify-preview hook fires off it
-  // (null until the first blur, reset on every open/task switch).
-  const [blurredTitle, setBlurredTitle] = useState<string | null>(null);
+
+  // The category lock: a selected category means classify runs with
+  // `category_id=` and affixes are shown around the hole.
+  const [categoryId, setCategoryId] = useState<string | null>(null);
+  // The title snapshot the classify-hook fires on: set on blur (the hole),
+  // on edit-open (the stored full title), and on lock change (the hole).
+  const [classifyTitle, setClassifyTitle] = useState<string | null>(null);
+  // What the latest classify was sent with — Save re-classifies when the
+  // current input+lock no longer matches it.
+  const lastClassifyRef = useRef<{ input: string; lock: string | null } | null>(
+    null,
+  );
 
   // Blur-preview of where the title will be filed (GET /api/tasks/classify).
   // Advisory only — the server stays the authority on Save. resetKey changes
   // on open/close and task.id, so the hook self-resets there.
   const classifyStatus: ClassifyStatus = useTitleClassification({
     title,
-    blurredTitle,
+    classifyTitle,
+    categoryId,
     initialTitle: isEditing ? task!.title : undefined,
     active: open,
     resetKey: `${open}:${task?.id ?? 'new'}`,
   });
+
+  /** The chrome (prefix/suffix) around the hole from the latest classify.
+   *  Loading/idle carry none; matched/nomatch/conflict all carry the affixes
+   *  the server reported (a locked category previews them even on nomatch). */
+  const chrome: { prefix: string; suffix: string } =
+    classifyStatus.state === 'matched'
+      ? classifyStatus
+      : classifyStatus.state === 'nomatch'
+        ? classifyStatus
+        : classifyStatus.state === 'conflict'
+          ? classifyStatus
+          : { prefix: '', suffix: '' };
+
+  // The "Files to ● X" hint target: a lock always names its category; an
+  // unlocked match names the classify result.
+  const lockedCategory = categoryId
+    ? (categories.find((entry) => entry.id === categoryId) ?? null)
+    : null;
+  const hintCategory =
+    lockedCategory ??
+    (classifyStatus.state === 'matched' ? classifyStatus.category : null);
+  // A changed lock in edit mode reads as a refile (the target differs from
+  // the stored one); otherwise it files into the target.
+  const willRefile =
+    isEditing && hintCategory !== null && hintCategory.id !== task!.category.id;
 
   /** Persists the form via `onSubmit` — shared by the Save button and the
    *  create-mode park-dialog confirm (which passes `displace`). */
   const submitForm = async (displace?: MoveDisplaceInput) => {
     setSaving(true);
     setFormError(null);
+
+    // Resolve the title to persist: use the latest classify's persist_title
+    // when it corresponds to the current input+lock; otherwise await one
+    // classify and POST its persist_title. Never send the raw hole.
+    const last = lastClassifyRef.current;
+    const corresponds =
+      last !== null &&
+      last.lock === categoryId &&
+      last.input.trim() === title.trim();
+    let persistTitle: string;
+    if (classifyStatus.state === 'matched' && corresponds) {
+      persistTitle = classifyStatus.persistTitle;
+    } else {
+      // The user typed (or changed the lock) since the last classify, or the
+      // state is idle (create without a blur, or a degraded preview) — verify
+      // right before persisting.
+      const fresh = await classifyOnce(title, categoryId);
+      if (fresh && 'Matched' in fresh) {
+        persistTitle = fresh.Matched.persist_title;
+      } else if (fresh && 'Untracked' in fresh && fresh.Untracked.conflict) {
+        setSaving(false);
+        setFormError(
+          `Title matches ${fresh.Untracked.categories
+            .map((entry) => entry.title)
+            .join(', ')
+            .replace(/, ([^,]*)$/, ' and $1')} — be more specific`,
+        );
+        return;
+      } else {
+        setSaving(false);
+        setFormError(
+          'Title does not match a category — pick a category or retitle',
+        );
+        return;
+      }
+    }
+
     const error = await onSubmit(
       {
-        title,
+        title: persistTitle,
         description,
         durationMinutes: parseInt(duration, 10) || 15,
         priority,
@@ -182,6 +335,20 @@ export function TaskModal({
       return;
     }
     await submitForm();
+  };
+
+  /** Picker change: the picked category becomes the lock and fires a classify
+   *  of the CURRENT hole (empty input + lock is allowed). `null` unlocks. */
+  const handleSelectCategory = (id: string | null) => {
+    lastClassifyRef.current = { input: title, lock: id };
+    setClassifyTitle(title);
+    setCategoryId(id);
+  };
+
+  // Track the input at blur so Save can tell a stale classify apart.
+  const handleTitleBlur = () => {
+    lastClassifyRef.current = { input: title, lock: categoryId };
+    setClassifyTitle(title);
   };
 
   const handleDelete = async () => {
@@ -267,35 +434,114 @@ export function TaskModal({
             <DialogDescription>
               {isEditing
                 ? 'Update the details of your task below.'
-                : 'Tasks are filed by their title — type a title that matches a category.'}
+                : 'Pick a category or type a title that matches one.'}
             </DialogDescription>
           </DialogHeader>
           <hr className="shrink-0 border-border" />
 
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 pb-4">
-            {/* Task Title */}
+            {/* Task Title — the category lock above, then one field that reads
+                [chrome prefix][hole][chrome suffix] */}
             <div className="space-y-2 mb-5">
+              <CategoryPicker
+                lists={lists}
+                categories={categories}
+                selectedId={categoryId}
+                onSelect={handleSelectCategory}
+              />
+
               <label className="text-sm font-medium text-foreground">
                 Task Name
               </label>
-              <input
-                type="text"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                onBlur={() => setBlurredTitle(title)}
-                placeholder={
-                  isEditing
-                    ? 'What needs to be done?'
-                    : `e.g. Work or Review | Work`
-                }
-                className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-              />
-              {/* Classification preview — fires on blur, advisory only. The
-                edit-mode stored category tag below stays the current truth. */}
+              <div className="flex items-center w-full rounded-xl border border-input bg-background text-foreground transition-all focus-within:ring-2 focus-within:ring-primary/20 focus-within:border-primary">
+                {chrome.prefix !== '' && (
+                  <span className="select-none pl-4 py-3 text-muted-foreground whitespace-nowrap">
+                    {chrome.prefix}
+                  </span>
+                )}
+                <input
+                  type="text"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  onBlur={handleTitleBlur}
+                  placeholder={
+                    isEditing
+                      ? 'What needs to be done?'
+                      : `e.g. Review Q3`
+                  }
+                  className={cn(
+                    'flex-1 min-w-0 bg-transparent py-3 focus:outline-none',
+                    chrome.prefix !== '' ? 'pl-1' : 'pl-4',
+                    chrome.suffix !== '' ? 'pr-1' : 'pr-4',
+                  )}
+                />
+                {chrome.suffix !== '' && (
+                  <span className="select-none pr-4 py-3 text-muted-foreground whitespace-nowrap">
+                    {chrome.suffix}
+                  </span>
+                )}
+              </div>
+
+              {/* Classification preview — fires on blur / lock change,
+                advisory only. The lock's target is shown even before the
+                first classify resolves. */}
+              {classifyStatus.state === 'loading' && (
+                <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin inline text-muted-foreground" />
+                  Checking…
+                </p>
+              )}
+              {classifyStatus.state === 'matched' && hintCategory && (
+                <p
+                  className={cn(
+                    'text-xs flex items-center gap-1.5',
+                    willRefile
+                      ? 'text-foreground'
+                      : 'text-muted-foreground',
+                  )}
+                >
+                  <span
+                    className="inline-block h-2.5 w-2.5 rounded-full align-middle"
+                    style={{ backgroundColor: hintCategory.color }}
+                  />
+                  {willRefile
+                    ? `Will refile to ${hintCategory.title}`
+                    : `Files to ${hintCategory.title}`}
+                </p>
+              )}
+              {/* A lock always has a target — show it while the preview is
+                  idle (before the first classify settles). */}
+              {categoryId !== null &&
+                lockedCategory !== null &&
+                classifyStatus.state === 'idle' && (
+                  <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+                    <span
+                      className="inline-block h-2.5 w-2.5 rounded-full align-middle"
+                      style={{ backgroundColor: lockedCategory.color }}
+                    />
+                    {isEditing && lockedCategory.id !== task!.category.id
+                      ? `Will refile to ${lockedCategory.title}`
+                      : `Files to ${lockedCategory.title}`}
+                  </p>
+                )}
+              {classifyStatus.state === 'nomatch' && (
+                <p className="text-xs text-destructive">
+                  No category matches — Save will fail
+                </p>
+              )}
+              {classifyStatus.state === 'conflict' && (
+                <p className="text-xs text-destructive">
+                  Matches{' '}
+                  {classifyStatus.categories
+                    .map((entry) => entry.title)
+                    .join(', ')
+                    .replace(/, ([^,]*)$/, ' and $1')}{' '}
+                  — be more specific
+                </p>
+              )}
               {classifyStatus.state === 'idle' && !isEditing && (
                 <p className="text-xs text-muted-foreground">
-                  The title must match exactly one category — the server
-                  explains if it does not.
+                  Pick a category or type a title that matches one.
                 </p>
               )}
               {classifyStatus.state === 'idle' &&
@@ -306,48 +552,6 @@ export function TaskModal({
                     still work.
                   </p>
                 )}
-              {classifyStatus.state === 'loading' && (
-                <p className="text-xs text-muted-foreground flex items-center gap-1.5">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin inline text-muted-foreground" />
-                  Checking…
-                </p>
-              )}
-              {classifyStatus.state === 'matched' && (
-                <p
-                  className={cn(
-                    'text-xs flex items-center gap-1.5',
-                    isEditing &&
-                      classifyStatus.category.id !== task!.category.id
-                      ? 'text-foreground'
-                      : 'text-muted-foreground',
-                  )}
-                >
-                  <span
-                    className="inline-block h-2.5 w-2.5 rounded-full align-middle"
-                    style={{
-                      backgroundColor: classifyStatus.category.color,
-                    }}
-                  />
-                  {isEditing && classifyStatus.category.id !== task!.category.id
-                    ? `Will refile to ${classifyStatus.category.title}`
-                    : `Files to ${classifyStatus.category.title}`}
-                </p>
-              )}
-              {classifyStatus.state === 'nomatch' && (
-                <p className="text-xs text-destructive">
-                  No category matches — Save will fail
-                </p>
-              )}
-              {classifyStatus.state === 'conflict' && (
-                <p className="text-xs text-destructive">
-                  Matches{' '}
-                  {classifyStatus.categories
-                    .map((c) => c.title)
-                    .join(', ')
-                    .replace(/, ([^,]*)$/, ' and $1')}{' '}
-                  — be more specific
-                </p>
-              )}
             </div>
 
             {/* Description */}
@@ -515,23 +719,8 @@ export function TaskModal({
               </div>
             ) : null}
 
-            {/* Category tag — edit mode only: the computed filing result of an
-              existing task. Create is page-level and files by title match, so
-              there is no category to show here. */}
-            {isEditing && (
-              <div className="flex items-center gap-2 mb-6 p-3 bg-muted rounded-xl">
-                <Tag className="h-4 w-4 text-primary" />
-                <span className="text-sm text-foreground">Category:</span>
-                <span className="text-sm font-medium text-primary">
-                  {task!.category.title}
-                </span>
-                {task!.category.is_untracked && (
-                  <span className="text-xs text-muted-foreground">
-                    (untracked)
-                  </span>
-                )}
-              </div>
-            )}
+            {/* Category — the lock picker above owns the choice now; the old
+                static edit-only tag is gone in favor of it. */}
 
             {formError && (
               <p className="mb-4 text-sm text-destructive">{formError}</p>
@@ -563,9 +752,10 @@ export function TaskModal({
               <Button
                 onClick={handleSave}
                 disabled={
-                  !title.trim() ||
                   saving ||
                   movingStatus ||
+                  !title.trim() ||
+                  classifyStatus.state === 'loading' ||
                   classifyStatus.state === 'nomatch' ||
                   classifyStatus.state === 'conflict' ||
                   (isEditing &&

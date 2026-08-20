@@ -1,23 +1,56 @@
 import { useEffect, useRef, useState } from 'react';
 import { API_BASE_URL } from '@/lib/api';
+import { buildClassifyUrl } from './classify-url';
 import type { ClassifyResponse, TaskCategorySummary } from '@/app/types';
 
+// The classify preview status + the chrome it computed. `matched` is a
+// guaranteed filing target; `nomatch`/`conflict` still carry the chrome the
+// server reported (a locked category outside the identity case previews its
+// affixes even when the fill does not file). `persistTitle` is what a save
+// would store and `displayTitle` the hole the server split off.
 export type ClassifyStatus =
   | { state: 'idle' } // neutral (no result yet / cleared / degraded)
   | { state: 'loading' } // request in flight
-  | { state: 'matched'; category: TaskCategorySummary } // "Files to ● X" / "Will refile to ● X"
-  | { state: 'nomatch' } // "No category matches — Save will fail"
-  | { state: 'conflict'; categories: TaskCategorySummary[] }; // "Matches A and B — be more specific"
+  | {
+      state: 'matched';
+      category: TaskCategorySummary;
+      prefix: string;
+      suffix: string;
+      persistTitle: string;
+      displayTitle: string;
+    } // "Files to ● X" / "Will refile to ● X"
+  | {
+      state: 'nomatch';
+      prefix: string;
+      suffix: string;
+      persistTitle: string;
+      displayTitle: string;
+    } // "No category matches — Save will fail"
+  | {
+      state: 'conflict';
+      categories: TaskCategorySummary[];
+      prefix: string;
+      suffix: string;
+      persistTitle: string;
+      displayTitle: string;
+    }; // "Matches A and B — be more specific"
 
 export interface UseTitleClassificationArgs {
-  /** Live title value — a divergence from `blurredTitle` clears a stale result. */
+  /** Live title value — the visible hole. Used to drop responses that landed
+   *  after the user moved past the classified snapshot. */
   title: string;
-  /** The title snapshot at the moment the input blurred (modal sets this in
-   *  onBlur). `null` until the first blur. */
-  blurredTitle: string | null;
-  /** Edit mode: the task's stored title. The hook never fires when
-   *  `blurredTitle` equals this (no point re-classifying the unchanged title
-   *  the server already filed). Omit in create mode. */
+  /** The title snapshot to classify. The modal sets it on every blur (the
+   *  hole), on edit-open (the stored FULL `task.title`, so the first classify
+   *  is identity — classifying the hole would fill and canonicalize the
+   *  affixes), and on lock change (the current hole). `null` until there is
+   *  something to classify. */
+  classifyTitle: string | null;
+  /** Category lock; `null` = title-only classify. Empty titles only fire when
+   *  locked (the server 400s an empty unlocked classify). */
+  categoryId: string | null;
+  /** Edit mode: the task's stored full title. Identifies the edit-open seed
+   *  so its response is never dropped as stale — the live title is the hole,
+   *  which legitimately differs from the full stored string. Omit in create. */
   initialTitle?: string;
   /** `false` when the modal is closed. */
   active: boolean;
@@ -29,22 +62,22 @@ export interface UseTitleClassificationArgs {
 
 export function useTitleClassification({
   title,
-  blurredTitle,
+  classifyTitle,
+  categoryId,
   initialTitle,
   active,
   resetKey,
 }: UseTitleClassificationArgs): ClassifyStatus {
   const [status, setStatus] = useState<ClassifyStatus>({ state: 'idle' });
   const abortRef = useRef<AbortController | null>(null);
-  // Suppression cache: only MATCHED outcomes suppress a re-fire of the same
-  // title. Negative (nomatch/conflict) results re-fire on every re-blur so a
-  // taxonomy change elsewhere can unblock the user without forcing them to
-  // edit the title text.
-  const lastMatchedTitle = useRef<string | null>(null);
-  // Latest live title, read at request resolution so a response for a blurred
-  // snapshot never resurrects a status after the user kept typing (the
-  // clear-on-change effect only fires on title *changes* — a late response
-  // landing after it would otherwise repaint a stale result).
+  // Suppression cache keyed by `lock:title`: only MATCHED outcomes suppress a
+  // re-fire of the exact same request. Negative (nomatch/conflict) results
+  // re-fire on every trigger so a taxonomy change elsewhere can unblock the
+  // user without forcing them to edit the title text.
+  const lastMatchedKey = useRef<string | null>(null);
+  // Latest live title, read at request resolution so a response for a
+  // classified snapshot never repaints a stale result after the user kept
+  // typing (the seed is exempt — see the fire effect).
   const titleRef = useRef(title);
   // Guards setState after unmount (React 18/19 dev warning). TaskModal stays
   // mounted with `open=false`, but callers could unmount it while a classify
@@ -67,57 +100,90 @@ export function useTitleClassification({
     abortRef.current?.abort();
     abortRef.current = null;
     setStatus({ state: 'idle' });
-    lastMatchedTitle.current = null;
+    lastMatchedKey.current = null;
   }, [resetKey]);
 
-  // Clear-on-change: the moment the live title diverges from the blurred
-  // snapshot, the result is stale → back to idle (re-renders the neutral hint).
+  // A lock CHANGE must always re-classify — even reverting to a title that
+  // previously matched unlocked — because the lock changes both the outcome
+  // and the displayed chrome. Without this, clearing a lock could hit the
+  // match cache for a re-issue of the same unlocked request and leave the
+  // PREVIOUS lock's chrome (e.g. " | Work") on screen.
+  const prevCategoryRef = useRef(categoryId);
   useEffect(() => {
-    if (!active || blurredTitle === null) return;
-    if (title.trim() !== blurredTitle.trim()) {
-      setStatus({ state: 'idle' });
+    if (prevCategoryRef.current !== categoryId) {
+      lastMatchedKey.current = null;
+      prevCategoryRef.current = categoryId;
     }
-  }, [title, blurredTitle, active]);
+  }, [categoryId]);
 
-  // Fire on blur.
+  // Fire on (classifyTitle | categoryId) change: a title blur sends the hole,
+  // edit-open sends the stored full title once, and a picker change sends the
+  // current hole with the new lock (empty titles are fine when locked).
   useEffect(() => {
-    if (!active || blurredTitle === null) return;
-    const trimmed = blurredTitle.trim();
-    if (trimmed === '') return; // blank → neutral
-    if (initialTitle !== undefined && trimmed === initialTitle.trim()) return; // edit unchanged
-    if (lastMatchedTitle.current === trimmed) return; // unchanged+matched → cache hit
+    if (!active || classifyTitle === null) return;
+    const trimmed = classifyTitle.trim();
+    if (trimmed === '' && categoryId === null) return; // empty + no lock → idle
+    const key = `${categoryId ?? ''}:${trimmed}`;
+    if (lastMatchedKey.current === key) return; // exact request already matched
 
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
     setStatus({ state: 'loading' });
 
+    // Edit-open seed: classify the hole's FULL stored title (identity) so the
+    // response is never dropped — the live title (the hole) differs by design.
+    const isSeed =
+      initialTitle !== undefined && trimmed === initialTitle.trim();
+    const url = `${API_BASE_URL}${buildClassifyUrl(trimmed, categoryId)}`;
+
     (async () => {
       try {
-        const res = await fetch(
-          `${API_BASE_URL}/api/tasks/classify?title=${encodeURIComponent(trimmed)}`,
-          { credentials: 'include', signal: controller.signal },
-        );
+        const res = await fetch(url, {
+          credentials: 'include',
+          signal: controller.signal,
+        });
         if (!mountedRef.current) return;
         if (!res.ok) {
           setStatus({ state: 'idle' });
-          return; // silent degrade
+          return; // silent degrade (the modal never fires the 400 cases)
         }
         const data = (await res.json()) as ClassifyResponse;
-        // The user kept typing after this blur — the live title no longer
-        // matches the snapshot we classified, so drop the result.
-        if (titleRef.current.trim() !== trimmed) return;
+        if (!mountedRef.current) return;
+        // The user typed past the snapshot we classified — drop the stale
+        // result instead of repainting it (never for the seed).
+        if (!isSeed && titleRef.current.trim() !== trimmed) {
+          setStatus({ state: 'idle' });
+          return;
+        }
         if (!mountedRef.current) return;
         if ('Matched' in data) {
-          lastMatchedTitle.current = trimmed;
-          setStatus({ state: 'matched', category: data.Matched.category });
+          lastMatchedKey.current = key;
+          setStatus({
+            state: 'matched',
+            category: data.Matched.category,
+            prefix: data.Matched.prefix,
+            suffix: data.Matched.suffix,
+            persistTitle: data.Matched.persist_title,
+            displayTitle: data.Matched.display_title,
+          });
         } else if (data.Untracked.conflict) {
           setStatus({
             state: 'conflict',
             categories: data.Untracked.categories,
+            prefix: data.Untracked.prefix,
+            suffix: data.Untracked.suffix,
+            persistTitle: data.Untracked.persist_title,
+            displayTitle: data.Untracked.display_title,
           });
         } else {
-          setStatus({ state: 'nomatch' });
+          setStatus({
+            state: 'nomatch',
+            prefix: data.Untracked.prefix,
+            suffix: data.Untracked.suffix,
+            persistTitle: data.Untracked.persist_title,
+            displayTitle: data.Untracked.display_title,
+          });
         }
       } catch {
         // AbortError and network failures both land here → silent degrade.
@@ -126,8 +192,8 @@ export function useTitleClassification({
     })();
     // NOTE: do NOT abort in the cleanup of this effect — the [resetKey]
     // effect is the single owner of abort-on-reset. Aborting here would
-    // cancel the in-flight request on every re-render of the blur effect.
-  }, [blurredTitle, active, initialTitle]);
+    // cancel the in-flight request on every re-render of the fire effect.
+  }, [classifyTitle, categoryId, active, initialTitle]);
 
   return status;
 }
