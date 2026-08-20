@@ -651,7 +651,7 @@ export function CategoriesPage() {
                     calendars={calendars}
                     isLoading={calendarsLoading}
                     error={null}
-                    placeholder="None — events only"
+                    placeholder="None — inherit"
                     aria-label={`Pattern ${index + 1} Google Calendar`}
                   />
                 </div>
