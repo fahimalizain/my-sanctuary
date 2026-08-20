@@ -10,6 +10,7 @@ pub mod google_color;
 pub mod lists;
 pub mod models;
 pub mod oauth;
+pub mod pattern_gen;
 pub mod repo;
 pub mod tasks;
 pub mod time;
@@ -45,6 +46,9 @@ pub use categories::{
 pub use oauth::{
     authorization_url, exchange_and_login, generate_state, HttpClient, HttpError, OAuthError,
     GOOGLE_AUTH_URL, GOOGLE_TOKEN_URL, GOOGLE_USERINFO_URL, OAUTH_SCOPES,
+};
+pub use pattern_gen::{
+    emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
 pub use repo::{
     build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
