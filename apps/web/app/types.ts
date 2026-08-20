@@ -203,13 +203,36 @@ export interface TaskCategorySummary {
   color: string;
 }
 
-// Response of GET /api/tasks/classify?title=… — the title→category match the
-// create/update endpoints enforce, as a preview (never writes). Externally-
-// tagged serde enum: {"Matched":{"category":{...}}} or
-// {"Untracked":{"conflict":bool,"categories":[...]}}.
+// Response of GET /api/tasks/classify?title=…&category_id=… — the title→
+// category match the create/update endpoints enforce, as a preview (never
+// writes). Externally-tagged serde enum:
+//   {"Matched":{"category":{...},"prefix":..,"suffix":..,"persist_title":..,"display_title":..}}
+//   {"Untracked":{"conflict":bool,"categories":[...],"prefix":..,"suffix":..,"persist_title":..,"display_title":..}}
+// Every variant carries the title chrome and the two views the modal needs:
+// `prefix`/`suffix` are the fixed text around the input slot (empty when
+// there is none), `persist_title` is what a save would store (filled, and
+// guaranteed to file to the matched category), and `display_title` is the
+// hole the input should show.
 export type ClassifyResponse =
-  | { Matched: { category: TaskCategorySummary } }
-  | { Untracked: { conflict: boolean; categories: TaskCategorySummary[] } };
+  | {
+      Matched: {
+        category: TaskCategorySummary;
+        prefix: string;
+        suffix: string;
+        persist_title: string;
+        display_title: string;
+      };
+    }
+  | {
+      Untracked: {
+        conflict: boolean;
+        categories: TaskCategorySummary[];
+        prefix: string;
+        suffix: string;
+        persist_title: string;
+        display_title: string;
+      };
+    };
 
 // A task as returned by the API: the `tasks` row shape (snake_case) plus the
 // computed `category`. `status` is driven by the timer endpoints: start →
@@ -225,7 +248,12 @@ export type TaskStatus =
 export interface TaskRecord {
   id: string;
   user_id: string;
+  // The stored full string — always the authority.
   title: string;
+  // Computed by the API: the hole split off `title` under the category's
+  // first matching pattern ("Review Q3 | Work" → "Review Q3"). Never null; a
+  // patternless match (e.g. "Work"), untracked, or conflict keep `title`.
+  display_title: string;
   description: string;
   duration_minutes: number;
   priority: TaskPriority;

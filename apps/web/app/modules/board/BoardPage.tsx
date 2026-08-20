@@ -817,10 +817,10 @@ export function BoardPage() {
     (
       tasks.find((task) => task.id === displacePrompt.runningTask.id) ??
       displacePrompt.runningTask
-    ).title;
+    ).display_title;
   const draggedTaskTitle =
     displacePrompt &&
-    (tasks.find((task) => task.id === displacePrompt.taskId)?.title ??
+    (tasks.find((task) => task.id === displacePrompt.taskId)?.display_title ??
       'this task');
 
   return (

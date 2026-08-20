@@ -198,11 +198,14 @@ pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>
     }
 }
 
-/// `GET /api/tasks/classify?title=…` → 200 `ClassifyResponse`. A read: runs
-/// the title→category matcher the create/update endpoints enforce, but never
-/// writes. Used by the TaskModal's blur preview. Blank title → 400 (same
-/// rule as create). Seeds the taxonomy (count-gated) so a first-visit caller
-/// still has a matcher — same as `list_tasks`.
+/// `GET /api/tasks/classify?title=…&category_id=…` → 200 `ClassifyResponse`. A
+/// read: runs the title→category matcher the create/update endpoints enforce,
+/// but never writes. Used by the TaskModal's blur preview. `title` is always
+/// read (default `""`); without a `category_id` lock a blank title is 400
+/// (same rule as create). `category_id` optionally locks the preview to one
+/// category — blank titles are allowed then, and a missing/other-user/
+/// untracked id is a 400 "category not found". Seeds the taxonomy (count-
+/// gated) so a first-visit caller still has a matcher — same as `list_tasks`.
 pub async fn classify_title(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -210,13 +213,31 @@ pub async fn classify_title(
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
     };
-    let title = req
-        .url()?
-        .query_pairs()
-        .find(|(k, _)| k == "title")
-        .map(|(_, v)| v.into_owned())
+    let pairs: Vec<(String, String)> = {
+        let url = req.url()?;
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    };
+    let title = pairs
+        .iter()
+        .find(|(key, _)| key == "title")
+        .map(|(_, value)| value.clone())
         .unwrap_or_default();
-    match api_core::classify_title(&lists_d1(&ctx)?, &categories_d1(&ctx)?, &user.id, &title).await {
+    let category_id = pairs
+        .iter()
+        .find(|(key, _)| key == "category_id")
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty());
+    match api_core::classify_title(
+        &lists_d1(&ctx)?,
+        &categories_d1(&ctx)?,
+        &user.id,
+        &title,
+        category_id,
+    )
+    .await
+    {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
