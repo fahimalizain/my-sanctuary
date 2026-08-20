@@ -271,15 +271,24 @@ export function TaskModal({
     setFormError(null);
 
     // Resolve the title to persist: use the latest classify's persist_title
-    // when it corresponds to the current input+lock; otherwise await one
-    // classify and POST its persist_title. Never send the raw hole.
+    // when it corresponds to the current input+lock AND — with a lock set —
+    // the matched result is for that same lock; otherwise await one classify
+    // and POST its persist_title. Never send the raw hole. The lock check is
+    // the real fix: selecting a category only fires a classify inside an
+    // effect (after paint), so until it settles the cached result is stale
+    // for the new lock — reusing it would persist the PREVIOUS lock's title
+    // (e.g. "Work" instead of "Work | SpicyHome").
     const last = lastClassifyRef.current;
     const corresponds =
       last !== null &&
       last.lock === categoryId &&
       last.input.trim() === title.trim();
     let persistTitle: string;
-    if (classifyStatus.state === 'matched' && corresponds) {
+    if (
+      classifyStatus.state === 'matched' &&
+      corresponds &&
+      (categoryId === null || classifyStatus.category.id === categoryId)
+    ) {
       persistTitle = classifyStatus.persistTitle;
     } else {
       // The user typed (or changed the lock) since the last classify, or the
