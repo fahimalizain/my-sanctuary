@@ -337,7 +337,11 @@ pub async fn list_events(
 ///
 /// When `input.task_id` is set, the payload carries
 /// `extendedProperties.shared.sanctuary_task_id` — the task timer's carrier
-/// (slice 4); the sync path maps it back onto `calendar_events.task_id`.
+/// (slice 4); the sync path maps it back onto `calendar_events.task_id`. When
+/// both `task_id` and `sanctuary_focus` are set (a focus segment, slice 3),
+/// the shared map also carries `sanctuary_focus = "1"` — always both keys
+/// together, never a partial shared map. Unfocused creates send the carrier
+/// alone; `sanctuary_focus` is never sent without it.
 pub async fn create_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -361,9 +365,12 @@ pub async fn create_event(
         "end": { "dateTime": input.end },
     });
     if let Some(task_id) = &input.task_id {
-        payload["extendedProperties"] = serde_json::json!({
-            "shared": { "sanctuary_task_id": task_id }
-        });
+        let mut shared = serde_json::json!({ "sanctuary_task_id": task_id });
+        if input.sanctuary_focus {
+            // Never `"0"`: the key is present only on focused segments.
+            shared["sanctuary_focus"] = serde_json::json!("1");
+        }
+        payload["extendedProperties"] = serde_json::json!({ "shared": shared });
     }
     // The stored category color, copied verbatim by `start_task`. Never
     // included for hand-created events (`None`) or when blank after trim.
@@ -3155,6 +3162,7 @@ mod tests {
             end: "2026-08-19T10:00:00Z".to_string(),
             task_id: None,
             color_id: None,
+            sanctuary_focus: false,
         }
     }
 
@@ -3365,6 +3373,85 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(body.get("extendedProperties").is_none(), "{body}");
         assert_eq!(output.event.task_id, "", "no property → no task link");
+    }
+
+    /// A created event that carries both the task carrier and the focus flag,
+    /// exactly as Google echoes a focused segment back after `events.insert`.
+    fn created_with_focus_json(task_id: &str) -> String {
+        format!(
+            r#"{{
+                "id": "google-evt-created", "etag": "e1", "updated": "2026-08-17T12:00:00.000Z",
+                "summary": "New meeting", "description": "About things",
+                "start": {{"dateTime": "2026-08-19T09:00:00Z"}},
+                "end": {{"dateTime": "2026-08-19T10:00:00Z"}},
+                "extendedProperties": {{"shared": {{"sanctuary_task_id": "{task_id}", "sanctuary_focus": "1"}}}}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn create_with_task_and_focus_sends_both_shared_keys() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_with_focus_json("task-1"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.sanctuary_focus = true;
+        let output = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Both keys travel together — never a partial shared map, never
+        // `sanctuary_focus` inside a `private` map.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_task_id"],
+            "task-1"
+        );
+        assert_eq!(body["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+        assert!(body.get("private").is_none(), "no private properties");
+
+        // The echoed event maps the task carrier onto the cached row.
+        assert_eq!(output.event.task_id, "task-1");
+        let upserted = events.upserted_single.lock().unwrap().clone().unwrap().1;
+        assert_eq!(upserted.task_id, "task-1");
+    }
+
+    #[test]
+    fn create_with_task_but_no_focus_omits_the_focus_key() {
+        // Unfocused creates (e.g. `start_task`) send the carrier alone — the
+        // `sanctuary_focus` key must not appear, and never as `"0"`.
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_with_task_json("task-1"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.sanctuary_focus = false;
+        pollster::block_on(create_event(&http, &calendars, &events, &access(), &input, NOW_UNIX))
+            .unwrap();
+
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_task_id"],
+            "task-1"
+        );
+        assert!(
+            body["extendedProperties"]["shared"].get("sanctuary_focus").is_none(),
+            "unfocused creates never send sanctuary_focus: {body}"
+        );
     }
 
     #[test]

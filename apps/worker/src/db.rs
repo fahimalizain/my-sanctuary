@@ -42,7 +42,8 @@ use api_core::repo::{
     TASK_SET_STATUS_SQL,
     TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
     TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
-    USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
+    USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_DELETE_BY_ID_SQL,
     WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
     WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
@@ -207,9 +208,30 @@ impl UserRepo for D1UserRepo {
                     created_at: existing.created_at,
                     updated_at: now,
                     deleted_at: existing.deleted_at,
+                    // The focus pointer is never part of a login upsert: keep
+                    // whatever the stored row held (login must not wipe it).
+                    focused_task_id: existing.focused_task_id,
                 })
             }
         }
+    }
+
+    async fn set_focused_task_id(
+        &self,
+        user_id: &str,
+        task_id: Option<&str>,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(USER_SET_FOCUSED_TASK_ID_SQL)
+            .bind_refs(&[
+                optional_text(task_id),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(user_id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 }
 
@@ -954,8 +976,9 @@ impl TaskRepo for D1TaskRepo {
 
     async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
         // The elongate cron's work list: every living IN_PROGRESS row, all
-        // users (status is the one-running lock). No binds — `prepare`
-        // returns the statement directly when there is nothing to bind.
+        // users (IN_PROGRESS is a column, not a singleton lock). No binds —
+        // `prepare` returns the statement directly when there is nothing to
+        // bind.
         query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
     }
 

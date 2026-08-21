@@ -101,6 +101,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/api/tasks/:id/complete", tasks::complete_task)
         .post_async("/api/tasks/:id/discard", tasks::discard_task)
         .post_async("/api/tasks/:id/move", tasks::move_task)
+        .post_async("/api/tasks/:id/focus", tasks::focus_task)
+        // `/api/focus` is a fixed DELETE (not under `/api/tasks/:id`) — it is
+        // registered before any `/:id`-style routes that could swallow it.
+        .delete_async("/api/focus", tasks::delete_focus)
         .options("/api/tasks", auth::options)
         .options("/api/tasks/classify", auth::options)
         .options("/api/tasks/:id", auth::options)
@@ -110,6 +114,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/tasks/:id/complete", auth::options)
         .options("/api/tasks/:id/discard", auth::options)
         .options("/api/tasks/:id/move", auth::options)
+        .options("/api/tasks/:id/focus", auth::options)
+        .options("/api/focus", auth::options)
         .run(req, env)
         .await
 }

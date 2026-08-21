@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Clock, Flag, Gauge, Loader2 } from 'lucide-react';
+import { Clock, Flag, Gauge, Loader2, Pin } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -9,7 +9,6 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { CategoryPicker } from './CategoryPicker';
-import { DisplaceDialog } from './DisplaceDialog';
 import {
   useTitleClassification,
   type ClassifyStatus,
@@ -23,7 +22,6 @@ import {
   type CategoriesResponse,
   type Category,
   type ClassifyResponse,
-  type MoveDisplaceInput,
   type TaskCategorySummary,
   type TaskDifficulty,
   type TaskList,
@@ -56,28 +54,22 @@ interface TaskModalProps {
    *  (Lists page: no pills). */
   createStatus?: TaskStatus;
   /** Persists the form. Return an error message to show on the form (e.g.
-   *  the server's "title does not match a category"), or null to close.
-   *  `displace` is only passed by create into an OCCUPIED In Progress
-   *  column, after the park dialog confirmed: the parent creates the task,
-   *  then follows with ONE /move carrying the parked runner. */
-  onSubmit: (
-    values: TaskFormValues,
-    displace?: MoveDisplaceInput,
-  ) => Promise<string | null>;
+   *  the server's "title does not match a category"), or null to close. */
+  onSubmit: (values: TaskFormValues) => Promise<string | null>;
   /** Deletes the task (edit mode only). Return an error or null to close. */
   onDelete?: (taskId: string) => Promise<string | null>;
   /** Immediate status change (edit only). Return an error string to show on
-   *  the form, or null on success. `displace` is set when the user confirmed
-   *  parking the current runner. sort_order is omitted — no drop: the server
-   *  applies the column default. When omitted, Status renders read-only. */
-  onMove?: (
-    taskId: string,
-    status: TaskStatus,
-    displace?: MoveDisplaceInput,
-  ) => Promise<string | null>;
-  /** The task currently IN_PROGRESS, if any (may be this task). Used to
-   *  decide whether tapping In Progress needs the park dialog. */
-  runningTask?: TaskRecord | null;
+   *  the form, or null on success. A pill to IN_PROGRESS is a plain `/move`
+   *  that starts the card even while other tasks run (a column, not a
+   *  singleton lock). sort_order is omitted — no drop: the server applies
+   *  the column default. When omitted, Status renders read-only. */
+  onMove?: (taskId: string, status: TaskStatus) => Promise<string | null>;
+  /** Immediate focus toggle (edit only, IN_PROGRESS only). Same contract as
+   *  onMove: the board owns the optimistic paint, revert and banner, and
+   *  returns an error string (null on success). Only shown when the edited
+   *  task is IN_PROGRESS — ListsPage omits it, so that modal never renders
+   *  the control. */
+  onToggleFocus?: (task: TaskRecord) => Promise<string | null>;
 }
 
 const difficultyConfig: Record<TaskDifficulty, { label: string }> = {
@@ -122,7 +114,7 @@ export function TaskModal({
   onSubmit,
   onDelete,
   onMove,
-  runningTask,
+  onToggleFocus,
 }: TaskModalProps) {
   const isEditing = !!task;
   // (Re)initialize the form when the dialog opens or the target task id
@@ -132,9 +124,7 @@ export function TaskModal({
   // so they still follow the merged record.
   useEffect(() => {
     if (!open) {
-      // Parent closed the modal — the park dialog must close with it even
-      // when it was the one on screen (overlay close, ESC, parent unmount).
-      setDisplaceOpen(false);
+      // Parent closed the modal — reset the ad-hoc classify state.
       setClassifyTitle(null);
       setLockId(null);
       lastClassifyRef.current = null;
@@ -148,7 +138,6 @@ export function TaskModal({
     setDifficulty(task?.difficulty || 'easy');
     setDuration(String(task?.duration_minutes || 15));
     setFormError(null);
-    setDisplaceOpen(false);
     if (task) {
       // A tracked edit locks to its computed category; untracked has no lock.
       const lock = task.category.is_untracked ? null : task.category.id;
@@ -211,8 +200,8 @@ export function TaskModal({
   const [saving, setSaving] = useState(false);
   // A /move is in flight — pills and Save/Delete are disabled.
   const [movingStatus, setMovingStatus] = useState(false);
-  // Occupied In Progress: the park dialog is open, move not yet dispatched.
-  const [displaceOpen, setDisplaceOpen] = useState(false);
+  // A focus toggle is in flight — the Focus/Unfocus pill is disabled.
+  const [focusPending, setFocusPending] = useState(false);
 
   // The category lock: an explicit user pick. Passed as `category_id` to
   // classify, so a locked title persists its affixes (e.g. "Work | SpicyHome")
@@ -302,9 +291,8 @@ export function TaskModal({
   const willRefile =
     isEditing && hintCategory !== null && hintCategory.id !== task!.category.id;
 
-  /** Persists the form via `onSubmit` — shared by the Save button and the
-   *  create-mode park-dialog confirm (which passes `displace`). */
-  const submitForm = async (displace?: MoveDisplaceInput) => {
+  /** Persists the form via `onSubmit`. */
+  const submitForm = async () => {
     setSaving(true);
     setFormError(null);
 
@@ -353,16 +341,13 @@ export function TaskModal({
       }
     }
 
-    const error = await onSubmit(
-      {
-        title: persistTitle,
-        description,
-        durationMinutes: parseInt(duration, 10) || 15,
-        priority,
-        difficulty,
-      },
-      displace,
-    );
+    const error = await onSubmit({
+      title: persistTitle,
+      description,
+      durationMinutes: parseInt(duration, 10) || 15,
+      priority,
+      difficulty,
+    });
     setSaving(false);
     if (error) {
       setFormError(error);
@@ -372,15 +357,6 @@ export function TaskModal({
   };
 
   const handleSave = async () => {
-    // Create into an OCCUPIED In Progress column: park the runner BEFORE any
-    // write — no orphan Backlog card is ever created just to discover the
-    // slot is taken. Cancel stays on the form (nothing created); confirm
-    // re-enters this path with `displace` via submitForm. The Save button is
-    // disabled on an empty title, so the dialog only opens with a real one.
-    if (!isEditing && createStatus === 'IN_PROGRESS' && runningTask) {
-      setDisplaceOpen(true);
-      return;
-    }
     await submitForm();
   };
 
@@ -415,50 +391,34 @@ export function TaskModal({
    *  carries status). The parent merges the response into `task` so the
    *  selected pill follows the server; on error the message lands in
    *  `formError` and the modal stays open. */
-  const runMove = async (dest: TaskStatus, displace?: MoveDisplaceInput) => {
+  const runMove = async (dest: TaskStatus) => {
     if (!task || !onMove) return;
     setMovingStatus(true);
     setFormError(null);
-    const error = await onMove(task.id, dest, displace);
+    const error = await onMove(task.id, dest);
     setMovingStatus(false);
+    if (error) setFormError(error);
+  };
+
+  /** Runs a focus toggle (edit + IN_PROGRESS only, like the status pills).
+   *  The parent merges the server rows into `task` so the pill follows; on
+   *  error the message lands in `formError` and the modal stays open. */
+  const runToggleFocus = async () => {
+    if (!task || !onToggleFocus || focusPending || movingStatus) return;
+    setFocusPending(true);
+    setFormError(null);
+    const error = await onToggleFocus(task);
+    setFocusPending(false);
     if (error) setFormError(error);
   };
 
   const handleStatusClick = (dest: TaskStatus) => {
     if (!task || !onMove || movingStatus) return;
     if (task.status === dest) return; // tapping the current status is a no-op
-    // The running slot is occupied by a DIFFERENT task: park it first (ADR
-    // 0002 § UI). Cancel = nothing; confirm dispatches one /move with
-    // `displace`.
-    if (dest === 'IN_PROGRESS' && runningTask && runningTask.id !== task.id) {
-      setDisplaceOpen(true);
-      return;
-    }
+    // A pill to In Progress is a plain `/move` — it starts the card even
+    // while other tasks already run (IN_PROGRESS is a column, not a
+    // singleton lock).
     void runMove(dest);
-  };
-
-  const handleDisplaceConfirm = (
-    parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
-  ) => {
-    if (!runningTask) return;
-    setDisplaceOpen(false);
-    // Create mode: the park dialog opened BEFORE the create write
-    // (handleSave intercepted). Confirming now runs the same submit path as
-    // Save, with the displace attached — the parent creates then moves in
-    // one flow, so nothing was written while the dialog was open.
-    if (!task && createStatus === 'IN_PROGRESS') {
-      void submitForm({
-        id: runningTask.id,
-        status: parkStatus,
-      });
-      return;
-    }
-    // Edit mode: immediate status change with displace (existing behavior).
-    if (!task) return;
-    void runMove('IN_PROGRESS', {
-      id: runningTask.id,
-      status: parkStatus,
-    });
   };
 
   return (
@@ -735,6 +695,40 @@ export function TaskModal({
                         </button>
                       ),
                     )}
+                    {/* Focus control — IN_PROGRESS only (focus is
+                        IP-only; the API 400s any other status), and only
+                        when the board wired it up (ListsPage omits
+                        onToggleFocus). Renders as a Focus/Unfocus pill right
+                        next to the status pills. */}
+                    {task!.status === 'IN_PROGRESS' && onToggleFocus && (
+                      <button
+                        type="button"
+                        onClick={() => void runToggleFocus()}
+                        disabled={focusPending || movingStatus || saving}
+                        aria-pressed={task!.focused}
+                        aria-label={task!.focused ? 'Unfocus' : 'Focus'}
+                        className={cn(
+                          'flex items-center gap-2 px-4 py-2 rounded-xl border-2 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-50',
+                          task!.focused
+                            ? 'bg-primary/10 border-primary text-primary'
+                            : 'bg-background border-input text-muted-foreground hover:border-primary/30',
+                        )}
+                      >
+                        <Pin
+                          className={cn(
+                            'h-4 w-4',
+                            task!.focused && 'fill-current',
+                          )}
+                        />
+                        {focusPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : task!.focused ? (
+                          'Unfocus'
+                        ) : (
+                          'Focus'
+                        )}
+                      </button>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -824,18 +818,6 @@ export function TaskModal({
           </div>
         </DialogContent>
       </Dialog>
-
-      {/* Occupied In Progress park dialog — same component as the board's
-        drag conflict; Cancel / overlay close dispatches nothing */}
-      <DisplaceDialog
-        open={displaceOpen}
-        onOpenChange={(open) => {
-          if (!open) setDisplaceOpen(false);
-        }}
-        runningTitle={runningTask?.title ?? ''}
-        incomingTitle={title.trim() || 'this task'}
-        onConfirm={handleDisplaceConfirm}
-      />
     </>
   );
 }

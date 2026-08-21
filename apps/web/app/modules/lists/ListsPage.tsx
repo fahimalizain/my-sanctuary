@@ -28,8 +28,6 @@ import { cn } from '@/lib/utils';
 import { defaultMoveRank } from '../board/board-model';
 import {
   TASK_PRIORITY_LABELS,
-  type MoveDisplaceInput,
-  type MoveTaskError,
   type MoveTaskInput,
   type MoveTaskResponse,
   type NewTaskInput,
@@ -64,30 +62,6 @@ async function readError(res: Response): Promise<string> {
     // Not JSON — fall through to the generic message.
   }
   return `Request failed with status ${res.status}`;
-}
-
-// Move failures can carry a `displaced` task (ADR 0002 § Move API): when the
-// start fails AFTER a successful displace, the parked task stays and only the
-// moved task snaps back. Same page-local copy convention as `readError`
-// (BoardPage has its own).
-async function readMoveError(res: Response): Promise<MoveTaskError> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return {
-        error: (data as { error: string }).error,
-        displaced: (data as Partial<MoveTaskError>).displaced,
-      };
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return { error: `Request failed with status ${res.status}` };
 }
 
 interface ListFormState {
@@ -192,14 +166,6 @@ export function ListsPage() {
   // Task timer actions (start/stop/pause/complete/discard)
   // ──────────────────────────────────────────
 
-  // Any task IN_PROGRESS means the single running slot is taken: every Start
-  // button is disabled until a stop/pause/complete/discard frees it.
-  const anyRunning = tasks.some((task) => task.status === 'IN_PROGRESS');
-  // The actual running task record — the task modal needs it to decide
-  // whether tapping In Progress must park someone first.
-  const runningTask =
-    tasks.find((task) => task.status === 'IN_PROGRESS') ?? null;
-
   const handleTaskAction = async (taskId: string, action: TaskAction) => {
     setActionError(null);
     const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/${action}`, {
@@ -207,8 +173,9 @@ export function ListsPage() {
       credentials: 'include',
     });
     if (!res.ok) {
-      // The server's 409 message ("a task is already running") lands in the
-      // banner; the cards stay visible.
+      // The server's message (e.g. a missing Google token) lands in the
+      // banner; the cards stay visible. IN_PROGRESS is a column, not a
+      // singleton lock, so starting another task while some run is fine.
       setActionError(await readError(res));
       return;
     }
@@ -324,15 +291,14 @@ export function ListsPage() {
   /** TaskModal's immediate status change — the same /move contract as the
    *  board: no drop position, so `sort_order` is OMITTED and the server
    *  applies the column default (`defaultMoveRank` mirrors it for the
-   *  optimistic frame — the moved card to its default rank, the parked
-   *  runner to 0), then one POST /api/tasks/:id/move. Failure with a
-   *  `displaced` task keeps A parked and snaps only this task back; any
-   *  other failure restores the full snapshot. Sets the banner and returns
-   *  the message for the form (null on success). */
+   *  optimistic frame), then one POST /api/tasks/:id/move. A pill to In
+   *  Progress is a plain `/move` — it starts the card even while other tasks
+   *  run (IN_PROGRESS is a column, not a singleton lock). Failure restores
+   *  the full snapshot. Sets the banner and returns the message for the form
+   *  (null on success). */
   const handleMoveTask = async (
     taskId: string,
     status: TaskStatus,
-    displace?: MoveDisplaceInput,
   ): Promise<string | null> => {
     setActionError(null);
     const snapshot = tasksRef.current;
@@ -343,25 +309,14 @@ export function ListsPage() {
       snapshot,
       taskId,
     );
-    // No-drop: omit `displace.sort_order` too — the park always prepends.
-    const park = displace
-      ? { id: displace.id, status: displace.status }
-      : undefined;
     setTasks((prev) =>
-      prev.map((entry) => {
-        if (displace && entry.id === displace.id) {
-          return {
-            ...entry,
-            status: displace.status,
-            sort_order: 0,
-          };
-        }
-        return entry.id === taskId
+      prev.map((entry) =>
+        entry.id === taskId
           ? { ...entry, status, sort_order: destRank }
-          : entry;
-      }),
+          : entry,
+      ),
     );
-    const body: MoveTaskInput = { status, displace: park };
+    const body: MoveTaskInput = { status };
     try {
       const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
         method: 'POST',
@@ -370,34 +325,14 @@ export function ListsPage() {
         body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const failure = await readMoveError(res);
-        if (failure.displaced) {
-          // ADR 0002 § Move API: no rollback for A — it stays parked. Only
-          // the moved task goes back to where it was before.
-          setTasks((prev) =>
-            prev.map((entry) => {
-              if (entry.id === failure.displaced!.id) return failure.displaced!;
-              if (entry.id === taskId) {
-                return snapshot.find((snap) => snap.id === taskId) ?? entry;
-              }
-              return entry;
-            }),
-          );
-        } else {
-          setTasks(snapshot);
-        }
-        setActionError(failure.error);
-        return failure.error;
+        const message = await readError(res);
+        setTasks(snapshot);
+        setActionError(message);
+        return message;
       }
       const data = (await res.json()) as MoveTaskResponse;
       setTasks((prev) =>
-        prev.map((entry) => {
-          if (entry.id === data.task.id) return data.task;
-          if (data.displaced && entry.id === data.displaced.id) {
-            return data.displaced;
-          }
-          return entry;
-        }),
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
       );
       // Keep the modal's `task` prop in sync so the selected pill follows
       // the server — the modal stays open after a status change.
@@ -568,7 +503,6 @@ export function ListsPage() {
                 onEditList={openEditList}
                 onDeleteList={handleDeleteList}
                 onEditTask={openEditTask}
-                anyRunning={anyRunning}
                 onStartTask={handleStartTask}
                 onStopTask={handleStopTask}
                 onPauseTask={handlePauseTask}
@@ -656,7 +590,7 @@ export function ListsPage() {
       </Dialog>
 
       {/* New / Edit Task Dialog — edit mode carries the immediate status
-          pills (onMove) and the running task for the park dialog */}
+          pills (onMove) */}
       <TaskModal
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
@@ -664,7 +598,6 @@ export function ListsPage() {
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
         onMove={handleMoveTask}
-        runningTask={runningTask}
       />
     </div>
   );
@@ -676,7 +609,6 @@ interface ListCardProps {
   onEditList: (list: TaskList) => void;
   onDeleteList: (list: TaskList) => void;
   onEditTask: (task: TaskRecord) => void;
-  anyRunning: boolean;
   onStartTask: (taskId: string) => void;
   onStopTask: (taskId: string) => void;
   onPauseTask: (taskId: string) => void;
@@ -690,7 +622,6 @@ function ListCard({
   onEditList,
   onDeleteList,
   onEditTask,
-  anyRunning,
   onStartTask,
   onStopTask,
   onPauseTask,
@@ -769,7 +700,6 @@ function ListCard({
               key={task.id}
               task={task}
               onEdit={onEditTask}
-              anyRunning={anyRunning}
               onStart={onStartTask}
               onStop={onStopTask}
               onPause={onPauseTask}
@@ -798,7 +728,6 @@ function ListCard({
 function TaskChip({
   task,
   onEdit,
-  anyRunning,
   onStart,
   onStop,
   onPause,
@@ -807,7 +736,6 @@ function TaskChip({
 }: {
   task: TaskRecord;
   onEdit: (task: TaskRecord) => void;
-  anyRunning: boolean;
   onStart: (taskId: string) => void;
   onStop: (taskId: string) => void;
   onPause: (taskId: string) => void;
@@ -872,8 +800,9 @@ function TaskChip({
         </span>
       )}
       {/* Actions — Start on OPEN and PLANNED (pause parks tasks in PLANNED,
-          so the Lists page must be able to restart them) and only when the
-          running slot is free; Stop + Pause only while this task runs;
+          so the Lists page must be able to restart them); IN_PROGRESS is a
+          column, not a singleton lock, so Start works even while other
+          tasks run; Stop + Pause only while this task runs;
           Complete/Discard whenever the task is not already in that terminal
           state */}
       {(task.status === 'OPEN' || task.status === 'PLANNED') && (
@@ -882,14 +811,9 @@ function TaskChip({
             e.stopPropagation();
             onStart(task.id);
           }}
-          disabled={anyRunning}
-          className={cn(
-            'flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground',
-            anyRunning &&
-              'cursor-not-allowed opacity-40 hover:bg-transparent hover:text-primary-foreground/70',
-          )}
+          className="flex-shrink-0 rounded-md p-1 text-primary-foreground/70 transition-colors hover:bg-primary-foreground/15 hover:text-primary-foreground"
           aria-label={`Start ${task.display_title}`}
-          title={anyRunning ? 'Another task is running' : 'Start'}
+          title="Start"
         >
           <Play className="h-3 w-3" />
         </button>
