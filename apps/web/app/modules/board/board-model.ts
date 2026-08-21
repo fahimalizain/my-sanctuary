@@ -1,5 +1,4 @@
 import type {
-  MoveTaskError,
   TaskDifficulty,
   TaskPriority,
   TaskRecord,
@@ -33,30 +32,6 @@ export async function readError(res: Response): Promise<string> {
     // Not JSON — fall through to the generic message.
   }
   return `Request failed with status ${res.status}`;
-}
-
-// Move failures can carry a `displaced` task (ADR 0002 § Move API): when the
-// start fails AFTER a successful displace, the parked task stays and the
-// client snaps only the moved card back. readError cannot express that, so
-// the move flow parses the full body instead.
-export async function readMoveError(res: Response): Promise<MoveTaskError> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return {
-        error: (data as { error: string }).error,
-        displaced: (data as Partial<MoveTaskError>).displaced,
-      };
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return { error: `Request failed with status ${res.status}` };
 }
 
 export interface BoardColumn {

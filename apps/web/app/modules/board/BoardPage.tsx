@@ -10,7 +10,6 @@ import {
 import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
 import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { DisplaceDialog } from '@/app/components/DisplaceDialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { API_BASE_URL } from '@/lib/api';
@@ -19,7 +18,6 @@ import {
   TASK_PRIORITY_LABELS,
   type CategoriesResponse,
   type Category,
-  type MoveDisplaceInput,
   type MoveTaskInput,
   type MoveTaskResponse,
   type NewTaskInput,
@@ -43,7 +41,6 @@ import {
   TERMINAL_COLUMN_CAP,
   defaultMoveRank,
   readError,
-  readMoveError,
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
@@ -54,18 +51,6 @@ interface TaskFormState {
   task?: TaskRecord;
   /** Create destination. Always set when mode === 'create' on the board. */
   createStatus?: TaskStatus;
-}
-
-// A drop onto an occupied In Progress column (ADR 0002 § UI): the move is NOT
-// applied optimistically yet — the user picks where the running task A is
-// parked, then a single `/move` with `displace` runs. Cancel drops the stash.
-interface DisplacePrompt {
-  /** The dragged task (B) trying to enter In Progress. */
-  taskId: string;
-  /** B's status before the drop (used to describe the move). */
-  fromStatus: TaskStatus;
-  /** The task (A) currently running — the one the dialog parks. */
-  runningTask: TaskRecord;
 }
 
 export function BoardPage() {
@@ -101,10 +86,6 @@ export function BoardPage() {
   // Cards with a /move request in flight — dragging them again is ignored
   // until the response lands (no queuing).
   const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
-  // Occupied In Progress conflict stash; non-null renders the park dialog.
-  const [displacePrompt, setDisplacePrompt] = useState<DisplacePrompt | null>(
-    null,
-  );
 
   // PointerSensor with an 8px activation distance: a plain click still opens
   // the edit modal, and only a real 8px+ movement starts a drag (ADR 0002
@@ -333,12 +314,10 @@ export function BoardPage() {
 
   /** One negotiated `/move` request. Applies the OPTIMISTIC change first
    *  (caller has already snapshotted and decided what to send), then:
-   *  - 200 → merge `response.task` (and `response.displaced`, if present);
-   *  - failure with `displaced` in the body → the parked task A stays, only
-   *    the moved card B is snapped back to its pre-drop snapshot;
-   *  - failure without `displaced` → restore the full snapshot.
-   *  Every failure raises the error banner and returns the message (null on
-   *  success) so the task modal can show it on the form too. */
+   *  - 200 → merge `response.task`;
+   *  - failure → restore the full snapshot and raise the error banner.
+   *  Returns the error message (null on success) so the task modal can show
+   *  it on the form too. */
   const sendMoveRequest = async (
     taskId: string,
     body: MoveTaskInput,
@@ -355,24 +334,10 @@ export function BoardPage() {
         body: JSON.stringify(body),
       });
       if (!res.ok) {
-        const failure = await readMoveError(res);
-        if (failure.displaced) {
-          // ADR 0002 § Move API: no rollback for A — it stays parked. Only
-          // the moved card goes back to where it was before the drop.
-          setTasks((prev) =>
-            prev.map((entry) => {
-              if (entry.id === failure.displaced!.id) return failure.displaced!;
-              if (entry.id === taskId) {
-                return snapshot.find((snap) => snap.id === taskId) ?? entry;
-              }
-              return entry;
-            }),
-          );
-        } else {
-          setTasks(snapshot);
-        }
-        setActionError(failure.error);
-        return failure.error;
+        const message = await readError(res);
+        setTasks(snapshot);
+        setActionError(message);
+        return message;
       }
       onSuccess((await res.json()) as MoveTaskResponse);
       return null;
@@ -413,21 +378,19 @@ export function BoardPage() {
       snapshot,
       (data) => {
         setTasks((prev) =>
-          prev.map((entry) => {
-            if (entry.id === data.task.id) return data.task;
-            if (data.displaced && entry.id === data.displaced.id) {
-              return data.displaced;
-            }
-            return entry;
-          }),
+          prev.map((entry) =>
+            entry.id === data.task.id ? data.task : entry,
+          ),
         );
       },
     );
   };
 
   /** Resolves a drop against the displayed (filtered + capped) lists and
-   *  either starts the optimistic move, opens the displace dialog, or does
-   *  nothing (dropped back onto its own slot). */
+   *  starts the optimistic move, or does nothing (dropped back onto its own
+   *  slot). A drop onto In Progress is a plain `/move` — it starts the card
+   *  even while other tasks already run (IN_PROGRESS is a column, not a
+   *  singleton lock). */
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     setActiveDrag(null);
@@ -459,88 +422,28 @@ export function BoardPage() {
     const remaining = destShown.filter((task) => task.id !== activeId);
     const destSortOrder = resolveSortOrder(remaining, destIndex, destStatus);
 
-    // Same column + same slot = no movement: never call the API (In Progress
-    // singleton drops land here too — there is only slot 0).
+    // Same column + same slot = no movement: never call the API.
     if (destStatus === activeTask.status) {
       const oldIndex = destShown.findIndex((task) => task.id === activeId);
       const slot = destIndex >= remaining.length ? remaining.length : destIndex;
       if (oldIndex !== -1 && slot === oldIndex) return;
     }
 
-    // Occupied In Progress (ADR 0002 § UI): the optimistic move is NOT
-    // applied. Stash the drop and ask where the running task goes.
-    if (destStatus === 'IN_PROGRESS') {
-      const runningTask = tasksRef.current.find(
-        (task) => task.status === 'IN_PROGRESS' && task.id !== activeId,
-      );
-      if (runningTask) {
-        setDisplacePrompt({
-          taskId: activeId,
-          fromStatus: activeTask.status,
-          runningTask,
-        });
-        return;
-      }
-    }
-
     void performMove(activeId, destStatus, destSortOrder);
-  };
-
-  /** Confirm in the conflict dialog: park the running task A at the chosen
-   *  status (no drop — `sort_order` omitted, the park always prepends),
-   *  move B to In Progress (rank 0), then ONE `/move` carrying both halves
-   *  via `displace`. */
-  const confirmDisplace = (
-    parkStatus: 'PLANNED' | 'COMPLETED' | 'DISCARDED',
-  ) => {
-    const prompt = displacePrompt;
-    if (!prompt) return;
-    setDisplacePrompt(null);
-
-    const snapshot = tasksRef.current;
-    setTasks((prev) =>
-      prev.map((entry) => {
-        if (entry.id === prompt.runningTask.id) {
-          return { ...entry, status: parkStatus, sort_order: 0 };
-        }
-        if (entry.id === prompt.taskId) {
-          return { ...entry, status: 'IN_PROGRESS', sort_order: 0 };
-        }
-        return entry;
-      }),
-    );
-    const body: MoveTaskInput = {
-      status: 'IN_PROGRESS',
-      displace: {
-        id: prompt.runningTask.id,
-        status: parkStatus,
-      },
-    };
-    void sendMoveRequest(prompt.taskId, body, snapshot, (data) => {
-      setTasks((prev) =>
-        prev.map((entry) => {
-          if (entry.id === data.task.id) return data.task;
-          if (data.displaced && entry.id === data.displaced.id) {
-            return data.displaced;
-          }
-          return entry;
-        }),
-      );
-    });
   };
 
   /** TaskModal's immediate status change (ADR 0002 § UI): a drop with no
    *  drop position — `sort_order` is OMITTED and the server applies the
    *  column default (`defaultMoveRank` mirrors it for the optimistic frame:
-   *  OPEN appends, pause prepends Planned, complete/discard prepend).
-   *  Optimistic, then ONE `/move`; `sendMoveRequest` already owns the
-   *  displaced-aware revert and the banner. Returns the error message for
-   *  the form (null on success). The modal stays open; `task` in props
-   *  updates via this merge. */
+   *  OPEN appends, pause prepends Planned, complete/discard prepend). A
+   *  status pill to IN_PROGRESS is a plain `/move` — it starts the card even
+   *  while other tasks run. Optimistic, then ONE `/move`;
+   *  `sendMoveRequest` already owns the revert and the banner. Returns the
+   *  error message for the form (null on success). The modal stays open;
+   *  `task` in props updates via this merge. */
   const handleMoveTask = async (
     taskId: string,
     status: TaskStatus,
-    displace?: MoveDisplaceInput,
   ): Promise<string | null> => {
     const snapshot = tasksRef.current;
     const current = snapshot.find((entry) => entry.id === taskId);
@@ -550,37 +453,22 @@ export function BoardPage() {
       snapshot,
       taskId,
     );
-    // No-drop: omit `displace.sort_order` too — the park always prepends.
-    const park = displace
-      ? { id: displace.id, status: displace.status }
-      : undefined;
     setTasks((prev) =>
-      prev.map((entry) => {
-        if (displace && entry.id === displace.id) {
-          return {
-            ...entry,
-            status: displace.status,
-            sort_order: 0,
-          };
-        }
-        return entry.id === taskId
+      prev.map((entry) =>
+        entry.id === taskId
           ? { ...entry, status, sort_order: destRank }
-          : entry;
-      }),
+          : entry,
+      ),
     );
     return sendMoveRequest(
       taskId,
-      { status, displace: park },
+      { status },
       snapshot,
       (data) => {
         setTasks((prev) =>
-          prev.map((entry) => {
-            if (entry.id === data.task.id) return data.task;
-            if (data.displaced && entry.id === data.displaced.id) {
-              return data.displaced;
-            }
-            return entry;
-          }),
+          prev.map((entry) =>
+            entry.id === data.task.id ? data.task : entry,
+          ),
         );
         // Keep the modal's `task` prop in sync so the selected pill follows
         // the server — the modal stays open after a status change.
@@ -618,14 +506,12 @@ export function BoardPage() {
   // tasks always stamps OPEN (status is never in the body), and a
   // non-Backlog destination is reached by an immediate follow-up /move that
   // OMITS sort_order — the server applies the column default, the same
-  // matrix the board drop uses. Create into an OCCUPIED In Progress column
-  // carries `displace`: TaskModal opened the park dialog BEFORE the create
-  // write, so this only runs after the user confirmed where the runner goes
-  // (cancel never writes a thing). The move failure path closes the modal,
+  // matrix the board drop uses. A create into In Progress is a plain
+  // create-then-move that starts the card even while other tasks run (a
+  // column, not a singleton lock). The move failure path closes the modal,
   // raises the banner and leaves the orphan card OPEN in Backlog at the
   // server-assigned append rank (the server-owned create is never deleted);
-  // a `displaced` failure body keeps the runner parked (same rule as
-  // sendMoveRequest), anything else full-restores the pre-move snapshot.
+  // any failure full-restores the pre-move snapshot.
   const handleTaskSubmit = async (
     values: {
       title: string;
@@ -634,7 +520,6 @@ export function BoardPage() {
       priority: TaskPriority;
       difficulty: TaskDifficulty;
     },
-    displace?: MoveDisplaceInput,
   ): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
@@ -701,9 +586,6 @@ export function BoardPage() {
     // server's column default for a create (OPEN → dest; `defaultMoveRank`
     // mirrors it — do NOT hardcode 0, a Planned-append dest would flash the
     // card at the head), then persist with ONE /move that OMITS sort_order.
-    // With `displace` (occupied In Progress create) the runner is parked in
-    // the same optimistic frame — the dialog ran before the create write, so
-    // canceling never left a stray Backlog card to clean up.
     const snapshotBeforeOptimistic = tasksRef.current;
     const destRank = defaultMoveRank(
       'OPEN',
@@ -711,25 +593,11 @@ export function BoardPage() {
       snapshotBeforeOptimistic,
       data.task.id,
     );
-    const park = displace
-      ? { id: displace.id, status: displace.status }
-      : undefined;
-    const moveBody: MoveTaskInput = {
-      status: dest,
-      ...(park ? { displace: park } : {}),
-    };
-    setTasks((prev) => {
-      const next = prev.map((entry) =>
-        displace && entry.id === displace.id
-          ? {
-              ...entry,
-              status: displace.status,
-              sort_order: 0,
-            }
-          : entry,
-      );
-      return [{ ...data.task, status: dest, sort_order: destRank }, ...next];
-    });
+    const moveBody: MoveTaskInput = { status: dest };
+    setTasks((prev) => [
+      { ...data.task, status: dest, sort_order: destRank },
+      ...prev,
+    ]);
 
     let moveRes: Response;
     try {
@@ -743,49 +611,29 @@ export function BoardPage() {
       // Network failure: restore the pre-move snapshot, then ensure the
       // created card is present as OPEN/Backlog at the server-assigned
       // append rank (the orphan stays — the server owns the create, nothing
-      // to undo). When displace was applied optimistically, this also
-      // restores the parked runner. Banner, close.
+      // to undo). Banner, close.
       setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
       const message = err instanceof Error ? err.message : 'Move failed';
       setActionError(message);
       closeTaskForm();
       return null;
     }
-    // Move failure (409 on occupied In Progress, 401 missing Google token,
-    // …): when the body carries a `displaced` row, the runner stays parked
-    // (same rule as sendMoveRequest) and only the created card snaps back to
-    // OPEN/Backlog (keeping its append rank); otherwise the full pre-move
-    // snapshot is restored with the created card OPEN at its append rank.
+    // Move failure (401 missing Google token, 400, …): restore the full
+    // pre-move snapshot with the created card OPEN at its append rank.
     // Banner, close (null closes the modal).
     if (!moveRes.ok) {
-      const failure = await readMoveError(moveRes);
-      if (failure.displaced) {
-        // A stays parked; B (new task) goes back to OPEN/Backlog at the
-        // append rank the server assigned on create; every other card comes
-        // back from the snapshot (taken before B's insert).
-        setTasks(() => {
-          const base = snapshotBeforeOptimistic.map((entry) =>
-            entry.id === failure.displaced!.id ? failure.displaced! : entry,
-          );
-          return [data.task, ...base.filter((e) => e.id !== data.task.id)];
-        });
-      } else {
-        setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
-      }
-      setActionError(failure.error);
+      const message = await readError(moveRes);
+      setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
+      setActionError(message);
       closeTaskForm();
       return null;
     }
-    // Move success: merge the authoritative row (and any displaced task).
+    // Move success: merge the authoritative row.
     const moveData = (await moveRes.json()) as MoveTaskResponse;
     setTasks((prev) =>
-      prev.map((entry) => {
-        if (entry.id === moveData.task.id) return moveData.task;
-        if (moveData.displaced && entry.id === moveData.displaced.id) {
-          return moveData.displaced;
-        }
-        return entry;
-      }),
+      prev.map((entry) =>
+        entry.id === moveData.task.id ? moveData.task : entry,
+      ),
     );
     closeTaskForm();
     return null;
@@ -804,24 +652,6 @@ export function BoardPage() {
     closeTaskForm();
     return null;
   };
-
-  // The sole running task, if any (may be the task being edited). Decides
-  // whether tapping In Progress in the modal needs the park dialog.
-  const runningTask =
-    tasks.find((task) => task.status === 'IN_PROGRESS') ?? null;
-
-  // The conflict dialog reads both titles from live state so they stay
-  // correct even if the optimistic render happens first.
-  const runningTaskTitle =
-    displacePrompt &&
-    (
-      tasks.find((task) => task.id === displacePrompt.runningTask.id) ??
-      displacePrompt.runningTask
-    ).display_title;
-  const draggedTaskTitle =
-    displacePrompt &&
-    (tasks.find((task) => task.id === displacePrompt.taskId)?.display_title ??
-      'this task');
 
   return (
     <div className="flex min-h-screen flex-col bg-cream">
@@ -1026,22 +856,8 @@ export function BoardPage() {
         </DndContext>
       )}
 
-      {/* Occupied In Progress conflict dialog (ADR 0002 § UI): pick where the
-          running task is parked. Cancel / overlay close drops the stash with
-          no request. Shared component — also used by the task modal's status
-          pills. */}
-      <DisplaceDialog
-        open={displacePrompt !== null}
-        onOpenChange={(open) => {
-          if (!open) setDisplacePrompt(null);
-        }}
-        runningTitle={runningTaskTitle || ''}
-        incomingTitle={draggedTaskTitle || ''}
-        onConfirm={confirmDisplace}
-      />
-
       {/* New / Edit Task Dialog — edit mode carries the immediate status
-          pills (onMove) and the running task for the park dialog */}
+          pills (onMove) */}
       <TaskModal
         open={taskForm !== null}
         onOpenChange={(open) => !open && closeTaskForm()}
@@ -1052,7 +868,6 @@ export function BoardPage() {
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
         onMove={handleMoveTask}
-        runningTask={runningTask}
       />
     </div>
   );

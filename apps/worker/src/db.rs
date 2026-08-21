@@ -976,8 +976,9 @@ impl TaskRepo for D1TaskRepo {
 
     async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError> {
         // The elongate cron's work list: every living IN_PROGRESS row, all
-        // users (status is the one-running lock). No binds — `prepare`
-        // returns the statement directly when there is nothing to bind.
+        // users (IN_PROGRESS is a column, not a singleton lock). No binds —
+        // `prepare` returns the statement directly when there is nothing to
+        // bind.
         query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
     }
 

@@ -19,7 +19,7 @@ pub fn unix_secs_to_rfc3339(secs: i64) -> String {
 /// Snaps a Unix timestamp (seconds) to the nearest whole minute (half-up):
 /// seconds < 30 floor to the current minute, seconds >= 30 ceil to the next.
 ///
-/// Every timer Google write (start/stop/pause/complete/discard/displace)
+/// Every timer Google write (start/stop/pause/complete/discard)
 /// lands on this minute grid so elapsed-time reports never show sub-minute
 /// blocks. The result is always `rem_euclid(60) == 0`.
 pub fn nearest_minute_unix(secs: i64) -> i64 {

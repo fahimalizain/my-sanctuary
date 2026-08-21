@@ -273,7 +273,7 @@ pub trait TaskRepo: Send + Sync {
     /// regroups by computed category anyway).
     async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Task>, RepoError>;
     /// Every living `IN_PROGRESS` task across ALL users — the elongate cron's
-    /// work list (`tasks.status` is the one-running lock, slice 1, so a
+    /// work list (IN_PROGRESS is a column, not a singleton lock, so a
     /// stale/expired event cache neither adds nor drops work here).
     async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError>;
     /// Returns the task with local `id`, or `None` when absent or soft-deleted.
@@ -509,8 +509,7 @@ pub const EVENT_GET_BY_ID_SQL: &str =
     "SELECT * FROM calendar_events WHERE id = ? AND deleted_at IS NULL";
 
 /// The exit path's event lookup: the living cached row a `started` log points
-/// at (its `start_time` decides the PATCH end / displace start, on the minute
-/// grid).
+/// at (its `start_time` decides the PATCH end, on the minute grid).
 pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
     "SELECT * FROM calendar_events WHERE calendar_id = ? AND google_event_id = ? AND deleted_at IS NULL";
 
@@ -775,7 +774,7 @@ pub const TASK_LIST_BY_USER_ID_SQL: &str =
     "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY status ASC, sort_order ASC, created_at ASC";
 
 /// The elongate cron's work list: every living IN_PROGRESS task, all users
-/// (the status is the one-running lock — soft-deleted rows are filtered).
+/// (IN_PROGRESS is a pile — soft-deleted rows are filtered).
 pub const TASK_LIST_IN_PROGRESS_SQL: &str =
     "SELECT * FROM tasks WHERE status = 'IN_PROGRESS' AND deleted_at IS NULL";
 
@@ -1328,9 +1327,9 @@ mod tests {
 
     #[test]
     fn task_list_in_progress_filters_status_and_living_rows() {
-        // The elongate cron's work list: IN_PROGRESS status is the lock
-        // (`status` TEXT compares to the quoted literal), soft-deleted rows
-        // are filtered, and there is deliberately no user filter — all users.
+        // The elongate cron's work list: IN_PROGRESS is a column, not a
+        // singleton lock; soft-deleted rows are filtered, and there is
+        // deliberately no user filter — all users.
         let sql = TASK_LIST_IN_PROGRESS_SQL;
         assert!(sql.starts_with("SELECT * FROM tasks"), "{sql}");
         assert!(sql.contains("status = 'IN_PROGRESS'"), "{sql}");

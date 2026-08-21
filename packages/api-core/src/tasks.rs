@@ -49,16 +49,18 @@
 //!   writable** (`access_role` `owner` or `writer`); a missing or read-only
 //!   named calendar never falls through to the next inheritance slot — it
 //!   goes to the user's **primary** calendar. No writable calendar → 400.
-//! - One running task per user: a second start raises [`TasksError::Conflict`]
-//!   (409) even when the same task is already running. **`tasks.status ==
-//!   "IN_PROGRESS"` is the only lock** — the start gate scans the user's
-//!   living tasks by status, never the event window.
+//! - **IN_PROGRESS is a column, not a singleton lock**: any number of living
+//!   tasks may be IN_PROGRESS at once. Starting a task that is already
+//!   IN_PROGRESS is a 200 no-op (no new event, no log, no re-rank); starting
+//!   any other task proceeds and opens its own event. `tasks.status ==
+//!   "IN_PROGRESS"` never gates a start — the event window is never
+//!   consulted either.
 //! - Every timer Google write snaps to the nearest minute: `start_task`
 //!   creates at `T … T + START_EVENT_MINUTES` (15, independent of
 //!   `duration_minutes`), and all exit verbs
-//!   (`stop_task`/`pause_task`/`complete_task`/`discard_task`, and the
-//!   displace park) PATCH the event's end to snapped `T` (`start + 60s` when
-//!   `T <= start`, keeping the event valid).
+//!   (`stop_task`/`pause_task`/`complete_task`/`discard_task`) PATCH the
+//!   event's end to snapped `T` (`start + 60s` when `T <= start`, keeping the
+//!   event valid).
 //! - Exit verbs resolve the event to PATCH through the task's **latest
 //!   `started` log** (`calendar_id` + `google_event_id`) — never through the
 //!   running-event window — so a run whose event end already passed still
@@ -86,7 +88,8 @@
 //!   the event calendar's TZ) so the live calendar block never looks
 //!   finished. Never shrink (the exit verbs snap the end back to actuals on
 //!   close — that may shrink and is correct), never recreate a missing
-//!   event, never touch status: IN_PROGRESS stays the lock.
+//!   event, never touch status: IN_PROGRESS is a pile the cron grows one
+//!   event per row.
 //!
 //! Move ([`move_task`], ADR 0002 § Move API): the board drop dispatches the
 //! transition matrix (start/stop/pause/complete/discard/plan/unplan/reopen/
@@ -97,11 +100,8 @@
 //! Omitted `sort_order` = no drop position: the server applies the column
 //! default ([`default_move_rank`]) — OPEN/PLANNED append except a pause
 //! prepends, Done/Discarded/In Progress prepend; same-status omit is a no-op.
-//! A same-status cross-card drag is a pure reorder. `displace` parks the
-//! running task first (PLANNED/COMPLETED/DISCARDED only — `displace.id` must
-//! be the task whose **status** is IN_PROGRESS), then starts the moved task;
-//! if that start fails the parked task STAYS — the error is
-//! [`TasksError::AfterDisplace`] and carries the displaced task's view.
+//! A same-status cross-card drag (including IN_PROGRESS → IN_PROGRESS with a
+//! rank) is a pure reorder — In Progress is a real pile, not a singleton.
 
 use std::collections::HashMap;
 
@@ -137,8 +137,9 @@ pub const START_EVENT_MINUTES: i64 = 15;
 pub const MIN_DURATION_MINUTES: i64 = 1;
 /// The status every created task gets.
 pub const TASK_STATUS_OPEN: &str = "OPEN";
-/// A running task — **the one-running-task lock** (a second start is 409
-/// while any living task carries this status, whatever the event cache says).
+/// A running task — **a column, not the one-running-task lock**: any number
+/// of living tasks may carry this status at once, and a start never 409s on
+/// it. The elongate cron grows one event per IN_PROGRESS row.
 pub const TASK_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// A finished task.
 pub const TASK_STATUS_COMPLETED: &str = "COMPLETED";
@@ -193,25 +194,12 @@ pub enum TasksError {
     Invalid(String),
     #[error("task not found")]
     NotFound,
-    #[error("a task is already running")]
-    Conflict,
     #[error("google api error: {0}")]
     GoogleApi(String),
     #[error("database error: {0}")]
     Repo(#[from] RepoError),
     #[error("calendar error: {0}")]
     Calendar(CalendarError),
-    /// The move already parked `displaced` (its event is closed, it sits in
-    /// its new status/rank) when the subsequent start failed. Deliberately
-    /// NO rollback (ADR 0002): `displaced` stays parked and the worker
-    /// serializes `{"error": <inner>…, "displaced": TaskView}` so the client
-    /// can snap the moved card back.
-    #[error("move failed after displacing the running task")]
-    AfterDisplace {
-        displaced: TaskView,
-        #[source]
-        source: Box<TasksError>,
-    },
 }
 
 impl From<CalendarError> for TasksError {
@@ -269,8 +257,7 @@ pub struct TaskActionResponse {
 }
 
 /// Request body for `POST /api/tasks/:id/move` (ADR 0002 § Move API): the
-/// absolute `sort_order` to assign in the target `status`. `displace` is
-/// optional (omitted or explicit `null`).
+/// absolute `sort_order` to assign in the target `status`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct MoveTaskInput {
     /// One of `OPEN|PLANNED|IN_PROGRESS|COMPLETED|DISCARDED` (the service
@@ -281,35 +268,14 @@ pub struct MoveTaskInput {
     /// `default_move_rank`).
     #[serde(default)]
     pub sort_order: Option<i64>,
-    /// When set: park the running task first (must be the currently running
-    /// task; its landing status must be PLANNED/COMPLETED/DISCARDED), then
-    /// start the moved task.
-    pub displace: Option<DisplaceInput>,
 }
 
-/// The `displace` sub-object: parks the running task at its own status/rank
-/// before the moved task starts. `status` is locked to
-/// `PLANNED|COMPLETED|DISCARDED` (never OPEN/IN_PROGRESS).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct DisplaceInput {
-    /// Id of the currently running task (its `tasks.status` row is
-    /// IN_PROGRESS — the status lock, not the event window); anything else
-    /// is 400.
-    pub id: String,
-    pub status: String,
-    /// Absolute rank in `status`. Omitted / null = prepend `0` (the park is
-    /// always from IN_PROGRESS, whose column default never appends).
-    #[serde(default)]
-    pub sort_order: Option<i64>,
-}
-
-/// Response envelope for `POST /api/tasks/:id/move`: the moved task plus the
-/// optionally displaced task and the Google event the dispatched action
-/// touched (the same `TaskActionResponse` family, plus `displaced`).
+/// Response envelope for `POST /api/tasks/:id/move`: the moved task and the
+/// Google event the dispatched action touched (the same
+/// `TaskActionResponse` family).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MoveTaskResponse {
     pub task: TaskView,
-    pub displaced: Option<TaskView>,
     pub event: Option<CalendarEvent>,
 }
 
@@ -912,11 +878,15 @@ pub async fn delete_task(
 /// allowed — a NEW event opens for the new chapter and the old logs/events
 /// stay. Start on PLANNED was always allowed, so a paused task restarts.
 ///
+/// **IN_PROGRESS is a column, not a singleton lock**: any number of living
+/// tasks may be IN_PROGRESS. Starting a task that is already IN_PROGRESS is
+/// a 200 no-op (`{ task, event: None }` — no new event, no log, no re-rank);
+/// otherwise a NEW event opens regardless of what else is running.
+///
 /// Order of operations:
 /// 1. Load the task — missing, soft-deleted, or another user's task → 404.
-/// 2. If ANY living task of the user has `status == IN_PROGRESS` → 409
-///    (`Conflict`) — even when it is this very task. **Status is the only
-///    lock**: the event window is never consulted here.
+/// 2. Already IN_PROGRESS → 200 no-op (**this task only**; other running
+///    tasks never gate a start).
 /// 3. Classify the title (seeding the taxonomy like every other read) to pick
 ///    the category.
 /// 4. Resolve the target calendar: `wanted` is the first non-empty of the
@@ -950,18 +920,19 @@ pub async fn start_task(
     if task.user_id != user_id {
         return Err(TasksError::NotFound);
     }
+    // Idempotent 200 no-op on this task: already IN_PROGRESS → no new event,
+    // no log, no re-rank. Other living IN_PROGRESS tasks never block a start.
+    if task.status == TASK_STATUS_IN_PROGRESS {
+        let taxonomy = load_taxonomy(category_repo, user_id).await?;
+        return Ok(TaskActionResponse {
+            task: to_view(&task, &taxonomy, None),
+            event: None,
+        });
+    }
     // No status gate: start on COMPLETED/DISCARDED opens a NEW event (the
     // board's reopen-by-start, ADR 0002) — history stays in the logs.
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    // The one-running-task lock is `tasks.status == IN_PROGRESS` — never the
-    // event window, so a stale/expired cache can neither block nor free a
-    // start.
-    let living = task_repo.list_by_user_id(user_id).await?;
-    if living.iter().any(|task| task.status == TASK_STATUS_IN_PROGRESS) {
-        return Err(TasksError::Conflict);
-    }
-
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
     let target = resolve_target_calendar(calendars, &taxonomy, &task.title, user_id).await?;
 
@@ -1132,7 +1103,7 @@ pub async fn discard_task(
 /// (`max + 1` over the mover-excluded pile) and pause prepends PLANNED;
 /// already in the landing status → the row is returned as set, no re-rank
 /// (and the log behavior is unchanged). `false` from [`dispatch_matrix_action`]
-/// / the displace park — `/move` places exactly once afterwards.
+/// — `/move` places exactly once afterwards.
 async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1306,9 +1277,8 @@ async fn complete_or_discard(
 }
 
 /// Resolves the cached event a task's latest `started` log points at, for the
-/// exit verbs and the displace park: `None` when the task never started, the
-/// log carries no ids, or the cached row is gone (the user closed the event
-/// in Google).
+/// exit verbs: `None` when the task never started, the log carries no ids, or
+/// the cached row is gone (the user closed the event in Google).
 async fn latest_started_event(
     logs: &dyn TaskLogRepo,
     events: &dyn CalendarEventRepo,
@@ -1544,10 +1514,9 @@ fn is_valid_task_status(status: &str) -> bool {
 }
 
 /// The move endpoint's Google gate (mirrors the worker's `needs_google`):
-/// start, any exit from IN_PROGRESS, and the displace park all PATCH/create
-/// Google events and require a refreshable token. The session-only
-/// transitions (plan/unplan/reopen/reorder/idle complete/discard) must be
-/// able to run with both `None`.
+/// start and any exit from IN_PROGRESS PATCH/create Google events and require
+/// a refreshable token. The session-only transitions (plan/unplan/reopen/
+/// reorder/idle complete/discard) must be able to run with both `None`.
 fn require_google<'a>(
     http: Option<&'a dyn HttpClient>,
     access: Option<&'a GoogleAccess>,
@@ -1587,9 +1556,9 @@ async fn dispatch_matrix_action(
     to: &str,
     now_unix: i64,
 ) -> Result<Option<CalendarEvent>, TasksError> {
-    // `to == IN_PROGRESS` is always start — the IN_PROGRESS → IN_PROGRESS
-    // no-op is short-circuited by the caller, so `from` is never
-    // IN_PROGRESS here.
+    // `to == IN_PROGRESS` is always start. Same-status cells never dispatch
+    // here — the caller runs them as no-ops/reorders — so `from` is never
+    // IN_PROGRESS on this arm.
     match (from, to) {
         (_, TASK_STATUS_IN_PROGRESS) => {
             let (http, access) = require_google(http, access)?;
@@ -1676,10 +1645,9 @@ async fn dispatch_matrix_action(
             )
             .await
         }
-        // The matrix's same-status cells are no-ops/reorders; reorders are
-        // handled by the caller, and the only same-status dispatch that can
-        // reach here is the displace park when the running task's stored
-        // status already equals its landing status (stale cache) — a no-op.
+        // The matrix's same-status cells are no-ops/reorders, and reorders
+        // are handled by the caller — this defensive fallback is unreachable
+        // by construction.
         (from, to) if from == to => Ok(None),
         // Every other cell of the 5×5 matrix is dispatched above; this is
         // unreachable by construction.
@@ -1834,8 +1802,8 @@ async fn reorder_in_place(
 /// helpers for the Google-touching legs, with plan/unplan/reopen as local
 /// flips), then places the task at `input.sort_order` in the target status —
 /// exactly once, which is why the dispatched exits never place themselves.
-/// Same-status moves are pure reorders (the IN_PROGRESS → IN_PROGRESS case
-/// is a no-op that ignores `sort_order`).
+/// Same-status moves are pure reorders — including IN_PROGRESS → IN_PROGRESS
+/// with a sent rank: In Progress is a real pile, not a singleton.
 ///
 /// Omitted `sort_order` (null or absent) means "no drop position": the server
 /// applies the column default from [`default_move_rank`] — OPEN and PLANNED
@@ -1845,28 +1813,18 @@ async fn reorder_in_place(
 /// A same-status move with omitted `sort_order` is a no-op (the row is
 /// returned unchanged, never sent to the tail).
 ///
-/// `displace` (move to IN_PROGRESS only) parks the running task first:
-/// 1. `displace.id` must be the task whose **status** is IN_PROGRESS — the
-///    status lock, never the event window (400 `"displace id is not the
-///    running task"` otherwise).
-/// 2. Park A at `displace.status`/`displace.sort_order` (must be
-///    PLANNED/COMPLETED/DISCARDED — the matrix from IN_PROGRESS; omitted
-///    rank prepends 0).
-/// 3. `start_task(B)` on the minute grid (`B.start = A.end` — snapped `T`,
-///    or `A.start + 60` under the invert guard), then place B.
-/// 4. If step 3 fails: [`TasksError::AfterDisplace`] — A STAYS parked
-///    (no rollback) and the error carries A's view.
+/// `/move` to IN_PROGRESS is just `start` ([`dispatch_matrix_action`] →
+/// [`start_task`]) — a NEW event opens regardless of what else is running,
+/// so moving the second task into In Progress while others already run never
+/// conflicts.
 ///
 /// `http`/`access` are `Option` because status-only moves (plan/unplan/
 /// reopen/reorder/idle complete/discard) never touch Google; the worker
 /// passes both only when its `needs_google` gate fires (target IN_PROGRESS,
-/// leaving IN_PROGRESS, or any displace).
+/// or leaving IN_PROGRESS).
 ///
-/// Validation: unknown `status` → 400; negative `sort_order` → 400
-/// (`None` is not negative); `displace.status` outside
-/// PLANNED/COMPLETED/DISCARDED → 400; move to IN_PROGRESS without
-/// `displace` while something runs → 409 (from `start_task`);
-/// missing/other-user/soft-deleted task → 404.
+/// Validation: unknown `status` → 400; negative `sort_order` → 400 (`None`
+/// is not negative); missing/other-user/soft-deleted task → 404.
 pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1897,150 +1855,28 @@ pub async fn move_task(
     if task.user_id != user_id {
         return Err(TasksError::NotFound);
     }
-    // `displace` parks the runner so the moved task can start — it only makes
-    // sense on a move TO IN_PROGRESS (the conflict dialog's one move call).
-    if input.displace.is_some() && input.status != TASK_STATUS_IN_PROGRESS {
-        return Err(TasksError::Invalid(
-            "displace is only allowed when moving to in progress".to_string(),
-        ));
-    }
-    if let Some(displace) = &input.displace {
-        if let Some(sort_order) = displace.sort_order {
-            if sort_order < 0 {
-                return Err(TasksError::Invalid(
-                    "sort_order must not be negative".to_string(),
-                ));
-            }
-        }
-        if !matches!(
-            displace.status.as_str(),
-            TASK_STATUS_PLANNED | TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED
-        ) {
-            return Err(TasksError::Invalid(
-                "displace status must be planned, completed, or discarded".to_string(),
-            ));
-        }
-    }
 
     // Same-status + no drop position: nothing happens, the current task is
-    // returned as-is — never secretly sent to the tail. (The matrix's
-    // IN_PROGRESS → IN_PROGRESS branch below is the same no-op for that
-    // column even when a rank IS sent.)
+    // returned as-is — never secretly sent to the tail.
     if task.status == input.status && input.sort_order.is_none() {
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         return Ok(MoveTaskResponse {
             task: to_view(&task, &taxonomy, None),
-            displaced: None,
             event: None,
         });
     }
 
-    // The matrix's IN_PROGRESS → IN_PROGRESS no-op: nothing happens, the
-    // current task is returned as-is, `sort_order` is ignored.
-    if task.status == TASK_STATUS_IN_PROGRESS && input.status == TASK_STATUS_IN_PROGRESS {
-        let taxonomy = load_taxonomy(category_repo, user_id).await?;
-        return Ok(MoveTaskResponse {
-            task: to_view(&task, &taxonomy, None),
-            displaced: None,
-            event: None,
-        });
-    }
-
-    // ── Displace flow: park A, then start B ──
-    if let Some(displace) = &input.displace {
-        // `displace.id` must be the task whose STATUS is IN_PROGRESS (the
-        // lock) — the event window is never consulted, so a stale/expired
-        // event can neither block the displace nor falsify the identity.
-        let Some(displaced_task) = task_repo.get_by_id(&displace.id).await? else {
-            return Err(TasksError::Invalid(
-                "displace id is not the running task".to_string(),
-            ));
-        };
-        if displaced_task.user_id != user_id || displaced_task.status != TASK_STATUS_IN_PROGRESS {
-            return Err(TasksError::Invalid(
-                "displace id is not the running task".to_string(),
-            ));
-        }
-        // B's start instant on the minute grid (rule: `A.end == B.start`):
-        // snapped T, or `A.start + 60` when T has not passed A's start (the
-        // same invert guard the park PATCH applies, so the two agree).
-        let displaced_start_unix = latest_started_event(logs, events, &displaced_task.id)
-            .await?
-            .and_then(|event| rfc3339_to_unix_secs(&event.start_time));
-        let t_unix = nearest_minute_unix(now_unix);
-        let b_start_unix = match displaced_start_unix {
-            Some(start) if t_unix <= start => start + 60,
-            _ => t_unix,
-        };
-
-        // Park A (matrix from IN_PROGRESS: pause/complete/discard), then rank.
-        // A failure here is a plain error — nothing was started yet. An
-        // omitted park rank prepends 0 (the park always comes from
-        // IN_PROGRESS, whose column default never appends).
-        dispatch_matrix_action(
-            http, calendars, events, list_repo, category_repo, task_repo, logs, access,
-            user_id, &displaced_task.id, &displaced_task.status, &displace.status, now_unix,
-        )
-        .await?;
-        let park_rank = displace.sort_order.unwrap_or(0);
-        let displaced_row = place_at(
-            task_repo,
-            user_id,
-            &displaced_task.id,
-            &displace.status,
-            park_rank,
-        )
-        .await?;
-
-        // Start B, then rank B. A start failure is an HONEST partial failure:
-        // A stays parked (no rollback) and `AfterDisplace` carries A's view.
-        // B's omitted rank resolves through the same column default — to
-        // IN_PROGRESS that is always 0.
-        let b_rank = match input.sort_order {
-            Some(sort_order) => sort_order,
-            None => default_move_rank(&task.status, TASK_STATUS_IN_PROGRESS, None),
-        };
-        match dispatch_matrix_action(
-            http, calendars, events, list_repo, category_repo, task_repo, logs, access,
-            user_id, task_id, &task.status, TASK_STATUS_IN_PROGRESS, b_start_unix,
-        )
-        .await
-        {
-            Ok(event) => {
-                let row = place_at(
-                    task_repo,
-                    user_id,
-                    task_id,
-                    TASK_STATUS_IN_PROGRESS,
-                    b_rank,
-                )
-                .await?;
-                let taxonomy = load_taxonomy(category_repo, user_id).await?;
-                Ok(MoveTaskResponse {
-                    task: to_view(&row, &taxonomy, None),
-                    displaced: Some(to_view(&displaced_row, &taxonomy, None)),
-                    event,
-                })
-            }
-            Err(inner) => {
-                let taxonomy = load_taxonomy(category_repo, user_id).await?;
-                Err(TasksError::AfterDisplace {
-                    displaced: to_view(&displaced_row, &taxonomy, None),
-                    source: Box::new(inner),
-                })
-            }
-        }
-    } else if task.status == input.status {
+    if task.status == input.status {
         // Same column: pure reorder (the moving card keeps its status; rank
-        // shifts neighbors only when it actually changes position). Omitted
-        // `sort_order` already returned as a no-op above, so a rank is
-        // guaranteed here.
+        // shifts neighbors only when it actually changes position) — In
+        // Progress is a real pile, so this covers IN_PROGRESS → IN_PROGRESS
+        // with a rank too. Omitted `sort_order` already returned as a no-op
+        // above, so a rank is guaranteed here.
         let row = reorder_in_place(task_repo, user_id, &task, input.sort_order.unwrap_or(0))
             .await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
             task: to_view(&row, &taxonomy, None),
-            displaced: None,
             event: None,
         })
     } else {
@@ -2075,7 +1911,6 @@ pub async fn move_task(
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
             task: to_view(&row, &taxonomy, None),
-            displaced: None,
             event,
         })
     }
@@ -4882,7 +4717,9 @@ mod tests {
     }
 
     #[test]
-    fn start_while_another_task_runs_is_conflict_and_never_inserts() {
+    fn start_while_another_task_runs_opens_a_second_event() {
+        // IN_PROGRESS is a column, not a singleton lock: a second start while
+        // `first` runs opens its own event and both tasks stay IN_PROGRESS.
         let (lists, categories, tasks) = seeded();
         let first = work_task(&lists, &categories, &tasks);
         let second = pollster::block_on(create_task(
@@ -4906,25 +4743,37 @@ mod tests {
         ))
         .unwrap();
 
-        // Second start hits the one-running-task rule → 409.
-        let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(start_task(
+        // Second start also succeeds: a second event opens, both run.
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&second.id, NOW_SNAPPED, NOW_END),
+        )]);
+        let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
             &access(), "u-1", &second.id, NOW_UNIX,
         ))
-        .unwrap_err();
-        assert!(matches!(err, TasksError::Conflict), "got {err:?}");
-        assert_eq!(http.posts.lock().unwrap().len(), 0, "no insert attempted");
-        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only the first event");
-        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "only the first start logged");
+        .unwrap();
+        assert_eq!(response.task.id, second.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "the second insert");
+        assert!(response.event.is_some(), "the second start returns its event");
+        assert_eq!(logs.inserted.lock().unwrap().len(), 2, "both starts logged");
+        assert_eq!(
+            pollster::block_on(tasks.get_by_id(&first.id)).unwrap().unwrap().status,
+            TASK_STATUS_IN_PROGRESS,
+            "first stays IN_PROGRESS"
+        );
         assert_eq!(
             pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
-            TASK_STATUS_OPEN
+            TASK_STATUS_IN_PROGRESS
         );
     }
 
     #[test]
-    fn start_while_same_task_runs_is_also_conflict() {
+    fn start_while_same_task_runs_is_a_200_noop() {
+        // Starting a task that is already IN_PROGRESS is an idempotent 200:
+        // no new event, no log, no re-rank — even with other tasks running.
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
@@ -4943,20 +4792,26 @@ mod tests {
         .unwrap();
 
         let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(start_task(
+        let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
-        .unwrap_err();
-        assert!(matches!(err, TasksError::Conflict));
+        .unwrap();
+        assert_eq!(response.task.id, task.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(response.task.sort_order, 0, "no re-rank");
+        assert!(response.event.is_none(), "no new event");
+        assert!(http.posts.lock().unwrap().is_empty(), "no insert attempted");
+        assert!(http.patches.lock().unwrap().is_empty());
+        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only the first event");
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "still one started log");
     }
 
     #[test]
-    fn start_conflicts_via_status_lock_even_without_running_event() {
-        // The one-running lock is `tasks.status == IN_PROGRESS`, never the
-        // event window: a task whose status says IN_PROGRESS but that has no
-        // living timed event (stale/missing cache) still blocks a second
-        // start.
+    fn start_second_while_other_row_in_progress_succeeds() {
+        // IN_PROGRESS is a status column, never a gate: a task whose status
+        // says IN_PROGRESS but that has no living timed event (stale/missing
+        // cache) does NOT block a second start — it simply starts too.
         let (lists, categories, tasks) = seeded();
         let first = work_task(&lists, &categories, &tasks);
         let second = pollster::block_on(create_task(
@@ -4970,19 +4825,23 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
-        let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(start_task(
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&second.id, NOW_SNAPPED, NOW_END),
+        )]);
+        let response = pollster::block_on(start_task(
             &http, &calendars, &events, &lists, &categories, &tasks, &logs,
             &access(), "u-1", &second.id, NOW_UNIX,
         ))
-        .unwrap_err();
-        assert!(matches!(err, TasksError::Conflict), "got {err:?}");
-        assert!(http.posts.lock().unwrap().is_empty(), "no insert attempted");
-        assert!(events.upserted.lock().unwrap().is_empty(), "nothing cached");
-        assert!(logs.inserted.lock().unwrap().is_empty(), "nothing logged");
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "second insert happens");
+        assert_eq!(events.upserted.lock().unwrap().len(), 1, "second cached");
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "second logged");
         assert_eq!(
             pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
-            TASK_STATUS_OPEN
+            TASK_STATUS_IN_PROGRESS
         );
     }
 
@@ -5305,8 +5164,8 @@ mod tests {
         assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:23:00Z", "PATCH end snaps");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
-        // Ending the event also frees the one-running slot; a new start works
-        // (start is allowed from any status since the board slice).
+        // Pausing this task ends its run; a new start works (start is allowed
+        // from any status since the board slice).
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -6036,8 +5895,8 @@ mod tests {
 
     #[test]
     fn elongate_extends_both_dirty_in_progress_tasks() {
-        // Two IN_PROGRESS rows at once (dirty data — status is the lock, not
-        // an event window): both elongate.
+        // Two IN_PROGRESS rows at once is normal now (IN_PROGRESS is a
+        // column): both elongate.
         let (lists, categories, tasks) = seeded();
         let task_a = work_task(&lists, &categories, &tasks);
         let task_b = pollster::block_on(tasks.insert(NewTask {
@@ -6101,7 +5960,7 @@ mod tests {
     // move_task (ADR 0002 § Move API)
     // ──────────────────────────────────────────
 
-    /// Calls `move_task` for `u-1` at `NOW_UNIX` with no displace.
+    /// Calls `move_task` for `u-1` at `NOW_UNIX`.
     fn move_to(
         http: &FakeHttp,
         calendars: &FakeCalendarRepo,
@@ -6130,14 +5989,13 @@ mod tests {
             &MoveTaskInput {
                 status: status.to_string(),
                 sort_order,
-                displace: None,
             },
         ))
     }
 
     /// Starts `task_id` against the default Google stack (writable primary
     /// calendar, one `/events` route) and returns the fresh fakes — the
-    /// running-task setup behind the exit/displace tests.
+    /// running-task setup behind the exit tests.
     fn start_running(
         lists: &FakeTaskListRepo,
         categories: &FakeTaskCategoryRepo,
@@ -6186,7 +6044,6 @@ mod tests {
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
         assert_eq!(response.task.sort_order, 0);
-        assert!(response.displaced.is_none());
         assert!(response.event.is_none());
 
         let stored = tasks.stored.lock().unwrap();
@@ -6276,7 +6133,6 @@ mod tests {
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
         let event = response.event.expect("start leg returns the created event");
         assert_eq!(event.task_id, task.id);
-        assert!(response.displaced.is_none());
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_STARTED, "{inserted:?}");
     }
@@ -6348,7 +6204,6 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_PLANNED.to_string(),
                 sort_order: Some(0),
-                displace: None,
             },
         ))
         .unwrap();
@@ -6390,7 +6245,6 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_OPEN.to_string(),
                 sort_order: Some(4),
-                displace: None,
             },
         ))
         .unwrap();
@@ -6403,7 +6257,9 @@ mod tests {
     }
 
     #[test]
-    fn move_to_in_progress_without_displace_conflicts() {
+    fn move_to_in_progress_while_another_runs_succeeds() {
+        // `/move` to IN_PROGRESS is just `start`: a NEW event opens even while
+        // `first` already runs, and both tasks stay IN_PROGRESS. No 409.
         let (lists, categories, tasks) = seeded();
         let first = work_task(&lists, &categories, &tasks);
         let second = pollster::block_on(create_task(
@@ -6415,8 +6271,12 @@ mod tests {
             start_running(&lists, &categories, &tasks, &first.id);
         drop(_start_http);
 
-        let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(move_task(
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&second.id, NOW_SNAPPED, NOW_END),
+        )]);
+        let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
             &events,
@@ -6431,336 +6291,23 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
                 sort_order: Some(0),
-                displace: None,
-            },
-        ))
-        .unwrap_err();
-        assert!(matches!(err, TasksError::Conflict), "got {err:?}");
-        assert!(http.posts.lock().unwrap().is_empty(), "no insert attempted");
-        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only the first event");
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
-            TASK_STATUS_OPEN
-        );
-    }
-
-    #[test]
-    fn move_to_in_progress_with_displace_parks_then_starts() {
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
-        let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
-        drop(_start_http);
-
-        // Route order matters: the patch URL contains "/events" too. A's park
-        // PATCHes end to 22:14:00 (the invert guard: snapped T = 22:13:00 ==
-        // A.start → end = A.start + 60); B starts at the same instant on the
-        // minute grid (rule: A.end == B.start).
-        let http = FakeHttp::new(vec![
-            (
-                "/events/g-1",
-                200,
-                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
-            ),
-            (
-                "/events",
-                200,
-                &created_event_json(&b.id, "2023-11-14T22:14:00Z", "2023-11-14T22:29:00Z"),
-            ),
-        ]);
-        let response = pollster::block_on(move_task(
-            Some(&http),
-            &calendars,
-            &events,
-            &lists,
-            &categories,
-            &tasks,
-            &logs,
-            Some(&access()),
-            "u-1",
-            &b.id,
-            NOW_UNIX,
-            &MoveTaskInput {
-                status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: Some(0),
-                displace: Some(DisplaceInput {
-                    id: a.id.clone(),
-                    status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: Some(0),
-                }),
             },
         ))
         .unwrap();
-
-        assert_eq!(response.task.id, b.id);
+        assert_eq!(response.task.id, second.id);
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
         assert_eq!(response.task.sort_order, 0);
-        let displaced = response.displaced.expect("A is returned as displaced");
-        assert_eq!(displaced.id, a.id);
-        assert_eq!(displaced.status, TASK_STATUS_PLANNED);
-        assert_eq!(displaced.sort_order, 0);
-        let event = response.event.expect("B's new event");
-        assert_eq!(event.task_id, b.id);
-
-        // Persisted state: A parked, B running, one patch + one insert.
+        assert!(response.event.is_some(), "B's new event opens");
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's insert happens");
         assert_eq!(
-            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
-            TASK_STATUS_PLANNED
-        );
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
-            TASK_STATUS_IN_PROGRESS
-        );
-        assert_eq!(http.patches.lock().unwrap().len(), 1, "A's event closed");
-        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's event inserted");
-        let inserted = logs.inserted.lock().unwrap().clone();
-        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
-        assert_eq!(types, vec!["started", "paused", "started"], "{inserted:?}");
-    }
-
-    #[test]
-    fn move_displace_then_start_failure_keeps_displaced() {
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
-        let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
-        drop(_start_http);
-
-        // A's park patch succeeds (echo end = 22:14:00 — the invert guard on
-        // the minute grid); B's start insert then fails with a Google 400.
-        let http = FakeHttp::new(vec![
-            (
-                "/events/g-1",
-                200,
-                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
-            ),
-            ("/events", 400, r#"{"error":"invalid"}"#),
-        ]);
-        let err = pollster::block_on(move_task(
-            Some(&http),
-            &calendars,
-            &events,
-            &lists,
-            &categories,
-            &tasks,
-            &logs,
-            Some(&access()),
-            "u-1",
-            &b.id,
-            NOW_UNIX,
-            &MoveTaskInput {
-                status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: Some(0),
-                displace: Some(DisplaceInput {
-                    id: a.id.clone(),
-                    status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: Some(0),
-                }),
-            },
-        ))
-        .unwrap_err();
-        let TasksError::AfterDisplace { displaced, source } = err else {
-            panic!("expected AfterDisplace, got {err:?}");
-        };
-        assert_eq!(displaced.id, a.id, "the parked task is reported");
-        assert_eq!(displaced.status, TASK_STATUS_PLANNED);
-        let message = match source.as_ref() {
-            TasksError::GoogleApi(message) => message,
-            other => panic!("inner error is {other:?}"),
-        };
-        assert_eq!(message, "google events.insert returned 400");
-
-        // A STAYS parked (no rollback); B never started; nothing is running.
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
-            TASK_STATUS_PLANNED,
-            "displaced task stays parked after the failed start"
-        );
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
-            TASK_STATUS_OPEN
-        );
-        assert_eq!(events.upserted.lock().unwrap().len(), 1, "only A's closed-event echo");
-        let inserted = logs.inserted.lock().unwrap().clone();
-        assert_eq!(inserted[1].r#type, TASK_LOG_PAUSED, "{inserted:?}");
-        assert!(
-            pollster::block_on(events.list_running_by_user_id(
-                "u-1",
-                &unix_secs_to_rfc3339(NOW_UNIX + 360),
-            ))
-            .unwrap()
-            .is_empty(),
-            "A's event is closed, nothing runs"
-        );
-    }
-
-    #[test]
-    fn move_displace_wrong_id_is_invalid() {
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
-        let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
-        drop(_start_http);
-
-        // `displace.id` = the moved task itself, which is NOT running → 400.
-        let http = FakeHttp::new(vec![]);
-        let err = pollster::block_on(move_task(
-            Some(&http),
-            &calendars,
-            &events,
-            &lists,
-            &categories,
-            &tasks,
-            &logs,
-            Some(&access()),
-            "u-1",
-            &b.id,
-            NOW_UNIX,
-            &MoveTaskInput {
-                status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: Some(0),
-                displace: Some(DisplaceInput {
-                    id: b.id.clone(),
-                    status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: Some(0),
-                }),
-            },
-        ))
-        .unwrap_err();
-        let message = match &err {
-            TasksError::Invalid(message) => message.as_str(),
-            other => panic!("expected the locked displace error, got {other:?}"),
-        };
-        assert_eq!(message, "displace id is not the running task");
-        assert!(http.posts.lock().unwrap().is_empty(), "nothing dispatched");
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
+            pollster::block_on(tasks.get_by_id(&first.id)).unwrap().unwrap().status,
             TASK_STATUS_IN_PROGRESS,
-            "A untouched"
+            "first stays IN_PROGRESS"
         );
         assert_eq!(
-            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
-            TASK_STATUS_OPEN,
-            "B untouched"
-        );
-
-        // With nothing running at all, any displace id fails the same way.
-        let (lists2, categories2, tasks2) = seeded();
-        let c = work_task(&lists2, &categories2, &tasks2);
-        let calendars2 = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
-        let events2 = FakeEventRepo::new();
-        let logs2 = FakeTaskLogRepo::default();
-        let err = pollster::block_on(move_task(
-            Some(&http),
-            &calendars2,
-            &events2,
-            &lists2,
-            &categories2,
-            &tasks2,
-            &logs2,
-            Some(&access()),
-            "u-1",
-            &c.id,
-            NOW_UNIX,
-            &MoveTaskInput {
-                status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: Some(0),
-                displace: Some(DisplaceInput {
-                    id: "nope".to_string(),
-                    status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: Some(0),
-                }),
-            },
-        ))
-        .unwrap_err();
-        let message = match &err {
-            TasksError::Invalid(message) => message.as_str(),
-            other => panic!("expected the locked displace error, got {other:?}"),
-        };
-        assert_eq!(message, "displace id is not the running task");
-    }
-
-    #[test]
-    fn move_displace_succeeds_when_running_events_end_is_in_the_past() {
-        // The production 400 this slice fixes: A's stored status is
-        // IN_PROGRESS but its cached event window already lapsed, so the old
-        // `list_running` check rejected the displace. Status is the lock now:
-        // the displace proceeds and A's run closes via its started log.
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
-        let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
-        drop(_start_http);
-
-        // Expire A's cached event end (as if the original duration passed
-        // while the row stayed IN_PROGRESS) — `list_running` would not find
-        // it anymore.
-        {
-            let mut stored = events.stored.lock().unwrap();
-            let event = stored.iter_mut().find(|row| row.task_id == a.id).unwrap();
-            event.end_time = "2023-11-14T21:00:00Z".to_string();
-        }
-
-        // A's park PATCHes end to 22:14:00 (invert guard: snapped T =
-        // 22:13:00 == the snapped A.start → end = A.start + 60); B starts at
-        // the same instant.
-        let http = FakeHttp::new(vec![
-            (
-                "/events/g-1",
-                200,
-                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
-            ),
-            (
-                "/events",
-                200,
-                &created_event_json(&b.id, "2023-11-14T22:14:00Z", "2023-11-14T22:29:00Z"),
-            ),
-        ]);
-        let response = pollster::block_on(move_task(
-            Some(&http),
-            &calendars,
-            &events,
-            &lists,
-            &categories,
-            &tasks,
-            &logs,
-            Some(&access()),
-            "u-1",
-            &b.id,
-            NOW_UNIX,
-            &MoveTaskInput {
-                status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: Some(0),
-                displace: Some(DisplaceInput {
-                    id: a.id.clone(),
-                    status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: Some(0),
-                }),
-            },
-        ))
-        .unwrap();
-
-        assert_eq!(response.task.id, b.id);
-        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
-        assert_eq!(
-            response.displaced.expect("A is returned as displaced").id,
-            a.id
-        );
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap().status,
-            TASK_STATUS_PLANNED,
-            "A parked despite the expired window"
-        );
-        assert_eq!(
-            pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap().status,
+            pollster::block_on(tasks.get_by_id(&second.id)).unwrap().unwrap().status,
             TASK_STATUS_IN_PROGRESS
         );
-        assert_eq!(http.patches.lock().unwrap().len(), 1, "A's event closed via the log");
-        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's event inserted");
     }
 
     #[test]
@@ -6809,7 +6356,9 @@ mod tests {
     }
 
     #[test]
-    fn move_in_progress_to_in_progress_is_noop() {
+    fn move_in_progress_to_in_progress_omit_is_noop() {
+        // IN_PROGRESS → IN_PROGRESS with an OMITTED rank is a same-status
+        // no-op: the row returns unchanged, no new event, no re-rank.
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
         let (_start_http, calendars, events, logs) =
@@ -6831,15 +6380,13 @@ mod tests {
             NOW_UNIX,
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: Some(99),
-                displace: None,
+                sort_order: None,
             },
         ))
         .unwrap();
         assert_eq!(response.task.id, task.id);
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
-        assert_eq!(response.task.sort_order, 0, "sort_order ignored by the no-op");
-        assert!(response.displaced.is_none());
+        assert_eq!(response.task.sort_order, 0, "same-status omit does not reorder");
         assert!(response.event.is_none());
         assert_eq!(logs.inserted.lock().unwrap().len(), 1, "only the original start log");
         assert!(http.posts.lock().unwrap().is_empty());
@@ -6847,7 +6394,61 @@ mod tests {
     }
 
     #[test]
-    fn move_validates_status_rank_and_displace() {
+    fn move_in_progress_to_in_progress_with_rank_reorders() {
+        // In Progress is a real pile: IN_PROGRESS → IN_PROGRESS with a sent
+        // rank reorders within the column (no event, no new log).
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        // Start both against the SAME calendar/event/log fakes (both may run).
+        let (_a_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        drop(_a_http);
+        let http_b = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&b.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &b.id, NOW_UNIX,
+        ))
+        .unwrap();
+        let a = pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap();
+        let b = pollster::block_on(tasks.get_by_id(&b.id)).unwrap().unwrap();
+        assert_eq!(a.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(b.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(a.sort_order, 0);
+        assert_eq!(b.sort_order, 1, "start never ranks; the create order holds");
+        assert_eq!(logs.inserted.lock().unwrap().len(), 2, "both starts logged");
+
+        // Swap: drag B (rank 1) to rank 0 — A (rank 0) shifts up to 1.
+        let http = FakeHttp::new(vec![]);
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &b.id, TASK_STATUS_IN_PROGRESS, Some(0),
+        )
+        .unwrap();
+        assert_eq!(response.task.id, b.id);
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        assert_eq!(response.task.sort_order, 0, "B reorders to the front");
+        assert!(response.event.is_none(), "reorder touches no event");
+        let stored = tasks.stored.lock().unwrap();
+        let rank = |id: &str| stored.iter().find(|row| row.id == id).unwrap().sort_order;
+        assert_eq!(rank(&a.id), 1, "the IN_PROGRESS peer shifts up");
+        assert_eq!(rank(&b.id), 0);
+        drop(stored);
+        assert_eq!(
+            logs.inserted.lock().unwrap().len(),
+            2,
+            "reorder logs nothing — the two starts only"
+        );
+        assert!(http.posts.lock().unwrap().is_empty());
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_validates_status_and_rank() {
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
@@ -6858,7 +6459,6 @@ mod tests {
         let unknown = MoveTaskInput {
             status: "GONE".to_string(),
             sort_order: Some(0),
-            displace: None,
         };
         let err = pollster::block_on(move_task(
             Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
@@ -6874,7 +6474,6 @@ mod tests {
         let negative = MoveTaskInput {
             status: TASK_STATUS_OPEN.to_string(),
             sort_order: Some(-1),
-            displace: None,
         };
         let err = pollster::block_on(move_task(
             Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
@@ -6886,48 +6485,6 @@ mod tests {
             other => panic!("expected the negative-rank error, got {other:?}"),
         };
         assert_eq!(message, "sort_order must not be negative");
-
-        // displace.status is locked to PLANNED/COMPLETED/DISCARDED.
-        let bad_displace = MoveTaskInput {
-            status: TASK_STATUS_IN_PROGRESS.to_string(),
-            sort_order: Some(0),
-            displace: Some(DisplaceInput {
-                id: "x".to_string(),
-                status: TASK_STATUS_OPEN.to_string(),
-                sort_order: Some(0),
-            }),
-        };
-        let err = pollster::block_on(move_task(
-            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            "u-1", &task.id, NOW_UNIX, &bad_displace,
-        ))
-        .unwrap_err();
-        let message = match &err {
-            TasksError::Invalid(message) => message.as_str(),
-            other => panic!("expected the displace-status error, got {other:?}"),
-        };
-        assert_eq!(message, "displace status must be planned, completed, or discarded");
-
-        // displace only makes sense when the target is IN_PROGRESS.
-        let misplaced = MoveTaskInput {
-            status: TASK_STATUS_COMPLETED.to_string(),
-            sort_order: Some(0),
-            displace: Some(DisplaceInput {
-                id: "x".to_string(),
-                status: TASK_STATUS_PLANNED.to_string(),
-                sort_order: Some(0),
-            }),
-        };
-        let err = pollster::block_on(move_task(
-            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
-            "u-1", &task.id, NOW_UNIX, &misplaced,
-        ))
-        .unwrap_err();
-        let message = match &err {
-            TasksError::Invalid(message) => message.as_str(),
-            other => panic!("expected the misplaced-displace error, got {other:?}"),
-        };
-        assert_eq!(message, "displace is only allowed when moving to in progress");
 
         assert_eq!(tasks.stored.lock().unwrap().len(), 1, "nothing changed");
     }
@@ -6943,7 +6500,6 @@ mod tests {
         let input = MoveTaskInput {
             status: TASK_STATUS_OPEN.to_string(),
             sort_order: Some(0),
-            displace: None,
         };
 
         assert!(matches!(
@@ -7086,7 +6642,6 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_PLANNED.to_string(),
                 sort_order: None,
-                displace: None,
             },
         ))
         .unwrap();
@@ -7166,83 +6721,10 @@ mod tests {
 
     #[test]
     fn move_omit_deserializes_from_json_without_field() {
-        // The worker accepts a body with no sort_order at all (and a
-        // displace with no sort_order): both deserialize to `None`.
+        // The worker accepts a body with no sort_order at all: it
+        // deserializes to `None`.
         let input: MoveTaskInput = serde_json::from_str(r#"{"status":"OPEN"}"#).unwrap();
         assert_eq!(input.status, "OPEN");
         assert!(input.sort_order.is_none(), "omitted sort_order deserializes to None");
-        assert!(input.displace.is_none());
-
-        let displaced: MoveTaskInput =
-            serde_json::from_str(r#"{"status":"IN_PROGRESS","displace":{"id":"t","status":"PLANNED"}}"#)
-                .unwrap();
-        let displace = displaced.displace.expect("displace is present");
-        assert_eq!(displace.id, "t");
-        assert!(displace.sort_order.is_none(), "omitted displace.sort_order deserializes to None");
-    }
-
-    #[test]
-    fn move_displace_omit_sort_order_prepends_planned() {
-        // The conflict-dialog displace with no drop position parks the
-        // running task at the front of its landing pile (prepend 0).
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
-        let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
-        drop(_start_http);
-
-        // A parked at 22:14:00 (the invert guard: snapped T == A.start →
-        // end = A.start + 60); B starts at the same instant on the minute
-        // grid.
-        let http = FakeHttp::new(vec![
-            (
-                "/events/g-1",
-                200,
-                &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
-            ),
-            (
-                "/events",
-                200,
-                &created_event_json(&b.id, "2023-11-14T22:14:00Z", "2023-11-14T22:29:00Z"),
-            ),
-        ]);
-        let response = pollster::block_on(move_task(
-            Some(&http),
-            &calendars,
-            &events,
-            &lists,
-            &categories,
-            &tasks,
-            &logs,
-            Some(&access()),
-            "u-1",
-            &b.id,
-            NOW_UNIX,
-            &MoveTaskInput {
-                status: TASK_STATUS_IN_PROGRESS.to_string(),
-                sort_order: None,
-                displace: Some(DisplaceInput {
-                    id: a.id.clone(),
-                    status: TASK_STATUS_PLANNED.to_string(),
-                    sort_order: None,
-                }),
-            },
-        ))
-        .unwrap();
-
-        assert_eq!(response.task.id, b.id);
-        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
-        assert_eq!(response.task.sort_order, 0, "B ranks 0 in In Progress");
-        let displaced = response.displaced.expect("A is returned as displaced");
-        assert_eq!(displaced.id, a.id);
-        assert_eq!(displaced.status, TASK_STATUS_PLANNED);
-        assert_eq!(displaced.sort_order, 0, "A is parked at the front of Planned");
-        let stored = tasks.stored.lock().unwrap();
-        assert_eq!(stored.iter().find(|row| row.id == a.id).unwrap().sort_order, 0);
-        assert_eq!(stored.iter().find(|row| row.id == b.id).unwrap().sort_order, 0);
-        drop(stored);
-        assert_eq!(http.patches.lock().unwrap().len(), 1, "A's event closed");
-        assert_eq!(http.posts.lock().unwrap().len(), 1, "B's event inserted");
     }
 }
