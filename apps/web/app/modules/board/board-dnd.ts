@@ -1,6 +1,18 @@
 import { closestCenter, pointerWithin } from '@dnd-kit/core';
 import type { CollisionDetection } from '@dnd-kit/core';
 
+// DnD activation constraints (ADR 0002 § DnD): the sensor constants live
+// here so BoardPage, the comments there and the tests below cannot drift.
+
+/** Mouse activation distance (px). A shorter move is a click-to-edit. */
+export const MOUSE_DND_DISTANCE_PX = 8;
+
+/** Touch hold (ms) before a card lifts. A swipe under this window pans. */
+export const TOUCH_DND_DELAY_MS = 250;
+
+/** If the finger moves more than this (px) during the delay, cancel the drag. */
+export const TOUCH_DND_TOLERANCE_PX = 8;
+
 // After the board columns stretch to the leftover viewport height (f5e07c8,
 // 3c154e3), `closestCorners` snaps to a neighboring card whose corners are
 // closer than the tall empty body under the pointer — a drop aimed at column

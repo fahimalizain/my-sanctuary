@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
-  PointerSensor,
+  MouseSensor,
+  TouchSensor,
   useSensor,
   useSensors,
 } from '@dnd-kit/core';
@@ -34,7 +35,12 @@ import { BoardColumnView } from './BoardColumn';
 import { CategoryFilter } from './CategoryFilter';
 import { FilterPill } from './FilterPill';
 import { TaskCard } from './TaskCard';
-import { boardCollisionDetection } from './board-dnd';
+import {
+  boardCollisionDetection,
+  MOUSE_DND_DISTANCE_PX,
+  TOUCH_DND_DELAY_MS,
+  TOUCH_DND_TOLERANCE_PX,
+} from './board-dnd';
 import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
 import {
   COLUMNS,
@@ -93,12 +99,20 @@ export function BoardPage() {
   // flight: further pin taps are ignored and every pin is disabled.
   const [focusInFlight, setFocusInFlight] = useState(false);
 
-  // PointerSensor with an 8px activation distance: a plain click still opens
-  // the edit modal, and only a real 8px+ movement starts a drag (ADR 0002
-  // § DnD). Sensors live on the cards, so grabbing the scroll gutter or the
-  // column headers still scrolls the board horizontally.
+  // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
+  // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
+  // DevTools device mode speaks touch events, not pointer). Hold ~250ms
+  // to lift a card; a swipe still scrolls.
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(MouseSensor, {
+      activationConstraint: { distance: MOUSE_DND_DISTANCE_PX },
+    }),
+    useSensor(TouchSensor, {
+      activationConstraint: {
+        delay: TOUCH_DND_DELAY_MS,
+        tolerance: TOUCH_DND_TOLERANCE_PX,
+      },
+    }),
   );
 
   const load = useCallback(() => {

@@ -1,6 +1,25 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pickPointerHit } from './board-dnd';
+import {
+  MOUSE_DND_DISTANCE_PX,
+  TOUCH_DND_DELAY_MS,
+  TOUCH_DND_TOLERANCE_PX,
+  pickPointerHit,
+} from './board-dnd';
+
+// ── DnD activation constants (ADR 0002 § DnD) ───────────────────────────
+
+test('MOUSE_DND_DISTANCE_PX keeps a click a click and a drag a drag', () => {
+  assert.equal(MOUSE_DND_DISTANCE_PX, 8);
+});
+
+test('TOUCH_DND_DELAY_MS lets a swipe pan before a hold lifts the card', () => {
+  assert.equal(TOUCH_DND_DELAY_MS, 250);
+});
+
+test('TOUCH_DND_TOLERANCE_PX cancels the lift once the finger moves', () => {
+  assert.equal(TOUCH_DND_TOLERANCE_PX, 8);
+});
 
 // ── pickPointerHit (which pointer-within hit wins the drop) ──────────────
 
