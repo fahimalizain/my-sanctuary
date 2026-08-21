@@ -121,7 +121,7 @@ use crate::oauth::HttpClient;
 use crate::pattern_gen::{emit_affixes, fill_regex, split_hole};
 use crate::repo::{
     CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo, TaskListRepo, TaskLogRepo,
-    TaskRepo, TokenRepo,
+    TaskRepo, TokenRepo, UserRepo,
 };
 use crate::time::{
     ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
@@ -160,6 +160,11 @@ pub const TASK_LOG_DISCARDED: &str = "discarded";
 pub const TASK_LOG_PLANNED: &str = "planned";
 pub const TASK_LOG_UNPLANNED: &str = "unplanned";
 pub const TASK_LOG_REOPENED: &str = "reopened";
+/// Task-focus (slice 3): opening a flagged focus segment logs `focused`;
+/// closing/clearing focus logs `unfocused` (with the **continuation** event's
+/// ids on a focus switch/clear, or the snapped event's ids on an exit).
+pub const TASK_LOG_FOCUSED: &str = "focused";
+pub const TASK_LOG_UNFOCUSED: &str = "unfocused";
 
 /// The append rank for a new card: `max + 1`, or 0 when the pile is empty.
 /// Slices 2–3 reuse this for the no-drop `/move` and timer-verb landings.
@@ -277,6 +282,21 @@ pub struct MoveTaskInput {
 pub struct MoveTaskResponse {
     pub task: TaskView,
     pub event: Option<CalendarEvent>,
+}
+
+/// Response envelope for the focus verbs (task-focus, slice 3):
+/// `POST /api/tasks/:id/focus` and `DELETE /api/focus`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FocusTaskResponse {
+    /// The task that now holds (POST) or has just lost (DELETE) focus. `None`
+    /// on DELETE when the pointer is empty/invalid (a 200 no-op).
+    pub task: Option<TaskView>,
+    /// The task that lost focus to `task` on a switch; `None` on a first
+    /// focus, a repair, and every DELETE.
+    pub previous: Option<TaskView>,
+    /// The new calendar segments created in this request (focus / unfocus /
+    /// unfocused continuations, in creation order).
+    pub events: Vec<CalendarEvent>,
 }
 
 /// HTTP shape of a task: every `tasks` column (minus `deleted_at`) plus the
@@ -844,23 +864,59 @@ pub async fn update_task(
     })
 }
 
-/// SOFT deletes a task.
+/// SOFT deletes a task (task-focus, slice 3).
 ///
 /// - Missing, soft-deleted, or another user's task → [`TasksError::NotFound`]
 ///   (404) — ownership is never leaked.
 /// - Otherwise the row is stamped with `deleted_at = now_rfc3339` and
 ///   `{"success": true}` is returned.
+///
+/// `delete_task` was session-only; it still is for a task the user's focus
+/// pointer does not point at. When the deleted row **is** the focused task
+/// (`users.focused_task_id == id`):
+/// 1. Snap the living event (end only, no continuation, no `unfocused`
+///    log — the row is gone, only the calendar chip carries the trace) via
+///    `stop_running_event`, which resolves the newest focus segment through
+///    the event-bearing log.
+/// 2. Clear the pointer.
+/// 3. Then `deleted_at`.
+///
+/// The worker decides the Google gate from the pointer (focused → timer gate,
+/// 401 without a token); here `http`/`access` are `Option` so session-only
+/// deletes keep working. The pointer is cleared **even without Google**
+/// (`http`/`access` `None`) — we never want to point at a ghost — but the
+/// snap itself needs the refreshable token.
 pub async fn delete_task(
+    http: Option<&dyn HttpClient>,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
+    access: Option<&GoogleAccess>,
     task_repo: &dyn TaskRepo,
     user_id: &str,
     id: &str,
     now_rfc3339: &str,
+    now_unix: i64,
 ) -> Result<DeleteTaskResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(id).await? else {
         return Err(TasksError::NotFound);
     };
     if task.user_id != user_id {
         return Err(TasksError::NotFound);
+    }
+    // `users.focused_task_id` is the lock — never scan events for focus.
+    let user = users.get_by_id(user_id).await?;
+    let is_focused = user.as_ref().and_then(|u| u.focused_task_id.as_deref()) == Some(id);
+
+    if is_focused {
+        // Snap the living event when Google is available (the worker gates
+        // focused deletes on a refreshable token); the pointer is cleared even
+        // without Google so a soft delete never leaves a ghost pointer.
+        if let (Some(http), Some(access)) = (http, access) {
+            stop_running_event(http, calendars, events, logs, access, id, now_unix).await?;
+        }
+        users.set_focused_task_id(user_id, None, now_rfc3339).await?;
     }
     task_repo.soft_delete(id, now_rfc3339).await?;
     Ok(DeleteTaskResponse { success: true })
@@ -955,6 +1011,8 @@ pub async fn start_task(
             end: end_rfc3339,
             task_id: Some(task.id.clone()),
             color_id: target.google_color_id,
+            // Start never takes focus: the started chip is unfocused.
+            sanctuary_focus: false,
         },
         now_unix,
     )
@@ -1002,13 +1060,14 @@ pub async fn stop_task(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: &GoogleAccess,
     user_id: &str,
     task_id: &str,
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
-        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
         now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true,
     )
     .await
@@ -1030,13 +1089,14 @@ pub async fn pause_task(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: &GoogleAccess,
     user_id: &str,
     task_id: &str,
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
-        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
         now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true,
     )
     .await
@@ -1055,13 +1115,14 @@ pub async fn complete_task(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: &GoogleAccess,
     user_id: &str,
     task_id: &str,
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
-        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
         now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true,
     )
     .await
@@ -1081,13 +1142,14 @@ pub async fn discard_task(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: &GoogleAccess,
     user_id: &str,
     task_id: &str,
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
-        http, calendars, events, category_repo, task_repo, logs, access, user_id, task_id,
+        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
         now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true,
     )
     .await
@@ -1111,6 +1173,7 @@ async fn stop_or_pause(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: &GoogleAccess,
     user_id: &str,
     task_id: &str,
@@ -1136,6 +1199,32 @@ async fn stop_or_pause(
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let (patched, at, calendar_id, google_event_id) =
         stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
+
+    // Exiting the focused task is a focus exit (task-focus, slice 3): snap
+    // (already done above — `stop_running_event` resolves the newest focus
+    // segment through the event-bearing log), log `unfocused` with the same
+    // calendar/event ids as the snap, clear the pointer, THEN do the status/
+    // rank work. No new event is opened — exits snap, only focus verbs open
+    // continuations.
+    let user = users.get_by_id(user_id).await?;
+    let is_focused = user.as_ref().and_then(|u| u.focused_task_id.as_deref()) == Some(task_id);
+    if is_focused {
+        logs.insert(
+            NewTaskLog {
+                task_id: task_id.to_string(),
+                user_id: user_id.to_string(),
+                r#type: TASK_LOG_UNFOCUSED.to_string(),
+                at: at.clone(),
+                calendar_id: calendar_id.clone(),
+                google_event_id: google_event_id.clone(),
+            },
+            &now_rfc3339,
+        )
+        .await?;
+        users
+            .set_focused_task_id(user_id, None, &now_rfc3339)
+            .await?;
+    }
 
     let Some(updated) = task_repo
         .set_status(task_id, target_status, &now_rfc3339)
@@ -1197,6 +1286,7 @@ async fn complete_or_discard(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: &GoogleAccess,
     user_id: &str,
     task_id: &str,
@@ -1222,10 +1312,36 @@ async fn complete_or_discard(
     }
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    // Exiting the focused task is a focus exit (task-focus, slice 3): the
+    // auto-stop snap below already closes the newest focus segment — log
+    // `unfocused` with the snap's ids before the `stopped` log, and clear the
+    // pointer. No new event opens (only the focus verbs open continuations).
+    let user = users.get_by_id(user_id).await?;
+    let is_focused = user.as_ref().and_then(|u| u.focused_task_id.as_deref()) == Some(task_id);
+
     // Auto-stop: a running event is closed first, and that close is logged
     // (`stopped`) before the terminal log.
     let (patched, at, calendar_id, google_event_id) =
         stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
+    if is_focused {
+        if let Some(_event) = &patched {
+            logs.insert(
+                NewTaskLog {
+                    task_id: task_id.to_string(),
+                    user_id: user_id.to_string(),
+                    r#type: TASK_LOG_UNFOCUSED.to_string(),
+                    at: at.clone(),
+                    calendar_id: calendar_id.clone(),
+                    google_event_id: google_event_id.clone(),
+                },
+                &now_rfc3339,
+            )
+            .await?;
+        }
+        users
+            .set_focused_task_id(user_id, None, &now_rfc3339)
+            .await?;
+    }
     if let Some(_event) = &patched {
         logs.insert(
             NewTaskLog {
@@ -1549,6 +1665,7 @@ async fn dispatch_matrix_action(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: Option<&GoogleAccess>,
     user_id: &str,
     task_id: &str,
@@ -1575,7 +1692,7 @@ async fn dispatch_matrix_action(
             // /stop endpoint only — `/move` places exactly once afterwards,
             // so a stop via the board is never double-placed.
             stop_or_pause(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
                 task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, false,
             )
             .await
@@ -1584,7 +1701,7 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_PLANNED) => {
             let (http, access) = require_google(http, access)?;
             stop_or_pause(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
                 task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
             )
             .await
@@ -1593,7 +1710,7 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED) => {
             let (http, access) = require_google(http, access)?;
             complete_or_discard(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
                 task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
             )
             .await
@@ -1602,7 +1719,7 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_DISCARDED) => {
             let (http, access) = require_google(http, access)?;
             complete_or_discard(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
                 task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
             )
             .await
@@ -1633,14 +1750,14 @@ async fn dispatch_matrix_action(
         // complete / discard from any non-running status: no Google writes.
         (_, TASK_STATUS_COMPLETED) => {
             terminal_transition(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
                 task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix,
             )
             .await
         }
         (_, TASK_STATUS_DISCARDED) => {
             terminal_transition(
-                http, calendars, events, category_repo, task_repo, logs, access, user_id,
+                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
                 task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix,
             )
             .await
@@ -1703,6 +1820,7 @@ async fn terminal_transition(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: Option<&GoogleAccess>,
     user_id: &str,
     task_id: &str,
@@ -1726,6 +1844,7 @@ async fn terminal_transition(
             category_repo,
             task_repo,
             logs,
+            users,
             access,
             user_id,
             task_id,
@@ -1833,6 +1952,7 @@ pub async fn move_task(
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
     access: Option<&GoogleAccess>,
     user_id: &str,
     task_id: &str,
@@ -1855,13 +1975,20 @@ pub async fn move_task(
     if task.user_id != user_id {
         return Err(TasksError::NotFound);
     }
+    // The pre-mutation pointer, read once and passed to every `to_view` — the
+    // exit legs clear it (when it pointed at the mover), but a moved task is
+    // never IN_PROGRESS after an exit, so the paint stays false regardless.
+    let focused_task_id = users
+        .get_by_id(user_id)
+        .await?
+        .and_then(|user| user.focused_task_id);
 
     // Same-status + no drop position: nothing happens, the current task is
     // returned as-is — never secretly sent to the tail.
     if task.status == input.status && input.sort_order.is_none() {
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         return Ok(MoveTaskResponse {
-            task: to_view(&task, &taxonomy, None),
+            task: to_view(&task, &taxonomy, focused_task_id.as_deref()),
             event: None,
         });
     }
@@ -1871,12 +1998,13 @@ pub async fn move_task(
         // shifts neighbors only when it actually changes position) — In
         // Progress is a real pile, so this covers IN_PROGRESS → IN_PROGRESS
         // with a rank too. Omitted `sort_order` already returned as a no-op
-        // above, so a rank is guaranteed here.
+        // above, so a rank is guaranteed here. A same-status IP move of the
+        // focused task stays focused — focus is untouched.
         let row = reorder_in_place(task_repo, user_id, &task, input.sort_order.unwrap_or(0))
             .await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
-            task: to_view(&row, &taxonomy, None),
+            task: to_view(&row, &taxonomy, focused_task_id.as_deref()),
             event: None,
         })
     } else {
@@ -1903,17 +2031,335 @@ pub async fn move_task(
             }
         };
         let event = dispatch_matrix_action(
-            http, calendars, events, list_repo, category_repo, task_repo, logs, access,
+            http, calendars, events, list_repo, category_repo, task_repo, logs, users, access,
             user_id, task_id, &task.status, &input.status, now_unix,
         )
         .await?;
         let row = place_at(task_repo, user_id, task_id, &input.status, rank).await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
-            task: to_view(&row, &taxonomy, None),
+            task: to_view(&row, &taxonomy, focused_task_id.as_deref()),
             event,
         })
     }
+}
+
+// ──────────────────────────────────────────
+// Task-focus (slice 3): POST /api/tasks/:id/focus and DELETE /api/focus
+// ──────────────────────────────────────────
+
+/// The matched category's stored `google_color_id`, or `None` when the title
+/// is untracked or the category has no stored color. Focus segments re-resolve
+/// their color from the category here — the event cache has no color column,
+/// so the replaced chip cannot supply it.
+fn category_color_id(taxonomy: &Taxonomy, title: &str) -> Option<String> {
+    match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
+        ClassifyOutcome::Matched { category_id } => taxonomy
+            .categories
+            .iter()
+            .find(|category| category.id == category_id)
+            .and_then(|category| category.google_color_id.clone()),
+        ClassifyOutcome::Untracked { .. } => None,
+    }
+}
+
+/// Opens one focus segment (a `focused`/`unfocused` chapter) on the minute
+/// grid — `[T, T + START_EVENT_MINUTES)` like `start_task`: the timeline's
+/// next live marker, grown by the elongate cron.
+///
+/// The new event inherits its `calendar_id` from the chip it replaces (the
+/// task's newest event-bearing log → cached row); with no living chip it falls
+/// back to `resolve_target_calendar` exactly like `start_task`. `color_id` is
+/// re-resolved from the category (the cache has no color column). `focused`
+/// controls the `sanctuary_focus = "1"` flag; the summary is the task title
+/// exactly, never a `▶` prefix.
+async fn create_focus_segment(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    logs: &dyn TaskLogRepo,
+    access: &GoogleAccess,
+    taxonomy: &Taxonomy,
+    user_id: &str,
+    task: &Task,
+    focused: bool,
+    now_unix: i64,
+) -> Result<CalendarEvent, TasksError> {
+    let t_unix = nearest_minute_unix(now_unix);
+    let start_rfc3339 = unix_secs_to_rfc3339(t_unix);
+    let end_rfc3339 = unix_secs_to_rfc3339(t_unix + START_EVENT_MINUTES * 60);
+
+    let calendar_id = match latest_started_event(logs, events, &task.id).await? {
+        // Inherit from the chip this segment replaces — but verify the
+        // calendar itself is still living (a soft-deleted inherited calendar
+        // falls through to resolve like any other missing chip).
+        Some(chip) => match calendars.get_by_id(&chip.calendar_id).await? {
+            Some(_) => chip.calendar_id,
+            None => resolve_target_calendar(calendars, taxonomy, &task.title, user_id)
+                .await?
+                .calendar_id,
+        },
+        None => resolve_target_calendar(calendars, taxonomy, &task.title, user_id)
+            .await?
+            .calendar_id,
+    };
+    let color_id = category_color_id(taxonomy, &task.title);
+
+    let output = create_event(
+        http,
+        calendars,
+        events,
+        access,
+        &NewEventInput {
+            calendar_id,
+            summary: task.title.clone(),
+            description: None,
+            start: start_rfc3339,
+            end: end_rfc3339,
+            task_id: Some(task.id.clone()),
+            color_id,
+            sanctuary_focus: focused,
+        },
+        now_unix,
+    )
+    .await?;
+    Ok(output.event)
+}
+
+/// `POST /api/tasks/:id/focus` — focus the task's live calendar segment
+/// (task-focus, slice 3). The Google write order of a switch (A focused → B):
+///
+/// 1. Snap **A**'s living event (PATCH end only — the closed chip keeps its
+///    `sanctuary_focus=1`). Fail → abort, pointer still A.
+/// 2. Create **B′** flagged (`sanctuary_task_id` + `sanctuary_focus=1`),
+///    summary = B.title. Fail → abort, pointer still A (A may now have no
+///    living event — a repaired later).
+/// 3. `set_focused_task_id(B)` — the lock. Fail → abort, pointer still A.
+/// 4. Create **A′** unfocused (`sanctuary_task_id` only). Fail → 502, pointer
+///    is already B (A is IN_PROGRESS with no living event; acceptable).
+/// 5. Snap **B**'s old living event if it existed (end only; it never had the
+///    flag).
+/// 6. Logs: `unfocused` on A (new A′ ids), `focused` on B (B′ ids).
+///
+/// Locked rules: focus is IP-only (400 "task is not in progress"); missing/
+/// other-user/soft-deleted → 404; empty focus is valid. Start never takes
+/// focus. Already-focused with a living chip → 200 no-op (no Google write).
+/// Already-focused with no living chip → **repair**: open a new flagged
+/// segment and keep the pointer.
+pub async fn focus_task(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<FocusTaskResponse, TasksError> {
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    // Focus is IP-only.
+    if task.status != TASK_STATUS_IN_PROGRESS {
+        return Err(TasksError::Invalid("task is not in progress".to_string()));
+    }
+    let Some(user) = users.get_by_id(user_id).await? else {
+        return Err(TasksError::NotFound);
+    };
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+
+    // `users.focused_task_id` is the lock — never scan events for focus.
+    let prev_pointer = user.focused_task_id;
+    let already_focused = prev_pointer.as_deref() == Some(task_id);
+
+    // Already-focused + a living chip → 200 no-op, no Google write.
+    if already_focused && latest_started_event(logs, events, task_id).await?.is_some() {
+        return Ok(FocusTaskResponse {
+            task: Some(to_view(&task, &taxonomy, Some(task.id.as_str()))),
+            previous: None,
+            events: Vec::new(),
+        });
+    }
+
+    let mut created: Vec<CalendarEvent> = Vec::new();
+
+    // The previous focused task (A). A pointer that no longer names a living
+    // IN_PROGRESS row of this user is ignored — a first focus, and the stale
+    // pointer is simply overwritten by step 3.
+    let previous = match prev_pointer.as_deref() {
+        Some(id) if id != task_id => task_repo.get_by_id(id).await?,
+        _ => None,
+    };
+    let previous = previous.filter(|a| {
+        a.user_id == user_id && a.status == TASK_STATUS_IN_PROGRESS
+    });
+
+    // 1. Snap A's living event (end only — the closed chip keeps its flag).
+    if let Some(a) = &previous {
+        stop_running_event(http, calendars, events, logs, access, &a.id, now_unix).await?;
+    }
+
+    // 2. Create B′ flagged (or the repaired flagged segment on the
+    //    already-focused/no-chip path, which falls through here).
+    let b_prime = create_focus_segment(
+        http, calendars, events, logs, access, &taxonomy, user_id, &task, true, now_unix,
+    )
+    .await?;
+    created.push(b_prime.clone());
+
+    // 3. Commit the switch: the pointer is the lock.
+    users
+        .set_focused_task_id(user_id, Some(task.id.as_str()), &now_rfc3339)
+        .await?;
+
+    // 4. On a switch, create A′ (the unfocused continuation) and log
+    //    `unfocused` on A with the A′ ids (the newest event-bearing log on A
+    //    now names the still-running continuation).
+    if let Some(a) = &previous {
+        let a_prime = create_focus_segment(
+            http, calendars, events, logs, access, &taxonomy, user_id, a, false, now_unix,
+        )
+        .await?;
+        created.push(a_prime.clone());
+        logs.insert(
+            NewTaskLog {
+                task_id: a.id.clone(),
+                user_id: user_id.to_string(),
+                r#type: TASK_LOG_UNFOCUSED.to_string(),
+                at: now_rfc3339.clone(),
+                calendar_id: Some(a_prime.calendar_id.clone()),
+                google_event_id: Some(a_prime.google_event_id.clone()),
+            },
+            &now_rfc3339,
+        )
+        .await?;
+    }
+
+    // 5. Snap B's old living event if it existed (end only; it never had the
+    //    flag). The newest event-bearing log still names B_old here — the
+    //    `focused` log below is what moves the pointer forward.
+    if !already_focused {
+        stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
+    }
+
+    // 6. Log `focused` on B with the B′ ids — the newest event-bearing log on
+    //    B now names the live focused segment (the exit verbs / elongate cron
+    //    follow it automatically).
+    logs.insert(
+        NewTaskLog {
+            task_id: task.id.clone(),
+            user_id: user_id.to_string(),
+            r#type: TASK_LOG_FOCUSED.to_string(),
+            at: now_rfc3339.clone(),
+            calendar_id: Some(b_prime.calendar_id.clone()),
+            google_event_id: Some(b_prime.google_event_id.clone()),
+        },
+        &now_rfc3339,
+    )
+    .await?;
+
+    Ok(FocusTaskResponse {
+        // `to_view` gets the post-mutation pointer so the flags are right:
+        // B focused, A (when switched) unfocused.
+        task: Some(to_view(&task, &taxonomy, Some(task.id.as_str()))),
+        previous: previous.map(|a| to_view(&a, &taxonomy, Some(task.id.as_str()))),
+        events: created,
+    })
+}
+
+/// `DELETE /api/focus` — drop the focus pointer and un-flag the focused
+/// segment, opening an unprefixed continuation (task-focus, slice 3).
+///
+/// When a task is focused: snap the focused chip (end only — the closed chip
+/// keeps `sanctuary_focus=1`), create the unfocused continuation B′ (carrier
+/// only), clear the pointer, log `unfocused` with the B′ ids. Response:
+/// `task` = the continuation view (`focused: false`), `previous` = null,
+/// `events` = the new segment.
+///
+/// Empty / invalid pointer (missing, other-user, not IN_PROGRESS): a 200
+/// `{ task: null, previous: null, events: [] }` with no Google write. The
+/// token is still required (the worker gate) even then.
+pub async fn delete_focus(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    users: &dyn UserRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    now_unix: i64,
+) -> Result<FocusTaskResponse, TasksError> {
+    let Some(user) = users.get_by_id(user_id).await? else {
+        return Ok(FocusTaskResponse {
+            task: None,
+            previous: None,
+            events: Vec::new(),
+        });
+    };
+    let Some(b_id) = user.focused_task_id else {
+        // Empty pointer: 200 no-op.
+        return Ok(FocusTaskResponse {
+            task: None,
+            previous: None,
+            events: Vec::new(),
+        });
+    };
+    let Some(task) = task_repo.get_by_id(&b_id).await? else {
+        // Dangling pointer: 200 no-op.
+        return Ok(FocusTaskResponse {
+            task: None,
+            previous: None,
+            events: Vec::new(),
+        });
+    };
+    if task.user_id != user_id || task.status != TASK_STATUS_IN_PROGRESS {
+        return Ok(FocusTaskResponse {
+            task: None,
+            previous: None,
+            events: Vec::new(),
+        });
+    }
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let taxonomy = load_taxonomy(category_repo, user_id).await?;
+
+    // Snap B (end only — the closed chip keeps its flag), open the unprefixed
+    // continuation, clear the pointer, log `unfocused`.
+    stop_running_event(http, calendars, events, logs, access, &task.id, now_unix).await?;
+    let b_prime = create_focus_segment(
+        http, calendars, events, logs, access, &taxonomy, user_id, &task, false, now_unix,
+    )
+    .await?;
+    users
+        .set_focused_task_id(user_id, None, &now_rfc3339)
+        .await?;
+    logs.insert(
+        NewTaskLog {
+            task_id: task.id.clone(),
+            user_id: user_id.to_string(),
+            r#type: TASK_LOG_UNFOCUSED.to_string(),
+            at: now_rfc3339.clone(),
+            calendar_id: Some(b_prime.calendar_id.clone()),
+            google_event_id: Some(b_prime.google_event_id.clone()),
+        },
+        &now_rfc3339,
+    )
+    .await?;
+
+    Ok(FocusTaskResponse {
+        task: Some(to_view(&task, &taxonomy, None)),
+        previous: None,
+        events: vec![b_prime],
+    })
 }
 
 /// Loads the taxonomy, seeding it first (same count-gated path as
@@ -2182,11 +2628,12 @@ mod tests {
     use crate::models::{
         GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
         NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, NewTaskList, NewToken,
-        TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTaskCategory, UpdateTaskList,
+        TaskCategory, TaskCategoryPattern, TaskList, TaskLog, NewUser, UpdateTaskCategory,
+        UpdateTaskList, User,
     };
     use crate::oauth::{HttpClient, HttpError};
     use crate::repo::{
-        CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo, TokenRepo,
+        CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo, TokenRepo, UserRepo,
     };
 
     // ──────────────────────────────────────────
@@ -2416,6 +2863,60 @@ mod tests {
                 row.deleted_at = Some(now_rfc3339.to_string());
                 row.updated_at = now_rfc3339.to_string();
             }
+            Ok(())
+        }
+    }
+
+    /// In-memory `UserRepo` mirroring the focus pointer (task-focus, slice 3):
+    /// the `focused_task_id` lock lives here, exactly like the D1 row.
+    #[derive(Default)]
+    struct FakeUserRepo {
+        focused_task_id: Mutex<Option<String>>,
+    }
+
+    impl FakeUserRepo {
+        fn focused(task_id: &str) -> Self {
+            Self {
+                focused_task_id: Mutex::new(Some(task_id.to_string())),
+            }
+        }
+
+        fn pointer(&self) -> Option<String> {
+            self.focused_task_id.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl UserRepo for FakeUserRepo {
+        async fn get_by_id(&self, _id: &str) -> Result<Option<User>, RepoError> {
+            Ok(Some(User {
+                id: "u-1".to_string(),
+                google_id: "google-1".to_string(),
+                email: "u-1@example.com".to_string(),
+                name: "U1".to_string(),
+                picture: None,
+                created_at: "2026-08-18T00:00:00Z".to_string(),
+                updated_at: "2026-08-18T00:00:00Z".to_string(),
+                deleted_at: None,
+                focused_task_id: self.pointer(),
+            }))
+        }
+
+        async fn get_by_google_id(&self, _google_id: &str) -> Result<Option<User>, RepoError> {
+            Ok(None)
+        }
+
+        async fn upsert_by_google_id(&self, _user: NewUser) -> Result<User, RepoError> {
+            Err(RepoError::NotFound)
+        }
+
+        async fn set_focused_task_id(
+            &self,
+            _user_id: &str,
+            task_id: Option<&str>,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            *self.focused_task_id.lock().unwrap() = task_id.map(str::to_string);
             Ok(())
         }
     }
@@ -3218,7 +3719,7 @@ mod tests {
             &categories,
             "u-1",
             "Work",
-            Some(&child.id),
+            Some(child.id.as_str()),
         ))
         .unwrap();
         match response {
@@ -3251,7 +3752,7 @@ mod tests {
             &categories,
             "u-1",
             "",
-            Some(&child.id),
+            Some(child.id.as_str()),
         ))
         .unwrap();
         match response {
@@ -3282,7 +3783,7 @@ mod tests {
             &categories,
             "u-1",
             "Hello! | SpicyHome",
-            Some(&child.id),
+            Some(child.id.as_str()),
         ))
         .unwrap();
         match response {
@@ -3469,8 +3970,13 @@ mod tests {
         ))
         .unwrap()
         .task;
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(delete_task(
-            &tasks, "u-1", &created.id, "2026-08-18T02:00:00Z",
+            None, &calendars, &events, &logs, &users, None, &tasks, "u-1", &created.id,
+            "2026-08-18T02:00:00Z", NOW_UNIX,
         ))
         .unwrap();
         assert!(response.success);
@@ -3480,7 +3986,10 @@ mod tests {
             "no living tasks remain"
         );
         assert!(matches!(
-            pollster::block_on(delete_task(&tasks, "u-1", &created.id, "2026-08-18T02:00:00Z")),
+            pollster::block_on(delete_task(
+                None, &calendars, &events, &logs, &users, None, &tasks, "u-1", &created.id,
+                "2026-08-18T02:00:00Z", NOW_UNIX,
+            )),
             Err(TasksError::NotFound)
         ));
     }
@@ -3493,12 +4002,22 @@ mod tests {
         ))
         .unwrap()
         .task;
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         assert!(matches!(
-            pollster::block_on(delete_task(&tasks, "u-2", &created.id, "2026-08-18T02:00:00Z")),
+            pollster::block_on(delete_task(
+                None, &calendars, &events, &logs, &users, None, &tasks, "u-2", &created.id,
+                "2026-08-18T02:00:00Z", NOW_UNIX,
+            )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
-            pollster::block_on(delete_task(&tasks, "u-1", "nope", "2026-08-18T02:00:00Z")),
+            pollster::block_on(delete_task(
+                None, &calendars, &events, &logs, &users, None, &tasks, "u-1", "nope",
+                "2026-08-18T02:00:00Z", NOW_UNIX,
+            )),
             Err(TasksError::NotFound)
         ));
     }
@@ -3583,7 +4102,7 @@ mod tests {
             &categories,
             &tasks,
             "u-1",
-            Some(&first.id),
+            Some(first.id.as_str()),
         ))
         .unwrap();
         assert_eq!(response.tasks.len(), 2);
@@ -3604,7 +4123,7 @@ mod tests {
             &categories,
             &tasks,
             "u-1",
-            Some(&first.id),
+            Some(first.id.as_str()),
         ))
         .unwrap();
         assert_eq!(response.tasks.len(), 2);
@@ -3986,14 +4505,26 @@ mod tests {
             &self,
             task_id: &str,
         ) -> Result<Option<TaskLog>, RepoError> {
-            // Mirrors TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL: scan the
-            // inserted rows in reverse for the task's newest `started` row and
-            // synthesize a `TaskLog` from the insert input.
+            // Mirrors TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL (slice 3): scan
+            // the inserted rows in reverse for the task's newest **event-
+            // bearing** log — `started|focused|unfocused` with a non-empty
+            // `google_event_id` — and synthesize a `TaskLog` from the insert
+            // input.
             let inserted = self.inserted.lock().unwrap();
             Ok(inserted
                 .iter()
                 .rev()
-                .find(|log| log.task_id == task_id && log.r#type == TASK_LOG_STARTED)
+                .find(|log| {
+                    log.task_id == task_id
+                        && matches!(
+                            log.r#type.as_str(),
+                            TASK_LOG_STARTED | TASK_LOG_FOCUSED | TASK_LOG_UNFOCUSED
+                        )
+                        && log
+                            .google_event_id
+                            .as_deref()
+                            .is_some_and(|id| !id.is_empty())
+                })
                 .map(|log| TaskLog {
                     id: "log-1".to_string(),
                     task_id: log.task_id.clone(),
@@ -4141,6 +4672,23 @@ mod tests {
     fn patched_event_json_for(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
         format!(
             r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+        )
+    }
+
+    /// An `events.insert` echo for a specific Google event id (the task-focus
+    /// tests start several tasks and need distinct ids so the cache never
+    /// collapses them).
+    fn event_json_with_id(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+        )
+    }
+
+    /// An `events.insert` echo carrying the focus flag — what Google echoes
+    /// back for a focused segment.
+    fn focused_event_json(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}","sanctuary_focus":"1"}}}}}}"#
         )
     }
 
@@ -4964,6 +5512,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -4983,7 +5532,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix,
         ))
         .unwrap();
@@ -5012,6 +5561,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -5032,7 +5582,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5055,11 +5605,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         // No event was ever opened for this task.
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5085,6 +5636,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -5111,7 +5663,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5135,6 +5687,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -5154,7 +5707,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
         )]);
         let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix,
         ))
         .unwrap();
@@ -5186,11 +5739,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
 
         let http = FakeHttp::new(vec![]);
         let err = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap_err();
@@ -5215,8 +5769,9 @@ mod tests {
             200,
             &patched_event_json(&a.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &a.id, stop_unix,
         ))
         .unwrap();
@@ -5240,10 +5795,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5277,8 +5833,9 @@ mod tests {
             200,
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
         )]);
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix,
         ))
         .unwrap();
@@ -5306,10 +5863,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5334,6 +5892,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -5352,7 +5911,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, complete_unix,
         ))
         .unwrap();
@@ -5376,11 +5935,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         // Task never started — complete has nothing to stop.
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5400,16 +5960,17 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
 
         let http = FakeHttp::new(vec![]);
         pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
         // Second complete: no-op, still 200.
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5430,10 +5991,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5458,10 +6020,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5483,6 +6046,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -5501,7 +6065,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(discard_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, discard_unix,
         ))
         .unwrap();
@@ -5520,10 +6084,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(discard_task(
-            &http, &calendars, &events, &categories, &tasks, &logs,
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5540,24 +6105,668 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
         let access = access();
 
         let complete_other = complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &access, "u-2",
+            &http, &calendars, &events, &categories, &tasks, &logs, &users, &access, "u-2",
             &task.id, NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(complete_other), Err(TasksError::NotFound)));
         let discard_other = discard_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &access, "u-2",
+            &http, &calendars, &events, &categories, &tasks, &logs, &users, &access, "u-2",
             &task.id, NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(discard_other), Err(TasksError::NotFound)));
         let complete_missing = complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &access, "u-1",
+            &http, &calendars, &events, &categories, &tasks, &logs, &users, &access, "u-1",
             "nope", NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
+    }
+
+    // ──────────────────────────────────────────
+    // focus_task / delete_focus (task-focus, slice 3)
+    // ──────────────────────────────────────────
+
+    /// Starts `task_id` (`g-1`) then focuses it at `NOW_UNIX + 300` — the old
+    /// chip `g-1` snaps to 22:18:00, the flagged segment `g-focus` opens, and
+    /// the pointer is set. Returns the fresh fakes.
+    fn focus_first(
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        tasks: &FakeTaskRepo,
+        task_id: &str,
+    ) -> (FakeHttp, FakeCalendarRepo, FakeEventRepo, FakeTaskLogRepo, FakeUserRepo) {
+        let (_start_http, calendars, events, logs) =
+            start_running(lists, categories, tasks, task_id);
+        let focus_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json_for("g-1", task_id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &focused_event_json(
+                    "g-focus",
+                    task_id,
+                    "2023-11-14T22:18:00Z",
+                    "2023-11-14T22:33:00Z",
+                ),
+            ),
+        ]);
+        let users = FakeUserRepo::default();
+        pollster::block_on(focus_task(
+            &http, &calendars, &events, lists, categories, tasks, &logs, &users,
+            &access(), "u-1", task_id, focus_unix,
+        ))
+        .unwrap();
+        (http, calendars, events, logs, users)
+    }
+
+    #[test]
+    fn focus_open_task_is_invalid() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let err = pollster::block_on(focus_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, TasksError::Invalid(m) if m == "task is not in progress"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google writes");
+    }
+
+    #[test]
+    fn focus_missing_or_other_users_task_is_not_found() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        assert!(matches!(
+            pollster::block_on(focus_task(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+                &access(), "u-2", &task.id, NOW_UNIX,
+            )),
+            Err(TasksError::NotFound)
+        ));
+        assert!(matches!(
+            pollster::block_on(focus_task(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+                &access(), "u-1", "nope", NOW_UNIX,
+            )),
+            Err(TasksError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn focus_first_time_snaps_the_old_chip_and_opens_a_flagged_segment() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http_start = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-1", &task.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_start, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Focus 5 minutes later (22:18:20 → snapped 22:18:00).
+        let focus_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json_for("g-1", &task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &focused_event_json(
+                    "g-focus",
+                    &task.id,
+                    "2023-11-14T22:18:00Z",
+                    "2023-11-14T22:33:00Z",
+                ),
+            ),
+        ]);
+        let users = FakeUserRepo::default();
+        let response = pollster::block_on(focus_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, focus_unix,
+        ))
+        .unwrap();
+
+        assert!(response.previous.is_none(), "first focus has no previous");
+        let task_view = response.task.as_ref().unwrap();
+        assert_eq!(task_view.id, task.id);
+        assert!(task_view.focused);
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].google_event_id, "g-focus");
+        assert_eq!(
+            users.pointer().as_deref(),
+            Some(task.id.as_str()),
+            "first focus commits the pointer"
+        );
+
+        // Snap: the old chip closes with an end-only patch.
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let (url, body) = patches.first().unwrap().clone();
+        assert!(url.contains("/events/g-1"), "{url}");
+        let patch: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(patch["end"]["dateTime"], "2023-11-14T22:18:00Z");
+        assert!(
+            patch.get("extendedProperties").is_none(),
+            "snap sends end only: {body}"
+        );
+
+        // Create: one flagged segment — summary equals the title exactly
+        // (never ▶), carrying both shared keys.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let (_, body) = posts.first().unwrap().clone();
+        let create: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(create["summary"], "Work", "no ▶ prefix");
+        assert_eq!(
+            create["extendedProperties"]["shared"]["sanctuary_task_id"],
+            task.id
+        );
+        assert_eq!(create["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+
+        // Logs: started then focused (the focused log names the new segment).
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|l| l.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "focused"]);
+        assert_eq!(
+            inserted[1].calendar_id.as_deref(),
+            Some("cal-primary@example.com")
+        );
+        assert_eq!(inserted[1].google_event_id.as_deref(), Some("g-focus"));
+    }
+
+    #[test]
+    fn focus_already_focused_with_living_chip_is_a_noop() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_focus_http, calendars, events, logs, users) =
+            focus_first(&lists, &categories, &tasks, &task.id);
+        assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
+
+        // Focus again while the flagged chip is alive: 200 no-op, no Google.
+        let http = FakeHttp::new(vec![]);
+        let response = pollster::block_on(focus_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, NOW_UNIX + 600,
+        ))
+        .unwrap();
+
+        assert!(response.previous.is_none());
+        assert!(response.task.as_ref().unwrap().focused);
+        assert!(response.events.is_empty(), "no segment opened");
+        assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
+        assert!(http.posts.lock().unwrap().is_empty(), "no create on a no-op");
+        assert!(http.patches.lock().unwrap().is_empty(), "no patch on a no-op");
+    }
+
+    #[test]
+    fn focus_already_focused_without_a_living_chip_repairs() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_focus_http, calendars, events, logs, users) =
+            focus_first(&lists, &categories, &tasks, &task.id);
+
+        // The flagged chip vanishes from the store (synced away): the newest
+        // event-bearing log still names it, but the cached row is gone.
+        {
+            let mut stored = events.stored.lock().unwrap();
+            let chip = stored
+                .iter_mut()
+                .find(|event| event.google_event_id == "g-focus")
+                .expect("focused chip is cached");
+            chip.deleted_at = Some("2023-11-14T22:20:00Z".to_string());
+        }
+
+        let repair_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &focused_event_json(
+                "g-repair",
+                &task.id,
+                "2023-11-14T22:23:00Z",
+                "2023-11-14T22:38:00Z",
+            ),
+        )]);
+        let response = pollster::block_on(focus_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, repair_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.events.len(), 1, "a repaired flagged segment opens");
+        assert_eq!(response.events[0].google_event_id, "g-repair");
+        assert!(response.task.as_ref().unwrap().focused);
+        assert!(response.previous.is_none(), "a repair is not a switch");
+        assert_eq!(
+            users.pointer().as_deref(),
+            Some(task.id.as_str()),
+            "repair keeps the pointer"
+        );
+        // Calendar falls back to resolve like start (no living chip).
+        assert_eq!(response.events[0].calendar_id, "cal-primary@example.com");
+
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let (_, body) = posts.first().unwrap().clone();
+        let create: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(create["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_FOCUSED);
+        assert_eq!(inserted.last().unwrap().google_event_id.as_deref(), Some("g-repair"));
+    }
+
+    #[test]
+    fn focus_switch_a_to_b_snaps_a_and_opens_both_continuations() {
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http_a = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-a", &a.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_a, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &a.id, NOW_UNIX,
+        ))
+        .unwrap();
+        let http_b = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-b", &b.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &b.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // A → B at 22:18.
+        let switch_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-a",
+                200,
+                &patched_event_json_for("g-a", &a.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+            ),
+            (
+                "/events/g-b",
+                200,
+                &patched_event_json_for("g-b", &b.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &event_json_with_id(
+                    "g-new",
+                    &b.id,
+                    "2023-11-14T22:18:00Z",
+                    "2023-11-14T22:33:00Z",
+                ),
+            ),
+        ]);
+        let users = FakeUserRepo::focused(&a.id);
+        let response = pollster::block_on(focus_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &b.id, switch_unix,
+        ))
+        .unwrap();
+
+        // Pointer moved to B; B is focused, A is the unfocused previous.
+        assert_eq!(users.pointer().as_deref(), Some(b.id.as_str()));
+        let task_view = response.task.unwrap();
+        assert_eq!(task_view.id, b.id);
+        assert!(task_view.focused);
+        let previous = response.previous.unwrap();
+        assert_eq!(previous.id, a.id);
+        assert!(!previous.focused);
+        assert_eq!(response.events.len(), 2, "B′ then A′");
+
+        // Two snaps, both end-only (A's old chip, then B's old chip).
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 2);
+        for (url, body) in patches.iter() {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(v.get("extendedProperties").is_none(), "snap is end only: {body}");
+            assert_eq!(v["end"]["dateTime"], "2023-11-14T22:18:00Z");
+            assert!(url.contains("/events/g-a") || url.contains("/events/g-b"), "{url}");
+        }
+
+        // Creates: B′ flagged first, A′ unprefixed second.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2);
+        let (_, body_bp) = posts.first().unwrap().clone();
+        let bbp: serde_json::Value = serde_json::from_str(&body_bp).unwrap();
+        assert_eq!(bbp["summary"], "Work", "B's summary is its title, no ▶");
+        assert_eq!(bbp["extendedProperties"]["shared"]["sanctuary_task_id"], b.id);
+        assert_eq!(bbp["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+        let (_, body_ap) = &posts[1];
+        let abp: serde_json::Value = serde_json::from_str(body_ap).unwrap();
+        assert_eq!(abp["extendedProperties"]["shared"]["sanctuary_task_id"], a.id);
+        assert!(
+            abp["extendedProperties"]["shared"].get("sanctuary_focus").is_none(),
+            "A′ is unprefixed: {body_ap}"
+        );
+
+        // Logs: A started, B started, A unfocused, B focused.
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|l| l.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "started", "unfocused", "focused"]);
+        assert_eq!(inserted[2].task_id, a.id);
+        assert_eq!(inserted[3].task_id, b.id);
+        assert_eq!(inserted[3].google_event_id.as_deref(), Some("g-new"));
+    }
+
+    #[test]
+    fn focus_switch_google_failure_leaves_the_pointer_unchanged() {
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http_a = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-a", &a.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_a, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &a.id, NOW_UNIX,
+        ))
+        .unwrap();
+        let http_b = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-b", &b.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &b.id, NOW_UNIX,
+        ))
+        .unwrap();
+        let users = FakeUserRepo::focused(&a.id);
+
+        // Step 1 of the switch (snap A) fails with a Google 500: abort with
+        // the pointer still on A, no rollback.
+        let switch_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![
+            ("/events/g-a", 500, r#"{"error":"boom"}"#),
+            ("/events/g-b", 200, &patched_event_json_for("g-b", &b.id, NOW_SNAPPED, "2023-11-14T22:18:00Z")),
+            ("/events", 200, &event_json_with_id("g-new", &b.id, "2023-11-14T22:18:00Z", "2023-11-14T22:33:00Z")),
+        ]);
+        let err = pollster::block_on(focus_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &b.id, switch_unix,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::GoogleApi(_)), "got {err:?}");
+        assert_eq!(
+            users.pointer().as_deref(),
+            Some(a.id.as_str()),
+            "a mid-switch failure leaves the pointer unchanged"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no create before the snap");
+    }
+
+    #[test]
+    fn delete_focus_when_focused_snaps_and_opens_an_unprefixed_continuation() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_focus_http, calendars, events, logs, users) =
+            focus_first(&lists, &categories, &tasks, &task.id);
+        assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
+
+        let delete_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-focus",
+                200,
+                &patched_event_json_for("g-focus", &task.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &event_json_with_id("g-after", &task.id, "2023-11-14T22:23:00Z", "2023-11-14T22:38:00Z"),
+            ),
+        ]);
+        let response = pollster::block_on(delete_focus(
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &access(), "u-1", delete_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(users.pointer(), None, "pointer cleared");
+        let task_view = response.task.unwrap();
+        assert_eq!(task_view.id, task.id);
+        assert!(!task_view.focused, "the continuation is unfocused");
+        assert!(response.previous.is_none());
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].google_event_id, "g-after");
+
+        // Snap the focused chip (end only, keeps the flag), then the unprefixed
+        // continuation.
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let (url, body) = patches.first().unwrap().clone();
+        assert!(url.contains("/events/g-focus"), "{url}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("extendedProperties").is_none(), "snap is end only: {body}");
+
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let (_, body) = posts.first().unwrap().clone();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["extendedProperties"]["shared"]["sanctuary_task_id"], task.id);
+        assert!(
+            v["extendedProperties"]["shared"].get("sanctuary_focus").is_none(),
+            "the continuation never carries the flag: {body}"
+        );
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_UNFOCUSED);
+        assert_eq!(inserted.last().unwrap().google_event_id.as_deref(), Some("g-after"));
+    }
+
+    #[test]
+    fn delete_focus_with_empty_pointer_is_a_200_noop() {
+        let (_lists, categories, tasks) = seeded();
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(delete_focus(
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &access(), "u-1", NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert!(response.task.is_none());
+        assert!(response.previous.is_none());
+        assert!(response.events.is_empty());
+        assert_eq!(users.pointer(), None);
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google write");
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google write");
+    }
+
+    #[test]
+    fn stop_of_the_focused_task_clears_focus_without_a_continuation() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_focus_http, calendars, events, logs, users) =
+            focus_first(&lists, &categories, &tasks, &task.id);
+        assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
+
+        let stop_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-focus",
+            200,
+            &patched_event_json_for("g-focus", &task.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, stop_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(users.pointer(), None, "exiting the focused task clears the pointer");
+        assert!(http.posts.lock().unwrap().is_empty(), "exits snap, no continuation insert");
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "the focused segment closes through the focused log");
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|l| l.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "focused", "unfocused", "stopped"]);
+        assert_eq!(inserted[2].google_event_id.as_deref(), Some("g-focus"), "unfocused carries the snap ids");
+        assert_eq!(inserted[3].google_event_id.as_deref(), Some("g-focus"), "stopped carries the snap ids");
+    }
+
+    #[test]
+    fn stop_of_an_unfocused_task_keeps_the_focus_pointer() {
+        let (lists, categories, tasks) = seeded();
+        let a = work_task(&lists, &categories, &tasks);
+        let b = work_task(&lists, &categories, &tasks);
+
+        // Focus A (shared stores), then start B against the same cache/logs.
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &a.id);
+        let focus_unix = NOW_UNIX + 300;
+        let focus_http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json_for("g-1", &a.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &focused_event_json("g-af", &a.id, "2023-11-14T22:18:00Z", "2023-11-14T22:33:00Z"),
+            ),
+        ]);
+        let users = FakeUserRepo::default();
+        pollster::block_on(focus_task(
+            &focus_http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &a.id, focus_unix,
+        ))
+        .unwrap();
+        assert_eq!(users.pointer().as_deref(), Some(a.id.as_str()));
+
+        let http_b = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-b", &b.id, "2023-11-14T22:18:00Z", "2023-11-14T22:33:00Z"),
+        )]);
+        pollster::block_on(start_task(
+            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &b.id, focus_unix,
+        ))
+        .unwrap();
+
+        // Stop the unfocused peer: focus is untouched.
+        let stop_unix = NOW_UNIX + 600;
+        let stop_http = FakeHttp::new(vec![(
+            "/events/g-b",
+            200,
+            &patched_event_json_for("g-b", &b.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &stop_http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &b.id, stop_unix,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert_eq!(
+            users.pointer().as_deref(),
+            Some(a.id.as_str()),
+            "stopping the unfocused peer leaves focus untouched"
+        );
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|l| l.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "focused", "started", "stopped"]);
+    }
+
+    #[test]
+    fn delete_of_the_focused_task_snaps_clears_pointer_and_soft_deletes() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let (_focus_http, calendars, events, logs, users) =
+            focus_first(&lists, &categories, &tasks, &task.id);
+        assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
+
+        let delete_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-focus",
+            200,
+            &patched_event_json_for("g-focus", &task.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
+        )]);
+        let response = pollster::block_on(delete_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &logs,
+            &users,
+            Some(&access()),
+            &tasks,
+            "u-1",
+            &task.id,
+            "2023-11-14T22:23:20Z",
+            delete_unix,
+        ))
+        .unwrap();
+
+        assert!(response.success);
+        assert_eq!(users.pointer(), None, "delete clears a pointer at the row");
+        assert!(
+            pollster::block_on(tasks.get_by_id(&task.id)).unwrap().is_none(),
+            "row soft-deleted"
+        );
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "living focused chip snapped");
+        assert!(http.posts.lock().unwrap().is_empty(), "no continuation on delete");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|l| l.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "focused"], "delete opens no continuation log");
     }
 
     // ──────────────────────────────────────────
@@ -5969,6 +7178,7 @@ mod tests {
         categories: &FakeTaskCategoryRepo,
         tasks: &FakeTaskRepo,
         logs: &FakeTaskLogRepo,
+        users: &FakeUserRepo,
         access: Option<&GoogleAccess>,
         task_id: &str,
         status: &str,
@@ -5982,6 +7192,7 @@ mod tests {
             categories,
             tasks,
             logs,
+            users,
             access,
             "u-1",
             task_id,
@@ -6026,11 +7237,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         // Park the peer in PLANNED first (session-only, no Google).
         let parked = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &peer.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -6038,7 +7250,7 @@ mod tests {
 
         // Plan `task` at the front: the PLANNED peer shifts up to 1.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -6068,17 +7280,18 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let planned = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
         assert_eq!(planned.task.status, TASK_STATUS_PLANNED);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &task.id, TASK_STATUS_OPEN, Some(0),
         )
         .unwrap();
@@ -6097,11 +7310,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
         let http = FakeHttp::new(vec![]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -6119,6 +7333,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -6126,7 +7341,7 @@ mod tests {
         )]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
             Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
@@ -6157,6 +7372,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![(
             "/events",
             200,
@@ -6164,7 +7380,7 @@ mod tests {
         )]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
             Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
@@ -6189,6 +7405,7 @@ mod tests {
             200,
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
         )]);
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
@@ -6197,6 +7414,7 @@ mod tests {
             &categories,
             &tasks,
             &logs,
+            &users,
             Some(&access()),
             "u-1",
             &task.id,
@@ -6230,6 +7448,7 @@ mod tests {
             200,
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
@@ -6238,6 +7457,7 @@ mod tests {
             &categories,
             &tasks,
             &logs,
+            &users,
             Some(&access()),
             "u-1",
             &task.id,
@@ -6276,6 +7496,7 @@ mod tests {
             200,
             &created_event_json(&second.id, NOW_SNAPPED, NOW_END),
         )]);
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
@@ -6284,6 +7505,7 @@ mod tests {
             &categories,
             &tasks,
             &logs,
+            &users,
             Some(&access()),
             "u-1",
             &second.id,
@@ -6320,11 +7542,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         // Drag A (rank 0) down to rank 2: the peers in (0, 2] shift down one.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &a.id, TASK_STATUS_OPEN, Some(2),
         )
         .unwrap();
@@ -6338,7 +7561,7 @@ mod tests {
 
         // And back up: A (rank 2) to rank 0 — peers in [0, 2) shift up one.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &a.id, TASK_STATUS_OPEN, Some(0),
         )
         .unwrap();
@@ -6366,6 +7589,7 @@ mod tests {
         drop(_start_http);
 
         let http = FakeHttp::new(vec![]);
+        let users = FakeUserRepo::default();
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
@@ -6374,6 +7598,7 @@ mod tests {
             &categories,
             &tasks,
             &logs,
+            &users,
             None, // the no-op never dispatches, so even Google-less works
             "u-1",
             &task.id,
@@ -6424,8 +7649,9 @@ mod tests {
 
         // Swap: drag B (rank 1) to rank 0 — A (rank 0) shifts up to 1.
         let http = FakeHttp::new(vec![]);
+        let users = FakeUserRepo::default();
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &b.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
@@ -6454,6 +7680,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let unknown = MoveTaskInput {
@@ -6461,7 +7688,7 @@ mod tests {
             sort_order: Some(0),
         };
         let err = pollster::block_on(move_task(
-            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            Some(&http), &calendars, &events, &lists,             &categories, &tasks, &logs, &users, None,
             "u-1", &task.id, NOW_UNIX, &unknown,
         ))
         .unwrap_err();
@@ -6476,7 +7703,7 @@ mod tests {
             sort_order: Some(-1),
         };
         let err = pollster::block_on(move_task(
-            Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            Some(&http), &calendars, &events, &lists,             &categories, &tasks, &logs, &users, None,
             "u-1", &task.id, NOW_UNIX, &negative,
         ))
         .unwrap_err();
@@ -6496,6 +7723,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
         let input = MoveTaskInput {
             status: TASK_STATUS_OPEN.to_string(),
@@ -6504,14 +7732,14 @@ mod tests {
 
         assert!(matches!(
             pollster::block_on(move_task(
-                Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs,
+                Some(&http), &calendars, &events, &lists,                 &categories, &tasks, &logs, &users,
                 None, "u-2", &task.id, NOW_UNIX, &input,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(move_task(
-                Some(&http), &calendars, &events, &lists, &categories, &tasks, &logs,
+                Some(&http), &calendars, &events, &lists,                 &categories, &tasks, &logs, &users,
                 None, "u-1", "nope", NOW_UNIX, &input,
             )),
             Err(TasksError::NotFound)
@@ -6533,11 +7761,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         // Plan A with an explicit drop (0 is fine).
         let planned = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &a.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -6547,7 +7776,7 @@ mod tests {
         // living OPEN peers (B holds 1), landing at 2 — not at its leftover
         // PLANNED rank and not at the tail of an inflated max.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &a.id, TASK_STATUS_OPEN, None,
         )
         .unwrap();
@@ -6571,10 +7800,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let first = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &a.id, TASK_STATUS_PLANNED, None,
         )
         .unwrap();
@@ -6585,7 +7815,7 @@ mod tests {
         );
 
         let second = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &b.id, TASK_STATUS_PLANNED, None,
         )
         .unwrap();
@@ -6607,11 +7837,12 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         // Seed a PLANNED peer at 0 (plan via move with an explicit drop).
         let planned = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &peer.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -6635,6 +7866,7 @@ mod tests {
             &categories,
             &tasks,
             &logs,
+            &users,
             Some(&access()),
             "u-1",
             &task.id,
@@ -6667,6 +7899,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         // Seed a COMPLETED peer at 0 (dummy row: set_status + rank).
@@ -6674,7 +7907,7 @@ mod tests {
         pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &task.id, TASK_STATUS_COMPLETED, None,
         )
         .unwrap();
@@ -6699,10 +7932,11 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
         let http = FakeHttp::new(vec![]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
             &b.id, TASK_STATUS_OPEN, None,
         )
         .unwrap();

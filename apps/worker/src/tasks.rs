@@ -269,6 +269,11 @@ pub async fn update_task(
 
 /// `DELETE /api/tasks/:id` → 200 `{"success":true}` (soft delete; 404 for
 /// missing/other-user tasks).
+///
+/// The focus pointer decides the auth gate: deleting the user's **focused**
+/// task snaps its living event, so it uses the timer's Google gate (401
+/// without a refreshable token); every other delete stays session-only. The
+/// pointer is always cleared when it points at the deleted id.
 pub async fn delete_task(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -281,7 +286,44 @@ pub async fn delete_task(
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
-    match api_core::delete_task(&d1(&ctx)?, &user.id, id, &now_rfc3339).await {
+
+    let users = users_d1(&ctx)?;
+    let focused_task_id = users
+        .get_by_id(&user.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.focused_task_id);
+    let is_focused = focused_task_id.as_deref() == Some(id);
+    let repos = timer_d1(&ctx)?;
+    let (http, access) = if is_focused {
+        let (_user_id, access) = match timer_access(&req, &ctx).await? {
+            Ok(gated) => gated,
+            Err(response) => return Ok(response),
+        };
+        (
+            Some(&crate::http::WorkerHttp as &dyn api_core::HttpClient),
+            Some(access),
+        )
+    } else {
+        (None, None)
+    };
+
+    match api_core::delete_task(
+        http,
+        &repos.calendars,
+        &repos.events,
+        &repos.logs,
+        &users,
+        access.as_ref(),
+        &d1(&ctx)?,
+        &user.id,
+        id,
+        &now_rfc3339,
+        now_unix,
+    )
+    .await
+    {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
@@ -396,6 +438,7 @@ macro_rules! timer_action {
                 return json_error(&ctx, 404, "task not found");
             };
             let repos = timer_d1(&ctx)?;
+            let users = users_d1(&ctx)?;
             let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
             let result = $path(
                 &crate::http::WorkerHttp,
@@ -404,6 +447,7 @@ macro_rules! timer_action {
                 &repos.categories,
                 &repos.tasks,
                 &repos.logs,
+                &users,
                 &access,
                 &user_id,
                 id,
@@ -527,6 +571,7 @@ pub async fn move_task(
         &repos.categories,
         &repos.tasks,
         &repos.logs,
+        &users_d1(&ctx)?,
         access.as_ref(),
         &user.id,
         id,
@@ -541,5 +586,98 @@ pub async fn move_task(
         }
         Err(err) => map_error(&ctx, err),
     }
+}
+
+// ──────────────────────────────────────────
+// Focus verbs (task-focus, slice 3)
+// ──────────────────────────────────────────
+
+/// Serializes a `FocusTaskResponse` (or maps the error).
+fn respond_focus(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    result: Result<api_core::FocusTaskResponse, TasksError>,
+) -> Result<Response> {
+    match result {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(ctx))?))
+        }
+        Err(err) => map_error(ctx, err),
+    }
+}
+
+/// `POST /api/tasks/:id/focus` → 200 `{"task":{...},"previous":{...}|null,"events":[...]}`.
+///
+/// Focuses the task's live calendar segment (task-focus, slice 3): on a
+/// switch the previous focused task is snapped and its unfocused continuation
+/// opens, the focused task gets a flagged segment, and the user's
+/// `focused_task_id` pointer moves. Focus is IN_PROGRESS-only (400 otherwise);
+/// a missing/other-user/soft-deleted task is 404; already-focused is a 200
+/// no-op (or a repair when the flagged chip is gone).
+///
+/// Same gate as `/start`: session + a refreshable Google token (401 otherwise)
+/// — even for the 200 no-op.
+pub async fn focus_task(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let (user_id, access) = match timer_access(&req, &ctx).await? {
+        Ok(gated) => gated,
+        Err(response) => return Ok(response),
+    };
+    let Some(id) = ctx.param("id") else {
+        return json_error(&ctx, 404, "task not found");
+    };
+    let repos = timer_d1(&ctx)?;
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let result = api_core::focus_task(
+        &crate::http::WorkerHttp,
+        &repos.calendars,
+        &repos.events,
+        &repos.lists,
+        &repos.categories,
+        &repos.tasks,
+        &repos.logs,
+        &users_d1(&ctx)?,
+        &access,
+        &user_id,
+        id,
+        now_unix,
+    )
+    .await;
+    respond_focus(&ctx, result)
+}
+
+/// `DELETE /api/focus` → 200 `{"task":{...}|null,"previous":null,"events":[...]}`.
+///
+/// Drops the focus pointer, snapping the focused chip and opening an
+/// unprefixed continuation. An empty/invalid pointer is a 200 no-op
+/// (`task: null`). Same gate as `/start` (session + refreshable token,
+/// required even for the no-op). `DELETE /api/focus` is NOT under
+/// `/api/tasks/:id`.
+pub async fn delete_focus(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let (user_id, access) = match timer_access(&req, &ctx).await? {
+        Ok(gated) => gated,
+        Err(response) => return Ok(response),
+    };
+    let repos = timer_d1(&ctx)?;
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let result = api_core::delete_focus(
+        &crate::http::WorkerHttp,
+        &repos.calendars,
+        &repos.events,
+        &repos.categories,
+        &repos.tasks,
+        &repos.logs,
+        &users_d1(&ctx)?,
+        &access,
+        &user_id,
+        now_unix,
+    )
+    .await;
+    respond_focus(&ctx, result)
 }
 

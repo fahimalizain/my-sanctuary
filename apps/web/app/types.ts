@@ -331,3 +331,14 @@ export interface MoveTaskResponse {
   task: TaskRecord;
   event: CalendarEvent | null;
 }
+
+// The envelope returned by POST /api/tasks/:id/focus and DELETE /api/focus
+// (task-focus). `task` is the task that now holds (POST) or has just lost
+// (DELETE) focus — the frontend also uses it to gauge whether focus is on.
+// `previous` is the task that lost focus on a switch (null otherwise), and
+// `events` are the new calendar segments created by the request.
+export interface FocusTaskResponse {
+  task: TaskRecord | null;
+  previous: TaskRecord | null;
+  events: CalendarEvent[];
+}

@@ -345,17 +345,21 @@ pub trait TaskRepo: Send + Sync {
 ///
 /// Append-only by design — nothing ever updates or deletes a row. The only
 /// read is [`TaskLogRepo::latest_started_by_task_id`]: closing a run PATCHes
-/// the Google event the task's most recent `started` row points at, so the
-/// timer never depends on the event window for identity.
+/// the Google event the task's newest **event-bearing** row (`started`, or a
+/// slice-3 `focused`/`unfocused` segment) points at, so the timer never
+/// depends on the event window for identity.
 #[async_trait(?Send)]
 pub trait TaskLogRepo: Send + Sync {
     /// Inserts one log row. The D1 implementation generates the UUID `id` and
     /// the `created_at` timestamp; `at` (the transition instant) comes from
     /// the service. Returns the generated `id`.
     async fn insert(&self, log: NewTaskLog, now_rfc3339: &str) -> Result<String, RepoError>;
-    /// The task's most recent `started` row (ties broken by insertion time),
-    /// or `None` when the task never started. Its `calendar_id`/
-    /// `google_event_id` name the event the exit verbs PATCH.
+    /// The task's newest **event-bearing** log row — `started`, `focused`, or
+    /// `unfocused` with a non-empty `google_event_id`, ties broken by
+    /// insertion time — or `None` when the task never opened an event. Its
+    /// `calendar_id`/`google_event_id` name the event the exit verbs and the
+    /// elongate cron PATCH (the newest focus segment is followed
+    /// automatically).
     async fn latest_started_by_task_id(&self, task_id: &str) -> Result<Option<TaskLog>, RepoError>;
 }
 
@@ -861,12 +865,18 @@ pub const TASK_LOG_INSERT_SQL: &str = "
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
-/// The exit verbs' event identity: the task's most recent `started` row (the
-/// `type` column is TEXT, so the literal needs no quotes gymnastics; ties by
-/// `created_at` keep the D1 insertion order).
+/// The exit verbs' event identity: the task's newest **event-bearing** row —
+/// a `started` (the timer's original chapter), `focused`, or `unfocused` log
+/// (slice 3 focus segments all land here too — the exit verbs and the
+/// elongate cron follow the newest segment automatically) that carries a
+/// non-empty `google_event_id`. Terminal/in-between rows (`stopped`, …) never
+/// point at an event, so they are skipped (the `type` column is TEXT, so the
+/// literal list needs no quote gymnastics; ties by `created_at` keep the D1
+/// insertion order).
 pub const TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL: &str = "
     SELECT * FROM task_logs
-    WHERE task_id = ? AND type = 'started'
+    WHERE task_id = ? AND type IN ('started', 'focused', 'unfocused')
+      AND google_event_id IS NOT NULL AND google_event_id != ''
     ORDER BY at DESC, created_at DESC
     LIMIT 1
 ";
@@ -1459,11 +1469,20 @@ mod tests {
     }
 
     #[test]
-    fn task_log_latest_started_query_filters_type_and_takes_newest() {
+    fn task_log_latest_started_query_filters_event_bearing_type_and_takes_newest() {
         let sql = TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL;
         assert!(sql.contains("SELECT * FROM task_logs"), "{sql}");
         assert!(sql.contains("task_id = ?"), "{sql}");
-        assert!(sql.contains("type = 'started'"), "only started rows: {sql}");
+        // Slice 3: focus segments (`focused`/`unfocused` logs) join `started`
+        // as event identity — the exit verbs follow the newest segment.
+        assert!(
+            sql.contains("type IN ('started', 'focused', 'unfocused')"),
+            "only event-bearing types: {sql}"
+        );
+        assert!(
+            sql.contains("google_event_id IS NOT NULL AND google_event_id != ''"),
+            "only logs that name an event: {sql}"
+        );
         assert!(
             sql.contains("ORDER BY at DESC, created_at DESC"),
             "{sql}"

@@ -632,6 +632,13 @@ pub struct NewEventInput {
     /// stored `google_color_id`. Hand-created events leave this unset.
     #[serde(default)]
     pub color_id: Option<String>,
+    /// Focus segment flag (task-focus, slice 3): when `task_id` is set AND
+    /// this is `true`, the insert payload also carries
+    /// `extendedProperties.shared.sanctuary_focus = "1"` next to the task
+    /// carrier — "never send a partial shared map" (the key is omitted, never
+    /// `"0"`, when `false`). `start_task` stays unfocused (`false`).
+    #[serde(default)]
+    pub sanctuary_focus: bool,
 }
 
 #[cfg(test)]
