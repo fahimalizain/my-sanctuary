@@ -179,8 +179,7 @@ function displayIds(tasks: TaskRecord[], status: TaskStatus): string[] {
     .filter((task) => task.status === status)
     .sort(
       (a, b) =>
-        a.sort_order - b.sort_order ||
-        a.created_at.localeCompare(b.created_at),
+        a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at),
     )
     .map((task) => task.id);
 }
@@ -190,10 +189,30 @@ function displayIds(tasks: TaskRecord[], status: TaskStatus): string[] {
 // sort D *after* A.
 test('applyOptimisticMove: last→first (D to rank 0) paints D,A,B,C', () => {
   const tasks = [
-    task({ id: 'A', status: 'OPEN', sort_order: 0, created_at: '2026-08-20T00:00:00Z' }),
-    task({ id: 'B', status: 'OPEN', sort_order: 1, created_at: '2026-08-20T01:00:00Z' }),
-    task({ id: 'C', status: 'OPEN', sort_order: 2, created_at: '2026-08-20T02:00:00Z' }),
-    task({ id: 'D', status: 'OPEN', sort_order: 3, created_at: '2026-08-20T03:00:00Z' }),
+    task({
+      id: 'A',
+      status: 'OPEN',
+      sort_order: 0,
+      created_at: '2026-08-20T00:00:00Z',
+    }),
+    task({
+      id: 'B',
+      status: 'OPEN',
+      sort_order: 1,
+      created_at: '2026-08-20T01:00:00Z',
+    }),
+    task({
+      id: 'C',
+      status: 'OPEN',
+      sort_order: 2,
+      created_at: '2026-08-20T02:00:00Z',
+    }),
+    task({
+      id: 'D',
+      status: 'OPEN',
+      sort_order: 3,
+      created_at: '2026-08-20T03:00:00Z',
+    }),
   ];
   const result = applyOptimisticMove(tasks, 'D', 'OPEN', 0);
   assert.deepEqual(

@@ -66,18 +66,12 @@ test('pickPointerHit: two cards resolve to the first (nearest) card', () => {
 
 test('pickPointerHit: only unknown / missing types resolve to null', () => {
   assert.equal(pickPointerHit([{ id: 'task-1' }]), null);
-  assert.equal(
-    pickPointerHit([{ id: 'task-1' }, { id: 'task-2' }]),
-    null,
-  );
+  assert.equal(pickPointerHit([{ id: 'task-1' }, { id: 'task-2' }]), null);
 });
 
 test('pickPointerHit: a column wins over an unknown-type hit', () => {
   assert.equal(
-    pickPointerHit([
-      { id: 'task-1' },
-      { id: 'column:OPEN', type: 'column' },
-    ]),
+    pickPointerHit([{ id: 'task-1' }, { id: 'column:OPEN', type: 'column' }]),
     'column:OPEN',
   );
 });

@@ -100,9 +100,7 @@ export function BoardColumnView({
           ref={setNodeRef}
           className={cn(
             'flex-1 space-y-2 p-3 transition-colors',
-            overThisColumn &&
-              tasks.length === 0 &&
-              'bg-muted/40 rounded-lg',
+            overThisColumn && tasks.length === 0 && 'bg-muted/40 rounded-lg',
           )}
         >
           {tasks.length > 0 ? (
