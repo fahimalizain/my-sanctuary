@@ -69,15 +69,12 @@ export const COLUMN_ID_PREFIX = 'column:';
  *  - Middle → the hovered visible card's own rank (insert before it).
  *  - End → last visible rank + 1. Done/Discarded clamp at the rank of the
  *    20th visible match so the drop never lands past the capped window (the
- *    old last-visible card is pushed to #20 and off the board).
- *  - In Progress is a singleton: the rank is always 0. */
+ *    old last-visible card is pushed to #20 and off the board). */
 export function resolveSortOrder(
   remaining: TaskRecord[],
   destIndex: number,
   destStatus: TaskStatus,
 ): number {
-  if (destStatus === 'IN_PROGRESS') return 0;
-
   if (remaining.length === 0 || destIndex <= 0) {
     return remaining[0]?.sort_order ?? 0;
   }

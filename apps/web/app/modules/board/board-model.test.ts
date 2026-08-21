@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { TaskRecord, TaskStatus } from '../../types';
-import { defaultMoveRank } from './board-model';
+import { defaultMoveRank, resolveSortOrder } from './board-model';
 
 // ── Fixtures (inline — never import mock-data) ───────────────────────────
 
@@ -97,4 +97,39 @@ test('defaultMoveRank: excludeId keeps the mover out of its own append target', 
   ];
   assert.equal(defaultMoveRank('PLANNED', 'OPEN', tasks, 'mover'), 2);
   assert.equal(defaultMoveRank('PLANNED', 'OPEN', tasks, 'ghost'), 10);
+});
+
+// ── resolveSortOrder (remaining = dest column minus dragged id; destIndex is
+//    a view index into the column's filtered, capped display list) ─────────
+
+test('resolveSortOrder: empty In Progress pile drops at 0', () => {
+  assert.equal(resolveSortOrder([], 0, 'IN_PROGRESS'), 0);
+});
+
+test('resolveSortOrder: In Progress drop onto the top takes the first card rank', () => {
+  const tasks = [
+    task({ status: 'IN_PROGRESS', sort_order: 2 }),
+    task({ status: 'IN_PROGRESS', sort_order: 7 }),
+  ];
+  // Prepend-compatible: the first visible card's rank (not hardcoded 0).
+  assert.equal(resolveSortOrder(tasks, 0, 'IN_PROGRESS'), 2);
+});
+
+test('resolveSortOrder: In Progress insert before the second card is not always 0', () => {
+  const tasks = [
+    task({ status: 'IN_PROGRESS', sort_order: 0 }),
+    task({ status: 'IN_PROGRESS', sort_order: 1 }),
+  ];
+  // destIndex 1 = insert before the card at view index 1 → its rank, 1.
+  assert.equal(resolveSortOrder(tasks, 1, 'IN_PROGRESS'), 1);
+});
+
+test('resolveSortOrder: In Progress drop past the end appends last rank + 1', () => {
+  const tasks = [
+    task({ status: 'IN_PROGRESS', sort_order: 0 }),
+    task({ status: 'IN_PROGRESS', sort_order: 1 }),
+  ];
+  // Unranked beyond the pile → last visible rank + 1 (no 20-card cap).
+  assert.equal(resolveSortOrder(tasks, 2, 'IN_PROGRESS'), 2);
+  assert.equal(resolveSortOrder(tasks, 5, 'IN_PROGRESS'), 2);
 });
