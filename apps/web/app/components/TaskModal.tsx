@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Clock, Flag, Gauge, Loader2 } from 'lucide-react';
+import { Clock, Flag, Gauge, Loader2, Pin } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -64,6 +64,12 @@ interface TaskModalProps {
    *  singleton lock). sort_order is omitted — no drop: the server applies
    *  the column default. When omitted, Status renders read-only. */
   onMove?: (taskId: string, status: TaskStatus) => Promise<string | null>;
+  /** Immediate focus toggle (edit only, IN_PROGRESS only). Same contract as
+   *  onMove: the board owns the optimistic paint, revert and banner, and
+   *  returns an error string (null on success). Only shown when the edited
+   *  task is IN_PROGRESS — ListsPage omits it, so that modal never renders
+   *  the control. */
+  onToggleFocus?: (task: TaskRecord) => Promise<string | null>;
 }
 
 const difficultyConfig: Record<TaskDifficulty, { label: string }> = {
@@ -108,6 +114,7 @@ export function TaskModal({
   onSubmit,
   onDelete,
   onMove,
+  onToggleFocus,
 }: TaskModalProps) {
   const isEditing = !!task;
   // (Re)initialize the form when the dialog opens or the target task id
@@ -193,6 +200,8 @@ export function TaskModal({
   const [saving, setSaving] = useState(false);
   // A /move is in flight — pills and Save/Delete are disabled.
   const [movingStatus, setMovingStatus] = useState(false);
+  // A focus toggle is in flight — the Focus/Unfocus pill is disabled.
+  const [focusPending, setFocusPending] = useState(false);
 
   // The category lock: an explicit user pick. Passed as `category_id` to
   // classify, so a locked title persists its affixes (e.g. "Work | SpicyHome")
@@ -388,6 +397,18 @@ export function TaskModal({
     setFormError(null);
     const error = await onMove(task.id, dest);
     setMovingStatus(false);
+    if (error) setFormError(error);
+  };
+
+  /** Runs a focus toggle (edit + IN_PROGRESS only, like the status pills).
+   *  The parent merges the server rows into `task` so the pill follows; on
+   *  error the message lands in `formError` and the modal stays open. */
+  const runToggleFocus = async () => {
+    if (!task || !onToggleFocus || focusPending || movingStatus) return;
+    setFocusPending(true);
+    setFormError(null);
+    const error = await onToggleFocus(task);
+    setFocusPending(false);
     if (error) setFormError(error);
   };
 
@@ -673,6 +694,40 @@ export function TaskModal({
                           {statusConfig[status].label}
                         </button>
                       ),
+                    )}
+                    {/* Focus control — IN_PROGRESS only (focus is
+                        IP-only; the API 400s any other status), and only
+                        when the board wired it up (ListsPage omits
+                        onToggleFocus). Renders as a Focus/Unfocus pill right
+                        next to the status pills. */}
+                    {task!.status === 'IN_PROGRESS' && onToggleFocus && (
+                      <button
+                        type="button"
+                        onClick={() => void runToggleFocus()}
+                        disabled={focusPending || movingStatus || saving}
+                        aria-pressed={task!.focused}
+                        aria-label={task!.focused ? 'Unfocus' : 'Focus'}
+                        className={cn(
+                          'flex items-center gap-2 px-4 py-2 rounded-xl border-2 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-50',
+                          task!.focused
+                            ? 'bg-primary/10 border-primary text-primary'
+                            : 'bg-background border-input text-muted-foreground hover:border-primary/30',
+                        )}
+                      >
+                        <Pin
+                          className={cn(
+                            'h-4 w-4',
+                            task!.focused && 'fill-current',
+                          )}
+                        />
+                        {focusPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : task!.focused ? (
+                          'Unfocus'
+                        ) : (
+                          'Focus'
+                        )}
+                      </button>
                     )}
                   </div>
                 </div>

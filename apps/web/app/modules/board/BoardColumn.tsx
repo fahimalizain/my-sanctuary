@@ -22,6 +22,8 @@ export function BoardColumnView({
   items,
   movingIds,
   onEditTask,
+  onToggleFocus,
+  focusDisabled,
   onAddTask,
 }: {
   column: BoardColumn;
@@ -31,6 +33,10 @@ export function BoardColumnView({
   /** Cards with a /move in flight: their drag handlers are disabled. */
   movingIds: Set<string>;
   onEditTask: (task: TaskRecord) => void;
+  /** Focus-pin tap → BoardPage.handleToggleFocus (see TaskCard). */
+  onToggleFocus?: (task: TaskRecord) => void;
+  /** A focus request is in flight: every pin is disabled. */
+  focusDisabled?: boolean;
   /** Column-header + : opens New Task locked to this column's status. */
   onAddTask: (status: TaskStatus) => void;
 }) {
@@ -94,6 +100,8 @@ export function BoardColumnView({
                 key={task.id}
                 task={task}
                 onEdit={onEditTask}
+                onToggleFocus={onToggleFocus}
+                focusDisabled={focusDisabled}
                 disabled={movingIds.has(task.id)}
               />
             ))

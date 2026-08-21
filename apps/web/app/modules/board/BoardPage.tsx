@@ -18,6 +18,7 @@ import {
   TASK_PRIORITY_LABELS,
   type CategoriesResponse,
   type Category,
+  type FocusTaskResponse,
   type MoveTaskInput,
   type MoveTaskResponse,
   type NewTaskInput,
@@ -86,6 +87,9 @@ export function BoardPage() {
   // Cards with a /move request in flight — dragging them again is ignored
   // until the response lands (no queuing).
   const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
+  // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
+  // flight: further pin taps are ignored and every pin is disabled.
+  const [focusInFlight, setFocusInFlight] = useState(false);
 
   // PointerSensor with an 8px activation distance: a plain click still opens
   // the edit modal, and only a real 8px+ movement starts a drag (ADR 0002
@@ -482,6 +486,107 @@ export function BoardPage() {
   };
 
   // ──────────────────────────────────────────
+  // Focus toggle (task-focus, slice 4)
+  // ──────────────────────────────────────────
+
+  /** Merges the authoritative `{ task, previous }` rows from a focus response
+   *  into the board by id, and keeps the edit modal's `task` prop in sync when
+   *  it is one of the two — the modal stays open after a focus toggle, so the
+   *  Focus pill follows the server like the status pills follow a /move. */
+  const mergeFocusRows = (data: FocusTaskResponse): void => {
+    const focusedRow = data.task;
+    const previousRow = data.previous;
+    setTasks((prev) =>
+      prev.map((entry) => {
+        if (focusedRow && entry.id === focusedRow.id) return focusedRow;
+        if (previousRow && entry.id === previousRow.id) return previousRow;
+        return entry;
+      }),
+    );
+    setTaskForm((prev) => {
+      if (!prev || prev.mode !== 'edit' || !prev.task) return prev;
+      if (focusedRow && focusedRow.id === prev.task.id) {
+        return { ...prev, task: focusedRow };
+      }
+      if (previousRow && previousRow.id === prev.task.id) {
+        return { ...prev, task: previousRow };
+      }
+      return prev;
+    });
+  };
+
+  /** One negotiated focus request. The caller has already applied the
+   *  OPTIMISTIC paint; here we wait for the server:
+   *  - 200 → merge the authoritative `{ task, previous }` rows (onSuccess);
+   *  - failure → restore the full snapshot and raise the action banner.
+   *  Returns the error message (null on success) so the modal Focus pill can
+   *  show it on the form too. Mirrors sendMoveRequest (API_BASE_URL,
+   *  credentials: 'include', readError). */
+  const sendFocusRequest = async (
+    isFocus: boolean,
+    taskId: string,
+    snapshot: TaskRecord[],
+    onSuccess: (data: FocusTaskResponse) => void,
+  ): Promise<string | null> => {
+    setFocusInFlight(true);
+    setActionError(null);
+    try {
+      const res = isFocus
+        ? await fetch(`${API_BASE_URL}/api/tasks/${taskId}/focus`, {
+            method: 'POST',
+            credentials: 'include',
+          })
+        : await fetch(`${API_BASE_URL}/api/focus`, {
+            method: 'DELETE',
+            credentials: 'include',
+          });
+      if (!res.ok) {
+        const message = await readError(res);
+        setTasks(snapshot);
+        setActionError(message);
+        return message;
+      }
+      onSuccess((await res.json()) as FocusTaskResponse);
+      return null;
+    } catch (err) {
+      setTasks(snapshot);
+      const message = err instanceof Error ? err.message : 'Focus change failed';
+      setActionError(message);
+      return message;
+    } finally {
+      setFocusInFlight(false);
+    }
+  };
+
+  /** Optimistic focus toggle, used by both the card pin and the modal Focus
+   *  control. Focus is IN_PROGRESS-only — the pin renders only on IP cards and
+   *  the modal shows the control only for IP tasks, so every other status is
+   *  unreachable here (and would 400). While a request is in flight further
+   *  taps are ignored (focusInFlight guard) and every pin is disabled
+   *  (focusDisabled). POST focuses the target and clears every other card;
+   *  DELETE unfocuses (all clear). On 502/4xx the pre-toggle snapshot is
+   *  restored and the actionError banner raised. Returns the error message
+   *  (null on success). */
+  const handleToggleFocus = async (
+    task: TaskRecord,
+  ): Promise<string | null> => {
+    if (focusInFlight) return null;
+    const snapshot = tasksRef.current;
+    const targetId = task.id;
+    if (task.focused) {
+      setTasks((prev) => prev.map((entry) => ({ ...entry, focused: false })));
+      return sendFocusRequest(false, targetId, snapshot, mergeFocusRows);
+    }
+    setTasks((prev) =>
+      prev.map((entry) => ({
+        ...entry,
+        focused: entry.id === targetId,
+      })),
+    );
+    return sendFocusRequest(true, targetId, snapshot, mergeFocusRows);
+  };
+
+  // ──────────────────────────────────────────
   // Task actions (New Task + click-to-edit; no timer buttons this slice)
   // ──────────────────────────────────────────
 
@@ -839,6 +944,8 @@ export function BoardPage() {
                   items={itemsByColumn[column.status]}
                   movingIds={movingIds}
                   onEditTask={openEditTask}
+                  onToggleFocus={handleToggleFocus}
+                  focusDisabled={focusInFlight}
                   onAddTask={openCreateTask}
                 />
               ))}
@@ -868,6 +975,7 @@ export function BoardPage() {
         onSubmit={handleTaskSubmit}
         onDelete={handleTaskDelete}
         onMove={handleMoveTask}
+        onToggleFocus={handleToggleFocus}
       />
     </div>
   );
