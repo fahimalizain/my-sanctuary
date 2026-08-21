@@ -95,6 +95,87 @@ export function resolveSortOrder(
   return remaining[destIndex].sort_order;
 }
 
+/** destIndex from destShown (includes the mover) → index into `remaining`
+ *  (destShown minus the mover) so resolveSortOrder reads the hovered card,
+ *  not the one after it. When the mover sat *before* the hover target,
+ *  removing it shifts every later index down by one. */
+export function destIndexInRemaining(
+  destIndexInShown: number,
+  oldIndexInShown: number, // -1 if the mover is not in the dest column
+): number {
+  if (oldIndexInShown !== -1 && oldIndexInShown < destIndexInShown) {
+    return destIndexInShown - 1;
+  }
+  return destIndexInShown;
+}
+
+/** Optimistically applies a `/move` to the local task list — mirrors the
+ *  server exactly: `reorder_in_place` for a same-column drop
+ *  (packages/api-core/src/tasks.rs 1883–1915), `place_at` for a cross-column
+ *  one (1863–1881). The success merge only replaces the mover
+ *  (`response.task`), so siblings must already carry the post-shift ranks or
+ *  the board stays wrong until the next refresh.
+ *
+ *  - Same column, `destSortOrder < old`: dest peers (not the mover) with
+ *    `destSortOrder <= rank < old` shift +1.
+ *  - Same column, `destSortOrder > old`: dest peers with
+ *    `old < rank <= destSortOrder` shift −1.
+ *  - Same column, `destSortOrder === old`: no sibling changes.
+ *  - Cross column: dest peers with `rank >= destSortOrder` shift +1; the
+ *    source column is NOT compacted (gaps are fine, like `place_at`).
+ *
+ *  Input objects are never mutated; shifted rows and the mover are spread
+ *  into new objects. Returns `tasks` unchanged when the mover is missing. */
+export function applyOptimisticMove(
+  tasks: TaskRecord[],
+  taskId: string,
+  destStatus: TaskStatus,
+  destSortOrder: number,
+): TaskRecord[] {
+  const mover = tasks.find((task) => task.id === taskId);
+  if (!mover) return tasks;
+
+  const old = mover.sort_order;
+  if (mover.status === destStatus && destSortOrder !== old) {
+    if (destSortOrder < old) {
+      // new < old: peers with `new <= rank < old` shift up one.
+      tasks = tasks.map((task) =>
+        task.status === destStatus &&
+        task.id !== taskId &&
+        task.sort_order >= destSortOrder &&
+        task.sort_order < old
+          ? { ...task, sort_order: task.sort_order + 1 }
+          : task,
+      );
+    } else {
+      // new > old: peers with `old < rank <= new` shift down one.
+      tasks = tasks.map((task) =>
+        task.status === destStatus &&
+        task.id !== taskId &&
+        task.sort_order > old &&
+        task.sort_order <= destSortOrder
+          ? { ...task, sort_order: task.sort_order - 1 }
+          : task,
+      );
+    }
+  } else if (mover.status !== destStatus) {
+    // Cross-column: dest peers with `rank >= insert` shift up one.
+    tasks = tasks.map((task) =>
+      task.status === destStatus &&
+      task.id !== taskId &&
+      task.sort_order >= destSortOrder
+        ? { ...task, sort_order: task.sort_order + 1 }
+        : task,
+    );
+  }
+
+  return tasks.map((task) =>
+    task.id === taskId
+      ? { ...task, status: destStatus, sort_order: destSortOrder }
+      : task,
+  );
+}
+
 /** Mirrors the Rust `default_move_rank` (ADR 0002 § Move API): the column
  *  default for a no-drop `/move`. The max is computed over ALL tasks of the
  *  target status (the server queries the whole column, not the filtered

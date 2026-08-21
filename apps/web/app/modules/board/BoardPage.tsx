@@ -40,7 +40,9 @@ import {
   COLUMNS,
   COLUMN_ID_PREFIX,
   TERMINAL_COLUMN_CAP,
+  applyOptimisticMove,
   defaultMoveRank,
+  destIndexInRemaining,
   readError,
   resolveSortOrder,
 } from './board-model';
@@ -360,9 +362,10 @@ export function BoardPage() {
   };
 
   /** Normal drop path (no conflict): optimistically move the card, then
-   *  persist. Dropped-card status/sort_order are set directly; sibling
-   *  ranks are left alone until the response lands, so a moment of two cards
-   *  at the same rank is fine (tasksForColumn re-sorts immediately). */
+   *  persist. `applyOptimisticMove` shifts the dest column's sibling ranks
+   *  exactly like the server (reorder_in_place / place_at), so the board
+   *  paints the real slot immediately — the success merge only replaces the
+   *  mover (`response.task`). */
   const performMove = async (
     taskId: string,
     destStatus: TaskStatus,
@@ -370,11 +373,7 @@ export function BoardPage() {
   ) => {
     const snapshot = tasksRef.current;
     setTasks((prev) =>
-      prev.map((entry) =>
-        entry.id === taskId
-          ? { ...entry, status: destStatus, sort_order: destSortOrder }
-          : entry,
-      ),
+      applyOptimisticMove(prev, taskId, destStatus, destSortOrder),
     );
     await sendMoveRequest(
       taskId,
@@ -422,14 +421,20 @@ export function BoardPage() {
 
     const destShown = tasksForColumn(destStatus);
     const remaining = destShown.filter((task) => task.id !== activeId);
-    const destSortOrder = resolveSortOrder(remaining, destIndex, destStatus);
+    // The mover's shown index, hoisted so the same-slot no-op can compare
+    // against the unadjusted destIndex and the rank lookup can skip the
+    // mover (destIndexInRemaining) — destIndex counts the mover, `remaining`
+    // does not, so the raw index would read the NEXT card when moving down.
+    const oldIndex = destShown.findIndex((task) => task.id === activeId);
 
     // Same column + same slot = no movement: never call the API.
     if (destStatus === activeTask.status) {
-      const oldIndex = destShown.findIndex((task) => task.id === activeId);
       const slot = destIndex >= remaining.length ? remaining.length : destIndex;
       if (oldIndex !== -1 && slot === oldIndex) return;
     }
+
+    const insertIndex = destIndexInRemaining(destIndex, oldIndex);
+    const destSortOrder = resolveSortOrder(remaining, insertIndex, destStatus);
 
     void performMove(activeId, destStatus, destSortOrder);
   };
@@ -455,13 +460,7 @@ export function BoardPage() {
       snapshot,
       taskId,
     );
-    setTasks((prev) =>
-      prev.map((entry) =>
-        entry.id === taskId
-          ? { ...entry, status, sort_order: destRank }
-          : entry,
-      ),
-    );
+    setTasks((prev) => applyOptimisticMove(prev, taskId, status, destRank));
     return sendMoveRequest(taskId, { status }, snapshot, (data) => {
       setTasks((prev) =>
         prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
