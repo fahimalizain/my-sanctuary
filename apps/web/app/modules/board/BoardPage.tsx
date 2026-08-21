@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
-  PointerSensor,
-  closestCorners,
+  MouseSensor,
+  TouchSensor,
   useSensor,
   useSensors,
 } from '@dnd-kit/core';
@@ -35,12 +35,20 @@ import { BoardColumnView } from './BoardColumn';
 import { CategoryFilter } from './CategoryFilter';
 import { FilterPill } from './FilterPill';
 import { TaskCard } from './TaskCard';
+import {
+  boardCollisionDetection,
+  MOUSE_DND_DISTANCE_PX,
+  TOUCH_DND_DELAY_MS,
+  TOUCH_DND_TOLERANCE_PX,
+} from './board-dnd';
 import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
 import {
   COLUMNS,
   COLUMN_ID_PREFIX,
   TERMINAL_COLUMN_CAP,
+  applyOptimisticMove,
   defaultMoveRank,
+  destIndexInRemaining,
   readError,
   resolveSortOrder,
 } from './board-model';
@@ -91,12 +99,20 @@ export function BoardPage() {
   // flight: further pin taps are ignored and every pin is disabled.
   const [focusInFlight, setFocusInFlight] = useState(false);
 
-  // PointerSensor with an 8px activation distance: a plain click still opens
-  // the edit modal, and only a real 8px+ movement starts a drag (ADR 0002
-  // § DnD). Sensors live on the cards, so grabbing the scroll gutter or the
-  // column headers still scrolls the board horizontally.
+  // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
+  // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
+  // DevTools device mode speaks touch events, not pointer). Hold ~250ms
+  // to lift a card; a swipe still scrolls.
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(MouseSensor, {
+      activationConstraint: { distance: MOUSE_DND_DISTANCE_PX },
+    }),
+    useSensor(TouchSensor, {
+      activationConstraint: {
+        delay: TOUCH_DND_DELAY_MS,
+        tolerance: TOUCH_DND_TOLERANCE_PX,
+      },
+    }),
   );
 
   const load = useCallback(() => {
@@ -360,9 +376,10 @@ export function BoardPage() {
   };
 
   /** Normal drop path (no conflict): optimistically move the card, then
-   *  persist. Dropped-card status/sort_order are set directly; sibling
-   *  ranks are left alone until the response lands, so a moment of two cards
-   *  at the same rank is fine (tasksForColumn re-sorts immediately). */
+   *  persist. `applyOptimisticMove` shifts the dest column's sibling ranks
+   *  exactly like the server (reorder_in_place / place_at), so the board
+   *  paints the real slot immediately — the success merge only replaces the
+   *  mover (`response.task`). */
   const performMove = async (
     taskId: string,
     destStatus: TaskStatus,
@@ -370,11 +387,7 @@ export function BoardPage() {
   ) => {
     const snapshot = tasksRef.current;
     setTasks((prev) =>
-      prev.map((entry) =>
-        entry.id === taskId
-          ? { ...entry, status: destStatus, sort_order: destSortOrder }
-          : entry,
-      ),
+      applyOptimisticMove(prev, taskId, destStatus, destSortOrder),
     );
     await sendMoveRequest(
       taskId,
@@ -422,14 +435,20 @@ export function BoardPage() {
 
     const destShown = tasksForColumn(destStatus);
     const remaining = destShown.filter((task) => task.id !== activeId);
-    const destSortOrder = resolveSortOrder(remaining, destIndex, destStatus);
+    // The mover's shown index, hoisted so the same-slot no-op can compare
+    // against the unadjusted destIndex and the rank lookup can skip the
+    // mover (destIndexInRemaining) — destIndex counts the mover, `remaining`
+    // does not, so the raw index would read the NEXT card when moving down.
+    const oldIndex = destShown.findIndex((task) => task.id === activeId);
 
     // Same column + same slot = no movement: never call the API.
     if (destStatus === activeTask.status) {
-      const oldIndex = destShown.findIndex((task) => task.id === activeId);
       const slot = destIndex >= remaining.length ? remaining.length : destIndex;
       if (oldIndex !== -1 && slot === oldIndex) return;
     }
+
+    const insertIndex = destIndexInRemaining(destIndex, oldIndex);
+    const destSortOrder = resolveSortOrder(remaining, insertIndex, destStatus);
 
     void performMove(activeId, destStatus, destSortOrder);
   };
@@ -455,13 +474,7 @@ export function BoardPage() {
       snapshot,
       taskId,
     );
-    setTasks((prev) =>
-      prev.map((entry) =>
-        entry.id === taskId
-          ? { ...entry, status, sort_order: destRank }
-          : entry,
-      ),
-    );
+    setTasks((prev) => applyOptimisticMove(prev, taskId, status, destRank));
     return sendMoveRequest(taskId, { status }, snapshot, (data) => {
       setTasks((prev) =>
         prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
@@ -919,7 +932,7 @@ export function BoardPage() {
                 the floating nav. */
         <DndContext
           sensors={sensors}
-          collisionDetection={closestCorners}
+          collisionDetection={boardCollisionDetection}
           onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
           onDragCancel={() => setActiveDrag(null)}
