@@ -177,9 +177,7 @@ export function TaskCard({
                   focusPinVisibility(focused),
                 )}
               >
-                <Pin
-                  className={cn('h-3.5 w-3.5', focused && 'fill-current')}
-                />
+                <Pin className={cn('h-3.5 w-3.5', focused && 'fill-current')} />
               </button>
             )}
           </span>

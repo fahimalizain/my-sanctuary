@@ -332,9 +332,7 @@ export function ListsPage() {
       }
       const data = (await res.json()) as MoveTaskResponse;
       setTasks((prev) =>
-        prev.map((entry) =>
-          entry.id === data.task.id ? data.task : entry,
-        ),
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
       );
       // Keep the modal's `task` prop in sync so the selected pill follows
       // the server — the modal stays open after a status change.

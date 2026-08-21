@@ -382,9 +382,7 @@ export function BoardPage() {
       snapshot,
       (data) => {
         setTasks((prev) =>
-          prev.map((entry) =>
-            entry.id === data.task.id ? data.task : entry,
-          ),
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
         );
       },
     );
@@ -464,25 +462,18 @@ export function BoardPage() {
           : entry,
       ),
     );
-    return sendMoveRequest(
-      taskId,
-      { status },
-      snapshot,
-      (data) => {
-        setTasks((prev) =>
-          prev.map((entry) =>
-            entry.id === data.task.id ? data.task : entry,
-          ),
-        );
-        // Keep the modal's `task` prop in sync so the selected pill follows
-        // the server — the modal stays open after a status change.
-        setTaskForm((prev) =>
-          prev && prev.mode === 'edit' && prev.task?.id === data.task.id
-            ? { ...prev, task: data.task }
-            : prev,
-        );
-      },
-    );
+    return sendMoveRequest(taskId, { status }, snapshot, (data) => {
+      setTasks((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+      // Keep the modal's `task` prop in sync so the selected pill follows
+      // the server — the modal stays open after a status change.
+      setTaskForm((prev) =>
+        prev && prev.mode === 'edit' && prev.task?.id === data.task.id
+          ? { ...prev, task: data.task }
+          : prev,
+      );
+    });
   };
 
   // ──────────────────────────────────────────
@@ -550,7 +541,8 @@ export function BoardPage() {
       return null;
     } catch (err) {
       setTasks(snapshot);
-      const message = err instanceof Error ? err.message : 'Focus change failed';
+      const message =
+        err instanceof Error ? err.message : 'Focus change failed';
       setActionError(message);
       return message;
     } finally {
@@ -617,15 +609,13 @@ export function BoardPage() {
   // raises the banner and leaves the orphan card OPEN in Backlog at the
   // server-assigned append rank (the server-owned create is never deleted);
   // any failure full-restores the pre-move snapshot.
-  const handleTaskSubmit = async (
-    values: {
-      title: string;
-      description: string;
-      durationMinutes: number;
-      priority: TaskPriority;
-      difficulty: TaskDifficulty;
-    },
-  ): Promise<string | null> => {
+  const handleTaskSubmit = async (values: {
+    title: string;
+    description: string;
+    durationMinutes: number;
+    priority: TaskPriority;
+    difficulty: TaskDifficulty;
+  }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
     const body: NewTaskInput | UpdateTaskInput = {
