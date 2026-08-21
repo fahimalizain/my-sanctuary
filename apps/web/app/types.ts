@@ -264,6 +264,11 @@ export interface TaskRecord {
   status: TaskStatus;
   created_at: string;
   updated_at: string;
+  // Computed by the API: `true` only for the user's focused task (its id
+  // equals the user's `focused_task_id` pointer AND it is a living
+  // IN_PROGRESS row). Never stored on the task; reads paint `false`
+  // everywhere when the pointer is missing or dangling.
+  focused: boolean;
   category: TaskCategorySummary;
 }
 

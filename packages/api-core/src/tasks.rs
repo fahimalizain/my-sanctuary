@@ -339,6 +339,11 @@ pub struct TaskView {
     pub created_at: String,
     /// RFC 3339 instant.
     pub updated_at: String,
+    /// **Computed** flag (never stored): `true` exactly when the task is the
+    /// user's focused task — its id equals the user's `focused_task_id` pointer
+    /// AND it is a living IN_PROGRESS row. Reads paint `false` everywhere when
+    /// the pointer is missing or dangling; reads never write the users row.
+    pub focused: bool,
     pub category: TaskCategorySummary,
 }
 
@@ -377,11 +382,15 @@ struct Taxonomy {
 /// A task whose title now classifies as `untracked` (e.g. the user deleted the
 /// matching pattern) is still returned, with the `untracked` summary attached
 /// — never a 400 from a read.
+///
+/// `focused_task_id` is the caller's pointer into this user's focus lock; it
+/// only downgrades the painted `focused` flag — reads never write the users row.
 pub async fn list_tasks(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     user_id: &str,
+    focused_task_id: Option<&str>,
 ) -> Result<TasksResponse, TasksError> {
     let lists = list_repo.list_by_user_id(user_id).await?;
     let categories = category_repo.list_by_user_id(user_id).await?;
@@ -391,7 +400,7 @@ pub async fn list_tasks(
     let tasks = task_repo.list_by_user_id(user_id).await?;
     let views = tasks
         .iter()
-        .map(|task| to_view(task, &taxonomy))
+        .map(|task| to_view(task, &taxonomy, focused_task_id))
         .collect();
     Ok(TasksResponse { tasks: views })
 }
@@ -790,7 +799,7 @@ pub async fn create_task(
         })
         .await?;
     Ok(TaskResponse {
-        task: to_view(&task, &taxonomy),
+        task: to_view(&task, &taxonomy, None),
     })
 }
 
@@ -865,7 +874,7 @@ pub async fn update_task(
     };
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskResponse {
-        task: to_view(&updated, &taxonomy),
+        task: to_view(&updated, &taxonomy, None),
     })
 }
 
@@ -1001,7 +1010,7 @@ pub async fn start_task(
     .await?;
 
     Ok(TaskActionResponse {
-        task: to_view(&updated, &taxonomy),
+        task: to_view(&updated, &taxonomy, None),
         event: Some(event),
     })
 }
@@ -1197,7 +1206,7 @@ async fn stop_or_pause(
 
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
-        task: to_view(&placed, &taxonomy),
+        task: to_view(&placed, &taxonomy, None),
         event: patched,
     })
 }
@@ -1236,7 +1245,7 @@ async fn complete_or_discard(
     if task.status == target_status {
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         return Ok(TaskActionResponse {
-            task: to_view(&task, &taxonomy),
+            task: to_view(&task, &taxonomy, None),
             event: None,
         });
     }
@@ -1291,7 +1300,7 @@ async fn complete_or_discard(
 
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
-        task: to_view(&placed, &taxonomy),
+        task: to_view(&placed, &taxonomy, None),
         event: patched,
     })
 }
@@ -1920,7 +1929,7 @@ pub async fn move_task(
     if task.status == input.status && input.sort_order.is_none() {
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         return Ok(MoveTaskResponse {
-            task: to_view(&task, &taxonomy),
+            task: to_view(&task, &taxonomy, None),
             displaced: None,
             event: None,
         });
@@ -1931,7 +1940,7 @@ pub async fn move_task(
     if task.status == TASK_STATUS_IN_PROGRESS && input.status == TASK_STATUS_IN_PROGRESS {
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         return Ok(MoveTaskResponse {
-            task: to_view(&task, &taxonomy),
+            task: to_view(&task, &taxonomy, None),
             displaced: None,
             event: None,
         });
@@ -2008,15 +2017,15 @@ pub async fn move_task(
                 .await?;
                 let taxonomy = load_taxonomy(category_repo, user_id).await?;
                 Ok(MoveTaskResponse {
-                    task: to_view(&row, &taxonomy),
-                    displaced: Some(to_view(&displaced_row, &taxonomy)),
+                    task: to_view(&row, &taxonomy, None),
+                    displaced: Some(to_view(&displaced_row, &taxonomy, None)),
                     event,
                 })
             }
             Err(inner) => {
                 let taxonomy = load_taxonomy(category_repo, user_id).await?;
                 Err(TasksError::AfterDisplace {
-                    displaced: to_view(&displaced_row, &taxonomy),
+                    displaced: to_view(&displaced_row, &taxonomy, None),
                     source: Box::new(inner),
                 })
             }
@@ -2030,7 +2039,7 @@ pub async fn move_task(
             .await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
-            task: to_view(&row, &taxonomy),
+            task: to_view(&row, &taxonomy, None),
             displaced: None,
             event: None,
         })
@@ -2065,7 +2074,7 @@ pub async fn move_task(
         let row = place_at(task_repo, user_id, task_id, &input.status, rank).await?;
         let taxonomy = load_taxonomy(category_repo, user_id).await?;
         Ok(MoveTaskResponse {
-            task: to_view(&row, &taxonomy),
+            task: to_view(&row, &taxonomy, None),
             displaced: None,
             event,
         })
@@ -2180,7 +2189,7 @@ fn is_valid_difficulty(difficulty: &str) -> bool {
     matches!(difficulty, "easy" | "medium" | "hard")
 }
 
-fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
+fn to_view(task: &Task, taxonomy: &Taxonomy, focused_task_id: Option<&str>) -> TaskView {
     let outcome = classify(&task.title, CalendarScope::Ignore, &taxonomy.matchers);
     // Resolve the category AND the display_title together: a Matched,
     // non-untracked category splits its first matching pattern's hole off the
@@ -2219,6 +2228,8 @@ fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
         ),
     };
     let category = category.expect("ensure_taxonomy guarantees the untracked sink exists");
+    let focused = task.status == TASK_STATUS_IN_PROGRESS
+        && Some(task.id.as_str()) == focused_task_id;
     TaskView {
         id: task.id.clone(),
         user_id: task.user_id.clone(),
@@ -2232,6 +2243,7 @@ fn to_view(task: &Task, taxonomy: &Taxonomy) -> TaskView {
         status: task.status.clone(),
         created_at: task.created_at.clone(),
         updated_at: task.updated_at.clone(),
+        focused,
         category,
     }
 }
@@ -3666,7 +3678,7 @@ mod tests {
         pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
         pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Dinner | Family"))).unwrap();
 
-        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1")).unwrap();
+        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
         assert_eq!(response.tasks.len(), 2);
         let by_title = |title: &str| response.tasks.iter().find(|t| t.title == title).unwrap();
         assert_eq!(by_title("Work").category.title, "Work");
@@ -3682,7 +3694,7 @@ mod tests {
         let ids = category_ids_by_slug(&categories);
         pollster::block_on(categories.replace_patterns(&ids["work"], vec![])).unwrap();
 
-        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1")).unwrap();
+        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
         assert_eq!(response.tasks.len(), 1, "read never drops tasks");
         assert!(response.tasks[0].category.is_untracked);
         assert_eq!(response.tasks[0].category.title, "Untracked");
@@ -3693,7 +3705,7 @@ mod tests {
         let lists = FakeTaskListRepo::new();
         let categories = FakeTaskCategoryRepo::new();
         let tasks = FakeTaskRepo::new();
-        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1")).unwrap();
+        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
         assert!(response.tasks.is_empty());
         assert_eq!(
             pollster::block_on(categories.count_by_user_id("u-1")).unwrap(),
@@ -3706,8 +3718,65 @@ mod tests {
     fn list_is_scoped_to_the_user() {
         let (lists, categories, tasks) = seeded();
         pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
-        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-2")).unwrap();
+        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-2", None)).unwrap();
         assert!(response.tasks.is_empty());
+    }
+
+    #[test]
+    fn list_focus_is_false_without_a_pointer() {
+        let (lists, categories, tasks) = seeded();
+        pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
+        let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
+        assert_eq!(response.tasks.len(), 1);
+        assert!(
+            response.tasks.iter().all(|t| !t.focused),
+            "no pointer → nothing is focused"
+        );
+    }
+
+    #[test]
+    fn list_focus_paints_the_pointed_in_progress_task() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        let second = work_task(&lists, &categories, &tasks);
+        // Make `first` the running (IN_PROGRESS) task via the repo directly —
+        // the focus rule needs a living IN_PROGRESS row, not a Google event.
+        pollster::block_on(tasks.set_status(&first.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+
+        let response = pollster::block_on(list_tasks(
+            &lists,
+            &categories,
+            &tasks,
+            "u-1",
+            Some(&first.id),
+        ))
+        .unwrap();
+        assert_eq!(response.tasks.len(), 2);
+        let by_id = |id: &str| response.tasks.iter().find(|t| t.id == id).unwrap();
+        assert!(by_id(&first.id).focused, "pointed IN_PROGRESS task is focused");
+        assert!(!by_id(&second.id).focused, "siblings stay unfocused");
+    }
+
+    #[test]
+    fn list_focus_ignores_a_pointer_at_a_non_running_task() {
+        let (lists, categories, tasks) = seeded();
+        let first = work_task(&lists, &categories, &tasks);
+        work_task(&lists, &categories, &tasks);
+        // The pointer names an OPEN task (never IN_PROGRESS): the pointer is
+        // dangling, so every row paints false — and the read must not write.
+        let response = pollster::block_on(list_tasks(
+            &lists,
+            &categories,
+            &tasks,
+            "u-1",
+            Some(&first.id),
+        ))
+        .unwrap();
+        assert_eq!(response.tasks.len(), 2);
+        assert!(
+            response.tasks.iter().all(|t| !t.focused),
+            "pointer at a non-running task focuses nothing"
+        );
     }
 
     #[test]
@@ -3718,7 +3787,7 @@ mod tests {
         *categories.list_patterns_by_user_id_calls.lock().unwrap() = 0;
         *categories.list_patterns_by_category_id_calls.lock().unwrap() = 0;
 
-        pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1")).unwrap();
+        pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
 
         assert_eq!(*categories.list_patterns_by_user_id_calls.lock().unwrap(), 1);
         assert_eq!(

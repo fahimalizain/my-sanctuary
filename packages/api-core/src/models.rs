@@ -88,6 +88,12 @@ pub struct User {
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
     pub deleted_at: Option<String>,
+    /// The one-focus lock (task-focus, slice 1): id of the task this user's
+    /// board pin points at, or `None` when nothing is focused. Nullable TEXT,
+    /// never written by a login upsert. `#[serde(default)]` so older JSON (no
+    /// such field) still deserializes as `None`.
+    #[serde(default)]
+    pub focused_task_id: Option<String>,
 }
 
 /// Insert/update input for [`crate::repo::UserRepo::upsert_by_google_id`].

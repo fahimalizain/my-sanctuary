@@ -30,7 +30,7 @@ use worker::*;
 
 use api_core::models::{NewTaskInput, UpdateTask};
 use api_core::tasks::{MoveTaskInput, TasksError};
-use api_core::TaskRepo;
+use api_core::{TaskRepo, UserRepo};
 
 /// 401 body for missing/invalid sessions and failed token refreshes.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -182,14 +182,39 @@ fn lists_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D
     Ok(crate::db::D1TaskListRepo::new(db))
 }
 
+fn users_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1UserRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1UserRepo::new(db))
+}
+
 /// `GET /api/tasks` → 200 `{"tasks":[...]}`; each task carries its computed
 /// `category` (the client never reimplements the matcher). Seeds the taxonomy
 /// (count-gated) so a tasks-only first visitor still has categories.
+///
+/// The focused flag is painted from the user's `focused_task_id` pointer — a
+/// read; a missing/soft-deleted user row (or a failed load) just lists with
+/// `focused: false` everywhere rather than failing the board.
 pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
     };
-    match api_core::list_tasks(&lists_d1(&ctx)?, &categories_d1(&ctx)?, &d1(&ctx)?, &user.id).await {
+    let focused_task_id = users_d1(&ctx)?
+        .get_by_id(&user.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.focused_task_id);
+    match api_core::list_tasks(
+        &lists_d1(&ctx)?,
+        &categories_d1(&ctx)?,
+        &d1(&ctx)?,
+        &user.id,
+        focused_task_id.as_deref(),
+    )
+    .await
+    {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))

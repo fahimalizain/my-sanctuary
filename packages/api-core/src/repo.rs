@@ -48,6 +48,16 @@ pub trait UserRepo: Send + Sync {
     /// Inserts a new user or updates the existing one (keyed on `google_id`).
     /// Returns the stored row, including the DB-generated `id`.
     async fn upsert_by_google_id(&self, user: NewUser) -> Result<User, RepoError>;
+    /// Sets (or clears, when `task_id` is `None`) the user's focus pointer —
+    /// the one-focus lock backing the task-focus feature. `focused_task_id` is
+    /// nullable TEXT; untouched by the login upsert. Only ever called with a
+    /// living IN_PROGRESS task id of the user (slice 3 enforces that).
+    async fn set_focused_task_id(
+        &self,
+        user_id: &str,
+        task_id: Option<&str>,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
 }
 
 /// Google OAuth token persistence.
@@ -408,6 +418,14 @@ pub const USER_UPSERT_SQL: &str = "
 /// found by `get_by_google_id` instead. Mirrors the old Go d1_repo.go fallback.
 pub const USER_UPDATE_BY_ID_SQL: &str =
     "UPDATE users SET email = ?, name = ?, picture = ?, updated_at = ? WHERE id = ?";
+
+/// The one-focus lock (task-focus, slice 1): writes the user's `focused_task_id`
+/// pointer (nullable — `None` clears it) and stamps `updated_at`. Scoped to the
+/// living row; writes on a soft-deleted user no-op.
+pub const USER_SET_FOCUSED_TASK_ID_SQL: &str = "
+    UPDATE users SET focused_task_id = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
 
 pub const TOKEN_GET_BY_USER_ID_SQL: &str =
     "SELECT * FROM google_oauth_tokens WHERE user_id = ? AND deleted_at IS NULL";
@@ -907,6 +925,18 @@ mod tests {
         assert!(CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL.contains("deleted_at IS NULL"));
         assert!(EVENT_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
         assert!(EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL.contains("deleted_at IS NULL"));
+    }
+
+    #[test]
+    fn user_set_focused_task_id_writes_pointer_and_filters_deleted() {
+        assert!(
+            USER_SET_FOCUSED_TASK_ID_SQL.contains("focused_task_id = ?"),
+            "{USER_SET_FOCUSED_TASK_ID_SQL}"
+        );
+        assert!(
+            USER_SET_FOCUSED_TASK_ID_SQL.contains("deleted_at IS NULL"),
+            "{USER_SET_FOCUSED_TASK_ID_SQL}"
+        );
     }
 
     #[test]
