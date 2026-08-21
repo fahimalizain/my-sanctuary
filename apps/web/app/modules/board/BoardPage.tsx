@@ -3,7 +3,6 @@ import {
   DndContext,
   DragOverlay,
   PointerSensor,
-  closestCorners,
   useSensor,
   useSensors,
 } from '@dnd-kit/core';
@@ -35,6 +34,7 @@ import { BoardColumnView } from './BoardColumn';
 import { CategoryFilter } from './CategoryFilter';
 import { FilterPill } from './FilterPill';
 import { TaskCard } from './TaskCard';
+import { boardCollisionDetection } from './board-dnd';
 import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
 import {
   COLUMNS,
@@ -919,7 +919,7 @@ export function BoardPage() {
                 the floating nav. */
         <DndContext
           sensors={sensors}
-          collisionDetection={closestCorners}
+          collisionDetection={boardCollisionDetection}
           onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
           onDragCancel={() => setActiveDrag(null)}

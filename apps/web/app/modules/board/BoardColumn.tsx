@@ -1,4 +1,4 @@
-import { useDroppable } from '@dnd-kit/core';
+import { useDndContext, useDroppable } from '@dnd-kit/core';
 import {
   SortableContext,
   verticalListSortingStrategy,
@@ -13,9 +13,10 @@ import { SortableTaskCard } from './TaskCard';
 
 /** One board column: neutral surface with a 2px status accent on the header
  *  only. The count is the number of cards currently shown (after filter +
- *  cap) — never a `20 / 64` overflow hint. The whole section is the column
- *  droppable (`column:<status>`), so EMPTY columns accept a drop; the cards
- *  inside are a vertical SortableContext. */
+ *  cap) — never a `20 / 64` overflow hint. The CARD LIST is the column
+ *  droppable (`column:<status>`), so the empty space below the cards (and
+ *  whole empty columns) accept a drop; the cards inside remain a vertical
+ *  SortableContext. */
 export function BoardColumnView({
   column,
   tasks,
@@ -45,13 +46,20 @@ export function BoardColumnView({
     id: columnDroppableId,
     data: { type: 'column' },
   });
+  // `isOver` is only true when the winning collision is the column itself
+  // (the empty body). On a card, `over` is that card — the ring must still
+  // light the parent column, so any card of this column counts as over.
+  const { over } = useDndContext();
+  const overThisColumn =
+    isOver || (over != null && items.includes(String(over.id)));
 
   return (
     <section
-      ref={setNodeRef}
       className={cn(
         'flex w-[260px] shrink-0 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
-        isOver ? 'border-primary/60 ring-2 ring-primary/20' : 'border-border',
+        overThisColumn
+          ? 'border-primary/60 ring-2 ring-primary/20'
+          : 'border-border',
       )}
     >
       <header className="shrink-0 border-b border-border">
@@ -69,8 +77,8 @@ export function BoardColumnView({
               {tasks.length}
             </span>
           </div>
-          {/* Column + — sits inside the column droppable, so stopPropagation
-              keeps it from registering as a drop target press */}
+          {/* Column + — the header is outside the column droppable (the
+              card list is), so stopPropagation is just belt-and-braces */}
           <Button
             type="button"
             variant="ghost"
@@ -89,9 +97,12 @@ export function BoardColumnView({
 
       <SortableContext items={items} strategy={verticalListSortingStrategy}>
         <div
+          ref={setNodeRef}
           className={cn(
             'flex-1 space-y-2 p-3 transition-colors',
-            isOver && tasks.length === 0 && 'bg-muted/40 rounded-lg',
+            overThisColumn &&
+              tasks.length === 0 &&
+              'bg-muted/40 rounded-lg',
           )}
         >
           {tasks.length > 0 ? (
