@@ -1013,6 +1013,9 @@ pub async fn start_task(
             color_id: target.google_color_id,
             // Start never takes focus: the started chip is unfocused.
             sanctuary_focus: false,
+            // Create-time snapshot of the task's P/D — never patched later.
+            priority: Some(task.priority.clone()),
+            difficulty: Some(task.difficulty.clone()),
         },
         now_unix,
     )
@@ -2119,6 +2122,9 @@ async fn create_focus_segment(
             task_id: Some(task.id.clone()),
             color_id,
             sanctuary_focus: focused,
+            // Create-time snapshot of the task's P/D — never patched later.
+            priority: Some(task.priority.clone()),
+            difficulty: Some(task.difficulty.clone()),
         },
         now_unix,
     )
@@ -4788,6 +4794,21 @@ mod tests {
             body["extendedProperties"]["shared"]["sanctuary_task_id"],
             task.id
         );
+        // The create-time snapshot stamps the task's defaults (medium/easy).
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_priority"],
+            "medium"
+        );
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_difficulty"],
+            "easy"
+        );
+        assert!(
+            body["extendedProperties"]["shared"]
+                .get("sanctuary_focus")
+                .is_none(),
+            "start never takes focus: {body}"
+        );
         assert!(body.get("private").is_none(), "carrier is shared, not private");
         // The matched Work category's stored color (seed hex #2a5c8a → "9").
         assert_eq!(body["colorId"], "9");
@@ -4800,6 +4821,46 @@ mod tests {
         assert_eq!(inserted[0].at, NOW);
         assert_eq!(inserted[0].calendar_id.as_deref(), Some("cal-primary@example.com"));
         assert_eq!(inserted[0].google_event_id.as_deref(), Some("g-1"));
+    }
+
+    #[test]
+    fn start_snapshots_custom_priority_and_difficulty_onto_the_insert_body() {
+        let (lists, categories, tasks) = seeded();
+        let mut high_input = input("Work");
+        high_input.priority = Some("high".to_string());
+        high_input.difficulty = Some("hard".to_string());
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &high_input,
+        ))
+        .unwrap()
+        .task;
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // The insert body carries the task's P/D verbatim as snapshots.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_priority"],
+            "high"
+        );
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_difficulty"],
+            "hard"
+        );
     }
 
     #[test]
@@ -6285,7 +6346,7 @@ mod tests {
         );
 
         // Create: one flagged segment — summary equals the title exactly
-        // (never ▶), carrying both shared keys.
+        // (never ▶), carrying both shared keys plus the P/D snapshots.
         let posts = http.posts.lock().unwrap();
         assert_eq!(posts.len(), 1);
         let (_, body) = posts.first().unwrap().clone();
@@ -6296,6 +6357,15 @@ mod tests {
             task.id
         );
         assert_eq!(create["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+        // Focus segments snapshot the task's P/D at create time too.
+        assert_eq!(
+            create["extendedProperties"]["shared"]["sanctuary_priority"],
+            "medium"
+        );
+        assert_eq!(
+            create["extendedProperties"]["shared"]["sanctuary_difficulty"],
+            "easy"
+        );
 
         // Logs: started then focused (the focused log names the new segment).
         let inserted = logs.inserted.lock().unwrap().clone();
@@ -6471,7 +6541,8 @@ mod tests {
             assert!(url.contains("/events/g-a") || url.contains("/events/g-b"), "{url}");
         }
 
-        // Creates: B′ flagged first, A′ unprefixed second.
+        // Creates: B′ flagged first, A′ unprefixed second. Both snapshot the
+        // task's default P/D (medium/easy) at create time.
         let posts = http.posts.lock().unwrap();
         assert_eq!(posts.len(), 2);
         let (_, body_bp) = posts.first().unwrap().clone();
@@ -6479,12 +6550,28 @@ mod tests {
         assert_eq!(bbp["summary"], "Work", "B's summary is its title, no ▶");
         assert_eq!(bbp["extendedProperties"]["shared"]["sanctuary_task_id"], b.id);
         assert_eq!(bbp["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+        assert_eq!(
+            bbp["extendedProperties"]["shared"]["sanctuary_priority"],
+            "medium"
+        );
+        assert_eq!(
+            bbp["extendedProperties"]["shared"]["sanctuary_difficulty"],
+            "easy"
+        );
         let (_, body_ap) = &posts[1];
         let abp: serde_json::Value = serde_json::from_str(body_ap).unwrap();
         assert_eq!(abp["extendedProperties"]["shared"]["sanctuary_task_id"], a.id);
         assert!(
             abp["extendedProperties"]["shared"].get("sanctuary_focus").is_none(),
             "A′ is unprefixed: {body_ap}"
+        );
+        assert_eq!(
+            abp["extendedProperties"]["shared"]["sanctuary_priority"],
+            "medium"
+        );
+        assert_eq!(
+            abp["extendedProperties"]["shared"]["sanctuary_difficulty"],
+            "easy"
         );
 
         // Logs: A started, B started, A unfocused, B focused.
