@@ -44,7 +44,7 @@ export function BoardColumnView({
   const columnDroppableId = `${COLUMN_ID_PREFIX}${column.status}`;
   const { setNodeRef, isOver } = useDroppable({
     id: columnDroppableId,
-    data: { type: 'column' },
+    data: { type: 'column', status: column.status },
   });
   // `isOver` is only true when the winning collision is the column itself
   // (the empty body). On a card, `over` is that card — the ring must still
@@ -108,6 +108,7 @@ export function BoardColumnView({
               <SortableTaskCard
                 key={task.id}
                 task={task}
+                columnStatus={column.status}
                 onEdit={onEditTask}
                 onToggleFocus={onToggleFocus}
                 focusDisabled={focusDisabled}
