@@ -42,7 +42,7 @@
 //!   Webhook).
 
 use serde::de::{self, Deserializer, Visitor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 use url::Url;
@@ -331,6 +331,31 @@ pub async fn list_events(
     })
 }
 
+/// Builds `extendedProperties.shared` for an `events.insert`.
+///
+/// Returns `None` when there is no task carrier — hand-created events
+/// send no extendedProperties at all. When `Some`, `sanctuary_task_id`
+/// is always set; `sanctuary_focus` is `"1"` only if focused (never
+/// `"0"`); `sanctuary_priority` / `sanctuary_difficulty` are present
+/// only when the input carried a non-empty snapshot. Never a partial
+/// map without the carrier.
+fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEventSharedProperties> {
+    let task_id = input.task_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    let trim_opt = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(GoogleEventSharedProperties {
+        sanctuary_task_id: Some(task_id.to_string()),
+        sanctuary_focus: input.sanctuary_focus.then(|| "1".to_string()),
+        sanctuary_priority: trim_opt(&input.priority),
+        sanctuary_difficulty: trim_opt(&input.difficulty),
+    })
+}
+
 /// Creates an event on Google (`events.insert`) and upserts the returned row
 /// into the local cache. A cache failure is logged (returned in
 /// [`CreateEventOutput::cache_error`]), never fatal.
@@ -339,9 +364,13 @@ pub async fn list_events(
 /// `extendedProperties.shared.sanctuary_task_id` — the task timer's carrier
 /// (slice 4); the sync path maps it back onto `calendar_events.task_id`. When
 /// both `task_id` and `sanctuary_focus` are set (a focus segment, slice 3),
-/// the shared map also carries `sanctuary_focus = "1"` — always both keys
-/// together, never a partial shared map. Unfocused creates send the carrier
-/// alone; `sanctuary_focus` is never sent without it.
+/// the shared map also carries `sanctuary_focus = "1"` — always with the
+/// carrier, never a partial shared map; `sanctuary_focus` is never sent
+/// without the carrier and never as `"0"`. `sanctuary_priority` and
+/// `sanctuary_difficulty` are create-time snapshots of the task's values,
+/// stamped next to the carrier at insert time only — they are never patched
+/// when the task later changes. Unfocused creates send the carrier (plus any
+/// snapshots) alone.
 pub async fn create_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -364,12 +393,7 @@ pub async fn create_event(
         "start": { "dateTime": input.start },
         "end": { "dateTime": input.end },
     });
-    if let Some(task_id) = &input.task_id {
-        let mut shared = serde_json::json!({ "sanctuary_task_id": task_id });
-        if input.sanctuary_focus {
-            // Never `"0"`: the key is present only on focused segments.
-            shared["sanctuary_focus"] = serde_json::json!("1");
-        }
+    if let Some(shared) = build_shared_properties(input) {
         payload["extendedProperties"] = serde_json::json!({ "shared": shared });
     }
     // The stored category color, copied verbatim by `start_task`. Never
@@ -1215,6 +1239,8 @@ fn is_skipped(event: &GoogleEvent) -> bool {
 /// `task_id` is copied from `extendedProperties.shared.sanctuary_task_id`
 /// (the task timer's carrier); events without the property map to `""` and
 /// the upsert's `COALESCE` leaves any stored value untouched.
+// `sanctuary_focus` / `sanctuary_priority` / `sanctuary_difficulty` are
+// create-time snapshots on Google and are not cached.
 fn map_google_event(event: &GoogleEvent, calendar_id: &str, now_rfc3339: &str) -> NewCalendarEvent {
     NewCalendarEvent {
         calendar_id: calendar_id.to_string(),
@@ -1323,10 +1349,22 @@ struct GoogleEventExtendedProperties {
     shared: Option<GoogleEventSharedProperties>,
 }
 
-#[derive(Debug, Deserialize)]
+/// `extendedProperties.shared` of a Google event. Every key we write is
+/// modelled here: `sanctuary_task_id` (the task timer's carrier),
+/// `sanctuary_focus` (focused-segment flag), and the create-time snapshots
+/// `sanctuary_priority` / `sanctuary_difficulty`. Absent keys deserialize to
+/// `None`; `None` values are skipped on serialize, so the wire shape never
+/// carries `"0"`/empty placeholders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 struct GoogleEventSharedProperties {
-    #[serde(default, rename = "sanctuary_task_id")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_task_id")]
     sanctuary_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_focus")]
+    sanctuary_focus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_priority")]
+    sanctuary_priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_difficulty")]
+    sanctuary_difficulty: Option<String>,
 }
 
 /// `start`/`end` of a Google event; all-day events carry `date` instead of
@@ -3143,6 +3181,114 @@ mod tests {
     }
 
     // ──────────────────────────────────────────
+    // build_shared_properties
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn shared_properties_without_task_id_are_none() {
+        let mut input = input();
+        input.priority = Some("high".to_string());
+        input.difficulty = Some("hard".to_string());
+        assert!(
+            build_shared_properties(&input).is_none(),
+            "no carrier → no extendedProperties at all"
+        );
+    }
+
+    #[test]
+    fn shared_properties_with_whitespace_only_task_id_are_none() {
+        for blank in ["", "   ", "\t"] {
+            let mut input = input();
+            input.task_id = Some(blank.to_string());
+            assert!(
+                build_shared_properties(&input).is_none(),
+                "whitespace-only task id {blank:?} is no carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_properties_task_id_only_serializes_the_carrier_alone() {
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        let shared = build_shared_properties(&input).expect("carrier present");
+        assert_eq!(shared.sanctuary_task_id.as_deref(), Some("task-1"));
+        let value = serde_json::to_value(&shared).unwrap();
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 1, "only the carrier key: {value}");
+        assert_eq!(map["sanctuary_task_id"], "task-1");
+        assert!(
+            !matches!(map.get("sanctuary_focus"), Some(v) if v == "0"),
+            "focus never serializes as \"0\""
+        );
+        assert_eq!(shared.sanctuary_focus, None);
+        assert_eq!(shared.sanctuary_priority, None);
+        assert_eq!(shared.sanctuary_difficulty, None);
+    }
+
+    #[test]
+    fn shared_properties_focused_sets_sanctuary_focus_to_one() {
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.sanctuary_focus = true;
+        let shared = build_shared_properties(&input).unwrap();
+        assert_eq!(shared.sanctuary_focus.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn shared_properties_unfocused_omits_the_focus_key_on_serialize() {
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.sanctuary_focus = false;
+        let shared = build_shared_properties(&input).unwrap();
+        assert_eq!(shared.sanctuary_focus, None);
+        let value = serde_json::to_value(&shared).unwrap();
+        assert!(
+            value.get("sanctuary_focus").is_none(),
+            "unfocused never sends the key (never \"0\"): {value}"
+        );
+    }
+
+    #[test]
+    fn shared_properties_carry_priority_and_difficulty_snapshots() {
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.priority = Some("high".to_string());
+        input.difficulty = Some("hard".to_string());
+        let shared = build_shared_properties(&input).unwrap();
+        assert_eq!(shared.sanctuary_priority.as_deref(), Some("high"));
+        assert_eq!(shared.sanctuary_difficulty.as_deref(), Some("hard"));
+        let value = serde_json::to_value(&shared).unwrap();
+        assert_eq!(value["sanctuary_priority"], "high");
+        assert_eq!(value["sanctuary_difficulty"], "hard");
+    }
+
+    #[test]
+    fn shared_properties_blank_snapshots_are_dropped() {
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.priority = Some("  ".to_string());
+        input.difficulty = Some("\t".to_string());
+        let shared = build_shared_properties(&input).unwrap();
+        assert_eq!(shared.sanctuary_priority, None);
+        assert_eq!(shared.sanctuary_difficulty, None);
+        let value = serde_json::to_value(&shared).unwrap();
+        assert!(value.get("sanctuary_priority").is_none(), "{value}");
+        assert!(value.get("sanctuary_difficulty").is_none(), "{value}");
+    }
+
+    #[test]
+    fn shared_properties_focus_without_a_task_id_is_none() {
+        let mut input = input();
+        input.sanctuary_focus = true;
+        input.priority = Some("high".to_string());
+        assert!(
+            build_shared_properties(&input).is_none(),
+            "focus and snapshots never travel without the carrier"
+        );
+    }
+
+    // ──────────────────────────────────────────
     // create_event
     // ──────────────────────────────────────────
 
@@ -3163,6 +3309,8 @@ mod tests {
             task_id: None,
             color_id: None,
             sanctuary_focus: false,
+            priority: None,
+            difficulty: None,
         }
     }
 
@@ -3346,6 +3494,10 @@ mod tests {
             body["extendedProperties"]["shared"]["sanctuary_task_id"],
             "task-1"
         );
+        let shared = body["extendedProperties"]["shared"].as_object().unwrap();
+        for key in ["sanctuary_focus", "sanctuary_priority", "sanctuary_difficulty"] {
+            assert!(!shared.contains_key(key), "{key} absent without a value: {body}");
+        }
         assert!(body.get("private").is_none(), "no private properties");
 
         // The echoed event maps the property onto the cached row.
@@ -3416,6 +3568,11 @@ mod tests {
             "task-1"
         );
         assert_eq!(body["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+        // No snapshots were set on the input, so P/D stay absent.
+        let shared = body["extendedProperties"]["shared"].as_object().unwrap();
+        for key in ["sanctuary_priority", "sanctuary_difficulty"] {
+            assert!(!shared.contains_key(key), "{key} absent unless set: {body}");
+        }
         assert!(body.get("private").is_none(), "no private properties");
 
         // The echoed event maps the task carrier onto the cached row.
@@ -3452,6 +3609,54 @@ mod tests {
             body["extendedProperties"]["shared"].get("sanctuary_focus").is_none(),
             "unfocused creates never send sanctuary_focus: {body}"
         );
+    }
+
+    #[test]
+    fn create_with_task_priority_and_difficulty_snapshots_both_keys() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_with_task_json("task-1"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let mut input = input();
+        input.task_id = Some("task-1".to_string());
+        input.priority = Some("high".to_string());
+        input.difficulty = Some("hard".to_string());
+        input.sanctuary_focus = false;
+        let output = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // The snapshots ride along with the carrier; unfocused sends no
+        // `sanctuary_focus`.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_task_id"],
+            "task-1"
+        );
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_priority"],
+            "high"
+        );
+        assert_eq!(
+            body["extendedProperties"]["shared"]["sanctuary_difficulty"],
+            "hard"
+        );
+        assert!(
+            body["extendedProperties"]["shared"]
+                .get("sanctuary_focus")
+                .is_none(),
+            "snapshots never imply focus: {body}"
+        );
+
+        // The echo maps the carrier onto the cached row (snapshots are not
+        // cached — no D1 columns for them).
+        assert_eq!(output.event.task_id, "task-1");
     }
 
     #[test]

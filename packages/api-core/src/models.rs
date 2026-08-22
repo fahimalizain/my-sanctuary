@@ -639,6 +639,16 @@ pub struct NewEventInput {
     /// `"0"`, when `false`). `start_task` stays unfocused (`false`).
     #[serde(default)]
     pub sanctuary_focus: bool,
+    /// Create-time snapshot written to
+    /// `extendedProperties.shared.sanctuary_priority`. Omitted from the
+    /// shared map when `None`. Never patched when the task later changes.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Create-time snapshot written to
+    /// `extendedProperties.shared.sanctuary_difficulty`. Omitted from the
+    /// shared map when `None`. Never patched when the task later changes.
+    #[serde(default)]
+    pub difficulty: Option<String>,
 }
 
 #[cfg(test)]
