@@ -2,7 +2,11 @@ import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { Pin } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { TASK_PRIORITY_LABELS, type TaskRecord } from '@/app/types';
+import {
+  TASK_PRIORITY_LABELS,
+  type TaskRecord,
+  type TaskStatus,
+} from '@/app/types';
 import { focusPinVisibility } from './focus-pin';
 
 /** The draggable wrapper of a card: applies the sortable transform while the
@@ -11,12 +15,16 @@ import { focusPinVisibility } from './focus-pin';
  *  pointer actually holds. */
 export function SortableTaskCard({
   task,
+  columnStatus,
   onEdit,
   onToggleFocus,
   focusDisabled,
   disabled,
 }: {
   task: TaskRecord;
+  /** The column rendering this card — NOT task.status, which stays the
+   *  source while the live preview shows the card inside another column. */
+  columnStatus: TaskStatus;
   onEdit: (task: TaskRecord) => void;
   onToggleFocus?: (task: TaskRecord) => void;
   focusDisabled?: boolean;
@@ -32,7 +40,7 @@ export function SortableTaskCard({
   } = useSortable({
     id: task.id,
     disabled,
-    data: { type: 'task' },
+    data: { type: 'task', status: columnStatus },
   });
 
   return (

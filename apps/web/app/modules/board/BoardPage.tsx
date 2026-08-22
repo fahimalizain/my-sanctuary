@@ -7,7 +7,11 @@ import {
   useSensor,
   useSensors,
 } from '@dnd-kit/core';
-import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
+import type {
+  DragEndEvent,
+  DragOverEvent,
+  DragStartEvent,
+} from '@dnd-kit/core';
 import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { TaskModal } from '@/app/components/TaskModal';
@@ -40,7 +44,12 @@ import {
   MOUSE_DND_DISTANCE_PX,
   TOUCH_DND_DELAY_MS,
   TOUCH_DND_TOLERANCE_PX,
+  applyDragOverPreview,
+  cloneBoardItems,
+  columnOf,
+  dropInsertIndex,
 } from './board-dnd';
+import type { BoardColumnItems } from './board-dnd';
 import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
 import {
   COLUMNS,
@@ -48,7 +57,6 @@ import {
   TERMINAL_COLUMN_CAP,
   applyOptimisticMove,
   defaultMoveRank,
-  destIndexInRemaining,
   readError,
   resolveSortOrder,
 } from './board-model';
@@ -92,6 +100,16 @@ export function BoardPage() {
 
   // Drag state (ADR 0002 § DnD).
   const [activeDrag, setActiveDrag] = useState<TaskRecord | null>(null);
+  // Live cross-column preview: per-column id arrays cloned from the
+  // displayed columns on lift and discarded on end/cancel. `tasks` stays
+  // committed until the drop — only this throwaway map moves ids between
+  // columns mid-drag so the dest column can part around the mover.
+  const [dragItems, setDragItems] = useState<BoardColumnItems | null>(null);
+  // Latest preview for `handleDragEnd` (same "latest value during render"
+  // pattern as tasksRef): the drop resolves against the columns as shown,
+  // before the handler clears them.
+  const dragItemsRef = useRef<BoardColumnItems | null>(null);
+  dragItemsRef.current = dragItems;
   // Cards with a /move request in flight — dragging them again is ignored
   // until the response lands (no queuing).
   const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
@@ -322,6 +340,23 @@ export function BoardPage() {
     return items;
   }, [tasksForColumn]);
 
+  // During a drag the columns render the PREVIEW ids. Running those back
+  // through `tasksForColumn` would re-filter/re-cap and could drop the
+  // ghost, so they map straight through the loaded tasks instead (missing
+  // = deleted mid-drag — skipped, never rendered as undefined).
+  const displayItems = dragItems ?? itemsByColumn;
+  const taskById = useMemo(
+    () => new Map(tasks.map((task) => [task.id, task])),
+    [tasks],
+  );
+  const displayTasks = useCallback(
+    (status: TaskStatus): TaskRecord[] =>
+      displayItems[status]
+        .map((id) => taskById.get(id))
+        .filter((task) => task !== undefined),
+    [displayItems, taskById],
+  );
+
   // ──────────────────────────────────────────
   // Drag + optimistic move (ADR 0002 § DnD, § UI)
   // ──────────────────────────────────────────
@@ -330,6 +365,26 @@ export function BoardPage() {
     const task = tasksRef.current.find((entry) => entry.id === event.active.id);
     // Unknown (e.g. deleted while dragging) — show nothing in the overlay.
     setActiveDrag(task ?? null);
+    // Snapshot the displayed (filtered + capped) columns: the drag mutates
+    // only this preview, never the committed `tasks`.
+    setDragItems(cloneBoardItems(itemsByColumn));
+  };
+
+  /** Live preview while hovering (`onDragOver`, ADR 0002 § DnD): moves the
+   *  REAL dragged id between the preview's column arrays so the dest
+   *  SortableContext mounts a dimmed ghost and its cards part. Nothing is
+   *  persisted and `applyOptimisticMove` stays drop-only — a cancel or
+   *  drop-outside just discards the map. */
+  const handleDragOver = (event: DragOverEvent) => {
+    const { active, over } = event;
+    if (!over || typeof active.id !== 'string') return;
+    setDragItems((prev) =>
+      applyDragOverPreview(
+        prev ?? itemsByColumn,
+        String(active.id),
+        String(over.id),
+      ),
+    );
   };
 
   /** One negotiated `/move` request. Applies the OPTIMISTIC change first
@@ -408,7 +463,13 @@ export function BoardPage() {
    *  singleton lock). */
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
+    // Capture the preview BEFORE clearing it: the drop resolves against the
+    // columns as the pointer saw them during the drag.
+    const preview = dragItemsRef.current;
     setActiveDrag(null);
+    // The preview is throwaway — clearing restores the committed columns
+    // even when the /move below fails and reverts `tasks`.
+    setDragItems(null);
     if (!over || typeof active.id !== 'string') return;
     const activeId = active.id;
 
@@ -416,16 +477,44 @@ export function BoardPage() {
     if (!activeTask) return;
 
     // `over` is either a card (task id) or a column (`column:<status>`).
+    // Dest IDENTITY prefers the preview column (where the pointer last saw
+    // things); every index math stays on committed `tasksForColumn` — the
+    // preview decides where the card goes, never what gets sent.
     const overId = over.id;
     let destStatus: TaskStatus;
     let destIndex: number; // view index in the dest column's displayed list
+    // Only the self-over branch yields a PREVIEW index; it is already shaped
+    // for `remaining` and must skip destIndexInRemaining (dropInsertIndex).
+    let overIsSelf = false;
     if (typeof overId === 'string' && overId.startsWith(COLUMN_ID_PREFIX)) {
       destStatus = overId.slice(COLUMN_ID_PREFIX.length) as TaskStatus;
+      // Column-body drop means append. The committed length (mover counted)
+      // is what the hoist expects: in-column it becomes remaining.length,
+      // cross-column it already is. The preview index would read one short.
       destIndex = tasksForColumn(destStatus).length; // end (0 when empty)
+    } else if (typeof overId === 'string' && overId === activeId) {
+      // Dropped onto the mover's own ghost: its committed status is still
+      // the SOURCE column, so resolve through the preview — trusting
+      // `overTask.status` here would collapse a cross-column hover into a
+      // same-slot no-op.
+      overIsSelf = true;
+      destStatus =
+        (preview !== null ? columnOf(preview, activeId) : null) ??
+        activeTask.status;
+      const previewIdx = preview?.[destStatus]?.indexOf(activeId) ?? -1;
+      destIndex =
+        previewIdx >= 0
+          ? previewIdx
+          : tasksForColumn(destStatus).findIndex(
+              (task) => task.id === activeId,
+            );
+      if (destIndex === -1) return; // unresolvable slot (filtered/capped out)
     } else if (typeof overId === 'string') {
       const overTask = tasksRef.current.find((task) => task.id === overId);
       if (!overTask) return;
-      destStatus = overTask.status;
+      destStatus =
+        (preview !== null ? columnOf(preview, overId) : null) ??
+        overTask.status;
       const destShown = tasksForColumn(destStatus);
       destIndex = destShown.findIndex((task) => task.id === overId);
       if (destIndex === -1) return; // not displayed (filtered out) — ignore
@@ -437,8 +526,10 @@ export function BoardPage() {
     const remaining = destShown.filter((task) => task.id !== activeId);
     // The mover's shown index, hoisted so the same-slot no-op can compare
     // against the unadjusted destIndex and the rank lookup can skip the
-    // mover (destIndexInRemaining) — destIndex counts the mover, `remaining`
-    // does not, so the raw index would read the NEXT card when moving down.
+    // mover (dropInsertIndex) — a card/column destIndex counts the mover,
+    // `remaining` does not, so the raw index would read the NEXT card when
+    // moving down. Self-over destIndex skips the hoist (already
+    // remaining-shaped).
     const oldIndex = destShown.findIndex((task) => task.id === activeId);
 
     // Same column + same slot = no movement: never call the API.
@@ -447,7 +538,7 @@ export function BoardPage() {
       if (oldIndex !== -1 && slot === oldIndex) return;
     }
 
-    const insertIndex = destIndexInRemaining(destIndex, oldIndex);
+    const insertIndex = dropInsertIndex(destIndex, oldIndex, overIsSelf);
     const destSortOrder = resolveSortOrder(remaining, insertIndex, destStatus);
 
     void performMove(activeId, destStatus, destSortOrder);
@@ -934,8 +1025,14 @@ export function BoardPage() {
           sensors={sensors}
           collisionDetection={boardCollisionDetection}
           onDragStart={handleDragStart}
+          onDragOver={handleDragOver}
           onDragEnd={handleDragEnd}
-          onDragCancel={() => setActiveDrag(null)}
+          onDragCancel={() => {
+            setActiveDrag(null);
+            // Discard the preview or a cancelled cross-column hover would
+            // leave the ghost parked in dest.
+            setDragItems(null);
+          }}
         >
           <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
             <div className="mx-auto flex min-h-full w-max gap-6 px-6">
@@ -943,8 +1040,8 @@ export function BoardPage() {
                 <BoardColumnView
                   key={column.status}
                   column={column}
-                  tasks={tasksForColumn(column.status)}
-                  items={itemsByColumn[column.status]}
+                  tasks={displayTasks(column.status)}
+                  items={displayItems[column.status]}
                   movingIds={movingIds}
                   onEditTask={openEditTask}
                   onToggleFocus={handleToggleFocus}
