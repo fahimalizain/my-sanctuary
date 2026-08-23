@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -17,9 +17,6 @@ import { Button } from '@/components/ui/button';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import {
-  listCategories,
-  listLists,
-  listTasks,
   createTask,
   deleteTask,
   focusTask,
@@ -27,16 +24,19 @@ import {
   unfocusTask,
   updateTask,
 } from '@/lib/api';
+import { useCategoriesQuery } from '@/app/queries/categories';
+import { useListsQuery } from '@/app/queries/lists';
+import { setTasksCache, useTasksQuery } from '@/app/queries/tasks';
+import { queryKeys } from '@/app/queries/keys';
+import { queryClient } from '@/lib/queryClient';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
-  type Category,
   type FocusTaskResponse,
   type MoveTaskInput,
   type MoveTaskResponse,
   type NewTaskInput,
   type TaskDifficulty,
-  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskResponse,
@@ -87,23 +87,42 @@ export function BoardPage() {
     from: '/board',
   });
 
-  const [lists, setLists] = useState<TaskListsResponse['lists']>([]);
-  const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  // Latest `lists` for the dependency-free `load` callback below (writing a
-  // ref during render is the "latest value" pattern). Reading it lets `load`
-  // decide whether to show the full-page loader without closing over a stale
-  // array.
-  const listsRef = useRef<TaskListsResponse['lists']>([]);
-  listsRef.current = lists;
-  // Same pattern for `tasks`: the async move flow reads the pre-drop snapshot
-  // and looks up the dropped card from the latest render, never a stale one.
+  // Shared queries (slice 6): one `['tasks']` cache written by Board, Lists
+  // and the Home task picker. Tasks and categories are seed-gated on lists
+  // success — GET /api/lists performs the first-visit seed (default lists +
+  // category taxonomy), so their requests must run after it (computed
+  // categories depend on the seeded taxonomy). Tasks and categories are
+  // independent of each other and fetch in parallel (the same seed rule as
+  // ListsPage).
+  const listsQuery = useListsQuery();
+  const lists = listsQuery.data?.lists ?? [];
+  const categoriesQuery = useCategoriesQuery({ enabled: listsQuery.isSuccess });
+  const categories = categoriesQuery.data?.categories ?? [];
+  const tasksQuery = useTasksQuery({ enabled: listsQuery.isSuccess });
+  const tasks = tasksQuery.data?.tasks ?? [];
+  const setTasks = setTasksCache;
+  // Same pattern as before for `tasks`: the async move flow reads the
+  // pre-drop snapshot and looks up the dropped card from the latest render,
+  // never a stale one. Only the storage behind `setTasks` changed (useState
+  // → shared cache); the ref stays.
   const tasksRef = useRef<TaskRecord[]>([]);
   tasksRef.current = tasks;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the board with the
-  // error+retry banner when there are no lists to show.
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Full-page loader only while there is no data yet (first load, or a retry
+  // after a hard error) — Query's `isLoading` already means "no data yet",
+  // so a quiet refresh with cards on screen never flashes the spinner.
+  const isLoading =
+    listsQuery.isLoading ||
+    (listsQuery.isSuccess &&
+      (tasksQuery.isLoading || categoriesQuery.isLoading));
+  // Load failures: the first Error.message among the three queries, else
+  // null. Replaces the board with the error+retry banner when there are no
+  // lists to show.
+  const firstErrorMessage = (err: unknown, fallback: string): string | null =>
+    err instanceof Error ? err.message : err ? fallback : null;
+  const loadError =
+    firstErrorMessage(listsQuery.error, 'Failed to load board') ??
+    firstErrorMessage(tasksQuery.error, 'Failed to load tasks') ??
+    firstErrorMessage(categoriesQuery.error, 'Failed to load categories');
   // Action failures (move 409, etc.): rendered as a banner above the
   // still-visible board — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -129,19 +148,13 @@ export function BoardPage() {
   // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
   // flight: further pin taps are ignored and every pin is disabled.
   const [focusInFlight, setFocusInFlight] = useState(false);
-  // One load at a time: the mount effect, Retry and a quiet refresh tick
-  // (interval or visibility) can race — while a load is in flight a second
-  // call is a no-op, never a double fetch. A ref on purpose: the flag flips
-  // inside load() with no guaranteed re-render either way, so the refresh
-  // hook must read it live (see the useBoardRefresh call below).
-  const loadInFlightRef = useRef(false);
   // Render-driven state a quiet background refresh must not interrupt (see
   // useBoardRefresh): a live drag or preview, an in-flight /move, an
-  // in-flight focus toggle. Written during render (same pattern as listsRef
-  // above) so the refresh hook reads the freshest value without
-  // re-subscribing. The in-flight load is NOT here: it lives only in
-  // loadInFlightRef and drops without a re-render, so snapshotting it into
-  // this render-time value could leave the board latched busy.
+  // in-flight focus toggle. Written during render so the refresh hook reads
+  // the freshest value without re-subscribing. In-flight fetches are NOT
+  // here: the refresh callback reads `tasksQuery.isFetching` /
+  // `listsQuery.isFetching` live instead — a render-time snapshot could
+  // leave the board latched busy.
   const busyRef = useRef(false);
   busyRef.current =
     activeDrag !== null ||
@@ -165,51 +178,22 @@ export function BoardPage() {
     }),
   );
 
-  const load = useCallback(() => {
-    if (loadInFlightRef.current) return;
-    loadInFlightRef.current = true;
-    // Full-page loader only when the board is empty (first load, or a retry
-    // after a hard error cleared it) — the same rule as ListsPage, so
-    // reloads fired while cards are on screen never flash the spinner.
-    setIsLoading(listsRef.current.length === 0);
-    setLoadError(null);
-    // Sequential on purpose: GET /api/lists performs the first-visit seed (it
-    // inserts the default lists AND the category taxonomy), so the tasks and
-    // categories requests must run after it — their computed categories
-    // depend on the seeded taxonomy. Tasks and categories are independent of
-    // each other and load in parallel (the same seed rule as ListsPage).
-    listLists()
-      .then(async (listsData) => {
-        setLists(listsData.lists ?? []);
-        const [tasksData, categoriesData] = await Promise.all([
-          listTasks(),
-          listCategories(),
-        ]);
-        setTasks(tasksData.tasks ?? []);
-        setCategories(categoriesData.categories ?? []);
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load board';
-        setLoadError(message);
-      })
-      .finally(() => {
-        setIsLoading(false);
-        loadInFlightRef.current = false;
-      });
+  // Quiet refresh (60s interval + tab visibility): invalidates the shared
+  // query keys instead of the old `load()`. The queries refetch in the
+  // background; the seed gate (tasks/categories enabled only after lists
+  // succeed) keeps the first-visit taxonomy ordering on the very first load,
+  // and invalidation of all three keys covers refreshes once data exists.
+  // The hook never fires on mount and skips ticks while `busyRef` is set or
+  // a fetch is in flight (read live at tick time).
+  const refresh = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.lists.all });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.tasks.all });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.categories.all });
   }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  // Quiet refresh (60s interval + tab visibility): wired after the mount
-  // effect above so the initial load stays the first refresh — the hook
-  // never fires on mount and skips ticks while `busyRef` is set. The hook
-  // reads this callback at tick time, so loadInFlightRef is checked LIVE:
-  // an in-flight load still gates the tick, and its flag dropping in
-  // load()'s finally is visible on the next tick without a re-render.
-  useBoardRefresh(load, () => busyRef.current || loadInFlightRef.current);
+  useBoardRefresh(
+    refresh,
+    () => busyRef.current || tasksQuery.isFetching || listsQuery.isFetching,
+  );
 
   // ──────────────────────────────────────────
   // URL filters (ADR 0002 § Filters)
@@ -890,8 +874,14 @@ export function BoardPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setLoadError(null);
-                load();
+                // Refetch lists first — tasks/categories are seed-gated on
+                // lists success and re-run automatically; when lists are
+                // already loaded, refetch tasks and categories too.
+                void listsQuery.refetch();
+                if (listsQuery.isSuccess) {
+                  void tasksQuery.refetch();
+                  void categoriesQuery.refetch();
+                }
               }}
             >
               Retry

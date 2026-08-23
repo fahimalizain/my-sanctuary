@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   Check,
   Loader2,
@@ -25,7 +25,6 @@ import {
   ApiError,
   createTask,
   deleteTask,
-  listTasks,
   moveTask,
   runTaskAction,
   updateTask,
@@ -36,6 +35,7 @@ import {
   useListsQuery,
   useUpdateList,
 } from '@/app/queries/lists';
+import { setTasksCache, useTasksQuery } from '@/app/queries/tasks';
 import { cn } from '@/lib/utils';
 // Lists is unlinked from the nav; one shared helper is fine to import across
 // modules — no new package.
@@ -70,24 +70,21 @@ export function ListsPage() {
   const navigate = useNavigate();
   const listsQuery = useListsQuery();
   const lists = listsQuery.data?.lists ?? [];
-  const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  // Latest `tasks` for the async move flow, so the pre-move snapshot and the
-  // reverted card lookups never close over a stale array (same pattern as
-  // BoardPage).
-  const tasksRef = useRef<TaskRecord[]>([]);
-  tasksRef.current = tasks;
   // Tasks load once after lists succeed — the seed rule: GET /api/lists
   // performs the first-visit seed (default lists + category taxonomy), so the
   // tasks request must run after it (their computed categories depend on the
   // seeded taxonomy, and GET /api/tasks also runs the count-gated seed — a
   // no-op once lists seeded). Lists hide untracked tasks (no list to belong
-  // to), so the categories endpoint is never needed here.
-  const [tasksReady, setTasksReady] = useState(false);
-  // Local tasks-fetch failure — shown when the lists query itself is fine.
-  const [tasksError, setTasksError] = useState<string | null>(null);
-  // Bumped by Retry so the tasks effect re-runs even when `isSuccess` is
-  // already true (a lists refetch alone would not re-fire it).
-  const [tasksAttempt, setTasksAttempt] = useState(0);
+  // to), so the categories endpoint is never needed here. Shares the one
+  // `['tasks']` cache with the Board and the Home task picker (slice 6).
+  const tasksQuery = useTasksQuery({ enabled: listsQuery.isSuccess });
+  const tasks = tasksQuery.data?.tasks ?? [];
+  const setTasks = setTasksCache;
+  // Latest `tasks` for the async move flow, so the pre-move snapshot and the
+  // reverted card lookups never close over a stale array (same pattern as
+  // BoardPage).
+  const tasksRef = useRef<TaskRecord[]>([]);
+  tasksRef.current = tasks;
   // Action failures (delete 409, etc.): rendered as a banner above the
   // still-visible grid — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -104,66 +101,32 @@ export function ListsPage() {
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
 
   // Full-page loader only when the grid is empty (first load, or a retry
-  // after a hard error cleared it) — the same rule as CalendarPage
-  // (`isLoading: prev.events.length === 0`), so reloads fired while cards
-  // are on screen never flash the spinner.
+  // after a hard error cleared it) — Query's `isLoading` means "no data
+  // yet", so reloads fired while cards are on screen never flash the
+  // spinner.
   const isLoading =
-    listsQuery.isLoading || (listsQuery.isSuccess && !tasksReady);
-  // Load failures: the lists query's error, else the local tasks-fetch
-  // error. Replaces the grid with the error+retry banner only when there
-  // are no lists to show.
+    listsQuery.isLoading || (listsQuery.isSuccess && tasksQuery.isLoading);
+  // Load failures: the lists query's error, else the tasks query's error.
+  // Replaces the grid with the error+retry banner only when there are no
+  // lists to show.
   const loadError =
     (listsQuery.error instanceof Error
       ? listsQuery.error.message
       : listsQuery.error
         ? 'Failed to load lists'
-        : null) ?? tasksError;
-
-  // After lists succeed, fetch tasks once (the sequential seed rule from the
-  // old `load()`). Retry bumps `tasksAttempt` to re-run this even when
-  // `isSuccess` is already true — a plain lists refetch would not re-fire it.
-  useEffect(() => {
-    if (!listsQuery.isSuccess) return;
-    let cancelled = false;
-    listTasks()
-      .then((data) => {
-        if (!cancelled) setTasks(data.tasks ?? []);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setTasksError(
-            err instanceof Error ? err.message : 'Failed to load lists',
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setTasksReady(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [listsQuery.isSuccess, tasksAttempt]);
-
-  // Clear the local tasks error when the lists query starts fetching again
-  // (window focus, invalidation, Retry) — a stale failure banner must not
-  // outlive a fresh load attempt.
-  useEffect(() => {
-    if (listsQuery.isFetching) setTasksError(null);
-  }, [listsQuery.isFetching]);
+        : null) ??
+    (tasksQuery.error instanceof Error
+      ? tasksQuery.error.message
+      : tasksQuery.error
+        ? 'Failed to load tasks'
+        : null);
 
   // Refreshes only the tasks (timer actions never change lists, so the
-  // sequential lists→tasks reload is unnecessary here).
+  // sequential lists→tasks reload is unnecessary here). A plain refetch
+  // replaces the shared `['tasks']` cache — the Board picks it up too.
   const reloadTasks = useCallback(() => {
-    listTasks()
-      .then((data) => {
-        setTasks(data.tasks ?? []);
-      })
-      .catch((err: unknown) => {
-        setActionError(
-          err instanceof Error ? err.message : 'Failed to reload tasks',
-        );
-      });
-  }, []);
+    void tasksQuery.refetch();
+  }, [tasksQuery]);
 
   // ──────────────────────────────────────────
   // Task timer actions (start/stop/pause/complete/discard)
@@ -440,14 +403,11 @@ export function ListsPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                // Re-run the tasks fetch even when `isSuccess` is already
-                // true (the effect keys on `tasksAttempt`), and reset
-                // `tasksReady` so the full-page spinner rule still holds
-                // when the grid is empty.
-                setTasksReady(false);
-                setTasksError(null);
-                setTasksAttempt((attempt) => attempt + 1);
+                // Refetch lists first — the tasks query is seed-gated on
+                // lists success and re-runs automatically; when lists are
+                // already loaded, refetch tasks too.
                 void listsQuery.refetch();
+                if (listsQuery.isSuccess) void tasksQuery.refetch();
               }}
             >
               Retry
