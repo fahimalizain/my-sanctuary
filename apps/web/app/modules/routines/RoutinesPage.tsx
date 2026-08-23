@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -10,11 +10,11 @@ import {
 } from '@/components/ui/dialog';
 import { useNavigate } from '@tanstack/react-router';
 import {
-  createRoutine,
-  deleteRoutine,
-  listRoutines,
-  updateRoutine,
-} from '@/lib/api';
+  useCreateRoutine,
+  useDeleteRoutine,
+  useRoutinesQuery,
+  useUpdateRoutine,
+} from '@/app/queries/routines';
 import { useTitleClassification } from '@/app/hooks/useTitleClassification';
 import type { ClassifyStatus } from '@/app/hooks/useTitleClassification';
 import type {
@@ -81,15 +81,17 @@ interface RoutineFormState {
 
 export function RoutinesPage() {
   const navigate = useNavigate();
-  const [routines, setRoutines] = useState<RoutineRecord[]>([]);
-  // Latest `routines` for the dependency-free `load` callback below (writing a
-  // ref during render is the "latest value" pattern) — same as CategoriesPage.
-  const routinesRef = useRef<RoutineRecord[]>([]);
-  routinesRef.current = routines;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the document tree with
-  // the error+retry banner when there are no routines to show.
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const routinesQuery = useRoutinesQuery();
+  const routines = routinesQuery.data?.routines ?? [];
+  const isLoading = routinesQuery.isLoading;
+  // Load failures: the query's error. Replaces the document tree with the
+  // error+retry banner when there are no routines to show.
+  const loadError =
+    routinesQuery.error instanceof Error
+      ? routinesQuery.error.message
+      : routinesQuery.error
+        ? 'Failed to load routines'
+        : null;
   // Action failures (delete 400, etc.): rendered as a banner above the
   // still-visible list — rows are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -117,28 +119,6 @@ export function RoutinesPage() {
   const [classifyTitle, setClassifyTitle] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    // Full-page loader only while the list is empty (first load, or a retry
-    // after a hard error cleared it) — reloads fired while rows are on
-    // screen never flash the spinner.
-    setIsLoading(routinesRef.current.length === 0);
-    setLoadError(null);
-    listRoutines()
-      .then((data) => {
-        setRoutines(data.routines ?? []);
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load routines';
-        setLoadError(message);
-      })
-      .finally(() => setIsLoading(false));
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   // Title classify preview (advisory — the server 400s authoritatively).
   // resetKey changes on open/close and per routine id, so the hook
@@ -354,6 +334,10 @@ export function RoutinesPage() {
   // Actions
   // ──────────────────────────────────────────
 
+  const createRoutineMutation = useCreateRoutine();
+  const updateRoutineMutation = useUpdateRoutine();
+  const deleteRoutineMutation = useDeleteRoutine();
+
   const handleSubmit = async () => {
     if (!form || !canSave) return;
     setSaving(true);
@@ -369,9 +353,12 @@ export function RoutinesPage() {
     try {
       if (form.mode === 'edit') {
         // Every field optional — sending the full set is a no-op replace.
-        await updateRoutine(form.routine!.id, payload as UpdateRoutineInput);
+        await updateRoutineMutation.mutateAsync({
+          id: form.routine!.id,
+          input: payload as UpdateRoutineInput,
+        });
       } else {
-        await createRoutine(payload);
+        await createRoutineMutation.mutateAsync(payload);
       }
     } catch (err) {
       setSaving(false);
@@ -379,7 +366,7 @@ export function RoutinesPage() {
       return;
     }
     closeForm();
-    load();
+    // Invalidation refreshes the routines — no reload call needed.
   };
 
   const handleDelete = async (routine: RoutineRecord) => {
@@ -388,12 +375,12 @@ export function RoutinesPage() {
 
     setActionError(null);
     try {
-      await deleteRoutine(routine.id);
+      await deleteRoutineMutation.mutateAsync(routine.id);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Delete failed');
       return;
     }
-    load();
+    // Invalidation refreshes the routines — no reload call needed.
   };
 
   // ──────────────────────────────────────────
@@ -441,8 +428,7 @@ export function RoutinesPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setLoadError(null);
-                load();
+                void routinesQuery.refetch();
               }}
             >
               Retry
