@@ -13,7 +13,8 @@
 //! without a refreshable token), 400 invalid input (missing/invalid date,
 //! malformed body, non-task kind, terminal/foreign task, DELETE on an
 //! occurrence item, empty PATCH body, negative rank, start on a non-today or
-//! terminal occurrence, no writable calendar), 404 "not found"
+//! terminal occurrence, reschedule of an in_progress/done occurrence or onto
+//! a date already holding the routine, no writable calendar), 404 "not found"
 //! (missing/other-user/soft-deleted task, occurrence, item, or routine —
 //! existence is never leaked), 502 Google write failure, 500 logged database
 //! errors.
@@ -21,7 +22,9 @@
 use worker::*;
 
 use api_core::agenda::AgendaError;
-use api_core::models::{MoveAgendaItemInput, NewAgendaItemInput, UpdateOccurrence};
+use api_core::models::{
+    MoveAgendaItemInput, NewAgendaItemInput, RescheduleAgendaItemInput, UpdateOccurrence,
+};
 use api_core::{GoogleAccess, OccurrenceRepo, OAuthConfig, UserRepo};
 
 /// 401 body for missing/invalid sessions.
@@ -320,6 +323,51 @@ pub async fn delete_agenda_item(
     };
 
     match api_core::delete_agenda_item(&agenda_d1(&ctx)?, &user.id, id).await {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+
+/// `POST /api/agenda/items/:id/reschedule` → 200 `{"item":{...}}`. Body:
+/// `{date}` (`YYYY-MM-DD`, required). Relocates the slot to that day —
+/// occurrences exdate their source date on the routine and move
+/// (`pending | skipped` only), tasks move the membership slot only (task
+/// status unchanged, no `task_logs` row). Session-only: no Google write of
+/// any kind.
+pub async fn reschedule_agenda_item(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id") else {
+        return json_error(&ctx, 404, "not found");
+    };
+
+    let input: RescheduleAgendaItemInput = match req.json().await {
+        Ok(input) => input,
+        Err(_) => return json_error(&ctx, 400, "invalid body"),
+    };
+    let focused_task_id = focused_task_id(&ctx, &user.id).await;
+
+    match api_core::reschedule_agenda_item(
+        &lists_d1(&ctx)?,
+        &categories_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
+        &tasks_d1(&ctx)?,
+        &occurrences_d1(&ctx)?,
+        &routines_d1(&ctx)?,
+        &user.id,
+        id,
+        &input.date,
+        focused_task_id.as_deref(),
+    )
+    .await
+    {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))

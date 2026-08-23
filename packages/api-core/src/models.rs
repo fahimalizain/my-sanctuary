@@ -759,6 +759,13 @@ pub struct MoveAgendaItemInput {
     pub sort_order: i64,
 }
 
+/// Request body for `POST /api/agenda/items/:id/reschedule`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RescheduleAgendaItemInput {
+    /// Local civil date `YYYY-MM-DD` the slot moves to.
+    pub date: String,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike

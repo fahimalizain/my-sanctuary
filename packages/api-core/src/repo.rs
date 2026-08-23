@@ -418,6 +418,9 @@ pub trait OccurrenceRepo: Send + Sync {
     /// Transitions `status` (`pending | in_progress | done | skipped`). No
     /// soft-delete filter — the table has none.
     async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError>;
+    /// Relocates the occurrence to `local_date` (reschedule). Bumps
+    /// `updated_at` — the date is a content change. No soft-delete filter.
+    async fn set_local_date(&self, id: &str, local_date: &str) -> Result<(), RepoError>;
     /// Every `in_progress` occurrence across ALL users that carries both ids
     /// (`calendar_id`/`google_event_id` NOT NULL) — the elongate cron's
     /// occurrence work list (slice 6: grow living in_progress one-shot logs
@@ -463,6 +466,16 @@ pub trait AgendaItemRepo: Send + Sync {
     /// Sets the item's pile rank. No `updated_at`: placement is a position
     /// change, not a content update (same spirit as `TASK_SET_SORT_ORDER_SQL`).
     async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<(), RepoError>;
+    /// Relocates the item to `local_date` at `sort_order` (reschedule appends
+    /// `max+1` on the target pile). No `updated_at`: a slot move is a
+    /// placement change, not a content update (same spirit as
+    /// `set_sort_order`).
+    async fn set_local_date(
+        &self,
+        id: &str,
+        local_date: &str,
+        sort_order: i64,
+    ) -> Result<(), RepoError>;
     /// Shifts every peer of the user's `local_date` pile ranked at or after
     /// `from_rank` by `delta` (+1 up, -1 down) — the reorder's neighbor shift.
     /// Never touches `updated_at` (same spirit as `TASK_SHIFT_SORT_ORDER_SQL`).
@@ -1144,6 +1157,11 @@ pub const OCCURRENCE_SET_EVENT_IDS_SQL: &str =
 pub const OCCURRENCE_SET_STATUS_SQL: &str =
     "UPDATE routine_occurrences SET status = ?, updated_at = ? WHERE id = ?";
 
+/// Relocates the occurrence to another day (reschedule). `updated_at` is
+/// bumped — the date is a content change. No `deleted_at` filter.
+pub const OCCURRENCE_SET_LOCAL_DATE_SQL: &str =
+    "UPDATE routine_occurrences SET local_date = ?, updated_at = ? WHERE id = ?";
+
 /// The elongate cron's occurrence work list (slice 6): every `in_progress`
 /// occurrence that actually has a chip. Rows without ids are never recreated
 /// here — a start stores both ids together, so a missing one means the row
@@ -1194,6 +1212,11 @@ pub const AGENDA_ITEM_MAX_SORT_ORDER_SQL: &str = "
 /// change, not a content update (same spirit as `TASK_SET_SORT_ORDER_SQL`).
 pub const AGENDA_ITEM_SET_SORT_ORDER_SQL: &str =
     "UPDATE agenda_items SET sort_order = ? WHERE id = ?";
+
+/// Relocates the item to another date at a new rank (reschedule). No
+/// `updated_at`: a slot move is a placement change, not a content update.
+pub const AGENDA_ITEM_SET_LOCAL_DATE_SQL: &str =
+    "UPDATE agenda_items SET local_date = ?, sort_order = ? WHERE id = ?";
 
 /// The reorder's neighbor shift: every peer of the user's date pile ranked at
 /// or after `from_rank` moves by `delta` (+1 up, -1 down). `updated_at` is
@@ -1861,6 +1884,12 @@ mod tests {
         assert_eq!(OCCURRENCE_UPDATE_TITLE_SQL.matches('?').count(), 3, "{}", OCCURRENCE_UPDATE_TITLE_SQL);
         assert_eq!(OCCURRENCE_SET_STATUS_SQL.matches('?').count(), 3, "{}", OCCURRENCE_SET_STATUS_SQL);
         assert_eq!(OCCURRENCE_SET_EVENT_IDS_SQL.matches('?').count(), 4, "{}", OCCURRENCE_SET_EVENT_IDS_SQL);
+        let set_date = OCCURRENCE_SET_LOCAL_DATE_SQL;
+        assert!(set_date.starts_with("UPDATE"), "{set_date}");
+        assert!(set_date.contains("local_date = ?"), "{set_date}");
+        assert!(set_date.contains("updated_at = ?"), "reschedule bumps updated_at: {set_date}");
+        assert!(!set_date.contains("deleted_at"), "no soft-delete on occurrences: {set_date}");
+        assert_eq!(set_date.matches('?').count(), 3, "{set_date}");
         assert!(
             OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("status = 'in_progress'"),
             "{}",
@@ -1901,5 +1930,11 @@ mod tests {
         assert!(set.contains("SET sort_order = ?"), "{set}");
         assert!(!set.contains("updated_at"), "placement never bumps updated_at: {set}");
         assert_eq!(set.matches('?').count(), 2, "{set}");
+        let set_date = AGENDA_ITEM_SET_LOCAL_DATE_SQL;
+        assert!(set_date.contains("local_date = ?"), "{set_date}");
+        assert!(set_date.contains("sort_order = ?"), "{set_date}");
+        assert!(!set_date.contains("updated_at"), "a slot move never bumps updated_at: {set_date}");
+        assert!(!set_date.contains("deleted_at"), "hard-delete table: {set_date}");
+        assert_eq!(set_date.matches('?').count(), 3, "{set_date}");
     }
 }
