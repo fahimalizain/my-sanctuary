@@ -8,6 +8,7 @@ import {
   childIdsOf,
   expandCategorySelection,
   isImpliedByParent,
+  taskMatchesSearch,
   toggleCategoryId,
 } from './board-filters';
 
@@ -397,4 +398,49 @@ test('buildCategoryTree: query is trimmed and case-insensitive', () => {
 
 test('buildCategoryTree: no matches → []', () => {
   assert.deepEqual(buildCategoryTree(lists, categories, 'zzzz'), []);
+});
+
+// ── taskMatchesSearch ────────────────────────────────────────────────────
+
+// Inline fixtures — only the fields `taskMatchesSearch` reads. Note that
+// `display_title` is NOT an input to this helper (locked decision): only
+// stored `title` and `description` are searched, so no display_title is
+// ever passed here.
+const card = (title: string, description: string) => ({ title, description });
+
+test('taskMatchesSearch: empty and whitespace-only queries match everything', () => {
+  assert.equal(taskMatchesSearch(card('Alpha', 'Beta'), ''), true);
+  assert.equal(taskMatchesSearch(card('Alpha', 'Beta'), '   '), true);
+  assert.equal(taskMatchesSearch(card('', ''), ''), true);
+});
+
+test('taskMatchesSearch: query hits title after trim + case fold', () => {
+  assert.equal(
+    taskMatchesSearch(card('Review Q3 Roadmap', 'notes'), '  review  '),
+    true,
+  );
+});
+
+test('taskMatchesSearch: description hit when the title misses', () => {
+  assert.equal(
+    taskMatchesSearch(card('Team Standup', 'Prepare demo notes'), 'demo'),
+    true,
+  );
+});
+
+test('taskMatchesSearch: miss on both title and description → false', () => {
+  // display_title would be derived as e.g. "ZZZ unique" for a card like
+  // this in production, but it is not consulted — only these two fields.
+  assert.equal(taskMatchesSearch(card('Alpha | Work', ''), 'ZZZ'), false);
+});
+
+test("taskMatchesSearch: accepted consequence — suffix segment matches ('Work' vs 'Review Q3 | Work')", () => {
+  assert.equal(taskMatchesSearch(card('Review Q3 | Work', ''), 'work'), true);
+});
+
+test('taskMatchesSearch: present in both title and description still matches', () => {
+  assert.equal(
+    taskMatchesSearch(card('Plan review', 'review notes'), 'review'),
+    true,
+  );
 });

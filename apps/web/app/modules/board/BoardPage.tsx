@@ -50,7 +50,11 @@ import {
   dropInsertIndex,
 } from './board-dnd';
 import type { BoardColumnItems } from './board-dnd';
-import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
+import {
+  categoryMatchesSelection,
+  taskMatchesSearch,
+  toggleCategoryId,
+} from './board-filters';
 import {
   COLUMNS,
   COLUMN_ID_PREFIX,
@@ -72,7 +76,9 @@ interface TaskFormState {
 
 export function BoardPage() {
   const navigate = useNavigate();
-  const { priority, difficulty, category } = useSearch({ from: '/board' });
+  const { priority, difficulty, category, search } = useSearch({
+    from: '/board',
+  });
 
   const [lists, setLists] = useState<TaskListsResponse['lists']>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
@@ -205,7 +211,8 @@ export function BoardPage() {
   const hasActiveFilters =
     priority !== undefined ||
     difficulty !== undefined ||
-    selectedCategoryIds.length > 0;
+    selectedCategoryIds.length > 0 ||
+    (search ?? '').trim().length > 0;
 
   // Merges the given fields into the URL search params. Only keys that are
   // PRESENT in `updates` are touched: an explicitly `undefined` value removes
@@ -241,6 +248,17 @@ export function BoardPage() {
               next.category = updates.category;
             }
           }
+          if ('search' in updates) {
+            // Whitespace-only is a no-op: drop the param entirely.
+            if (
+              updates.search === undefined ||
+              updates.search.trim().length === 0
+            ) {
+              delete next.search;
+            } else {
+              next.search = updates.search;
+            }
+          }
           return next;
         },
       });
@@ -269,6 +287,7 @@ export function BoardPage() {
       priority: undefined,
       difficulty: undefined,
       category: undefined,
+      search: undefined,
     });
 
   // ──────────────────────────────────────────
@@ -295,9 +314,12 @@ export function BoardPage() {
       ) {
         return false;
       }
+      // Free-text filter over stored title/description (never display_title);
+      // an empty/whitespace `search` matches everything.
+      if (!taskMatchesSearch(task, search ?? '')) return false;
       return true;
     },
-    [priority, difficulty, selectedCategoryIds, categories],
+    [priority, difficulty, selectedCategoryIds, categories, search],
   );
 
   // Filter the column's tasks (AND), sort by `sort_order ASC` (tie-break
@@ -929,7 +951,9 @@ export function BoardPage() {
           /* URL filters — one wrapping horizontal row (ADR 0002 § UI):
                 Priority and Difficulty are single-select All+value pills;
                 Category is a searchable checkbox combobox grouped by list →
-                root → children. Filters combine with AND. */
+                root → children; Search is a free-text title/description
+                filter driven by `?search=` (its input UI lands in a later
+                slice). Filters combine with AND. */
           <section className="mb-6 space-y-3">
             <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
               <div className="flex flex-col items-start gap-1.5">

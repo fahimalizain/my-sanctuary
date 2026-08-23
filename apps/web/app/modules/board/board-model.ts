@@ -7,11 +7,13 @@ import type {
 
 /** The /board search params — locked by ADR 0002 § Filters. All fields are
  *  optional; missing params mean "all". `category` is a comma-separated list
- *  of category ids; unknown ids are ignored by the page. */
+ *  of category ids; unknown ids are ignored by the page. `search` is a
+ *  free-text filter over task title/description; missing or empty = all. */
 export type BoardSearch = {
   priority?: TaskPriority;
   difficulty?: TaskDifficulty;
   category?: string; // comma-separated category ids
+  search?: string; // free-text substring filter over title/description
 };
 
 // The server's error envelope is `{"error": "message"}`; fall back to a

@@ -75,6 +75,14 @@ const boardRoute = createRoute({
       typeof search.category === 'string' && search.category.length > 0
         ? search.category
         : undefined,
+    // Free-text title/description filter. Mirrors `category`: non-strings,
+    // '' and whitespace-only all mean "no filter". The raw string is kept
+    // (not trimmed) when it has non-whitespace content, so mid-query spaces
+    // survive; the matcher trims before comparing.
+    search:
+      typeof search.search === 'string' && search.search.trim().length > 0
+        ? search.search
+        : undefined,
   }),
 });
 
