@@ -1,7 +1,8 @@
 import type { Category, TaskList } from '../../types';
 
-// Pure category-filter helpers for the board (ADR 0002 § Filters, amended
-// 2026-08-20). No React, no DOM, no fetch — unit-tested with node:test.
+// Pure category-filter and task-search helpers for the board (ADR 0002
+// § Filters, amended 2026-08-20). No React, no DOM, no fetch — unit-tested
+// with node:test.
 //
 // Taxonomy contract:
 // - One-level tree: roots have `parent_id: null`; children hang directly off
@@ -95,6 +96,23 @@ export function categoryTriggerLabel(
     return cat ? cat.title : selectedIds[0];
   }
   return `${selectedIds.length} categories`;
+}
+
+/**
+ * Free-text board filter. True when `query` is empty/whitespace, or a
+ * case-insensitive substring of `task.title` or `task.description`.
+ * Does not consult `display_title` — only the stored fields are searched.
+ */
+export function taskMatchesSearch(
+  task: { title: string; description: string },
+  query: string,
+): boolean {
+  const q = query.trim().toLowerCase();
+  if (q.length === 0) return true;
+  return (
+    task.title.toLowerCase().includes(q) ||
+    task.description.toLowerCase().includes(q)
+  );
 }
 
 export type CategoryTreeRoot = {

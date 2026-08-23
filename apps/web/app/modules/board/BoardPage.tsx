@@ -50,7 +50,11 @@ import {
   dropInsertIndex,
 } from './board-dnd';
 import type { BoardColumnItems } from './board-dnd';
-import { categoryMatchesSelection, toggleCategoryId } from './board-filters';
+import {
+  categoryMatchesSelection,
+  taskMatchesSearch,
+  toggleCategoryId,
+} from './board-filters';
 import {
   COLUMNS,
   COLUMN_ID_PREFIX,
@@ -72,7 +76,9 @@ interface TaskFormState {
 
 export function BoardPage() {
   const navigate = useNavigate();
-  const { priority, difficulty, category } = useSearch({ from: '/board' });
+  const { priority, difficulty, category, search } = useSearch({
+    from: '/board',
+  });
 
   const [lists, setLists] = useState<TaskListsResponse['lists']>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
@@ -205,7 +211,8 @@ export function BoardPage() {
   const hasActiveFilters =
     priority !== undefined ||
     difficulty !== undefined ||
-    selectedCategoryIds.length > 0;
+    selectedCategoryIds.length > 0 ||
+    (search ?? '').trim().length > 0;
 
   // Merges the given fields into the URL search params. Only keys that are
   // PRESENT in `updates` are touched: an explicitly `undefined` value removes
@@ -241,6 +248,17 @@ export function BoardPage() {
               next.category = updates.category;
             }
           }
+          if ('search' in updates) {
+            // Whitespace-only is a no-op: drop the param entirely.
+            if (
+              updates.search === undefined ||
+              updates.search.trim().length === 0
+            ) {
+              delete next.search;
+            } else {
+              next.search = updates.search;
+            }
+          }
           return next;
         },
       });
@@ -269,6 +287,7 @@ export function BoardPage() {
       priority: undefined,
       difficulty: undefined,
       category: undefined,
+      search: undefined,
     });
 
   // ──────────────────────────────────────────
@@ -295,9 +314,12 @@ export function BoardPage() {
       ) {
         return false;
       }
+      // Free-text filter over stored title/description (never display_title);
+      // an empty/whitespace `search` matches everything.
+      if (!taskMatchesSearch(task, search ?? '')) return false;
       return true;
     },
-    [priority, difficulty, selectedCategoryIds, categories],
+    [priority, difficulty, selectedCategoryIds, categories, search],
   );
 
   // Filter the column's tasks (AND), sort by `sort_order ASC` (tie-break
@@ -929,9 +951,13 @@ export function BoardPage() {
           /* URL filters — one wrapping horizontal row (ADR 0002 § UI):
                 Priority and Difficulty are single-select All+value pills;
                 Category is a searchable checkbox combobox grouped by list →
-                root → children. Filters combine with AND. */
-          <section className="mb-6 space-y-3">
-            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+                root → children; Search is a free-text title/description
+                filter driven by `?search=` (each keystroke rewrites the
+                param, whitespace-only removes it). Clear filters sits on
+                this same row, aligned with the controls. Filters combine
+                with AND. */
+          <section className="mb-6">
+            <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
               <div className="flex flex-col items-start gap-1.5">
                 <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Priority
@@ -998,19 +1024,40 @@ export function BoardPage() {
                   </span>
                 )}
               </div>
-            </div>
 
-            {hasActiveFilters && (
-              <div className="flex justify-end">
+              <div className="flex flex-col items-start gap-1.5">
+                <label
+                  htmlFor="board-task-search"
+                  className="text-xs font-medium uppercase tracking-wide text-muted-foreground"
+                >
+                  Search
+                </label>
+                {/* type="text" (never "search" — that paints a native
+                    cancel button); every keystroke writes `?search=` via
+                    updateSearch (replace: true), which treats whitespace-only
+                    as delete. Focus border only — never the primary fill. */}
+                <input
+                  id="board-task-search"
+                  type="text"
+                  value={search ?? ''}
+                  onChange={(event) =>
+                    updateSearch({ search: event.target.value })
+                  }
+                  placeholder="Search tasks"
+                  className="w-56 min-w-0 rounded-xl border-2 border-input bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:border-primary transition-all"
+                />
+              </div>
+
+              {hasActiveFilters && (
                 <button
                   type="button"
                   onClick={clearFilters}
-                  className="text-sm font-medium text-primary hover:underline"
+                  className="shrink-0 py-1.5 text-sm font-medium text-primary hover:underline"
                 >
                   Clear filters
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </section>
         )}
       </div>
