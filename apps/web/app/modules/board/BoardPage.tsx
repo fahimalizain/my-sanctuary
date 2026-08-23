@@ -65,6 +65,7 @@ import {
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
+import { useBoardRefresh } from './useBoardRefresh';
 
 interface TaskFormState {
   mode: 'create' | 'edit';
@@ -122,6 +123,22 @@ export function BoardPage() {
   // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
   // flight: further pin taps are ignored and every pin is disabled.
   const [focusInFlight, setFocusInFlight] = useState(false);
+  // One load at a time: the mount effect, Retry and a quiet refresh tick
+  // (interval or visibility) can race — while a load is in flight a second
+  // call is a no-op, never a double fetch.
+  const loadInFlightRef = useRef(false);
+  // Anything a quiet background refresh must not interrupt (see
+  // useBoardRefresh): a live drag or preview, an in-flight /move, an
+  // in-flight focus toggle, or an in-flight load itself. Written during
+  // render (same pattern as listsRef above) so the refresh hook reads the
+  // freshest value without re-subscribing.
+  const busyRef = useRef(false);
+  busyRef.current =
+    activeDrag !== null ||
+    dragItems !== null ||
+    movingIds.size > 0 ||
+    focusInFlight ||
+    loadInFlightRef.current;
 
   // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
   // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
@@ -140,6 +157,8 @@ export function BoardPage() {
   );
 
   const load = useCallback(() => {
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
     // Full-page loader only when the board is empty (first load, or a retry
     // after a hard error cleared it) — the same rule as ListsPage, so
     // reloads fired while cards are on screen never flash the spinner.
@@ -173,12 +192,20 @@ export function BoardPage() {
           err instanceof Error ? err.message : 'Failed to load board';
         setLoadError(message);
       })
-      .finally(() => setIsLoading(false));
+      .finally(() => {
+        setIsLoading(false);
+        loadInFlightRef.current = false;
+      });
   }, []);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Quiet refresh (60s interval + tab visibility): wired after the mount
+  // effect above so the initial load stays the first refresh — the hook
+  // never fires on mount and skips ticks while `busyRef` is set.
+  useBoardRefresh(load, () => busyRef.current);
 
   // ──────────────────────────────────────────
   // URL filters (ADR 0002 § Filters)
