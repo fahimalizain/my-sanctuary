@@ -360,10 +360,9 @@ pub trait RoutineRepo: Send + Sync {
     /// Inserts a new routine and returns the stored row. The D1 implementation
     /// generates the UUID `id` and the `created_at`/`updated_at` timestamps.
     async fn insert(&self, routine: NewRoutine) -> Result<Routine, RepoError>;
-    /// Updates `title`/`estimated_minutes`/`dtstart`/`rrule`/`exdates`/
-    /// `sort_order` on a living routine (`None` fields are left unchanged) and
-    /// returns the updated row, or `None` when the routine is missing or
-    /// soft-deleted.
+    /// Updates `title`/`estimated_minutes`/`rrule`/`sort_order` on a living
+    /// routine (`None` fields are left unchanged) and returns the updated row,
+    /// or `None` when the routine is missing or soft-deleted.
     async fn update(&self, id: &str, updates: &UpdateRoutine) -> Result<Option<Routine>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
@@ -418,9 +417,6 @@ pub trait OccurrenceRepo: Send + Sync {
     /// Transitions `status` (`pending | in_progress | done | skipped`). No
     /// soft-delete filter — the table has none.
     async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError>;
-    /// Relocates the occurrence to `local_date` (reschedule). Bumps
-    /// `updated_at` — the date is a content change. No soft-delete filter.
-    async fn set_local_date(&self, id: &str, local_date: &str) -> Result<(), RepoError>;
     /// Every `in_progress` occurrence across ALL users that carries both ids
     /// (`calendar_id`/`google_event_id` NOT NULL) — the elongate cron's
     /// occurrence work list (slice 6: grow living in_progress one-shot logs
@@ -446,11 +442,21 @@ pub trait AgendaItemRepo: Send + Sync {
     /// must verify `row.user_id` (the service does).
     async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError>;
     /// The item at the `UNIQUE (user_id, local_date, kind, ref_id)` key, or
-    /// `None` — the add-task idempotency and the seed's already-present check.
+    /// `None` — the add-task idempotency.
     async fn get_by_key(
         &self,
         user_id: &str,
         local_date: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<Option<AgendaItem>, RepoError>;
+    /// The user's item of `kind` referencing `ref_id` on ANY date, or `None` —
+    /// the seed's "no membership anywhere" check: an occurrence whose agenda
+    /// row was rescheduled to another day must not be re-attached to its rule
+    /// date.
+    async fn get_by_ref(
+        &self,
+        user_id: &str,
         kind: &str,
         ref_id: &str,
     ) -> Result<Option<AgendaItem>, RepoError>;
@@ -1079,25 +1085,22 @@ pub const ROUTINE_GET_BY_ID_SQL: &str =
     "SELECT * FROM routines WHERE id = ? AND deleted_at IS NULL";
 
 /// Plain INSERT (no `ON CONFLICT`): routines are user-authored, never upserted.
-/// The D1 implementation binds the UUID `id` and the timestamps; `exdates`
-/// arrives as JSON array text (`'[]'` when empty).
+/// The D1 implementation binds the UUID `id` and the timestamps; `rrule`
+/// arrives as the two-line recurrence blob (DTSTART + RRULE).
 pub const ROUTINE_INSERT_SQL: &str = "
     INSERT INTO routines
-        (id, user_id, title, estimated_minutes, dtstart, rrule, exdates, sort_order, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, user_id, title, estimated_minutes, rrule, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). Rule
 /// changes never touch materialized occurrences — they only affect future
-/// ensure. The D1 implementation binds `D1Type::Null` for `None` fields and
-/// serializes a present `exdates` Vec to its JSON text.
+/// ensure. The D1 implementation binds `D1Type::Null` for `None` fields.
 pub const ROUTINE_UPDATE_SQL: &str = "
     UPDATE routines SET
         title = COALESCE(?, title),
         estimated_minutes = COALESCE(?, estimated_minutes),
-        dtstart = COALESCE(?, dtstart),
         rrule = COALESCE(?, rrule),
-        exdates = COALESCE(?, exdates),
         sort_order = COALESCE(?, sort_order),
         updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
@@ -1157,11 +1160,6 @@ pub const OCCURRENCE_SET_EVENT_IDS_SQL: &str =
 pub const OCCURRENCE_SET_STATUS_SQL: &str =
     "UPDATE routine_occurrences SET status = ?, updated_at = ? WHERE id = ?";
 
-/// Relocates the occurrence to another day (reschedule). `updated_at` is
-/// bumped — the date is a content change. No `deleted_at` filter.
-pub const OCCURRENCE_SET_LOCAL_DATE_SQL: &str =
-    "UPDATE routine_occurrences SET local_date = ?, updated_at = ? WHERE id = ?";
-
 /// The elongate cron's occurrence work list (slice 6): every `in_progress`
 /// occurrence that actually has a chip. Rows without ids are never recreated
 /// here — a start stores both ids together, so a missing one means the row
@@ -1186,6 +1184,13 @@ pub const AGENDA_ITEM_GET_BY_ID_SQL: &str = "SELECT * FROM agenda_items WHERE id
 
 pub const AGENDA_ITEM_GET_BY_KEY_SQL: &str =
     "SELECT * FROM agenda_items WHERE user_id = ? AND local_date = ? AND kind = ? AND ref_id = ?";
+
+/// The seed's "no membership anywhere" read: any item of `kind` referencing
+/// `ref_id` for the user, on ANY date. An occurrence rescheduled to another
+/// day keeps its membership row there, so a GET on its rule date must not
+/// re-attach it.
+pub const AGENDA_ITEM_GET_BY_REF_SQL: &str =
+    "SELECT * FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ? LIMIT 1";
 
 /// Idempotent ensure: `OR IGNORE` absorbs the `UNIQUE (user_id, local_date,
 /// kind, ref_id)` race — a duplicate returns the existing row (its stored
@@ -1821,21 +1826,23 @@ mod tests {
     }
 
     #[test]
-    fn routine_insert_binds_all_10_columns() {
+    fn routine_insert_binds_all_8_columns() {
         assert!(ROUTINE_INSERT_SQL.contains("INSERT INTO routines"), "{}", ROUTINE_INSERT_SQL);
         assert!(!ROUTINE_INSERT_SQL.contains("ON CONFLICT"), "{}", ROUTINE_INSERT_SQL);
         assert_eq!(
             ROUTINE_INSERT_SQL.matches('?').count(),
-            10,
+            8,
             "one placeholder per column: {}",
             ROUTINE_INSERT_SQL
         );
         for column in [
-            "id", "user_id", "title", "estimated_minutes", "dtstart", "rrule",
-            "exdates", "sort_order", "created_at", "updated_at",
+            "id", "user_id", "title", "estimated_minutes", "rrule",
+            "sort_order", "created_at", "updated_at",
         ] {
             assert!(ROUTINE_INSERT_SQL.contains(column), "missing {column}");
         }
+        assert!(!ROUTINE_INSERT_SQL.contains("dtstart"), "{}", ROUTINE_INSERT_SQL);
+        assert!(!ROUTINE_INSERT_SQL.contains("exdates"), "{}", ROUTINE_INSERT_SQL);
     }
 
     #[test]
@@ -1844,11 +1851,11 @@ mod tests {
         assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
         assert!(sql.contains("COALESCE(?, title)"), "{sql}");
         assert!(sql.contains("COALESCE(?, estimated_minutes)"), "{sql}");
-        assert!(sql.contains("COALESCE(?, dtstart)"), "{sql}");
         assert!(sql.contains("COALESCE(?, rrule)"), "{sql}");
-        assert!(sql.contains("COALESCE(?, exdates)"), "{sql}");
         assert!(sql.contains("COALESCE(?, sort_order)"), "{sql}");
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("dtstart"), "{sql}");
+        assert!(!sql.contains("exdates"), "{sql}");
     }
 
     #[test]
@@ -1884,12 +1891,6 @@ mod tests {
         assert_eq!(OCCURRENCE_UPDATE_TITLE_SQL.matches('?').count(), 3, "{}", OCCURRENCE_UPDATE_TITLE_SQL);
         assert_eq!(OCCURRENCE_SET_STATUS_SQL.matches('?').count(), 3, "{}", OCCURRENCE_SET_STATUS_SQL);
         assert_eq!(OCCURRENCE_SET_EVENT_IDS_SQL.matches('?').count(), 4, "{}", OCCURRENCE_SET_EVENT_IDS_SQL);
-        let set_date = OCCURRENCE_SET_LOCAL_DATE_SQL;
-        assert!(set_date.starts_with("UPDATE"), "{set_date}");
-        assert!(set_date.contains("local_date = ?"), "{set_date}");
-        assert!(set_date.contains("updated_at = ?"), "reschedule bumps updated_at: {set_date}");
-        assert!(!set_date.contains("deleted_at"), "no soft-delete on occurrences: {set_date}");
-        assert_eq!(set_date.matches('?').count(), 3, "{set_date}");
         assert!(
             OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("status = 'in_progress'"),
             "{}",
@@ -1910,6 +1911,9 @@ mod tests {
             AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL
         );
         assert!(AGENDA_ITEM_GET_BY_KEY_SQL.contains("user_id = ? AND local_date = ? AND kind = ? AND ref_id = ?"), "{}", AGENDA_ITEM_GET_BY_KEY_SQL);
+        assert!(AGENDA_ITEM_GET_BY_REF_SQL.contains("user_id = ? AND kind = ? AND ref_id = ?"), "{}", AGENDA_ITEM_GET_BY_REF_SQL);
+        assert!(!AGENDA_ITEM_GET_BY_REF_SQL.contains("local_date"), "any date: {}", AGENDA_ITEM_GET_BY_REF_SQL);
+        assert!(AGENDA_ITEM_GET_BY_REF_SQL.contains("LIMIT 1"), "{}", AGENDA_ITEM_GET_BY_REF_SQL);
         assert!(AGENDA_ITEM_INSERT_SQL.trim_start().starts_with("INSERT OR IGNORE"), "{}", AGENDA_ITEM_INSERT_SQL);
         assert_eq!(AGENDA_ITEM_INSERT_SQL.matches('?').count(), 8, "{}", AGENDA_ITEM_INSERT_SQL);
         assert!(AGENDA_ITEM_DELETE_SQL.starts_with("DELETE FROM"), "{}", AGENDA_ITEM_DELETE_SQL);

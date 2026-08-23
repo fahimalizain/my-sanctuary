@@ -7,7 +7,7 @@
 //! user, wires the D1 repos, and maps errors to HTTP responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid input (title/category rules,
-//! `estimated_minutes < 1`, invalid RRULE/dtstart/exdates, empty PATCH body),
+//! `estimated_minutes < 1`, invalid rrule blob, empty PATCH body),
 //! 404 "routine not found" (missing/soft-deleted/other-user), 500 logged
 //! database errors.
 
@@ -99,8 +99,9 @@ pub async fn list_routines(
 }
 
 /// `POST /api/routines` → 200 `{"routine":{...}}`. Body:
-/// `{title, estimated_minutes?, dtstart, rrule, exdates?}`. Invalid RRULE or a
-/// title that does not uniquely classify is 400; nothing is persisted then.
+/// `{title, estimated_minutes?, rrule}` — `rrule` is the two-line recurrence
+/// blob (`DTSTART:` line + `RRULE:` line). Invalid rrule or a title that does
+/// not uniquely classify is 400; nothing is persisted then.
 pub async fn create_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -132,9 +133,9 @@ pub async fn create_routine(
 }
 
 /// `PATCH /api/routines/:id` → 200 `{"routine":{...}}`. Body:
-/// `{title?, estimated_minutes?, dtstart?, rrule?, exdates?, sort_order?}` —
-/// at least one field required (400 otherwise). Rule changes never touch
-/// materialized occurrences.
+/// `{title?, estimated_minutes?, rrule?, sort_order?}` — at least one field
+/// required (400 otherwise). Rule changes never touch materialized
+/// occurrences.
 pub async fn update_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,

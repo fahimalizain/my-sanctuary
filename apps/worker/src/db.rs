@@ -23,9 +23,9 @@ use api_core::repo::{
     RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo,
     UserRepo, WatchChannelRepo,
     AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
-    AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL, AGENDA_ITEM_MAX_SORT_ORDER_SQL,
-    AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
-    AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
+    AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
+    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL,
+    AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
@@ -35,7 +35,7 @@ use api_core::repo::{
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
     OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
-    OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_LOCAL_DATE_SQL, OCCURRENCE_SET_STATUS_SQL,
+    OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
     OCCURRENCE_UPDATE_TITLE_SQL,
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL, ROUTINE_LIST_BY_USER_ID_SQL,
     ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
@@ -760,10 +760,7 @@ impl RoutineRepo for D1RoutineRepo {
                 D1Type::Text(&routine.user_id),
                 D1Type::Text(&routine.title),
                 D1Type::Integer(routine.estimated_minutes as i32),
-                D1Type::Text(&routine.dtstart),
                 D1Type::Text(&routine.rrule),
-                // Exclusion dates as a JSON array text ('[]' when empty).
-                D1Type::Text(&routine.exdates_json),
                 D1Type::Integer(routine.sort_order as i32),
                 D1Type::Text(&now),
                 D1Type::Text(&now),
@@ -775,9 +772,7 @@ impl RoutineRepo for D1RoutineRepo {
             user_id: routine.user_id,
             title: routine.title,
             estimated_minutes: routine.estimated_minutes,
-            dtstart: routine.dtstart,
             rrule: routine.rrule,
-            exdates: routine.exdates_json,
             sort_order: routine.sort_order,
             created_at: now.clone(),
             updated_at: now,
@@ -796,20 +791,7 @@ impl RoutineRepo for D1RoutineRepo {
             Some(value) => D1Type::Integer(value as i32),
             None => D1Type::Null,
         };
-        let dtstart = optional_text(updates.dtstart.as_deref());
         let rrule = optional_text(updates.rrule.as_deref());
-        // A present exdates set replaces the whole JSON array; absent leaves it.
-        let exdates_json = match &updates.exdates {
-            Some(exdates) => Some(
-                serde_json::to_string(exdates)
-                    .map_err(|err| RepoError::Backend(err.to_string()))?,
-            ),
-            None => None,
-        };
-        let exdates = match exdates_json.as_deref() {
-            Some(json) => D1Type::Text(json),
-            None => D1Type::Null,
-        };
         let sort_order = match updates.sort_order {
             Some(value) => D1Type::Integer(value as i32),
             None => D1Type::Null,
@@ -821,9 +803,7 @@ impl RoutineRepo for D1RoutineRepo {
             .bind_refs(&[
                 title,
                 estimated_minutes,
-                dtstart,
                 rrule,
-                exdates,
                 sort_order,
                 D1Type::Text(&now),
                 D1Type::Text(id),
@@ -971,16 +951,6 @@ impl OccurrenceRepo for D1OccurrenceRepo {
         run_stmt(stmt).await
     }
 
-    async fn set_local_date(&self, id: &str, local_date: &str) -> Result<(), RepoError> {
-        let now = now_rfc3339();
-        let stmt = self
-            .db
-            .prepare(OCCURRENCE_SET_LOCAL_DATE_SQL)
-            .bind_refs(&[D1Type::Text(local_date), D1Type::Text(&now), D1Type::Text(id)])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
     async fn list_in_progress(&self) -> Result<Vec<RoutineOccurrence>, RepoError> {
         // The elongate cron's occurrence work list: every `in_progress` row
         // that carries both ids, all users. No binds — `prepare` returns the
@@ -1043,6 +1013,20 @@ impl AgendaItemRepo for D1AgendaItemRepo {
                 D1Type::Text(kind),
                 D1Type::Text(ref_id),
             ])
+            .map_err(backend)?;
+        stmt.first::<AgendaItem>(None).await.map_err(backend)
+    }
+
+    async fn get_by_ref(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<Option<AgendaItem>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_GET_BY_REF_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(kind), D1Type::Text(ref_id)])
             .map_err(backend)?;
         stmt.first::<AgendaItem>(None).await.map_err(backend)
     }

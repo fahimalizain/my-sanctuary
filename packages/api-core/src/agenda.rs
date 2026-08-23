@@ -10,13 +10,15 @@
 //! the caller — never `SystemTime`. The Worker layers session checks and
 //! token refresh on top (`apps/worker/src/agenda.rs`).
 //!
-//! Domain rules (ADR 0004, locked):
+//! Domain rules (ADR 0004 amendment, locked):
 //! - `GET /api/agenda?date=` **seeds on read** (not a cron): for every living
-//!   routine whose RRULE + exdates covers the date, ensure the occurrence row
+//!   routine whose rrule blob covers the date, ensure the occurrence row
 //!   (idempotent via `UNIQUE (routine_id, local_date)`) and append an
-//!   occurrence agenda item **after** already-present items, in standing
-//!   `routines.sort_order` relative to each other. A list the user already
-//!   reordered is never reshuffled. Tasks never auto-land.
+//!   occurrence agenda item **only when this occurrence has no agenda item on
+//!   ANY date** (`get_by_ref`), landing **after** already-present items, in
+//!   standing `routines.sort_order` relative to each other. A list the user
+//!   already reordered is never reshuffled; a rescheduled occurrence is never
+//!   re-attached to its rule date. Tasks never auto-land.
 //! - The response omits occurrence items whose routine is missing/
 //!   soft-deleted and task items whose task is missing/soft-deleted; the
 //!   orphan membership rows stay in D1 (membership is hard-deleted only by
@@ -28,13 +30,14 @@
 //! - `POST /api/agenda/items/:id/move` reorders that item's date pile only;
 //!   peers at/after the insert rank shift up (no `updated_at` bump).
 //! - `POST /api/agenda/items/:id/reschedule { date }` relocates a slot to
-//!   another day (ADR 0004 amendment): an occurrence **appends its source
-//!   date to the routine's `exdates`** (else the next GET on the source date
-//!   re-seeds a fresh occurrence — the RRULE still matches), rewrites
-//!   `local_date`, and moves the agenda row to the target pile appended;
+//!   another day (ADR 0004 amendment): an occurrence moves its **agenda item
+//!   only** — `occurrence.local_date` (the rule date) and `routines.rrule`
+//!   are never touched, there is **no EXDATE anywhere**, and the seed's
+//!   no-membership-anywhere rule keeps the rule date from re-attaching it.
 //!   `pending | skipped` are the only reschedulable statuses (`skipped` →
 //!   `pending` on the new date), `in_progress`/`done` → 400, and a target
-//!   date already holding this routine → 400. A task reschedule moves the
+//!   date already holding this routine is allowed (two rows of the same
+//!   routine on one day are legal). A task reschedule moves the
 //!   **membership slot** only — task status unchanged, no `task_logs` row
 //!   (the agenda is an overlay; `task_logs` has no civil-date column) — and
 //!   an already-on-target task unpins the source and returns the existing
@@ -52,8 +55,10 @@
 //!   now, `start + 60s` when now <= start — the same invert guard as task
 //!   exits) before the status flip; a Google 404 still flips. Without ids
 //!   (or with `http`/`access` `None`) the flip is session-only.
-//! - `/start` is **today-only** (`local_date == civil date of now in
-//!   Asia/Kolkata`) and `pending`-only: it creates the one-shot Google log
+//! - `/start` is **agenda-today-only** (this occurrence has an agenda item
+//!   whose `local_date` is the civil date of now in Asia/Kolkata — NOT
+//!   `occurrence.local_date`, which is the rule date) and `pending`-only: it
+//!   creates the one-shot Google log
 //!   (summary = the **resolved** title, carriers
 //!   `sanctuary_routine_id`/`sanctuary_occurrence_id`, never a task_id,
 //!   never an RRULE, `T … T + START_EVENT_MINUTES` on the minute grid),
@@ -85,7 +90,7 @@ use crate::config::OAuthConfig;
 use crate::models::{
     AgendaItem, CalendarEvent, GoogleCalendar, NewAgendaItem, NewAgendaItemInput,
     NewEventInput, NewRoutineOccurrence, Routine, RoutineOccurrence, Task, TaskCategory,
-    TaskCategoryPattern, UpdateOccurrence, UpdateRoutine,
+    TaskCategoryPattern, UpdateOccurrence,
 };
 use crate::oauth::HttpClient;
 use crate::repo::{
@@ -208,8 +213,8 @@ pub struct AgendaItemView {
 }
 
 /// HTTP shape of an occurrence: every `routine_occurrences` column plus the
-/// routine's display fields (`estimated_minutes`, `dtstart`/`rrule`/parsed
-/// `exdates` for display), the **resolved** title and its computed category.
+/// routine's display fields (`estimated_minutes`, the `rrule` recurrence
+/// blob), the **resolved** title and its computed category.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OccurrenceView {
     pub id: String,
@@ -225,12 +230,9 @@ pub struct OccurrenceView {
     pub status: String,
     /// From the routine (the estimate lives on the standing definition).
     pub estimated_minutes: i64,
-    /// Naive local civil datetime `YYYY-MM-DDTHH:MM:SS` (routine, for display).
-    pub dtstart: String,
-    /// RFC 5545 RRULE body (routine, for display).
+    /// The routine's two-line recurrence blob (`DTSTART:` + `RRULE:`), for
+    /// display.
     pub rrule: String,
-    /// Parsed local `YYYY-MM-DD` exclusions (routine, for display).
-    pub exdates: Vec<String>,
     /// Local calendar id once started (slice 6); `None` until then.
     pub calendar_id: Option<String>,
     /// Google event id of the one-shot log (slice 6); `None` until then.
@@ -251,11 +253,13 @@ pub struct OccurrenceView {
 
 /// `GET /api/agenda?date=YYYY-MM-DD` → `{"items":[…]}`.
 ///
-/// Seeds on read: every living routine whose rule covers `date` gets its
-/// occurrence ensured (idempotent) and, when not already on the date, an
-/// agenda item **appended after** already-present items (standing
-/// `routines.sort_order` relative to each other). A user-reordered list is
-/// never reshuffled. Tasks never auto-land.
+/// Seeds on read (ADR 0004 amendment): every living routine whose rule covers
+/// `date` gets its occurrence ensured (idempotent). The membership row is
+/// appended only when this occurrence has **no agenda item on ANY date** —
+/// a reschedule moves the item to another day, so a GET on the rule date must
+/// not re-attach it; the item lands **after** already-present items (standing
+/// `routines.sort_order` relative to each other), never reshuffling a list the
+/// user reordered. Tasks never auto-land.
 ///
 /// `focused_task_id` is the caller's pointer into this user's focus lock —
 /// it only paints the embedded tasks' `focused` flag (reads never write the
@@ -279,15 +283,9 @@ pub async fn get_agenda(
     for routine in &routines {
         // A stored rule that no longer parses (hand-edited row) degrades to
         // "no seed" — a read never 400s on stored-data decay.
-        let covers = occurrence_dates(
-            &routine.dtstart,
-            &routine.rrule,
-            &date,
-            &date,
-            &routine_exdates(routine),
-        )
-        .map(|dates| dates.contains(&date))
-        .unwrap_or(false);
+        let covers = occurrence_dates(&routine.rrule, &date, &date)
+            .map(|dates| dates.contains(&date))
+            .unwrap_or(false);
         if !covers {
             continue;
         }
@@ -299,10 +297,12 @@ pub async fn get_agenda(
                 local_date: date.clone(),
             })
             .await?;
-        // Append the membership row only when this date does not have one
-        // yet — a list the user reordered keeps its ranks.
+        // Append the membership row only when this occurrence has NO item on
+        // ANY date — a rescheduled occurrence keeps its moved row, so the
+        // rule date never re-attaches it (and a list the user reordered keeps
+        // its ranks).
         if agenda_repo
-            .get_by_key(user_id, &date, AGENDA_KIND_OCCURRENCE, &occurrence.id)
+            .get_by_ref(user_id, AGENDA_KIND_OCCURRENCE, &occurrence.id)
             .await?
             .is_none()
         {
@@ -479,18 +479,19 @@ pub async fn move_agenda_item(
 /// embed as add/move).
 ///
 /// Relocates the item's slot to `date` (ADR 0004 amendment). Session-only —
-/// no Google write of any kind, no RRULE anywhere.
+/// no Google write of any kind, no RRULE anywhere, **no EXDATE anywhere**.
 ///
 /// **Occurrence** (kind `occurrence`):
-/// 1. The **source date is appended to the routine's `exdates`** (no-op when
-///    already present). Without this the next `GET /api/agenda?date=<source>`
-///    would re-seed a **new** source-date occurrence — the RRULE still
-///    matches and the moved-away day resurrects itself. Next week's same
-///    weekday is a different `YYYY-MM-DD` and still seeds.
-/// 2. `local_date` is rewritten; `pending | skipped` are the only
-///    reschedulable statuses — `skipped` becomes `pending` on the new date
-///    (deferred, not declined); `in_progress`/`done` → 400. A target date
-///    that already holds an occurrence of this `routine_id` → 400. Title
+/// 1. Load the item + its occurrence + the living routine (404s as always).
+/// 2. `pending | skipped` are the only reschedulable statuses — `skipped`
+///    becomes `pending` on the new date (deferred, not declined);
+///    `in_progress`/`done` → 400.
+/// 3. The **agenda item moves only**: `occurrence.local_date` is never
+///    rewritten (it stays the series-instance key — the rule date), and the
+///    routine's `rrule` is never touched. A target date that already holds
+///    another occurrence of this routine is FINE — daily snooze
+///    today→tomorrow puts two rows of the same routine on tomorrow.
+/// 4. The agenda row lands **appended** (`max+1`) on the target pile. Title
 ///    override and any stored google ids travel with the row (never cleared).
 ///
 /// **Task** (kind `task`): the **membership slot** moves, not the task —
@@ -593,11 +594,12 @@ pub async fn reschedule_agenda_item(
 /// The occurrence half of a reschedule:
 /// 1. verify the occurrence + its routine are alive and owned (404 otherwise),
 /// 2. gate the status (`pending | skipped` only; `skipped` → `pending`),
-/// 3. refuse a target date already holding this routine (400),
-/// 4. append the **source** date to the routine's `exdates` (no-op when
-///    already present) — the anti-re-seed lock,
-/// 5. rewrite `local_date` and move the agenda row to the target pile
-///    appended (`max+1`).
+/// 3. move the **agenda item** to the target pile appended (`max+1`).
+///
+/// `occurrence.local_date` is deliberately NEVER rewritten — it is the
+/// series-instance key (the rule date), and the "Monday must not come back"
+/// guarantee now comes from the seed's no-membership-anywhere rule, not from
+/// an exdate. The routine's `rrule` is never touched either.
 async fn reschedule_occurrence(
     agenda_repo: &dyn AgendaItemRepo,
     occurrence_repo: &dyn OccurrenceRepo,
@@ -614,9 +616,9 @@ async fn reschedule_occurrence(
     }
     // A soft-deleted routine makes its materialized occurrences 404 (same
     // gate as every occurrence verb).
-    let Some(routine) = routine_repo.get_by_id(&occurrence.routine_id).await? else {
+    if routine_repo.get_by_id(&occurrence.routine_id).await?.is_none() {
         return Err(AgendaError::NotFound);
-    };
+    }
 
     match occurrence.status.as_str() {
         OCCURRENCE_STATUS_IN_PROGRESS => {
@@ -638,42 +640,20 @@ async fn reschedule_occurrence(
             )))
         }
     }
-    // The `UNIQUE (routine_id, local_date)` slot on the target date is
-    // already taken by this routine → refuse (never collide).
-    if occurrence_repo
-        .get_by_routine_and_date(&occurrence.routine_id, date)
-        .await?
-        .is_some()
-    {
-        return Err(AgendaError::Invalid(
-            "routine already has an occurrence on that date".to_string(),
-        ));
-    }
 
-    // The anti-re-seed lock (ADR 0004 amendment): the source date leaves the
-    // rule's expansion, or the next GET on it would seed a fresh occurrence.
-    let mut exdates = routine_exdates(&routine);
-    if !exdates.iter().any(|excluded| excluded == &occurrence.local_date) {
-        exdates.push(occurrence.local_date.clone());
-        routine_repo
-            .update(
-                &routine.id,
-                &UpdateRoutine {
-                    exdates: Some(exdates),
-                    ..Default::default()
-                },
-            )
-            .await?;
-    }
-
-    occurrence_repo.set_local_date(&occurrence.id, date).await?;
+    // NO target-date UNIQUE check: `occurrence.local_date` is the rule date,
+    // not the moved-to date, so it cannot tell us whether the target pile
+    // already holds this routine. A daily snooze today→tomorrow legitimately
+    // puts TWO rows of the same routine on tomorrow (today's moved instance +
+    // tomorrow's own seeded instance) — that is allowed.
     if occurrence.status == OCCURRENCE_STATUS_SKIPPED {
         occurrence_repo
             .set_status(&occurrence.id, OCCURRENCE_STATUS_PENDING)
             .await?;
     }
     // The agenda row lands appended on the target pile (the source pile keeps
-    // its ranks — same gap semantics as unpin).
+    // its ranks — same gap semantics as unpin). `occurrence.local_date` and
+    // `routines.rrule` are untouched.
     let rank = agenda_repo
         .max_sort_order(user_id, date)
         .await?
@@ -855,7 +835,7 @@ pub async fn patch_occurrence(
 
 /// `POST /api/occurrences/:id/start` → 200 `{"occurrence":…,"event":…}`.
 ///
-/// Starts a **pending, today-only** occurrence: creates the one-shot Google
+/// Starts a **pending, agenda-today** occurrence: creates the one-shot Google
 /// log (summary = the **resolved** title, carriers
 /// `sanctuary_routine_id`/`sanctuary_occurrence_id`, never a task_id, never
 /// an RRULE, `T … T + START_EVENT_MINUTES` on the minute grid), stores
@@ -863,11 +843,15 @@ pub async fn patch_occurrence(
 /// `in_progress`. One Google event per occurrence, ever.
 ///
 /// Verb matrix (locked): `pending` → start; `in_progress` → **200 no-op**
-/// (no second event); `done`/`skipped` → 400. Start is valid only when
-/// `local_date` is today — the civil date of `now_unix` in `Asia/Kolkata`
-/// (production TZ, already in the locked offset table); otherwise 400.
-/// Missing / other-user / soft-deleted-routine → 404. No writable calendar →
-/// 400. Focus stays task-only: `sanctuary_focus` is never set here.
+/// (no second event); `done`/`skipped` → 400. Start is valid only when this
+/// occurrence has an **agenda item whose `local_date` is civil today** — the
+/// civil date of `now_unix` in `Asia/Kolkata` (production TZ, already in the
+/// locked offset table); otherwise 400. The gate is agenda membership, NOT
+/// `occurrence.local_date`: a reschedule moves the item (and the plan) to
+/// another day while the occurrence keeps its rule date, so "today" is where
+/// the item sits. Missing / other-user / soft-deleted-routine → 404. No
+/// writable calendar → 400. Focus stays task-only: `sanctuary_focus` is never
+/// set here.
 pub async fn start_occurrence(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -876,6 +860,7 @@ pub async fn start_occurrence(
     category_repo: &dyn TaskCategoryRepo,
     routine_repo: &dyn RoutineRepo,
     occurrence_repo: &dyn OccurrenceRepo,
+    agenda_repo: &dyn AgendaItemRepo,
     access: &GoogleAccess,
     user_id: &str,
     id: &str,
@@ -902,11 +887,18 @@ pub async fn start_occurrence(
             status = occurrence.status
         )));
     }
-    // Today-only (ADR 0004 § Start): the production offset table decides the
-    // civil date — a planned occurrence is started the day it is planned.
-    if occurrence.local_date != civil_date_in_offset(now_unix, "Asia/Kolkata") {
+    // Agenda-today only (ADR 0004 amendment): the production offset table
+    // decides the civil date, and the occurrence must be SCHEDULED there —
+    // i.e. its agenda item sits on that date. `occurrence.local_date` is the
+    // rule date and says nothing about where the item was rescheduled to.
+    let today = civil_date_in_offset(now_unix, "Asia/Kolkata");
+    if agenda_repo
+        .get_by_key(user_id, &today, AGENDA_KIND_OCCURRENCE, &occurrence.id)
+        .await?
+        .is_none()
+    {
         return Err(AgendaError::Invalid(
-            "occurrence can only be started on its local date".to_string(),
+            "occurrence can only be started on a day it is scheduled".to_string(),
         ));
     }
 
@@ -1487,21 +1479,13 @@ fn occurrence_view(occurrence: &RoutineOccurrence, routine: &Routine, taxonomy: 
         resolved_title,
         status: occurrence.status.clone(),
         estimated_minutes: routine.estimated_minutes,
-        dtstart: routine.dtstart.clone(),
         rrule: routine.rrule.clone(),
-        exdates: routine_exdates(routine),
         calendar_id: occurrence.calendar_id.clone(),
         google_event_id: occurrence.google_event_id.clone(),
         created_at: occurrence.created_at.clone(),
         updated_at: occurrence.updated_at.clone(),
         category,
     }
-}
-
-/// Parses the routine's stored `exdates` JSON text; hand-edited rows degrade
-/// to an empty array (same as `routines::to_view`).
-fn routine_exdates(routine: &Routine) -> Vec<String> {
-    serde_json::from_str(&routine.exdates).unwrap_or_default()
 }
 
 /// Validates a local civil date string (`YYYY-MM-DD`).
@@ -1951,18 +1935,14 @@ mod tests {
             user_id: &str,
             title: &str,
             sort_order: i64,
-            dtstart: &str,
             rrule: &str,
-            exdates: &str,
         ) -> Routine {
             Routine {
                 id: id.to_string(),
                 user_id: user_id.to_string(),
                 title: title.to_string(),
                 estimated_minutes: 15,
-                dtstart: dtstart.to_string(),
                 rrule: rrule.to_string(),
-                exdates: exdates.to_string(),
                 sort_order,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -2003,9 +1983,7 @@ mod tests {
                 user_id: routine.user_id,
                 title: routine.title,
                 estimated_minutes: routine.estimated_minutes,
-                dtstart: routine.dtstart,
                 rrule: routine.rrule,
-                exdates: routine.exdates_json,
                 sort_order: routine.sort_order,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -2036,14 +2014,8 @@ mod tests {
             if let Some(estimated_minutes) = updates.estimated_minutes {
                 row.estimated_minutes = estimated_minutes;
             }
-            if let Some(dtstart) = &updates.dtstart {
-                row.dtstart = dtstart.clone();
-            }
             if let Some(rrule) = &updates.rrule {
                 row.rrule = rrule.clone();
-            }
-            if let Some(exdates) = &updates.exdates {
-                row.exdates = serde_json::to_string(exdates).unwrap();
             }
             if let Some(sort_order) = updates.sort_order {
                 row.sort_order = sort_order;
@@ -2210,14 +2182,6 @@ mod tests {
             Ok(())
         }
 
-        async fn set_local_date(&self, id: &str, local_date: &str) -> Result<(), RepoError> {
-            if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
-                row.local_date = local_date.to_string();
-                row.updated_at = "2026-08-23T02:00:00Z".to_string();
-            }
-            Ok(())
-        }
-
         async fn list_in_progress(&self) -> Result<Vec<RoutineOccurrence>, RepoError> {
             Ok(self
                 .stored
@@ -2297,6 +2261,23 @@ mod tests {
                         && row.local_date == local_date
                         && row.kind == kind
                         && row.ref_id == ref_id
+                })
+                .cloned())
+        }
+
+        async fn get_by_ref(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_id: &str,
+        ) -> Result<Option<AgendaItem>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row.user_id == user_id && row.kind == kind && row.ref_id == ref_id
                 })
                 .cloned())
         }
@@ -3143,21 +3124,25 @@ mod tests {
     }
 
     /// Wires a Fajr routine + occurrence of `status` into `repos` and returns
-    /// the occurrence id.
+    /// the occurrence id. The occurrence's agenda item sits on 2026-08-23 —
+    /// the civil date of `NOW_UNIX` — so the start gate (agenda membership on
+    /// civil today) passes.
     fn seed_occurrence(repos: &Repos, status: &str) -> String {
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         let mut occurrence =
             FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-23", status);
         occurrence.title = Some("Fajr Qadha".to_string());
         repos.occurrences.stored.lock().unwrap().push(occurrence);
+        repos.agenda.stored.lock().unwrap().push(AgendaItem {
+            id: "ai-1".to_string(),
+            user_id: "u-1".to_string(),
+            local_date: "2026-08-23".to_string(),
+            kind: AGENDA_KIND_OCCURRENCE.to_string(),
+            ref_id: "occ-1".to_string(),
+            sort_order: 0,
+            created_at: "2026-08-23T00:00:00Z".to_string(),
+            updated_at: "2026-08-23T00:00:00Z".to_string(),
+        });
         "occ-1".to_string()
     }
 
@@ -3179,6 +3164,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
+            &repos.agenda,
             &access(),
             user_id,
             id,
@@ -3213,15 +3199,7 @@ mod tests {
     #[test]
     fn get_agenda_seeds_daily_routine_occurrence_and_item() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
         let response = get(&repos, "u-1", "2026-08-23").unwrap();
         assert_eq!(response.items.len(), 1);
@@ -3236,9 +3214,10 @@ mod tests {
         assert_eq!(occurrence.title, None, "seeding copies no title — inheritance stays live");
         assert_eq!(occurrence.resolved_title, "Fajr", "resolved = override ?? routine.title");
         assert_eq!(occurrence.estimated_minutes, 15, "estimate comes from the routine");
-        assert_eq!(occurrence.dtstart, "2026-01-01T05:30:00");
-        assert_eq!(occurrence.rrule, "FREQ=DAILY");
-        assert_eq!(occurrence.exdates, Vec::<String>::new());
+        assert_eq!(
+            occurrence.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            "the recurrence blob is exposed for display"
+        );
         assert_eq!(occurrence.calendar_id, None);
         assert_eq!(occurrence.google_event_id, None);
         assert!(
@@ -3253,15 +3232,7 @@ mod tests {
     #[test]
     fn get_agenda_twice_is_idempotent() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
         let first = get(&repos, "u-1", "2026-08-23").unwrap();
         let second = get(&repos, "u-1", "2026-08-23").unwrap();
@@ -3284,15 +3255,7 @@ mod tests {
     fn weekly_routine_seeds_matching_dates_only() {
         let repos = repos();
         // 2026-08-17 is a Monday: BYDAY=MO,WE covers the 17th and the 19th.
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Standup",
-            0,
-            "2026-08-17T09:00:00",
-            "FREQ=WEEKLY;BYDAY=MO,WE",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Standup", 0, "DTSTART:20260817T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE"));
 
         let matching = get(&repos, "u-1", "2026-08-19").unwrap();
         assert_eq!(matching.items.len(), 1, "Wednesday matches");
@@ -3307,37 +3270,9 @@ mod tests {
     }
 
     #[test]
-    fn exdates_exclude_the_seeded_day() {
-        let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            r#"["2026-08-23"]"#,
-        ));
-
-        let excluded = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(excluded.items.len(), 0, "exdated day never seeds");
-        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 0);
-        let next_day = get(&repos, "u-1", "2026-08-24").unwrap();
-        assert_eq!(next_day.items.len(), 1, "other days still seed");
-    }
-
-    #[test]
     fn soft_deleted_routine_never_seeds_and_leftover_item_is_omitted() {
         let repos = repos();
-        let mut routine = FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        );
+        let mut routine = FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
         routine.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
         repos.routines.stored.lock().unwrap().push(routine);
         // A leftover materialized occurrence + membership row from when the
@@ -3403,8 +3338,8 @@ mod tests {
     fn seeding_after_user_reorder_appends_without_reshuffling() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().extend([
-            FakeRoutineRepo::row("rt-a", "u-1", "Fajr", 0, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-b", "u-1", "Salat", 1, "2026-01-01T12:00:00", "FREQ=DAILY", "[]"),
+            FakeRoutineRepo::row("rt-a", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-b", "u-1", "Salat", 1, "DTSTART:20260101T120000\nRRULE:FREQ=DAILY"),
         ]);
 
         let first = get(&repos, "u-1", "2026-08-23").unwrap();
@@ -3420,15 +3355,7 @@ mod tests {
 
         // A third routine appears; the next GET must append it AFTER the
         // reordered pair, leaving their ranks untouched.
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-c",
-            "u-1",
-            "Work",
-            2,
-            "2026-01-01T09:00:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-c", "u-1", "Work", 2, "DTSTART:20260101T090000\nRRULE:FREQ=DAILY"));
         let second = get(&repos, "u-1", "2026-08-23").unwrap();
         let ranks: Vec<(String, i64)> = second
             .items
@@ -3453,9 +3380,9 @@ mod tests {
         let repos = repos();
         // Standing order is 0,1,2 regardless of insertion order.
         repos.routines.stored.lock().unwrap().extend([
-            FakeRoutineRepo::row("rt-a", "u-1", "A", 2, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-b", "u-1", "B", 0, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-c", "u-1", "C", 1, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
+            FakeRoutineRepo::row("rt-a", "u-1", "A", 2, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-b", "u-1", "B", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-c", "u-1", "C", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
         ]);
 
         let response = get(&repos, "u-1", "2026-08-23").unwrap();
@@ -3588,15 +3515,7 @@ mod tests {
     #[test]
     fn delete_occurrence_item_is_refused_and_missing_item_is_404() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
 
         let err = pollster::block_on(delete_agenda_item(&repos.agenda, "u-1", &agenda.items[0].id))
@@ -3632,9 +3551,9 @@ mod tests {
     fn move_reorders_within_the_date_pile_only() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().extend([
-            FakeRoutineRepo::row("rt-a", "u-1", "A", 0, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-b", "u-1", "B", 1, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-c", "u-1", "C", 2, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
+            FakeRoutineRepo::row("rt-a", "u-1", "A", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-b", "u-1", "B", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-c", "u-1", "C", 2, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
         ]);
         // Two dates, same routines — a full pile on each.
         let day1 = get(&repos, "u-1", "2026-08-23").unwrap();
@@ -3666,15 +3585,7 @@ mod tests {
     #[test]
     fn move_same_rank_is_a_no_op_and_bad_inputs_are_rejected() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-a",
-            "u-1",
-            "A",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-a", "u-1", "A", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let id = agenda.items[0].id.clone();
 
@@ -3713,22 +3624,14 @@ mod tests {
     /// A weekly-Monday routine (dtstart 2026-08-17, a Monday) + its seeded
     /// occurrence/item on 2026-08-17. Returns the agenda item id.
     fn seed_monday_occurrence(repos: &Repos) -> String {
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-08-17T05:30:00",
-            "FREQ=WEEKLY;BYDAY=MO",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260817T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO"));
         let agenda = get(repos, "u-1", "2026-08-17").unwrap();
         assert_eq!(agenda.items.len(), 1, "Monday seeded");
         agenda.items[0].id.clone()
     }
 
     #[test]
-    fn reschedule_weekly_occurrence_exdates_source_and_moves_row() {
+    fn reschedule_weekly_occurrence_moves_item_only_and_monday_never_comes_back() {
         let repos = repos();
         let item_id = seed_monday_occurrence(&repos);
         let occ_id = pollster::block_on(repos.agenda.get_by_id(&item_id))
@@ -3744,27 +3647,31 @@ mod tests {
         assert_eq!(response.item.sort_order, 0, "empty Tuesday pile appends at 0");
         let occurrence = response.item.occurrence.as_ref().expect("occurrence embedded");
         assert_eq!(occurrence.id, occ_id, "same occurrence id");
-        assert_eq!(occurrence.local_date, "2026-08-18");
+        assert_eq!(
+            occurrence.local_date, "2026-08-17",
+            "occurrence.local_date is the SERIES key (the rule date) — never rewritten"
+        );
         assert_eq!(occurrence.status, OCCURRENCE_STATUS_PENDING);
 
-        // The source date is exdated on the routine — the anti-re-seed lock.
+        // The routine is untouched — no exdate anywhere, the blob is intact.
         let routine = pollster::block_on(repos.routines.get_by_id("rt-1"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<Vec<String>>(&routine.exdates).unwrap(),
-            vec!["2026-08-17".to_string()],
-            "source date appended to exdates"
+            routine.rrule, "DTSTART:20260817T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+            "rrule never changes on a reschedule"
         );
 
-        // Monday GET does NOT re-seed: the rule still matches 2026-08-17, but
-        // the exdate keeps it out — the moved-away day stays empty.
+        // Monday GET does NOT re-attach: the occurrence exists for the rule
+        // date, but its agenda item now sits on Tuesday, and the seed only
+        // appends when the occurrence has NO membership anywhere.
         let monday = get(&repos, "u-1", "2026-08-17").unwrap();
-        assert_eq!(monday.items.len(), 0, "exdated Monday never re-seeds");
+        assert_eq!(monday.items.len(), 0, "Monday stays empty");
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 1, "no new occurrence");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "no re-attached item");
 
-        // Tuesday GET shows the SAME occurrence (not a fresh seed — the rule
-        // does not even cover Tuesday, so the moved row is the only one).
+        // Tuesday GET shows the SAME occurrence (the rule does not even cover
+        // Tuesday, so the moved row is the only one).
         let tuesday = get(&repos, "u-1", "2026-08-18").unwrap();
         assert_eq!(tuesday.items.len(), 1);
         assert_eq!(tuesday.items[0].id, item_id, "same agenda row");
@@ -3773,93 +3680,108 @@ mod tests {
             occ_id,
             "same occurrence id"
         );
+
+        // NEXT Monday (2026-08-24) seeds fresh: a new occurrence + item of
+        // its own — the moved instance never blocks the series.
+        let next_monday = get(&repos, "u-1", "2026-08-24").unwrap();
+        assert_eq!(next_monday.items.len(), 1, "next week's Monday seeds");
+        assert_ne!(
+            next_monday.items[0].occurrence.as_ref().unwrap().id,
+            occ_id,
+            "a different occurrence instance"
+        );
     }
 
     #[test]
-    fn reschedule_daily_occurrence_moves_row_and_seed_creates_no_second() {
+    fn reschedule_daily_occurrence_moves_item_only_and_tomorrow_gets_two_rows() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         let today = get(&repos, "u-1", "2026-08-23").unwrap();
         assert_eq!(today.items.len(), 1);
         let item_id = today.items[0].id.clone();
         let occ_id = today.items[0].occurrence.as_ref().unwrap().id.clone();
 
-        // Today → tomorrow.
+        // Today → tomorrow: the agenda item moves; the occurrence keeps its
+        // rule date.
         let response = reschedule(&repos, "u-1", &item_id, "2026-08-24").unwrap();
         assert_eq!(response.item.local_date, "2026-08-24");
         assert_eq!(response.item.id, item_id, "same agenda row");
-
-        // Today is exdated.
+        assert_eq!(
+            response.item.occurrence.as_ref().unwrap().local_date,
+            "2026-08-23",
+            "occurrence.local_date untouched"
+        );
         let routine = pollster::block_on(repos.routines.get_by_id("rt-1"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<Vec<String>>(&routine.exdates).unwrap(),
-            vec!["2026-08-23".to_string()]
+            routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            "no exdate is written"
         );
 
-        // Tomorrow's GET: the moved row IS the seeded-looking day — the
-        // ensure on 2026-08-24 finds the moved occurrence under the UNIQUE
-        // key and the moved membership row under the item key, so the seed
-        // creates no second occurrence and no second item.
+        // Tomorrow's GET seeds tomorrow's OWN instance (the rule covers it
+        // and the UNIQUE key is (routine_id, local_date) — a different day is
+        // a different slot), then appends its item. The moved row stays too:
+        // TWO rows of the same routine on tomorrow is ALLOWED.
         let tomorrow = get(&repos, "u-1", "2026-08-24").unwrap();
-        assert_eq!(tomorrow.items.len(), 1, "no duplicate from the seed");
-        assert_eq!(tomorrow.items[0].id, item_id, "same agenda row");
-        assert_eq!(
-            tomorrow.items[0].occurrence.as_ref().unwrap().id,
-            occ_id,
-            "the moved row, not a fresh seed"
-        );
-        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 1, "one occurrence total");
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "one item total");
+        assert_eq!(tomorrow.items.len(), 2, "moved instance + tomorrow's own");
+        let moved = tomorrow
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .expect("the moved row is still there");
+        assert_eq!(moved.occurrence.as_ref().unwrap().id, occ_id);
+        let fresh = tomorrow
+            .items
+            .iter()
+            .find(|item| item.id != item_id)
+            .expect("a fresh seed for tomorrow");
+        assert_eq!(fresh.occurrence.as_ref().unwrap().local_date, "2026-08-24");
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 2, "two instances");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 2, "two items");
 
-        // Today's GET is empty (exdated).
+        // Today's GET: the occurrence exists (no duplicate seeded), but its
+        // item lives on tomorrow — the no-membership-anywhere rule keeps
+        // today empty.
         let today_after = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(today_after.items.len(), 0);
+        assert_eq!(today_after.items.len(), 0, "today stays empty");
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 2, "no new occurrence");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 2, "no re-attached item");
     }
 
     #[test]
-    fn reschedule_refuses_target_date_already_holding_the_routine() {
+    fn reschedule_allows_target_date_already_holding_the_routine() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         // Two dates already seeded by plain GETs — each has its own
         // occurrence of the same routine.
         let day1 = get(&repos, "u-1", "2026-08-23").unwrap();
         let day2 = get(&repos, "u-1", "2026-08-24").unwrap();
         assert_eq!(day2.items.len(), 1);
         let day1_id = day1.items[0].id.clone();
+        let day1_occ = day1.items[0].occurrence.as_ref().unwrap().id.clone();
+        let day2_occ = day2.items[0].occurrence.as_ref().unwrap().id.clone();
 
-        let err = reschedule(&repos, "u-1", &day1_id, "2026-08-24").unwrap_err();
-        assert!(
-            matches!(err, AgendaError::Invalid(ref m) if m == "routine already has an occurrence on that date"),
-            "{err:?}"
-        );
-        // Nothing moved, nothing exdated.
-        let stored = pollster::block_on(repos.agenda.get_by_id(&day1_id))
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.local_date, "2026-08-23");
-        let routine = pollster::block_on(repos.routines.get_by_id("rt-1"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(routine.exdates, "[]", "no exdate on a refused move");
-        let occurrence = pollster::block_on(repos.occurrences.get_by_routine_and_date("rt-1", "2026-08-23"))
+        // Moving onto a day that already holds another occurrence of this
+        // routine is ALLOWED — `occurrence.local_date` is the rule date, not
+        // the plan, so it cannot be used to refuse the target.
+        let response = reschedule(&repos, "u-1", &day1_id, "2026-08-24").unwrap();
+        assert_eq!(response.item.id, day1_id);
+        assert_eq!(response.item.local_date, "2026-08-24");
+        assert_eq!(response.item.sort_order, 1, "appended after the existing row");
+        assert_eq!(response.item.occurrence.as_ref().unwrap().id, day1_occ);
+
+        // Two items on the 24th: day1's moved occurrence + day2's own.
+        let day2_after = get(&repos, "u-1", "2026-08-24").unwrap();
+        assert_eq!(day2_after.items.len(), 2);
+        let occs: Vec<String> = day2_after
+            .items
+            .iter()
+            .map(|item| item.occurrence.as_ref().unwrap().id.clone())
+            .collect();
+        assert_eq!(occs, vec![day2_occ, day1_occ.clone()], "both instances present");
+        // The moved occurrence's rule date stays untouched.
+        let occurrence = pollster::block_on(repos.occurrences.get_by_id(&day1_occ))
             .unwrap()
             .unwrap();
         assert_eq!(occurrence.local_date, "2026-08-23", "occurrence untouched");
@@ -3868,15 +3790,7 @@ mod tests {
     #[test]
     fn reschedule_statuses_in_progress_done_are_400_skipped_becomes_pending() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         // Seed once so the agenda rows exist, then rewrite the occurrences'
         // statuses to drive the matrix.
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
@@ -3917,28 +3831,24 @@ mod tests {
             "stored google ids are never cleared"
         );
         assert_eq!(occurrence.google_event_id.as_deref(), Some("g-1"));
-        // The routine got the exdate.
+        assert_eq!(
+            occurrence.local_date, "2026-08-23",
+            "occurrence.local_date is never rewritten"
+        );
+        // The routine is untouched — no exdate is ever written.
         let routine = pollster::block_on(repos.routines.get_by_id("rt-1"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<Vec<String>>(&routine.exdates).unwrap(),
-            vec!["2026-08-23".to_string()]
+            routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            "rrule unchanged"
         );
     }
 
     #[test]
     fn reschedule_same_date_is_200_noop_unchanged() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let item_id = agenda.items[0].id.clone();
         let occ_id = agenda.items[0].occurrence.as_ref().unwrap().id.clone();
@@ -3948,11 +3858,14 @@ mod tests {
         assert_eq!(response.item.sort_order, 0, "rank untouched");
         assert_eq!(response.item.occurrence.as_ref().unwrap().id, occ_id);
 
-        // Nothing written: no exdate, no date/status/updated_at change.
+        // Nothing written: no rrule change, no date/status/updated_at change.
         let routine = pollster::block_on(repos.routines.get_by_id("rt-1"))
             .unwrap()
             .unwrap();
-        assert_eq!(routine.exdates, "[]", "same-date no-op never exdates");
+        assert_eq!(
+            routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            "same-date no-op never touches the routine"
+        );
         let occurrence = pollster::block_on(repos.occurrences.get_by_id(&occ_id))
             .unwrap()
             .unwrap();
@@ -4062,15 +3975,7 @@ mod tests {
         assert!(matches!(err, AgendaError::NotFound), "{err:?}");
 
         // An occurrence-kind item whose routine is soft-deleted → 404.
-        let mut routine = FakeRoutineRepo::row(
-            "rt-gone",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        );
+        let mut routine = FakeRoutineRepo::row("rt-gone", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
         routine.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
         repos.routines.stored.lock().unwrap().push(routine);
         repos
@@ -4096,15 +4001,7 @@ mod tests {
     #[test]
     fn reschedule_rejects_invalid_dates() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let item_id = agenda.items[0].id.clone();
         for bad in ["", "   ", "2026-13-01", "23-08-2026", "not a date"] {
@@ -4118,7 +4015,7 @@ mod tests {
         let routine = pollster::block_on(repos.routines.get_by_id("rt-1"))
             .unwrap()
             .unwrap();
-        assert_eq!(routine.exdates, "[]");
+        assert_eq!(routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
         let stored = pollster::block_on(repos.agenda.get_by_id(&item_id))
             .unwrap()
             .unwrap();
@@ -4132,15 +4029,7 @@ mod tests {
     #[test]
     fn complete_matrix_all_four_states() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         for (from, expected_updated_at) in [
             ("pending", "2026-08-23T02:00:00Z"),
             ("in_progress", "2026-08-23T02:00:00Z"),
@@ -4163,15 +4052,7 @@ mod tests {
     #[test]
     fn skip_matrix_all_four_states() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         for (from, expected_updated_at) in [
             ("pending", "2026-08-23T02:00:00Z"),
             ("in_progress", "2026-08-23T02:00:00Z"),
@@ -4197,15 +4078,7 @@ mod tests {
     #[test]
     fn patch_title_overrides_and_empty_clears_back_to_inheritance() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         repos
             .occurrences
             .stored
@@ -4284,15 +4157,7 @@ mod tests {
     #[test]
     fn other_users_occurrence_is_404_on_complete_skip_and_patch() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-2",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-2", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         repos
             .occurrences
             .stored
@@ -4323,15 +4188,7 @@ mod tests {
     #[test]
     fn occurrence_verbs_404_when_the_routine_is_soft_deleted() {
         let repos = repos();
-        let mut routine = FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        );
+        let mut routine = FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
         routine.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
         repos.routines.stored.lock().unwrap().push(routine);
         repos
@@ -4415,6 +4272,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
+            &repos.agenda,
             &access(),
             "u-1",
             "occ-1",
@@ -4496,6 +4354,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
+            &repos.agenda,
             &access(),
             "u-1",
             "occ-1",
@@ -4533,26 +4392,73 @@ mod tests {
     #[test]
     fn start_wrong_date_is_invalid() {
         let repos = repos();
-        // Tomorrow (2026-08-24) — start is today-only.
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        // The occurrence's rule date IS today (2026-08-23), but its agenda
+        // item sits on TOMORROW — the gate is membership, not local_date, and
+        // a day without the scheduled row cannot start.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         repos
             .occurrences
             .stored
             .lock()
             .unwrap()
-            .push(FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-24", "pending"));
+            .push(FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-23", "pending"));
+        repos.agenda.stored.lock().unwrap().push(AgendaItem {
+            id: "ai-1".to_string(),
+            user_id: "u-1".to_string(),
+            local_date: "2026-08-24".to_string(),
+            kind: AGENDA_KIND_OCCURRENCE.to_string(),
+            ref_id: "occ-1".to_string(),
+            sort_order: 0,
+            created_at: "2026-08-23T00:00:00Z".to_string(),
+            updated_at: "2026-08-23T00:00:00Z".to_string(),
+        });
 
         let err = start(&repos, "u-1", "occ-1").unwrap_err();
         assert!(
-            matches!(err, AgendaError::Invalid(ref m) if m == "occurrence can only be started on its local date"),
+            matches!(err, AgendaError::Invalid(ref m) if m == "occurrence can only be started on a day it is scheduled"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn start_after_reschedule_to_today_works() {
+        let repos = repos();
+        // Weekly-Monday series: the Monday (2026-08-17) occurrence is
+        // rescheduled to Tuesday (2026-08-18)…
+        let item_id = seed_monday_occurrence(&repos);
+        reschedule(&repos, "u-1", &item_id, "2026-08-18").unwrap();
+        // …then the user snoozes it again onto 2026-08-23 — the civil date of
+        // NOW_UNIX — while `occurrence.local_date` still says 2026-08-17.
+        reschedule(&repos, "u-1", &item_id, "2026-08-23").unwrap();
+
+        let response = start(&repos, "u-1", "occ-1").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_IN_PROGRESS);
+        assert_eq!(
+            response.occurrence.local_date, "2026-08-17",
+            "the rule date is untouched — the item's date is what mattered"
+        );
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.calendar_id.as_deref(), Some("cal-primary@example.com"));
+    }
+
+    #[test]
+    fn start_requires_an_agenda_row_for_that_occurrence_on_today() {
+        let repos = repos();
+        // A pending occurrence with NO agenda item anywhere: even on its own
+        // rule date it cannot start — it was never scheduled.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-23", "pending"));
+
+        let err = start(&repos, "u-1", "occ-1").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "occurrence can only be started on a day it is scheduled"),
             "{err:?}"
         );
     }
@@ -4564,15 +4470,7 @@ mod tests {
         assert!(matches!(start(&repos, "u-1", "nope").unwrap_err(), AgendaError::NotFound));
 
         // Another user's occurrence → 404 (never leak existence).
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
-            "rt-1",
-            "u-2",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        ));
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-2", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
         repos
             .occurrences
             .stored
@@ -4582,15 +4480,7 @@ mod tests {
         assert!(matches!(start(&repos, "u-1", "occ-2").unwrap_err(), AgendaError::NotFound));
 
         // Soft-deleted routine → its occurrence is 404.
-        let mut routine = FakeRoutineRepo::row(
-            "rt-3",
-            "u-1",
-            "Fajr",
-            0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
-        );
+        let mut routine = FakeRoutineRepo::row("rt-3", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
         routine.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
         repos.routines.stored.lock().unwrap().push(routine);
         repos
@@ -4631,6 +4521,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
+            &repos.agenda,
             &access(),
             "u-1",
             "occ-1",
@@ -4661,6 +4552,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
+            &repos.agenda,
             &access(),
             "u-1",
             "occ-1",
@@ -4692,15 +4584,7 @@ mod tests {
             .stored
             .lock()
             .unwrap()
-            .push(FakeRoutineRepo::row(
-                "rt-1",
-                "u-1",
-                "Fajr",
-                0,
-                "2026-01-01T05:30:00",
-                "FREQ=DAILY",
-                "[]",
-            ));
+            .push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
     }
 
     #[test]

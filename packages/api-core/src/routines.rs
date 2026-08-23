@@ -6,12 +6,15 @@
 //! matcher as tasks. The Worker layers session checks on top
 //! (`apps/worker/src/routines.rs`).
 //!
-//! Domain rules (ADR 0004, locked):
+//! Domain rules (ADR 0004 amendment, locked):
 //! - A routine is a standing definition — never completable, never on the
-//!   Board. Repetition is a full RFC 5545 RRULE body stored on the row;
-//!   expansion happens in **floating local civil time** (the naive `dtstart`
-//!   is treated as UTC inside this crate purely to satisfy the parser — no
-//!   TZID ever exists, and the tzdb is never used for membership).
+//!   Board. Repetition is stored as ONE `routines.rrule` TEXT blob with
+//!   exactly two `\n`-separated lines — `DTSTART:YYYYMMDDTHHMMSS` (floating
+//!   local, no Z/TZID) + `RRULE:<body>` — and expansion happens in **floating
+//!   local civil time** (the naive DTSTART is treated as UTC inside this crate
+//!   purely to satisfy the parser — no TZID ever exists, and the tzdb is
+//!   never used for membership). No EXDATE/RDATE/EXRULE/TZID anywhere; the
+//!   RRULE body may keep a Z-form `UNTIL` if the crate needs it.
 //! - Create/update classify the title with the **same unique non-untracked
 //!   rules as `create_task`** (400 on 0 matches / conflict / untracked sink),
 //!   seeding the taxonomy first like the tasks endpoints do. The classify
@@ -23,8 +26,8 @@
 //! - Delete is SOFT; materialized occurrences are never touched. A missing/
 //!   other-user/soft-deleted routine is always [`RoutinesError::NotFound`] —
 //!   ownership is never leaked.
-//! - Rule changes (`dtstart`/`rrule`/`exdates`) only affect future ensure;
-//!   already-materialized occurrences stay.
+//! - Rule changes (`rrule`) only affect future ensure; already-materialized
+//!   occurrences stay.
 
 use std::collections::HashMap;
 
@@ -88,22 +91,17 @@ pub struct DeleteRoutineResponse {
     pub success: bool,
 }
 
-/// HTTP shape of a routine: every `routines` column (minus `deleted_at`)
-/// except that `exdates` arrives **parsed** as an array of local dates (it is
-/// stored as JSON text), plus the **computed** category summary so the client
-/// never reimplements the matcher.
+/// HTTP shape of a routine: every `routines` column (minus `deleted_at`),
+/// plus the **computed** category summary so the client never reimplements
+/// the matcher.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RoutineView {
     pub id: String,
     pub user_id: String,
     pub title: String,
     pub estimated_minutes: i64,
-    /// Naive local civil datetime `YYYY-MM-DDTHH:MM:SS`.
-    pub dtstart: String,
-    /// RFC 5545 RRULE body (`FREQ=…`).
+    /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line).
     pub rrule: String,
-    /// Local `YYYY-MM-DD` strings, excluded from occurrence expansion.
-    pub exdates: Vec<String>,
     pub sort_order: i64,
     /// RFC 3339 instant.
     pub created_at: String,
@@ -118,12 +116,72 @@ pub struct RoutineView {
 // Recurrence: parse / validate / expand
 // ──────────────────────────────────────────
 
-/// Parses a naive local civil datetime (`YYYY-MM-DDTHH:MM:SS`, trimmed). No
-/// offset, no `Z`, no TZID — the storage format is locked by ADR 0004.
-fn parse_dtstart(dtstart: &str) -> Result<NaiveDateTime, RoutinesError> {
-    NaiveDateTime::parse_from_str(dtstart.trim(), "%Y-%m-%dT%H:%M:%S").map_err(|_| {
-        RoutinesError::Invalid("dtstart must be a local datetime like YYYY-MM-DDTHH:MM:SS".to_string())
-    })
+/// Parses the two-line recurrence blob into its floating-local DTSTART and
+/// the bare RRULE body.
+///
+/// The stored format is locked by ADR 0004 (amendment): exactly two
+/// `\n`-separated lines, no trailing extras —
+/// `DTSTART:20260105T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO`. The DTSTART is
+/// **floating local** (basic form `YYYYMMDDTHHMMSS`, no `Z`, no `TZID`); the
+/// RRULE line holds the body only. Rejected (400 "invalid rrule") when the
+/// blob contains `EXDATE`, `RDATE`, `EXRULE`, or `TZID` anywhere, more than
+/// one `RRULE:` line, a `Z` on the DTSTART value, or anything other than
+/// exactly those two lines.
+fn parse_blob(rrule: &str) -> Result<(NaiveDateTime, &str), RoutinesError> {
+    let blob = rrule.trim();
+    let upper = blob.to_ascii_uppercase();
+    for forbidden in ["EXDATE", "RDATE", "EXRULE", "TZID"] {
+        if upper.contains(forbidden) {
+            return Err(RoutinesError::Invalid(
+                "invalid rrule: recurrence must be DTSTART + RRULE only".to_string(),
+            ));
+        }
+    }
+    if upper.matches("RRULE:").count() != 1 {
+        return Err(RoutinesError::Invalid(
+            "invalid rrule: exactly one RRULE line is required".to_string(),
+        ));
+    }
+    let mut lines = blob
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(dtstart_line) = lines.next() else {
+        return Err(RoutinesError::Invalid("invalid rrule".to_string()));
+    };
+    let Some(rrule_line) = lines.next() else {
+        return Err(RoutinesError::Invalid("invalid rrule".to_string()));
+    };
+    if lines.next().is_some() {
+        return Err(RoutinesError::Invalid(
+            "invalid rrule: exactly two lines (DTSTART + RRULE)".to_string(),
+        ));
+    }
+    if !dtstart_line.to_ascii_uppercase().starts_with("DTSTART:") {
+        return Err(RoutinesError::Invalid(
+            "invalid rrule: first line must be DTSTART:".to_string(),
+        ));
+    }
+    let dt_value = dtstart_line["DTSTART:".len()..].trim();
+    // Floating local: the basic form must never carry a Z or an offset.
+    if dt_value.to_ascii_uppercase().contains('Z') {
+        return Err(RoutinesError::Invalid(
+            "invalid rrule: DTSTART must be floating local (no Z)".to_string(),
+        ));
+    }
+    let naive_start = NaiveDateTime::parse_from_str(dt_value, "%Y%m%dT%H%M%S").map_err(|_| {
+        RoutinesError::Invalid("invalid rrule: DTSTART must be YYYYMMDDTHHMMSS".to_string())
+    })?;
+    if !rrule_line.to_ascii_uppercase().starts_with("RRULE:") {
+        return Err(RoutinesError::Invalid(
+            "invalid rrule: second line must be RRULE:".to_string(),
+        ));
+    }
+    let body = rrule_line["RRULE:".len()..].trim();
+    if body.is_empty() {
+        return Err(RoutinesError::Invalid("invalid rrule".to_string()));
+    }
+    Ok((naive_start, body))
 }
 
 /// Validates one local date string (`YYYY-MM-DD`).
@@ -132,44 +190,19 @@ fn parse_local_date(date: &str) -> Result<NaiveDate, RoutinesError> {
         .map_err(|_| RoutinesError::Invalid("dates must be YYYY-MM-DD".to_string()))
 }
 
-/// Validates a whole `exdates` set (each entry a local `YYYY-MM-DD`). Order is
-/// preserved; entries are trimmed.
-fn validate_exdates(exdates: Option<&[String]>) -> Result<Vec<String>, RoutinesError> {
-    let Some(exdates) = exdates else {
-        return Ok(Vec::new());
-    };
-    exdates
-        .iter()
-        .map(|date| {
-            let date = date.trim();
-            if date.is_empty() {
-                return Err(RoutinesError::Invalid(
-                    "exdates must be YYYY-MM-DD dates".to_string(),
-                ));
-            }
-            parse_local_date(date)?;
-            Ok(date.to_string())
-        })
-        .collect()
-}
-
-/// Parses + validates an RRULE body against its DTSTART. The body must be the
-/// bare property value (`FREQ=DAILY;INTERVAL=1`) — never a full content line,
-/// never prefixed with `DTSTART:`. Returns the aware civil datetime (UTC
-/// carrier for the naive local time) plus the validated rule ready for
-/// [`rrule::RRuleSet::rrule`].
+/// Parses + validates a recurrence blob against its own DTSTART. Returns the
+/// aware civil datetime (UTC carrier for the naive local time) plus the
+/// validated rule ready for [`rrule::RRuleSet::rrule`].
 ///
-/// Floating local civil time: the naive `dtstart` is attached to UTC purely as
+/// Floating local civil time: the naive DTSTART is attached to UTC purely as
 /// a carrier for the crate (which requires an aware datetime). Expansion then
 /// yields exactly those civil times back, so membership never involves the
 /// tzdb — matching ADR 0004's floating-local rule.
 fn parse_recurrence(
-    rrule_body: &str,
-    dtstart: &str,
+    rrule: &str,
 ) -> Result<(chrono::DateTime<rrule::Tz>, rrule::RRule<rrule::Validated>), RoutinesError> {
-    let naive_start = parse_dtstart(dtstart)?;
+    let (naive_start, body) = parse_blob(rrule)?;
     let dt_start = rrule::Tz::UTC.from_utc_datetime(&naive_start);
-    let body = rule_body(rrule_body)?;
     let unvalidated: rrule::RRule<rrule::Unvalidated> =
         body.parse().map_err(|_| RoutinesError::Invalid("invalid rrule".to_string()))?;
     let validated = unvalidated
@@ -178,40 +211,24 @@ fn parse_recurrence(
     Ok((dt_start, validated))
 }
 
-/// Trims the RRULE body and rejects `RRULE:`-prefixed / `DTSTART:`-carrying
-/// input early so the error names the actual mistake (the crate would accept a
-/// full content line, which we forbid storing).
-fn rule_body(rrule: &str) -> Result<&str, RoutinesError> {
-    let rrule = rrule.trim();
-    let upper = rrule.to_ascii_uppercase();
-    if rrule.is_empty() || upper.starts_with("RRULE:") || upper.starts_with("DTSTART") {
-        return Err(RoutinesError::Invalid(
-            "invalid rrule: send the rule body like FREQ=DAILY".to_string(),
-        ));
-    }
-    Ok(rrule)
-}
-
-/// Validates a recurrence definition without expanding it — the create/update
-/// gate (invalid rule → 400 "invalid rrule").
-pub fn validate_recurrence(rrule: &str, dtstart: &str) -> Result<(), RoutinesError> {
-    parse_recurrence(rrule, dtstart)?;
+/// Validates a recurrence blob without expanding it — the create/update gate
+/// (invalid rule → 400 "invalid rrule").
+pub fn validate_recurrence(rrule: &str) -> Result<(), RoutinesError> {
+    parse_recurrence(rrule)?;
     Ok(())
 }
 
-/// Expands a recurrence into the local civil dates it covers in the inclusive
-/// window `[from, to]` (`YYYY-MM-DD`, both ends included), minus `exdates`
-/// (local-date exclusion). Dates come back ascending and deduplicated.
+/// Expands a recurrence blob into the local civil dates it covers in the
+/// inclusive window `[from, to]` (`YYYY-MM-DD`, both ends included). Dates
+/// come back ascending and deduplicated.
 ///
 /// Floating local civil time throughout: results are read straight off the
 /// UTC-carried civil datetimes (see [`parse_recurrence`]) — never converted
 /// through any timezone database.
 pub fn occurrence_dates(
-    dtstart: &str,
     rrule: &str,
     from: &str,
     to: &str,
-    exdates: &[String],
 ) -> Result<Vec<String>, RoutinesError> {
     let from = parse_local_date(from)?;
     let to = parse_local_date(to)?;
@@ -231,7 +248,7 @@ pub fn occurrence_dates(
         RoutinesError::Invalid("to is out of range".to_string())
     })?);
 
-    let (dt_start, validated) = parse_recurrence(rrule, dtstart)?;
+    let (dt_start, validated) = parse_recurrence(rrule)?;
     let set = rrule::RRuleSet::new(dt_start)
         .rrule(validated)
         .after(after_bound)
@@ -248,9 +265,6 @@ pub fn occurrence_dates(
             continue;
         }
         let day = civil.format("%Y-%m-%d").to_string();
-        if exdates.iter().any(|excluded| excluded.trim() == day) {
-            continue;
-        }
         if !out.contains(&day) {
             out.push(day);
         }
@@ -297,8 +311,8 @@ pub async fn list_routines(
 ///   non-untracked category — the exact `create_task` rules and messages.
 /// - `estimated_minutes` defaults to [`DEFAULT_ESTIMATED_MINUTES`] and must be
 ///   >= [`MIN_ESTIMATED_MINUTES`].
-/// - `dtstart`/`rrule` are validated (invalid rule → 400 "invalid rrule");
-///   `exdates` default to `[]`.
+/// - `rrule` (the two-line blob) is validated (invalid rule → 400
+///   "invalid rrule").
 /// - The new routine appends the standing order: `max(sort_order)+1`, or 0
 ///   when the pile is empty. Titles are not unique.
 pub async fn create_routine(
@@ -318,8 +332,7 @@ pub async fn create_routine(
             "estimated_minutes must be at least 1".to_string(),
         ));
     }
-    validate_recurrence(&input.rrule, &input.dtstart)?;
-    let exdates = validate_exdates(input.exdates.as_deref())?;
+    validate_recurrence(&input.rrule)?;
 
     // Seed the taxonomy like `create_task`, then enforce its unique-match
     // rules before anything is persisted.
@@ -336,9 +349,7 @@ pub async fn create_routine(
             user_id: user_id.to_string(),
             title,
             estimated_minutes,
-            dtstart: input.dtstart.trim().to_string(),
             rrule: input.rrule.trim().to_string(),
-            exdates_json: serde_json::to_string(&exdates).unwrap_or_else(|_| "[]".to_string()),
             sort_order: append_rank(max),
         })
         .await?;
@@ -347,15 +358,14 @@ pub async fn create_routine(
     })
 }
 
-/// Updates a routine's `title`/`estimated_minutes`/`dtstart`/`rrule`/
-/// `exdates`/`sort_order` (`None` = unchanged).
+/// Updates a routine's `title`/`estimated_minutes`/`rrule`/`sort_order`
+/// (`None` = unchanged).
 ///
 /// - A body with nothing to update is 400 ("nothing to update").
 /// - When `title` is present it must be non-blank AND uniquely match a
 ///   non-untracked category (same rules and messages as create).
-/// - `estimated_minutes` must be >= 1 when present. When either half of the
-///   recurrence changes, the effective pair (`dtstart`, `rrule`) is validated
-///   together against the stored values.
+/// - `estimated_minutes` must be >= 1 when present. A changed `rrule` blob is
+///   validated on its own (it carries its own DTSTART).
 /// - A missing, soft-deleted, or another user's routine is 404. Rule changes
 ///   never touch materialized occurrences.
 pub async fn update_routine(
@@ -367,9 +377,7 @@ pub async fn update_routine(
 ) -> Result<RoutineResponse, RoutinesError> {
     if updates.title.is_none()
         && updates.estimated_minutes.is_none()
-        && updates.dtstart.is_none()
         && updates.rrule.is_none()
-        && updates.exdates.is_none()
         && updates.sort_order.is_none()
     {
         return Err(RoutinesError::Invalid("nothing to update".to_string()));
@@ -396,15 +404,10 @@ pub async fn update_routine(
         return Err(RoutinesError::NotFound);
     }
 
-    // Validate the effective recurrence pair: a changed side pairs with the
-    // stored other side, so the row can never end up un-expandable.
-    if updates.dtstart.is_some() || updates.rrule.is_some() {
-        let dtstart = updates.dtstart.as_deref().unwrap_or(&existing.dtstart);
-        let rrule = updates.rrule.as_deref().unwrap_or(&existing.rrule);
-        validate_recurrence(rrule, dtstart)?;
-    }
-    if updates.exdates.is_some() {
-        validate_exdates(updates.exdates.as_deref())?;
+    // A changed blob is validated on its own — it carries its own DTSTART, so
+    // there is no cross-field pair to check anymore.
+    if let Some(rrule) = updates.rrule.as_deref() {
+        validate_recurrence(rrule)?;
     }
     // A new title must classify to a single non-untracked category, exactly
     // like create. The old title needs no re-validation.
@@ -546,10 +549,8 @@ fn summary_for(category: &TaskCategory, categories: &[TaskCategory]) -> TaskCate
 
 /// Wraps a stored routine into its HTTP view. Classification is a read: a
 /// title that no longer uniquely matches keeps the `untracked` summary —
-/// listing never 400s on classification. Stored `exdates` JSON that fails to
-/// parse (hand-edited rows) degrades to an empty array rather than failing.
+/// listing never 400s on classification.
 fn to_view(routine: &Routine, taxonomy: &Taxonomy) -> RoutineView {
-    let exdates: Vec<String> = serde_json::from_str(&routine.exdates).unwrap_or_default();
     let outcome = classify(&routine.title, CalendarScope::Ignore, &taxonomy.matchers);
     let category = match &outcome {
         ClassifyOutcome::Matched { category_id } => taxonomy
@@ -568,9 +569,7 @@ fn to_view(routine: &Routine, taxonomy: &Taxonomy) -> RoutineView {
         user_id: routine.user_id.clone(),
         title: routine.title.clone(),
         estimated_minutes: routine.estimated_minutes,
-        dtstart: routine.dtstart.clone(),
         rrule: routine.rrule.clone(),
-        exdates,
         sort_order: routine.sort_order,
         created_at: routine.created_at.clone(),
         updated_at: routine.updated_at.clone(),
@@ -623,18 +622,14 @@ mod tests {
             user_id: &str,
             title: &str,
             sort_order: i64,
-            dtstart: &str,
             rrule: &str,
-            exdates: &str,
         ) -> Routine {
             Routine {
                 id: id.to_string(),
                 user_id: user_id.to_string(),
                 title: title.to_string(),
                 estimated_minutes: 15,
-                dtstart: dtstart.to_string(),
                 rrule: rrule.to_string(),
-                exdates: exdates.to_string(),
                 sort_order,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -676,9 +671,7 @@ mod tests {
                 user_id: routine.user_id,
                 title: routine.title,
                 estimated_minutes: routine.estimated_minutes,
-                dtstart: routine.dtstart,
                 rrule: routine.rrule,
-                exdates: routine.exdates_json,
                 sort_order: routine.sort_order,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
@@ -689,9 +682,7 @@ mod tests {
                 user_id: row.user_id.clone(),
                 title: row.title.clone(),
                 estimated_minutes: row.estimated_minutes,
-                dtstart: row.dtstart.clone(),
                 rrule: row.rrule.clone(),
-                exdates_json: row.exdates.clone(),
                 sort_order: row.sort_order,
             });
             self.stored.lock().unwrap().push(row.clone());
@@ -716,14 +707,8 @@ mod tests {
             if let Some(estimated_minutes) = updates.estimated_minutes {
                 row.estimated_minutes = estimated_minutes;
             }
-            if let Some(dtstart) = &updates.dtstart {
-                row.dtstart = dtstart.clone();
-            }
             if let Some(rrule) = &updates.rrule {
                 row.rrule = rrule.clone();
-            }
-            if let Some(exdates) = &updates.exdates {
-                row.exdates = serde_json::to_string(exdates).unwrap();
             }
             if let Some(sort_order) = updates.sort_order {
                 row.sort_order = sort_order;
@@ -1072,13 +1057,21 @@ mod tests {
         }
     }
 
-    fn input(title: &str, dtstart: &str, rrule: &str) -> NewRoutineInput {
+    /// Composes the two-line recurrence blob from the hyphenated civil
+    /// datetime used across these tests (the API accepts the blob as-is).
+    fn blob(dtstart: &str, body: &str) -> String {
+        let compact: String = dtstart
+            .chars()
+            .filter(|c| *c != '-' && *c != ':')
+            .collect();
+        format!("DTSTART:{compact}\nRRULE:{body}")
+    }
+
+    fn input(title: &str, rrule: &str) -> NewRoutineInput {
         NewRoutineInput {
             title: title.to_string(),
             estimated_minutes: None,
-            dtstart: dtstart.to_string(),
             rrule: rrule.to_string(),
-            exdates: None,
         }
     }
 
@@ -1096,9 +1089,7 @@ mod tests {
             "u-1",
             "Fajr",
             0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
         ));
 
         let response =
@@ -1108,7 +1099,10 @@ mod tests {
         let routine = &response.routines[0];
         assert_eq!(routine.title, "Fajr");
         assert_eq!(routine.estimated_minutes, 15, "default estimate");
-        assert_eq!(routine.exdates, Vec::<String>::new(), "parsed array, not JSON text");
+        assert_eq!(
+            routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            "the stored blob round-trips"
+        );
         // Seeded roots exist but none match "Fajr" → untracked summary.
         assert!(routine.category.is_untracked);
         assert_eq!(routine.category.slug, "untracked");
@@ -1121,9 +1115,9 @@ mod tests {
     fn list_orders_by_standing_sort_order() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().extend([
-            FakeRoutineRepo::row("rt-b", "u-1", "Second", 2, "2026-01-02T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-a", "u-1", "First", 1, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
-            FakeRoutineRepo::row("rt-x", "u-2", "Other user", 0, "2026-01-01T05:30:00", "FREQ=DAILY", "[]"),
+            FakeRoutineRepo::row("rt-b", "u-1", "Second", 2, "DTSTART:20260102T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-a", "u-1", "First", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-x", "u-2", "Other user", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
         ]);
         let response =
             pollster::block_on(list_routines(&repos.lists, &repos.categories, &repos.routines, "u-1"))
@@ -1140,9 +1134,7 @@ mod tests {
             "u-1",
             "Vanished Pattern",
             0,
-            "2026-01-01T05:30:00",
-            "FREQ=DAILY",
-            "[]",
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
         ));
         let response =
             pollster::block_on(list_routines(&repos.lists, &repos.categories, &repos.routines, "u-1"))
@@ -1164,7 +1156,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Work", "2026-01-01T06:30:00", "FREQ=DAILY;INTERVAL=2"),
+            &input("Work", "DTSTART:20260101T063000\nRRULE:FREQ=DAILY;INTERVAL=2"),
         ))
         .unwrap();
         assert_eq!(first.routine.sort_order, 0);
@@ -1183,30 +1175,23 @@ mod tests {
             &NewRoutineInput {
                 title: "Salat".to_string(),
                 estimated_minutes: Some(10),
-                dtstart: "2026-01-01T05:30:00".to_string(),
-                rrule: "FREQ=DAILY".to_string(),
-                exdates: Some(vec!["2026-01-03".to_string()]),
+                rrule: blob("2026-01-01T05:30:00", "FREQ=DAILY"),
             },
         ))
         .unwrap();
         assert_eq!(second.routine.sort_order, 1, "append rank max+1");
         assert_eq!(second.routine.estimated_minutes, 10);
         assert_eq!(
-            second.routine.exdates,
-            vec!["2026-01-03".to_string()],
-            "exdates round-trip as an array"
+            second.routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            "the blob round-trips"
         );
-        // Stored form keeps JSON text.
-        assert_eq!(second.routine.exdates.len(), 1);
-        let stored_exdates = repos.routines.stored.lock().unwrap()[1].exdates.clone();
-        assert_eq!(stored_exdates, r#"["2026-01-03"]"#);
         // Titles are not unique: a second "Salat" is allowed…
         let duplicate = pollster::block_on(create_routine(
             &repos.lists,
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Salat", "2026-02-01T05:30:00", "FREQ=WEEKLY;BYDAY=MO,WE"),
+            &input("Salat", "DTSTART:20260201T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE"),
         ))
         .unwrap();
         assert_eq!(duplicate.routine.sort_order, 2);
@@ -1215,15 +1200,10 @@ mod tests {
     #[test]
     fn create_rejects_blank_title_invalid_estimate_bad_recurrence() {
         let repos = repos();
+        let good = blob("2026-01-01T05:30:00", "FREQ=DAILY");
         let cases = [
-            (
-                input("", "2026-01-01T05:30:00", "FREQ=DAILY"),
-                "title must not be empty",
-            ),
-            (
-                input("   ", "2026-01-01T05:30:00", "FREQ=DAILY"),
-                "title must not be empty",
-            ),
+            (input("", &good), "title must not be empty"),
+            (input("   ", &good), "title must not be empty"),
         ];
         for (body, message) in cases {
             let err = pollster::block_on(create_routine(
@@ -1238,7 +1218,7 @@ mod tests {
         }
         let zero_estimate = NewRoutineInput {
             estimated_minutes: Some(0),
-            ..input("Work", "2026-01-01T05:30:00", "FREQ=DAILY")
+            ..input("Work", &good)
         };
         let err = pollster::block_on(create_routine(
             &repos.lists,
@@ -1253,21 +1233,28 @@ mod tests {
             "{err:?}"
         );
         for bad in [
-            input("Work", "2026-01-01T05:30:00", ""),
-            input("Work", "2026-01-01T05:30:00", "NOT_A_RULE=1"),
-            input("Work", "2026-01-01T05:30:00", "RRULE:FREQ=DAILY"),
-            input("Work", "2026-01-01 05:30:00", "FREQ=DAILY"),
-            input("Work", "2026-01-01T05:30:00Z", "FREQ=DAILY"),
+            "",
+            "FREQ=DAILY", // missing the DTSTART line
+            "DTSTART:20260101T053000", // missing the RRULE line
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY\nRRULE:FREQ=WEEKLY", // two RRULEs
+            "DTSTART:20260101T053000\nFREQ=DAILY", // second line not RRULE:
+            "DTSTART:20260101T053000Z\nRRULE:FREQ=DAILY", // Z on DTSTART
+            "DTSTART:2026-01-01T05:30:00\nRRULE:FREQ=DAILY", // not the basic form
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY;EXDATE:20260102", // exdate
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY;RDATE:20260102", // rdate
+            "DTSTART;TZID=Asia/Kolkata:20260101T053000\nRRULE:FREQ=DAILY", // tzid
+            "DTSTART:20260101T053000\nRRULE:NOT_A_RULE=1",
+            "DTSTART:20260101T053000\nRRULE:",
         ] {
             let err = pollster::block_on(create_routine(
                 &repos.lists,
                 &repos.categories,
                 &repos.routines,
                 "u-1",
-                &bad,
+                &input("Work", bad),
             ))
             .unwrap_err();
-            assert!(matches!(err, RoutinesError::Invalid(_)), "want 400, got {err:?}");
+            assert!(matches!(err, RoutinesError::Invalid(_)), "want 400, got {err:?} for {bad:?}");
         }
         assert!(
             repos.routines.inserted.lock().unwrap().is_empty(),
@@ -1276,37 +1263,38 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_bad_exdates() {
+    fn create_rejects_rrule_with_exrule_and_extra_lines() {
         let repos = repos();
-        let bad = NewRoutineInput {
-            exdates: Some(vec!["03-01-2026".to_string()]),
-            ..input("Work", "2026-01-01T05:30:00", "FREQ=DAILY")
-        };
-        let err = pollster::block_on(create_routine(
-            &repos.lists,
-            &repos.categories,
-            &repos.routines,
-            "u-1",
-            &bad,
-        ))
-        .unwrap_err();
-        assert!(
-            matches!(err, RoutinesError::Invalid(ref m) if m == "dates must be YYYY-MM-DD"),
-            "{err:?}"
-        );
+        // The locked-format rejections beyond the bad-body cases above.
+        for bad in [
+            // A trailing newline is trimmed away — still exactly two lines.
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY\nEXTRA", // third line
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY;EXRULE:FREQ=WEEKLY",
+        ] {
+            let err = pollster::block_on(create_routine(
+                &repos.lists,
+                &repos.categories,
+                &repos.routines,
+                "u-1",
+                &input("Work", bad),
+            ))
+            .unwrap_err();
+            assert!(matches!(err, RoutinesError::Invalid(_)), "{err:?} for {bad:?}");
+        }
         assert!(repos.routines.inserted.lock().unwrap().is_empty());
     }
 
     #[test]
     fn create_enforces_the_same_classify_rules_as_create_task() {
         let repos = repos();
+        let good = blob("2026-01-01T05:30:00", "FREQ=DAILY");
         // 0 matches.
         let err = pollster::block_on(create_routine(
             &repos.lists,
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Meditation", "2026-01-01T05:30:00", "FREQ=DAILY"),
+            &input("Meditation", &good),
         ))
         .unwrap_err();
         assert!(
@@ -1333,7 +1321,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Dupe", "2026-01-01T05:30:00", "FREQ=DAILY"),
+            &input("Dupe", &good),
         ))
         .unwrap_err();
         assert!(
@@ -1350,7 +1338,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Weird", "2026-01-01T05:30:00", "FREQ=DAILY"),
+            &input("Weird", &good),
         ))
         .unwrap_err();
         assert!(
@@ -1365,22 +1353,23 @@ mod tests {
     // ──────────────────────────────────────────
 
     #[test]
-    fn update_applies_partial_updates_and_revalidates_pair() {
+    fn update_applies_partial_updates_and_revalidates_blob() {
         let repos = repos();
         let created = pollster::block_on(create_routine(
             &repos.lists,
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Work", "2026-01-01T06:30:00", "FREQ=DAILY"),
+            &input("Work", &blob("2026-01-01T06:30:00", "FREQ=DAILY")),
         ))
         .unwrap();
         let id = created.routine.id.clone();
 
-        // Estimate + rule only: title untouched.
+        // Estimate + rule only: title untouched. The blob replaces the whole
+        // recurrence (it carries its own DTSTART).
         let updates = UpdateRoutine {
             estimated_minutes: Some(20),
-            rrule: Some("FREQ=WEEKLY;BYDAY=MO,WE".to_string()),
+            rrule: Some(blob("2026-01-05T09:00:00", "FREQ=WEEKLY;BYDAY=MO,WE")),
             ..UpdateRoutine::default()
         };
         let updated = pollster::block_on(update_routine(
@@ -1392,40 +1381,29 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(updated.routine.estimated_minutes, 20);
-        assert_eq!(updated.routine.rrule, "FREQ=WEEKLY;BYDAY=MO,WE");
-        assert_eq!(updated.routine.dtstart, "2026-01-01T06:30:00", "unchanged");
-
-        // Changing dtstart alone validates against the stored rrule.
-        let retimed = UpdateRoutine {
-            dtstart: Some("2026-02-01T07:00:00".to_string()),
-            ..UpdateRoutine::default()
-        };
-        let updated = pollster::block_on(update_routine(
-            &repos.categories,
-            &repos.routines,
-            "u-1",
-            &id,
-            &retimed,
-        ))
-        .unwrap();
-        assert_eq!(updated.routine.dtstart, "2026-02-01T07:00:00");
-
-        // Replacing exdates swaps the whole set.
-        let pruned = UpdateRoutine {
-            exdates: Some(vec!["2026-02-03".to_string(), "2026-02-04".to_string()]),
-            ..UpdateRoutine::default()
-        };
-        let updated = pollster::block_on(update_routine(
-            &repos.categories,
-            &repos.routines,
-            "u-1",
-            &id,
-            &pruned,
-        ))
-        .unwrap();
         assert_eq!(
-            updated.routine.exdates,
-            vec!["2026-02-03".to_string(), "2026-02-04".to_string()]
+            updated.routine.rrule, "DTSTART:20260105T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+            "the blob round-trips"
+        );
+
+        // A bad replacement blob is refused; the stored rule stays intact.
+        let invalid_rule = UpdateRoutine {
+            rrule: Some("FREQ=DAILY".to_string()),
+            ..UpdateRoutine::default()
+        };
+        let err = pollster::block_on(update_routine(
+            &repos.categories,
+            &repos.routines,
+            "u-1",
+            &id,
+            &invalid_rule,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, RoutinesError::Invalid(_)), "{err:?}");
+        let stored = pollster::block_on(repos.routines.get_by_id(&id)).unwrap().unwrap();
+        assert_eq!(
+            stored.rrule, "DTSTART:20260105T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+            "refused update writes nothing"
         );
     }
 
@@ -1437,7 +1415,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Work", "2026-01-01T06:30:00", "FREQ=DAILY"),
+            &input("Work", "DTSTART:20260101T063000\nRRULE:FREQ=DAILY"),
         ))
         .unwrap();
         let id = created.routine.id.clone();
@@ -1529,7 +1507,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Work", "2026-01-01T06:30:00", "FREQ=DAILY"),
+            &input("Work", "DTSTART:20260101T063000\nRRULE:FREQ=DAILY"),
         ))
         .unwrap();
         let id = created.routine.id.clone();
@@ -1586,7 +1564,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Work", "2026-01-01T06:30:00", "FREQ=DAILY"),
+            &input("Work", "DTSTART:20260101T063000\nRRULE:FREQ=DAILY"),
         ))
         .unwrap();
         let id = created.routine.id.clone();
@@ -1616,7 +1594,7 @@ mod tests {
             &repos.categories,
             &repos.routines,
             "u-1",
-            &input("Work", "2026-01-01T06:30:00", "FREQ=DAILY"),
+            &input("Work", "DTSTART:20260101T063000\nRRULE:FREQ=DAILY"),
         ))
         .unwrap();
         let id = created.routine.id.clone();
@@ -1647,10 +1625,8 @@ mod tests {
     #[allow(dead_code)] // `name` is documentation for the npm side too
     struct GoldenCase {
         name: String,
-        dtstart: String,
+        /// The two-line recurrence blob (`DTSTART:` + `RRULE:`).
         rrule: String,
-        #[serde(default)]
-        exdates: Vec<String>,
         from: String,
         to: String,
         expected: Vec<String>,
@@ -1662,60 +1638,51 @@ mod tests {
             "../fixtures/rrule_golden.json"
         ))
         .expect("golden fixtures are valid JSON");
-        assert!(fixtures.cases.len() >= 5, "daily, BYDAY, INTERVAL=2, UNTIL, exdates");
+        assert!(fixtures.cases.len() >= 4, "daily, BYDAY, INTERVAL=2, UNTIL");
 
         for case in &fixtures.cases {
-            validate_recurrence(&case.rrule, &case.dtstart)
+            validate_recurrence(&case.rrule)
                 .unwrap_or_else(|err| panic!("{} should validate: {err}", case.name));
-            let got = occurrence_dates(
-                &case.dtstart,
-                &case.rrule,
-                &case.from,
-                &case.to,
-                &case.exdates,
-            )
-            .unwrap_or_else(|err| panic!("{} should expand: {err}", case.name));
+            let got = occurrence_dates(&case.rrule, &case.from, &case.to)
+                .unwrap_or_else(|err| panic!("{} should expand: {err}", case.name));
             assert_eq!(got, case.expected, "case {}", case.name);
         }
     }
 
     #[test]
     fn occurrence_window_is_inclusive_on_both_ends() {
+        let blob = "DTSTART:20260101T063000\nRRULE:FREQ=DAILY";
         // Single-day window [d, d] catches the occurrence on d itself.
-        let got = occurrence_dates(
-            "2026-01-01T06:30:00",
-            "FREQ=DAILY",
-            "2026-01-03",
-            "2026-01-03",
-            &[],
-        )
-        .unwrap();
+        let got = occurrence_dates(blob, "2026-01-03", "2026-01-03").unwrap();
         assert_eq!(got, ["2026-01-03"]);
 
         // And an inverted window is rejected rather than silently empty.
-        let err = occurrence_dates("2026-01-01T06:30:00", "FREQ=DAILY", "2026-01-05", "2026-01-01", &[])
-            .unwrap_err();
+        let err = occurrence_dates(blob, "2026-01-05", "2026-01-01").unwrap_err();
         assert!(matches!(err, RoutinesError::Invalid(_)), "{err:?}");
     }
 
     #[test]
-    fn occurrence_dates_exclude_local_dates_and_survive_midnight_dtstarts() {
-        // Exdate removes exactly its own date.
-        let got = occurrence_dates(
-            "2026-01-01T00:00:00",
-            "FREQ=DAILY",
-            "2026-01-01",
-            "2026-01-04",
-            &["2026-01-02".to_string()],
-        )
-        .unwrap();
-        assert_eq!(got, ["2026-01-01", "2026-01-03", "2026-01-04"]);
-
+    fn occurrence_dates_use_the_blob_dtstart_and_survive_midnight_dtstarts() {
         // Midnight dtstart: the widened bounds must not drop the window edge.
         assert_eq!(
-            occurrence_dates("2026-01-01T00:00:00", "FREQ=DAILY", "2026-01-01", "2026-01-02", &[])
-                .unwrap(),
+            occurrence_dates(
+                "DTSTART:20260101T000000\nRRULE:FREQ=DAILY",
+                "2026-01-01",
+                "2026-01-02",
+            )
+            .unwrap(),
             ["2026-01-01", "2026-01-02"]
+        );
+        // The blob's own DTSTART anchors the series (2026-01-05 is a Monday,
+        // so BYDAY=MO covers it; 2026-01-04 does not match).
+        assert_eq!(
+            occurrence_dates(
+                "DTSTART:20260105T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+                "2026-01-04",
+                "2026-01-12",
+            )
+            .unwrap(),
+            ["2026-01-05", "2026-01-12"]
         );
     }
 }

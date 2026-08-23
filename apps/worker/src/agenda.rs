@@ -460,10 +460,12 @@ pub async fn patch_occurrence(
 ///
 /// Creates the one-shot Google log (summary = the resolved title, carriers
 /// `sanctuary_routine_id`/`sanctuary_occurrence_id`, never an RRULE), stores
-/// the ids on the occurrence, and flips it to `in_progress`. Today-only and
-/// `pending`-only (repeating on `in_progress` is a 200 no-op; `done`/
-/// `skipped` or a non-today date → 400). Always needs Google — session +
-/// refreshable token (401 otherwise), same gate as the task timer.
+/// the ids on the occurrence, and flips it to `in_progress`. `pending`-only
+/// (repeating on `in_progress` is a 200 no-op; `done`/`skipped` → 400), and
+/// the occurrence must be **scheduled on civil today** — an agenda item for
+/// it sits on today's date (a rescheduled occurrence starts where its item
+/// moved, not on its rule date); otherwise 400. Always needs Google —
+/// session + refreshable token (401 otherwise), same gate as the task timer.
 pub async fn start_occurrence(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -490,6 +492,7 @@ pub async fn start_occurrence(
         &categories_d1(&ctx)?,
         &routines_d1(&ctx)?,
         &occurrences_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
         &access,
         &user_id,
         id,
