@@ -125,20 +125,23 @@ export function BoardPage() {
   const [focusInFlight, setFocusInFlight] = useState(false);
   // One load at a time: the mount effect, Retry and a quiet refresh tick
   // (interval or visibility) can race — while a load is in flight a second
-  // call is a no-op, never a double fetch.
+  // call is a no-op, never a double fetch. A ref on purpose: the flag flips
+  // inside load() with no guaranteed re-render either way, so the refresh
+  // hook must read it live (see the useBoardRefresh call below).
   const loadInFlightRef = useRef(false);
-  // Anything a quiet background refresh must not interrupt (see
+  // Render-driven state a quiet background refresh must not interrupt (see
   // useBoardRefresh): a live drag or preview, an in-flight /move, an
-  // in-flight focus toggle, or an in-flight load itself. Written during
-  // render (same pattern as listsRef above) so the refresh hook reads the
-  // freshest value without re-subscribing.
+  // in-flight focus toggle. Written during render (same pattern as listsRef
+  // above) so the refresh hook reads the freshest value without
+  // re-subscribing. The in-flight load is NOT here: it lives only in
+  // loadInFlightRef and drops without a re-render, so snapshotting it into
+  // this render-time value could leave the board latched busy.
   const busyRef = useRef(false);
   busyRef.current =
     activeDrag !== null ||
     dragItems !== null ||
     movingIds.size > 0 ||
-    focusInFlight ||
-    loadInFlightRef.current;
+    focusInFlight;
 
   // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
   // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
@@ -204,8 +207,11 @@ export function BoardPage() {
 
   // Quiet refresh (60s interval + tab visibility): wired after the mount
   // effect above so the initial load stays the first refresh — the hook
-  // never fires on mount and skips ticks while `busyRef` is set.
-  useBoardRefresh(load, () => busyRef.current);
+  // never fires on mount and skips ticks while `busyRef` is set. The hook
+  // reads this callback at tick time, so loadInFlightRef is checked LIVE:
+  // an in-flight load still gates the tick, and its flag dropping in
+  // load()'s finally is visible on the next tick without a re-render.
+  useBoardRefresh(load, () => busyRef.current || loadInFlightRef.current);
 
   // ──────────────────────────────────────────
   // URL filters (ADR 0002 § Filters)
