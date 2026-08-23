@@ -83,6 +83,18 @@ export interface TaskListsResponse {
   lists: TaskList[];
 }
 
+// Request body for POST /api/lists
+export interface NewListInput {
+  name: string;
+  color: string;
+}
+
+// Request body for PATCH /api/lists/:id — every field optional
+export interface UpdateListInput {
+  name?: string;
+  color?: string;
+}
+
 // The envelope returned by POST /api/lists and PATCH /api/lists/:id
 export interface TaskListResponse {
   list: TaskList;
@@ -500,6 +512,12 @@ export interface RescheduleAgendaItemInput {
 // POST /api/occurrences/:id/complete and POST /api/occurrences/:id/skip.
 export interface OccurrenceResponse {
   occurrence: OccurrenceRecord;
+}
+
+// Request body for PATCH /api/occurrences/:id — the day-level title override;
+// empty clears back to inheriting the routine title.
+export interface UpdateOccurrenceInput {
+  title: string;
 }
 
 // The envelope returned by POST /api/occurrences/:id/start: the fresh

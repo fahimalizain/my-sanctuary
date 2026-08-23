@@ -21,7 +21,19 @@ import {
 } from '@/components/ui/dialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
-import { API_BASE_URL } from '@/lib/api';
+import {
+  ApiError,
+  createList,
+  createTask,
+  deleteList,
+  deleteTask,
+  listLists,
+  listTasks,
+  moveTask,
+  runTaskAction,
+  updateList,
+  updateTask,
+} from '@/lib/api';
 import { cn } from '@/lib/utils';
 // Lists is unlinked from the nav; one shared helper is fine to import across
 // modules — no new package.
@@ -29,40 +41,17 @@ import { defaultMoveRank } from '../board/board-model';
 import {
   TASK_PRIORITY_LABELS,
   type MoveTaskInput,
-  type MoveTaskResponse,
   type NewTaskInput,
   type TaskDifficulty,
   type TaskList,
-  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskResponse,
   type TaskStatus,
-  type TasksResponse,
-  type UpdateTaskInput,
 } from '@/app/types';
 
 // Timer actions map to the same POST endpoints; the server explains 409s.
 type TaskAction = 'start' | 'stop' | 'pause' | 'complete' | 'discard';
-
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON.
-async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
 
 interface ListFormState {
   mode: 'create' | 'edit';
@@ -122,16 +111,10 @@ export function ListsPage() {
     // seeded taxonomy, and GET /api/tasks also runs the count-gated seed (a
     // no-op once lists seeded). Lists hide untracked tasks (no list to
     // belong to), so the categories endpoint is never needed here.
-    fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
-      .then(async (listsRes) => {
-        if (!listsRes.ok) throw new Error(await readError(listsRes));
-        const listsData = (await listsRes.json()) as TaskListsResponse;
+    listLists()
+      .then(async (listsData) => {
         setLists(listsData.lists ?? []);
-        return fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' });
-      })
-      .then(async (tasksRes) => {
-        if (!tasksRes.ok) throw new Error(await readError(tasksRes));
-        const tasksData = (await tasksRes.json()) as TasksResponse;
+        const tasksData = await listTasks();
         setTasks(tasksData.tasks ?? []);
       })
       .catch((err: unknown) => {
@@ -149,10 +132,8 @@ export function ListsPage() {
   // Refreshes only the tasks (timer actions never change lists, so the
   // sequential lists→tasks reload is unnecessary here).
   const reloadTasks = useCallback(() => {
-    fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as TasksResponse;
+    listTasks()
+      .then((data) => {
         setTasks(data.tasks ?? []);
       })
       .catch((err: unknown) => {
@@ -168,15 +149,13 @@ export function ListsPage() {
 
   const handleTaskAction = async (taskId: string, action: TaskAction) => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/${action}`, {
-      method: 'POST',
-      credentials: 'include',
-    });
-    if (!res.ok) {
+    try {
+      await runTaskAction(taskId, action);
+    } catch (err) {
       // The server's message (e.g. a missing Google token) lands in the
       // banner; the cards stay visible. IN_PROGRESS is a column, not a
       // singleton lock, so starting another task while some run is fine.
-      setActionError(await readError(res));
+      setActionError(err instanceof Error ? err.message : 'Action failed');
       return;
     }
     reloadTasks();
@@ -222,23 +201,15 @@ export function ListsPage() {
     setSaving(true);
     setFormError(null);
     setActionError(null);
-    const res =
-      listForm.mode === 'create'
-        ? await fetch(`${API_BASE_URL}/api/lists`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: trimmed, color: listColor }),
-          })
-        : await fetch(`${API_BASE_URL}/api/lists/${listForm.list!.id}`, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: trimmed, color: listColor }),
-          });
-    if (!res.ok) {
+    try {
+      if (listForm.mode === 'create') {
+        await createList({ name: trimmed, color: listColor });
+      } else {
+        await updateList(listForm.list!.id, { name: trimmed, color: listColor });
+      }
+    } catch (err) {
       setSaving(false);
-      setFormError(await readError(res));
+      setFormError(err instanceof Error ? err.message : 'Save failed');
       return;
     }
     closeListForm();
@@ -250,17 +221,16 @@ export function ListsPage() {
     if (!confirmed) return;
 
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/lists/${list.id}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      const message = await readError(res);
+    try {
+      await deleteList(list.id);
+    } catch (err) {
       // 409 from the backend: living root categories still reference the list.
       setActionError(
-        res.status === 409
+        err instanceof ApiError && err.status === 409
           ? `"${list.name}" is still in use and cannot be deleted.`
-          : message,
+          : err instanceof Error
+            ? err.message
+            : 'Failed to delete list',
       );
       return;
     }
@@ -318,19 +288,7 @@ export function ListsPage() {
     );
     const body: MoveTaskInput = { status };
     try {
-      const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const message = await readError(res);
-        setTasks(snapshot);
-        setActionError(message);
-        return message;
-      }
-      const data = (await res.json()) as MoveTaskResponse;
+      const data = await moveTask(taskId, body);
       setTasks((prev) =>
         prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
       );
@@ -362,35 +320,28 @@ export function ListsPage() {
   }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
-    const body: NewTaskInput | UpdateTaskInput = {
+    // `NewTaskInput` on purpose: create sends the full set, and the edit
+    // PATCH accepts it too (every field optional server-side).
+    const body: NewTaskInput = {
       title: values.title,
       description: values.description,
       duration_minutes: values.durationMinutes,
       priority: values.priority,
       difficulty: values.difficulty,
     };
-    const res =
-      taskForm.mode === 'create'
-        ? await fetch(`${API_BASE_URL}/api/tasks`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          })
-        : await fetch(`${API_BASE_URL}/api/tasks/${taskForm.task!.id}`, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-    if (!res.ok) {
-      return await readError(res);
+    let data: TaskResponse;
+    try {
+      data =
+        taskForm.mode === 'create'
+          ? await createTask(body)
+          : await updateTask(taskForm.task!.id, body);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Save failed';
     }
     // The response carries the computed category — reuse it directly so the
     // card regroups instantly (the task lands on the card whose
     // `inherited_list_id` matches; an untracked result stays hidden, which is
     // correct on this page).
-    const data = (await res.json()) as TaskResponse;
     setTasks((prev) =>
       taskForm.mode === 'create'
         ? [data.task, ...prev]
@@ -402,12 +353,10 @@ export function ListsPage() {
 
   const handleTaskDelete = async (taskId: string): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      return await readError(res);
+    try {
+      await deleteTask(taskId);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Delete failed';
     }
     setTasks((prev) => prev.filter((entry) => entry.id !== taskId));
     closeTaskForm();

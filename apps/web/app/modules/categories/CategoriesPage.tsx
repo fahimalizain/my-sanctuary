@@ -10,36 +10,21 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { useNavigate, useRouter } from '@tanstack/react-router';
-import { API_BASE_URL } from '@/lib/api';
+import {
+  createCategory,
+  deleteCategory,
+  listCalendars,
+  listCategories,
+  listLists,
+  updateCategory,
+} from '@/lib/api';
 import type {
-  CalendarsResponse,
-  CategoriesResponse,
   Category,
   GoogleCalendar,
   NewCategoryInput,
   TaskList,
-  TaskListsResponse,
   UpdateCategoryInput,
 } from '@/app/types';
-
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON.
-async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
 
 interface PatternDraft {
   regex: string;
@@ -104,19 +89,10 @@ export function CategoriesPage() {
     // inserts the default lists AND the category taxonomy), so the categories
     // request must run after it — a parallel fetch would often return [] on
     // first paint and never retry.
-    fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
-      .then(async (listsRes) => {
-        if (!listsRes.ok) throw new Error(await readError(listsRes));
-        const listsData = (await listsRes.json()) as TaskListsResponse;
+    listLists()
+      .then(async (listsData) => {
         setLists(listsData.lists ?? []);
-        return fetch(`${API_BASE_URL}/api/categories`, {
-          credentials: 'include',
-        });
-      })
-      .then(async (categoriesRes) => {
-        if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
-        const categoriesData =
-          (await categoriesRes.json()) as CategoriesResponse;
+        const categoriesData = await listCategories();
         setCategories(categoriesData.categories ?? []);
       })
       .catch((err: unknown) => {
@@ -139,12 +115,8 @@ export function CategoriesPage() {
     let cancelled = false;
     setCalendarsLoading(true);
     setCalendarsError(null);
-    fetch(`${API_BASE_URL}/api/calendar/calendars`, {
-      credentials: 'include',
-    })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as CalendarsResponse;
+    listCalendars()
+      .then((data) => {
         if (!cancelled) setCalendars(data.calendars ?? []);
       })
       .catch((err: unknown) => {
@@ -233,43 +205,33 @@ export function CategoriesPage() {
     setFormError(null);
     setActionError(null);
 
-    let res: Response;
-    if (form.mode === 'edit') {
-      const body: UpdateCategoryInput = {
-        title: trimmedTitle,
-        color,
-        is_productive: isProductive,
-        google_calendar_id: googleCalendarId.trim() || null,
-        patterns: bodyPatterns,
-      };
-      res = await fetch(`${API_BASE_URL}/api/categories/${form.category!.id}`, {
-        method: 'PATCH',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-    } else {
-      const body: NewCategoryInput = {
-        title: trimmedTitle,
-        color,
-        is_productive: isProductive,
-        google_calendar_id: googleCalendarId.trim() || null,
-        // Roots carry the target list; children carry no list_id at all (the
-        // service rejects a child with one).
-        list_id: form.list ? form.list.id : null,
-        parent_id: form.parent ? form.parent.id : null,
-        patterns: bodyPatterns,
-      };
-      res = await fetch(`${API_BASE_URL}/api/categories`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-    }
-    if (!res.ok) {
+    try {
+      if (form.mode === 'edit') {
+        const body: UpdateCategoryInput = {
+          title: trimmedTitle,
+          color,
+          is_productive: isProductive,
+          google_calendar_id: googleCalendarId.trim() || null,
+          patterns: bodyPatterns,
+        };
+        await updateCategory(form.category!.id, body);
+      } else {
+        const body: NewCategoryInput = {
+          title: trimmedTitle,
+          color,
+          is_productive: isProductive,
+          google_calendar_id: googleCalendarId.trim() || null,
+          // Roots carry the target list; children carry no list_id at all (the
+          // service rejects a child with one).
+          list_id: form.list ? form.list.id : null,
+          parent_id: form.parent ? form.parent.id : null,
+          patterns: bodyPatterns,
+        };
+        await createCategory(body);
+      }
+    } catch (err) {
       setSaving(false);
-      setFormError(await readError(res));
+      setFormError(err instanceof Error ? err.message : 'Save failed');
       return;
     }
     closeForm();
@@ -281,13 +243,11 @@ export function CategoriesPage() {
     if (!confirmed) return;
 
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/categories/${category.id}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
+    try {
+      await deleteCategory(category.id);
+    } catch (err) {
       // The backend explains 409s (living children, undeletable untracked).
-      setActionError(await readError(res));
+      setActionError(err instanceof Error ? err.message : 'Delete failed');
       return;
     }
     load();

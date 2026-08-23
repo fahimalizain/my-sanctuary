@@ -1,30 +1,9 @@
 // Pure helpers for the Home agenda (ADR 0004 § Surfaces — Home). Date label,
 // add-task picker filter, and the reorder rank math live here so they can be
-// unit-tested without a DOM; `readError` is the page's local copy of the
-// server error envelope (Categories / Routines / board-model each keep their
-// own — this slice does not refactor them to share).
+// unit-tested without a DOM.
 
 import type { AgendaItemRecord, TaskRecord, TaskStatus } from '../../types';
 import { addCivilDays } from '../routines/rrule-preview';
-
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON.
-export async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
 
 const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTH_SHORT = [

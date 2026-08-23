@@ -13,19 +13,16 @@ import {
   useTitleClassification,
   type ClassifyStatus,
 } from '@/app/hooks/useTitleClassification';
-import { buildClassifyUrl } from '@/app/hooks/classify-url';
+import { listCategories, listLists, classifyTask } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import { API_BASE_URL } from '@/lib/api';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
-  type CategoriesResponse,
   type Category,
   type ClassifyResponse,
   type TaskCategorySummary,
   type TaskDifficulty,
   type TaskList,
-  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskStatus,
@@ -96,11 +93,7 @@ async function classifyOnce(
   lock: string | null,
 ): Promise<ClassifyResponse | null> {
   try {
-    const res = await fetch(`${API_BASE_URL}${buildClassifyUrl(text, lock)}`, {
-      credentials: 'include',
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as ClassifyResponse;
+    return await classifyTask(text, lock);
   } catch {
     return null;
   }
@@ -165,20 +158,11 @@ export function TaskModal({
     let cancelled = false;
     setLists([]);
     setCategories([]);
-    void Promise.all([
-      fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' }),
-      fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' }),
-    ])
-      .then(async ([listsRes, catsRes]) => {
+    void Promise.all([listLists(), listCategories()])
+      .then(([listsData, catsData]) => {
         if (cancelled) return;
-        const listsData = listsRes.ok
-          ? ((await listsRes.json()) as TaskListsResponse)
-          : null;
-        const catsData = catsRes.ok
-          ? ((await catsRes.json()) as CategoriesResponse)
-          : null;
-        setLists(listsData?.lists ?? []);
-        setCategories(catsData?.categories ?? []);
+        setLists(listsData.lists ?? []);
+        setCategories(catsData.categories ?? []);
       })
       .catch(() => {
         if (!cancelled) {

@@ -1,12 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { API_BASE_URL } from './api';
+import { getMe, logout as apiLogout, type AuthUser } from './api';
 
-export interface User {
-  id: string;
-  email: string;
-  name: string;
-  picture: string;
-}
+export type User = AuthUser;
 
 interface AuthContextType {
   user: User | null;
@@ -25,9 +20,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    fetch(`${API_BASE_URL}/auth/me`, { credentials: 'include' })
-      .then((res) => res.json())
-      .then((data: { user: User | null }) => {
+    getMe()
+      .then((data) => {
         setUser(data.user);
       })
       .catch(() => setUser(null))
@@ -35,10 +29,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = async () => {
-    await fetch(`${API_BASE_URL}/auth/logout`, {
-      method: 'POST',
-      credentials: 'include',
-    });
+    try {
+      await apiLogout();
+    } catch {
+      // HTTP/network failures still clear the local session.
+    }
     setUser(null);
   };
 

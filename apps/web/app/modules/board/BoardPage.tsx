@@ -16,11 +16,20 @@ import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
-import { API_BASE_URL } from '@/lib/api';
+import {
+  listCategories,
+  listLists,
+  listTasks,
+  createTask,
+  deleteTask,
+  focusTask,
+  moveTask,
+  unfocusTask,
+  updateTask,
+} from '@/lib/api';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
-  type CategoriesResponse,
   type Category,
   type FocusTaskResponse,
   type MoveTaskInput,
@@ -32,8 +41,6 @@ import {
   type TaskRecord,
   type TaskResponse,
   type TaskStatus,
-  type TasksResponse,
-  type UpdateTaskInput,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
 import { CategoryFilter } from './CategoryFilter';
@@ -61,7 +68,6 @@ import {
   TERMINAL_COLUMN_CAP,
   applyOptimisticMove,
   defaultMoveRank,
-  readError,
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
@@ -172,20 +178,12 @@ export function BoardPage() {
     // categories requests must run after it — their computed categories
     // depend on the seeded taxonomy. Tasks and categories are independent of
     // each other and load in parallel (the same seed rule as ListsPage).
-    fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
-      .then(async (listsRes) => {
-        if (!listsRes.ok) throw new Error(await readError(listsRes));
-        const listsData = (await listsRes.json()) as TaskListsResponse;
+    listLists()
+      .then(async (listsData) => {
         setLists(listsData.lists ?? []);
-        const [tasksRes, categoriesRes] = await Promise.all([
-          fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' }),
-          fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' }),
-        ]);
-        if (!tasksRes.ok) throw new Error(await readError(tasksRes));
-        if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
         const [tasksData, categoriesData] = await Promise.all([
-          tasksRes.json() as Promise<TasksResponse>,
-          categoriesRes.json() as Promise<CategoriesResponse>,
+          listTasks(),
+          listCategories(),
         ]);
         setTasks(tasksData.tasks ?? []);
         setCategories(categoriesData.categories ?? []);
@@ -457,19 +455,8 @@ export function BoardPage() {
     setActionError(null);
     setMovingIds((prev) => new Set(prev).add(taskId));
     try {
-      const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const message = await readError(res);
-        setTasks(snapshot);
-        setActionError(message);
-        return message;
-      }
-      onSuccess((await res.json()) as MoveTaskResponse);
+      const data = await moveTask(taskId, body);
+      onSuccess(data);
       return null;
     } catch (err) {
       setTasks(snapshot);
@@ -670,8 +657,7 @@ export function BoardPage() {
    *  - 200 → merge the authoritative `{ task, previous }` rows (onSuccess);
    *  - failure → restore the full snapshot and raise the action banner.
    *  Returns the error message (null on success) so the modal Focus pill can
-   *  show it on the form too. Mirrors sendMoveRequest (API_BASE_URL,
-   *  credentials: 'include', readError). */
+   *  show it on the form too. Mirrors sendMoveRequest. */
   const sendFocusRequest = async (
     isFocus: boolean,
     taskId: string,
@@ -681,22 +667,7 @@ export function BoardPage() {
     setFocusInFlight(true);
     setActionError(null);
     try {
-      const res = isFocus
-        ? await fetch(`${API_BASE_URL}/api/tasks/${taskId}/focus`, {
-            method: 'POST',
-            credentials: 'include',
-          })
-        : await fetch(`${API_BASE_URL}/api/focus`, {
-            method: 'DELETE',
-            credentials: 'include',
-          });
-      if (!res.ok) {
-        const message = await readError(res);
-        setTasks(snapshot);
-        setActionError(message);
-        return message;
-      }
-      onSuccess((await res.json()) as FocusTaskResponse);
+      onSuccess(isFocus ? await focusTask(taskId) : await unfocusTask());
       return null;
     } catch (err) {
       setTasks(snapshot);
@@ -777,7 +748,9 @@ export function BoardPage() {
   }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
-    const body: NewTaskInput | UpdateTaskInput = {
+    // `NewTaskInput` on purpose: create sends the full set, and the edit
+    // PATCH accepts it too (every field optional server-side).
+    const body: NewTaskInput = {
       title: values.title,
       description: values.description,
       duration_minutes: values.durationMinutes,
@@ -787,43 +760,33 @@ export function BoardPage() {
 
     // ── Edit (PATCH) — unchanged: merge the returned task, close.
     if (taskForm.mode === 'edit') {
-      const res = await fetch(
-        `${API_BASE_URL}/api/tasks/${taskForm.task!.id}`,
-        {
-          method: 'PATCH',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        },
-      );
-      if (!res.ok) {
-        return await readError(res);
+      try {
+        const data = await updateTask(taskForm.task!.id, body);
+        setTasks((prev) =>
+          prev.map((entry) =>
+            entry.id === data.task.id ? data.task : entry,
+          ),
+        );
+        closeTaskForm();
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : 'Save failed';
       }
-      const data = (await res.json()) as TaskResponse;
-      setTasks((prev) =>
-        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
-      );
-      closeTaskForm();
-      return null;
     }
 
     // ── Create (POST always stamps OPEN on the server — `createStatus` only
     //    decides whether a follow-up /move is needed, it never goes in the
     //    request body).
-    const createRes = await fetch(`${API_BASE_URL}/api/tasks`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    // Create 400 etc.: return the error, the modal stays open on the form.
-    if (!createRes.ok) {
-      return await readError(createRes);
+    let data: TaskResponse;
+    try {
+      data = await createTask(body);
+    } catch (err) {
+      // Create 400 etc.: return the error, the modal stays open on the form.
+      return err instanceof Error ? err.message : 'Create failed';
     }
     // The response carries the computed category — reuse it directly so the
     // card lands in the right column instantly. The server never returns an
     // untracked result on create (create stays strict).
-    const data = (await createRes.json()) as TaskResponse;
     const dest = taskForm.createStatus ?? 'OPEN';
 
     // Destination is the create status itself: done, no useless same-status
@@ -853,37 +816,22 @@ export function BoardPage() {
       ...prev,
     ]);
 
-    let moveRes: Response;
+    let moveData: MoveTaskResponse;
     try {
-      moveRes = await fetch(`${API_BASE_URL}/api/tasks/${data.task.id}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(moveBody),
-      });
+      moveData = await moveTask(data.task.id, moveBody);
     } catch (err) {
-      // Network failure: restore the pre-move snapshot, then ensure the
-      // created card is present as OPEN/Backlog at the server-assigned
-      // append rank (the orphan stays — the server owns the create, nothing
-      // to undo). Banner, close.
+      // Failure — network or HTTP (401 missing Google token, 400, …):
+      // restore the pre-move snapshot, then ensure the created card is
+      // present as OPEN/Backlog at the server-assigned append rank (the
+      // orphan stays — the server owns the create, nothing to undo).
+      // Banner, close (null closes the modal).
       setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
       const message = err instanceof Error ? err.message : 'Move failed';
       setActionError(message);
       closeTaskForm();
       return null;
     }
-    // Move failure (401 missing Google token, 400, …): restore the full
-    // pre-move snapshot with the created card OPEN at its append rank.
-    // Banner, close (null closes the modal).
-    if (!moveRes.ok) {
-      const message = await readError(moveRes);
-      setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
-      setActionError(message);
-      closeTaskForm();
-      return null;
-    }
     // Move success: merge the authoritative row.
-    const moveData = (await moveRes.json()) as MoveTaskResponse;
     setTasks((prev) =>
       prev.map((entry) =>
         entry.id === moveData.task.id ? moveData.task : entry,
@@ -895,12 +843,10 @@ export function BoardPage() {
 
   const handleTaskDelete = async (taskId: string): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      return await readError(res);
+    try {
+      await deleteTask(taskId);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Delete failed';
     }
     setTasks((prev) => prev.filter((entry) => entry.id !== taskId));
     closeTaskForm();

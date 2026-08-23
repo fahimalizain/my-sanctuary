@@ -8,8 +8,8 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { API_BASE_URL } from '@/lib/api';
-import type { CalendarEvent, CalendarEventsResponse } from '@/app/types';
+import { listCalendarEvents } from '@/lib/api';
+import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 
 const WEEK_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -130,20 +130,12 @@ function useCalendarEvents(viewDate: Date) {
         error: null,
       }));
 
-      const params = new URLSearchParams({
-        time_min: range.timeMin,
-        time_max: range.timeMax,
-      });
-
-      fetch(`${API_BASE_URL}/api/calendar/events?${params}`, {
-        credentials: 'include',
+      listCalendarEvents({
+        timeMin: range.timeMin,
+        timeMax: range.timeMax,
         signal,
       })
-        .then(async (res) => {
-          if (!res.ok) {
-            throw new Error(`Request failed with status ${res.status}`);
-          }
-          const data = (await res.json()) as CalendarEventsResponse;
+        .then((data) => {
           setState({
             events: data.events ?? [],
             isLoading: false,

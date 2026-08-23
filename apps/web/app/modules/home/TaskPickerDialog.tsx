@@ -14,15 +14,11 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
-import { API_BASE_URL } from '@/lib/api';
+import { listTasks } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import type { TaskRecord, TasksResponse } from '../../types';
+import type { TaskRecord } from '../../types';
 import { TASK_PRIORITY_LABELS } from '../../types';
-import {
-  agendaTaskMatches,
-  filterAgendaPickerTasks,
-  readError,
-} from './agenda-helpers';
+import { agendaTaskMatches, filterAgendaPickerTasks } from './agenda-helpers';
 
 interface TaskPickerDialogProps {
   open: boolean;
@@ -59,11 +55,9 @@ export function TaskPickerDialog({
     setPickError(null);
     setIsLoading(true);
     setLoadError(null);
-    fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' })
-      .then(async (res) => {
+    listTasks()
+      .then((data) => {
         if (cancelled) return;
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as TasksResponse;
         setTasks(data.tasks ?? []);
       })
       .catch((err: unknown) => {

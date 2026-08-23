@@ -9,13 +9,17 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { useNavigate } from '@tanstack/react-router';
-import { API_BASE_URL } from '@/lib/api';
+import {
+  createRoutine,
+  deleteRoutine,
+  listRoutines,
+  updateRoutine,
+} from '@/lib/api';
 import { useTitleClassification } from '@/app/hooks/useTitleClassification';
 import type { ClassifyStatus } from '@/app/hooks/useTitleClassification';
 import type {
   NewRoutineInput,
   RoutineRecord,
-  RoutinesResponse,
   UpdateRoutineInput,
 } from '@/app/types';
 import {
@@ -29,25 +33,6 @@ import {
   rruleSummary,
   untilMatchesDtstartTime,
 } from './rrule-preview';
-
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON.
-async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
 
 type WeekdayCode = 'MO' | 'TU' | 'WE' | 'TH' | 'FR' | 'SA' | 'SU';
 const WEEKDAY_CODES: WeekdayCode[] = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
@@ -139,10 +124,8 @@ export function RoutinesPage() {
     // screen never flash the spinner.
     setIsLoading(routinesRef.current.length === 0);
     setLoadError(null);
-    fetch(`${API_BASE_URL}/api/routines`, { credentials: 'include' })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as RoutinesResponse;
+    listRoutines()
+      .then((data) => {
         setRoutines(data.routines ?? []);
       })
       .catch((err: unknown) => {
@@ -383,26 +366,16 @@ export function RoutinesPage() {
       rrule: rruleBlob,
     };
 
-    let res: Response;
-    if (form.mode === 'edit') {
-      // Every field optional — sending the full set is a no-op replace.
-      res = await fetch(`${API_BASE_URL}/api/routines/${form.routine!.id}`, {
-        method: 'PATCH',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload as UpdateRoutineInput),
-      });
-    } else {
-      res = await fetch(`${API_BASE_URL}/api/routines`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-    }
-    if (!res.ok) {
+    try {
+      if (form.mode === 'edit') {
+        // Every field optional — sending the full set is a no-op replace.
+        await updateRoutine(form.routine!.id, payload as UpdateRoutineInput);
+      } else {
+        await createRoutine(payload);
+      }
+    } catch (err) {
       setSaving(false);
-      setFormError(await readError(res));
+      setFormError(err instanceof Error ? err.message : 'Save failed');
       return;
     }
     closeForm();
@@ -414,12 +387,10 @@ export function RoutinesPage() {
     if (!confirmed) return;
 
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/routines/${routine.id}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      setActionError(await readError(res));
+    try {
+      await deleteRoutine(routine.id);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Delete failed');
       return;
     }
     load();

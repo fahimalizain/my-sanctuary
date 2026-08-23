@@ -16,26 +16,6 @@ export type BoardSearch = {
   search?: string; // free-text substring filter over title/description
 };
 
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON. (Copied locally — ListsPage has
-// its own copy and this slice does not refactor it to share.)
-export async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
-
 export interface BoardColumn {
   title: string;
   status: TaskStatus;

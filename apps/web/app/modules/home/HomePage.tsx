@@ -21,33 +21,34 @@ import { FocusTimer } from '@/app/components/FocusTimer';
 import { QuotesSection } from '@/app/components/QuotesSection';
 import { TaskModal } from '@/app/components/TaskModal';
 import { quotes } from '@/app/mock-data';
-import { API_BASE_URL } from '@/lib/api';
+import {
+  createAgendaItem,
+  deleteAgendaItem,
+  deleteTask,
+  getAgenda,
+  moveAgendaItem,
+  moveTask,
+  rescheduleAgendaItem,
+  runTaskAction,
+  skipOccurrence,
+  startOccurrence,
+  completeOccurrence,
+  updateOccurrence,
+  updateTask,
+} from '@/lib/api';
 import { AgendaItemRow } from './AgendaItemRow';
 import { TaskPickerDialog } from './TaskPickerDialog';
 import { addCivilDays } from '@/app/modules/routines/rrule-preview';
-import {
-  agendaDateLabel,
-  agendaMoveTarget,
-  applyAgendaMove,
-  readError,
-} from './agenda-helpers';
+import { agendaDateLabel, agendaMoveTarget, applyAgendaMove } from './agenda-helpers';
 import type {
   AgendaItemRecord,
-  AgendaItemResponse,
-  AgendaResponse,
-  MoveAgendaItemInput,
   MoveTaskInput,
-  MoveTaskResponse,
   NewAgendaItemInput,
-  OccurrenceActionResponse,
   OccurrenceRecord,
-  OccurrenceResponse,
   OccurrenceStatus,
-  RescheduleAgendaItemInput,
   TaskDifficulty,
   TaskPriority,
   TaskRecord,
-  TaskResponse,
   TaskStatus,
   UpdateTaskInput,
 } from '@/app/types';
@@ -101,16 +102,9 @@ export function HomePage() {
     setLoadError(null);
     // First load (no viewed date yet): omit `?date=` so the server reads its
     // own today — the browser never computes the default Home date.
-    const query = requestedDate
-      ? `?date=${encodeURIComponent(requestedDate)}`
-      : '';
-    fetch(`${API_BASE_URL}/api/agenda${query}`, {
-      credentials: 'include',
-    })
-      .then(async (res) => {
+    getAgenda(requestedDate || undefined)
+      .then((data) => {
         if (seq !== loadSeq.current) return; // superseded
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as AgendaResponse;
         // Keep the server's civil today from every GET (ADR 0004 amendment).
         setServerToday(data.today);
         setItems(sortItems(data.items ?? []));
@@ -151,33 +145,18 @@ export function HomePage() {
     // Optimistic paint that mirrors the server's shift exactly.
     setItems(applyAgendaMove(snapshot, itemId, target));
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/agenda/items/${itemId}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sort_order: target,
-        } satisfies MoveAgendaItemInput),
-      });
+      const data = await moveAgendaItem(itemId, { sort_order: target });
+      // Merge the authoritative row (fresh embeds); ranks already match.
+      setItems((prev) =>
+        sortItems(
+          prev.map((entry) => (entry.id === data.item.id ? data.item : entry)),
+        ),
+      );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    // Merge the authoritative row (fresh embeds); ranks already match.
-    const data = (await res.json()) as AgendaItemResponse;
-    setItems((prev) =>
-      sortItems(
-        prev.map((entry) => (entry.id === data.item.id ? data.item : entry)),
-      ),
-    );
   };
 
   // ──────────────────────────────────────────
@@ -198,35 +177,17 @@ export function HomePage() {
     const snapshot = itemsRef.current;
     setItems((prev) => prev.filter((entry) => entry.id !== item.id));
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(
-        `${API_BASE_URL}/api/agenda/items/${item.id}/reschedule`,
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            date: targetDate,
-          } satisfies RescheduleAgendaItemInput),
-        },
-      );
+      const data = await rescheduleAgendaItem(item.id, { date: targetDate });
+      setItems((prev) => {
+        const next = prev.filter((entry) => entry.id !== item.id);
+        if (data.item.local_date === dateRef.current) next.push(data.item);
+        return sortItems(next);
+      });
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as AgendaItemResponse;
-    setItems((prev) => {
-      const next = prev.filter((entry) => entry.id !== item.id);
-      if (data.item.local_date === dateRef.current) next.push(data.item);
-      return sortItems(next);
-    });
   };
 
   // ──────────────────────────────────────────
@@ -247,30 +208,19 @@ export function HomePage() {
       ),
     );
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/tasks/${task.id}/complete`, {
-        method: 'POST',
-        credentials: 'include',
-      });
+      const data = await runTaskAction(task.id, 'complete');
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: data.task }
+            : entry,
+        ),
+      );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Complete failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as MoveTaskResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.task
-          ? { ...entry, task: data.task }
-          : entry,
-      ),
-    );
   };
 
   /** Task → the existing `/start` (Board → In Progress). The FocusTimer is a
@@ -279,28 +229,18 @@ export function HomePage() {
     const task = item.task;
     if (!task) return;
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/tasks/${task.id}/start`, {
-        method: 'POST',
-        credentials: 'include',
-      });
+      const data = await runTaskAction(task.id, 'start');
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: data.task }
+            : entry,
+        ),
+      );
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Start failed');
-      return;
     }
-    if (!res.ok) {
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as MoveTaskResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.task
-          ? { ...entry, task: data.task }
-          : entry,
-      ),
-    );
   };
 
   /** Remove from today = hard-delete the membership row (unpin). The task
@@ -310,20 +250,11 @@ export function HomePage() {
     const snapshot = itemsRef.current;
     setItems((prev) => prev.filter((entry) => entry.id !== item.id));
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/agenda/items/${item.id}`, {
-        method: 'DELETE',
-        credentials: 'include',
-      });
+      await deleteAgendaItem(item.id);
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Remove failed');
-      return;
-    }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
     }
   };
 
@@ -345,30 +276,22 @@ export function HomePage() {
       ),
     );
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(
-        `${API_BASE_URL}/api/occurrences/${occurrence.id}/${verb}`,
-        { method: 'POST', credentials: 'include' },
+      const data =
+        verb === 'complete'
+          ? await completeOccurrence(occurrence.id)
+          : await skipOccurrence(occurrence.id);
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
       );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Update failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as OccurrenceResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.occurrence
-          ? { ...entry, occurrence: data.occurrence }
-          : entry,
-      ),
-    );
   };
 
   /** Occurrence start (slice 6): creates the one-shot Google log and flips
@@ -390,30 +313,19 @@ export function HomePage() {
       ),
     );
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(
-        `${API_BASE_URL}/api/occurrences/${occurrence.id}/start`,
-        { method: 'POST', credentials: 'include' },
+      const data = await startOccurrence(occurrence.id);
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
       );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Start failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as OccurrenceActionResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.occurrence
-          ? { ...entry, occurrence: data.occurrence }
-          : entry,
-      ),
-    );
   };
 
   // ──────────────────────────────────────────
@@ -422,22 +334,19 @@ export function HomePage() {
 
   const handlePickTask = async (task: TaskRecord): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/agenda/items`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    try {
+      // The server appends at max+1 for the date — the sorted insert lands it
+      // at the back of the pile.
+      const data = await createAgendaItem({
         kind: 'task',
         ref_id: task.id,
         date,
-      } satisfies NewAgendaItemInput),
-    });
-    if (!res.ok) return await readError(res);
-    // The server appends at max+1 for the date — the sorted insert lands it
-    // at the back of the pile.
-    const data = (await res.json()) as AgendaItemResponse;
-    setItems((prev) => sortItems([...prev, data.item]));
-    return null;
+      } satisfies NewAgendaItemInput);
+      setItems((prev) => sortItems([...prev, data.item]));
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Add failed';
+    }
   };
 
   // ──────────────────────────────────────────
@@ -461,35 +370,32 @@ export function HomePage() {
   }): Promise<string | null> => {
     if (!taskModal) return null;
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskModal.id}`, {
-      method: 'PATCH',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    try {
+      // Merge the fresh embed straight into the rows (same refresh the
+      // agenda reload would give, without the spinner flash).
+      const data = await updateTask(taskModal.id, {
         title: values.title,
         description: values.description,
         duration_minutes: values.durationMinutes,
         priority: values.priority,
         difficulty: values.difficulty,
-      } satisfies UpdateTaskInput),
-    });
-    if (!res.ok) return await readError(res);
-    // Merge the fresh embed straight into the rows (same refresh the
-    // agenda reload would give, without the spinner flash).
-    const data = (await res.json()) as TaskResponse;
-    mergeTask(data.task);
-    return null; // the modal closes itself on success
+      } satisfies UpdateTaskInput);
+      mergeTask(data.task);
+      return null; // the modal closes itself on success
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Save failed';
+    }
   };
 
   const handleTaskModalDelete = async (
     taskId: string,
   ): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) return await readError(res);
+    try {
+      await deleteTask(taskId);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Delete failed';
+    }
     // The membership row is an orphan after the task dies — the next GET
     // omits it server-side; drop it locally now.
     setItems((prev) => prev.filter((entry) => entry.task?.id !== taskId));
@@ -501,19 +407,16 @@ export function HomePage() {
     status: TaskStatus,
   ): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status } satisfies MoveTaskInput),
-    });
-    if (!res.ok) return await readError(res);
-    const data = (await res.json()) as MoveTaskResponse;
-    mergeTask(data.task);
-    // The modal's status pills read `task.status` from its props — keep the
-    // edited copy fresh so the selection follows the server.
-    setTaskModal((prev) => (prev && prev.id === taskId ? data.task : prev));
-    return null;
+    try {
+      const data = await moveTask(taskId, { status } satisfies MoveTaskInput);
+      mergeTask(data.task);
+      // The modal's status pills read `task.status` from its props — keep the
+      // edited copy fresh so the selection follows the server.
+      setTaskModal((prev) => (prev && prev.id === taskId ? data.task : prev));
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Move failed';
+    }
   };
 
   // ──────────────────────────────────────────
@@ -535,26 +438,23 @@ export function HomePage() {
     if (!renaming) return;
     setRenameSaving(true);
     setRenameError(null);
-    const res = await fetch(`${API_BASE_URL}/api/occurrences/${renaming.id}`, {
-      method: 'PATCH',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+    try {
       // Empty/whitespace clears the override — the day inherits again.
-      body: JSON.stringify({ title: renameTitle.trim() }),
-    });
-    if (!res.ok) {
+      const data = await updateOccurrence(renaming.id, {
+        title: renameTitle.trim(),
+      });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.occurrence && entry.occurrence.id === data.occurrence.id
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
+      );
+    } catch (err) {
       setRenameSaving(false);
-      setRenameError(await readError(res));
+      setRenameError(err instanceof Error ? err.message : 'Save failed');
       return;
     }
-    const data = (await res.json()) as OccurrenceResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.occurrence && entry.occurrence.id === data.occurrence.id
-          ? { ...entry, occurrence: data.occurrence }
-          : entry,
-      ),
-    );
     setRenameSaving(false);
     setRenaming(null);
   };
