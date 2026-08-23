@@ -24,7 +24,7 @@ import { quotes } from '@/app/mock-data';
 import { API_BASE_URL } from '@/lib/api';
 import { AgendaItemRow } from './AgendaItemRow';
 import { TaskPickerDialog } from './TaskPickerDialog';
-import { addCivilDays, civilToday } from '@/app/modules/routines/rrule-preview';
+import { addCivilDays } from '@/app/modules/routines/rrule-preview';
 import {
   agendaDateLabel,
   agendaMoveTarget,
@@ -54,9 +54,14 @@ import type {
 
 export function HomePage() {
   const navigate = useNavigate();
-  // Default date = the browser's civil today (ADR 0004: "today" is the civil
-  // date implied by now; acceptable for v1).
-  const [date, setDate] = useState(civilToday());
+  // The viewed date. Empty until the first load: the server decides "today"
+  // (ADR 0004 amendment — the browser's local date must NOT pick the default
+  // Home date), then the first GET's `today` becomes the viewed date.
+  const [date, setDate] = useState('');
+  // The server's civil today (primary calendar time zone, chrono-tz) —
+  // refreshed from EVERY GET; anchors the header label, the "Today" button,
+  // and the Play gate.
+  const [serverToday, setServerToday] = useState('');
   const [items, setItems] = useState<AgendaItemRecord[]>([]);
   const itemsRef = useRef<AgendaItemRecord[]>([]);
   itemsRef.current = items;
@@ -94,15 +99,23 @@ export function HomePage() {
     // rows are on screen never flash the spinner.
     setIsLoading(itemsRef.current.length === 0);
     setLoadError(null);
-    fetch(
-      `${API_BASE_URL}/api/agenda?date=${encodeURIComponent(requestedDate)}`,
-      { credentials: 'include' },
-    )
+    // First load (no viewed date yet): omit `?date=` so the server reads its
+    // own today — the browser never computes the default Home date.
+    const query = requestedDate
+      ? `?date=${encodeURIComponent(requestedDate)}`
+      : '';
+    fetch(`${API_BASE_URL}/api/agenda${query}`, {
+      credentials: 'include',
+    })
       .then(async (res) => {
         if (seq !== loadSeq.current) return; // superseded
         if (!res.ok) throw new Error(await readError(res));
         const data = (await res.json()) as AgendaResponse;
+        // Keep the server's civil today from every GET (ADR 0004 amendment).
+        setServerToday(data.today);
         setItems(sortItems(data.items ?? []));
+        // The first load adopts the server's today as the viewed date.
+        if (!requestedDate) setDate(data.today);
       })
       .catch((err: unknown) => {
         if (seq !== loadSeq.current) return; // superseded
@@ -547,8 +560,11 @@ export function HomePage() {
   // Render
   // ──────────────────────────────────────────
 
-  const dateLabel = agendaDateLabel(date, civilToday());
-  const isToday = date === civilToday();
+  // Header + Play gate anchor on the SERVER's civil today (ADR 0004
+  // amendment) — never the browser's local date. Before the first load both
+  // are empty and the label reads "Today" with no rows on screen.
+  const dateLabel = agendaDateLabel(date || serverToday, serverToday);
+  const isToday = !!serverToday && (date || serverToday) === serverToday;
   const excludedTaskIds = new Set(
     items
       .filter((entry) => entry.kind === 'task' && entry.task)
@@ -612,7 +628,7 @@ export function HomePage() {
               </Button>
               <Button
                 variant="outline"
-                onClick={() => changeDate(civilToday())}
+                onClick={() => changeDate(serverToday)}
                 className="border-input text-foreground hover:bg-muted"
               >
                 Today

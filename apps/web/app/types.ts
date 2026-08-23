@@ -451,9 +451,18 @@ export interface AgendaItemRecord {
   occurrence: OccurrenceRecord | null;
 }
 
-// The envelope returned by GET /api/agenda?date=YYYY-MM-DD (seeds on read).
+// The envelope returned by GET /api/agenda?date=YYYY-MM-DD (seeds on read;
+// the date query is optional — missing/blank = civil today). `today` +
+// `time_zone` are the server's civil today (ADR 0004 amendment): the civil
+// date of now in the user's primary Google calendar's IANA `time_zone` —
+// the browser must never compute "today" itself.
 export interface AgendaResponse {
   items: AgendaItemRecord[];
+  // YYYY-MM-DD — civil today in `time_zone`; Home's "Today" anchor.
+  today: string;
+  // IANA name of the zone that produced `today` (the primary calendar's
+  // `time_zone`, or "UTC" when the user has no primary calendar).
+  time_zone: string;
 }
 
 // The envelope returned by POST /api/agenda/items,
