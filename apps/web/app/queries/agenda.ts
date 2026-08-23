@@ -63,7 +63,9 @@ export function setAgendaItems(
 // the optimistic paint and merges the authoritative row on success — the
 // `date` passed alongside the input is only used for the cancel.
 
-async function cancelAgendaQuery(date: string): Promise<void> {
+// Shared with occurrences.ts — occurrence mutations cancel the agenda query
+// of the viewed date.
+export async function cancelAgendaQuery(date: string): Promise<void> {
   await queryClient.cancelQueries({
     queryKey: queryKeys.agenda.byDate(date || undefined),
   });
