@@ -109,7 +109,7 @@ pub use session::{
     SESSION_DURATION_SECS,
 };
 pub use time::{
-    ceil_5min_unix_in_zone, civil_date_in_offset, nearest_minute_unix, rfc3339_to_unix_secs,
-    unix_secs_to_rfc3339,
+    ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, parse_iana_tz,
+    rfc3339_to_unix_secs, unix_secs_to_rfc3339,
 };
 pub use token::{refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS};

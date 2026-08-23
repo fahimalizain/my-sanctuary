@@ -10,11 +10,11 @@
 //! refreshes tokens, and maps errors to HTTP responses.
 //!
 //! Status map: 401 unauthorized (missing session, or a Google-touching verb
-//! without a refreshable token), 400 invalid input (missing/invalid date,
-//! malformed body, non-task kind, terminal/foreign task, DELETE on an
-//! occurrence item, empty PATCH body, negative rank, start on a non-today or
-//! terminal occurrence, reschedule of an in_progress/done occurrence or onto
-//! a date already holding the routine, no writable calendar), 404 "not found"
+//! without a refreshable token), 400 invalid input (invalid date, malformed
+//! body, non-task kind, terminal/foreign task, DELETE on an occurrence item,
+//! empty PATCH body, negative rank, start on a non-today or terminal
+//! occurrence, reschedule of an in_progress/done occurrence or onto a date
+//! already holding the routine, no writable calendar), 404 "not found"
 //! (missing/other-user/soft-deleted task, occurrence, item, or routine —
 //! existence is never leaked), 502 Google write failure, 500 logged database
 //! errors.
@@ -189,11 +189,15 @@ async fn focused_task_id(
         .and_then(|row| row.focused_task_id)
 }
 
-/// `GET /api/agenda?date=YYYY-MM-DD` → 200 `{"items":[...]}`.
+/// `GET /api/agenda?date=YYYY-MM-DD` → 200
+/// `{"items":[...],"today":"YYYY-MM-DD","time_zone":"IANA"}`.
 ///
-/// Seeds on read (living routines whose rule covers the date get their
-/// occurrence + membership ensured), then returns the mixed pile with
-/// embedded task views / occurrence views.
+/// The `date` query is **optional** (missing/blank = civil today — the
+/// primary calendar's IANA `time_zone` via chrono-tz, ADR 0004 amendment);
+/// Home's first load omits it so the server decides "today". Seeds on read
+/// (living routines whose rule covers the date get their occurrence +
+/// membership ensured), then returns the mixed pile with embedded task views
+/// / occurrence views plus the server-computed `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
@@ -203,11 +207,13 @@ pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>
         url.query_pairs()
             .find(|(key, _)| key == "date")
             .map(|(_, value)| value.into_owned())
-            .unwrap_or_default()
+            .filter(|value| !value.is_empty())
     };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let focused_task_id = focused_task_id(&ctx, &user.id).await;
 
     match api_core::get_agenda(
+        &calendars_d1(&ctx)?,
         &lists_d1(&ctx)?,
         &categories_d1(&ctx)?,
         &routines_d1(&ctx)?,
@@ -215,7 +221,8 @@ pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>
         &agenda_d1(&ctx)?,
         &tasks_d1(&ctx)?,
         &user.id,
-        &date,
+        date.as_deref(),
+        now_unix,
         focused_task_id.as_deref(),
     )
     .await

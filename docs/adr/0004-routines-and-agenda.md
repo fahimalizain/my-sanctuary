@@ -27,6 +27,25 @@ Date: 2026-08-23
 > reschedule relocates a slot, while Add-task still clones onto another day.
 > § Agenda rules and the API table are amended.
 
+> Amendment (2026-08-23): there is **one civil "today" per user** — the civil
+> date of `now` in the **primary Google calendar's IANA `time_zone`**,
+> resolved through **chrono-tz** (the full tzdb; the three-row
+> `resolve_tz_offset` table in `packages/api-core/src/time.rs` is deleted,
+> and **no hardcoded Kolkata anywhere**). **Travel = home base**: a user
+> whose primary calendar says `Asia/Kolkata` stays on Kolkata time abroad —
+> the hotel's timezone never moves today. `GET /api/agenda` returns
+> `today` + `time_zone` alongside `items`; the `date` query is **optional**
+> (missing/blank = today). Occurrence start gates on the **same**
+> `user_today` (agenda membership on that date) — not a hardcoded zone.
+> The browser never computes today: Home's first load **omits `date`**, and
+> the server's `today` anchors the header label, the "Today" button, and the
+> Play gate (the date picker may still open any date, including the
+> browser-local one). `ceil_5min_unix_in_zone` (the elongate cron) is
+> chrono-tz too: local wall-clock ceil, DST-aware; a fold resolves
+> `.single()` else `.earliest()`. Unknown/empty IANA → UTC.
+> § Expansion semantics / Agenda rules (Start) / Surfaces (Home) / API /
+> Residual risk are amended.
+
 ## Context
 
 Sanctuary **Tasks** (ADR 0002) are a finite work queue: five columns, a timer, and the status machine `OPEN | PLANNED | IN_PROGRESS | COMPLETED | DISCARDED`. Completing a task means the item is finished — the queue is supposed to drain.

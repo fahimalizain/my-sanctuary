@@ -56,7 +56,8 @@
 //!   exits) before the status flip; a Google 404 still flips. Without ids
 //!   (or with `http`/`access` `None`) the flip is session-only.
 //! - `/start` is **agenda-today-only** (this occurrence has an agenda item
-//!   whose `local_date` is the civil date of now in Asia/Kolkata — NOT
+//!   whose `local_date` is the user's ONE civil today — the primary Google
+//!   calendar's IANA `time_zone` via chrono-tz, never a hardcoded zone; NOT
 //!   `occurrence.local_date`, which is the rule date) and `pending`-only: it
 //!   creates the one-shot Google log
 //!   (summary = the **resolved** title, carriers
@@ -100,7 +101,7 @@ use crate::repo::{
 use crate::routines::occurrence_dates;
 use crate::tasks::{ElongateReport, START_EVENT_MINUTES, TaskCategorySummary, TaskView};
 use crate::time::{
-    ceil_5min_unix_in_zone, civil_date_in_offset, nearest_minute_unix, rfc3339_to_unix_secs,
+    ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, rfc3339_to_unix_secs,
     unix_secs_to_rfc3339,
 };
 use crate::token::{refresh_if_needed, GoogleAccess};
@@ -160,10 +161,18 @@ impl From<crate::categories::CategoriesError> for AgendaError {
     }
 }
 
-/// Response envelope for `GET /api/agenda?date=…`.
+/// Response envelope for `GET /api/agenda` — the mixed pile plus the
+/// server-computed civil today (ADR 0004 amendment): `today` is the civil
+/// date of now in the user's primary calendar `time_zone` (chrono-tz), the
+/// Home anchor the browser must not compute itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgendaResponse {
     pub items: Vec<AgendaItemView>,
+    /// `YYYY-MM-DD` — civil today in `time_zone`.
+    pub today: String,
+    /// IANA name of the zone that produced `today` (the primary calendar's
+    /// `time_zone`, or `UTC` when the user has no primary calendar).
+    pub time_zone: String,
 }
 
 /// Response envelope for `POST /api/agenda/items` and
@@ -251,7 +260,34 @@ pub struct OccurrenceView {
 // GET /api/agenda — ensure-for-date, seed, respond
 // ──────────────────────────────────────────
 
-/// `GET /api/agenda?date=YYYY-MM-DD` → `{"items":[…]}`.
+/// The user's **one civil today** (ADR 0004 amendment): the civil date of
+/// `now_unix` in the **primary Google calendar's IANA `time_zone`**
+/// (chrono-tz, DST-aware), plus that zone name. No primary calendar (or no
+/// calendars at all) → UTC. "Travel = home base": the primary calendar is the
+/// user's home zone — the hotel's timezone never moves today, and no zone is
+/// ever hardcoded.
+async fn user_today(
+    calendars: &dyn CalendarRepo,
+    user_id: &str,
+    now_unix: i64,
+) -> Result<(String, String), AgendaError> {
+    let time_zone = calendars
+        .list_by_user_id(user_id)
+        .await?
+        .into_iter()
+        .find(|cal| cal.is_primary)
+        .map(|cal| cal.time_zone)
+        .unwrap_or_else(|| "UTC".to_string());
+    let date = civil_date_in_zone(now_unix, &time_zone);
+    Ok((date, time_zone))
+}
+
+/// `GET /api/agenda?date=YYYY-MM-DD` → `{"items":[…],"today":…,"time_zone":…}`.
+///
+/// The `date` query is **optional**: missing/blank reads civil today (the
+/// primary calendar's IANA `time_zone` via chrono-tz) — Home's first load
+/// omits `date` so the server decides "today". The response carries that
+/// `today` + `time_zone` back for the browser to anchor on.
 ///
 /// Seeds on read (ADR 0004 amendment): every living routine whose rule covers
 /// `date` gets its occurrence ensured (idempotent). The membership row is
@@ -265,6 +301,7 @@ pub struct OccurrenceView {
 /// it only paints the embedded tasks' `focused` flag (reads never write the
 /// users row), the same contract as `tasks::list_tasks`.
 pub async fn get_agenda(
+    calendars: &dyn CalendarRepo,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     routine_repo: &dyn RoutineRepo,
@@ -272,10 +309,15 @@ pub async fn get_agenda(
     agenda_repo: &dyn AgendaItemRepo,
     task_repo: &dyn TaskRepo,
     user_id: &str,
-    date: &str,
+    date: Option<&str>,
+    now_unix: i64,
     focused_task_id: Option<&str>,
 ) -> Result<AgendaResponse, AgendaError> {
-    let date = parse_date(date)?;
+    let (today, time_zone) = user_today(calendars, user_id, now_unix).await?;
+    let date = match date.map(str::trim) {
+        Some(date) if !date.is_empty() => parse_date(date)?,
+        _ => today.clone(),
+    };
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
 
     // Living routines in standing order — the seed order.
@@ -335,7 +377,11 @@ pub async fn get_agenda(
             views.push(view);
         }
     }
-    Ok(AgendaResponse { items: views })
+    Ok(AgendaResponse {
+        items: views,
+        today,
+        time_zone,
+    })
 }
 
 // ──────────────────────────────────────────
@@ -845,13 +891,14 @@ pub async fn patch_occurrence(
 /// Verb matrix (locked): `pending` → start; `in_progress` → **200 no-op**
 /// (no second event); `done`/`skipped` → 400. Start is valid only when this
 /// occurrence has an **agenda item whose `local_date` is civil today** — the
-/// civil date of `now_unix` in `Asia/Kolkata` (production TZ, already in the
-/// locked offset table); otherwise 400. The gate is agenda membership, NOT
-/// `occurrence.local_date`: a reschedule moves the item (and the plan) to
-/// another day while the occurrence keeps its rule date, so "today" is where
-/// the item sits. Missing / other-user / soft-deleted-routine → 404. No
-/// writable calendar → 400. Focus stays task-only: `sanctuary_focus` is never
-/// set here.
+/// user's ONE today: the civil date of `now_unix` in the **primary Google
+/// calendar's IANA `time_zone`** (chrono-tz, ADR 0004 amendment — travel =
+/// home base, never a hardcoded zone); otherwise 400. The gate is agenda
+/// membership, NOT `occurrence.local_date`: a reschedule moves the item (and
+/// the plan) to another day while the occurrence keeps its rule date, so
+/// "today" is where the item sits. Missing / other-user / soft-deleted-routine
+/// → 404. No writable calendar → 400. Focus stays task-only:
+/// `sanctuary_focus` is never set here.
 pub async fn start_occurrence(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -887,11 +934,13 @@ pub async fn start_occurrence(
             status = occurrence.status
         )));
     }
-    // Agenda-today only (ADR 0004 amendment): the production offset table
-    // decides the civil date, and the occurrence must be SCHEDULED there —
-    // i.e. its agenda item sits on that date. `occurrence.local_date` is the
-    // rule date and says nothing about where the item was rescheduled to.
-    let today = civil_date_in_offset(now_unix, "Asia/Kolkata");
+    // Agenda-today only (ADR 0004 amendment): the user's ONE civil today —
+    // the primary Google calendar's IANA time_zone via chrono-tz (travel =
+    // home base), never a hardcoded zone — and the occurrence must be
+    // SCHEDULED there — i.e. its agenda item sits on that date.
+    // `occurrence.local_date` is the rule date and says nothing about where
+    // the item was rescheduled to.
+    let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
     if agenda_repo
         .get_by_key(user_id, &today, AGENDA_KIND_OCCURRENCE, &occurrence.id)
         .await?
@@ -2862,6 +2911,7 @@ mod tests {
         occurrences: FakeOccurrenceRepo,
         agenda: FakeAgendaItemRepo,
         tasks: FakeTaskRepo,
+        calendars: FakeCalendarRepo,
     }
 
     fn repos() -> Repos {
@@ -2872,6 +2922,10 @@ mod tests {
             occurrences: FakeOccurrenceRepo::new(),
             agenda: FakeAgendaItemRepo::new(),
             tasks: FakeTaskRepo::new(),
+            // The fake primary calendar is UTC (ADR 0004 amendment: the
+            // primary calendar's time_zone decides today) — tests that need
+            // another zone swap `repos.calendars` for their own fixture.
+            calendars: FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]),
         }
     }
 
@@ -2903,6 +2957,7 @@ mod tests {
 
     fn get(repos: &Repos, user_id: &str, date: &str) -> Result<AgendaResponse, AgendaError> {
         pollster::block_on(get_agenda(
+            &repos.calendars,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -2910,7 +2965,27 @@ mod tests {
             &repos.agenda,
             &repos.tasks,
             user_id,
-            date,
+            Some(date),
+            NOW_UNIX,
+            None,
+        ))
+    }
+
+    /// `GET /api/agenda` with the `date` query **omitted** — the server reads
+    /// civil today (the fake primary calendar is UTC, so `NOW_UNIX` is
+    /// `2026-08-23`).
+    fn get_default(repos: &Repos, user_id: &str) -> Result<AgendaResponse, AgendaError> {
+        pollster::block_on(get_agenda(
+            &repos.calendars,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.tasks,
+            user_id,
+            None,
+            NOW_UNIX,
             None,
         ))
     }
@@ -3020,9 +3095,10 @@ mod tests {
     // Google fixtures (slice 6)
     // ──────────────────────────────────────────
 
-    /// `2026-08-23T10:00:00Z` — its civil date is `2026-08-23` in both UTC
-    /// and Asia/Kolkata, so occurrence `local_date` fixtures of `2026-08-23`
-    /// pass the start's today-only gate.
+    /// `2026-08-23T10:00:00Z` — its civil date is `2026-08-23` in UTC (the
+    /// fake primary calendar's zone) and in Asia/Kolkata, so occurrence
+    /// `local_date` fixtures of `2026-08-23` pass the start's today-only
+    /// gate against the default fixtures.
     const NOW_UNIX: i64 = 1_787_479_200;
 
     fn access() -> GoogleAccess {
@@ -3032,7 +3108,9 @@ mod tests {
         }
     }
 
-    /// A writable primary calendar for `u-1` — the default start target.
+    /// A writable primary calendar for `u-1` — the default start target. Its
+    /// `time_zone` is UTC, so `NOW_UNIX` reads as `2026-08-23` (ADR 0004
+    /// amendment: the primary calendar's zone decides civil today).
     fn calendar(google_cal_id: &str, is_primary: bool) -> GoogleCalendar {
         GoogleCalendar {
             id: format!("cal-{google_cal_id}"),
@@ -3177,11 +3255,9 @@ mod tests {
     // ──────────────────────────────────────────
 
     #[test]
-    fn get_agenda_rejects_missing_or_invalid_date() {
+    fn get_agenda_rejects_invalid_dates() {
         let repos = repos();
         for bad in [
-            "",
-            "   ",
             "2026-13-01",
             "2026-00-10",
             "23-08-2026",
@@ -3194,6 +3270,79 @@ mod tests {
                 "{err:?} for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn get_agenda_without_date_reads_today_and_returns_today_and_time_zone() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+
+        // Omitted date → today's pile (2026-08-23 in the UTC primary calendar
+        // at NOW_UNIX), and the response carries today + time_zone for Home.
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.items.len(), 1, "today's routine seeded");
+        assert_eq!(response.today, "2026-08-23");
+        assert_eq!(response.time_zone, "UTC");
+        // Blank date means today too (ADR 0004 amendment: missing/blank = today).
+        assert_eq!(get(&repos, "u-1", "").unwrap().today, "2026-08-23");
+        assert_eq!(get(&repos, "u-1", "   ").unwrap().today, "2026-08-23");
+    }
+
+    #[test]
+    fn get_agenda_today_follows_the_primary_calendar_tz_only() {
+        let mut repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        // Late UTC evening: New York is still on the 23rd (18:30 EDT), Kolkata
+        // is already on the 24th (04:00+05:30). "Travel = home base" — the
+        // PRIMARY calendar's zone wins, and a named calendar's zone never
+        // moves today.
+        let evening = rfc3339_to_unix_secs("2026-08-23T22:30:00Z").unwrap();
+        repos.calendars = FakeCalendarRepo::with(vec![
+            GoogleCalendar {
+                time_zone: "Asia/Kolkata".to_string(),
+                ..calendar("named@example.com", false)
+            },
+            GoogleCalendar {
+                time_zone: "America/New_York".to_string(),
+                ..calendar("primary@example.com", true)
+            },
+        ]);
+
+        let response = pollster::block_on(get_agenda(
+            &repos.calendars,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.tasks,
+            "u-1",
+            None,
+            evening,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(response.today, "2026-08-23", "New York, not Kolkata");
+        assert_eq!(response.time_zone, "America/New_York");
+
+        // No primary calendar at all → UTC fallback.
+        repos.calendars = FakeCalendarRepo::with(vec![calendar("named@example.com", false)]);
+        let fallback = pollster::block_on(get_agenda(
+            &repos.calendars,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.tasks,
+            "u-1",
+            None,
+            evening,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(fallback.today, "2026-08-23", "UTC fallback");
+        assert_eq!(fallback.time_zone, "UTC");
     }
 
     #[test]
@@ -4222,6 +4371,7 @@ mod tests {
         repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "IN_PROGRESS"));
         let item = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
         let focused = pollster::block_on(get_agenda(
+            &repos.calendars,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -4229,7 +4379,8 @@ mod tests {
             &repos.agenda,
             &repos.tasks,
             "u-1",
-            "2026-08-23",
+            Some("2026-08-23"),
+            NOW_UNIX,
             Some("t-1"),
         ))
         .unwrap();
@@ -4387,6 +4538,74 @@ mod tests {
                 "{err:?} from {status}"
             );
         }
+    }
+
+    #[test]
+    fn start_gate_follows_the_primary_calendar_tz_not_kolkata() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+        // Late UTC evening: Kolkata is already on the 24th (04:00+05:30),
+        // New York is still on the 23rd (18:30 EDT). The gate is the PRIMARY
+        // calendar's zone — "travel = home base" — so the 23rd item starts
+        // from New York but not from Kolkata, and no zone is hardcoded.
+        let evening = rfc3339_to_unix_secs("2026-08-23T22:30:00Z").unwrap();
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_occurrence_json("rt-1", "occ-1", "2026-08-23T22:30:00Z", "2026-08-23T22:45:00Z"),
+        )]);
+        let events = FakeEventRepo::new();
+
+        // Kolkata primary: today is the 24th — the 23rd item cannot start.
+        let kolkata = FakeCalendarRepo::with(vec![GoogleCalendar {
+            time_zone: "Asia/Kolkata".to_string(),
+            ..calendar("primary@example.com", true)
+        }]);
+        let err = pollster::block_on(start_occurrence(
+            &http,
+            &kolkata,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &access(),
+            "u-1",
+            "occ-1",
+            evening,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "occurrence can only be started on a day it is scheduled"),
+            "{err:?}"
+        );
+
+        // Same instant, New York primary: today is still the 23rd — starts.
+        let ny = FakeCalendarRepo::with(vec![GoogleCalendar {
+            time_zone: "America/New_York".to_string(),
+            ..calendar("primary@example.com", true)
+        }]);
+        let response = pollster::block_on(start_occurrence(
+            &http,
+            &ny,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &access(),
+            "u-1",
+            "occ-1",
+            evening,
+        ))
+        .unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_IN_PROGRESS);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.calendar_id.as_deref(), Some("cal-primary@example.com"));
     }
 
     #[test]
