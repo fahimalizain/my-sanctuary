@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Task,
-    TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTask, UpdateTaskCategory,
-    UpdateTaskList, User, WatchChannel, NewWatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewRoutine,
+    NewTask, NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
+    Routine, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine,
+    UpdateTask, UpdateTaskCategory, UpdateTaskList, User, WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -339,6 +339,36 @@ pub trait TaskRepo: Send + Sync {
     ) -> Result<Option<i64>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+}
+
+/// Routine persistence (`routines` rows, ADR 0004).
+///
+/// All deletes are SOFT — the routine is the domain entity, and materialized
+/// `routine_occurrences` are never touched by it. Reads filter
+/// `deleted_at IS NULL`; a missing/soft-deleted/other-user routine is a 404 at
+/// the service layer (ownership checked on the loaded row, like tasks).
+#[async_trait(?Send)]
+pub trait RoutineRepo: Send + Sync {
+    /// The user's living routines, ordered by standing `sort_order` then
+    /// creation time (the agenda seed order).
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Routine>, RepoError>;
+    /// Returns the routine with local `id`, or `None` when absent or
+    /// soft-deleted. NOT user-scoped; callers must verify `row.user_id` (the
+    /// service does).
+    async fn get_by_id(&self, id: &str) -> Result<Option<Routine>, RepoError>;
+    /// Inserts a new routine and returns the stored row. The D1 implementation
+    /// generates the UUID `id` and the `created_at`/`updated_at` timestamps.
+    async fn insert(&self, routine: NewRoutine) -> Result<Routine, RepoError>;
+    /// Updates `title`/`estimated_minutes`/`dtstart`/`rrule`/`exdates`/
+    /// `sort_order` on a living routine (`None` fields are left unchanged) and
+    /// returns the updated row, or `None` when the routine is missing or
+    /// soft-deleted.
+    async fn update(&self, id: &str, updates: &UpdateRoutine) -> Result<Option<Routine>, RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339`.
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Highest living `sort_order` for the user's routines, or `None` when the
+    /// pile is empty. Used by `create_routine` to append: `max+1`, else 0.
+    async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
 }
 
 /// Task audit-trail persistence (`task_logs` rows).
@@ -919,6 +949,58 @@ pub const WATCH_CHANNEL_DELETE_BY_ID_SQL: &str =
 pub const WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL: &str =
     "DELETE FROM google_calendars_watch_channels WHERE calendar_id = ?";
 
+// ──────────────────────────────────────────
+// Routine SQL (ADR 0004)
+// ──────────────────────────────────────────
+
+/// Living routines for the user in standing order (`sort_order`, ties by
+/// creation time) — the agenda seed order.
+pub const ROUTINE_LIST_BY_USER_ID_SQL: &str =
+    "SELECT * FROM routines WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC";
+
+pub const ROUTINE_GET_BY_ID_SQL: &str =
+    "SELECT * FROM routines WHERE id = ? AND deleted_at IS NULL";
+
+/// Plain INSERT (no `ON CONFLICT`): routines are user-authored, never upserted.
+/// The D1 implementation binds the UUID `id` and the timestamps; `exdates`
+/// arrives as JSON array text (`'[]'` when empty).
+pub const ROUTINE_INSERT_SQL: &str = "
+    INSERT INTO routines
+        (id, user_id, title, estimated_minutes, dtstart, rrule, exdates, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). Rule
+/// changes never touch materialized occurrences — they only affect future
+/// ensure. The D1 implementation binds `D1Type::Null` for `None` fields and
+/// serializes a present `exdates` Vec to its JSON text.
+pub const ROUTINE_UPDATE_SQL: &str = "
+    UPDATE routines SET
+        title = COALESCE(?, title),
+        estimated_minutes = COALESCE(?, estimated_minutes),
+        dtstart = COALESCE(?, dtstart),
+        rrule = COALESCE(?, rrule),
+        exdates = COALESCE(?, exdates),
+        sort_order = COALESCE(?, sort_order),
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
+/// Materialized `routine_occurrences` are NOT touched.
+pub const ROUTINE_DELETE_SQL: &str =
+    "UPDATE routines SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// The highest living standing rank — the append target behind
+/// `create_routine` (`max + 1`, or 0 on an empty pile). `LIMIT 1` over `MAX()`
+/// so an empty pile reads as `None` via `first()`.
+pub const ROUTINE_MAX_SORT_ORDER_SQL: &str = "
+    SELECT sort_order FROM routines
+    WHERE user_id = ? AND deleted_at IS NULL
+    ORDER BY sort_order DESC
+    LIMIT 1
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1497,5 +1579,65 @@ mod tests {
         assert!(sql.contains("calendar_id = ?"), "{sql}");
         assert!(sql.contains("google_event_id = ?"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn routine_reads_filter_soft_deleted_rows_and_order_by_standing_sort() {
+        assert!(ROUTINE_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", ROUTINE_LIST_BY_USER_ID_SQL);
+        let order_start = ROUTINE_LIST_BY_USER_ID_SQL
+            .find("ORDER BY")
+            .expect("has ORDER BY");
+        assert_eq!(
+            &ROUTINE_LIST_BY_USER_ID_SQL[order_start..],
+            "ORDER BY sort_order ASC, created_at ASC"
+        );
+        assert!(ROUTINE_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", ROUTINE_GET_BY_ID_SQL);
+    }
+
+    #[test]
+    fn routine_insert_binds_all_10_columns() {
+        assert!(ROUTINE_INSERT_SQL.contains("INSERT INTO routines"), "{}", ROUTINE_INSERT_SQL);
+        assert!(!ROUTINE_INSERT_SQL.contains("ON CONFLICT"), "{}", ROUTINE_INSERT_SQL);
+        assert_eq!(
+            ROUTINE_INSERT_SQL.matches('?').count(),
+            10,
+            "one placeholder per column: {}",
+            ROUTINE_INSERT_SQL
+        );
+        for column in [
+            "id", "user_id", "title", "estimated_minutes", "dtstart", "rrule",
+            "exdates", "sort_order", "created_at", "updated_at",
+        ] {
+            assert!(ROUTINE_INSERT_SQL.contains(column), "missing {column}");
+        }
+    }
+
+    #[test]
+    fn routine_update_uses_coalesce_for_partial_updates() {
+        let sql = ROUTINE_UPDATE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("COALESCE(?, title)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, estimated_minutes)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, dtstart)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, rrule)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, exdates)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, sort_order)"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn routine_delete_is_soft_not_hard() {
+        assert!(ROUTINE_DELETE_SQL.starts_with("UPDATE"), "{}", ROUTINE_DELETE_SQL);
+        assert!(ROUTINE_DELETE_SQL.contains("SET deleted_at = ?"), "{}", ROUTINE_DELETE_SQL);
+        assert!(!ROUTINE_DELETE_SQL.contains("DELETE FROM"), "{}", ROUTINE_DELETE_SQL);
+    }
+
+    #[test]
+    fn routine_max_sort_order_scopes_to_living_user_rows() {
+        let sql = ROUTINE_MAX_SORT_ORDER_SQL;
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("ORDER BY sort_order DESC"), "{sql}");
+        assert!(sql.contains("LIMIT 1"), "{sql}");
     }
 }

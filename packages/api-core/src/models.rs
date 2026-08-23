@@ -574,6 +574,87 @@ pub struct UpdateTask {
     pub difficulty: Option<String>,
 }
 
+// ──────────────────────────────────────────
+// Routines (ADR 0004)
+// ──────────────────────────────────────────
+
+/// A routine (ADR 0004): a standing definition of repeated work. Never
+/// completable, never on the Board. Doubles as the D1 row projection AND the
+/// stored-shape payload (the HTTP view is [`crate::routines::RoutineView`],
+/// which swaps `exdates` for a parsed array and adds the computed category).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Routine {
+    pub id: String,
+    pub user_id: String,
+    pub title: String,
+    /// Planned estimate in minutes; service enforces `>= 1` (default 15).
+    /// Deliberately NOT `duration_minutes` — that stays the task column.
+    pub estimated_minutes: i64,
+    /// Naive **local civil** datetime `YYYY-MM-DDTHH:MM:SS` — no offset, no Z.
+    pub dtstart: String,
+    /// RFC 5545 RRULE **body** (`FREQ=DAILY;INTERVAL=1`) — never prefixed with
+    /// `DTSTART:`, never sent to Google.
+    pub rrule: String,
+    /// JSON array text of local `YYYY-MM-DD` strings; `'[]'` when empty.
+    pub exdates: String,
+    /// Per-user standing rank (agenda seeding order). Not unique per title —
+    /// titles are not unique either.
+    pub sort_order: i64,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+    /// Soft-delete marker; reads filter on `deleted_at IS NULL`. Materialized
+    /// occurrences are NOT deleted with the routine.
+    pub deleted_at: Option<String>,
+}
+
+/// Insert input for [`crate::repo::RoutineRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the `created_at`/`updated_at`
+/// timestamps; `exdates_json` arrives already serialized (`"[]"` when empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRoutine {
+    pub user_id: String,
+    pub title: String,
+    pub estimated_minutes: i64,
+    pub dtstart: String,
+    pub rrule: String,
+    pub exdates_json: String,
+    /// Standing rank; `create_routine` passes the append rank
+    /// (`max(sort_order)+1`, or 0 when the pile is empty).
+    pub sort_order: i64,
+}
+
+/// Request body for `POST /api/routines`. `estimated_minutes` defaults to 15
+/// server-side; `exdates` defaults to `[]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewRoutineInput {
+    pub title: String,
+    #[serde(default)]
+    pub estimated_minutes: Option<i64>,
+    /// Naive local civil datetime `YYYY-MM-DDTHH:MM:SS`.
+    pub dtstart: String,
+    /// RFC 5545 RRULE body (`FREQ=…`), validated on create.
+    pub rrule: String,
+    #[serde(default)]
+    pub exdates: Option<Vec<String>>,
+}
+
+/// Update input for [`crate::repo::RoutineRepo::update`] (`PATCH
+/// /api/routines/:id`). `None` fields are left unchanged; the service rejects
+/// a body where every field is `None` (400 "nothing to update"). Rule changes
+/// never touch materialized occurrences — they only affect future ensure.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateRoutine {
+    pub title: Option<String>,
+    pub estimated_minutes: Option<i64>,
+    pub dtstart: Option<String>,
+    pub rrule: Option<String>,
+    /// Replacement exclusion dates (whole-set replace, like patterns).
+    pub exdates: Option<Vec<String>>,
+    pub sort_order: Option<i64>,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike

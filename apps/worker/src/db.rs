@@ -12,21 +12,23 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
-    NewWatchChannel, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTask,
-    UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
+    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewRoutine,
+    NewTask, NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
+    NewWatchChannel, Routine, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog,
+    UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
+    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, RoutineRepo,
+    TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
-    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
+    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL, ROUTINE_LIST_BY_USER_ID_SQL,
+    ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
     TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
@@ -703,6 +705,145 @@ impl TaskListRepo for D1TaskListRepo {
             .map_err(backend)?;
         let row = stmt.first::<CountRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.count).unwrap_or(0))
+    }
+}
+
+/// `routines` table persistence (ADR 0004).
+pub struct D1RoutineRepo {
+    db: D1Database,
+}
+
+impl D1RoutineRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl RoutineRepo for D1RoutineRepo {
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Routine>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(ROUTINE_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<Routine>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(ROUTINE_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<Routine>(None).await.map_err(backend)
+    }
+
+    async fn insert(&self, routine: NewRoutine) -> Result<Routine, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(ROUTINE_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&routine.user_id),
+                D1Type::Text(&routine.title),
+                D1Type::Integer(routine.estimated_minutes as i32),
+                D1Type::Text(&routine.dtstart),
+                D1Type::Text(&routine.rrule),
+                // Exclusion dates as a JSON array text ('[]' when empty).
+                D1Type::Text(&routine.exdates_json),
+                D1Type::Integer(routine.sort_order as i32),
+                D1Type::Text(&now),
+                D1Type::Text(&now),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        Ok(Routine {
+            id: id.clone(),
+            user_id: routine.user_id,
+            title: routine.title,
+            estimated_minutes: routine.estimated_minutes,
+            dtstart: routine.dtstart,
+            rrule: routine.rrule,
+            exdates: routine.exdates_json,
+            sort_order: routine.sort_order,
+            created_at: now.clone(),
+            updated_at: now,
+            deleted_at: None,
+        })
+    }
+
+    async fn update(
+        &self,
+        id: &str,
+        updates: &UpdateRoutine,
+    ) -> Result<Option<Routine>, RepoError> {
+        // NULL binds flow through COALESCE and leave the column unchanged.
+        let title = optional_text(updates.title.as_deref());
+        let estimated_minutes = match updates.estimated_minutes {
+            Some(value) => D1Type::Integer(value as i32),
+            None => D1Type::Null,
+        };
+        let dtstart = optional_text(updates.dtstart.as_deref());
+        let rrule = optional_text(updates.rrule.as_deref());
+        // A present exdates set replaces the whole JSON array; absent leaves it.
+        let exdates_json = match &updates.exdates {
+            Some(exdates) => Some(
+                serde_json::to_string(exdates)
+                    .map_err(|err| RepoError::Backend(err.to_string()))?,
+            ),
+            None => None,
+        };
+        let exdates = match exdates_json.as_deref() {
+            Some(json) => D1Type::Text(json),
+            None => D1Type::Null,
+        };
+        let sort_order = match updates.sort_order {
+            Some(value) => D1Type::Integer(value as i32),
+            None => D1Type::Null,
+        };
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(ROUTINE_UPDATE_SQL)
+            .bind_refs(&[
+                title,
+                estimated_minutes,
+                dtstart,
+                rrule,
+                exdates,
+                sort_order,
+                D1Type::Text(&now),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        self.get_by_id(id).await
+    }
+
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(ROUTINE_DELETE_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(ROUTINE_MAX_SORT_ORDER_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.sort_order))
     }
 }
 

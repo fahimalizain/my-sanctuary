@@ -12,6 +12,7 @@ pub mod models;
 pub mod oauth;
 pub mod pattern_gen;
 pub mod repo;
+pub mod routines;
 pub mod tasks;
 pub mod time;
 pub mod token;
@@ -50,11 +51,18 @@ pub use oauth::{
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
+pub use routines::{
+    create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
+    validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,
+    RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
+};
 pub use repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
+    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, RoutineRepo,
+    TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
     CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
+    ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
+    ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
     TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
