@@ -5,12 +5,17 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { AgendaItemRecord, TaskRecord } from '../../types';
+import type {
+  AgendaItemRecord,
+  OccurrenceRecord,
+  TaskRecord,
+} from '../../types';
 import {
   agendaDateLabel,
   agendaMoveTarget,
   agendaTaskMatches,
   applyAgendaMove,
+  canReschedule,
   filterAgendaPickerTasks,
 } from './agenda-helpers';
 
@@ -57,6 +62,49 @@ function item(id: string, sortOrder: number): AgendaItemRecord {
     sort_order: sortOrder,
     task: null,
     occurrence: null,
+  };
+}
+
+/** A task-kind agenda row with its task embed. */
+function taskItem(id: string, status: TaskRecord['status']): AgendaItemRecord {
+  return { ...item(id, 0), task: task(id, status) };
+}
+
+/** An occurrence-kind agenda row with its occurrence embed. */
+function occurrenceItem(
+  id: string,
+  status: OccurrenceRecord['status'],
+): AgendaItemRecord {
+  return {
+    ...item(id, 0),
+    kind: 'occurrence',
+    ref_id: `occ-${id}`,
+    occurrence: {
+      id: `occ-${id}`,
+      routine_id: 'r-1',
+      user_id: 'u-1',
+      local_date: '2026-08-23',
+      title: null,
+      resolved_title: 'Morning run',
+      status,
+      estimated_minutes: 30,
+      dtstart: '2026-08-23T07:00:00',
+      rrule: 'FREQ=DAILY',
+      exdates: [],
+      calendar_id: null,
+      google_event_id: null,
+      created_at: '2026-08-23T00:00:00Z',
+      updated_at: '2026-08-23T00:00:00Z',
+      category: {
+        id: 'cat-1',
+        title: 'Work',
+        slug: 'work',
+        list_id: 'list-1',
+        inherited_list_id: null,
+        is_untracked: false,
+        color: '#2a5c8a',
+      },
+    },
   };
 }
 
@@ -247,4 +295,28 @@ test('applyAgendaMove: consecutive moves keep ranks server-exact', () => {
       ['d', 7],
     ],
   );
+});
+
+// ── canReschedule ────────────────────────────────────────────────────────
+
+test('canReschedule: occurrences move only while pending or skipped', () => {
+  assert.equal(canReschedule(occurrenceItem('a', 'pending')), true);
+  assert.equal(canReschedule(occurrenceItem('b', 'skipped')), true);
+  // The API 400s these (in_progress / done) — the control hides with the
+  // chip instead of inviting a failure banner.
+  assert.equal(canReschedule(occurrenceItem('c', 'in_progress')), false);
+  assert.equal(canReschedule(occurrenceItem('d', 'done')), false);
+});
+
+test('canReschedule: tasks move while living; completed/discarded stay put', () => {
+  assert.equal(canReschedule(taskItem('a', 'OPEN')), true);
+  assert.equal(canReschedule(taskItem('b', 'PLANNED')), true);
+  assert.equal(canReschedule(taskItem('c', 'IN_PROGRESS')), true);
+  // The API would allow these, but Home never invites moving a finished card.
+  assert.equal(canReschedule(taskItem('d', 'COMPLETED')), false);
+  assert.equal(canReschedule(taskItem('e', 'DISCARDED')), false);
+});
+
+test('canReschedule: an embedless row (orphan) is never reschedulable', () => {
+  assert.equal(canReschedule(item('orphan', 0)), false);
 });

@@ -148,3 +148,22 @@ export function applyAgendaMove(
     })
     .sort((a, b) => a.sort_order - b.sort_order);
 }
+
+/** Reschedule visibility (ADR 0004 amendment): occurrences move only while
+ *  `pending | skipped` (in_progress/done → API 400), tasks only while living
+ *  — COMPLETED/DISCARDED slots are hidden so Home never invites moving a
+ *  finished card (the API would allow it). */
+export function canReschedule(item: AgendaItemRecord): boolean {
+  if (item.kind === 'occurrence' && item.occurrence) {
+    return (
+      item.occurrence.status === 'pending' ||
+      item.occurrence.status === 'skipped'
+    );
+  }
+  if (item.kind === 'task' && item.task) {
+    return (
+      item.task.status !== 'COMPLETED' && item.task.status !== 'DISCARDED'
+    );
+  }
+  return false;
+}

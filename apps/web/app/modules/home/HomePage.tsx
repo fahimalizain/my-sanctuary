@@ -1,9 +1,10 @@
 // Home — the daily Agenda (ADR 0004 § Surfaces — Home): date-scoped mixed
 // list of tasks + routine occurrences, date selector (prev / today / next +
 // calendar pick), add-task picker, reorder, check-off, skip, start (today's
-// pending occurrences), occurrence rename, and the existing TaskModal for
-// task edits. Replaces the mock timeline (SkewedTimeline stays in
-// components/, unused — no drive-by delete).
+// pending occurrences), reschedule (Tomorrow / pick a day), occurrence
+// rename, and the existing TaskModal for task edits. Replaces the mock
+// timeline (SkewedTimeline stays in components/, unused — no drive-by
+// delete).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
@@ -42,6 +43,7 @@ import type {
   OccurrenceRecord,
   OccurrenceResponse,
   OccurrenceStatus,
+  RescheduleAgendaItemInput,
   TaskDifficulty,
   TaskPriority,
   TaskRecord,
@@ -163,6 +165,55 @@ export function HomePage() {
         prev.map((entry) => (entry.id === data.item.id ? data.item : entry)),
       ),
     );
+  };
+
+  // ──────────────────────────────────────────
+  // Reschedule (move a slot to another day — optimistic drop)
+  // ──────────────────────────────────────────
+
+  /** Move a row to another day (ADR 0004 amendment — reschedule). Optimistic:
+   *  the row drops from this pile immediately (it belongs to the target date
+   *  now); a failure reverts the list and banners. A pick of the row's own
+   *  date is a 200 no-op server-side, so it short-circuits here. The success
+   *  merge keeps the pile exact for the unusual "landed back on the viewed
+   *  date" echo (e.g. the viewed date changed mid-flight). */
+  const handleReschedule = async (
+    item: AgendaItemRecord,
+    targetDate: string,
+  ) => {
+    if (!targetDate || targetDate === item.local_date) return;
+    const snapshot = itemsRef.current;
+    setItems((prev) => prev.filter((entry) => entry.id !== item.id));
+    setActionError(null);
+    let res: Response;
+    try {
+      res = await fetch(
+        `${API_BASE_URL}/api/agenda/items/${item.id}/reschedule`,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            date: targetDate,
+          } satisfies RescheduleAgendaItemInput),
+        },
+      );
+    } catch (err) {
+      setItems(snapshot);
+      setActionError(err instanceof Error ? err.message : 'Move failed');
+      return;
+    }
+    if (!res.ok) {
+      setItems(snapshot);
+      setActionError(await readError(res));
+      return;
+    }
+    const data = (await res.json()) as AgendaItemResponse;
+    setItems((prev) => {
+      const next = prev.filter((entry) => entry.id !== item.id);
+      if (data.item.local_date === dateRef.current) next.push(data.item);
+      return sortItems(next);
+    });
   };
 
   // ──────────────────────────────────────────
@@ -648,6 +699,9 @@ export function HomePage() {
                     isLast={index === items.length - 1}
                     onMove={(itemId, direction) =>
                       void handleMove(itemId, direction)
+                    }
+                    onReschedule={(entry, targetDate) =>
+                      void handleReschedule(entry, targetDate)
                     }
                     onCompleteTask={(entry) => void handleCompleteTask(entry)}
                     onStartTask={(entry) => void handleStartTask(entry)}

@@ -468,8 +468,8 @@ export interface AgendaResponse {
   items: AgendaItemRecord[];
 }
 
-// The envelope returned by POST /api/agenda/items and
-// POST /api/agenda/items/:id/move.
+// The envelope returned by POST /api/agenda/items,
+// POST /api/agenda/items/:id/move and POST /api/agenda/items/:id/reschedule.
 export interface AgendaItemResponse {
   item: AgendaItemRecord;
 }
@@ -488,6 +488,15 @@ export interface NewAgendaItemInput {
 // item lands on (peers at/after it shift up one, within that date's pile).
 export interface MoveAgendaItemInput {
   sort_order: number;
+}
+
+// Request body for POST /api/agenda/items/:id/reschedule — the local civil
+// date (`YYYY-MM-DD`) the slot relocates to. Occurrences move only while
+// `pending | skipped` (skipped → pending; in_progress/done → 400); tasks
+// move the membership slot only, task status unchanged. Same date → 200
+// no-op.
+export interface RescheduleAgendaItemInput {
+  date: string;
 }
 
 // The envelope returned by PATCH /api/occurrences/:id,

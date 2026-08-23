@@ -1,9 +1,12 @@
 // One agenda row for Home (ADR 0004 § Surfaces — Home): the occurrence
-// variant (checkbox → complete, status chip, skip, rename) and the task
-// variant (checkbox → complete, start, remove-from-day, tap → TaskModal).
-// Pure presentational — every mutation lives in HomePage.
+// variant (checkbox → complete, status chip, skip, rename, move-to-another-
+// day) and the task variant (checkbox → complete, start, remove-from-day,
+// move-to-another-day, tap → TaskModal). Pure presentational — every
+// mutation lives in HomePage.
 
+import { useState } from 'react';
 import {
+  CalendarClock,
   CalendarX2,
   Check,
   ChevronDown,
@@ -19,12 +22,17 @@ import type {
 } from '../../types';
 import { TASK_PRIORITY_LABELS } from '../../types';
 import { cn } from '@/lib/utils';
+import { canReschedule } from './agenda-helpers';
+import { addCivilDays } from '../routines/rrule-preview';
 
 interface AgendaItemRowProps {
   item: AgendaItemRecord;
   isFirst: boolean;
   isLast: boolean;
   onMove: (itemId: string, direction: 'up' | 'down') => void;
+  /** Move the slot to another day (`YYYY-MM-DD`) — HomePage fires
+   *  `POST /api/agenda/items/:id/reschedule` optimistically. */
+  onReschedule: (item: AgendaItemRecord, date: string) => void;
   onCompleteTask: (item: AgendaItemRecord) => void;
   onStartTask: (item: AgendaItemRecord) => void;
   onRemoveTask: (item: AgendaItemRecord) => void;
@@ -104,6 +112,55 @@ function MoveButtons({
   );
 }
 
+/** Move-to-another-day control (ADR 0004 amendment — reschedule): a primary
+ *  "Tomorrow" action plus a compact native date picker for any other day.
+ *  Both fire immediately — no confirm — so the row's optimistic drop in
+ *  HomePage is instant; failures revert + banner. "Tomorrow" is the ROW's
+ *  own date +1 civil day (moving from a future day still means "the next
+ *  day"), never the browser's today. */
+function RescheduleControl({
+  item,
+  label,
+  onReschedule,
+}: {
+  item: AgendaItemRecord;
+  label: string;
+  onReschedule: AgendaItemRowProps['onReschedule'];
+}) {
+  const [pickDate, setPickDate] = useState('');
+  const tomorrow = addCivilDays(item.local_date, 1);
+  return (
+    <span className="flex items-center gap-1 flex-shrink-0">
+      <button
+        type="button"
+        onClick={() => onReschedule(item, tomorrow)}
+        aria-label={`Move ${label} to tomorrow`}
+        title="Move to tomorrow"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors flex-shrink-0"
+      >
+        <CalendarClock className="h-3.5 w-3.5" />
+        Tomorrow
+      </button>
+      <input
+        type="date"
+        value={pickDate}
+        onChange={(e) => {
+          const next = e.target.value;
+          // No confirm: picking a day reschedules immediately, then the
+          // control resets so it never reads as a filter.
+          if (next) {
+            setPickDate('');
+            onReschedule(item, next);
+          }
+        }}
+        aria-label={`Move ${label} to another day`}
+        title="Move to another day"
+        className="w-32 rounded-md border border-input bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all flex-shrink-0"
+      />
+    </span>
+  );
+}
+
 /** Status chip: done/skipped/in_progress for occurrences, done/in_progress
  *  for tasks — the same friendly labels the board uses. */
 function StatusChip({
@@ -133,6 +190,7 @@ function OccurrenceRow({
   isFirst,
   isLast,
   onMove,
+  onReschedule,
   onComplete,
   onSkip,
   onStart,
@@ -144,6 +202,7 @@ function OccurrenceRow({
   isFirst: boolean;
   isLast: boolean;
   onMove: AgendaItemRowProps['onMove'];
+  onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onSkip: () => void;
   onStart: () => void;
@@ -233,6 +292,15 @@ function OccurrenceRow({
             <Play className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
         )}
+        {/* Move-to-another-day — pending/skipped only (in_progress/done
+            → API 400, so the control hides with the chip). */}
+        {canReschedule(item) && (
+          <RescheduleControl
+            item={item}
+            label={occurrence.resolved_title}
+            onReschedule={onReschedule}
+          />
+        )}
         <MoveButtons
           isFirst={isFirst}
           isLast={isLast}
@@ -250,6 +318,7 @@ function TaskRow({
   isFirst,
   isLast,
   onMove,
+  onReschedule,
   onComplete,
   onStart,
   onRemove,
@@ -260,6 +329,7 @@ function TaskRow({
   isFirst: boolean;
   isLast: boolean;
   onMove: AgendaItemRowProps['onMove'];
+  onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onStart: () => void;
   onRemove: () => void;
@@ -326,6 +396,15 @@ function TaskRow({
         >
           <X className="h-3.5 w-3.5 text-muted-foreground" />
         </button>
+        {/* Move-to-another-day — living tasks only (COMPLETED/DISCARDED
+            cards stay put: Home never invites moving a finished card). */}
+        {canReschedule(item) && (
+          <RescheduleControl
+            item={item}
+            label={task.display_title}
+            onReschedule={onReschedule}
+          />
+        )}
         <MoveButtons
           isFirst={isFirst}
           isLast={isLast}
@@ -347,6 +426,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         isFirst={props.isFirst}
         isLast={props.isLast}
         onMove={props.onMove}
+        onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
         onStart={() => props.onStartOccurrence(item)}
@@ -363,6 +443,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         isFirst={props.isFirst}
         isLast={props.isLast}
         onMove={props.onMove}
+        onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteTask(item)}
         onStart={() => props.onStartTask(item)}
         onRemove={() => props.onRemoveTask(item)}
