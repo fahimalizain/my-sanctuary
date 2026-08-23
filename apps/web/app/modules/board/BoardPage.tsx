@@ -70,7 +70,11 @@ import {
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
-import { BOARD_REFRESH_INTERVAL_MS } from './board-refresh';
+
+/** Background refetch while the board is mounted and idle. Passed to
+ *  `useTasksQuery({ refetchInterval })`; set to `false` while a drag /
+ *  move / focus is in flight. */
+const TASKS_REFETCH_INTERVAL_MS = 60_000;
 
 interface TaskFormState {
   mode: 'create' | 'edit';
@@ -134,7 +138,7 @@ export function BoardPage() {
 
   const tasksQuery = useTasksQuery({
     enabled: listsQuery.isSuccess,
-    refetchInterval: busy ? false : BOARD_REFRESH_INTERVAL_MS,
+    refetchInterval: busy ? false : TASKS_REFETCH_INTERVAL_MS,
     refetchOnWindowFocus: !busy,
   });
   const tasks = tasksQuery.data?.tasks ?? [];
