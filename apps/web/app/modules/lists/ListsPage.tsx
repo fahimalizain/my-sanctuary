@@ -21,21 +21,22 @@ import {
 } from '@/components/ui/dialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
-import {
-  ApiError,
-  createTask,
-  deleteTask,
-  moveTask,
-  runTaskAction,
-  updateTask,
-} from '@/lib/api';
+import { ApiError } from '@/lib/api';
 import {
   useCreateList,
   useDeleteList,
   useListsQuery,
   useUpdateList,
 } from '@/app/queries/lists';
-import { setTasksCache, useTasksQuery } from '@/app/queries/tasks';
+import {
+  setTasksCache,
+  useCreateTask,
+  useDeleteTask,
+  useMoveTask,
+  useRunTaskAction,
+  useTasksQuery,
+  useUpdateTask,
+} from '@/app/queries/tasks';
 import { cn } from '@/lib/utils';
 // Lists is unlinked from the nav; one shared helper is fine to import across
 // modules — no new package.
@@ -128,6 +129,16 @@ export function ListsPage() {
     void tasksQuery.refetch();
   }, [tasksQuery]);
 
+  // Task write mutations (slice 7): thin wrappers over the API that cancel
+  // any in-flight `['tasks']` refetch on mutate. The optimistic paint stays
+  // here in the page — the hooks never write the cache themselves and never
+  // invalidate on success.
+  const moveTaskMutation = useMoveTask();
+  const createTaskMutation = useCreateTask();
+  const updateTaskMutation = useUpdateTask();
+  const deleteTaskMutation = useDeleteTask();
+  const runTaskActionMutation = useRunTaskAction();
+
   // ──────────────────────────────────────────
   // Task timer actions (start/stop/pause/complete/discard)
   // ──────────────────────────────────────────
@@ -135,7 +146,7 @@ export function ListsPage() {
   const handleTaskAction = async (taskId: string, action: TaskAction) => {
     setActionError(null);
     try {
-      await runTaskAction(taskId, action);
+      await runTaskActionMutation.mutateAsync({ id: taskId, action });
     } catch (err) {
       // The server's message (e.g. a missing Google token) lands in the
       // banner; the cards stay visible. IN_PROGRESS is a column, not a
@@ -284,7 +295,10 @@ export function ListsPage() {
     );
     const body: MoveTaskInput = { status };
     try {
-      const data = await moveTask(taskId, body);
+      const data = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: body,
+      });
       setTasks((prev) =>
         prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
       );
@@ -329,8 +343,11 @@ export function ListsPage() {
     try {
       data =
         taskForm.mode === 'create'
-          ? await createTask(body)
-          : await updateTask(taskForm.task!.id, body);
+          ? await createTaskMutation.mutateAsync(body)
+          : await updateTaskMutation.mutateAsync({
+              id: taskForm.task!.id,
+              input: body,
+            });
     } catch (err) {
       return err instanceof Error ? err.message : 'Save failed';
     }
@@ -350,7 +367,7 @@ export function ListsPage() {
   const handleTaskDelete = async (taskId: string): Promise<string | null> => {
     setActionError(null);
     try {
-      await deleteTask(taskId);
+      await deleteTaskMutation.mutateAsync(taskId);
     } catch (err) {
       return err instanceof Error ? err.message : 'Delete failed';
     }

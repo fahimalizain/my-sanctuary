@@ -6,7 +6,9 @@
 // the cooldown of the last completed load so mount + interval + visibility
 // never double-fetch.
 
-/** Interval between background refresh ticks while the page is mounted. */
+/** Interval between background refresh ticks while the page is mounted.
+ *  Board passes this to `useTasksQuery({ refetchInterval })` — the query
+ *  pauses it while the board is busy (see `busy` in BoardPage). */
 export const BOARD_REFRESH_INTERVAL_MS = 60_000;
 
 /** Minimum gap after a refresh before another may fire — a visibility event

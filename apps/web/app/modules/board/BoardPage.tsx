@@ -16,19 +16,18 @@ import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
-import {
-  createTask,
-  deleteTask,
-  focusTask,
-  moveTask,
-  unfocusTask,
-  updateTask,
-} from '@/lib/api';
 import { useCategoriesQuery } from '@/app/queries/categories';
 import { useListsQuery } from '@/app/queries/lists';
-import { setTasksCache, useTasksQuery } from '@/app/queries/tasks';
-import { queryKeys } from '@/app/queries/keys';
-import { queryClient } from '@/lib/queryClient';
+import {
+  setTasksCache,
+  useCreateTask,
+  useDeleteTask,
+  useFocusTask,
+  useMoveTask,
+  useTasksQuery,
+  useUnfocusTask,
+  useUpdateTask,
+} from '@/app/queries/tasks';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
@@ -71,7 +70,7 @@ import {
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
-import { useBoardRefresh } from './useBoardRefresh';
+import { BOARD_REFRESH_INTERVAL_MS } from './board-refresh';
 
 interface TaskFormState {
   mode: 'create' | 'edit';
@@ -98,7 +97,46 @@ export function BoardPage() {
   const lists = listsQuery.data?.lists ?? [];
   const categoriesQuery = useCategoriesQuery({ enabled: listsQuery.isSuccess });
   const categories = categoriesQuery.data?.categories ?? [];
-  const tasksQuery = useTasksQuery({ enabled: listsQuery.isSuccess });
+
+  // Drag state (ADR 0002 § DnD). Declared BEFORE `useTasksQuery`: `busy`
+  // below feeds the tasks query's refresh options, and hooks must run in a
+  // stable order.
+  const [activeDrag, setActiveDrag] = useState<TaskRecord | null>(null);
+  // Live cross-column preview: per-column id arrays cloned from the
+  // displayed columns on lift and discarded on end/cancel. `tasks` stays
+  // committed until the drop — only this throwaway map moves ids between
+  // columns mid-drag so the dest column can part around the mover.
+  const [dragItems, setDragItems] = useState<BoardColumnItems | null>(null);
+  // Latest preview for `handleDragEnd` (same "latest value during render"
+  // pattern as tasksRef): the drop resolves against the columns as shown,
+  // before the handler clears them.
+  const dragItemsRef = useRef<BoardColumnItems | null>(null);
+  dragItemsRef.current = dragItems;
+  // Cards with a /move request in flight — dragging them again is ignored
+  // until the response lands (no queuing).
+  const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
+  // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
+  // flight: further pin taps are ignored and every pin is disabled.
+  const [focusInFlight, setFocusInFlight] = useState(false);
+
+  // A live drag or preview, an in-flight /move, an in-flight focus toggle:
+  // while `busy` no tasks refetch may land — a window-focus or interval
+  // refetch would overwrite the optimistic cache with the pre-move server
+  // list. This is the old useBoardRefresh gate, now expressed as query
+  // options: the tasks query pauses its interval and window-focus refetch
+  // while busy, and every task write also cancels any in-flight refetch via
+  // its mutation's `onMutate`.
+  const busy =
+    activeDrag !== null ||
+    dragItems !== null ||
+    movingIds.size > 0 ||
+    focusInFlight;
+
+  const tasksQuery = useTasksQuery({
+    enabled: listsQuery.isSuccess,
+    refetchInterval: busy ? false : BOARD_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: !busy,
+  });
   const tasks = tasksQuery.data?.tasks ?? [];
   const setTasks = setTasksCache;
   // Same pattern as before for `tasks`: the async move flow reads the
@@ -130,38 +168,6 @@ export function BoardPage() {
   // Task dialog state.
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
 
-  // Drag state (ADR 0002 § DnD).
-  const [activeDrag, setActiveDrag] = useState<TaskRecord | null>(null);
-  // Live cross-column preview: per-column id arrays cloned from the
-  // displayed columns on lift and discarded on end/cancel. `tasks` stays
-  // committed until the drop — only this throwaway map moves ids between
-  // columns mid-drag so the dest column can part around the mover.
-  const [dragItems, setDragItems] = useState<BoardColumnItems | null>(null);
-  // Latest preview for `handleDragEnd` (same "latest value during render"
-  // pattern as tasksRef): the drop resolves against the columns as shown,
-  // before the handler clears them.
-  const dragItemsRef = useRef<BoardColumnItems | null>(null);
-  dragItemsRef.current = dragItems;
-  // Cards with a /move request in flight — dragging them again is ignored
-  // until the response lands (no queuing).
-  const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
-  // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
-  // flight: further pin taps are ignored and every pin is disabled.
-  const [focusInFlight, setFocusInFlight] = useState(false);
-  // Render-driven state a quiet background refresh must not interrupt (see
-  // useBoardRefresh): a live drag or preview, an in-flight /move, an
-  // in-flight focus toggle. Written during render so the refresh hook reads
-  // the freshest value without re-subscribing. In-flight fetches are NOT
-  // here: the refresh callback reads `tasksQuery.isFetching` /
-  // `listsQuery.isFetching` live instead — a render-time snapshot could
-  // leave the board latched busy.
-  const busyRef = useRef(false);
-  busyRef.current =
-    activeDrag !== null ||
-    dragItems !== null ||
-    movingIds.size > 0 ||
-    focusInFlight;
-
   // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
   // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
   // DevTools device mode speaks touch events, not pointer). Hold ~250ms
@@ -178,22 +184,17 @@ export function BoardPage() {
     }),
   );
 
-  // Quiet refresh (60s interval + tab visibility): invalidates the shared
-  // query keys instead of the old `load()`. The queries refetch in the
-  // background; the seed gate (tasks/categories enabled only after lists
-  // succeed) keeps the first-visit taxonomy ordering on the very first load,
-  // and invalidation of all three keys covers refreshes once data exists.
-  // The hook never fires on mount and skips ticks while `busyRef` is set or
-  // a fetch is in flight (read live at tick time).
-  const refresh = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.lists.all });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.tasks.all });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.categories.all });
-  }, []);
-  useBoardRefresh(
-    refresh,
-    () => busyRef.current || tasksQuery.isFetching || listsQuery.isFetching,
-  );
+  // Task write mutations (slice 7): thin wrappers over the API that cancel
+  // any in-flight `['tasks']` refetch on mutate. The optimistic paint and
+  // the snapshot rollback stay here in the page — the hooks never write the
+  // cache themselves and never invalidate on success (invalidation would
+  // fight applyOptimisticMove's sibling-rank contract).
+  const moveTaskMutation = useMoveTask();
+  const focusTaskMutation = useFocusTask();
+  const unfocusTaskMutation = useUnfocusTask();
+  const createTaskMutation = useCreateTask();
+  const updateTaskMutation = useUpdateTask();
+  const deleteTaskMutation = useDeleteTask();
 
   // ──────────────────────────────────────────
   // URL filters (ADR 0002 § Filters)
@@ -439,7 +440,10 @@ export function BoardPage() {
     setActionError(null);
     setMovingIds((prev) => new Set(prev).add(taskId));
     try {
-      const data = await moveTask(taskId, body);
+      const data = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: body,
+      });
       onSuccess(data);
       return null;
     } catch (err) {
@@ -651,7 +655,11 @@ export function BoardPage() {
     setFocusInFlight(true);
     setActionError(null);
     try {
-      onSuccess(isFocus ? await focusTask(taskId) : await unfocusTask());
+      onSuccess(
+        isFocus
+          ? await focusTaskMutation.mutateAsync(taskId)
+          : await unfocusTaskMutation.mutateAsync(),
+      );
       return null;
     } catch (err) {
       setTasks(snapshot);
@@ -745,7 +753,10 @@ export function BoardPage() {
     // ── Edit (PATCH) — unchanged: merge the returned task, close.
     if (taskForm.mode === 'edit') {
       try {
-        const data = await updateTask(taskForm.task!.id, body);
+        const data = await updateTaskMutation.mutateAsync({
+          id: taskForm.task!.id,
+          input: body,
+        });
         setTasks((prev) =>
           prev.map((entry) =>
             entry.id === data.task.id ? data.task : entry,
@@ -763,7 +774,7 @@ export function BoardPage() {
     //    request body).
     let data: TaskResponse;
     try {
-      data = await createTask(body);
+      data = await createTaskMutation.mutateAsync(body);
     } catch (err) {
       // Create 400 etc.: return the error, the modal stays open on the form.
       return err instanceof Error ? err.message : 'Create failed';
@@ -802,7 +813,10 @@ export function BoardPage() {
 
     let moveData: MoveTaskResponse;
     try {
-      moveData = await moveTask(data.task.id, moveBody);
+      moveData = await moveTaskMutation.mutateAsync({
+        id: data.task.id,
+        input: moveBody,
+      });
     } catch (err) {
       // Failure — network or HTTP (401 missing Google token, 400, …):
       // restore the pre-move snapshot, then ensure the created card is
@@ -828,7 +842,7 @@ export function BoardPage() {
   const handleTaskDelete = async (taskId: string): Promise<string | null> => {
     setActionError(null);
     try {
-      await deleteTask(taskId);
+      await deleteTaskMutation.mutateAsync(taskId);
     } catch (err) {
       return err instanceof Error ? err.message : 'Delete failed';
     }
