@@ -42,6 +42,7 @@ Copies the remote `sanctuary-db` onto the local wrangler D1 database (the one `w
 | Database name | `sanctuary-db` (not the binding name) |
 | Binding | `DB` |
 | database_id | `7fcdb90e-d286-412d-9161-a63e62ebaf44` |
+| account_id | `95ec2591c70d5cf2f2e07bb70e252be6` (Fahimalizain@gmail.com) |
 | Wrangler cwd | `apps/worker` (`--cwd apps/worker` from repo root) |
 | Local persist | `apps/worker/.wrangler/state/v3/d1/` |
 | Dump location | `tmp/d1/` (gitignored) |
@@ -53,6 +54,7 @@ Copies the remote `sanctuary-db` onto the local wrangler D1 database (the one `w
 | Problem | Fix |
 |---------|-----|
 | Auth / error 10000 | `npx wrangler login`, then re-run the script |
+| `More than one account available` (unable to select in non-interactive mode) | Script defaults `CLOUDFLARE_ACCOUNT_ID` to Fahimalizain's account; override the env var only if targeting a different account. Prefer re-running the script. |
 | Database is locked | Stop `npx nx serve worker`, then re-run |
 | Table already exists | `rm -rf apps/worker/.wrangler/state/v3/d1`, then re-run |
 | FOREIGN KEY constraint | Script falls back to sqlite3; install it (`brew install sqlite`) if missing |

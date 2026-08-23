@@ -11,6 +11,13 @@ KEEP_DUMP=0
 DUMP=""
 DUMP_GIVEN=0
 
+# Default to the sanctuary Cloudflare account. Wrangler `d1 export --remote`
+# fails in non-interactive mode when the token can see multiple accounts
+# (`unable to select one in non-interactive mode`) even though `whoami`
+# lists only this one. Honour an explicit CLOUDFLARE_ACCOUNT_ID if set.
+: "${CLOUDFLARE_ACCOUNT_ID:=95ec2591c70d5cf2f2e07bb70e252be6}"
+export CLOUDFLARE_ACCOUNT_ID
+
 usage() {
   cat <<'EOF'
 restore.sh - restore production D1 (sanctuary-db) onto local wrangler D1.
