@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   Check,
   Loader2,
@@ -21,7 +21,22 @@ import {
 } from '@/components/ui/dialog';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
-import { API_BASE_URL } from '@/lib/api';
+import { ApiError } from '@/lib/api';
+import {
+  useCreateList,
+  useDeleteList,
+  useListsQuery,
+  useUpdateList,
+} from '@/app/queries/lists';
+import {
+  setTasksCache,
+  useCreateTask,
+  useDeleteTask,
+  useMoveTask,
+  useRunTaskAction,
+  useTasksQuery,
+  useUpdateTask,
+} from '@/app/queries/tasks';
 import { cn } from '@/lib/utils';
 // Lists is unlinked from the nav; one shared helper is fine to import across
 // modules — no new package.
@@ -29,40 +44,17 @@ import { defaultMoveRank } from '../board/board-model';
 import {
   TASK_PRIORITY_LABELS,
   type MoveTaskInput,
-  type MoveTaskResponse,
   type NewTaskInput,
   type TaskDifficulty,
   type TaskList,
-  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskResponse,
   type TaskStatus,
-  type TasksResponse,
-  type UpdateTaskInput,
 } from '@/app/types';
 
 // Timer actions map to the same POST endpoints; the server explains 409s.
 type TaskAction = 'start' | 'stop' | 'pause' | 'complete' | 'discard';
-
-// The server's error envelope is `{"error": "message"}`; fall back to a
-// generic message when the body is not JSON.
-async function readError(res: Response): Promise<string> {
-  try {
-    const data: unknown = await res.json();
-    if (
-      data &&
-      typeof data === 'object' &&
-      'error' in data &&
-      typeof (data as { error: unknown }).error === 'string'
-    ) {
-      return (data as { error: string }).error;
-    }
-  } catch {
-    // Not JSON — fall through to the generic message.
-  }
-  return `Request failed with status ${res.status}`;
-}
 
 interface ListFormState {
   mode: 'create' | 'edit';
@@ -77,23 +69,23 @@ interface TaskFormState {
 
 export function ListsPage() {
   const navigate = useNavigate();
-  const [lists, setLists] = useState<TaskList[]>([]);
-  const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  // Latest `lists` for the dependency-free `load` callback below (writing a
-  // ref during render is the "latest value" pattern). Reading it lets `load`
-  // decide whether to show the full-page loader without closing over a stale
-  // array.
-  const listsRef = useRef<TaskList[]>([]);
-  listsRef.current = lists;
+  const listsQuery = useListsQuery();
+  const lists = listsQuery.data?.lists ?? [];
+  // Tasks load once after lists succeed — the seed rule: GET /api/lists
+  // performs the first-visit seed (default lists + category taxonomy), so the
+  // tasks request must run after it (their computed categories depend on the
+  // seeded taxonomy, and GET /api/tasks also runs the count-gated seed — a
+  // no-op once lists seeded). Lists hide untracked tasks (no list to belong
+  // to), so the categories endpoint is never needed here. Shares the one
+  // `['tasks']` cache with the Board and the Home task picker.
+  const tasksQuery = useTasksQuery({ enabled: listsQuery.isSuccess });
+  const tasks = tasksQuery.data?.tasks ?? [];
+  const setTasks = setTasksCache;
   // Latest `tasks` for the async move flow, so the pre-move snapshot and the
   // reverted card lookups never close over a stale array (same pattern as
   // BoardPage).
   const tasksRef = useRef<TaskRecord[]>([]);
   tasksRef.current = tasks;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the grid with the
-  // error+retry banner when there are no lists to show.
-  const [loadError, setLoadError] = useState<string | null>(null);
   // Action failures (delete 409, etc.): rendered as a banner above the
   // still-visible grid — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -109,58 +101,43 @@ export function ListsPage() {
   // Task dialog state.
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
 
-  const load = useCallback(() => {
-    // Full-page loader only when the grid is empty (first load, or a retry
-    // after a hard error cleared it) — the same rule as CalendarPage
-    // (`isLoading: prev.events.length === 0`), so reloads fired while cards
-    // are on screen never flash the spinner.
-    setIsLoading(listsRef.current.length === 0);
-    setLoadError(null);
-    // Sequential on purpose: GET /api/lists performs the first-visit seed (it
-    // inserts the default lists AND the category taxonomy), so the tasks
-    // request must run after it — their computed categories depend on the
-    // seeded taxonomy, and GET /api/tasks also runs the count-gated seed (a
-    // no-op once lists seeded). Lists hide untracked tasks (no list to
-    // belong to), so the categories endpoint is never needed here.
-    fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
-      .then(async (listsRes) => {
-        if (!listsRes.ok) throw new Error(await readError(listsRes));
-        const listsData = (await listsRes.json()) as TaskListsResponse;
-        setLists(listsData.lists ?? []);
-        return fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' });
-      })
-      .then(async (tasksRes) => {
-        if (!tasksRes.ok) throw new Error(await readError(tasksRes));
-        const tasksData = (await tasksRes.json()) as TasksResponse;
-        setTasks(tasksData.tasks ?? []);
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load lists';
-        setLoadError(message);
-      })
-      .finally(() => setIsLoading(false));
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+  // Full-page loader only when the grid is empty (first load, or a retry
+  // after a hard error cleared it) — Query's `isLoading` means "no data
+  // yet", so reloads fired while cards are on screen never flash the
+  // spinner.
+  const isLoading =
+    listsQuery.isLoading || (listsQuery.isSuccess && tasksQuery.isLoading);
+  // Load failures: the lists query's error, else the tasks query's error.
+  // Replaces the grid with the error+retry banner only when there are no
+  // lists to show.
+  const loadError =
+    (listsQuery.error instanceof Error
+      ? listsQuery.error.message
+      : listsQuery.error
+        ? 'Failed to load lists'
+        : null) ??
+    (tasksQuery.error instanceof Error
+      ? tasksQuery.error.message
+      : tasksQuery.error
+        ? 'Failed to load tasks'
+        : null);
 
   // Refreshes only the tasks (timer actions never change lists, so the
-  // sequential lists→tasks reload is unnecessary here).
+  // sequential lists→tasks reload is unnecessary here). A plain refetch
+  // replaces the shared `['tasks']` cache — the Board picks it up too.
   const reloadTasks = useCallback(() => {
-    fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as TasksResponse;
-        setTasks(data.tasks ?? []);
-      })
-      .catch((err: unknown) => {
-        setActionError(
-          err instanceof Error ? err.message : 'Failed to reload tasks',
-        );
-      });
-  }, []);
+    void tasksQuery.refetch();
+  }, [tasksQuery]);
+
+  // Task write mutations: thin wrappers over the API that cancel
+  // any in-flight `['tasks']` refetch on mutate. The optimistic paint stays
+  // here in the page — the hooks never write the cache themselves and never
+  // invalidate on success.
+  const moveTaskMutation = useMoveTask();
+  const createTaskMutation = useCreateTask();
+  const updateTaskMutation = useUpdateTask();
+  const deleteTaskMutation = useDeleteTask();
+  const runTaskActionMutation = useRunTaskAction();
 
   // ──────────────────────────────────────────
   // Task timer actions (start/stop/pause/complete/discard)
@@ -168,15 +145,13 @@ export function ListsPage() {
 
   const handleTaskAction = async (taskId: string, action: TaskAction) => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/${action}`, {
-      method: 'POST',
-      credentials: 'include',
-    });
-    if (!res.ok) {
+    try {
+      await runTaskActionMutation.mutateAsync({ id: taskId, action });
+    } catch (err) {
       // The server's message (e.g. a missing Google token) lands in the
       // banner; the cards stay visible. IN_PROGRESS is a column, not a
       // singleton lock, so starting another task while some run is fine.
-      setActionError(await readError(res));
+      setActionError(err instanceof Error ? err.message : 'Action failed');
       return;
     }
     reloadTasks();
@@ -193,6 +168,10 @@ export function ListsPage() {
   // ──────────────────────────────────────────
   // List actions
   // ──────────────────────────────────────────
+
+  const createListMutation = useCreateList();
+  const updateListMutation = useUpdateList();
+  const deleteListMutation = useDeleteList();
 
   const openCreateList = () => {
     setListForm({ mode: 'create' });
@@ -222,27 +201,26 @@ export function ListsPage() {
     setSaving(true);
     setFormError(null);
     setActionError(null);
-    const res =
-      listForm.mode === 'create'
-        ? await fetch(`${API_BASE_URL}/api/lists`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: trimmed, color: listColor }),
-          })
-        : await fetch(`${API_BASE_URL}/api/lists/${listForm.list!.id}`, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: trimmed, color: listColor }),
-          });
-    if (!res.ok) {
+    try {
+      if (listForm.mode === 'create') {
+        await createListMutation.mutateAsync({
+          name: trimmed,
+          color: listColor,
+        });
+      } else {
+        await updateListMutation.mutateAsync({
+          id: listForm.list!.id,
+          input: { name: trimmed, color: listColor },
+        });
+      }
+    } catch (err) {
       setSaving(false);
-      setFormError(await readError(res));
+      setFormError(err instanceof Error ? err.message : 'Save failed');
       return;
     }
     closeListForm();
-    load();
+    // Invalidation refreshes the lists — no reload call needed (create/edit
+    // do not change tasks, so tasks are left alone).
   };
 
   const handleDeleteList = async (list: TaskList) => {
@@ -250,21 +228,20 @@ export function ListsPage() {
     if (!confirmed) return;
 
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/lists/${list.id}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      const message = await readError(res);
+    try {
+      await deleteListMutation.mutateAsync(list.id);
+    } catch (err) {
       // 409 from the backend: living root categories still reference the list.
       setActionError(
-        res.status === 409
+        err instanceof ApiError && err.status === 409
           ? `"${list.name}" is still in use and cannot be deleted.`
-          : message,
+          : err instanceof Error
+            ? err.message
+            : 'Failed to delete list',
       );
       return;
     }
-    load();
+    // Invalidation refreshes the lists — no reload call needed.
   };
 
   // ──────────────────────────────────────────
@@ -318,19 +295,10 @@ export function ListsPage() {
     );
     const body: MoveTaskInput = { status };
     try {
-      const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+      const data = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: body,
       });
-      if (!res.ok) {
-        const message = await readError(res);
-        setTasks(snapshot);
-        setActionError(message);
-        return message;
-      }
-      const data = (await res.json()) as MoveTaskResponse;
       setTasks((prev) =>
         prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
       );
@@ -362,35 +330,31 @@ export function ListsPage() {
   }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
-    const body: NewTaskInput | UpdateTaskInput = {
+    // `NewTaskInput` on purpose: create sends the full set, and the edit
+    // PATCH accepts it too (every field optional server-side).
+    const body: NewTaskInput = {
       title: values.title,
       description: values.description,
       duration_minutes: values.durationMinutes,
       priority: values.priority,
       difficulty: values.difficulty,
     };
-    const res =
-      taskForm.mode === 'create'
-        ? await fetch(`${API_BASE_URL}/api/tasks`, {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          })
-        : await fetch(`${API_BASE_URL}/api/tasks/${taskForm.task!.id}`, {
-            method: 'PATCH',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-    if (!res.ok) {
-      return await readError(res);
+    let data: TaskResponse;
+    try {
+      data =
+        taskForm.mode === 'create'
+          ? await createTaskMutation.mutateAsync(body)
+          : await updateTaskMutation.mutateAsync({
+              id: taskForm.task!.id,
+              input: body,
+            });
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Save failed';
     }
     // The response carries the computed category — reuse it directly so the
     // card regroups instantly (the task lands on the card whose
     // `inherited_list_id` matches; an untracked result stays hidden, which is
     // correct on this page).
-    const data = (await res.json()) as TaskResponse;
     setTasks((prev) =>
       taskForm.mode === 'create'
         ? [data.task, ...prev]
@@ -402,12 +366,10 @@ export function ListsPage() {
 
   const handleTaskDelete = async (taskId: string): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      return await readError(res);
+    try {
+      await deleteTaskMutation.mutateAsync(taskId);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Delete failed';
     }
     setTasks((prev) => prev.filter((entry) => entry.id !== taskId));
     closeTaskForm();
@@ -458,8 +420,11 @@ export function ListsPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setLoadError(null);
-                load();
+                // Refetch lists first — the tasks query is seed-gated on
+                // lists success and re-runs automatically; when lists are
+                // already loaded, refetch tasks too.
+                void listsQuery.refetch();
+                if (listsQuery.isSuccess) void tasksQuery.refetch();
               }}
             >
               Retry

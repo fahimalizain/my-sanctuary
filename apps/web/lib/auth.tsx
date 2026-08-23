@@ -1,12 +1,8 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
-import { API_BASE_URL } from './api';
+import React, { createContext, useContext } from 'react';
+import type { AuthUser } from './api';
+import { useLogout, useMeQuery } from '@/app/queries/auth';
 
-export interface User {
-  id: string;
-  email: string;
-  name: string;
-  picture: string;
-}
+export type User = AuthUser;
 
 interface AuthContextType {
   user: User | null;
@@ -21,25 +17,17 @@ const AuthContext = createContext<AuthContextType>({
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    fetch(`${API_BASE_URL}/auth/me`, { credentials: 'include' })
-      .then((res) => res.json())
-      .then((data: { user: User | null }) => {
-        setUser(data.user);
-      })
-      .catch(() => setUser(null))
-      .finally(() => setIsLoading(false));
-  }, []);
+  const meQuery = useMeQuery();
+  const logoutMutation = useLogout();
+  const user = meQuery.data?.user ?? null;
+  const isLoading = meQuery.isLoading;
 
   const logout = async () => {
-    await fetch(`${API_BASE_URL}/auth/logout`, {
-      method: 'POST',
-      credentials: 'include',
-    });
-    setUser(null);
+    try {
+      await logoutMutation.mutateAsync();
+    } catch {
+      // onSettled already cleared
+    }
   };
 
   return (

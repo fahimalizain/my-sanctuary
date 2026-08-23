@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -16,24 +16,30 @@ import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
-import { API_BASE_URL } from '@/lib/api';
+import { useCategoriesQuery } from '@/app/queries/categories';
+import { useListsQuery } from '@/app/queries/lists';
+import {
+  setTasksCache,
+  useCreateTask,
+  useDeleteTask,
+  useFocusTask,
+  useMoveTask,
+  useTasksQuery,
+  useUnfocusTask,
+  useUpdateTask,
+} from '@/app/queries/tasks';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
-  type CategoriesResponse,
-  type Category,
   type FocusTaskResponse,
   type MoveTaskInput,
   type MoveTaskResponse,
   type NewTaskInput,
   type TaskDifficulty,
-  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskResponse,
   type TaskStatus,
-  type TasksResponse,
-  type UpdateTaskInput,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
 import { CategoryFilter } from './CategoryFilter';
@@ -61,11 +67,14 @@ import {
   TERMINAL_COLUMN_CAP,
   applyOptimisticMove,
   defaultMoveRank,
-  readError,
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
-import { useBoardRefresh } from './useBoardRefresh';
+
+/** Background refetch while the board is mounted and idle. Passed to
+ *  `useTasksQuery({ refetchInterval })`; set to `false` while a drag /
+ *  move / focus is in flight. */
+const TASKS_REFETCH_INTERVAL_MS = 60_000;
 
 interface TaskFormState {
   mode: 'create' | 'edit';
@@ -81,31 +90,21 @@ export function BoardPage() {
     from: '/board',
   });
 
-  const [lists, setLists] = useState<TaskListsResponse['lists']>([]);
-  const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  // Latest `lists` for the dependency-free `load` callback below (writing a
-  // ref during render is the "latest value" pattern). Reading it lets `load`
-  // decide whether to show the full-page loader without closing over a stale
-  // array.
-  const listsRef = useRef<TaskListsResponse['lists']>([]);
-  listsRef.current = lists;
-  // Same pattern for `tasks`: the async move flow reads the pre-drop snapshot
-  // and looks up the dropped card from the latest render, never a stale one.
-  const tasksRef = useRef<TaskRecord[]>([]);
-  tasksRef.current = tasks;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the board with the
-  // error+retry banner when there are no lists to show.
-  const [loadError, setLoadError] = useState<string | null>(null);
-  // Action failures (move 409, etc.): rendered as a banner above the
-  // still-visible board — cards are never unmounted by an action error.
-  const [actionError, setActionError] = useState<string | null>(null);
+  // Shared queries: one `['tasks']` cache written by Board, Lists
+  // and the Home task picker. Tasks and categories are seed-gated on lists
+  // success — GET /api/lists performs the first-visit seed (default lists +
+  // category taxonomy), so their requests must run after it (computed
+  // categories depend on the seeded taxonomy). Tasks and categories are
+  // independent of each other and fetch in parallel (the same seed rule as
+  // ListsPage).
+  const listsQuery = useListsQuery();
+  const lists = listsQuery.data?.lists ?? [];
+  const categoriesQuery = useCategoriesQuery({ enabled: listsQuery.isSuccess });
+  const categories = categoriesQuery.data?.categories ?? [];
 
-  // Task dialog state.
-  const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
-
-  // Drag state (ADR 0002 § DnD).
+  // Drag state (ADR 0002 § DnD). Declared BEFORE `useTasksQuery`: `busy`
+  // below feeds the tasks query's refresh options, and hooks must run in a
+  // stable order.
   const [activeDrag, setActiveDrag] = useState<TaskRecord | null>(null);
   // Live cross-column preview: per-column id arrays cloned from the
   // displayed columns on lift and discarded on end/cancel. `tasks` stays
@@ -123,25 +122,55 @@ export function BoardPage() {
   // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
   // flight: further pin taps are ignored and every pin is disabled.
   const [focusInFlight, setFocusInFlight] = useState(false);
-  // One load at a time: the mount effect, Retry and a quiet refresh tick
-  // (interval or visibility) can race — while a load is in flight a second
-  // call is a no-op, never a double fetch. A ref on purpose: the flag flips
-  // inside load() with no guaranteed re-render either way, so the refresh
-  // hook must read it live (see the useBoardRefresh call below).
-  const loadInFlightRef = useRef(false);
-  // Render-driven state a quiet background refresh must not interrupt (see
-  // useBoardRefresh): a live drag or preview, an in-flight /move, an
-  // in-flight focus toggle. Written during render (same pattern as listsRef
-  // above) so the refresh hook reads the freshest value without
-  // re-subscribing. The in-flight load is NOT here: it lives only in
-  // loadInFlightRef and drops without a re-render, so snapshotting it into
-  // this render-time value could leave the board latched busy.
-  const busyRef = useRef(false);
-  busyRef.current =
+
+  // A live drag or preview, an in-flight /move, an in-flight focus toggle:
+  // while `busy` no tasks refetch may land — a window-focus or interval
+  // refetch would overwrite the optimistic cache with the pre-move server
+  // list. Busy pauses interval and window-focus refetch on the tasks
+  // query — the tasks query pauses its interval and window-focus refetch
+  // while busy, and every task write also cancels any in-flight refetch via
+  // its mutation's `onMutate`.
+  const busy =
     activeDrag !== null ||
     dragItems !== null ||
     movingIds.size > 0 ||
     focusInFlight;
+
+  const tasksQuery = useTasksQuery({
+    enabled: listsQuery.isSuccess,
+    refetchInterval: busy ? false : TASKS_REFETCH_INTERVAL_MS,
+    refetchOnWindowFocus: !busy,
+  });
+  const tasks = tasksQuery.data?.tasks ?? [];
+  const setTasks = setTasksCache;
+  // Same pattern as before for `tasks`: the async move flow reads the
+  // pre-drop snapshot and looks up the dropped card from the latest render,
+  // never a stale one. Only the storage behind `setTasks` changed (useState
+  // → shared cache); the ref stays.
+  const tasksRef = useRef<TaskRecord[]>([]);
+  tasksRef.current = tasks;
+  // Full-page loader only while there is no data yet (first load, or a retry
+  // after a hard error) — Query's `isLoading` already means "no data yet",
+  // so a quiet refresh with cards on screen never flashes the spinner.
+  const isLoading =
+    listsQuery.isLoading ||
+    (listsQuery.isSuccess &&
+      (tasksQuery.isLoading || categoriesQuery.isLoading));
+  // Load failures: the first Error.message among the three queries, else
+  // null. Replaces the board with the error+retry banner when there are no
+  // lists to show.
+  const firstErrorMessage = (err: unknown, fallback: string): string | null =>
+    err instanceof Error ? err.message : err ? fallback : null;
+  const loadError =
+    firstErrorMessage(listsQuery.error, 'Failed to load board') ??
+    firstErrorMessage(tasksQuery.error, 'Failed to load tasks') ??
+    firstErrorMessage(categoriesQuery.error, 'Failed to load categories');
+  // Action failures (move 409, etc.): rendered as a banner above the
+  // still-visible board — cards are never unmounted by an action error.
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  // Task dialog state.
+  const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
 
   // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
   // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
@@ -159,59 +188,17 @@ export function BoardPage() {
     }),
   );
 
-  const load = useCallback(() => {
-    if (loadInFlightRef.current) return;
-    loadInFlightRef.current = true;
-    // Full-page loader only when the board is empty (first load, or a retry
-    // after a hard error cleared it) — the same rule as ListsPage, so
-    // reloads fired while cards are on screen never flash the spinner.
-    setIsLoading(listsRef.current.length === 0);
-    setLoadError(null);
-    // Sequential on purpose: GET /api/lists performs the first-visit seed (it
-    // inserts the default lists AND the category taxonomy), so the tasks and
-    // categories requests must run after it — their computed categories
-    // depend on the seeded taxonomy. Tasks and categories are independent of
-    // each other and load in parallel (the same seed rule as ListsPage).
-    fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' })
-      .then(async (listsRes) => {
-        if (!listsRes.ok) throw new Error(await readError(listsRes));
-        const listsData = (await listsRes.json()) as TaskListsResponse;
-        setLists(listsData.lists ?? []);
-        const [tasksRes, categoriesRes] = await Promise.all([
-          fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' }),
-          fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' }),
-        ]);
-        if (!tasksRes.ok) throw new Error(await readError(tasksRes));
-        if (!categoriesRes.ok) throw new Error(await readError(categoriesRes));
-        const [tasksData, categoriesData] = await Promise.all([
-          tasksRes.json() as Promise<TasksResponse>,
-          categoriesRes.json() as Promise<CategoriesResponse>,
-        ]);
-        setTasks(tasksData.tasks ?? []);
-        setCategories(categoriesData.categories ?? []);
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load board';
-        setLoadError(message);
-      })
-      .finally(() => {
-        setIsLoading(false);
-        loadInFlightRef.current = false;
-      });
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  // Quiet refresh (60s interval + tab visibility): wired after the mount
-  // effect above so the initial load stays the first refresh — the hook
-  // never fires on mount and skips ticks while `busyRef` is set. The hook
-  // reads this callback at tick time, so loadInFlightRef is checked LIVE:
-  // an in-flight load still gates the tick, and its flag dropping in
-  // load()'s finally is visible on the next tick without a re-render.
-  useBoardRefresh(load, () => busyRef.current || loadInFlightRef.current);
+  // Task write mutations: thin wrappers over the API that cancel
+  // any in-flight `['tasks']` refetch on mutate. The optimistic paint and
+  // the snapshot rollback stay here in the page — the hooks never write the
+  // cache themselves and never invalidate on success (invalidation would
+  // fight applyOptimisticMove's sibling-rank contract).
+  const moveTaskMutation = useMoveTask();
+  const focusTaskMutation = useFocusTask();
+  const unfocusTaskMutation = useUnfocusTask();
+  const createTaskMutation = useCreateTask();
+  const updateTaskMutation = useUpdateTask();
+  const deleteTaskMutation = useDeleteTask();
 
   // ──────────────────────────────────────────
   // URL filters (ADR 0002 § Filters)
@@ -457,19 +444,11 @@ export function BoardPage() {
     setActionError(null);
     setMovingIds((prev) => new Set(prev).add(taskId));
     try {
-      const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+      const data = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: body,
       });
-      if (!res.ok) {
-        const message = await readError(res);
-        setTasks(snapshot);
-        setActionError(message);
-        return message;
-      }
-      onSuccess((await res.json()) as MoveTaskResponse);
+      onSuccess(data);
       return null;
     } catch (err) {
       setTasks(snapshot);
@@ -636,7 +615,7 @@ export function BoardPage() {
   };
 
   // ──────────────────────────────────────────
-  // Focus toggle (task-focus, slice 4)
+  // Focus toggle
   // ──────────────────────────────────────────
 
   /** Merges the authoritative `{ task, previous }` rows from a focus response
@@ -670,8 +649,7 @@ export function BoardPage() {
    *  - 200 → merge the authoritative `{ task, previous }` rows (onSuccess);
    *  - failure → restore the full snapshot and raise the action banner.
    *  Returns the error message (null on success) so the modal Focus pill can
-   *  show it on the form too. Mirrors sendMoveRequest (API_BASE_URL,
-   *  credentials: 'include', readError). */
+   *  show it on the form too. Mirrors sendMoveRequest. */
   const sendFocusRequest = async (
     isFocus: boolean,
     taskId: string,
@@ -681,22 +659,11 @@ export function BoardPage() {
     setFocusInFlight(true);
     setActionError(null);
     try {
-      const res = isFocus
-        ? await fetch(`${API_BASE_URL}/api/tasks/${taskId}/focus`, {
-            method: 'POST',
-            credentials: 'include',
-          })
-        : await fetch(`${API_BASE_URL}/api/focus`, {
-            method: 'DELETE',
-            credentials: 'include',
-          });
-      if (!res.ok) {
-        const message = await readError(res);
-        setTasks(snapshot);
-        setActionError(message);
-        return message;
-      }
-      onSuccess((await res.json()) as FocusTaskResponse);
+      onSuccess(
+        isFocus
+          ? await focusTaskMutation.mutateAsync(taskId)
+          : await unfocusTaskMutation.mutateAsync(),
+      );
       return null;
     } catch (err) {
       setTasks(snapshot);
@@ -738,7 +705,7 @@ export function BoardPage() {
   };
 
   // ──────────────────────────────────────────
-  // Task actions (New Task + click-to-edit; no timer buttons this slice)
+  // Task actions (New Task + click-to-edit)
   // ──────────────────────────────────────────
 
   /** Opens the create dialog with the status pills locked to `status` —
@@ -777,7 +744,9 @@ export function BoardPage() {
   }): Promise<string | null> => {
     if (!taskForm) return null;
     setActionError(null);
-    const body: NewTaskInput | UpdateTaskInput = {
+    // `NewTaskInput` on purpose: create sends the full set, and the edit
+    // PATCH accepts it too (every field optional server-side).
+    const body: NewTaskInput = {
       title: values.title,
       description: values.description,
       duration_minutes: values.durationMinutes,
@@ -787,43 +756,34 @@ export function BoardPage() {
 
     // ── Edit (PATCH) — unchanged: merge the returned task, close.
     if (taskForm.mode === 'edit') {
-      const res = await fetch(
-        `${API_BASE_URL}/api/tasks/${taskForm.task!.id}`,
-        {
-          method: 'PATCH',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        },
-      );
-      if (!res.ok) {
-        return await readError(res);
+      try {
+        const data = await updateTaskMutation.mutateAsync({
+          id: taskForm.task!.id,
+          input: body,
+        });
+        setTasks((prev) =>
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+        );
+        closeTaskForm();
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : 'Save failed';
       }
-      const data = (await res.json()) as TaskResponse;
-      setTasks((prev) =>
-        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
-      );
-      closeTaskForm();
-      return null;
     }
 
     // ── Create (POST always stamps OPEN on the server — `createStatus` only
     //    decides whether a follow-up /move is needed, it never goes in the
     //    request body).
-    const createRes = await fetch(`${API_BASE_URL}/api/tasks`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    // Create 400 etc.: return the error, the modal stays open on the form.
-    if (!createRes.ok) {
-      return await readError(createRes);
+    let data: TaskResponse;
+    try {
+      data = await createTaskMutation.mutateAsync(body);
+    } catch (err) {
+      // Create 400 etc.: return the error, the modal stays open on the form.
+      return err instanceof Error ? err.message : 'Create failed';
     }
     // The response carries the computed category — reuse it directly so the
     // card lands in the right column instantly. The server never returns an
     // untracked result on create (create stays strict).
-    const data = (await createRes.json()) as TaskResponse;
     const dest = taskForm.createStatus ?? 'OPEN';
 
     // Destination is the create status itself: done, no useless same-status
@@ -853,37 +813,25 @@ export function BoardPage() {
       ...prev,
     ]);
 
-    let moveRes: Response;
+    let moveData: MoveTaskResponse;
     try {
-      moveRes = await fetch(`${API_BASE_URL}/api/tasks/${data.task.id}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(moveBody),
+      moveData = await moveTaskMutation.mutateAsync({
+        id: data.task.id,
+        input: moveBody,
       });
     } catch (err) {
-      // Network failure: restore the pre-move snapshot, then ensure the
-      // created card is present as OPEN/Backlog at the server-assigned
-      // append rank (the orphan stays — the server owns the create, nothing
-      // to undo). Banner, close.
+      // Failure — network or HTTP (401 missing Google token, 400, …):
+      // restore the pre-move snapshot, then ensure the created card is
+      // present as OPEN/Backlog at the server-assigned append rank (the
+      // orphan stays — the server owns the create, nothing to undo).
+      // Banner, close (null closes the modal).
       setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
       const message = err instanceof Error ? err.message : 'Move failed';
       setActionError(message);
       closeTaskForm();
       return null;
     }
-    // Move failure (401 missing Google token, 400, …): restore the full
-    // pre-move snapshot with the created card OPEN at its append rank.
-    // Banner, close (null closes the modal).
-    if (!moveRes.ok) {
-      const message = await readError(moveRes);
-      setTasks(() => [data.task, ...snapshotBeforeOptimistic]);
-      setActionError(message);
-      closeTaskForm();
-      return null;
-    }
     // Move success: merge the authoritative row.
-    const moveData = (await moveRes.json()) as MoveTaskResponse;
     setTasks((prev) =>
       prev.map((entry) =>
         entry.id === moveData.task.id ? moveData.task : entry,
@@ -895,12 +843,10 @@ export function BoardPage() {
 
   const handleTaskDelete = async (taskId: string): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) {
-      return await readError(res);
+    try {
+      await deleteTaskMutation.mutateAsync(taskId);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Delete failed';
     }
     setTasks((prev) => prev.filter((entry) => entry.id !== taskId));
     closeTaskForm();
@@ -944,8 +890,14 @@ export function BoardPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setLoadError(null);
-                load();
+                // Refetch lists first — tasks/categories are seed-gated on
+                // lists success and re-run automatically; when lists are
+                // already loaded, refetch tasks and categories too.
+                void listsQuery.refetch();
+                if (listsQuery.isSuccess) {
+                  void tasksQuery.refetch();
+                  void categoriesQuery.refetch();
+                }
               }}
             >
               Retry

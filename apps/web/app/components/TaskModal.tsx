@@ -13,19 +13,16 @@ import {
   useTitleClassification,
   type ClassifyStatus,
 } from '@/app/hooks/useTitleClassification';
-import { buildClassifyUrl } from '@/app/hooks/classify-url';
+import { classifyTask } from '@/lib/api';
 import { cn } from '@/lib/utils';
-import { API_BASE_URL } from '@/lib/api';
+import { useListsQuery } from '@/app/queries/lists';
+import { useCategoriesQuery } from '@/app/queries/categories';
 import {
   TASK_PRIORITIES,
   TASK_PRIORITY_LABELS,
-  type CategoriesResponse,
-  type Category,
   type ClassifyResponse,
   type TaskCategorySummary,
   type TaskDifficulty,
-  type TaskList,
-  type TaskListsResponse,
   type TaskPriority,
   type TaskRecord,
   type TaskStatus,
@@ -96,11 +93,7 @@ async function classifyOnce(
   lock: string | null,
 ): Promise<ClassifyResponse | null> {
   try {
-    const res = await fetch(`${API_BASE_URL}${buildClassifyUrl(text, lock)}`, {
-      credentials: 'include',
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as ClassifyResponse;
+    return await classifyTask(text, lock);
   } catch {
     return null;
   }
@@ -156,40 +149,18 @@ export function TaskModal({
     }
   }, [open, task?.id]);
 
-  // The modal owns its picker data: it fetches lists + categories on open
-  // (ListsPage does not load categories today), so callers need no new props.
-  const [lists, setLists] = useState<TaskList[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setLists([]);
-    setCategories([]);
-    void Promise.all([
-      fetch(`${API_BASE_URL}/api/lists`, { credentials: 'include' }),
-      fetch(`${API_BASE_URL}/api/categories`, { credentials: 'include' }),
-    ])
-      .then(async ([listsRes, catsRes]) => {
-        if (cancelled) return;
-        const listsData = listsRes.ok
-          ? ((await listsRes.json()) as TaskListsResponse)
-          : null;
-        const catsData = catsRes.ok
-          ? ((await catsRes.json()) as CategoriesResponse)
-          : null;
-        setLists(listsData?.lists ?? []);
-        setCategories(catsData?.categories ?? []);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setLists([]);
-          setCategories([]);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
+  // The modal shares the picker data with the query cache: lists fetch on
+  // first open, and categories are seed-gated on lists success (the same
+  // rule as CategoriesPage — GET /api/lists seeds the taxonomy, so a
+  // parallel fetch could return [] on first paint). The cache means a
+  // re-open within staleTime does not refetch — intended. On failure the
+  // picker just sees [] (same degrade as the old Promise.all).
+  const listsQuery = useListsQuery({ enabled: open });
+  const categoriesQuery = useCategoriesQuery({
+    enabled: open && listsQuery.isSuccess,
+  });
+  const lists = listsQuery.data?.lists ?? [];
+  const categories = categoriesQuery.data?.categories ?? [];
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');

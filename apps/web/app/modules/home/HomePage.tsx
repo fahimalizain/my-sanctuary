@@ -6,7 +6,7 @@
 // timeline (SkewedTimeline stays in components/, unused — no drive-by
 // delete).
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { ChevronLeft, ChevronRight, Loader2, Plus, Repeat } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -21,7 +21,29 @@ import { FocusTimer } from '@/app/components/FocusTimer';
 import { QuotesSection } from '@/app/components/QuotesSection';
 import { TaskModal } from '@/app/components/TaskModal';
 import { quotes } from '@/app/mock-data';
-import { API_BASE_URL } from '@/lib/api';
+import {
+  setAgendaItems,
+  useAgendaQuery,
+  useCreateAgendaItem,
+  useDeleteAgendaItem,
+  useMoveAgendaItem,
+  useRescheduleAgendaItem,
+} from '@/app/queries/agenda';
+import { queryKeys } from '@/app/queries/keys';
+import {
+  useCompleteOccurrence,
+  useSkipOccurrence,
+  useStartOccurrence,
+  useUpdateOccurrence,
+} from '@/app/queries/occurrences';
+import {
+  setTasksCache,
+  useDeleteTask,
+  useMoveTask,
+  useRunTaskAction,
+  useUpdateTask,
+} from '@/app/queries/tasks';
+import { queryClient } from '@/lib/queryClient';
 import { AgendaItemRow } from './AgendaItemRow';
 import { TaskPickerDialog } from './TaskPickerDialog';
 import { addCivilDays } from '@/app/modules/routines/rrule-preview';
@@ -29,25 +51,16 @@ import {
   agendaDateLabel,
   agendaMoveTarget,
   applyAgendaMove,
-  readError,
 } from './agenda-helpers';
 import type {
   AgendaItemRecord,
-  AgendaItemResponse,
-  AgendaResponse,
-  MoveAgendaItemInput,
   MoveTaskInput,
-  MoveTaskResponse,
   NewAgendaItemInput,
-  OccurrenceActionResponse,
   OccurrenceRecord,
-  OccurrenceResponse,
   OccurrenceStatus,
-  RescheduleAgendaItemInput,
   TaskDifficulty,
   TaskPriority,
   TaskRecord,
-  TaskResponse,
   TaskStatus,
   UpdateTaskInput,
 } from '@/app/types';
@@ -58,21 +71,29 @@ export function HomePage() {
   // (ADR 0004 amendment — the browser's local date must NOT pick the default
   // Home date), then the first GET's `today` becomes the viewed date.
   const [date, setDate] = useState('');
+  // `date === ''` → the sentinel key ['agenda','today'] and a `getAgenda()`
+  // with no `?date=` (ADR 0004 — the browser never computes today).
+  const agendaQuery = useAgendaQuery(date);
+  const items = agendaQuery.data?.items ?? [];
   // The server's civil today (primary calendar time zone, chrono-tz) —
   // refreshed from EVERY GET; anchors the header label, the "Today" button,
   // and the Play gate.
-  const [serverToday, setServerToday] = useState('');
-  const [items, setItems] = useState<AgendaItemRecord[]>([]);
+  const serverToday = agendaQuery.data?.today ?? '';
+  const isLoading = agendaQuery.isLoading;
+  // Load failures: the date-keyed query error. Replaces the list when there
+  // are no rows; with rows on screen it reads as a refresh-failure notice.
+  const loadError =
+    agendaQuery.error instanceof Error
+      ? agendaQuery.error.message
+      : agendaQuery.error
+        ? 'Failed to load agenda'
+        : null;
   const itemsRef = useRef<AgendaItemRecord[]>([]);
   itemsRef.current = items;
-  // Latest `date` for the load callback below (same "latest value" pattern
-  // as RoutinesPage's routinesRef).
+  // Latest `date` for the mutation callbacks below (same "latest value"
+  // pattern as RoutinesPage's routinesRef).
   const dateRef = useRef(date);
   dateRef.current = date;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the list when there are
-  // no rows; with rows on screen it reads as a refresh-failure notice.
-  const [loadError, setLoadError] = useState<string | null>(null);
   // Action failures (move/complete/skip/etc.): a banner above the still-
   // visible list — rows are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -84,59 +105,51 @@ export function HomePage() {
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameSaving, setRenameSaving] = useState(false);
 
+  // First-load seed (mandatory — prevents a flash-refetch): the sentinel
+  // query succeeded — copy its payload onto the civil-today key and adopt
+  // that date as the viewed date. The follow-up `useAgendaQuery(today)` is
+  // then a cache hit: no second GET, no empty flash.
+  useEffect(() => {
+    if (date !== '' || !agendaQuery.isSuccess || !agendaQuery.data) return;
+    const today = agendaQuery.data.today;
+    queryClient.setQueryData(queryKeys.agenda.byDate(today), agendaQuery.data);
+    setDate(today);
+  }, [date, agendaQuery.isSuccess, agendaQuery.data]);
+
+  // Optimistic agenda writes: the page owns the paint, the hooks own the
+  // API call + in-flight cancel. `setItems` writes the viewed date's key.
+  const setItems = (
+    updater:
+      | AgendaItemRecord[]
+      | ((prev: AgendaItemRecord[]) => AgendaItemRecord[]),
+  ) => setAgendaItems(dateRef.current, updater);
+
   const sortItems = (list: AgendaItemRecord[]): AgendaItemRecord[] =>
     [...list].sort((a, b) => a.sort_order - b.sort_order);
 
-  // A monotone token drops superseded fetches: changing the date (or
-  // starting a retry) invalidates any in-flight load for the old date, so a
-  // late response can never paint yesterday's rows under today's header.
-  const loadSeq = useRef(0);
-
-  const load = useCallback(() => {
-    const seq = ++loadSeq.current;
-    const requestedDate = dateRef.current;
-    // Full-page loader only while the list is empty — reloads fired while
-    // rows are on screen never flash the spinner.
-    setIsLoading(itemsRef.current.length === 0);
-    setLoadError(null);
-    // First load (no viewed date yet): omit `?date=` so the server reads its
-    // own today — the browser never computes the default Home date.
-    const query = requestedDate
-      ? `?date=${encodeURIComponent(requestedDate)}`
-      : '';
-    fetch(`${API_BASE_URL}/api/agenda${query}`, {
-      credentials: 'include',
-    })
-      .then(async (res) => {
-        if (seq !== loadSeq.current) return; // superseded
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as AgendaResponse;
-        // Keep the server's civil today from every GET (ADR 0004 amendment).
-        setServerToday(data.today);
-        setItems(sortItems(data.items ?? []));
-        // The first load adopts the server's today as the viewed date.
-        if (!requestedDate) setDate(data.today);
-      })
-      .catch((err: unknown) => {
-        if (seq !== loadSeq.current) return; // superseded
-        setLoadError(
-          err instanceof Error ? err.message : 'Failed to load agenda',
-        );
-      })
-      .finally(() => {
-        if (seq !== loadSeq.current) return;
-        setIsLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load, date]);
+  // Agenda write mutations: thin wrappers that cancel the viewed-
+  // date query on mutate so an in-flight refetch can never resolve over the
+  // page's optimistic cache mid-write. No invalidation on success — the
+  // handlers merge the authoritative row themselves.
+  const moveAgendaItemMutation = useMoveAgendaItem();
+  const rescheduleAgendaItemMutation = useRescheduleAgendaItem();
+  const createAgendaItemMutation = useCreateAgendaItem();
+  const deleteAgendaItemMutation = useDeleteAgendaItem();
+  const completeOccurrenceMutation = useCompleteOccurrence();
+  const skipOccurrenceMutation = useSkipOccurrence();
+  const startOccurrenceMutation = useStartOccurrence();
+  const updateOccurrenceMutation = useUpdateOccurrence();
+  // Task writes reuse the shared task mutations from `queries/tasks.ts`;
+  // after each success the handler also patches the `['tasks']` cache so
+  // Board/Lists see the fresh row (same sibling-rank contract —
+  // never invalidate).
+  const runTaskActionMutation = useRunTaskAction();
+  const updateTaskMutation = useUpdateTask();
+  const deleteTaskMutation = useDeleteTask();
+  const moveTaskMutation = useMoveTask();
 
   const changeDate = (next: string) => {
     if (!next || next === date) return;
-    loadSeq.current++; // drop any in-flight load for the old date
-    setItems([]); // never show the old date's rows under the new header
     setDate(next);
   };
 
@@ -151,33 +164,22 @@ export function HomePage() {
     // Optimistic paint that mirrors the server's shift exactly.
     setItems(applyAgendaMove(snapshot, itemId, target));
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/agenda/items/${itemId}/move`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sort_order: target,
-        } satisfies MoveAgendaItemInput),
+      const data = await moveAgendaItemMutation.mutateAsync({
+        id: itemId,
+        input: { sort_order: target },
+        date: dateRef.current,
       });
+      // Merge the authoritative row (fresh embeds); ranks already match.
+      setItems((prev) =>
+        sortItems(
+          prev.map((entry) => (entry.id === data.item.id ? data.item : entry)),
+        ),
+      );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    // Merge the authoritative row (fresh embeds); ranks already match.
-    const data = (await res.json()) as AgendaItemResponse;
-    setItems((prev) =>
-      sortItems(
-        prev.map((entry) => (entry.id === data.item.id ? data.item : entry)),
-      ),
-    );
   };
 
   // ──────────────────────────────────────────
@@ -198,35 +200,21 @@ export function HomePage() {
     const snapshot = itemsRef.current;
     setItems((prev) => prev.filter((entry) => entry.id !== item.id));
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(
-        `${API_BASE_URL}/api/agenda/items/${item.id}/reschedule`,
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            date: targetDate,
-          } satisfies RescheduleAgendaItemInput),
-        },
-      );
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: item.id,
+        input: { date: targetDate },
+        date: dateRef.current,
+      });
+      setItems((prev) => {
+        const next = prev.filter((entry) => entry.id !== item.id);
+        if (data.item.local_date === dateRef.current) next.push(data.item);
+        return sortItems(next);
+      });
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as AgendaItemResponse;
-    setItems((prev) => {
-      const next = prev.filter((entry) => entry.id !== item.id);
-      if (data.item.local_date === dateRef.current) next.push(data.item);
-      return sortItems(next);
-    });
   };
 
   // ──────────────────────────────────────────
@@ -247,30 +235,26 @@ export function HomePage() {
       ),
     );
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/tasks/${task.id}/complete`, {
-        method: 'POST',
-        credentials: 'include',
+      const data = await runTaskActionMutation.mutateAsync({
+        id: task.id,
+        action: 'complete',
       });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: data.task }
+            : entry,
+        ),
+      );
+      // Patch the shared tasks cache so Board/Lists see the fresh row.
+      setTasksCache((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Complete failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as MoveTaskResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.task
-          ? { ...entry, task: data.task }
-          : entry,
-      ),
-    );
   };
 
   /** Task → the existing `/start` (Board → In Progress). The FocusTimer is a
@@ -279,28 +263,25 @@ export function HomePage() {
     const task = item.task;
     if (!task) return;
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/tasks/${task.id}/start`, {
-        method: 'POST',
-        credentials: 'include',
+      const data = await runTaskActionMutation.mutateAsync({
+        id: task.id,
+        action: 'start',
       });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: data.task }
+            : entry,
+        ),
+      );
+      // Patch the shared tasks cache so Board/Lists see the fresh row.
+      setTasksCache((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Start failed');
-      return;
     }
-    if (!res.ok) {
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as MoveTaskResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.task
-          ? { ...entry, task: data.task }
-          : entry,
-      ),
-    );
   };
 
   /** Remove from today = hard-delete the membership row (unpin). The task
@@ -310,20 +291,14 @@ export function HomePage() {
     const snapshot = itemsRef.current;
     setItems((prev) => prev.filter((entry) => entry.id !== item.id));
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(`${API_BASE_URL}/api/agenda/items/${item.id}`, {
-        method: 'DELETE',
-        credentials: 'include',
+      await deleteAgendaItemMutation.mutateAsync({
+        id: item.id,
+        date: dateRef.current,
       });
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Remove failed');
-      return;
-    }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
     }
   };
 
@@ -345,33 +320,31 @@ export function HomePage() {
       ),
     );
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(
-        `${API_BASE_URL}/api/occurrences/${occurrence.id}/${verb}`,
-        { method: 'POST', credentials: 'include' },
+      const data =
+        verb === 'complete'
+          ? await completeOccurrenceMutation.mutateAsync({
+              id: occurrence.id,
+              date: dateRef.current,
+            })
+          : await skipOccurrenceMutation.mutateAsync({
+              id: occurrence.id,
+              date: dateRef.current,
+            });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
       );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Update failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as OccurrenceResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.occurrence
-          ? { ...entry, occurrence: data.occurrence }
-          : entry,
-      ),
-    );
   };
 
-  /** Occurrence start (slice 6): creates the one-shot Google log and flips
+  /** Occurrence start: creates the one-shot Google log and flips
    *  the chip to in_progress. Today-only on the server; the Play button is
    *  only rendered for today's pending occurrences. Optimistic → the chip
    *  reads In progress immediately; a 401/400 rolls back with a banner. */
@@ -390,30 +363,22 @@ export function HomePage() {
       ),
     );
     setActionError(null);
-    let res: Response;
     try {
-      res = await fetch(
-        `${API_BASE_URL}/api/occurrences/${occurrence.id}/start`,
-        { method: 'POST', credentials: 'include' },
+      const data = await startOccurrenceMutation.mutateAsync({
+        id: occurrence.id,
+        date: dateRef.current,
+      });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
       );
     } catch (err) {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Start failed');
-      return;
     }
-    if (!res.ok) {
-      setItems(snapshot);
-      setActionError(await readError(res));
-      return;
-    }
-    const data = (await res.json()) as OccurrenceActionResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id && entry.occurrence
-          ? { ...entry, occurrence: data.occurrence }
-          : entry,
-      ),
-    );
   };
 
   // ──────────────────────────────────────────
@@ -422,22 +387,22 @@ export function HomePage() {
 
   const handlePickTask = async (task: TaskRecord): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/agenda/items`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        kind: 'task',
-        ref_id: task.id,
-        date,
-      } satisfies NewAgendaItemInput),
-    });
-    if (!res.ok) return await readError(res);
-    // The server appends at max+1 for the date — the sorted insert lands it
-    // at the back of the pile.
-    const data = (await res.json()) as AgendaItemResponse;
-    setItems((prev) => sortItems([...prev, data.item]));
-    return null;
+    try {
+      // The server appends at max+1 for the date — the sorted insert lands it
+      // at the back of the pile.
+      const data = await createAgendaItemMutation.mutateAsync({
+        input: {
+          kind: 'task',
+          ref_id: task.id,
+          date,
+        } satisfies NewAgendaItemInput,
+        date: dateRef.current,
+      });
+      setItems((prev) => sortItems([...prev, data.item]));
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Add failed';
+    }
   };
 
   // ──────────────────────────────────────────
@@ -461,38 +426,44 @@ export function HomePage() {
   }): Promise<string | null> => {
     if (!taskModal) return null;
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskModal.id}`, {
-      method: 'PATCH',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: values.title,
-        description: values.description,
-        duration_minutes: values.durationMinutes,
-        priority: values.priority,
-        difficulty: values.difficulty,
-      } satisfies UpdateTaskInput),
-    });
-    if (!res.ok) return await readError(res);
-    // Merge the fresh embed straight into the rows (same refresh the
-    // agenda reload would give, without the spinner flash).
-    const data = (await res.json()) as TaskResponse;
-    mergeTask(data.task);
-    return null; // the modal closes itself on success
+    try {
+      // Merge the fresh embed straight into the rows (same refresh the
+      // agenda reload would give, without the spinner flash).
+      const data = await updateTaskMutation.mutateAsync({
+        id: taskModal.id,
+        input: {
+          title: values.title,
+          description: values.description,
+          duration_minutes: values.durationMinutes,
+          priority: values.priority,
+          difficulty: values.difficulty,
+        } satisfies UpdateTaskInput,
+      });
+      mergeTask(data.task);
+      // Patch the shared tasks cache so Board/Lists see the fresh row.
+      setTasksCache((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+      return null; // the modal closes itself on success
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Save failed';
+    }
   };
 
   const handleTaskModalDelete = async (
     taskId: string,
   ): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    });
-    if (!res.ok) return await readError(res);
+    try {
+      await deleteTaskMutation.mutateAsync(taskId);
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Delete failed';
+    }
     // The membership row is an orphan after the task dies — the next GET
     // omits it server-side; drop it locally now.
     setItems((prev) => prev.filter((entry) => entry.task?.id !== taskId));
+    // Patch the shared tasks cache so Board/Lists drop the task too.
+    setTasksCache((prev) => prev.filter((entry) => entry.id !== taskId));
     return null;
   };
 
@@ -501,19 +472,23 @@ export function HomePage() {
     status: TaskStatus,
   ): Promise<string | null> => {
     setActionError(null);
-    const res = await fetch(`${API_BASE_URL}/api/tasks/${taskId}/move`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status } satisfies MoveTaskInput),
-    });
-    if (!res.ok) return await readError(res);
-    const data = (await res.json()) as MoveTaskResponse;
-    mergeTask(data.task);
-    // The modal's status pills read `task.status` from its props — keep the
-    // edited copy fresh so the selection follows the server.
-    setTaskModal((prev) => (prev && prev.id === taskId ? data.task : prev));
-    return null;
+    try {
+      const data = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: { status } satisfies MoveTaskInput,
+      });
+      mergeTask(data.task);
+      // Patch the shared tasks cache so Board/Lists see the fresh row.
+      setTasksCache((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+      // The modal's status pills read `task.status` from its props — keep the
+      // edited copy fresh so the selection follows the server.
+      setTaskModal((prev) => (prev && prev.id === taskId ? data.task : prev));
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Move failed';
+    }
   };
 
   // ──────────────────────────────────────────
@@ -535,26 +510,25 @@ export function HomePage() {
     if (!renaming) return;
     setRenameSaving(true);
     setRenameError(null);
-    const res = await fetch(`${API_BASE_URL}/api/occurrences/${renaming.id}`, {
-      method: 'PATCH',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+    try {
       // Empty/whitespace clears the override — the day inherits again.
-      body: JSON.stringify({ title: renameTitle.trim() }),
-    });
-    if (!res.ok) {
+      const data = await updateOccurrenceMutation.mutateAsync({
+        id: renaming.id,
+        input: { title: renameTitle.trim() },
+        date: dateRef.current,
+      });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.occurrence && entry.occurrence.id === data.occurrence.id
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
+      );
+    } catch (err) {
       setRenameSaving(false);
-      setRenameError(await readError(res));
+      setRenameError(err instanceof Error ? err.message : 'Save failed');
       return;
     }
-    const data = (await res.json()) as OccurrenceResponse;
-    setItems((prev) =>
-      prev.map((entry) =>
-        entry.occurrence && entry.occurrence.id === data.occurrence.id
-          ? { ...entry, occurrence: data.occurrence }
-          : entry,
-      ),
-    );
     setRenameSaving(false);
     setRenaming(null);
   };
@@ -648,10 +622,7 @@ export function HomePage() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => {
-                    setLoadError(null);
-                    load();
-                  }}
+                  onClick={() => void agendaQuery.refetch()}
                 >
                   Retry
                 </Button>
@@ -673,8 +644,8 @@ export function HomePage() {
               </div>
             )}
 
-            {/* Loading — only while the list is empty (first load, a date
-                switch, or a retry after a hard error) */}
+            {/* Loading — only while the list is empty (first load or a date
+                switch; a retry keeps the banner until the refetch lands) */}
             {isLoading && items.length === 0 && (
               <div className="flex items-center justify-center py-24 gap-2 text-muted-foreground">
                 <Loader2 className="h-5 w-5 animate-spin" />

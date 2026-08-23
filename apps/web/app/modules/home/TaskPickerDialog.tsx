@@ -14,15 +14,12 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
-import { API_BASE_URL } from '@/lib/api';
+import { useListsQuery } from '@/app/queries/lists';
+import { useTasksQuery } from '@/app/queries/tasks';
 import { cn } from '@/lib/utils';
-import type { TaskRecord, TasksResponse } from '../../types';
+import type { TaskRecord } from '../../types';
 import { TASK_PRIORITY_LABELS } from '../../types';
-import {
-  agendaTaskMatches,
-  filterAgendaPickerTasks,
-  readError,
-} from './agenda-helpers';
+import { agendaTaskMatches, filterAgendaPickerTasks } from './agenda-helpers';
 
 interface TaskPickerDialogProps {
   open: boolean;
@@ -40,46 +37,41 @@ export function TaskPickerDialog({
   excludedTaskIds,
   onPick,
 }: TaskPickerDialogProps) {
-  const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [pickingId, setPickingId] = useState<string | null>(null);
   const [pickError, setPickError] = useState<string | null>(null);
-  // Retry inside an open dialog re-triggers the fetch (the effect keys on
-  // `open` only, so a retry while open must force a refetch another way).
-  const [reloadKey, setReloadKey] = useState(0);
 
-  // Refetch on every open — the board may have moved tasks meanwhile.
+  // Shared queries: tasks come from the one `['tasks']` cache the
+  // Board and Lists write, so moves made on the board are already visible —
+  // no refetch on every open (the 30s staleTime plus the shared cache
+  // replace the old "board may have moved" refetch). Lists stay seed-gated:
+  // GET /api/lists performs the first-visit seed, so tasks fetch after it.
+  const listsQuery = useListsQuery({ enabled: open });
+  const tasksQuery = useTasksQuery({ enabled: open && listsQuery.isSuccess });
+  const tasks = tasksQuery.data?.tasks ?? [];
+  const isLoading =
+    listsQuery.isLoading || (listsQuery.isSuccess && tasksQuery.isLoading);
+  const loadError =
+    (listsQuery.error instanceof Error
+      ? listsQuery.error.message
+      : listsQuery.error
+        ? 'Failed to load tasks'
+        : null) ??
+    (tasksQuery.error instanceof Error
+      ? tasksQuery.error.message
+      : tasksQuery.error
+        ? 'Failed to load tasks'
+        : null);
+
+  // Local UX reset on open: the search box and the pick error start fresh
+  // every time the dialog opens. The shared tasks cache is deliberately NOT
+  // cleared — that is the point of the shared cache.
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setTasks([]);
-    setQuery('');
-    setPickError(null);
-    setIsLoading(true);
-    setLoadError(null);
-    fetch(`${API_BASE_URL}/api/tasks`, { credentials: 'include' })
-      .then(async (res) => {
-        if (cancelled) return;
-        if (!res.ok) throw new Error(await readError(res));
-        const data = (await res.json()) as TasksResponse;
-        setTasks(data.tasks ?? []);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setLoadError(
-            err instanceof Error ? err.message : 'Failed to load tasks',
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setIsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, reloadKey]);
+    if (open) {
+      setQuery('');
+      setPickError(null);
+    }
+  }, [open]);
 
   const pickable = filterAgendaPickerTasks(tasks, excludedTaskIds);
   const visible = pickable.filter((task) => agendaTaskMatches(task, query));
@@ -127,7 +119,13 @@ export function TaskPickerDialog({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setReloadKey((n) => n + 1)}
+                onClick={() => {
+                  // Lists first — tasks are seed-gated on lists success and
+                  // re-run automatically; when lists are already loaded,
+                  // refetch tasks too.
+                  void listsQuery.refetch();
+                  if (listsQuery.isSuccess) void tasksQuery.refetch();
+                }}
               >
                 Retry
               </Button>

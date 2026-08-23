@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { API_BASE_URL } from '@/lib/api';
-import { buildClassifyUrl } from './classify-url';
-import type { ClassifyResponse, TaskCategorySummary } from '@/app/types';
+import { classifyTask } from '@/lib/api';
+import type { TaskCategorySummary } from '@/app/types';
 
 // The classify preview status + the chrome it computed. `matched` is a
 // guaranteed filing target; `nomatch`/`conflict` still carry the chrome the
@@ -135,20 +134,12 @@ export function useTitleClassification({
     // response is never dropped — the live title (the hole) differs by design.
     const isSeed =
       initialTitle !== undefined && trimmed === initialTitle.trim();
-    const url = `${API_BASE_URL}${buildClassifyUrl(trimmed, categoryId)}`;
 
     (async () => {
       try {
-        const res = await fetch(url, {
-          credentials: 'include',
+        const data = await classifyTask(trimmed, categoryId, {
           signal: controller.signal,
         });
-        if (!mountedRef.current) return;
-        if (!res.ok) {
-          setStatus({ state: 'idle' });
-          return; // silent degrade (the modal never fires the 400 cases)
-        }
-        const data = (await res.json()) as ClassifyResponse;
         if (!mountedRef.current) return;
         // The snap shape: the modal collapsed the input to the hole
         // (`display_title`) while this request was in flight for the full
@@ -200,8 +191,12 @@ export function useTitleClassification({
             displayTitle: data.Untracked.display_title,
           });
         }
-      } catch {
-        // AbortError and network failures both land here → silent degrade.
+      } catch (err) {
+        // An aborted request (superseded by a newer classify or a reset) is
+        // a silent return — the aborting side owns the state transition
+        // (reset → idle, re-fire → loading). Network failures and HTTP
+        // errors (ApiError) degrade to idle like today.
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         if (mountedRef.current) setStatus({ state: 'idle' });
       }
     })();
