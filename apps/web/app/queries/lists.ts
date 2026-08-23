@@ -1,10 +1,5 @@
 import { queryOptions, useMutation, useQuery } from '@tanstack/react-query';
-import {
-  createList,
-  deleteList,
-  listLists,
-  updateList,
-} from '@/lib/api';
+import { createList, deleteList, listLists, updateList } from '@/lib/api';
 import type { UpdateListInput } from '@/app/types';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';

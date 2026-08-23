@@ -10,7 +10,9 @@ export function listRoutines(): Promise<RoutinesResponse> {
   return fetchJson<RoutinesResponse>('/api/routines');
 }
 
-export function createRoutine(input: NewRoutineInput): Promise<RoutineResponse> {
+export function createRoutine(
+  input: NewRoutineInput,
+): Promise<RoutineResponse> {
   return fetchJson<RoutineResponse>('/api/routines', {
     method: 'POST',
     body: input,

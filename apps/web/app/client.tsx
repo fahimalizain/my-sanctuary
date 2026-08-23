@@ -15,7 +15,10 @@ if (!rootElement.innerHTML) {
         <RouterProvider router={router} />
       </AuthProvider>
       {import.meta.env.DEV ? (
-        <ReactQueryDevtools initialIsOpen={false} buttonPosition="bottom-left" />
+        <ReactQueryDevtools
+          initialIsOpen={false}
+          buttonPosition="bottom-left"
+        />
       ) : null}
     </QueryClientProvider>,
   );

@@ -47,7 +47,11 @@ import { queryClient } from '@/lib/queryClient';
 import { AgendaItemRow } from './AgendaItemRow';
 import { TaskPickerDialog } from './TaskPickerDialog';
 import { addCivilDays } from '@/app/modules/routines/rrule-preview';
-import { agendaDateLabel, agendaMoveTarget, applyAgendaMove } from './agenda-helpers';
+import {
+  agendaDateLabel,
+  agendaMoveTarget,
+  applyAgendaMove,
+} from './agenda-helpers';
 import type {
   AgendaItemRecord,
   MoveTaskInput,

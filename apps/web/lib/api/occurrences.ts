@@ -27,9 +27,7 @@ export function skipOccurrence(id: string): Promise<OccurrenceResponse> {
   });
 }
 
-export function startOccurrence(
-  id: string,
-): Promise<OccurrenceActionResponse> {
+export function startOccurrence(id: string): Promise<OccurrenceActionResponse> {
   return fetchJson<OccurrenceActionResponse>(`/api/occurrences/${id}/start`, {
     method: 'POST',
   });

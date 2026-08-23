@@ -758,9 +758,7 @@ export function BoardPage() {
           input: body,
         });
         setTasks((prev) =>
-          prev.map((entry) =>
-            entry.id === data.task.id ? data.task : entry,
-          ),
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
         );
         closeTaskForm();
         return null;

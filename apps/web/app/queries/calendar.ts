@@ -9,8 +9,7 @@ import { queryKeys } from './keys';
 export function calendarEventsQueryOptions(timeMin: string, timeMax: string) {
   return queryOptions({
     queryKey: queryKeys.calendar.events(timeMin, timeMax),
-    queryFn: ({ signal }) =>
-      listCalendarEvents({ timeMin, timeMax, signal }),
+    queryFn: ({ signal }) => listCalendarEvents({ timeMin, timeMax, signal }),
   });
 }
 

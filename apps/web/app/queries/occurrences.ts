@@ -25,7 +25,8 @@ async function cancelAgendaQuery(date: string): Promise<void> {
 
 export function useCompleteOccurrence() {
   return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) => completeOccurrence(id),
+    mutationFn: ({ id }: { id: string; date: string }) =>
+      completeOccurrence(id),
     onMutate: ({ date }) => cancelAgendaQuery(date),
   });
 }

@@ -39,10 +39,10 @@ export function rescheduleAgendaItem(
   id: string,
   input: RescheduleAgendaItemInput,
 ): Promise<AgendaItemResponse> {
-  return fetchJson<AgendaItemResponse>(
-    `/api/agenda/items/${id}/reschedule`,
-    { method: 'POST', body: input },
-  );
+  return fetchJson<AgendaItemResponse>(`/api/agenda/items/${id}/reschedule`, {
+    method: 'POST',
+    body: input,
+  });
 }
 
 export function deleteAgendaItem(id: string): Promise<void> {
