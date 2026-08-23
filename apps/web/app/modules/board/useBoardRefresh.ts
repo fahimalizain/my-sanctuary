@@ -1,8 +1,5 @@
 import { useEffect, useRef } from 'react';
-import {
-  BOARD_REFRESH_INTERVAL_MS,
-  shouldRefreshBoard,
-} from './board-refresh';
+import { BOARD_REFRESH_INTERVAL_MS, shouldRefreshBoard } from './board-refresh';
 
 /** Quietly refetches the board (lists → tasks+categories) every
  *  BOARD_REFRESH_INTERVAL_MS while mounted, and immediately when the tab
@@ -15,10 +12,7 @@ import {
  *  cheap no-ops; the interval is not torn down on visibility changes.
  *  Busy boards (live drag, in-flight move/focus/load) skip the refresh via
  *  `isBusy`. */
-export function useBoardRefresh(
-  load: () => void,
-  isBusy: () => boolean,
-): void {
+export function useBoardRefresh(load: () => void, isBusy: () => boolean): void {
   // Latest `load`/`isBusy` without re-subscribing: written during render
   // (the same "latest value" pattern as BoardPage's listsRef/tasksRef) so
   // the single [] effect below always reads fresh callbacks.
