@@ -401,3 +401,97 @@ export interface UpdateRoutineInput {
   exdates?: string[];
   sort_order?: number;
 }
+
+// ──────────────────────────────────────────
+// Agenda (ADR 0004 § Agenda rules) — shapes mirror
+// `packages/api-core/src/agenda.rs` view structs.
+// ──────────────────────────────────────────
+
+// Occurrence states (lowercase on purpose — these are NOT task statuses).
+export type OccurrenceStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
+
+// One local-date instance of a routine (ADR 0004 § Nouns): every
+// `routine_occurrences` column plus the routine's display fields
+// (`estimated_minutes`, `dtstart`/`rrule`/parsed `exdates`), the **resolved**
+// title and its computed category.
+export interface OccurrenceRecord {
+  id: string;
+  routine_id: string;
+  user_id: string;
+  // Local civil date `YYYY-MM-DD`.
+  local_date: string;
+  // Stored override; `null` = inherit the routine title.
+  title: string | null;
+  // `title ?? routine.title` — the display title and the classify input.
+  resolved_title: string;
+  // `pending | in_progress | done | skipped`.
+  status: OccurrenceStatus;
+  // From the routine (the estimate lives on the standing definition).
+  estimated_minutes: number;
+  // Naive local civil datetime `YYYY-MM-DDTHH:MM:SS` (routine, for display).
+  dtstart: string;
+  // RFC 5545 RRULE body (routine, for display).
+  rrule: string;
+  // Parsed local `YYYY-MM-DD` exclusions (routine, for display).
+  exdates: string[];
+  // Local calendar id once started (slice 6); `null` until then.
+  calendar_id: string | null;
+  // Google event id of the one-shot log (slice 6); `null` until then.
+  google_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+  // Computed from the **resolved** title with the same matcher as tasks.
+  category: TaskCategorySummary;
+}
+
+// Agenda item kinds (v1: occurrences are auto-seeded; POST is tasks-only).
+export type AgendaItemKind = 'task' | 'occurrence';
+
+// One agenda membership row with its embed: the task (kind `task`) or the
+// occurrence (kind `occurrence`) — exactly one is non-null.
+export interface AgendaItemRecord {
+  id: string;
+  user_id: string;
+  // Local civil date `YYYY-MM-DD`.
+  local_date: string;
+  kind: AgendaItemKind;
+  ref_id: string;
+  sort_order: number;
+  // Non-null for kind=task (full `TaskRecord`, `focused` included).
+  task: TaskRecord | null;
+  // Non-null for kind=occurrence.
+  occurrence: OccurrenceRecord | null;
+}
+
+// The envelope returned by GET /api/agenda?date=YYYY-MM-DD (seeds on read).
+export interface AgendaResponse {
+  items: AgendaItemRecord[];
+}
+
+// The envelope returned by POST /api/agenda/items and
+// POST /api/agenda/items/:id/move.
+export interface AgendaItemResponse {
+  item: AgendaItemRecord;
+}
+
+// Request body for POST /api/agenda/items — tasks only in v1 (occurrences
+// are auto-seeded); the `date` is required. `sort_order` is optional: the
+// server appends at `max+1` for the date when omitted.
+export interface NewAgendaItemInput {
+  kind: 'task';
+  ref_id: string;
+  date: string;
+  sort_order?: number;
+}
+
+// Request body for POST /api/agenda/items/:id/move — the absolute rank the
+// item lands on (peers at/after it shift up one, within that date's pile).
+export interface MoveAgendaItemInput {
+  sort_order: number;
+}
+
+// The envelope returned by PATCH /api/occurrences/:id,
+// POST /api/occurrences/:id/complete and POST /api/occurrences/:id/skip.
+export interface OccurrenceResponse {
+  occurrence: OccurrenceRecord;
+}
