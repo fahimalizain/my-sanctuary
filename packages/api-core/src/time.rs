@@ -4,6 +4,15 @@
 //! they are *always* derived from a caller-supplied Unix timestamp — never from
 //! `SystemTime`, which is unreliable on `wasm32-unknown-unknown`. The Worker
 //! sources "now" from `worker::Date::now()` (JS `Date.now()`).
+//!
+//! Civil "today" and the elongate grid are resolved through **chrono-tz** (the
+//! full IANA tzdb, ADR 0004 amendment): the user's primary Google calendar
+//! `time_zone` decides the civil date; unknown/empty zones fall back to UTC.
+//! The old fixed `resolve_tz_offset` table is gone.
+
+use chrono::{TimeZone, Timelike};
+use chrono_tz::Tz;
+use std::str::FromStr;
 
 /// Formats a Unix timestamp (seconds) as an RFC 3339 UTC string in the exact
 /// shape Go's `time.Now().UTC().Format(time.RFC3339)` produced, e.g.
@@ -14,6 +23,30 @@ pub fn unix_secs_to_rfc3339(secs: i64) -> String {
     let (year, month, day) = civil_from_days(days);
     let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Parses an IANA time zone name into its chrono-tz entry (full tzdb,
+/// DST-aware). Empty/unknown names → `None` — callers fall back to UTC
+/// (ADR 0004 amendment: "Unknown/empty IANA → UTC").
+pub fn parse_iana_tz(iana_tz: &str) -> Option<Tz> {
+    match iana_tz.trim() {
+        "" => None,
+        name => Tz::from_str(name).ok(),
+    }
+}
+
+/// The civil calendar date (`YYYY-MM-DD`) at a Unix instant **as seen in an
+/// IANA time zone** — chrono-tz, DST-aware (ADR 0004 amendment: "today" is
+/// the civil date of `now` in the user's primary calendar `time_zone`).
+/// Unknown/empty zones fall back to UTC.
+///
+/// Used by occurrence start (today-only), `GET /api/agenda`'s `today`, and
+/// the agenda tests.
+pub fn civil_date_in_zone(now_unix: i64, iana_tz: &str) -> String {
+    let tz = parse_iana_tz(iana_tz).unwrap_or(Tz::UTC);
+    let instant = chrono::DateTime::from_timestamp(now_unix, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant"));
+    instant.with_timezone(&tz).format("%Y-%m-%d").to_string()
 }
 
 /// Snaps a Unix timestamp (seconds) to the nearest whole minute (half-up):
@@ -35,41 +68,55 @@ pub fn nearest_minute_unix(secs: i64) -> i64 {
 /// ceiled up onto the 5-minute grid (multiples of 300) **as seen by the
 /// event calendar's IANA time zone**.
 ///
-/// The zone is resolved to a fixed UTC offset via [`resolve_tz_offset`] — no
-/// TZ database (api-core stays native-testable and small on wasm). The
-/// conversion is `local = instant + offset`, ceil the local wall clock,
-/// `instant' = ceiled_local - offset`.
-///
-/// Note: every common civil offset is a whole number of minutes and almost
-/// always a multiple of 5 minutes (e.g. `Asia/Kolkata`'s `+05:30` is
-/// `19_800 = 66 * 300`), so for those zones the result is numerically
-/// identical to a plain UTC ceil — the two grids are the same set of
-/// instants. The zone plumbing still matters for spec fidelity ("use the
-/// calendar TZ") and for any future non-multiple offset.
+/// DST-aware via chrono-tz (ADR 0004 amendment): the target instant is
+/// converted to the zone's local wall clock, ceiled to the next multiple of 5
+/// minutes (seconds included, so `11:17:55 → 11:20:00` and `11:20:55 →
+/// 11:25:00`), then converted back to a Unix instant. When the ceiled local
+/// time is ambiguous (a fall-back fold) `.single()` else `.earliest()`
+/// resolves it; when it does not exist (a spring-forward gap) the plain
+/// 5-minute grid on the raw instant is the fallback. Unknown/empty zones →
+/// UTC.
 pub fn ceil_5min_unix_in_zone(now_unix: i64, iana_tz: &str) -> i64 {
-    let offset = resolve_tz_offset(iana_tz);
-    let local = now_unix + 300 + offset;
-    let rem = local.rem_euclid(300);
-    let ceiled_local = if rem == 0 { local } else { local + 300 - rem };
-    ceiled_local - offset
-}
+    let tz = parse_iana_tz(iana_tz).unwrap_or(Tz::UTC);
+    let instant = chrono::DateTime::from_timestamp(now_unix, 0)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant"));
+    let target_local = (instant.with_timezone(&tz) + chrono::Duration::seconds(300)).naive_local();
 
-/// Resolves an IANA time zone to a fixed UTC offset in seconds.
-///
-/// Locked table (empty/unknown zones fall back to UTC — offset 0):
-/// - the UTC family (`UTC`, `Etc/UTC`, `Etc/GMT`, `Z`, `GMT`) and the empty
-///   string → 0
-/// - `Asia/Kolkata` / `Asia/Calcutta` → `+19800` (the production calendar)
-/// - `Asia/Dubai` → `+14400` (cheap fixed-offset addition)
-/// - anything else → 0 (UTC fallback, locked)
-///
-/// No DST-aware zones are modeled; a zone not listed simply behaves as UTC.
-fn resolve_tz_offset(iana_tz: &str) -> i64 {
-    match iana_tz {
-        "" | "UTC" | "Etc/UTC" | "Etc/GMT" | "Z" | "GMT" => 0,
-        "Asia/Kolkata" | "Asia/Calcutta" => 19_800, // +05:30 (production)
-        "Asia/Dubai" => 14_400,                     // +04:00
-        _ => 0,
+    // Ceil the local wall clock onto the 5-minute grid.
+    let mut day = target_local.date();
+    let mut secs_of_day =
+        target_local.hour() as i64 * 3600 + target_local.minute() as i64 * 60 + target_local.second() as i64;
+    let rem = secs_of_day.rem_euclid(300);
+    if rem != 0 {
+        secs_of_day += 300 - rem;
+    }
+    if secs_of_day >= 86_400 {
+        secs_of_day -= 86_400;
+        day = day.succ_opt().expect("day rollover stays in range");
+    }
+    let ceiled_naive = day
+        .and_hms_opt(
+            (secs_of_day / 3600) as u32,
+            ((secs_of_day % 3600) / 60) as u32,
+            (secs_of_day % 60) as u32,
+        )
+        .expect("grid minutes are valid");
+
+    // DST fold: a single mapping wins; an ambiguous one resolves to the
+    // earliest instant. A gap (spring-forward) falls back to the plain
+    // 5-minute grid on the instant itself.
+    let result = tz.from_local_datetime(&ceiled_naive);
+    match result.single().or_else(|| result.earliest()) {
+        Some(dt) => dt.timestamp(),
+        None => {
+            let t = now_unix + 300;
+            let rem = t.rem_euclid(300);
+            if rem == 0 {
+                t
+            } else {
+                t + 300 - rem
+            }
+        }
     }
 }
 
@@ -336,11 +383,12 @@ mod tests {
 
     #[test]
     fn ceil_5min_matches_utc_for_kolkata_since_offset_is_a_5min_multiple() {
-        // Asia/Kolkata is +05:30 = 19_800s = 66 * 300, so the 5-minute UTC
-        // grid and the IST 5-minute grid are the SAME set of instants — the
-        // unix result must match UTC exactly even though the local wall clock
-        // reads 16:50 there. (No test can make a multiple-of-5-min offset
-        // diverge; the zone path is exercised for spec fidelity.)
+        // Asia/Kolkata is +05:30 = 19_800s = 66 * 300 and has no DST, so the
+        // 5-minute UTC grid and the IST 5-minute grid are the SAME set of
+        // instants — the unix result must match UTC exactly even though the
+        // local wall clock reads 16:50 there. (No test can make a
+        // multiple-of-5-min offset diverge; the chrono-tz zone path is
+        // exercised for spec fidelity.)
         let now = rfc3339_to_unix_secs("2026-08-19T11:12:55Z").unwrap();
         let utc = ceil_5min_unix_in_zone(now, "UTC");
         let ist = ceil_5min_unix_in_zone(now, "Asia/Kolkata");
@@ -361,19 +409,95 @@ mod tests {
         assert_eq!(ceil_5min_unix_in_zone(now, ""), utc, "empty → UTC");
         assert_eq!(ceil_5min_unix_in_zone(now, "Etc/UTC"), utc);
         assert_eq!(ceil_5min_unix_in_zone(now, "Etc/GMT"), utc);
-        assert_eq!(ceil_5min_unix_in_zone(now, "America/New_York"), utc, "unknown → UTC");
         assert_eq!(ceil_5min_unix_in_zone(now, "bogus"), utc);
+        // America/New_York now resolves via chrono-tz: a whole-hour offset
+        // (-04:00 EDT) keeps the same set of grid instants, so this instant
+        // still lands on the identical unix result — but through the real
+        // zone, not the old unknown→UTC fallback.
+        assert_eq!(ceil_5min_unix_in_zone(now, "America/New_York"), utc);
     }
 
     #[test]
-    fn tz_offset_resolver_is_fixed_offsets_or_utc_fallback() {
-        for utc in ["", "UTC", "Etc/UTC", "Etc/GMT", "Z", "GMT"] {
-            assert_eq!(resolve_tz_offset(utc), 0, "{utc:?} → 0");
-        }
-        assert_eq!(resolve_tz_offset("Asia/Kolkata"), 19_800);
-        assert_eq!(resolve_tz_offset("Asia/Calcutta"), 19_800);
-        assert_eq!(resolve_tz_offset("Asia/Dubai"), 14_400);
-        assert_eq!(resolve_tz_offset("America/New_York"), 0, "unmodeled zone → UTC fallback");
+    fn ceil_5min_dst_fold_resolves_earliest_on_fall_back() {
+        // 2026-11-01: New York falls back at 02:00 EDT → 01:00 EST. 05:27:55Z
+        // is 01:27:55 EDT; +5 min = 01:32:55 occurs TWICE (EDT then EST), and
+        // the ceiled 01:35 is ambiguous — the fold resolves to the EARLIEST
+        // instant (01:35 EDT = 05:35:00Z), not 06:35:00Z.
+        let now = rfc3339_to_unix_secs("2026-11-01T05:27:55Z").unwrap();
+        assert_eq!(
+            unix_secs_to_rfc3339(ceil_5min_unix_in_zone(now, "America/New_York")),
+            "2026-11-01T05:35:00Z"
+        );
+    }
+
+    #[test]
+    fn ceil_5min_dst_gap_falls_back_to_the_plain_grid() {
+        // 2026-03-08: New York springs forward at 02:00 EST → 03:00 EDT.
+        // 06:57:55Z is 01:57:55 EST; +5 min = 02:02:55 local does NOT exist,
+        // and neither does the ceiled 02:05 — the gap falls back to the
+        // plain 5-minute grid on the raw instant (07:02:55Z → 07:05:00Z).
+        let now = rfc3339_to_unix_secs("2026-03-08T06:57:55Z").unwrap();
+        assert_eq!(
+            unix_secs_to_rfc3339(ceil_5min_unix_in_zone(now, "America/New_York")),
+            "2026-03-08T07:05:00Z"
+        );
+    }
+
+    #[test]
+    fn civil_date_in_zone_kolkata_vs_utc() {
+        // 2026-08-23T18:30:00Z is 2026-08-24T00:00:00+05:30 in Kolkata —
+        // the instant is the same, the civil date is NOT.
+        let evening = rfc3339_to_unix_secs("2026-08-23T18:30:00Z").unwrap();
+        assert_eq!(civil_date_in_zone(evening, "UTC"), "2026-08-23");
+        assert_eq!(civil_date_in_zone(evening, "Asia/Kolkata"), "2026-08-24");
+        // 19:00Z → 00:30 the next day in IST.
+        assert_eq!(civil_date_in_zone(evening + 1800, "Asia/Kolkata"), "2026-08-24");
+        // Mid-morning UTC is the same civil date in both zones.
+        let morning = rfc3339_to_unix_secs("2026-08-23T10:00:00Z").unwrap();
+        assert_eq!(civil_date_in_zone(morning, "UTC"), "2026-08-23");
+        assert_eq!(civil_date_in_zone(morning, "Asia/Kolkata"), "2026-08-23");
+        // Late UTC evening the day before is already the next civil date in
+        // Kolkata (22:30Z → 04:00+05:30 the next day).
+        let late_previous = rfc3339_to_unix_secs("2026-08-22T23:30:00Z").unwrap();
+        assert_eq!(civil_date_in_zone(late_previous, "UTC"), "2026-08-22");
+        assert_eq!(civil_date_in_zone(late_previous, "Asia/Kolkata"), "2026-08-23");
+        // Unknown zones fall back to UTC (same locked rule as parse_iana_tz).
+        assert_eq!(civil_date_in_zone(evening, "America/New_York"), "2026-08-23");
+        assert_eq!(civil_date_in_zone(evening, ""), "2026-08-23");
+    }
+
+    #[test]
+    fn civil_date_in_zone_is_dst_aware() {
+        // Winter (EST, -05:00): 23:30Z is still the 15th in New York.
+        let winter = rfc3339_to_unix_secs("2026-01-15T23:30:00Z").unwrap();
+        assert_eq!(civil_date_in_zone(winter, "America/New_York"), "2026-01-15");
+        // Summer (EDT, -04:00): 18:30Z is 14:30 in New York.
+        let summer = rfc3339_to_unix_secs("2026-08-23T18:30:00Z").unwrap();
+        assert_eq!(civil_date_in_zone(summer, "America/New_York"), "2026-08-23");
+        // The spring-forward night: 04:59Z on 2026-03-08 is 23:59 EST on the
+        // 7th — the civil date boundary is DST-aware.
+        let spring_night = rfc3339_to_unix_secs("2026-03-08T04:59:00Z").unwrap();
+        assert_eq!(
+            civil_date_in_zone(spring_night, "America/New_York"),
+            "2026-03-07"
+        );
+        // The fall-back morning: 06:30Z on 2026-11-01 is 01:30 EST.
+        let fall_back = rfc3339_to_unix_secs("2026-11-01T06:30:00Z").unwrap();
+        assert_eq!(civil_date_in_zone(fall_back, "America/New_York"), "2026-11-01");
+    }
+
+    #[test]
+    fn parse_iana_tz_known_zones_parse_and_unknown_ones_fall_back() {
+        assert!(parse_iana_tz("UTC").is_some());
+        assert!(parse_iana_tz("Etc/UTC").is_some());
+        assert!(parse_iana_tz("Asia/Kolkata").is_some());
+        assert!(parse_iana_tz("Asia/Dubai").is_some());
+        assert!(parse_iana_tz("America/New_York").is_some());
+        // Empty/unknown names are NOT a zone — callers fall back to UTC.
+        assert!(parse_iana_tz("").is_none());
+        assert!(parse_iana_tz("   ").is_none());
+        assert!(parse_iana_tz("bogus").is_none());
+        assert!(parse_iana_tz("Z").is_none(), "Z is not a tzdb name");
     }
 
     #[test]

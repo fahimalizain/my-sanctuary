@@ -1,10 +1,12 @@
 mod auth;
+mod agenda;
 mod calendar;
 mod categories;
 mod cron;
 mod db;
 mod http;
 mod lists;
+mod routines;
 mod tasks;
 
 use worker::*;
@@ -116,6 +118,30 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/tasks/:id/move", auth::options)
         .options("/api/tasks/:id/focus", auth::options)
         .options("/api/focus", auth::options)
+        .get_async("/api/routines", routines::list_routines)
+        .post_async("/api/routines", routines::create_routine)
+        .patch_async("/api/routines/:id", routines::update_routine)
+        .delete_async("/api/routines/:id", routines::delete_routine)
+        .options("/api/routines", auth::options)
+        .options("/api/routines/:id", auth::options)
+        .get_async("/api/agenda", agenda::get_agenda)
+        .post_async("/api/agenda/items", agenda::add_agenda_item)
+        .post_async("/api/agenda/items/:id/move", agenda::move_agenda_item)
+        .post_async("/api/agenda/items/:id/reschedule", agenda::reschedule_agenda_item)
+        .delete_async("/api/agenda/items/:id", agenda::delete_agenda_item)
+        .options("/api/agenda", auth::options)
+        .options("/api/agenda/items", auth::options)
+        .options("/api/agenda/items/:id/move", auth::options)
+        .options("/api/agenda/items/:id/reschedule", auth::options)
+        .options("/api/agenda/items/:id", auth::options)
+        .patch_async("/api/occurrences/:id", agenda::patch_occurrence)
+        .post_async("/api/occurrences/:id/start", agenda::start_occurrence)
+        .post_async("/api/occurrences/:id/complete", agenda::complete_occurrence)
+        .post_async("/api/occurrences/:id/skip", agenda::skip_occurrence)
+        .options("/api/occurrences/:id", auth::options)
+        .options("/api/occurrences/:id/start", auth::options)
+        .options("/api/occurrences/:id/complete", auth::options)
+        .options("/api/occurrences/:id/skip", auth::options)
         .run(req, env)
         .await
 }

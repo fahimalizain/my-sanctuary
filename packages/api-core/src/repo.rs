@@ -16,10 +16,11 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Task,
-    TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateTask, UpdateTaskCategory,
-    UpdateTaskList, User, WatchChannel, NewWatchChannel,
+    AgendaItem, CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewAgendaItem, NewCalendar,
+    NewCalendarEvent, NewRoutine, NewRoutineOccurrence, NewTask, NewTaskCategory,
+    NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Routine,
+    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine,
+    UpdateTask, UpdateTaskCategory, UpdateTaskList, User, WatchChannel, NewWatchChannel,
 };
 
 /// Errors surfaced by repository operations.
@@ -339,6 +340,158 @@ pub trait TaskRepo: Send + Sync {
     ) -> Result<Option<i64>, RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+}
+
+/// Routine persistence (`routines` rows, ADR 0004).
+///
+/// All deletes are SOFT — the routine is the domain entity, and materialized
+/// `routine_occurrences` are never touched by it. Reads filter
+/// `deleted_at IS NULL`; a missing/soft-deleted/other-user routine is a 404 at
+/// the service layer (ownership checked on the loaded row, like tasks).
+#[async_trait(?Send)]
+pub trait RoutineRepo: Send + Sync {
+    /// The user's living routines, ordered by standing `sort_order` then
+    /// creation time (the agenda seed order).
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<Routine>, RepoError>;
+    /// Returns the routine with local `id`, or `None` when absent or
+    /// soft-deleted. NOT user-scoped; callers must verify `row.user_id` (the
+    /// service does).
+    async fn get_by_id(&self, id: &str) -> Result<Option<Routine>, RepoError>;
+    /// Inserts a new routine and returns the stored row. The D1 implementation
+    /// generates the UUID `id` and the `created_at`/`updated_at` timestamps.
+    async fn insert(&self, routine: NewRoutine) -> Result<Routine, RepoError>;
+    /// Updates `title`/`estimated_minutes`/`rrule`/`sort_order` on a living
+    /// routine (`None` fields are left unchanged) and returns the updated row,
+    /// or `None` when the routine is missing or soft-deleted.
+    async fn update(&self, id: &str, updates: &UpdateRoutine) -> Result<Option<Routine>, RepoError>;
+    /// SOFT delete: stamps `deleted_at = now_rfc3339`.
+    async fn soft_delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Highest living `sort_order` for the user's routines, or `None` when the
+    /// pile is empty. Used by `create_routine` to append: `max+1`, else 0.
+    async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
+}
+
+/// Occurrence persistence (`routine_occurrences` rows, ADR 0004).
+///
+/// Occurrences are **never soft-deleted** — the table has no `deleted_at`
+/// (skip is the decline). Reads carry no deleted filter. Ownership is checked
+/// by the service on the loaded row (`get_by_id` is deliberately NOT
+/// user-scoped, like `RoutineRepo::get_by_id`); the routine's own soft-delete
+/// is checked by the service via the join.
+#[async_trait(?Send)]
+pub trait OccurrenceRepo: Send + Sync {
+    /// Returns the occurrence with local `id`, or `None`. NOT user-scoped;
+    /// callers must verify `row.user_id` (the service does).
+    async fn get_by_id(&self, id: &str) -> Result<Option<RoutineOccurrence>, RepoError>;
+    /// The occurrence of `routine_id` on `local_date`, or `None`. The ensure
+    /// path's read side of the `UNIQUE (routine_id, local_date)` idempotency.
+    async fn get_by_routine_and_date(
+        &self,
+        routine_id: &str,
+        local_date: &str,
+    ) -> Result<Option<RoutineOccurrence>, RepoError>;
+    /// The user's occurrences on `local_date` — the embed source for an
+    /// agenda read (kind=occurrence items).
+    async fn list_by_user_and_date(
+        &self,
+        user_id: &str,
+        local_date: &str,
+    ) -> Result<Vec<RoutineOccurrence>, RepoError>;
+    /// **Idempotent ensure**: inserts the row (`title NULL`, `status
+    /// 'pending'`, D1 mints id/timestamps) and returns it; when the `UNIQUE
+    /// (routine_id, local_date)` already holds a row, loads and returns the
+    /// existing one. Callers get a row either way — seed-on-GET never 500s on
+    /// a concurrent duplicate.
+    async fn insert(&self, occurrence: NewRoutineOccurrence) -> Result<RoutineOccurrence, RepoError>;
+    /// Writes the title override; `None` clears it back to inheritance
+    /// (stores NULL). No soft-delete filter — the table has none.
+    async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError>;
+    /// Stores the one-shot log's ids on the occurrence (slice 6 — `/start`).
+    /// Both are written together; neither may be empty.
+    async fn set_event_ids(
+        &self,
+        id: &str,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<(), RepoError>;
+    /// Transitions `status` (`pending | in_progress | done | skipped`). No
+    /// soft-delete filter — the table has none.
+    async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError>;
+    /// Every `in_progress` occurrence across ALL users that carries both ids
+    /// (`calendar_id`/`google_event_id` NOT NULL) — the elongate cron's
+    /// occurrence work list (slice 6: grow living in_progress one-shot logs
+    /// the same way tasks are grown; rows without a chip are never recreated).
+    async fn list_in_progress(&self) -> Result<Vec<RoutineOccurrence>, RepoError>;
+}
+
+/// Agenda membership persistence (`agenda_items` rows, ADR 0004).
+///
+/// Membership is a subscription, not a domain entity: unpin is a **HARD**
+/// delete (the same reasoning as watch channels, ADR 0001). `sort_order`
+/// ranks the item inside its `(user, local_date)` pile.
+#[async_trait(?Send)]
+pub trait AgendaItemRepo: Send + Sync {
+    /// The user's items for `local_date` in pile order (`sort_order`, ties by
+    /// creation) — the response order.
+    async fn list_by_user_and_date(
+        &self,
+        user_id: &str,
+        local_date: &str,
+    ) -> Result<Vec<AgendaItem>, RepoError>;
+    /// Returns the item with local `id`, or `None`. NOT user-scoped; callers
+    /// must verify `row.user_id` (the service does).
+    async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError>;
+    /// The item at the `UNIQUE (user_id, local_date, kind, ref_id)` key, or
+    /// `None` — the add-task idempotency.
+    async fn get_by_key(
+        &self,
+        user_id: &str,
+        local_date: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<Option<AgendaItem>, RepoError>;
+    /// The user's item of `kind` referencing `ref_id` on ANY date, or `None` —
+    /// the seed's "no membership anywhere" check: an occurrence whose agenda
+    /// row was rescheduled to another day must not be re-attached to its rule
+    /// date.
+    async fn get_by_ref(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<Option<AgendaItem>, RepoError>;
+    /// **Idempotent ensure**: inserts the row and returns it; when the UNIQUE
+    /// key already holds a row, loads and returns the existing one (the
+    /// caller's sort_order is then ignored — a duplicate never reshuffles).
+    async fn insert(&self, item: NewAgendaItem) -> Result<AgendaItem, RepoError>;
+    /// HARD delete (unpin). The referenced task/occurrence is untouched.
+    async fn hard_delete(&self, id: &str) -> Result<(), RepoError>;
+    /// Highest `sort_order` in the user's `local_date` pile, or `None` when
+    /// empty — the append target (`max+1`, else 0).
+    async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError>;
+    /// Sets the item's pile rank. No `updated_at`: placement is a position
+    /// change, not a content update (same spirit as `TASK_SET_SORT_ORDER_SQL`).
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<(), RepoError>;
+    /// Relocates the item to `local_date` at `sort_order` (reschedule appends
+    /// `max+1` on the target pile). No `updated_at`: a slot move is a
+    /// placement change, not a content update (same spirit as
+    /// `set_sort_order`).
+    async fn set_local_date(
+        &self,
+        id: &str,
+        local_date: &str,
+        sort_order: i64,
+    ) -> Result<(), RepoError>;
+    /// Shifts every peer of the user's `local_date` pile ranked at or after
+    /// `from_rank` by `delta` (+1 up, -1 down) — the reorder's neighbor shift.
+    /// Never touches `updated_at` (same spirit as `TASK_SHIFT_SORT_ORDER_SQL`).
+    async fn shift_sort_order(
+        &self,
+        user_id: &str,
+        local_date: &str,
+        from_rank: i64,
+        delta: i64,
+    ) -> Result<(), RepoError>;
 }
 
 /// Task audit-trail persistence (`task_logs` rows).
@@ -919,6 +1072,166 @@ pub const WATCH_CHANNEL_DELETE_BY_ID_SQL: &str =
 pub const WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL: &str =
     "DELETE FROM google_calendars_watch_channels WHERE calendar_id = ?";
 
+// ──────────────────────────────────────────
+// Routine SQL (ADR 0004)
+// ──────────────────────────────────────────
+
+/// Living routines for the user in standing order (`sort_order`, ties by
+/// creation time) — the agenda seed order.
+pub const ROUTINE_LIST_BY_USER_ID_SQL: &str =
+    "SELECT * FROM routines WHERE user_id = ? AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC";
+
+pub const ROUTINE_GET_BY_ID_SQL: &str =
+    "SELECT * FROM routines WHERE id = ? AND deleted_at IS NULL";
+
+/// Plain INSERT (no `ON CONFLICT`): routines are user-authored, never upserted.
+/// The D1 implementation binds the UUID `id` and the timestamps; `rrule`
+/// arrives as the two-line recurrence blob (DTSTART + RRULE).
+pub const ROUTINE_INSERT_SQL: &str = "
+    INSERT INTO routines
+        (id, user_id, title, estimated_minutes, rrule, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). Rule
+/// changes never touch materialized occurrences — they only affect future
+/// ensure. The D1 implementation binds `D1Type::Null` for `None` fields.
+pub const ROUTINE_UPDATE_SQL: &str = "
+    UPDATE routines SET
+        title = COALESCE(?, title),
+        estimated_minutes = COALESCE(?, estimated_minutes),
+        rrule = COALESCE(?, rrule),
+        sort_order = COALESCE(?, sort_order),
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
+/// Materialized `routine_occurrences` are NOT touched.
+pub const ROUTINE_DELETE_SQL: &str =
+    "UPDATE routines SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// The highest living standing rank — the append target behind
+/// `create_routine` (`max + 1`, or 0 on an empty pile). `LIMIT 1` over `MAX()`
+/// so an empty pile reads as `None` via `first()`.
+pub const ROUTINE_MAX_SORT_ORDER_SQL: &str = "
+    SELECT sort_order FROM routines
+    WHERE user_id = ? AND deleted_at IS NULL
+    ORDER BY sort_order DESC
+    LIMIT 1
+";
+
+// ──────────────────────────────────────────
+// Occurrence SQL (ADR 0004)
+// ──────────────────────────────────────────
+
+/// Reads carry no `deleted_at` filter: `routine_occurrences` has none (skip
+/// is the decline; the routine's own soft-delete is checked by the service).
+pub const OCCURRENCE_GET_BY_ID_SQL: &str = "SELECT * FROM routine_occurrences WHERE id = ?";
+
+pub const OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL: &str =
+    "SELECT * FROM routine_occurrences WHERE routine_id = ? AND local_date = ?";
+
+pub const OCCURRENCE_LIST_BY_USER_AND_DATE_SQL: &str =
+    "SELECT * FROM routine_occurrences WHERE user_id = ? AND local_date = ?";
+
+/// Idempotent ensure (seed-on-GET): `OR IGNORE` absorbs the `UNIQUE
+/// (routine_id, local_date)` race — the D1 implementation re-reads the row
+/// afterwards, so callers get the existing occurrence on a duplicate instead
+/// of a constraint error. `title`/`status` take the schema defaults (NULL /
+/// 'pending'); seeding copies no title, inheritance stays live.
+pub const OCCURRENCE_INSERT_SQL: &str = "
+    INSERT OR IGNORE INTO routine_occurrences
+        (id, routine_id, user_id, local_date, title, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, NULL, 'pending', ?, ?)
+";
+
+/// Writes the title override; binding `NULL` clears it back to inheritance.
+/// No `deleted_at` filter — the table has none.
+pub const OCCURRENCE_UPDATE_TITLE_SQL: &str =
+    "UPDATE routine_occurrences SET title = ?, updated_at = ? WHERE id = ?";
+
+/// Stores the one-shot log's ids on the occurrence (slice 6 — `/start`).
+/// No `deleted_at` filter — the table has none.
+pub const OCCURRENCE_SET_EVENT_IDS_SQL: &str =
+    "UPDATE routine_occurrences SET calendar_id = ?, google_event_id = ?, updated_at = ? WHERE id = ?";
+
+/// Occurrence status transitions (complete/skip). No `deleted_at` filter.
+pub const OCCURRENCE_SET_STATUS_SQL: &str =
+    "UPDATE routine_occurrences SET status = ?, updated_at = ? WHERE id = ?";
+
+/// The elongate cron's occurrence work list (slice 6): every `in_progress`
+/// occurrence that actually has a chip. Rows without ids are never recreated
+/// here — a start stores both ids together, so a missing one means the row
+/// never started (or the ids were lost) and there is nothing to grow.
+pub const OCCURRENCE_LIST_IN_PROGRESS_SQL: &str = "
+    SELECT * FROM routine_occurrences
+    WHERE status = 'in_progress'
+      AND calendar_id IS NOT NULL AND calendar_id != ''
+      AND google_event_id IS NOT NULL AND google_event_id != ''
+";
+
+// ──────────────────────────────────────────
+// Agenda item SQL (ADR 0004)
+// ──────────────────────────────────────────
+
+/// The user's items for a date in pile order — the response order. Ties by
+/// creation keep the seed append order deterministic.
+pub const AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL: &str =
+    "SELECT * FROM agenda_items WHERE user_id = ? AND local_date = ? ORDER BY sort_order ASC, created_at ASC";
+
+pub const AGENDA_ITEM_GET_BY_ID_SQL: &str = "SELECT * FROM agenda_items WHERE id = ?";
+
+pub const AGENDA_ITEM_GET_BY_KEY_SQL: &str =
+    "SELECT * FROM agenda_items WHERE user_id = ? AND local_date = ? AND kind = ? AND ref_id = ?";
+
+/// The seed's "no membership anywhere" read: any item of `kind` referencing
+/// `ref_id` for the user, on ANY date. An occurrence rescheduled to another
+/// day keeps its membership row there, so a GET on its rule date must not
+/// re-attach it.
+pub const AGENDA_ITEM_GET_BY_REF_SQL: &str =
+    "SELECT * FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ? LIMIT 1";
+
+/// Idempotent ensure: `OR IGNORE` absorbs the `UNIQUE (user_id, local_date,
+/// kind, ref_id)` race — a duplicate returns the existing row (its stored
+/// sort_order wins; an add never reshuffles).
+pub const AGENDA_ITEM_INSERT_SQL: &str = "
+    INSERT OR IGNORE INTO agenda_items
+        (id, user_id, local_date, kind, ref_id, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+/// HARD delete (unpin): membership is a subscription, not a domain entity.
+pub const AGENDA_ITEM_DELETE_SQL: &str = "DELETE FROM agenda_items WHERE id = ?";
+
+/// Highest rank in the user's date pile — the append target (`max+1`, else
+/// 0). `LIMIT 1` over `MAX()` so an empty pile reads as `None` via `first()`.
+pub const AGENDA_ITEM_MAX_SORT_ORDER_SQL: &str = "
+    SELECT sort_order FROM agenda_items
+    WHERE user_id = ? AND local_date = ?
+    ORDER BY sort_order DESC
+    LIMIT 1
+";
+
+/// Sets the item's pile rank. No `updated_at`: placement is a position
+/// change, not a content update (same spirit as `TASK_SET_SORT_ORDER_SQL`).
+pub const AGENDA_ITEM_SET_SORT_ORDER_SQL: &str =
+    "UPDATE agenda_items SET sort_order = ? WHERE id = ?";
+
+/// Relocates the item to another date at a new rank (reschedule). No
+/// `updated_at`: a slot move is a placement change, not a content update.
+pub const AGENDA_ITEM_SET_LOCAL_DATE_SQL: &str =
+    "UPDATE agenda_items SET local_date = ?, sort_order = ? WHERE id = ?";
+
+/// The reorder's neighbor shift: every peer of the user's date pile ranked at
+/// or after `from_rank` moves by `delta` (+1 up, -1 down). `updated_at` is
+/// left alone on purpose, same as `TASK_SHIFT_SORT_ORDER_SQL`.
+pub const AGENDA_ITEM_SHIFT_SORT_ORDER_SQL: &str = "
+    UPDATE agenda_items
+    SET sort_order = sort_order + ?
+    WHERE user_id = ? AND local_date = ? AND sort_order >= ?
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1497,5 +1810,135 @@ mod tests {
         assert!(sql.contains("calendar_id = ?"), "{sql}");
         assert!(sql.contains("google_event_id = ?"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn routine_reads_filter_soft_deleted_rows_and_order_by_standing_sort() {
+        assert!(ROUTINE_LIST_BY_USER_ID_SQL.contains("deleted_at IS NULL"), "{}", ROUTINE_LIST_BY_USER_ID_SQL);
+        let order_start = ROUTINE_LIST_BY_USER_ID_SQL
+            .find("ORDER BY")
+            .expect("has ORDER BY");
+        assert_eq!(
+            &ROUTINE_LIST_BY_USER_ID_SQL[order_start..],
+            "ORDER BY sort_order ASC, created_at ASC"
+        );
+        assert!(ROUTINE_GET_BY_ID_SQL.contains("deleted_at IS NULL"), "{}", ROUTINE_GET_BY_ID_SQL);
+    }
+
+    #[test]
+    fn routine_insert_binds_all_8_columns() {
+        assert!(ROUTINE_INSERT_SQL.contains("INSERT INTO routines"), "{}", ROUTINE_INSERT_SQL);
+        assert!(!ROUTINE_INSERT_SQL.contains("ON CONFLICT"), "{}", ROUTINE_INSERT_SQL);
+        assert_eq!(
+            ROUTINE_INSERT_SQL.matches('?').count(),
+            8,
+            "one placeholder per column: {}",
+            ROUTINE_INSERT_SQL
+        );
+        for column in [
+            "id", "user_id", "title", "estimated_minutes", "rrule",
+            "sort_order", "created_at", "updated_at",
+        ] {
+            assert!(ROUTINE_INSERT_SQL.contains(column), "missing {column}");
+        }
+        assert!(!ROUTINE_INSERT_SQL.contains("dtstart"), "{}", ROUTINE_INSERT_SQL);
+        assert!(!ROUTINE_INSERT_SQL.contains("exdates"), "{}", ROUTINE_INSERT_SQL);
+    }
+
+    #[test]
+    fn routine_update_uses_coalesce_for_partial_updates() {
+        let sql = ROUTINE_UPDATE_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("COALESCE(?, title)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, estimated_minutes)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, rrule)"), "{sql}");
+        assert!(sql.contains("COALESCE(?, sort_order)"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("dtstart"), "{sql}");
+        assert!(!sql.contains("exdates"), "{sql}");
+    }
+
+    #[test]
+    fn routine_delete_is_soft_not_hard() {
+        assert!(ROUTINE_DELETE_SQL.starts_with("UPDATE"), "{}", ROUTINE_DELETE_SQL);
+        assert!(ROUTINE_DELETE_SQL.contains("SET deleted_at = ?"), "{}", ROUTINE_DELETE_SQL);
+        assert!(!ROUTINE_DELETE_SQL.contains("DELETE FROM"), "{}", ROUTINE_DELETE_SQL);
+    }
+
+    #[test]
+    fn routine_max_sort_order_scopes_to_living_user_rows() {
+        let sql = ROUTINE_MAX_SORT_ORDER_SQL;
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("ORDER BY sort_order DESC"), "{sql}");
+        assert!(sql.contains("LIMIT 1"), "{sql}");
+    }
+
+    #[test]
+    fn occurrence_reads_have_no_deleted_filter_and_insert_is_idempotent() {
+        for sql in [
+            OCCURRENCE_GET_BY_ID_SQL,
+            OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL,
+            OCCURRENCE_LIST_BY_USER_AND_DATE_SQL,
+        ] {
+            assert!(sql.starts_with("SELECT * FROM routine_occurrences"), "{sql}");
+            assert!(!sql.contains("deleted_at"), "no soft-delete on occurrences: {sql}");
+        }
+        assert!(OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL.contains("routine_id = ? AND local_date = ?"), "{}", OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL);
+        assert!(OCCURRENCE_INSERT_SQL.trim_start().starts_with("INSERT OR IGNORE"), "{}", OCCURRENCE_INSERT_SQL);
+        assert!(OCCURRENCE_INSERT_SQL.contains("NULL, 'pending'"), "{}", OCCURRENCE_INSERT_SQL);
+        assert_eq!(OCCURRENCE_INSERT_SQL.matches('?').count(), 6, "{}", OCCURRENCE_INSERT_SQL);
+        assert_eq!(OCCURRENCE_UPDATE_TITLE_SQL.matches('?').count(), 3, "{}", OCCURRENCE_UPDATE_TITLE_SQL);
+        assert_eq!(OCCURRENCE_SET_STATUS_SQL.matches('?').count(), 3, "{}", OCCURRENCE_SET_STATUS_SQL);
+        assert_eq!(OCCURRENCE_SET_EVENT_IDS_SQL.matches('?').count(), 4, "{}", OCCURRENCE_SET_EVENT_IDS_SQL);
+        assert!(
+            OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("status = 'in_progress'"),
+            "{}",
+            OCCURRENCE_LIST_IN_PROGRESS_SQL
+        );
+        assert!(
+            OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("calendar_id") && OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("google_event_id"),
+            "both ids required: {}",
+            OCCURRENCE_LIST_IN_PROGRESS_SQL
+        );
+    }
+
+    #[test]
+    fn agenda_item_list_orders_by_pile_rank_and_delete_is_hard() {
+        assert!(
+            AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL.contains("ORDER BY sort_order ASC, created_at ASC"),
+            "{}",
+            AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL
+        );
+        assert!(AGENDA_ITEM_GET_BY_KEY_SQL.contains("user_id = ? AND local_date = ? AND kind = ? AND ref_id = ?"), "{}", AGENDA_ITEM_GET_BY_KEY_SQL);
+        assert!(AGENDA_ITEM_GET_BY_REF_SQL.contains("user_id = ? AND kind = ? AND ref_id = ?"), "{}", AGENDA_ITEM_GET_BY_REF_SQL);
+        assert!(!AGENDA_ITEM_GET_BY_REF_SQL.contains("local_date"), "any date: {}", AGENDA_ITEM_GET_BY_REF_SQL);
+        assert!(AGENDA_ITEM_GET_BY_REF_SQL.contains("LIMIT 1"), "{}", AGENDA_ITEM_GET_BY_REF_SQL);
+        assert!(AGENDA_ITEM_INSERT_SQL.trim_start().starts_with("INSERT OR IGNORE"), "{}", AGENDA_ITEM_INSERT_SQL);
+        assert_eq!(AGENDA_ITEM_INSERT_SQL.matches('?').count(), 8, "{}", AGENDA_ITEM_INSERT_SQL);
+        assert!(AGENDA_ITEM_DELETE_SQL.starts_with("DELETE FROM"), "{}", AGENDA_ITEM_DELETE_SQL);
+        assert!(!AGENDA_ITEM_DELETE_SQL.contains("deleted_at"), "{}", AGENDA_ITEM_DELETE_SQL);
+        assert!(AGENDA_ITEM_MAX_SORT_ORDER_SQL.contains("LIMIT 1"), "{}", AGENDA_ITEM_MAX_SORT_ORDER_SQL);
+    }
+
+    #[test]
+    fn agenda_item_reorder_shifts_peers_without_touching_updated_at() {
+        let sql = AGENDA_ITEM_SHIFT_SORT_ORDER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("sort_order = sort_order + ?"), "{sql}");
+        assert!(sql.contains("user_id = ? AND local_date = ?"), "{sql}");
+        assert!(sql.contains("sort_order >= ?"), "{sql}");
+        assert!(!sql.contains("updated_at"), "peer shifts never bump updated_at: {sql}");
+        assert_eq!(sql.matches('?').count(), 4, "{sql}");
+        let set = AGENDA_ITEM_SET_SORT_ORDER_SQL;
+        assert!(set.contains("SET sort_order = ?"), "{set}");
+        assert!(!set.contains("updated_at"), "placement never bumps updated_at: {set}");
+        assert_eq!(set.matches('?').count(), 2, "{set}");
+        let set_date = AGENDA_ITEM_SET_LOCAL_DATE_SQL;
+        assert!(set_date.contains("local_date = ?"), "{set_date}");
+        assert!(set_date.contains("sort_order = ?"), "{set_date}");
+        assert!(!set_date.contains("updated_at"), "a slot move never bumps updated_at: {set_date}");
+        assert!(!set_date.contains("deleted_at"), "hard-delete table: {set_date}");
+        assert_eq!(set_date.matches('?').count(), 3, "{set_date}");
     }
 }

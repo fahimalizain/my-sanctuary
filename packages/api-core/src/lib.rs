@@ -4,6 +4,7 @@
 //! (`cargo test -p api-core`) while still compiling for `wasm32-unknown-unknown`
 //! inside `apps/worker`.
 
+pub mod agenda;
 pub mod calendar;
 pub mod categories;
 pub mod google_color;
@@ -12,6 +13,7 @@ pub mod models;
 pub mod oauth;
 pub mod pattern_gen;
 pub mod repo;
+pub mod routines;
 pub mod tasks;
 pub mod time;
 pub mod token;
@@ -20,6 +22,14 @@ mod config;
 mod health;
 mod session;
 
+pub use agenda::{
+    add_agenda_item, complete_occurrence, delete_agenda_item, get_agenda, move_agenda_item,
+    patch_occurrence, reschedule_agenda_item, run_elongate_occurrences, skip_occurrence,
+    start_occurrence, AgendaError, AgendaItemResponse, AgendaItemView, AgendaResponse,
+    DeleteAgendaItemResponse, OccurrenceActionResponse, OccurrenceResponse, OccurrenceView,
+    AGENDA_KIND_OCCURRENCE, AGENDA_KIND_TASK, OCCURRENCE_STATUS_DONE,
+    OCCURRENCE_STATUS_IN_PROGRESS, OCCURRENCE_STATUS_PENDING, OCCURRENCE_STATUS_SKIPPED,
+};
 pub use calendar::{
     create_event, decide_webhook, ensure_watch, is_public_https_callback, list_calendars,
     list_events, parse_event_time_range, patch_event, renew_watch_if_needed, run_fallback_cron,
@@ -50,11 +60,26 @@ pub use oauth::{
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
+pub use routines::{
+    create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
+    validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,
+    RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
+};
 pub use repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
+    build_event_upsert_sql, AgendaItemRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo,
+    RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo,
+    UserRepo, WatchChannelRepo,
+    AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
+    AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
+    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
+    AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
+    OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
+    OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
+    ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
+    ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
     TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
@@ -84,6 +109,7 @@ pub use session::{
     SESSION_DURATION_SECS,
 };
 pub use time::{
-    ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
+    ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, parse_iana_tz,
+    rfc3339_to_unix_secs, unix_secs_to_rfc3339,
 };
 pub use token::{refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS};

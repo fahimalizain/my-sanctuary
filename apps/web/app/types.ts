@@ -342,3 +342,170 @@ export interface FocusTaskResponse {
   previous: TaskRecord | null;
   events: CalendarEvent[];
 }
+
+// A routine (ADR 0004 amendment): a standing definition of repeated work —
+// never completable, never on the Board. The `routines` row shape
+// (snake_case) plus the computed `category`.
+export interface RoutineRecord {
+  id: string;
+  user_id: string;
+  title: string;
+  estimated_minutes: number;
+  // The whole recurrence in one TEXT blob — exactly two `\n`-separated lines
+  // (ADR 0004 amendment): `DTSTART:YYYYMMDDTHHMMSS` (floating local, no
+  // Z/TZID) + `RRULE:<body>`. No EXDATE/RDATE/EXRULE/TZID anywhere.
+  rrule: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+  // Computed per title with the same matcher as tasks (never fails — an
+  // unmatched title keeps the `untracked` summary).
+  category: TaskCategorySummary;
+}
+
+// The envelope returned by GET /api/routines
+export interface RoutinesResponse {
+  routines: RoutineRecord[];
+}
+
+// The envelope returned by POST /api/routines and PATCH /api/routines/:id
+export interface RoutineResponse {
+  routine: RoutineRecord;
+}
+
+// Request body for POST /api/routines. `estimated_minutes` defaults to 15
+// server-side (min 1). The title must uniquely match a non-untracked category
+// (the server decides and explains 400s); `rrule` is the two-line recurrence
+// blob (`DTSTART:` line + `RRULE:` line), validated on create.
+export interface NewRoutineInput {
+  title: string;
+  estimated_minutes?: number;
+  rrule: string;
+}
+
+// Request body for PATCH /api/routines/:id — every field optional. A present
+// `title` must uniquely match a non-untracked category; a present `rrule`
+// blob is validated on its own (it carries its own DTSTART).
+export interface UpdateRoutineInput {
+  title?: string;
+  estimated_minutes?: number;
+  rrule?: string;
+  sort_order?: number;
+}
+
+// ──────────────────────────────────────────
+// Agenda (ADR 0004 § Agenda rules) — shapes mirror
+// `packages/api-core/src/agenda.rs` view structs.
+// ──────────────────────────────────────────
+
+// Occurrence states (lowercase on purpose — these are NOT task statuses).
+export type OccurrenceStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
+
+// One local-date instance of a routine (ADR 0004 § Nouns): every
+// `routine_occurrences` column plus the routine's display fields
+// (`estimated_minutes`, the `rrule` recurrence blob), the **resolved** title
+// and its computed category.
+export interface OccurrenceRecord {
+  id: string;
+  routine_id: string;
+  user_id: string;
+  // Local civil date `YYYY-MM-DD`.
+  local_date: string;
+  // Stored override; `null` = inherit the routine title.
+  title: string | null;
+  // `title ?? routine.title` — the display title and the classify input.
+  resolved_title: string;
+  // `pending | in_progress | done | skipped`.
+  status: OccurrenceStatus;
+  // From the routine (the estimate lives on the standing definition).
+  estimated_minutes: number;
+  // The routine's two-line recurrence blob (`DTSTART:` + `RRULE:`), for
+  // display.
+  rrule: string;
+  // Local calendar id once started (slice 6); `null` until then.
+  calendar_id: string | null;
+  // Google event id of the one-shot log (slice 6); `null` until then.
+  google_event_id: string | null;
+  created_at: string;
+  updated_at: string;
+  // Computed from the **resolved** title with the same matcher as tasks.
+  category: TaskCategorySummary;
+}
+
+// Agenda item kinds (v1: occurrences are auto-seeded; POST is tasks-only).
+export type AgendaItemKind = 'task' | 'occurrence';
+
+// One agenda membership row with its embed: the task (kind `task`) or the
+// occurrence (kind `occurrence`) — exactly one is non-null.
+export interface AgendaItemRecord {
+  id: string;
+  user_id: string;
+  // Local civil date `YYYY-MM-DD`.
+  local_date: string;
+  kind: AgendaItemKind;
+  ref_id: string;
+  sort_order: number;
+  // Non-null for kind=task (full `TaskRecord`, `focused` included).
+  task: TaskRecord | null;
+  // Non-null for kind=occurrence.
+  occurrence: OccurrenceRecord | null;
+}
+
+// The envelope returned by GET /api/agenda?date=YYYY-MM-DD (seeds on read;
+// the date query is optional — missing/blank = civil today). `today` +
+// `time_zone` are the server's civil today (ADR 0004 amendment): the civil
+// date of now in the user's primary Google calendar's IANA `time_zone` —
+// the browser must never compute "today" itself.
+export interface AgendaResponse {
+  items: AgendaItemRecord[];
+  // YYYY-MM-DD — civil today in `time_zone`; Home's "Today" anchor.
+  today: string;
+  // IANA name of the zone that produced `today` (the primary calendar's
+  // `time_zone`, or "UTC" when the user has no primary calendar).
+  time_zone: string;
+}
+
+// The envelope returned by POST /api/agenda/items,
+// POST /api/agenda/items/:id/move and POST /api/agenda/items/:id/reschedule.
+export interface AgendaItemResponse {
+  item: AgendaItemRecord;
+}
+
+// Request body for POST /api/agenda/items — tasks only in v1 (occurrences
+// are auto-seeded); the `date` is required. `sort_order` is optional: the
+// server appends at `max+1` for the date when omitted.
+export interface NewAgendaItemInput {
+  kind: 'task';
+  ref_id: string;
+  date: string;
+  sort_order?: number;
+}
+
+// Request body for POST /api/agenda/items/:id/move — the absolute rank the
+// item lands on (peers at/after it shift up one, within that date's pile).
+export interface MoveAgendaItemInput {
+  sort_order: number;
+}
+
+// Request body for POST /api/agenda/items/:id/reschedule — the local civil
+// date (`YYYY-MM-DD`) the slot relocates to. Occurrences move only while
+// `pending | skipped` (skipped → pending; in_progress/done → 400); tasks
+// move the membership slot only, task status unchanged. Same date → 200
+// no-op.
+export interface RescheduleAgendaItemInput {
+  date: string;
+}
+
+// The envelope returned by PATCH /api/occurrences/:id,
+// POST /api/occurrences/:id/complete and POST /api/occurrences/:id/skip.
+export interface OccurrenceResponse {
+  occurrence: OccurrenceRecord;
+}
+
+// The envelope returned by POST /api/occurrences/:id/start: the fresh
+// occurrence plus the one-shot Google log this start created (`event` is null
+// on the idempotent in_progress no-op — no second event was opened).
+export interface OccurrenceActionResponse {
+  occurrence: OccurrenceRecord;
+  event: CalendarEvent | null;
+}

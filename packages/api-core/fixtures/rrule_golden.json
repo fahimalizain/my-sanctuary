@@ -1,0 +1,33 @@
+{
+  "comment": "Golden fixtures for RRULE expansion (ADR 0004 amendment). Each case is a stored routine definition — ONE `rrule` blob with exactly two newline-separated lines: `DTSTART:YYYYMMDDTHHMMSS` (floating local, no Z/TZID) + `RRULE:<body>` — and the local YYYY-MM-DD dates the engine must produce inside the inclusive window [from, to]. The SAME cases must pass on BOTH engines: the Rust crate (packages/api-core/src/routines.rs::occurrence_dates, asserted in routines.rs tests) and the npm rrule runner (apps/web/app/modules/routines/rrule-preview.ts). Expansion is floating local civil time; the tzdb is never used. UNTIL may stay Z-form inside the RRULE body (the Rust crate needs the UTC instant; DTSTART itself must never be Z). exdates are gone.",
+  "cases": [
+    {
+      "name": "daily inclusive window",
+      "rrule": "DTSTART:20260101T063000\nRRULE:FREQ=DAILY",
+      "from": "2026-01-02",
+      "to": "2026-01-04",
+      "expected": ["2026-01-02", "2026-01-03", "2026-01-04"]
+    },
+    {
+      "name": "weekly BYDAY=MO,WE",
+      "rrule": "DTSTART:20260105T070000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+      "from": "2026-01-11",
+      "to": "2026-01-17",
+      "expected": ["2026-01-12", "2026-01-14"]
+    },
+    {
+      "name": "daily INTERVAL=2",
+      "rrule": "DTSTART:20260101T060000\nRRULE:FREQ=DAILY;INTERVAL=2",
+      "from": "2026-01-01",
+      "to": "2026-01-07",
+      "expected": ["2026-01-01", "2026-01-03", "2026-01-05", "2026-01-07"]
+    },
+    {
+      "name": "UNTIL bounds the series",
+      "rrule": "DTSTART:20260101T063000\nRRULE:FREQ=DAILY;UNTIL=20260104T063000Z",
+      "from": "2025-12-31",
+      "to": "2026-02-28",
+      "expected": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+    }
+  ]
+}

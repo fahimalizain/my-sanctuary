@@ -75,10 +75,19 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             return;
         }
     };
+    let occurrences = match env.d1("DB") {
+        Ok(db) => crate::db::D1OccurrenceRepo::new(db),
+        Err(err) => {
+            console_log!("cron: DB binding missing: {err} — skipping cron");
+            return;
+        }
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
-    // Every tick (*/2 and */15): grow living IN_PROGRESS events.
+    // Every tick (*/2 and */15): grow living IN_PROGRESS events — tasks and
+    // in_progress occurrences alike (slice 6), so a running occurrence's
+    // one-shot log never looks finished either.
     let elongate = api_core::run_elongate_cron(
         &crate::http::WorkerHttp,
         &calendars,
@@ -93,11 +102,25 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     for error in &elongate.errors {
         console_log!("cron: {error}");
     }
+    let elongate_occurrences = api_core::run_elongate_occurrences(
+        &crate::http::WorkerHttp,
+        &calendars,
+        &events,
+        &occurrences,
+        &tokens,
+        &oauth,
+        now_unix,
+    )
+    .await;
+    for error in &elongate_occurrences.errors {
+        console_log!("cron: {error}");
+    }
     console_log!(
-        "cron: elongated={} skipped={} errors={}",
+        "cron: elongated={} occurrences_elongated={} skipped={} errors={}",
         elongate.elongated,
-        elongate.skipped,
-        elongate.errors.len()
+        elongate_occurrences.occurrences_elongated,
+        elongate.skipped + elongate_occurrences.skipped,
+        elongate.errors.len() + elongate_occurrences.errors.len()
     );
 
     // Only the 15-minute tick runs the fallback sync + watch renewal — never

@@ -8,6 +8,7 @@ import {
   Moon,
   Sun,
   Monitor,
+  Repeat,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -206,6 +207,18 @@ export function SettingsPage() {
                   </span>
                 ) : undefined
               }
+            />
+          </div>
+        </SettingsSection>
+
+        {/* Routines */}
+        <SettingsSection title="Routines">
+          <div className="space-y-1">
+            <SettingsItem
+              icon={<Repeat className="h-5 w-5" />}
+              label="Routines"
+              value="Standing definitions — never on the Board"
+              onClick={() => navigate({ to: '/routines' })}
             />
           </div>
         </SettingsSection>

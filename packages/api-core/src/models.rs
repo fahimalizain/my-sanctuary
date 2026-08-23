@@ -574,6 +574,190 @@ pub struct UpdateTask {
     pub difficulty: Option<String>,
 }
 
+// ──────────────────────────────────────────
+// Routines (ADR 0004)
+// ──────────────────────────────────────────
+
+/// A routine (ADR 0004): a standing definition of repeated work. Never
+/// completable, never on the Board. Doubles as the D1 row projection AND the
+/// stored-shape payload (the HTTP view is [`crate::routines::RoutineView`],
+/// which adds the computed category).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Routine {
+    pub id: String,
+    pub user_id: String,
+    pub title: String,
+    /// Planned estimate in minutes; service enforces `>= 1` (default 15).
+    /// Deliberately NOT `duration_minutes` — that stays the task column.
+    pub estimated_minutes: i64,
+    /// The whole recurrence in one TEXT blob — exactly two `\n`-separated
+    /// lines (ADR 0004 amendment):
+    /// `DTSTART:YYYYMMDDTHHMMSS` (floating local, no Z/TZID) + `RRULE:<body>`.
+    /// No EXDATE/RDATE/EXRULE/TZID anywhere; never sent to Google.
+    pub rrule: String,
+    /// Per-user standing rank (agenda seeding order). Not unique per title —
+    /// titles are not unique either.
+    pub sort_order: i64,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+    /// Soft-delete marker; reads filter on `deleted_at IS NULL`. Materialized
+    /// occurrences are NOT deleted with the routine.
+    pub deleted_at: Option<String>,
+}
+
+/// Insert input for [`crate::repo::RoutineRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the `created_at`/`updated_at`
+/// timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRoutine {
+    pub user_id: String,
+    pub title: String,
+    pub estimated_minutes: i64,
+    /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line).
+    pub rrule: String,
+    /// Standing rank; `create_routine` passes the append rank
+    /// (`max(sort_order)+1`, or 0 when the pile is empty).
+    pub sort_order: i64,
+}
+
+/// Request body for `POST /api/routines`. `estimated_minutes` defaults to 15
+/// server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewRoutineInput {
+    pub title: String,
+    #[serde(default)]
+    pub estimated_minutes: Option<i64>,
+    /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line),
+    /// validated on create.
+    pub rrule: String,
+}
+
+/// Update input for [`crate::repo::RoutineRepo::update`] (`PATCH
+/// /api/routines/:id`). `None` fields are left unchanged; the service rejects
+/// a body where every field is `None` (400 "nothing to update"). Rule changes
+/// never touch materialized occurrences — they only affect future ensure.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateRoutine {
+    pub title: Option<String>,
+    pub estimated_minutes: Option<i64>,
+    /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line).
+    pub rrule: Option<String>,
+    pub sort_order: Option<i64>,
+}
+
+/// One local-date instance of a routine (ADR 0004), as stored in
+/// `routine_occurrences`. Doubles as the D1 row projection: field names match
+/// the schema. Unlike `routines` there is **no `deleted_at`** — occurrences
+/// are never soft-deleted (skip is the decline); the routine's own
+/// soft-delete is checked by the service via the join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutineOccurrence {
+    pub id: String,
+    pub routine_id: String,
+    pub user_id: String,
+    /// Local civil date `YYYY-MM-DD` (the occurrence's day).
+    pub local_date: String,
+    /// Nullable title override. `NULL` = inherit `routines.title`; the
+    /// resolved title is `override ?? routine.title`.
+    pub title: Option<String>,
+    /// `pending | in_progress | done | skipped` (occurrence states, lowercase
+    /// — deliberately NOT task statuses).
+    pub status: String,
+    /// Local calendar id once the occurrence has been started (slice 6);
+    /// `None` until then.
+    pub calendar_id: Option<String>,
+    /// Google event id of the one-shot log (slice 6); `None` until then.
+    pub google_event_id: Option<String>,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::OccurrenceRepo::insert`]. The D1
+/// implementation generates the UUID `id`, the timestamps, and stamps
+/// `status = 'pending'` / `title = NULL` (the schema defaults) — seeding
+/// never copies the routine title, inheritance stays live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRoutineOccurrence {
+    pub routine_id: String,
+    pub user_id: String,
+    pub local_date: String,
+}
+
+/// Request body for `PATCH /api/occurrences/:id`. `title` present (even `""`)
+/// writes the override; `""`/whitespace-only clears it back to inheritance
+/// (stores NULL). An empty body is rejected by the service (400).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateOccurrence {
+    pub title: Option<String>,
+}
+
+/// A date-scoped membership row in the run-of-show (ADR 0004), as stored in
+/// `agenda_items`. Doubles as the D1 row projection. Membership rows are
+/// HARD-deleted on unpin — they are a subscription, not a domain entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaItem {
+    pub id: String,
+    pub user_id: String,
+    /// Local civil date `YYYY-MM-DD` the item belongs to.
+    pub local_date: String,
+    /// `task | occurrence` (v1: only `task` is addable; occurrences seed).
+    pub kind: String,
+    /// `tasks.id` for kind=task, `routine_occurrences.id` for kind=occurrence.
+    pub ref_id: String,
+    /// Rank inside that date's pile (0 = top). Peers shift on reorder.
+    pub sort_order: i64,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::AgendaItemRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the timestamps; the service
+/// computes the append rank (`max+1` for the date, or 0 when empty) unless
+/// the caller named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgendaItem {
+    pub user_id: String,
+    pub local_date: String,
+    pub kind: String,
+    pub ref_id: String,
+    pub sort_order: i64,
+}
+
+/// Request body for `POST /api/agenda/items`. The `date` is REQUIRED — the
+/// ADR table omits it because GET is date-scoped, but the POST must name the
+/// date (invented per the slice brief; the ADR wins if they ever disagree).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewAgendaItemInput {
+    /// `task` only in v1 (occurrences are auto-seeded; anything else 400).
+    pub kind: String,
+    pub ref_id: String,
+    /// Optional placement; default appends at `max+1` for that date (0 when
+    /// empty). A named rank is used as-is (no peer shift — `/move` reorders).
+    pub sort_order: Option<i64>,
+    /// Local civil date `YYYY-MM-DD` the item lands on.
+    pub date: String,
+}
+
+/// Request body for `POST /api/agenda/items/:id/move`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MoveAgendaItemInput {
+    /// Target rank inside that item's date pile (>= 0, required).
+    pub sort_order: i64,
+}
+
+/// Request body for `POST /api/agenda/items/:id/reschedule`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RescheduleAgendaItemInput {
+    /// Local civil date `YYYY-MM-DD` the slot moves to.
+    pub date: String,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
@@ -627,6 +811,16 @@ pub struct NewEventInput {
     /// carrier — slice 4). `None` for hand-created events.
     #[serde(default)]
     pub task_id: Option<String>,
+    /// When set (with `occurrence_id`), the created event carries
+    /// `extendedProperties.shared.sanctuary_routine_id` (slice 6 — a
+    /// started occurrence's one-shot log). Mutually exclusive with
+    /// `task_id` at the call sites; the two carriers never mix on one event.
+    #[serde(default)]
+    pub routine_id: Option<String>,
+    /// When set (with `routine_id`), the created event carries
+    /// `extendedProperties.shared.sanctuary_occurrence_id` (slice 6).
+    #[serde(default)]
+    pub occurrence_id: Option<String>,
     /// Google event `colorId` (`"1"`..=`"11"`). Omitted from the Google
     /// payload when `None`. `start_task` copies the matched category's
     /// stored `google_color_id`. Hand-created events leave this unset.
