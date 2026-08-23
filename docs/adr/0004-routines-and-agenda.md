@@ -3,18 +3,29 @@
 Status: Accepted
 Date: 2026-08-23
 
+> Amendment (2026-08-23): recurrence is **one `routines.rrule` TEXT blob** —
+> exactly two `\n`-separated lines, `DTSTART:YYYYMMDDTHHMMSS` (floating
+> local, no `Z`, no `TZID`) + `RRULE:<body>` (the body may keep a Z-form
+> `UNTIL`). `dtstart` and `exdates` columns are gone; the **EXDATE concept is
+> removed entirely** (rdates stay deferred). `occurrence.local_date` is the
+> **series-instance key — the rule date**; `agenda_item.local_date` is the
+> **Home day**. Reschedule moves the **agenda item only**: no
+> `occurrence.local_date` rewrite, no exdate — the seed's "no membership
+> anywhere" rule (`AgendaItemRepo::get_by_ref`) keeps the rule date from
+> re-attaching a moved occurrence, and daily snooze today→tomorrow may put
+> two rows of the same routine on tomorrow (allowed). Start is keyed off
+> **agenda membership on civil today**, not `occurrence.local_date`. §
+> Recurrence / Schema / Agenda rules / Start / the API table are amended.
+
 > Amendment (2026-08-23): agenda **reschedule** is locked:
 > `POST /api/agenda/items/:id/reschedule { date }` relocates a slot to another
-> day — an occurrence moves by exdating its source date on the routine (the
-> RRULE still matches, so without the exdate the next GET on the source date
-> would re-seed a fresh occurrence), a task moves by relocating its
-> **membership slot** only (task status unchanged, **no `task_logs` row** —
-> the agenda is an overlay and `task_logs` has no civil-date column).
-> Session-only: never a Google write, never an RRULE. The same task **may**
-> appear on multiple days at once (`UNIQUE (user, date, kind, ref_id)` is a
-> per-date key, not a per-task one); reschedule relocates a slot, while
-> Add-task still clones onto another day. § Agenda rules and the API table are
-> amended.
+> day — a task moves by relocating its **membership slot** only (task status
+> unchanged, **no `task_logs` row** — the agenda is an overlay and
+> `task_logs` has no civil-date column). Session-only: never a Google write,
+> never an RRULE. The same task **may** appear on multiple days at once
+> (`UNIQUE (user, date, kind, ref_id)` is a per-date key, not a per-task one);
+> reschedule relocates a slot, while Add-task still clones onto another day.
+> § Agenda rules and the API table are amended.
 
 ## Context
 
@@ -38,7 +49,7 @@ Four nouns, three tables, one expansion rule. The following spec is the source o
 - No new nav tab for Routines. `/routines` is linked from Home ("Routines") and optionally Settings.
 - Existing Google recurring events are **not** imported. Once a routine lives in Sanctuary, the owner deletes the old Google series by hand so the calendar stops double-drawing a plan. Manual, out of v1.
 - No create-task from Home in v1. New finite work is `TaskModal` on the Board, then add to a date.
-- `rdates` (extra inclusion dates) are deferred to v2; `exdates` carry v1.
+- `rdates` (extra inclusion dates) are deferred to v2; there are no `exdates` — exclusions are expressed by moving the day's agenda item (a reschedule), never by editing the rule.
 - The elongate cron growing occurrence events is documented here, implemented in slice 6.
 
 ### Refused alternatives
@@ -75,10 +86,16 @@ Repetition is expressed as a full RFC 5545 RRULE stored on the routine — not a
 
 #### Stored on `routines`
 
-- `dtstart` — naive **local civil** datetime, `YYYY-MM-DDTHH:MM:SS` (no `Z`, no offset). RRULE requires a DTSTART; ours lives in its own column instead of inside the rule string.
-- `rrule` — the RFC 5545 RRULE **body** (`FREQ=DAILY;INTERVAL=1`, `FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=…`, …). Not a `DTSTART:` line, never prefixed with one, never sent to Google.
-- `exdates` — JSON array of local `YYYY-MM-DD` strings (v1). Exclusion is by local date.
-- `rdates` are deferred to v2.
+One TEXT column, two lines — the whole recurrence is one blob:
+
+```text
+DTSTART:20260105T063000
+RRULE:FREQ=WEEKLY;BYDAY=MO
+```
+
+- `rrule` — the blob: a `DTSTART:` line (basic form `YYYYMMDDTHHMMSS`, **floating local** — no `Z`, no `TZID`, no offset) then a `RRULE:` line holding the RFC 5545 RRULE **body** (`FREQ=DAILY;INTERVAL=1`, `FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=…`, …). Exactly two `\n`-separated lines, no trailing extras. Never sent to Google.
+- The blob is **rejected** (400 `invalid rrule`) when it contains `EXDATE`, `RDATE`, `EXRULE`, or `TZID` anywhere, more than one `RRULE:` line, or a `Z` on the DTSTART value. `UNTIL` inside the RRULE body **may** stay Z-form (`UNTIL=20260104T063000Z`) — the Rust crate validates it against the UTC-carried DTSTART; the DTSTART line itself must never be Z.
+- There is **no `exdates`** — exclusions are expressed by rescheduling the day's agenda item, never by editing the rule. `rdates` stay deferred to v2.
 
 #### Expansion semantics
 
@@ -92,14 +109,14 @@ Repetition is expressed as a full RFC 5545 RRULE stored on the routine — not a
 | Server seed / membership               | Rust crate `rrule` (`fmeringdal/rust-rrule`)   | `GET /api/agenda?date=`: expand, `between(start_of_D, end_of_D)` → ensure occurrence |
 | Editor / next-N preview                | npm `rrule` (`jakubroztocil/rrule`)            | `/routines` builder + preview, Home cadence summary |
 
-Both sides consume the **same stored string** (`dtstart` + `rrule` + `exdates`). Golden fixtures (DTSTART + RRULE → expected dates) must run on **both** sides so the engines cannot drift — this is an acceptance requirement of the RRULE slices. Fixtures may land in slice 2 and be asserted from slice 3.
+Both sides consume the **same stored blob** (the whole `rrule` string). Golden fixtures (blob → expected dates) must run on **both** sides so the engines cannot drift — this is an acceptance requirement of the RRULE slices. Fixtures may land in slice 2 and be asserted from slice 3.
 
 The Rust crate pulls `chrono` (+ `chrono-tz`). Documented as a Worker-size residual risk below: measure wasm size when it lands; if needed, compile `chrono-tz` with a zone filter. Either way, expansion stays floating local — the tzdb is never used for membership.
 
 #### Editing a rule
 
-- Changing `rrule` / `exdates` / `dtstart` does **not** delete already-materialized occurrences. It only affects future ensure. An occurrence that no longer matches the rule stays — it was planned.
-- RRULE is parsed/validated on routine create/update. Invalid rule → 400.
+- Changing `rrule` does **not** delete already-materialized occurrences. It only affects future ensure. An occurrence that no longer matches the rule stays — it was planned.
+- The blob is parsed/validated on routine create/update. Invalid rule → 400.
 
 ### `estimated_minutes`
 
@@ -129,9 +146,7 @@ CREATE TABLE IF NOT EXISTS routines (
 	user_id TEXT NOT NULL,
 	title TEXT NOT NULL,
 	estimated_minutes INTEGER NOT NULL DEFAULT 15,
-	dtstart TEXT NOT NULL,
 	rrule TEXT NOT NULL,
-	exdates TEXT NOT NULL DEFAULT '[]',
 	sort_order INTEGER NOT NULL DEFAULT 0,
 	created_at TEXT NOT NULL DEFAULT (datetime('now')),
 	updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -184,7 +199,8 @@ CREATE INDEX IF NOT EXISTS idx_agenda_items_user_date_sort
 
 Column notes:
 
-- `routines.dtstart` holds a naive local civil datetime; `local_date` everywhere is `YYYY-MM-DD`. Neither ever carries an offset.
+- `routines.rrule` holds the whole recurrence blob — `DTSTART:YYYYMMDDTHHMMSS` + `RRULE:<body>`, `\n`-separated; `local_date` everywhere is `YYYY-MM-DD`. Neither ever carries an offset.
+- `routine_occurrences.local_date` is the **series-instance key**: the rule date the instance was materialized for. It is never rewritten by a reschedule. `agenda_items.local_date` is the **Home day** — where the row is actually planned.
 - `routine_occurrences.status` is one of `pending | in_progress | done | skipped` (lowercase — these are occurrence states, not task statuses).
 - `calendar_id` / `google_event_id` are null until start. There is **no `google_event_id` on `routines`** and no series master anywhere.
 - Calendar destination resolves at **start**, with the same inheritance as `start_task`: matching pattern → category → parent root → primary; a named calendar that is missing or read-only falls back to primary; no writable calendar at all → 400.
@@ -196,8 +212,8 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 
 **Seeding happens on GET, not a midnight cron:**
 
-1. For every living routine of the user whose RRULE + exdates includes that local date, `INSERT` the occurrence if missing (`UNIQUE (routine_id, local_date)` makes this idempotent).
-2. If that occurrence is not yet an `agenda_items` row for that date, append it. Auto-seeded occurrences land in `routines.sort_order` relative to each other, **after** any already-present items — never reshuffle a list the user already reordered.
+1. For every living routine of the user whose rrule blob includes that local date, `INSERT` the occurrence if missing (`UNIQUE (routine_id, local_date)` makes this idempotent).
+2. Append an `agenda_items` row **only if this occurrence id has no agenda item on ANY date** (`AgendaItemRepo::get_by_ref(user, kind=occurrence, ref_id=occurrence.id)` — no date). This is the "Monday must not come back" guarantee: a reschedule moves the item to another day, so a GET on the rule date never re-attaches it. Auto-seeded occurrences land in `routines.sort_order` relative to each other, **after** any already-present items — never reshuffle a list the user already reordered.
 3. Tasks never auto-land.
 
 **Living rows only.** Seeding covers living routines (`deleted_at IS NULL`); a soft-deleted routine never seeds a new occurrence. The response likewise omits occurrence items whose routine is missing or soft-deleted and task items whose task is missing or soft-deleted. Their orphan `agenda_items` membership rows stay in D1 — membership is hard-deleted only by unpin.
@@ -212,7 +228,7 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 
 **Reschedule:** `POST /api/agenda/items/:id/reschedule { date }` relocates a slot to another day — the weekly occurrence that cannot happen today moves to tomorrow without becoming a Board card and without writing a Google RRULE. Session-only: no Google write of any kind.
 
-- **Occurrence:** the **source date is appended to the routine's `exdates`** (no-op when already present). Why: if we only rewrote `occurrence.local_date`, the next `GET /api/agenda?date=<source>` would re-seed a **new** source-date occurrence (the RRULE still matches) — resurrecting what was moved. Next week's same weekday is a different `YYYY-MM-DD` and still seeds. The occurrence's `local_date` is rewritten; `pending | skipped` are the only reschedulable statuses — `skipped` becomes `pending` on the new date (deferred, not declined); `in_progress` / `done` → 400. A target date that already has an occurrence of this `routine_id` → 400. The agenda row moves to the target date **appended** (`max+1` on the target pile). Title override and any stored google ids travel with the row (pending/skipped should have no chip, but ids are never cleared if somehow set). Same date → 200 no-op returning the item unchanged.
+- **Occurrence:** the **agenda item moves only**. `occurrence.local_date` is never rewritten (it is the series-instance key — the rule date) and the routine's `rrule` is never touched; **there is no EXDATE anywhere**. Why this is safe: the seed's step-2 rule ("no membership on any date") means the next `GET /api/agenda?date=<rule-date>` does **not** re-attach the moved occurrence — the moved-away day stays empty, while next week's same weekday is a different `YYYY-MM-DD` and seeds fresh. `pending | skipped` are the only reschedulable statuses — `skipped` becomes `pending` on the new date (deferred, not declined); `in_progress` / `done` → 400. A target date that already has an occurrence of this `routine_id` is **allowed** — daily snooze today→tomorrow puts TWO rows of the same routine on tomorrow (today's moved instance + tomorrow's own seeded instance). The agenda row moves to the target date **appended** (`max+1` on the target pile). Title override and any stored google ids travel with the row (pending/skipped should have no chip, but ids are never cleared if somehow set). Same date → 200 no-op returning the item unchanged.
 - **Task:** the **membership slot** moves, not the task — `tasks.status` is unchanged and **no `task_logs` row is written**: the agenda is an overlay, and `task_logs` has no civil-date column, so a reschedule has nothing to log (locked refusal). Same date → 200 no-op. A target date that already has this task **unpins the source** (hard-delete this item) and returns the **existing** target item — never a duplicate. The same task **may** appear on multiple days at once (`UNIQUE (user, date, kind, ref_id)` keys one row per date); reschedule relocates a slot, while Add-task still clones onto another day.
 - Missing item / other-user / soft-deleted routine → 404. Missing/invalid `date` → 400. Response is `{ "item": AgendaItemView }` (same embed as add/move).
 
@@ -226,7 +242,7 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 **Start:**
 
 - A task on Home uses the existing `/start` (Board → In Progress, one-shot Google log as today).
-- An occurrence start creates the one-shot Google log, moves the occurrence to `in_progress`, and stores `calendar_id` + `google_event_id` on the occurrence. Start is valid **only when `local_date` is today** (civil today via the offset table); otherwise 400.
+- An occurrence start creates the one-shot Google log, moves the occurrence to `in_progress`, and stores `calendar_id` + `google_event_id` on the occurrence. Start is valid **only when this occurrence has an agenda item whose `local_date` is civil today** (civil today via the offset table); otherwise 400 (`"occurrence can only be started on a day it is scheduled"`). The gate is agenda membership, NOT `occurrence.local_date` — a rescheduled occurrence starts where its item sits, not on its rule date.
 - One Google event per occurrence, ever. Repeating start while `in_progress` is a 200 no-op (no new event).
 - The elongate cron must grow living `in_progress` occurrence events the same way it grows `IN_PROGRESS` task events (slice 6). Documented here; not implemented before then.
 
@@ -265,13 +281,13 @@ Shapes are locked here; the Rust module layout is not. Endpoints are session-gat
 | Endpoint                                    | Behavior                                                                                                                                         |
 | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET /api/routines`                         | Living routines for the user.                                                                                                                    |
-| `POST /api/routines`                        | Create; validates RRULE (400 on invalid) and classifies the title like `create_task`.                                                            |
-| `PATCH /api/routines/:id`                   | Update; same validation. Rule changes never touch materialized occurrences.                                                                      |
+| `POST /api/routines`                        | Create; body `{title, estimated_minutes?, rrule}` where `rrule` is the two-line recurrence blob (`DTSTART:` + `RRULE:`); validates the blob (400 on invalid, incl. EXDATE/RDATE/EXRULE/TZID/Z-on-DTSTART) and classifies the title like `create_task`. |
+| `PATCH /api/routines/:id`                   | Update; body `{title?, estimated_minutes?, rrule?, sort_order?}` — same validation on a present blob (it carries its own DTSTART). Rule changes never touch materialized occurrences. |
 | `DELETE /api/routines/:id`                  | Soft-delete (`deleted_at`). Materialized occurrences are not deleted.                                                                            |
-| `GET /api/agenda?date=YYYY-MM-DD`           | Ensure-for-date + seed, then return mixed items with an embedded task view / occurrence+routine view: resolved title, computed category summary, status, `estimated_minutes` on the routine, `focused` only on tasks. Missing/invalid date → 400. Seeds only living routines; omits occurrence items whose routine is missing/soft-deleted and task items whose task is missing/soft-deleted (orphan membership rows stay in D1). |
+| `GET /api/agenda?date=YYYY-MM-DD`           | Ensure-for-date + seed, then return mixed items with an embedded task view / occurrence+routine view: resolved title, computed category summary, status, `estimated_minutes` on the routine, `focused` only on tasks. Seed appends the item only when the occurrence has **no agenda item on any date**. Missing/invalid date → 400. Seeds only living routines; omits occurrence items whose routine is missing/soft-deleted and task items whose task is missing/soft-deleted (orphan membership rows stay in D1). |
 | `POST /api/agenda/items`                    | `{ kind, ref_id, sort_order? }`. Tasks only in v1; idempotent 200 with the existing item when already present.                                   |
 | `POST /api/agenda/items/:id/move`           | `{ sort_order }`; reorder within that date's pile.                                                                                               |
-| `POST /api/agenda/items/:id/reschedule`     | `{ date }`; relocate the slot to that day. Occurrence: append source date to the routine's `exdates`, rewrite `local_date` (`pending|skipped` only; `skipped` → `pending`; `in_progress`/`done` → 400; target already holding this routine → 400), agenda row appended on the target pile. Task: move the membership slot only (no `task_logs`, task status unchanged); already-on-target unpins the source and returns the existing target item. Same date → 200 no-op. Session-only, no Google write. |
+| `POST /api/agenda/items/:id/reschedule`     | `{ date }`; relocate the slot to that day. Occurrence: **agenda item moves only** — `occurrence.local_date` (the rule date) and `routines.rrule` are never touched, no EXDATE anywhere (`pending|skipped` only; `skipped` → `pending`; `in_progress`/`done` → 400; a target date already holding this routine is allowed — two rows of the same routine on one day are legal), agenda row appended on the target pile. Task: move the membership slot only (no `task_logs`, task status unchanged); already-on-target unpins the source and returns the existing target item. Same date → 200 no-op. Session-only, no Google write. |
 | `DELETE /api/agenda/items/:id`              | Hard-delete (unpin). Occurrence-kind items → 400 (skip is the decline).                                                                          |
 | `PATCH /api/occurrences/:id`                | `{ title? }` writes the override; PATCHes the Google event `summary` when a chip exists.                                                         |
 | `POST /api/occurrences/:id/start`           | One-shot Google log, occurrence → `in_progress`, store ids. Today-only (else 400). Repeat while `in_progress` → 200 no-op.                        |
@@ -281,7 +297,7 @@ Shapes are locked here; the Rust module layout is not. Endpoints are session-gat
 Errors, across all of the above:
 
 - **401** — missing session.
-- **400** — invalid input: bad/missing date, malformed body, invalid RRULE, DELETE on an occurrence item, start on a non-today occurrence, adding a terminal or foreign task, classify failures on routine title.
+- **400** — invalid input: bad/missing date, malformed body, invalid rrule blob, DELETE on an occurrence item, start on an occurrence not scheduled today, adding a terminal or foreign task, classify failures on routine title.
 - **404** — missing, other-user, or soft-deleted routine/occurrence/item. Never leak existence.
 - **502** — Google write failure.
 - **500** — repository failure.
