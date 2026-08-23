@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
-import { getMe, logout as apiLogout, type AuthUser } from './api';
+import React, { createContext, useContext } from 'react';
+import type { AuthUser } from './api';
+import { useLogout, useMeQuery } from '@/app/queries/auth';
 
 export type User = AuthUser;
 
@@ -16,25 +17,17 @@ const AuthContext = createContext<AuthContextType>({
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    getMe()
-      .then((data) => {
-        setUser(data.user);
-      })
-      .catch(() => setUser(null))
-      .finally(() => setIsLoading(false));
-  }, []);
+  const meQuery = useMeQuery();
+  const logoutMutation = useLogout();
+  const user = meQuery.data?.user ?? null;
+  const isLoading = meQuery.isLoading;
 
   const logout = async () => {
     try {
-      await apiLogout();
+      await logoutMutation.mutateAsync();
     } catch {
-      // HTTP/network failures still clear the local session.
+      // onSettled already cleared
     }
-    setUser(null);
   };
 
   return (
