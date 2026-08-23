@@ -952,10 +952,12 @@ export function BoardPage() {
                 Priority and Difficulty are single-select All+value pills;
                 Category is a searchable checkbox combobox grouped by list →
                 root → children; Search is a free-text title/description
-                filter driven by `?search=` (its input UI lands in a later
-                slice). Filters combine with AND. */
-          <section className="mb-6 space-y-3">
-            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+                filter driven by `?search=` (each keystroke rewrites the
+                param, whitespace-only removes it). Clear filters sits on
+                this same row, aligned with the controls. Filters combine
+                with AND. */
+          <section className="mb-6">
+            <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
               <div className="flex flex-col items-start gap-1.5">
                 <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Priority
@@ -1022,19 +1024,40 @@ export function BoardPage() {
                   </span>
                 )}
               </div>
-            </div>
 
-            {hasActiveFilters && (
-              <div className="flex justify-end">
+              <div className="flex flex-col items-start gap-1.5">
+                <label
+                  htmlFor="board-task-search"
+                  className="text-xs font-medium uppercase tracking-wide text-muted-foreground"
+                >
+                  Search
+                </label>
+                {/* type="text" (never "search" — that paints a native
+                    cancel button); every keystroke writes `?search=` via
+                    updateSearch (replace: true), which treats whitespace-only
+                    as delete. Focus border only — never the primary fill. */}
+                <input
+                  id="board-task-search"
+                  type="text"
+                  value={search ?? ''}
+                  onChange={(event) =>
+                    updateSearch({ search: event.target.value })
+                  }
+                  placeholder="Search tasks"
+                  className="w-56 min-w-0 rounded-xl border-2 border-input bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:border-primary transition-all"
+                />
+              </div>
+
+              {hasActiveFilters && (
                 <button
                   type="button"
                   onClick={clearFilters}
-                  className="text-sm font-medium text-primary hover:underline"
+                  className="shrink-0 py-1.5 text-sm font-medium text-primary hover:underline"
                 >
                   Clear filters
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </section>
         )}
       </div>
