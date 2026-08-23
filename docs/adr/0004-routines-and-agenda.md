@@ -175,7 +175,7 @@ Column notes:
 - `routine_occurrences.status` is one of `pending | in_progress | done | skipped` (lowercase — these are occurrence states, not task statuses).
 - `calendar_id` / `google_event_id` are null until start. There is **no `google_event_id` on `routines`** and no series master anywhere.
 - Calendar destination resolves at **start**, with the same inheritance as `start_task`: matching pattern → category → parent root → primary; a named calendar that is missing or read-only falls back to primary; no writable calendar at all → 400.
-- Next D1 migration numbers (latest today is `0006_user_focused_task_id.sql`): `apps/worker/migrations/0007_routines.sql`, `0008_routine_occurrences.sql`, `0009_agenda_items.sql`. The migration files themselves are written in their implementing slices, not here.
+- One next D1 migration (latest today is `0006_user_focused_task_id.sql`): `apps/worker/migrations/0007_routines.sql` contains **all three tables**, schema-ahead like `0003_lists_categories_tasks.sql`. Slice 2 writes that file but still has no occurrence/agenda handlers; later slices add APIs only.
 
 ### Agenda rules
 
@@ -186,6 +186,8 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 1. For every living routine of the user whose RRULE + exdates includes that local date, `INSERT` the occurrence if missing (`UNIQUE (routine_id, local_date)` makes this idempotent).
 2. If that occurrence is not yet an `agenda_items` row for that date, append it. Auto-seeded occurrences land in `routines.sort_order` relative to each other, **after** any already-present items — never reshuffle a list the user already reordered.
 3. Tasks never auto-land.
+
+**Living rows only.** Seeding covers living routines (`deleted_at IS NULL`); a soft-deleted routine never seeds a new occurrence. The response likewise omits occurrence items whose routine is missing or soft-deleted and task items whose task is missing or soft-deleted. Their orphan `agenda_items` membership rows stay in D1 — membership is hard-deleted only by unpin.
 
 **Adding a task** to a date: `POST /api/agenda/items { kind: "task", ref_id, sort_order? }`. Default append (`max + 1` for that date). Allowed task statuses in v1: living `OPEN | PLANNED | IN_PROGRESS`. Already on that date → **idempotent 200 returning the existing item** (locked over a 400). Does **not** change `tasks.status` — Home is an overlay, not a sixth column.
 
@@ -200,7 +202,7 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 - Task → the existing `/complete` (Board → Done). The agenda row stays as a crossed-off row for the rest of that date.
 - Occurrence → `done` for that date. If an event is currently open for the occurrence, its end is PATCHed closed like a task exit; with no running event there is no Google write.
 
-**Skip:** occurrence → `skipped`. First-class verb. No task equivalent. No Google write.
+**Skip:** occurrence → `skipped`. First-class verb. No task equivalent. No Google write — except skip while running PATCHes the open event's end closed (see verb matrix below).
 
 **Start:**
 
@@ -208,6 +210,20 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 - An occurrence start creates the one-shot Google log, moves the occurrence to `in_progress`, and stores `calendar_id` + `google_event_id` on the occurrence. Start is valid **only when `local_date` is today** (civil today via the offset table); otherwise 400.
 - One Google event per occurrence, ever. Repeating start while `in_progress` is a 200 no-op (no new event).
 - The elongate cron must grow living `in_progress` occurrence events the same way it grows `IN_PROGRESS` task events (slice 6). Documented here; not implemented before then.
+
+**Occurrence verb matrix (locked across all slices):**
+
+| status ↓ / verb → | `start`                         | `complete`                             | `skip`                                   |
+| ----------------- | ------------------------------- | -------------------------------------- | ---------------------------------------- |
+| `pending`         | starts — today-only (else 400)  | → `done`; no Google                    | → `skipped`; no Google                   |
+| `in_progress`     | 200 no-op                       | → `done`; PATCH open event end closed  | → `skipped`; PATCH open event end closed |
+| `done`            | 400                             | 200 no-op                              | → `skipped`; no Google                   |
+| `skipped`         | 400                             | → `done`; no Google                    | 200 no-op                                |
+
+- `done` / `skipped` are terminal for `start`.
+- `complete` ↔ `skip` flips are allowed; there is no dedicated unskip verb.
+- Skip while running must close the chip (PATCH the open event's end), same as complete while running.
+- A missing, other-user, or soft-deleted-routine occurrence is **404** on every verb.
 
 **Focus** stays task-only. A running routine is highlighted on Home, never takes `users.focused_task_id`, and never appears in the Board's In Progress column.
 
@@ -233,7 +249,7 @@ Shapes are locked here; the Rust module layout is not. Endpoints are session-gat
 | `POST /api/routines`                        | Create; validates RRULE (400 on invalid) and classifies the title like `create_task`.                                                            |
 | `PATCH /api/routines/:id`                   | Update; same validation. Rule changes never touch materialized occurrences.                                                                      |
 | `DELETE /api/routines/:id`                  | Soft-delete (`deleted_at`). Materialized occurrences are not deleted.                                                                            |
-| `GET /api/agenda?date=YYYY-MM-DD`           | Ensure-for-date + seed, then return mixed items with an embedded task view / occurrence+routine view: resolved title, computed category summary, status, `estimated_minutes` on the routine, `focused` only on tasks. Missing/invalid date → 400. |
+| `GET /api/agenda?date=YYYY-MM-DD`           | Ensure-for-date + seed, then return mixed items with an embedded task view / occurrence+routine view: resolved title, computed category summary, status, `estimated_minutes` on the routine, `focused` only on tasks. Missing/invalid date → 400. Seeds only living routines; omits occurrence items whose routine is missing/soft-deleted and task items whose task is missing/soft-deleted (orphan membership rows stay in D1). |
 | `POST /api/agenda/items`                    | `{ kind, ref_id, sort_order? }`. Tasks only in v1; idempotent 200 with the existing item when already present.                                   |
 | `POST /api/agenda/items/:id/move`           | `{ sort_order }`; reorder within that date's pile.                                                                                               |
 | `DELETE /api/agenda/items/:id`              | Hard-delete (unpin). Occurrence-kind items → 400 (skip is the decline).                                                                          |
@@ -262,7 +278,7 @@ Errors, across all of the above:
 Planned follow-through, not work in this commit:
 
 1. **This ADR.**
-2. **Routine CRUD API** — tables (migrations 0007–0009), classify, RRULE parse/validate (Rust `rrule`), `estimated_minutes`, worker routes, tests. No occurrences yet.
+2. **Routine CRUD API** — writes the single migration `0007_routines.sql` with all three tables (schema-ahead, like `0003_lists_categories_tasks.sql`), classify, RRULE parse/validate (Rust `rrule`), `estimated_minutes`, worker routes, tests. Still no occurrence/agenda handlers; later slices add APIs only.
 3. **`/routines` page** — npm `rrule` builder, next-N preview, standing order. Golden fixtures shared with the Rust side as soon as both exist (fixtures can land in slice 2 and be asserted from slice 3).
 4. **Occurrences + Agenda API** — ensure-for-date, mixed list, add/remove/reorder task, complete/skip, occurrence title PATCH (the Google part may wait for slice 6 if no chip exists yet). Tests: cadence × civil date × idempotent ensure; Board endpoints still never return routines.
 5. **Home Today** — date selector, list, add-task picker, reorder, check-off. Board untouched.
@@ -270,10 +286,10 @@ Planned follow-through, not work in this commit:
 
 ## Consequences
 
-- Three new D1 tables behind migrations `0007_routines.sql`, `0008_routine_occurrences.sql`, `0009_agenda_items.sql`. No existing table changes: no `tasks.recurrence`, no `tasks.kind`, no renamed `duration_minutes`, no focus changes.
+- Three new D1 tables behind the single migration `0007_routines.sql` (schema-ahead, like `0003_lists_categories_tasks.sql`). No existing table changes: no `tasks.recurrence`, no `tasks.kind`, no renamed `duration_minutes`, no focus changes.
 - Repetition becomes Sanctuary-owned, full-strength RFC 5545 expanded in floating local civil time; "today" comes from the existing fixed offset table, with no new tzdb dependency.
 - Two new dependencies land in their own slices: the Rust `rrule` crate (wasm-size watch) and npm `rrule`. Golden fixtures on both sides are the drift guard and gate the RRULE slices.
 - The Google write surface grows by exactly two cases — occurrence start creating a one-shot log, and an occurrence title override patching an existing chip's `summary`. Everything sent to Google stays a one-shot event; no RRULE ever leaves Sanctuary.
 - Seeding happens on GET, so agenda correctness depends on the read being called; there is no midnight cron ensuring occurrences.
 - Home becomes the daily working surface (mixed agenda, date selector, reorder, check-off, skip, start, rename) and loses both mocks (`todayItems`, `SkewedTimeline`); `/routines` exists without a nav entry; Board, Calendar page, and Consistency are untouched.
-- Later slices add: the migrations, routine CRUD routes, the `/routines` page, the occurrences + agenda handlers, the Home rebuild, and occurrence start + elongate support.
+- Later slices add: the single `0007_routines.sql` migration (slice 2, all three tables), routine CRUD routes, the `/routines` page, the occurrences + agenda handlers, the Home rebuild, and occurrence start + elongate support.

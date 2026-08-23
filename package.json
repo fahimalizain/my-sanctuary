@@ -1,6 +1,6 @@
 {
   "name": "@org/source",
-  "version": "0.0.121",
+  "version": "0.0.122",
   "license": "MIT",
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true"
