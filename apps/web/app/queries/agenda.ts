@@ -36,8 +36,8 @@ export function useAgendaQuery(date: string) {
   return useQuery(agendaQueryOptions(date || undefined));
 }
 
-/** Drop-in replacement for the page's `setItems` / `setItems(prev => …)` —
- *  writes the viewed date's key as `{ items, today, time_zone }`. */
+/** Writes the viewed date's agenda key as `{ items, today, time_zone }`.
+ *  Accepts an array or an updater over the current items. */
 export function setAgendaItems(
   date: string,
   updater:

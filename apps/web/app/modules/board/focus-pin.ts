@@ -1,4 +1,4 @@
-/** The focus pin's visibility classes (task-focus, slice 4 — the locked UX):
+/** The focus pin's visibility classes (the locked UX):
  *  - focused: always visible;
  *  - unfocused: hidden until the card is hovered (fine pointers), and
  *    ALWAYS visible on coarse / no-hover pointers, where a hover affordance

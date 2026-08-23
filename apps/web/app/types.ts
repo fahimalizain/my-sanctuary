@@ -434,9 +434,9 @@ export interface OccurrenceRecord {
   // The routine's two-line recurrence blob (`DTSTART:` + `RRULE:`), for
   // display.
   rrule: string;
-  // Local calendar id once started (slice 6); `null` until then.
+  // Local calendar id once started; `null` until then.
   calendar_id: string | null;
-  // Google event id of the one-shot log (slice 6); `null` until then.
+  // Google event id of the one-shot log; `null` until then.
   google_event_id: string | null;
   created_at: string;
   updated_at: string;

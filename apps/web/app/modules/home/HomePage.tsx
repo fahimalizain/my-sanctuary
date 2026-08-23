@@ -127,7 +127,7 @@ export function HomePage() {
   const sortItems = (list: AgendaItemRecord[]): AgendaItemRecord[] =>
     [...list].sort((a, b) => a.sort_order - b.sort_order);
 
-  // Agenda write mutations (slice 8): thin wrappers that cancel the viewed-
+  // Agenda write mutations: thin wrappers that cancel the viewed-
   // date query on mutate so an in-flight refetch can never resolve over the
   // page's optimistic cache mid-write. No invalidation on success — the
   // handlers merge the authoritative row themselves.
@@ -141,7 +141,7 @@ export function HomePage() {
   const updateOccurrenceMutation = useUpdateOccurrence();
   // Task writes reuse the shared task mutations from `queries/tasks.ts`;
   // after each success the handler also patches the `['tasks']` cache so
-  // Board/Lists see the fresh row (same sibling-rank contract as slice 7 —
+  // Board/Lists see the fresh row (same sibling-rank contract —
   // never invalidate).
   const runTaskActionMutation = useRunTaskAction();
   const updateTaskMutation = useUpdateTask();
@@ -344,7 +344,7 @@ export function HomePage() {
     }
   };
 
-  /** Occurrence start (slice 6): creates the one-shot Google log and flips
+  /** Occurrence start: creates the one-shot Google log and flips
    *  the chip to in_progress. Today-only on the server; the Play button is
    *  only rendered for today's pending occurrences. Optimistic → the chip
    *  reads In progress immediately; a 401/400 rolls back with a banner. */

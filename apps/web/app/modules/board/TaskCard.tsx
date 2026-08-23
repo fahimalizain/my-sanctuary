@@ -74,7 +74,7 @@ export function SortableTaskCard({
  *  same chip elevated (shadow/opacity) with `onToggleFocus` omitted — the
  *  pin shows but stays inert (disabled).
  *
- *  Focus chrome (task-focus, slice 4): the focused card carries an always-on
+ *  Focus chrome: the focused card carries an always-on
  *  primary ring/border and an always-visible filled pin; the unfocused IP
  *  pin fades in on card hover (fine pointers) and is always visible on
  *  coarse / no-hover pointers. */

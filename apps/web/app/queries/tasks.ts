@@ -42,8 +42,8 @@ export function useTasksQuery(opts?: {
   });
 }
 
-/** Drop-in replacement for `setTasks` / `setTasks(prev => …)`.
- *  Writes `queryKeys.tasks.all` as `{ tasks }`. */
+/** Writes `queryKeys.tasks.all` as `{ tasks }`. Accepts an array or an
+ *  updater over the current list. */
 export function setTasksCache(
   updater: TaskRecord[] | ((prev: TaskRecord[]) => TaskRecord[]),
 ): void {

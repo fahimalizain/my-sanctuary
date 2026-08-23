@@ -77,7 +77,7 @@ export function ListsPage() {
   // seeded taxonomy, and GET /api/tasks also runs the count-gated seed — a
   // no-op once lists seeded). Lists hide untracked tasks (no list to belong
   // to), so the categories endpoint is never needed here. Shares the one
-  // `['tasks']` cache with the Board and the Home task picker (slice 6).
+  // `['tasks']` cache with the Board and the Home task picker.
   const tasksQuery = useTasksQuery({ enabled: listsQuery.isSuccess });
   const tasks = tasksQuery.data?.tasks ?? [];
   const setTasks = setTasksCache;
@@ -129,7 +129,7 @@ export function ListsPage() {
     void tasksQuery.refetch();
   }, [tasksQuery]);
 
-  // Task write mutations (slice 7): thin wrappers over the API that cancel
+  // Task write mutations: thin wrappers over the API that cancel
   // any in-flight `['tasks']` refetch on mutate. The optimistic paint stays
   // here in the page — the hooks never write the cache themselves and never
   // invalidate on success.

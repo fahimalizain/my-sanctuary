@@ -17,8 +17,8 @@ export const queryKeys = {
   },
   agenda: {
     all: ['agenda'] as const,
-    // `undefined` / empty → the 'today' sentinel. Slice 8 will write the
-    // server's civil today into the dated key after the first load.
+    // `undefined` / empty → the 'today' sentinel. Home's first load copies
+    // the server's civil today onto the dated key and then queries that key.
     byDate: (date?: string) =>
       [...queryKeys.agenda.all, date ? date : 'today'] as const,
   },

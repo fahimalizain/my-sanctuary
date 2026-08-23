@@ -90,7 +90,7 @@ export function BoardPage() {
     from: '/board',
   });
 
-  // Shared queries (slice 6): one `['tasks']` cache written by Board, Lists
+  // Shared queries: one `['tasks']` cache written by Board, Lists
   // and the Home task picker. Tasks and categories are seed-gated on lists
   // success — GET /api/lists performs the first-visit seed (default lists +
   // category taxonomy), so their requests must run after it (computed
@@ -126,8 +126,8 @@ export function BoardPage() {
   // A live drag or preview, an in-flight /move, an in-flight focus toggle:
   // while `busy` no tasks refetch may land — a window-focus or interval
   // refetch would overwrite the optimistic cache with the pre-move server
-  // list. This is the old useBoardRefresh gate, now expressed as query
-  // options: the tasks query pauses its interval and window-focus refetch
+  // list. Busy pauses interval and window-focus refetch on the tasks
+  // query — the tasks query pauses its interval and window-focus refetch
   // while busy, and every task write also cancels any in-flight refetch via
   // its mutation's `onMutate`.
   const busy =
@@ -188,7 +188,7 @@ export function BoardPage() {
     }),
   );
 
-  // Task write mutations (slice 7): thin wrappers over the API that cancel
+  // Task write mutations: thin wrappers over the API that cancel
   // any in-flight `['tasks']` refetch on mutate. The optimistic paint and
   // the snapshot rollback stay here in the page — the hooks never write the
   // cache themselves and never invalidate on success (invalidation would
@@ -615,7 +615,7 @@ export function BoardPage() {
   };
 
   // ──────────────────────────────────────────
-  // Focus toggle (task-focus, slice 4)
+  // Focus toggle
   // ──────────────────────────────────────────
 
   /** Merges the authoritative `{ task, previous }` rows from a focus response
@@ -705,7 +705,7 @@ export function BoardPage() {
   };
 
   // ──────────────────────────────────────────
-  // Task actions (New Task + click-to-edit; no timer buttons this slice)
+  // Task actions (New Task + click-to-edit)
   // ──────────────────────────────────────────
 
   /** Opens the create dialog with the status pills locked to `status` —

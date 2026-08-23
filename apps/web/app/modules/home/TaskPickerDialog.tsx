@@ -41,7 +41,7 @@ export function TaskPickerDialog({
   const [pickingId, setPickingId] = useState<string | null>(null);
   const [pickError, setPickError] = useState<string | null>(null);
 
-  // Shared queries (slice 6): tasks come from the one `['tasks']` cache the
+  // Shared queries: tasks come from the one `['tasks']` cache the
   // Board and Lists write, so moves made on the board are already visible —
   // no refetch on every open (the 30s staleTime plus the shared cache
   // replace the old "board may have moved" refetch). Lists stay seed-gated:
