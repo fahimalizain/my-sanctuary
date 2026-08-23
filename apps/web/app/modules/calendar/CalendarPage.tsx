@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   CalendarDays,
   ChevronLeft,
@@ -8,7 +8,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { listCalendarEvents } from '@/lib/api';
+import { useCalendarEventsQuery } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 
@@ -98,80 +98,6 @@ function queryRangeForView(viewDate: Date): {
   return { timeMin: start.toISOString(), timeMax: end.toISOString() };
 }
 
-interface FetchState {
-  events: CalendarEvent[];
-  isLoading: boolean;
-  isRefreshing: boolean;
-  error: string | null;
-}
-
-function useCalendarEvents(viewDate: Date) {
-  const [state, setState] = useState<FetchState>({
-    events: [],
-    isLoading: true,
-    isRefreshing: false,
-    error: null,
-  });
-
-  const viewYear = viewDate.getFullYear();
-  const viewMonth = viewDate.getMonth();
-  const range = useMemo(
-    () => queryRangeForView(new Date(viewYear, viewMonth, 1)),
-    [viewYear, viewMonth],
-  );
-
-  const load = useCallback(
-    (signal?: AbortSignal) => {
-      setState((prev) => ({
-        ...prev,
-        // Full-page loader only on the first load (or after a hard error cleared events).
-        isLoading: prev.events.length === 0,
-        isRefreshing: prev.events.length > 0,
-        error: null,
-      }));
-
-      listCalendarEvents({
-        timeMin: range.timeMin,
-        timeMax: range.timeMax,
-        signal,
-      })
-        .then((data) => {
-          setState({
-            events: data.events ?? [],
-            isLoading: false,
-            isRefreshing: false,
-            error: null,
-          });
-        })
-        .catch((err: unknown) => {
-          if (err instanceof DOMException && err.name === 'AbortError') {
-            return;
-          }
-          const message =
-            err instanceof Error ? err.message : 'Failed to load events';
-          setState((prev) => ({
-            // Keep previous events on refresh failure so the grid doesn't blank out.
-            events: prev.events,
-            isLoading: false,
-            isRefreshing: false,
-            error: message,
-          }));
-        });
-    },
-    [range.timeMin, range.timeMax],
-  );
-
-  useEffect(() => {
-    const ac = new AbortController();
-    load(ac.signal);
-    return () => ac.abort();
-  }, [load]);
-
-  const retry = useCallback(() => load(), [load]);
-
-  return { ...state, retry };
-}
-
 interface MonthGridEventProps {
   event: CalendarEvent;
 }
@@ -220,8 +146,29 @@ export function CalendarPage() {
     return new Date(now.getFullYear(), now.getMonth(), 1);
   });
 
-  const { events, isLoading, isRefreshing, error, retry } =
-    useCalendarEvents(viewDate);
+  // Query window for the current view — same year/month memo + range
+  // computation as before, now keying the Query cache (a month change is a
+  // new key, so each range loads fresh).
+  const viewYear = viewDate.getFullYear();
+  const viewMonth = viewDate.getMonth();
+  const range = useMemo(
+    () => queryRangeForView(new Date(viewYear, viewMonth, 1)),
+    [viewYear, viewMonth],
+  );
+
+  const eventsQuery = useCalendarEventsQuery(range.timeMin, range.timeMax);
+  const events = eventsQuery.data?.events ?? [];
+  const isLoading = eventsQuery.isLoading; // no data yet
+  const isRefreshing = eventsQuery.isFetching && !eventsQuery.isLoading;
+  const error =
+    eventsQuery.error instanceof Error
+      ? eventsQuery.error.message
+      : eventsQuery.error
+        ? 'Failed to load events'
+        : null;
+  const retry = () => {
+    void eventsQuery.refetch();
+  };
 
   const today = useMemo(() => {
     const now = new Date();

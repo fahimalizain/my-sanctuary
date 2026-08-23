@@ -32,6 +32,13 @@ test('queryKeys.calendar.events("a", "b") is ["calendar", "events", "a", "b"]', 
   ]);
 });
 
+test('queryKeys.calendar.calendars() is ["calendar", "calendars"]', () => {
+  assert.deepEqual(queryKeys.calendar.calendars(), [
+    'calendar',
+    'calendars',
+  ]);
+});
+
 test('queryKeys.auth.me() starts with queryKeys.auth.all', () => {
   assert.deepEqual(
     queryKeys.auth.me().slice(0, queryKeys.auth.all.length),

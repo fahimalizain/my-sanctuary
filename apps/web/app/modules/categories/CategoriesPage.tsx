@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { CalendarPicker } from '@/app/components/CalendarPicker';
 import { Button } from '@/components/ui/button';
@@ -10,17 +10,16 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { useNavigate, useRouter } from '@tanstack/react-router';
-import { listCalendars } from '@/lib/api';
 import {
   useCategoriesQuery,
   useCreateCategory,
   useDeleteCategory,
   useUpdateCategory,
 } from '@/app/queries/categories';
+import { useCalendarsQuery } from '@/app/queries/calendar';
 import { useListsQuery } from '@/app/queries/lists';
 import type {
   Category,
-  GoogleCalendar,
   NewCategoryInput,
   TaskList,
   UpdateCategoryInput,
@@ -85,42 +84,22 @@ export function CategoriesPage() {
   const [googleCalendarId, setGoogleCalendarId] = useState('');
   const [patterns, setPatterns] = useState<PatternDraft[]>([]);
 
-  // Google calendars for the pickers — fetched once per dialog open (never
-  // per keystroke / pattern add) and shared by every CalendarPicker. The
-  // API is cache-only after first import, so keeping the previous list
-  // across closes is fine; refetching each open is preferred.
-  const [calendars, setCalendars] = useState<GoogleCalendar[]>([]);
-  const [calendarsLoading, setCalendarsLoading] = useState(false);
-  const [calendarsError, setCalendarsError] = useState<string | null>(null);
+  // Google calendars for the pickers — enabled only while the dialog is open
+  // (never per keystroke / pattern add) and shared by every CalendarPicker.
+  // The query cache keeps the list across closes; a reopen inside staleTime
+  // (30s) serves the cached list without refetching.
+  const calendarsQuery = useCalendarsQuery({ enabled: form !== null });
+  const calendars = calendarsQuery.data?.calendars ?? [];
+  const calendarsLoading = calendarsQuery.isLoading;
+  const calendarsError =
+    calendarsQuery.error instanceof Error
+      ? calendarsQuery.error.message
+      : calendarsQuery.error
+        ? 'Failed to load calendars'
+        : null;
 
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-
-  // Calendars for the pickers: one request when the dialog opens, shared by
-  // every CalendarPicker instance. `form` changes identity only on
-  // open/close, so edits inside the dialog never refetch.
-  useEffect(() => {
-    if (form === null) return;
-    let cancelled = false;
-    setCalendarsLoading(true);
-    setCalendarsError(null);
-    listCalendars()
-      .then((data) => {
-        if (!cancelled) setCalendars(data.calendars ?? []);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setCalendarsError(
-          err instanceof Error ? err.message : 'Failed to load calendars',
-        );
-      })
-      .finally(() => {
-        if (!cancelled) setCalendarsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [form]);
 
   // Header back button: leave through real in-app history when there is one
   // (Board/Lists → Edit Categories); a direct load on /categories has none,
