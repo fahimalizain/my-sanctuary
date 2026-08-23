@@ -23,17 +23,19 @@ import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
 import {
   ApiError,
-  createList,
   createTask,
-  deleteList,
   deleteTask,
-  listLists,
   listTasks,
   moveTask,
   runTaskAction,
-  updateList,
   updateTask,
 } from '@/lib/api';
+import {
+  useCreateList,
+  useDeleteList,
+  useListsQuery,
+  useUpdateList,
+} from '@/app/queries/lists';
 import { cn } from '@/lib/utils';
 // Lists is unlinked from the nav; one shared helper is fine to import across
 // modules — no new package.
@@ -66,23 +68,26 @@ interface TaskFormState {
 
 export function ListsPage() {
   const navigate = useNavigate();
-  const [lists, setLists] = useState<TaskList[]>([]);
+  const listsQuery = useListsQuery();
+  const lists = listsQuery.data?.lists ?? [];
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  // Latest `lists` for the dependency-free `load` callback below (writing a
-  // ref during render is the "latest value" pattern). Reading it lets `load`
-  // decide whether to show the full-page loader without closing over a stale
-  // array.
-  const listsRef = useRef<TaskList[]>([]);
-  listsRef.current = lists;
   // Latest `tasks` for the async move flow, so the pre-move snapshot and the
   // reverted card lookups never close over a stale array (same pattern as
   // BoardPage).
   const tasksRef = useRef<TaskRecord[]>([]);
   tasksRef.current = tasks;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the grid with the
-  // error+retry banner when there are no lists to show.
-  const [loadError, setLoadError] = useState<string | null>(null);
+  // Tasks load once after lists succeed — the seed rule: GET /api/lists
+  // performs the first-visit seed (default lists + category taxonomy), so the
+  // tasks request must run after it (their computed categories depend on the
+  // seeded taxonomy, and GET /api/tasks also runs the count-gated seed — a
+  // no-op once lists seeded). Lists hide untracked tasks (no list to belong
+  // to), so the categories endpoint is never needed here.
+  const [tasksReady, setTasksReady] = useState(false);
+  // Local tasks-fetch failure — shown when the lists query itself is fine.
+  const [tasksError, setTasksError] = useState<string | null>(null);
+  // Bumped by Retry so the tasks effect re-runs even when `isSuccess` is
+  // already true (a lists refetch alone would not re-fire it).
+  const [tasksAttempt, setTasksAttempt] = useState(0);
   // Action failures (delete 409, etc.): rendered as a banner above the
   // still-visible grid — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -98,36 +103,53 @@ export function ListsPage() {
   // Task dialog state.
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
 
-  const load = useCallback(() => {
-    // Full-page loader only when the grid is empty (first load, or a retry
-    // after a hard error cleared it) — the same rule as CalendarPage
-    // (`isLoading: prev.events.length === 0`), so reloads fired while cards
-    // are on screen never flash the spinner.
-    setIsLoading(listsRef.current.length === 0);
-    setLoadError(null);
-    // Sequential on purpose: GET /api/lists performs the first-visit seed (it
-    // inserts the default lists AND the category taxonomy), so the tasks
-    // request must run after it — their computed categories depend on the
-    // seeded taxonomy, and GET /api/tasks also runs the count-gated seed (a
-    // no-op once lists seeded). Lists hide untracked tasks (no list to
-    // belong to), so the categories endpoint is never needed here.
-    listLists()
-      .then(async (listsData) => {
-        setLists(listsData.lists ?? []);
-        const tasksData = await listTasks();
-        setTasks(tasksData.tasks ?? []);
+  // Full-page loader only when the grid is empty (first load, or a retry
+  // after a hard error cleared it) — the same rule as CalendarPage
+  // (`isLoading: prev.events.length === 0`), so reloads fired while cards
+  // are on screen never flash the spinner.
+  const isLoading =
+    listsQuery.isLoading || (listsQuery.isSuccess && !tasksReady);
+  // Load failures: the lists query's error, else the local tasks-fetch
+  // error. Replaces the grid with the error+retry banner only when there
+  // are no lists to show.
+  const loadError =
+    (listsQuery.error instanceof Error
+      ? listsQuery.error.message
+      : listsQuery.error
+        ? 'Failed to load lists'
+        : null) ?? tasksError;
+
+  // After lists succeed, fetch tasks once (the sequential seed rule from the
+  // old `load()`). Retry bumps `tasksAttempt` to re-run this even when
+  // `isSuccess` is already true — a plain lists refetch would not re-fire it.
+  useEffect(() => {
+    if (!listsQuery.isSuccess) return;
+    let cancelled = false;
+    listTasks()
+      .then((data) => {
+        if (!cancelled) setTasks(data.tasks ?? []);
       })
       .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load lists';
-        setLoadError(message);
+        if (!cancelled) {
+          setTasksError(
+            err instanceof Error ? err.message : 'Failed to load lists',
+          );
+        }
       })
-      .finally(() => setIsLoading(false));
-  }, []);
+      .finally(() => {
+        if (!cancelled) setTasksReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [listsQuery.isSuccess, tasksAttempt]);
 
+  // Clear the local tasks error when the lists query starts fetching again
+  // (window focus, invalidation, Retry) — a stale failure banner must not
+  // outlive a fresh load attempt.
   useEffect(() => {
-    load();
-  }, [load]);
+    if (listsQuery.isFetching) setTasksError(null);
+  }, [listsQuery.isFetching]);
 
   // Refreshes only the tasks (timer actions never change lists, so the
   // sequential lists→tasks reload is unnecessary here).
@@ -173,6 +195,10 @@ export function ListsPage() {
   // List actions
   // ──────────────────────────────────────────
 
+  const createListMutation = useCreateList();
+  const updateListMutation = useUpdateList();
+  const deleteListMutation = useDeleteList();
+
   const openCreateList = () => {
     setListForm({ mode: 'create' });
     setListName('');
@@ -203,9 +229,15 @@ export function ListsPage() {
     setActionError(null);
     try {
       if (listForm.mode === 'create') {
-        await createList({ name: trimmed, color: listColor });
+        await createListMutation.mutateAsync({
+          name: trimmed,
+          color: listColor,
+        });
       } else {
-        await updateList(listForm.list!.id, { name: trimmed, color: listColor });
+        await updateListMutation.mutateAsync({
+          id: listForm.list!.id,
+          input: { name: trimmed, color: listColor },
+        });
       }
     } catch (err) {
       setSaving(false);
@@ -213,7 +245,8 @@ export function ListsPage() {
       return;
     }
     closeListForm();
-    load();
+    // Invalidation refreshes the lists — no reload call needed (create/edit
+    // do not change tasks, so tasks are left alone).
   };
 
   const handleDeleteList = async (list: TaskList) => {
@@ -222,7 +255,7 @@ export function ListsPage() {
 
     setActionError(null);
     try {
-      await deleteList(list.id);
+      await deleteListMutation.mutateAsync(list.id);
     } catch (err) {
       // 409 from the backend: living root categories still reference the list.
       setActionError(
@@ -234,7 +267,7 @@ export function ListsPage() {
       );
       return;
     }
-    load();
+    // Invalidation refreshes the lists — no reload call needed.
   };
 
   // ──────────────────────────────────────────
@@ -407,8 +440,14 @@ export function ListsPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setLoadError(null);
-                load();
+                // Re-run the tasks fetch even when `isSuccess` is already
+                // true (the effect keys on `tasksAttempt`), and reset
+                // `tasksReady` so the full-page spinner rule still holds
+                // when the grid is empty.
+                setTasksReady(false);
+                setTasksError(null);
+                setTasksAttempt((attempt) => attempt + 1);
+                void listsQuery.refetch();
               }}
             >
               Retry

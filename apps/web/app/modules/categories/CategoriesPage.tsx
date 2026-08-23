@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { CalendarPicker } from '@/app/components/CalendarPicker';
 import { Button } from '@/components/ui/button';
@@ -10,14 +10,14 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { useNavigate, useRouter } from '@tanstack/react-router';
+import { listCalendars } from '@/lib/api';
 import {
-  createCategory,
-  deleteCategory,
-  listCalendars,
-  listCategories,
-  listLists,
-  updateCategory,
-} from '@/lib/api';
+  useCategoriesQuery,
+  useCreateCategory,
+  useDeleteCategory,
+  useUpdateCategory,
+} from '@/app/queries/categories';
+import { useListsQuery } from '@/app/queries/lists';
 import type {
   Category,
   GoogleCalendar,
@@ -44,18 +44,35 @@ interface CategoryFormState {
 export function CategoriesPage() {
   const router = useRouter();
   const navigate = useNavigate();
-  const [lists, setLists] = useState<TaskList[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  // Latest `lists` for the dependency-free `load` callback below (writing a
-  // ref during render is the "latest value" pattern). Reading it lets `load`
-  // decide whether to show the full-page loader without closing over a stale
-  // array.
-  const listsRef = useRef<TaskList[]>([]);
-  listsRef.current = lists;
-  const [isLoading, setIsLoading] = useState(true);
-  // Load failures: only set from `load()`. Replaces the document tree with
-  // the error+retry banner when there are no lists to show.
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const listsQuery = useListsQuery();
+  // Seed gate: GET /api/lists performs the first-visit seed (it inserts the
+  // default lists AND the category taxonomy), so the categories request must
+  // run after it — a parallel fetch would often return [] on first paint and
+  // never retry.
+  const categoriesQuery = useCategoriesQuery({
+    enabled: listsQuery.isSuccess,
+  });
+  const lists = listsQuery.data?.lists ?? [];
+  const categories = categoriesQuery.data?.categories ?? [];
+  // Full-page loader only while the tree is empty (first load, or a retry
+  // after a hard error cleared it) — reloads fired while rows are on screen
+  // never flash the spinner.
+  const isLoading =
+    listsQuery.isLoading || (listsQuery.isSuccess && categoriesQuery.isLoading);
+  // Load failures: the lists query's error, else the (seed-gated) categories
+  // query's error. Replaces the document tree with the error+retry banner
+  // when there are no lists to show.
+  const loadError =
+    (listsQuery.error instanceof Error
+      ? listsQuery.error.message
+      : listsQuery.error
+        ? 'Failed to load lists'
+        : null) ??
+    (categoriesQuery.error instanceof Error
+      ? categoriesQuery.error.message
+      : categoriesQuery.error
+        ? 'Failed to load lists'
+        : null);
   // Action failures (delete 409, etc.): rendered as a banner above the
   // still-visible tree — rows are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -78,34 +95,6 @@ export function CategoriesPage() {
 
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    // Full-page loader only while the tree is empty (first load, or a retry
-    // after a hard error cleared it) — reloads fired while rows are on
-    // screen never flash the spinner.
-    setIsLoading(listsRef.current.length === 0);
-    setLoadError(null);
-    // Sequential on purpose: GET /api/lists performs the first-visit seed (it
-    // inserts the default lists AND the category taxonomy), so the categories
-    // request must run after it — a parallel fetch would often return [] on
-    // first paint and never retry.
-    listLists()
-      .then(async (listsData) => {
-        setLists(listsData.lists ?? []);
-        const categoriesData = await listCategories();
-        setCategories(categoriesData.categories ?? []);
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : 'Failed to load lists';
-        setLoadError(message);
-      })
-      .finally(() => setIsLoading(false));
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
 
   // Calendars for the pickers: one request when the dialog opens, shared by
   // every CalendarPicker instance. `form` changes identity only on
@@ -147,6 +136,10 @@ export function CategoriesPage() {
   // ──────────────────────────────────────────
   // Category actions — same dialogs and bodies as ListsPage.
   // ──────────────────────────────────────────
+
+  const createCategoryMutation = useCreateCategory();
+  const updateCategoryMutation = useUpdateCategory();
+  const deleteCategoryMutation = useDeleteCategory();
 
   const openCreateRoot = (list: TaskList) => {
     setForm({ mode: 'create', list });
@@ -214,7 +207,10 @@ export function CategoriesPage() {
           google_calendar_id: googleCalendarId.trim() || null,
           patterns: bodyPatterns,
         };
-        await updateCategory(form.category!.id, body);
+        await updateCategoryMutation.mutateAsync({
+          id: form.category!.id,
+          input: body,
+        });
       } else {
         const body: NewCategoryInput = {
           title: trimmedTitle,
@@ -227,7 +223,7 @@ export function CategoriesPage() {
           parent_id: form.parent ? form.parent.id : null,
           patterns: bodyPatterns,
         };
-        await createCategory(body);
+        await createCategoryMutation.mutateAsync(body);
       }
     } catch (err) {
       setSaving(false);
@@ -235,7 +231,7 @@ export function CategoriesPage() {
       return;
     }
     closeForm();
-    load();
+    // Invalidation refreshes the tree — no reload call needed.
   };
 
   const handleDeleteCategory = async (category: Category) => {
@@ -244,13 +240,13 @@ export function CategoriesPage() {
 
     setActionError(null);
     try {
-      await deleteCategory(category.id);
+      await deleteCategoryMutation.mutateAsync(category.id);
     } catch (err) {
       // The backend explains 409s (living children, undeletable untracked).
       setActionError(err instanceof Error ? err.message : 'Delete failed');
       return;
     }
-    load();
+    // Invalidation refreshes the tree — no reload call needed.
   };
 
   // ──────────────────────────────────────────
@@ -320,8 +316,11 @@ export function CategoriesPage() {
               variant="outline"
               size="sm"
               onClick={() => {
-                setLoadError(null);
-                load();
+                // Categories are seed-gated on lists success, so they run
+                // again automatically once the lists refetch lands; when
+                // lists already succeeded, refetch categories directly.
+                void listsQuery.refetch();
+                if (listsQuery.isSuccess) void categoriesQuery.refetch();
               }}
             >
               Retry
