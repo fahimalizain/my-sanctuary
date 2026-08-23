@@ -16,6 +16,20 @@ pub fn unix_secs_to_rfc3339(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// The civil calendar date (`YYYY-MM-DD`) at a Unix instant **as seen in an
+/// IANA time zone**: `local = now_unix + offset`, then civil. The offset comes
+/// from the locked [`resolve_tz_offset`] table — no tzdb (ADR 0004: "today"
+/// on Home is the civil date implied by `now` plus that table).
+///
+/// Used by occurrence start (today-only) and useful in agenda tests now.
+pub fn civil_date_in_offset(now_unix: i64, iana_tz: &str) -> String {
+    let offset = resolve_tz_offset(iana_tz);
+    let local = now_unix + offset;
+    let days = local.div_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Snaps a Unix timestamp (seconds) to the nearest whole minute (half-up):
 /// seconds < 30 floor to the current minute, seconds >= 30 ceil to the next.
 ///
@@ -363,6 +377,29 @@ mod tests {
         assert_eq!(ceil_5min_unix_in_zone(now, "Etc/GMT"), utc);
         assert_eq!(ceil_5min_unix_in_zone(now, "America/New_York"), utc, "unknown → UTC");
         assert_eq!(ceil_5min_unix_in_zone(now, "bogus"), utc);
+    }
+
+    #[test]
+    fn civil_date_in_offset_kolkata_vs_utc() {
+        // 2026-08-23T18:30:00Z is 2026-08-24T00:00:00+05:30 in Kolkata —
+        // the instant is the same, the civil date is NOT.
+        let evening = rfc3339_to_unix_secs("2026-08-23T18:30:00Z").unwrap();
+        assert_eq!(civil_date_in_offset(evening, "UTC"), "2026-08-23");
+        assert_eq!(civil_date_in_offset(evening, "Asia/Kolkata"), "2026-08-24");
+        // 19:00Z → 00:30 the next day in IST.
+        assert_eq!(civil_date_in_offset(evening + 1800, "Asia/Kolkata"), "2026-08-24");
+        // Mid-morning UTC is the same civil date in both zones.
+        let morning = rfc3339_to_unix_secs("2026-08-23T10:00:00Z").unwrap();
+        assert_eq!(civil_date_in_offset(morning, "UTC"), "2026-08-23");
+        assert_eq!(civil_date_in_offset(morning, "Asia/Kolkata"), "2026-08-23");
+        // Late UTC evening the day before is already the next civil date in
+        // Kolkata (22:30Z → 04:00+05:30 the next day).
+        let late_previous = rfc3339_to_unix_secs("2026-08-22T23:30:00Z").unwrap();
+        assert_eq!(civil_date_in_offset(late_previous, "UTC"), "2026-08-22");
+        assert_eq!(civil_date_in_offset(late_previous, "Asia/Kolkata"), "2026-08-23");
+        // Unknown zones fall back to UTC (same locked rule as resolve_tz_offset).
+        assert_eq!(civil_date_in_offset(evening, "America/New_York"), "2026-08-23");
+        assert_eq!(civil_date_in_offset(evening, ""), "2026-08-23");
     }
 
     #[test]

@@ -12,14 +12,19 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewRoutine,
-    NewTask, NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser,
-    NewWatchChannel, Routine, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog,
+    AgendaItem, CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewAgendaItem, NewCalendar,
+    NewCalendarEvent, NewRoutine, NewRoutineOccurrence, NewTask, NewTaskCategory,
+    NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, NewWatchChannel, Routine,
+    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog,
     UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, RoutineRepo,
-    TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
+    build_event_upsert_sql, AgendaItemRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo,
+    RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo,
+    UserRepo, WatchChannelRepo,
+    AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
+    AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL, AGENDA_ITEM_MAX_SORT_ORDER_SQL,
+    AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
@@ -27,6 +32,8 @@ use api_core::repo::{
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL, ROUTINE_LIST_BY_USER_ID_SQL,
     ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
@@ -844,6 +851,233 @@ impl RoutineRepo for D1RoutineRepo {
             .map_err(backend)?;
         let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.sort_order))
+    }
+}
+
+/// `routine_occurrences` table persistence (ADR 0004).
+///
+/// No `deleted_at` anywhere — occurrences are never soft-deleted (skip is the
+/// decline); the routine's own soft-delete is checked by the service.
+pub struct D1OccurrenceRepo {
+    db: D1Database,
+}
+
+impl D1OccurrenceRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl OccurrenceRepo for D1OccurrenceRepo {
+    async fn get_by_id(&self, id: &str) -> Result<Option<RoutineOccurrence>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<RoutineOccurrence>(None).await.map_err(backend)
+    }
+
+    async fn get_by_routine_and_date(
+        &self,
+        routine_id: &str,
+        local_date: &str,
+    ) -> Result<Option<RoutineOccurrence>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL)
+            .bind_refs(&[D1Type::Text(routine_id), D1Type::Text(local_date)])
+            .map_err(backend)?;
+        stmt.first::<RoutineOccurrence>(None).await.map_err(backend)
+    }
+
+    async fn list_by_user_and_date(
+        &self,
+        user_id: &str,
+        local_date: &str,
+    ) -> Result<Vec<RoutineOccurrence>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_LIST_BY_USER_AND_DATE_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(local_date)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn insert(&self, occurrence: NewRoutineOccurrence) -> Result<RoutineOccurrence, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&occurrence.routine_id),
+                D1Type::Text(&occurrence.user_id),
+                D1Type::Text(&occurrence.local_date),
+                D1Type::Text(&now),
+                D1Type::Text(&now),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        // INSERT OR IGNORE: the row exists either way (a concurrent duplicate
+        // kept the original) — read it back under the UNIQUE key.
+        self.get_by_routine_and_date(&occurrence.routine_id, &occurrence.local_date)
+            .await?
+            .ok_or_else(|| RepoError::Backend("occurrence insert produced no row".to_string()))
+    }
+
+    async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError> {
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_UPDATE_TITLE_SQL)
+            .bind_refs(&[optional_text(title), D1Type::Text(&now), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError> {
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_SET_STATUS_SQL)
+            .bind_refs(&[D1Type::Text(status), D1Type::Text(&now), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+}
+
+/// `agenda_items` table persistence (ADR 0004).
+///
+/// Membership rows are HARD-deleted on unpin — a subscription, not a domain
+/// entity (same reasoning as watch channels).
+pub struct D1AgendaItemRepo {
+    db: D1Database,
+}
+
+impl D1AgendaItemRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl AgendaItemRepo for D1AgendaItemRepo {
+    async fn list_by_user_and_date(
+        &self,
+        user_id: &str,
+        local_date: &str,
+    ) -> Result<Vec<AgendaItem>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(local_date)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<AgendaItem>(None).await.map_err(backend)
+    }
+
+    async fn get_by_key(
+        &self,
+        user_id: &str,
+        local_date: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<Option<AgendaItem>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_GET_BY_KEY_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(local_date),
+                D1Type::Text(kind),
+                D1Type::Text(ref_id),
+            ])
+            .map_err(backend)?;
+        stmt.first::<AgendaItem>(None).await.map_err(backend)
+    }
+
+    async fn insert(&self, item: NewAgendaItem) -> Result<AgendaItem, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&item.user_id),
+                D1Type::Text(&item.local_date),
+                D1Type::Text(&item.kind),
+                D1Type::Text(&item.ref_id),
+                D1Type::Integer(item.sort_order as i32),
+                D1Type::Text(&now),
+                D1Type::Text(&now),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        // INSERT OR IGNORE: a duplicate key kept the existing row (stored
+        // sort_order wins) — read it back under the UNIQUE key.
+        self.get_by_key(&item.user_id, &item.local_date, &item.kind, &item.ref_id)
+            .await?
+            .ok_or_else(|| RepoError::Backend("agenda item insert produced no row".to_string()))
+    }
+
+    async fn hard_delete(&self, id: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_DELETE_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_MAX_SORT_ORDER_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(local_date)])
+            .map_err(backend)?;
+        let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.sort_order))
+    }
+
+    async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_SET_SORT_ORDER_SQL)
+            .bind_refs(&[D1Type::Integer(sort_order as i32), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn shift_sort_order(
+        &self,
+        user_id: &str,
+        local_date: &str,
+        from_rank: i64,
+        delta: i64,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_SHIFT_SORT_ORDER_SQL)
+            .bind_refs(&[
+                D1Type::Integer(delta as i32),
+                D1Type::Text(user_id),
+                D1Type::Text(local_date),
+                D1Type::Integer(from_rank as i32),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 }
 

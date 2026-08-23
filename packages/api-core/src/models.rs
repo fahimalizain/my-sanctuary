@@ -655,6 +655,110 @@ pub struct UpdateRoutine {
     pub sort_order: Option<i64>,
 }
 
+/// One local-date instance of a routine (ADR 0004), as stored in
+/// `routine_occurrences`. Doubles as the D1 row projection: field names match
+/// the schema. Unlike `routines` there is **no `deleted_at`** — occurrences
+/// are never soft-deleted (skip is the decline); the routine's own
+/// soft-delete is checked by the service via the join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutineOccurrence {
+    pub id: String,
+    pub routine_id: String,
+    pub user_id: String,
+    /// Local civil date `YYYY-MM-DD` (the occurrence's day).
+    pub local_date: String,
+    /// Nullable title override. `NULL` = inherit `routines.title`; the
+    /// resolved title is `override ?? routine.title`.
+    pub title: Option<String>,
+    /// `pending | in_progress | done | skipped` (occurrence states, lowercase
+    /// — deliberately NOT task statuses).
+    pub status: String,
+    /// Local calendar id once the occurrence has been started (slice 6);
+    /// `None` until then.
+    pub calendar_id: Option<String>,
+    /// Google event id of the one-shot log (slice 6); `None` until then.
+    pub google_event_id: Option<String>,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::OccurrenceRepo::insert`]. The D1
+/// implementation generates the UUID `id`, the timestamps, and stamps
+/// `status = 'pending'` / `title = NULL` (the schema defaults) — seeding
+/// never copies the routine title, inheritance stays live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRoutineOccurrence {
+    pub routine_id: String,
+    pub user_id: String,
+    pub local_date: String,
+}
+
+/// Request body for `PATCH /api/occurrences/:id`. `title` present (even `""`)
+/// writes the override; `""`/whitespace-only clears it back to inheritance
+/// (stores NULL). An empty body is rejected by the service (400).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct UpdateOccurrence {
+    pub title: Option<String>,
+}
+
+/// A date-scoped membership row in the run-of-show (ADR 0004), as stored in
+/// `agenda_items`. Doubles as the D1 row projection. Membership rows are
+/// HARD-deleted on unpin — they are a subscription, not a domain entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaItem {
+    pub id: String,
+    pub user_id: String,
+    /// Local civil date `YYYY-MM-DD` the item belongs to.
+    pub local_date: String,
+    /// `task | occurrence` (v1: only `task` is addable; occurrences seed).
+    pub kind: String,
+    /// `tasks.id` for kind=task, `routine_occurrences.id` for kind=occurrence.
+    pub ref_id: String,
+    /// Rank inside that date's pile (0 = top). Peers shift on reorder.
+    pub sort_order: i64,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::AgendaItemRepo::insert`]. The D1
+/// implementation generates the UUID `id` and the timestamps; the service
+/// computes the append rank (`max+1` for the date, or 0 when empty) unless
+/// the caller named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAgendaItem {
+    pub user_id: String,
+    pub local_date: String,
+    pub kind: String,
+    pub ref_id: String,
+    pub sort_order: i64,
+}
+
+/// Request body for `POST /api/agenda/items`. The `date` is REQUIRED — the
+/// ADR table omits it because GET is date-scoped, but the POST must name the
+/// date (invented per the slice brief; the ADR wins if they ever disagree).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewAgendaItemInput {
+    /// `task` only in v1 (occurrences are auto-seeded; anything else 400).
+    pub kind: String,
+    pub ref_id: String,
+    /// Optional placement; default appends at `max+1` for that date (0 when
+    /// empty). A named rank is used as-is (no peer shift — `/move` reorders).
+    pub sort_order: Option<i64>,
+    /// Local civil date `YYYY-MM-DD` the item lands on.
+    pub date: String,
+}
+
+/// Request body for `POST /api/agenda/items/:id/move`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MoveAgendaItemInput {
+    /// Target rank inside that item's date pile (>= 0, required).
+    pub sort_order: i64,
+}
+
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
 /// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
 /// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
