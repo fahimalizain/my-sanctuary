@@ -3,6 +3,19 @@
 Status: Accepted
 Date: 2026-08-23
 
+> Amendment (2026-08-23): agenda **reschedule** is locked:
+> `POST /api/agenda/items/:id/reschedule { date }` relocates a slot to another
+> day — an occurrence moves by exdating its source date on the routine (the
+> RRULE still matches, so without the exdate the next GET on the source date
+> would re-seed a fresh occurrence), a task moves by relocating its
+> **membership slot** only (task status unchanged, **no `task_logs` row** —
+> the agenda is an overlay and `task_logs` has no civil-date column).
+> Session-only: never a Google write, never an RRULE. The same task **may**
+> appear on multiple days at once (`UNIQUE (user, date, kind, ref_id)` is a
+> per-date key, not a per-task one); reschedule relocates a slot, while
+> Add-task still clones onto another day. § Agenda rules and the API table are
+> amended.
+
 ## Context
 
 Sanctuary **Tasks** (ADR 0002) are a finite work queue: five columns, a timer, and the status machine `OPEN | PLANNED | IN_PROGRESS | COMPLETED | DISCARDED`. Completing a task means the item is finished — the queue is supposed to drain.
@@ -197,6 +210,12 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 
 **Reorder:** `POST /api/agenda/items/:id/move { sort_order }` — that date's pile only, peers shifted within the date. Tomorrow ignores today's permutation except each routine keeps its standing `routines.sort_order` for the next seed.
 
+**Reschedule:** `POST /api/agenda/items/:id/reschedule { date }` relocates a slot to another day — the weekly occurrence that cannot happen today moves to tomorrow without becoming a Board card and without writing a Google RRULE. Session-only: no Google write of any kind.
+
+- **Occurrence:** the **source date is appended to the routine's `exdates`** (no-op when already present). Why: if we only rewrote `occurrence.local_date`, the next `GET /api/agenda?date=<source>` would re-seed a **new** source-date occurrence (the RRULE still matches) — resurrecting what was moved. Next week's same weekday is a different `YYYY-MM-DD` and still seeds. The occurrence's `local_date` is rewritten; `pending | skipped` are the only reschedulable statuses — `skipped` becomes `pending` on the new date (deferred, not declined); `in_progress` / `done` → 400. A target date that already has an occurrence of this `routine_id` → 400. The agenda row moves to the target date **appended** (`max+1` on the target pile). Title override and any stored google ids travel with the row (pending/skipped should have no chip, but ids are never cleared if somehow set). Same date → 200 no-op returning the item unchanged.
+- **Task:** the **membership slot** moves, not the task — `tasks.status` is unchanged and **no `task_logs` row is written**: the agenda is an overlay, and `task_logs` has no civil-date column, so a reschedule has nothing to log (locked refusal). Same date → 200 no-op. A target date that already has this task **unpins the source** (hard-delete this item) and returns the **existing** target item — never a duplicate. The same task **may** appear on multiple days at once (`UNIQUE (user, date, kind, ref_id)` keys one row per date); reschedule relocates a slot, while Add-task still clones onto another day.
+- Missing item / other-user / soft-deleted routine → 404. Missing/invalid `date` → 400. Response is `{ "item": AgendaItemView }` (same embed as add/move).
+
 **Crossing off:**
 
 - Task → the existing `/complete` (Board → Done). The agenda row stays as a crossed-off row for the rest of that date.
@@ -252,6 +271,7 @@ Shapes are locked here; the Rust module layout is not. Endpoints are session-gat
 | `GET /api/agenda?date=YYYY-MM-DD`           | Ensure-for-date + seed, then return mixed items with an embedded task view / occurrence+routine view: resolved title, computed category summary, status, `estimated_minutes` on the routine, `focused` only on tasks. Missing/invalid date → 400. Seeds only living routines; omits occurrence items whose routine is missing/soft-deleted and task items whose task is missing/soft-deleted (orphan membership rows stay in D1). |
 | `POST /api/agenda/items`                    | `{ kind, ref_id, sort_order? }`. Tasks only in v1; idempotent 200 with the existing item when already present.                                   |
 | `POST /api/agenda/items/:id/move`           | `{ sort_order }`; reorder within that date's pile.                                                                                               |
+| `POST /api/agenda/items/:id/reschedule`     | `{ date }`; relocate the slot to that day. Occurrence: append source date to the routine's `exdates`, rewrite `local_date` (`pending|skipped` only; `skipped` → `pending`; `in_progress`/`done` → 400; target already holding this routine → 400), agenda row appended on the target pile. Task: move the membership slot only (no `task_logs`, task status unchanged); already-on-target unpins the source and returns the existing target item. Same date → 200 no-op. Session-only, no Google write. |
 | `DELETE /api/agenda/items/:id`              | Hard-delete (unpin). Occurrence-kind items → 400 (skip is the decline).                                                                          |
 | `PATCH /api/occurrences/:id`                | `{ title? }` writes the override; PATCHes the Google event `summary` when a chip exists.                                                         |
 | `POST /api/occurrences/:id/start`           | One-shot Google log, occurrence → `in_progress`, store ids. Today-only (else 400). Repeat while `in_progress` → 200 no-op.                        |
