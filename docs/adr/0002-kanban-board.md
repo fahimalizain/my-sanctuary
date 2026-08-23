@@ -42,6 +42,9 @@ Date: 2026-08-19
 > planned estimate. § Decision → Google side effects is amended; the elongate
 > cron and the exit verbs are unchanged.
 
+> Amendment (2026-08-23): the board category filter panel pins explicit
+> selections as checkbox rows above the scrolling tree. § UI is amended.
+
 ## Context
 
 `/lists` is a list-colored pile of tasks. We are replacing it in the nav with a status kanban at `/board`. This ADR is slice 0 of 5: it locks the design for the board. Nothing is implemented yet; later slices implement against this document the same way ADR 0001 was the source of truth for watch channels.
@@ -230,6 +233,10 @@ entirely, sent or not).
 - Filter chrome is one wrapping horizontal row: Priority and Difficulty stay All+value pills (single-select). Category is a searchable checkbox combobox grouped by list then root/children (same tree as `/categories`). Untracked is not offered in the picker; `?category=<untracked-sink-id>` still matches if present in the URL.
 - Category trigger label: no explicit ids → "All"; one → that category's title; many → "N categories" (explicit ids only, not the expanded set).
 - Checking a parent shows its children as checked+disabled. Instant apply; the panel stays open. Panel "Clear all" clears categories only; the page-level "Clear filters" clears priority + difficulty + categories.
+- The open panel pins explicit selections (checkbox rows, tree order, parent
+  title on children) above the scrolling tree. Implied-only children stay in
+  the tree. The pinned block ignores the search query. Keyboard highlight
+  stays on the tree.
 - Untracked tasks are visible in their status column. A living-category filter still excludes them (`task.category.id` will not match the expanded set). Lists continue to hide them.
 - Always **optimistic**. On failure: snap the dragged card back + error banner. A displaced task A stays parked if the start failed.
 - Occupied In Progress: `onDragEnd` does **not** apply the optimistic move. Stash `{ taskId, from }`, open a small dialog: move the old task to Planned / Done / Discarded. Confirm → one `move` with `displace`. Cancel → nothing.

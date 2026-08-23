@@ -14,6 +14,8 @@ import {
   buildCategoryTree,
   categoryTriggerLabel,
   isImpliedByParent,
+  selectedCategoryRows,
+  type SelectedCategoryRow,
 } from './board-filters';
 
 // A picker row in visual order (list → root → children). `checked` includes
@@ -33,6 +35,15 @@ type Section = {
   listId: string;
   listName: string;
   entries: { row: Row; indented: boolean; index: number }[];
+};
+
+// One pinned row of the "Selected" block above the tree: an explicitly
+// selected category as resolved by `selectedCategoryRows` — always checked
+// by definition. `implied` extras render disabled and every toggle on them
+// is a no-op (same rule as the tree rows).
+type PinnedRow = SelectedCategoryRow & {
+  checked: boolean;
+  implied: boolean;
 };
 
 /** The board's category filter (ADR 0002 § UI): a searchable checkbox
@@ -99,6 +110,18 @@ export function CategoryFilter({
     return { sections, rows };
   }, [lists, categories, query, selectedIds]);
 
+  // Explicit selections pinned above the tree (ADR 0002 § UI), in picker-tree
+  // order. Deliberately not keyed on the query: the pinned block ignores the
+  // search box and `selectedCategoryRows` already walks the empty-query tree.
+  const pinned = useMemo<PinnedRow[]>(
+    () =>
+      selectedCategoryRows(selectedIds, lists, categories).map((entry) => {
+        const implied = isImpliedByParent(entry.id, selectedIds, categories);
+        return { ...entry, checked: true, implied };
+      }),
+    [selectedIds, lists, categories],
+  );
+
   const close = useCallback((restoreFocus: boolean) => {
     setOpen(false);
     // Next open shows the full tree again.
@@ -136,8 +159,9 @@ export function CategoryFilter({
   );
 
   // Position the panel from the trigger rect. Recompute on open, scroll
-  // (capture: the board scroller scrolls too), resize and query changes (the
-  // list height changes with the results). Flip above when there is not
+  // (capture: the board scroller scrolls too), resize, query changes (the
+  // list height changes with the results) and selection changes (toggling
+  // adds/removes the pinned "Selected" block). Flip above when there is not
   // enough room below.
   useLayoutEffect(() => {
     if (!open) return;
@@ -163,7 +187,7 @@ export function CategoryFilter({
       window.removeEventListener('scroll', position, true);
       window.removeEventListener('resize', position);
     };
-  }, [open, query]);
+  }, [open, query, selectedIds]);
 
   // Outside click (mousedown, ignoring trigger + panel) closes without
   // stealing focus from the control the user actually clicked.
@@ -291,6 +315,51 @@ export function CategoryFilter({
     </div>
   );
 
+  // Pinned-row chrome mirrors `renderRow` (checkbox, color dot, title) minus
+  // everything that couples rows to the listbox keyboard model: no
+  // `role="option"`, no `data-row-index`, no `bg-muted` highlight, no indent.
+  // Mouse-only — ArrowUp/Down + Enter/Space keep walking the tree rows. The
+  // child's parent title trails as secondary muted text instead of being
+  // smashed into the title string.
+  const renderPinnedRow = (row: PinnedRow) => (
+    <div
+      key={row.id}
+      aria-disabled={row.implied}
+      onClick={() => {
+        if (!row.implied) onToggle(row.id);
+      }}
+      className={cn(
+        'flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-foreground',
+        row.implied
+          ? 'cursor-default opacity-60'
+          : 'cursor-pointer hover:bg-muted',
+      )}
+    >
+      <input
+        type="checkbox"
+        checked={row.checked}
+        disabled={row.implied}
+        onChange={() => {
+          if (!row.implied) onToggle(row.id);
+        }}
+        onClick={(event) => event.stopPropagation()}
+        tabIndex={-1}
+        className="h-4 w-4 shrink-0 accent-primary"
+      />
+      <span
+        className="h-2 w-2 shrink-0 rounded-full"
+        style={{ backgroundColor: row.color }}
+        aria-hidden
+      />
+      <span className="min-w-0 flex-1 truncate">{row.title}</span>
+      {row.parentTitle && (
+        <span className="min-w-0 truncate text-xs text-muted-foreground">
+          {row.parentTitle}
+        </span>
+      )}
+    </div>
+  );
+
   return (
     <>
       <button
@@ -354,6 +423,24 @@ export function CategoryFilter({
                 </button>
               )}
             </div>
+
+            {/* Pinned explicit selections (ADR 0002 § UI): above the
+                scrolling tree so a multi-select is visible without hunting
+                through the taxonomy; ignores the search query. Rows stay in
+                the tree too — pinning does not move them out. Hidden
+                entirely while nothing is selected. */}
+            {pinned.length > 0 && (
+              <div
+                role="group"
+                aria-label="Selected categories"
+                className="border-b border-border pb-2 mb-1"
+              >
+                <div className="px-2 pt-2 pb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Selected
+                </div>
+                {pinned.map(renderPinnedRow)}
+              </div>
+            )}
 
             {/* List headings are labels only — not selectable. */}
             <div ref={listRef} className="max-h-64 overflow-y-auto">

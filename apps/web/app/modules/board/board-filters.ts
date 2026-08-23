@@ -196,3 +196,53 @@ export function buildCategoryTree(
   }
   return groups;
 }
+
+export type SelectedCategoryRow = {
+  id: string;
+  title: string;
+  color: string;
+  /** Parent root title when this row is a child; null for roots. */
+  parentTitle: string | null;
+};
+
+/**
+ * Explicit selected ids as display rows, in the same visual order as the
+ * picker tree (list sort_order/name → root sort_order/title → children).
+ * Unknown / untracked / implied-only children are omitted. Query is not
+ * an input — the pinned selection ignores the search box.
+ */
+export function selectedCategoryRows(
+  selectedIds: readonly string[],
+  lists: readonly TaskList[],
+  categories: readonly Category[],
+): SelectedCategoryRow[] {
+  const selected = new Set(selectedIds);
+  const rows: SelectedCategoryRow[] = [];
+  // Empty query on purpose: a pinned row must survive whatever is typed
+  // into the picker's search box.
+  for (const group of buildCategoryTree(lists, categories, '')) {
+    for (const root of group.roots) {
+      // A selected parent does not pull its children in; only explicit
+      // child ids become rows (ADR 0002 § Filters).
+      if (selected.has(root.category.id)) {
+        rows.push({
+          id: root.category.id,
+          title: root.category.title,
+          color: root.category.color,
+          parentTitle: null,
+        });
+      }
+      for (const child of root.children) {
+        if (selected.has(child.id)) {
+          rows.push({
+            id: child.id,
+            title: child.title,
+            color: child.color,
+            parentTitle: root.category.title,
+          });
+        }
+      }
+    }
+  }
+  return rows;
+}
