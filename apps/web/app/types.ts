@@ -343,22 +343,18 @@ export interface FocusTaskResponse {
   events: CalendarEvent[];
 }
 
-// A routine (ADR 0004): a standing definition of repeated work — never
-// completable, never on the Board. The `routines` row shape (snake_case)
-// plus the computed `category`; `exdates` arrives parsed (the API stores it
-// as JSON text).
+// A routine (ADR 0004 amendment): a standing definition of repeated work —
+// never completable, never on the Board. The `routines` row shape
+// (snake_case) plus the computed `category`.
 export interface RoutineRecord {
   id: string;
   user_id: string;
   title: string;
   estimated_minutes: number;
-  // Naive local civil datetime `YYYY-MM-DDTHH:MM:SS` (no offset, no Z).
-  dtstart: string;
-  // RFC 5545 RRULE body (`FREQ=…`) — never a `DTSTART:`-prefixed content
-  // line.
+  // The whole recurrence in one TEXT blob — exactly two `\n`-separated lines
+  // (ADR 0004 amendment): `DTSTART:YYYYMMDDTHHMMSS` (floating local, no
+  // Z/TZID) + `RRULE:<body>`. No EXDATE/RDATE/EXRULE/TZID anywhere.
   rrule: string;
-  // Local `YYYY-MM-DD` dates excluded from occurrence expansion.
-  exdates: string[];
   sort_order: number;
   created_at: string;
   updated_at: string;
@@ -378,27 +374,22 @@ export interface RoutineResponse {
 }
 
 // Request body for POST /api/routines. `estimated_minutes` defaults to 15
-// server-side (min 1); `exdates` defaults to `[]`. The title must uniquely
-// match a non-untracked category (the server decides and explains 400s);
-// `dtstart`/`rrule` must parse together as a valid recurrence.
+// server-side (min 1). The title must uniquely match a non-untracked category
+// (the server decides and explains 400s); `rrule` is the two-line recurrence
+// blob (`DTSTART:` line + `RRULE:` line), validated on create.
 export interface NewRoutineInput {
   title: string;
   estimated_minutes?: number;
-  dtstart: string;
   rrule: string;
-  exdates?: string[];
 }
 
 // Request body for PATCH /api/routines/:id — every field optional. A present
-// `title` must uniquely match a non-untracked category; when either half of
-// the recurrence changes, the effective pair is validated against the stored
-// other side. `exdates` replaces the whole set when present.
+// `title` must uniquely match a non-untracked category; a present `rrule`
+// blob is validated on its own (it carries its own DTSTART).
 export interface UpdateRoutineInput {
   title?: string;
   estimated_minutes?: number;
-  dtstart?: string;
   rrule?: string;
-  exdates?: string[];
   sort_order?: number;
 }
 
@@ -412,8 +403,8 @@ export type OccurrenceStatus = 'pending' | 'in_progress' | 'done' | 'skipped';
 
 // One local-date instance of a routine (ADR 0004 § Nouns): every
 // `routine_occurrences` column plus the routine's display fields
-// (`estimated_minutes`, `dtstart`/`rrule`/parsed `exdates`), the **resolved**
-// title and its computed category.
+// (`estimated_minutes`, the `rrule` recurrence blob), the **resolved** title
+// and its computed category.
 export interface OccurrenceRecord {
   id: string;
   routine_id: string;
@@ -428,12 +419,9 @@ export interface OccurrenceRecord {
   status: OccurrenceStatus;
   // From the routine (the estimate lives on the standing definition).
   estimated_minutes: number;
-  // Naive local civil datetime `YYYY-MM-DDTHH:MM:SS` (routine, for display).
-  dtstart: string;
-  // RFC 5545 RRULE body (routine, for display).
+  // The routine's two-line recurrence blob (`DTSTART:` + `RRULE:`), for
+  // display.
   rrule: string;
-  // Parsed local `YYYY-MM-DD` exclusions (routine, for display).
-  exdates: string[];
   // Local calendar id once started (slice 6); `null` until then.
   calendar_id: string | null;
   // Google event id of the one-shot log (slice 6); `null` until then.

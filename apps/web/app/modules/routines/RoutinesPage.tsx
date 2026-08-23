@@ -21,8 +21,10 @@ import type {
 import {
   addCivilDays,
   civilToday,
+  composeRruleBlob,
   isValidRruleBody,
   occurrenceDates,
+  parseRruleBlob,
   rruleParts,
   rruleSummary,
 } from './rrule-preview';
@@ -84,14 +86,6 @@ function weekdayOf(date: string): WeekdayCode | null {
   return WEEKDAY_CODES[(carrier.getUTCDay() + 6) % 7];
 }
 
-/** Splits a stored `YYYY-MM-DDTHH:MM:SS` into its date and `HH:MM` halves. */
-function splitDtstart(dtstart: string): { date: string; time: string } {
-  return {
-    date: dtstart.slice(0, 10),
-    time: dtstart.length >= 16 ? dtstart.slice(11, 16) : '',
-  };
-}
-
 interface RoutineFormState {
   mode: 'create' | 'edit';
   routine?: RoutineRecord;
@@ -129,8 +123,6 @@ export function RoutinesPage() {
   // power users type any valid body (MONTHLY, BYMONTHDAY, …) the builder
   // cannot express.
   const [rawOverride, setRawOverride] = useState('');
-  const [exdates, setExdates] = useState<string[]>([]);
-  const [exdateDraft, setExdateDraft] = useState('');
   // The title snapshot the classify hook fires on: set on blur and on
   // edit-open (the stored title). Title-only classify — routines have no
   // category lock; the server stays the authority.
@@ -192,8 +184,6 @@ export function RoutinesPage() {
     setUntilDate('');
     setCountText('5');
     setRawOverride('');
-    setExdates([]);
-    setExdateDraft('');
     setClassifyTitle(null);
     setFormError(null);
   };
@@ -267,12 +257,21 @@ export function RoutinesPage() {
     setForm({ mode: 'edit', routine });
     setTitle(routine.title);
     setEstimatedMinutes(String(routine.estimated_minutes));
-    const split = splitDtstart(routine.dtstart);
-    setDtstartDate(split.date || civilToday());
-    setDtstartTime(split.time || '06:30');
-    setExdates([...routine.exdates].sort());
-    setExdateDraft('');
-    prefillRule(routine.rrule, routine.dtstart);
+    // The stored recurrence is ONE blob: split its DTSTART (basic form) into
+    // the builder's civil date + time fields, and prefill the rule body.
+    const parsed = parseRruleBlob(routine.rrule);
+    if (parsed) {
+      setDtstartDate(parsed.dtstart.slice(0, 10));
+      setDtstartTime(parsed.dtstart.slice(11, 16));
+      prefillRule(parsed.body, parsed.dtstart);
+    } else {
+      // Hand-edited / unparseable blob: keep the date fields as-is and let
+      // the raw override carry the stored body — editing can never silently
+      // change an unrepresentable rule.
+      setDtstartDate(civilToday());
+      setDtstartTime('06:30');
+      setRawOverride(routine.rrule);
+    }
     setClassifyTitle(routine.title);
     setFormError(null);
   };
@@ -320,23 +319,22 @@ export function RoutinesPage() {
 
   const dtstart = `${dtstartDate}T${dtstartTime}:00`;
   const rruleBody = buildRruleBody();
-  // The recurrence pair must parse together (mirrors the server gate).
-  const ruleValid = isValidRruleBody(rruleBody, dtstart);
+  // The recurrence blob — DTSTART line + RRULE line — must parse together
+  // (mirrors the server gate).
+  const rruleBlob = composeRruleBlob(dtstart, rruleBody);
+  const ruleValid = isValidRruleBody(rruleBlob);
   const estimateValid = Number(estimatedMinutes) >= 1;
 
-  /** Live preview: the next 8 civil dates in the 30-day window from today,
-   *  with the current exdates applied — the same expansion the list rows
-   *  use. */
+  /** Live preview: the next 8 civil dates in the 30-day window from today —
+   *  the same expansion the list rows use. */
   const previewDates = useMemo(() => {
     const today = civilToday();
     return occurrenceDates({
-      dtstart,
-      rrule: rruleBody,
-      exdates,
+      rrule: rruleBlob,
       from: today,
       to: addCivilDays(today, 30),
     }).slice(0, 8);
-  }, [dtstart, rruleBody, exdates]);
+  }, [rruleBlob]);
 
   const canSave =
     !saving &&
@@ -372,9 +370,7 @@ export function RoutinesPage() {
     const payload: NewRoutineInput = {
       title: title.trim(),
       estimated_minutes: Number(estimatedMinutes),
-      dtstart,
-      rrule: rruleBody,
-      exdates,
+      rrule: rruleBlob,
     };
 
     let res: Response;
@@ -420,15 +416,6 @@ export function RoutinesPage() {
       return;
     }
     load();
-  };
-
-  const addExdate = () => {
-    const date = exdateDraft.trim();
-    if (!date) return;
-    if (!exdates.includes(date)) {
-      setExdates((prev) => [...prev, date].sort());
-    }
-    setExdateDraft('');
   };
 
   // ──────────────────────────────────────────
@@ -533,9 +520,7 @@ export function RoutinesPage() {
           <div className="space-y-2">
             {routines.map((routine) => {
               const nextDates = occurrenceDates({
-                dtstart: routine.dtstart,
                 rrule: routine.rrule,
-                exdates: routine.exdates,
                 from: civilToday(),
                 to: addCivilDays(civilToday(), 30),
               });
@@ -835,69 +820,13 @@ export function RoutinesPage() {
               </p>
             </div>
 
-            {/* Exdates */}
-            <div className="space-y-2 mb-5">
-              <label className="text-sm font-medium text-foreground">
-                Skip dates{' '}
-                <span className="text-muted-foreground font-normal">
-                  (exdates)
-                </span>
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  type="date"
-                  value={exdateDraft}
-                  onChange={(e) => setExdateDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      addExdate();
-                    }
-                  }}
-                  className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-input bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-                />
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={addExdate}
-                  className="border-input text-foreground hover:bg-muted"
-                >
-                  <Plus className="h-4 w-4 mr-1" />
-                  Add
-                </Button>
-              </div>
-              {exdates.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {exdates.map((date) => (
-                    <span
-                      key={date}
-                      className="inline-flex items-center gap-1 rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground"
-                    >
-                      {date}
-                      <button
-                        onClick={() =>
-                          setExdates((prev) =>
-                            prev.filter((entry) => entry !== date),
-                          )
-                        }
-                        className="hover:text-destructive transition-colors"
-                        aria-label={`Remove skip date ${date}`}
-                      >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
-
             {/* Live preview */}
             <div className="space-y-1 mb-5 rounded-xl border border-border bg-background p-4">
               <p className="text-xs font-medium text-muted-foreground">
-                Rule body
+                Recurrence (stored as one blob)
               </p>
               <p className="text-sm font-mono text-foreground break-all">
-                {rruleBody}
+                {rruleBlob}
               </p>
               {!ruleValid && (
                 <p className="text-xs text-destructive">

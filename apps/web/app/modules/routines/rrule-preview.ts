@@ -1,15 +1,19 @@
-// RRULE expansion + summaries for /routines (ADR 0004 § Recurrence).
+// RRULE expansion + summaries for /routines (ADR 0004 amendment § Recurrence).
 //
 // The npm `rrule` engine must produce the SAME local civil dates as the Rust
 // crate (`packages/api-core/src/routines.rs::occurrence_dates`) — golden
 // fixtures (`packages/api-core/fixtures/rrule_golden.json`) are asserted on
 // BOTH engines so they cannot drift.
 //
-// Floating local civil time, always: a stored `dtstart`
-// (`YYYY-MM-DDTHH:MM:SS`, no offset) is attached to UTC purely as a carrier
-// when handed to npm `rrule`, and results are read back off the UTC
-// components. The browser's local timezone is NEVER consulted for membership
-// — same UTC-carrier trick as the Rust side.
+// The stored recurrence is ONE blob with exactly two newline-separated lines:
+// `DTSTART:YYYYMMDDTHHMMSS` (floating local, no Z/TZID) + `RRULE:<body>`.
+// `parseRruleBlob` splits it; the body goes to npm `rrule` and the DTSTART is
+// converted to the civil `YYYY-MM-DDTHH:MM:SS` form the engine helpers take.
+//
+// Floating local civil time, always: the civil dtstart is attached to UTC
+// purely as a carrier when handed to npm `rrule`, and results are read back
+// off the UTC components. The browser's local timezone is NEVER consulted for
+// membership — same UTC-carrier trick as the Rust side.
 //
 // One engine quirk this helper works around: with `forceset: true`,
 // `rrulestr` ignores the `dtstart` OPTION and only reads a `DTSTART:` line
@@ -28,6 +32,7 @@ const rrule: RruleApi = ((rruleModule as unknown as { default?: RruleApi }).defa
 
 const CIVIL_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const CIVIL_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/;
+const BASIC_DTSTART_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/;
 const MS_PER_DAY = 86_400_000;
 
 const BYDAY_LABELS: Record<string, string> = {
@@ -65,7 +70,7 @@ export function isCivilDateValid(date: string): boolean {
 }
 
 /** True when `dtstart` is a real floating local datetime in
- *  `YYYY-MM-DDTHH:MM:SS` form (no offset, no `Z` — the storage format). */
+ *  `YYYY-MM-DDTHH:MM:SS` form (no offset, no `Z`). */
 export function isCivilDateTimeValid(dtstart: string): boolean {
   const m = dtstart.trim().match(CIVIL_DATETIME_RE);
   if (!m) return false;
@@ -81,6 +86,57 @@ export function isCivilDateTimeValid(dtstart: string): boolean {
     pad(carrier.getUTCMinutes()) === mi &&
     pad(carrier.getUTCSeconds()) === s
   );
+}
+
+/** Converts the blob's basic DTSTART value (`YYYYMMDDTHHMMSS`) to the civil
+ *  hyphenated form (`YYYY-MM-DDTHH:MM:SS`); null when malformed. */
+function basicToCivil(value: string): string | null {
+  const m = value.trim().match(BASIC_DTSTART_RE);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  return `${y}-${mo}-${d}T${h}:${mi}:${s}`;
+}
+
+/**
+ * Parses the two-line recurrence blob (ADR 0004 amendment) — exactly
+ * `DTSTART:YYYYMMDDTHHMMSS\nRRULE:<body>`, no trailing extras. Mirrors the
+ * Rust `parse_blob`: rejects `EXDATE`/`RDATE`/`EXRULE`/`TZID` anywhere, more
+ * than one `RRULE:` line, a `Z` on the DTSTART value, and any other shape.
+ * Returns the civil dtstart (`YYYY-MM-DDTHH:MM:SS`) plus the bare RRULE
+ * body, or null when the blob does not match the locked format.
+ */
+export function parseRruleBlob(
+  rrule: string,
+): { dtstart: string; body: string } | null {
+  const blob = rrule.trim();
+  const upper = blob.toUpperCase();
+  for (const forbidden of ['EXDATE', 'RDATE', 'EXRULE', 'TZID']) {
+    if (upper.includes(forbidden)) return null;
+  }
+  if (upper.split('RRULE:').length - 1 !== 1) return null;
+  const lines = blob
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length !== 2) return null;
+  const [dtstartLine, rruleLine] = lines;
+  if (!dtstartLine.toUpperCase().startsWith('DTSTART:')) return null;
+  const value = dtstartLine.slice('DTSTART:'.length).trim();
+  // Floating local: the basic form must never carry a Z (or an offset).
+  if (value.toUpperCase().includes('Z')) return null;
+  const dtstart = basicToCivil(value);
+  if (!dtstart) return null;
+  if (!rruleLine.toUpperCase().startsWith('RRULE:')) return null;
+  const body = rruleLine.slice('RRULE:'.length).trim();
+  if (!body) return null;
+  return { dtstart, body };
+}
+
+/** Composes the two-line blob from a civil dtstart (`YYYY-MM-DDTHH:MM:SS`)
+ *  and a bare RRULE body — the exact shape the API stores. */
+export function composeRruleBlob(dtstart: string, body: string): string {
+  const compact = dtstart.replaceAll('-', '').replaceAll(':', '');
+  return `DTSTART:${compact}\nRRULE:${body.trim()}`;
 }
 
 function parseCivilDateCarrier(date: string): Date | null {
@@ -127,24 +183,21 @@ function toRuleText(rruleBody: string, dtstartCarrier: Date): string {
 }
 
 /**
- * Expands a recurrence into the local civil dates it covers in the inclusive
- * window `[from, to]` (`YYYY-MM-DD`, both ends included), minus `exdates`
- * (local-date exclusion). Dates come back ascending and deduplicated.
+ * Expands a recurrence blob into the local civil dates it covers in the
+ * inclusive window `[from, to]` (`YYYY-MM-DD`, both ends included). Dates
+ * come back ascending and deduplicated.
  *
  * Mirrors Rust `occurrence_dates`: window bounds are widened by a day on each
  * side before hitting the engine so edge inclusivity never depends on the
  * library's boundary conventions; occurrences are then filtered to the exact
- * civil-date window. Exdates apply AFTER expansion (a COUNT=5 series minus an
- * exdate still counts 5 internally), matching the fixtures.
+ * civil-date window.
  *
- * Returns [] on any malformed input (bad dates, bad dtstart, unparsable rule)
- * — callers gate saving with `isValidRruleBody`; the server remains the
- * validation authority either way.
+ * Returns [] on any malformed input (bad dates, unparsable blob) — callers
+ * gate saving with `isValidRruleBody`; the server remains the validation
+ * authority either way.
  */
 export function occurrenceDates(args: {
-  dtstart: string; // YYYY-MM-DDTHH:MM:SS
-  rrule: string; // body only
-  exdates: string[];
+  rrule: string; // the two-line blob
   from: string; // YYYY-MM-DD inclusive
   to: string; // YYYY-MM-DD inclusive
 }): string[] {
@@ -155,9 +208,11 @@ export function occurrenceDates(args: {
   if (!fromCarrier || !toCarrier || fromCarrier.getTime() > toCarrier.getTime()) {
     return [];
   }
-  const dtstartCarrier = parseCivilDateTimeCarrier(args.dtstart);
+  const parsed = parseRruleBlob(args.rrule);
+  if (!parsed) return [];
+  const dtstartCarrier = parseCivilDateTimeCarrier(parsed.dtstart);
   if (!dtstartCarrier) return [];
-  const body = ruleBody(args.rrule);
+  const body = ruleBody(parsed.body);
   if (!body) return [];
 
   let dates: Date[];
@@ -174,28 +229,26 @@ export function occurrenceDates(args: {
     return [];
   }
 
-  const exdates = new Set(args.exdates.map((date) => date.trim()));
   const out: string[] = [];
   for (const date of dates) {
     // The carrier tz is UTC, so the UTC view IS the floating civil time.
     const day = formatCivilDate(date);
     if (day < from || day > to) continue;
-    if (exdates.has(day)) continue;
     if (!out.includes(day)) out.push(day);
   }
   return out;
 }
 
-/** Create/update gate mirroring Rust `validate_recurrence`: both halves of
- *  the recurrence pair must parse together. UX only — the server re-validates
- *  and 400s authoritatively. */
-export function isValidRruleBody(rule: string, dtstart: string): boolean {
-  const body = ruleBody(rule);
-  if (!body) return false;
-  const dtstartCarrier = parseCivilDateTimeCarrier(dtstart);
+/** Create/update gate mirroring Rust `validate_recurrence`: the blob must
+ *  parse as a valid recurrence. UX only — the server re-validates and 400s
+ *  authoritatively. */
+export function isValidRruleBody(blob: string): boolean {
+  const parsed = parseRruleBlob(blob);
+  if (!parsed) return false;
+  const dtstartCarrier = parseCivilDateTimeCarrier(parsed.dtstart);
   if (!dtstartCarrier) return false;
   try {
-rrule.rrulestr(toRuleText(body, dtstartCarrier), { forceset: true });
+    rrule.rrulestr(toRuleText(parsed.body, dtstartCarrier), { forceset: true });
     return true;
   } catch {
     return false;
@@ -249,13 +302,14 @@ export function rruleParts(rrule: string): Map<string, string> {
 }
 
 /**
- * Human summary of an RRULE BODY for list rows ("Daily", "Weekly on Mon,
- * Wed"). Unknown/malformed rules degrade to the raw stored string so power
+ * Human summary of a recurrence blob for list rows ("Daily", "Weekly on Mon,
+ * Wed"). Unknown/malformed blobs degrade to the raw stored string so power
  * users still see what is there.
  */
 export function rruleSummary(rrule: string): string {
-  const raw = rrule.trim();
-  if (!raw) return 'No repeat rule';
+  const parsed = parseRruleBlob(rrule);
+  if (!parsed) return rrule.trim() || 'No repeat rule';
+  const raw = parsed.body.trim();
   const parts = rruleParts(raw);
   const freq = parts.get('FREQ')?.toUpperCase();
   const intervalRaw = parts.get('INTERVAL');

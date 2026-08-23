@@ -11,18 +11,18 @@ import { fileURLToPath } from 'node:url';
 import {
   addCivilDays,
   civilToday,
+  composeRruleBlob,
   isCivilDateValid,
   isCivilDateTimeValid,
   isValidRruleBody,
   occurrenceDates,
+  parseRruleBlob,
   rruleSummary,
 } from './rrule-preview';
 
 interface GoldenCase {
   name: string;
-  dtstart: string;
   rrule: string;
-  exdates: string[];
   from: string;
   to: string;
   expected: string[];
@@ -50,9 +50,7 @@ test('golden fixture loads with cases', () => {
 for (const c of fixture.cases) {
   test(`golden: ${c.name}`, () => {
     const got = occurrenceDates({
-      dtstart: c.dtstart,
       rrule: c.rrule,
-      exdates: c.exdates,
       from: c.from,
       to: c.to,
     });
@@ -64,19 +62,33 @@ for (const c of fixture.cases) {
 
 test('occurrenceDates returns [] on malformed input', () => {
   const base = {
-    dtstart: '2026-01-01T06:30:00',
-    rrule: 'FREQ=DAILY',
-    exdates: [] as string[],
+    rrule: 'DTSTART:20260101T063000\nRRULE:FREQ=DAILY',
     from: '2026-01-01',
     to: '2026-01-07',
   };
-  // Bad dtstart forms (the API 400s these too).
-  for (const dtstart of ['', '2026-01-01', '2026-01-01T06:30', '2026-01-01T06:30:00Z']) {
-    assert.deepEqual(occurrenceDates({ ...base, dtstart }), [], `dtstart ${dtstart}`);
+  // Bad blobs (the API 400s these too).
+  for (const rrule of [
+    '',
+    'FREQ=DAILY', // missing the DTSTART line
+    'DTSTART:20260101T063000', // missing the RRULE line
+    'DTSTART:20260101T063000Z\nRRULE:FREQ=DAILY', // Z on DTSTART
+    'DTSTART:2026-01-01T06:30:00\nRRULE:FREQ=DAILY', // not the basic form
+    'DTSTART:20260101T063000\nRRULE:FREQ=DAILY;EXDATE:20260102', // exdate
+    'DTSTART:20260101T063000\nRRULE:FREQ=DAILY\nEXTRA', // third line
+    'DTSTART:20260101T063000\nRRULE:NOT_A_RULE=1',
+    'DTSTART:20260101T063000\nRRULE:',
+  ]) {
+    assert.deepEqual(occurrenceDates({ ...base, rrule }), [], `rrule ${rrule}`);
   }
   // Impossible calendar dates must roll over nowhere.
-  assert.deepEqual(occurrenceDates({ ...base, dtstart: '2026-13-01T06:30:00' }), []);
-  assert.deepEqual(occurrenceDates({ ...base, dtstart: '2026-02-30T06:30:00' }), []);
+  assert.deepEqual(
+    occurrenceDates({ ...base, rrule: 'DTSTART:20261301T063000\nRRULE:FREQ=DAILY' }),
+    [],
+  );
+  assert.deepEqual(
+    occurrenceDates({ ...base, rrule: 'DTSTART:20260230T063000\nRRULE:FREQ=DAILY' }),
+    [],
+  );
   // Bad window.
   assert.deepEqual(occurrenceDates({ ...base, from: 'not-a-date' }), []);
   assert.deepEqual(occurrenceDates({ ...base, to: '2026/01/07' }), []);
@@ -85,17 +97,11 @@ test('occurrenceDates returns [] on malformed input', () => {
     [],
     'from after to',
   );
-  // Bad rules.
-  assert.deepEqual(occurrenceDates({ ...base, rrule: '' }), []);
-  assert.deepEqual(occurrenceDates({ ...base, rrule: 'RRULE:FREQ=DAILY' }), []);
-  assert.deepEqual(occurrenceDates({ ...base, rrule: 'NOT_A_RULE=1' }), []);
 });
 
 test('occurrenceDates is sorted and unique regardless of engine output', () => {
   const got = occurrenceDates({
-    dtstart: '2026-01-01T00:00:00',
-    rrule: 'FREQ=HOURLY;INTERVAL=12',
-    exdates: [],
+    rrule: 'DTSTART:20260101T000000\nRRULE:FREQ=HOURLY;INTERVAL=12',
     from: '2026-01-01',
     to: '2026-01-05',
   });
@@ -111,9 +117,7 @@ test('occurrenceDates is sorted and unique regardless of engine output', () => {
 
 test('window edges are inclusive at the exact time-of-day boundary', () => {
   const got = occurrenceDates({
-    dtstart: '2026-01-01T06:30:00',
-    rrule: 'FREQ=DAILY;UNTIL=20260104T063000Z',
-    exdates: [],
+    rrule: 'DTSTART:20260101T063000\nRRULE:FREQ=DAILY;UNTIL=20260104T063000Z',
     from: '2026-01-04',
     to: '2026-01-04',
   });
@@ -129,37 +133,84 @@ test('isCivilDate / isCivilDateTime validators', () => {
   assert.equal(isCivilDateTimeValid(' 2026-01-01T06:30:00 '), true, 'trim tolerated');
 });
 
+test('parseRruleBlob splits the locked two-line format', () => {
+  assert.deepEqual(
+    parseRruleBlob('DTSTART:20260105T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO'),
+    { dtstart: '2026-01-05T06:30:00', body: 'FREQ=WEEKLY;BYDAY=MO' },
+  );
+  // A trailing newline is trimmed away — still exactly two lines.
+  assert.deepEqual(
+    parseRruleBlob('DTSTART:20260105T063000\nRRULE:FREQ=DAILY\n'),
+    { dtstart: '2026-01-05T06:30:00', body: 'FREQ=DAILY' },
+  );
+  for (const bad of [
+    '',
+    'FREQ=DAILY',
+    'DTSTART:20260105T063000',
+    'DTSTART:20260105T063000Z\nRRULE:FREQ=DAILY',
+    'DTSTART;TZID=Asia/Kolkata:20260105T063000\nRRULE:FREQ=DAILY',
+    'DTSTART:20260105T063000\nRRULE:FREQ=DAILY\nRRULE:FREQ=WEEKLY',
+    'DTSTART:20260105T063000\nRRULE:FREQ=DAILY;RDATE:20260106',
+  ]) {
+    assert.equal(parseRruleBlob(bad), null, `bad blob: ${bad}`);
+  }
+});
+
+test('composeRruleBlob round-trips through parseRruleBlob', () => {
+  const blob = composeRruleBlob('2026-01-05T06:30:00', 'FREQ=WEEKLY;BYDAY=MO');
+  assert.equal(blob, 'DTSTART:20260105T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO');
+  assert.deepEqual(parseRruleBlob(blob), {
+    dtstart: '2026-01-05T06:30:00',
+    body: 'FREQ=WEEKLY;BYDAY=MO',
+  });
+});
+
 test('isValidRruleBody mirrors the server gate', () => {
-  const ok = '2026-01-01T06:30:00';
-  assert.equal(isValidRruleBody('FREQ=DAILY', ok), true);
-  assert.equal(isValidRruleBody('FREQ=WEEKLY;BYDAY=MO,WE;INTERVAL=2', ok), true);
-  assert.equal(isValidRruleBody('FREQ=DAILY;UNTIL=20260104T063000Z', ok), true);
-  assert.equal(isValidRruleBody('', ok), false);
-  assert.equal(isValidRruleBody('RRULE:FREQ=DAILY', ok), false);
-  assert.equal(isValidRruleBody('DTSTART:20260101T000000Z\nFREQ=DAILY', ok), false);
-  assert.equal(isValidRruleBody('FREQ=DAILY', '2026-01-01T06:30'), false, 'bad dtstart');
-  assert.equal(isValidRruleBody('FREQ=BOGUS', ok), false);
+  assert.equal(isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=DAILY'), true);
+  assert.equal(
+    isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE;INTERVAL=2'),
+    true,
+  );
+  assert.equal(
+    isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=DAILY;UNTIL=20260104T063000Z'),
+    true,
+  );
+  assert.equal(isValidRruleBody(''), false);
+  assert.equal(isValidRruleBody('FREQ=DAILY'), false);
+  assert.equal(isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=BOGUS'), false);
+  assert.equal(isValidRruleBody('DTSTART:20260101T063000Z\nRRULE:FREQ=DAILY'), false);
 });
 
 // ── rruleSummary ──────────────────────────────────────────────────────────
 
 test('rruleSummary renders the common bodies', () => {
-  assert.equal(rruleSummary('FREQ=DAILY'), 'Daily');
-  assert.equal(rruleSummary('FREQ=DAILY;INTERVAL=2'), 'Every 2 days');
-  assert.equal(rruleSummary('FREQ=WEEKLY;BYDAY=MO,WE'), 'Weekly on Mon, Wed');
-  assert.equal(rruleSummary('FREQ=WEEKLY;INTERVAL=2;BYDAY=TU'), 'Every 2 weeks on Tue');
-  assert.equal(rruleSummary('freq=weekly;byday=mo'), 'Weekly on Mon', 'case-insensitive keys/values');
-  assert.equal(rruleSummary('FREQ=WEEKLY'), 'Weekly');
-  assert.equal(rruleSummary('FREQ=MONTHLY;BYMONTHDAY=1,15'), 'Monthly on day 1,15');
-  assert.equal(rruleSummary('FREQ=MONTHLY'), 'Monthly');
-  assert.equal(rruleSummary('FREQ=YEARLY'), 'Yearly');
+  const blob = (body: string) => `DTSTART:20260101T063000\nRRULE:${body}`;
+  assert.equal(rruleSummary(blob('FREQ=DAILY')), 'Daily');
+  assert.equal(rruleSummary(blob('FREQ=DAILY;INTERVAL=2')), 'Every 2 days');
+  assert.equal(rruleSummary(blob('FREQ=WEEKLY;BYDAY=MO,WE')), 'Weekly on Mon, Wed');
+  assert.equal(rruleSummary(blob('FREQ=WEEKLY;INTERVAL=2;BYDAY=TU')), 'Every 2 weeks on Tue');
   assert.equal(
-    rruleSummary('FREQ=DAILY;UNTIL=20260104T063000Z'),
+    rruleSummary(blob('freq=weekly;byday=mo')),
+    'Weekly on Mon',
+    'case-insensitive keys/values',
+  );
+  assert.equal(rruleSummary(blob('FREQ=WEEKLY')), 'Weekly');
+  assert.equal(rruleSummary(blob('FREQ=MONTHLY;BYMONTHDAY=1,15')), 'Monthly on day 1,15');
+  assert.equal(rruleSummary(blob('FREQ=MONTHLY')), 'Monthly');
+  assert.equal(rruleSummary(blob('FREQ=YEARLY')), 'Yearly');
+  assert.equal(
+    rruleSummary(blob('FREQ=DAILY;UNTIL=20260104T063000Z')),
     'Daily until 2026-01-04',
   );
-  assert.equal(rruleSummary('FREQ=DAILY;COUNT=5'), 'Daily · 5 times');
-  assert.equal(rruleSummary('FREQ=MINUTELY;INTERVAL=30'), 'FREQ=MINUTELY;INTERVAL=30', 'unknown freq degrades to raw');
+  assert.equal(rruleSummary(blob('FREQ=DAILY;COUNT=5')), 'Daily · 5 times');
+  assert.equal(
+    rruleSummary(blob('FREQ=MINUTELY;INTERVAL=30')),
+    'FREQ=MINUTELY;INTERVAL=30',
+    'unknown freq degrades to raw body',
+  );
   assert.equal(rruleSummary(''), 'No repeat rule');
+  // A malformed blob degrades to the raw stored string.
+  assert.equal(rruleSummary('FREQ=DAILY'), 'FREQ=DAILY');
 });
 
 // ── Civil date arithmetic ─────────────────────────────────────────────────
