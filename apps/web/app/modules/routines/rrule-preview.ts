@@ -301,6 +301,15 @@ export function rruleParts(rrule: string): Map<string, string> {
   return parts;
 }
 
+/** True when UNTIL's clock (HHMMSS, optional trailing Z) equals the civil
+ *  dtstart time (`YYYY-MM-DDTHH:MM:SS`). Date-only UNTIL is not a match. */
+export function untilMatchesDtstartTime(until: string, dtstart: string): boolean {
+  const untilTime = until.trim().toUpperCase().replace(/Z$/, '');
+  const t = untilTime.indexOf('T');
+  if (t < 0) return false;
+  return untilTime.slice(t + 1) === dtstart.slice(11, 19).replaceAll(':', '');
+}
+
 /**
  * Human summary of a recurrence blob for list rows ("Daily", "Weekly on Mon,
  * Wed"). Unknown/malformed blobs degrade to the raw stored string so power

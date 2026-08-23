@@ -18,6 +18,7 @@ import {
   occurrenceDates,
   parseRruleBlob,
   rruleSummary,
+  untilMatchesDtstartTime,
 } from './rrule-preview';
 
 interface GoldenCase {
@@ -211,6 +212,51 @@ test('rruleSummary renders the common bodies', () => {
   assert.equal(rruleSummary(''), 'No repeat rule');
   // A malformed blob degrades to the raw stored string.
   assert.equal(rruleSummary('FREQ=DAILY'), 'FREQ=DAILY');
+});
+
+// ── untilMatchesDtstartTime (editor prefill) ──────────────────────────────
+
+test('untilMatchesDtstartTime matches the builder round-trip (Z-form)', () => {
+  // Save emits `UNTIL=${date}T${hhmm}00Z`; the stored rule must reopen in the
+  // builder, not in raw-override mode.
+  assert.equal(
+    untilMatchesDtstartTime('20260104T063000Z', '2026-01-05T06:30:00'),
+    true,
+  );
+});
+
+test('untilMatchesDtstartTime matches without the trailing Z', () => {
+  assert.equal(
+    untilMatchesDtstartTime('20260104T063000', '2026-01-05T06:30:00'),
+    true,
+  );
+});
+
+test('untilMatchesDtstartTime rejects a different clock time', () => {
+  assert.equal(
+    untilMatchesDtstartTime('20260104T070000Z', '2026-01-05T06:30:00'),
+    false,
+  );
+});
+
+test('untilMatchesDtstartTime rejects date-only UNTIL', () => {
+  assert.equal(untilMatchesDtstartTime('20260104', '2026-01-05T06:30:00'), false);
+});
+
+test('untilMatchesDtstartTime never falls into the colon-form trap', () => {
+  // The pre-fix prefill compared `UNTIL.slice(9, 15)` ("063000") against
+  // `dtstart.slice(11, 16) + "00"` — that splices the colon mid-number into
+  // "06:3000", which can never equal the compact form. The helper strips the
+  // Z, keeps the compact HHMMSS and strips the dtstart's colons instead, so
+  // both sides are compact.
+  const trap = `${'2026-01-05T06:30:00'.slice(11, 16)}00`; // the old dtTime
+  assert.equal(trap, '06:3000');
+  assert.notEqual(trap, '063000', 'the broken comparison can never match');
+  assert.equal(
+    untilMatchesDtstartTime('20260104T063000Z', '2026-01-05T06:30:00'),
+    true,
+    'compact form on both sides matches',
+  );
 });
 
 // ── Civil date arithmetic ─────────────────────────────────────────────────

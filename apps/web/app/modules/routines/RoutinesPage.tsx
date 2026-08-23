@@ -27,6 +27,7 @@ import {
   parseRruleBlob,
   rruleParts,
   rruleSummary,
+  untilMatchesDtstartTime,
 } from './rrule-preview';
 
 // The server's error envelope is `{"error": "message"}`; fall back to a
@@ -213,9 +214,7 @@ export function RoutinesPage() {
     if (representable && until) {
       // UNTIL must carry exactly the dtstart's time to be rebuildable
       // (the golden Z-form: `YYYYMMDDT` + dtstart time + `Z`).
-      const untilTime = until.slice(9, 15);
-      const dtTime = `${dtstart.slice(11, 16)}00`;
-      if (untilTime !== dtTime) representable = false;
+      if (!untilMatchesDtstartTime(until, dtstart)) representable = false;
     }
     if (!representable) {
       setRawOverride(body);
