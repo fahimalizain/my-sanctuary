@@ -83,11 +83,17 @@ test('occurrenceDates returns [] on malformed input', () => {
   }
   // Impossible calendar dates must roll over nowhere.
   assert.deepEqual(
-    occurrenceDates({ ...base, rrule: 'DTSTART:20261301T063000\nRRULE:FREQ=DAILY' }),
+    occurrenceDates({
+      ...base,
+      rrule: 'DTSTART:20261301T063000\nRRULE:FREQ=DAILY',
+    }),
     [],
   );
   assert.deepEqual(
-    occurrenceDates({ ...base, rrule: 'DTSTART:20260230T063000\nRRULE:FREQ=DAILY' }),
+    occurrenceDates({
+      ...base,
+      rrule: 'DTSTART:20260230T063000\nRRULE:FREQ=DAILY',
+    }),
     [],
   );
   // Bad window.
@@ -122,16 +128,32 @@ test('window edges are inclusive at the exact time-of-day boundary', () => {
     from: '2026-01-04',
     to: '2026-01-04',
   });
-  assert.deepEqual(got, ['2026-01-04'], 'single-day window still catches the rule');
+  assert.deepEqual(
+    got,
+    ['2026-01-04'],
+    'single-day window still catches the rule',
+  );
 });
 
 test('isCivilDate / isCivilDateTime validators', () => {
-  assert.equal(isCivilDateValid('2026-02-29'), false, '2026 is not a leap year');
+  assert.equal(
+    isCivilDateValid('2026-02-29'),
+    false,
+    '2026 is not a leap year',
+  );
   assert.equal(isCivilDateValid('2028-02-29'), true);
-  assert.equal(isCivilDateValid('2026-1-01'), false, 'components must be padded');
+  assert.equal(
+    isCivilDateValid('2026-1-01'),
+    false,
+    'components must be padded',
+  );
   assert.equal(isCivilDateTimeValid('2026-01-01T24:00:00'), false);
   assert.equal(isCivilDateTimeValid('2026-01-01T06:60:00'), false);
-  assert.equal(isCivilDateTimeValid(' 2026-01-01T06:30:00 '), true, 'trim tolerated');
+  assert.equal(
+    isCivilDateTimeValid(' 2026-01-01T06:30:00 '),
+    true,
+    'trim tolerated',
+  );
 });
 
 test('parseRruleBlob splits the locked two-line format', () => {
@@ -167,19 +189,32 @@ test('composeRruleBlob round-trips through parseRruleBlob', () => {
 });
 
 test('isValidRruleBody mirrors the server gate', () => {
-  assert.equal(isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=DAILY'), true);
   assert.equal(
-    isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE;INTERVAL=2'),
+    isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=DAILY'),
     true,
   );
   assert.equal(
-    isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=DAILY;UNTIL=20260104T063000Z'),
+    isValidRruleBody(
+      'DTSTART:20260101T063000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE;INTERVAL=2',
+    ),
+    true,
+  );
+  assert.equal(
+    isValidRruleBody(
+      'DTSTART:20260101T063000\nRRULE:FREQ=DAILY;UNTIL=20260104T063000Z',
+    ),
     true,
   );
   assert.equal(isValidRruleBody(''), false);
   assert.equal(isValidRruleBody('FREQ=DAILY'), false);
-  assert.equal(isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=BOGUS'), false);
-  assert.equal(isValidRruleBody('DTSTART:20260101T063000Z\nRRULE:FREQ=DAILY'), false);
+  assert.equal(
+    isValidRruleBody('DTSTART:20260101T063000\nRRULE:FREQ=BOGUS'),
+    false,
+  );
+  assert.equal(
+    isValidRruleBody('DTSTART:20260101T063000Z\nRRULE:FREQ=DAILY'),
+    false,
+  );
 });
 
 // ── rruleSummary ──────────────────────────────────────────────────────────
@@ -188,15 +223,24 @@ test('rruleSummary renders the common bodies', () => {
   const blob = (body: string) => `DTSTART:20260101T063000\nRRULE:${body}`;
   assert.equal(rruleSummary(blob('FREQ=DAILY')), 'Daily');
   assert.equal(rruleSummary(blob('FREQ=DAILY;INTERVAL=2')), 'Every 2 days');
-  assert.equal(rruleSummary(blob('FREQ=WEEKLY;BYDAY=MO,WE')), 'Weekly on Mon, Wed');
-  assert.equal(rruleSummary(blob('FREQ=WEEKLY;INTERVAL=2;BYDAY=TU')), 'Every 2 weeks on Tue');
+  assert.equal(
+    rruleSummary(blob('FREQ=WEEKLY;BYDAY=MO,WE')),
+    'Weekly on Mon, Wed',
+  );
+  assert.equal(
+    rruleSummary(blob('FREQ=WEEKLY;INTERVAL=2;BYDAY=TU')),
+    'Every 2 weeks on Tue',
+  );
   assert.equal(
     rruleSummary(blob('freq=weekly;byday=mo')),
     'Weekly on Mon',
     'case-insensitive keys/values',
   );
   assert.equal(rruleSummary(blob('FREQ=WEEKLY')), 'Weekly');
-  assert.equal(rruleSummary(blob('FREQ=MONTHLY;BYMONTHDAY=1,15')), 'Monthly on day 1,15');
+  assert.equal(
+    rruleSummary(blob('FREQ=MONTHLY;BYMONTHDAY=1,15')),
+    'Monthly on day 1,15',
+  );
   assert.equal(rruleSummary(blob('FREQ=MONTHLY')), 'Monthly');
   assert.equal(rruleSummary(blob('FREQ=YEARLY')), 'Yearly');
   assert.equal(
@@ -240,7 +284,10 @@ test('untilMatchesDtstartTime rejects a different clock time', () => {
 });
 
 test('untilMatchesDtstartTime rejects date-only UNTIL', () => {
-  assert.equal(untilMatchesDtstartTime('20260104', '2026-01-05T06:30:00'), false);
+  assert.equal(
+    untilMatchesDtstartTime('20260104', '2026-01-05T06:30:00'),
+    false,
+  );
 });
 
 test('untilMatchesDtstartTime never falls into the colon-form trap', () => {
@@ -265,5 +312,9 @@ test('civilToday + addCivilDays do pure calendar math', () => {
   assert.match(civilToday(), /^\d{4}-\d{2}-\d{2}$/);
   assert.equal(addCivilDays('2026-01-31', 1), '2026-02-01', 'month rollover');
   assert.equal(addCivilDays('2026-03-01', -1), '2026-02-28', 'negative shift');
-  assert.equal(addCivilDays('bogus', 3), 'bogus', 'malformed input returned unchanged');
+  assert.equal(
+    addCivilDays('bogus', 3),
+    'bogus',
+    'malformed input returned unchanged',
+  );
 });

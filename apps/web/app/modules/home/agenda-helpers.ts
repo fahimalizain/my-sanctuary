@@ -161,9 +161,7 @@ export function canReschedule(item: AgendaItemRecord): boolean {
     );
   }
   if (item.kind === 'task' && item.task) {
-    return (
-      item.task.status !== 'COMPLETED' && item.task.status !== 'DISCARDED'
-    );
+    return item.task.status !== 'COMPLETED' && item.task.status !== 'DISCARDED';
   }
   return false;
 }

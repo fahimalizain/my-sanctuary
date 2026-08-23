@@ -83,7 +83,9 @@ function emptyDays(): Record<WeekdayCode, boolean> {
 function weekdayOf(date: string): WeekdayCode | null {
   const m = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return null;
-  const carrier = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  const carrier = new Date(
+    Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])),
+  );
   return WEEKDAY_CODES[(carrier.getUTCDay() + 6) % 7];
 }
 
@@ -162,8 +164,7 @@ export function RoutinesPage() {
     title,
     classifyTitle,
     categoryId: null,
-    initialTitle:
-      form?.mode === 'edit' ? form.routine!.title : undefined,
+    initialTitle: form?.mode === 'edit' ? form.routine!.title : undefined,
     active: form !== null,
     resetKey: `${form !== null}:${form?.mode === 'edit' ? form.routine!.id : 'new'}`,
   });
@@ -205,7 +206,11 @@ export function RoutinesPage() {
       !(until && count);
     if (representable && byday) {
       for (const token of byday.split(',')) {
-        if (!WEEKDAY_CODES.includes(token.trim().replace(/^[+-]?\d{1,2}/, '') as WeekdayCode)) {
+        if (
+          !WEEKDAY_CODES.includes(
+            token.trim().replace(/^[+-]?\d{1,2}/, '') as WeekdayCode,
+          )
+        ) {
           representable = false;
           break;
         }
@@ -223,7 +228,11 @@ export function RoutinesPage() {
     setRawOverride('');
     setFreq(freqPart === 'WEEKLY' ? 'WEEKLY' : 'DAILY');
     const intervalRaw = parts.get('INTERVAL');
-    setIntervalText(intervalRaw ? String(Math.max(1, Number.parseInt(intervalRaw, 10) || 1)) : '1');
+    setIntervalText(
+      intervalRaw
+        ? String(Math.max(1, Number.parseInt(intervalRaw, 10) || 1))
+        : '1',
+    );
     const days = emptyDays();
     if (byday) {
       for (const token of byday.split(',')) {
@@ -239,7 +248,9 @@ export function RoutinesPage() {
     setWeeklyDays(days);
     if (until) {
       setUntilMode('until');
-      setUntilDate(`${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}`);
+      setUntilDate(
+        `${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}`,
+      );
       setCountText('5');
     } else if (count) {
       setUntilMode('count');
@@ -375,15 +386,12 @@ export function RoutinesPage() {
     let res: Response;
     if (form.mode === 'edit') {
       // Every field optional — sending the full set is a no-op replace.
-      res = await fetch(
-        `${API_BASE_URL}/api/routines/${form.routine!.id}`,
-        {
-          method: 'PATCH',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload as UpdateRoutineInput),
-        },
-      );
+      res = await fetch(`${API_BASE_URL}/api/routines/${form.routine!.id}`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload as UpdateRoutineInput),
+      });
     } else {
       res = await fetch(`${API_BASE_URL}/api/routines`, {
         method: 'POST',
@@ -446,10 +454,7 @@ export function RoutinesPage() {
               Standing commitments — they land on Home, never on the Board
             </p>
           </div>
-          <Button
-            onClick={openCreate}
-            className="flex-shrink-0"
-          >
+          <Button onClick={openCreate} className="flex-shrink-0">
             <Plus className="h-4 w-4 mr-1" />
             Add routine
           </Button>
@@ -700,9 +705,7 @@ export function RoutinesPage() {
               </div>
 
               <div className="flex items-center gap-3">
-                <label className="text-sm text-muted-foreground">
-                  Every
-                </label>
+                <label className="text-sm text-muted-foreground">Every</label>
                 <input
                   type="number"
                   min={1}

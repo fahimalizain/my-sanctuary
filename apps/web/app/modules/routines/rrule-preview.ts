@@ -27,8 +27,8 @@ import * as rruleModule from 'rrule';
 // resolve the ESM build and expose true named exports. Resolve both shapes
 // once so the helper runs identically in tests and in the app.
 type RruleApi = typeof rruleModule;
-const rrule: RruleApi = ((rruleModule as unknown as { default?: RruleApi }).default ??
-  rruleModule) as RruleApi;
+const rrule: RruleApi = ((rruleModule as unknown as { default?: RruleApi })
+  .default ?? rruleModule) as RruleApi;
 
 const CIVIL_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const CIVIL_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/;
@@ -76,7 +76,14 @@ export function isCivilDateTimeValid(dtstart: string): boolean {
   if (!m) return false;
   const [, y, mo, d, h, mi, s] = m;
   const carrier = new Date(
-    Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s)),
+    Date.UTC(
+      Number(y),
+      Number(mo) - 1,
+      Number(d),
+      Number(h),
+      Number(mi),
+      Number(s),
+    ),
   );
   return (
     `${carrier.getUTCFullYear()}` === y &&
@@ -205,7 +212,11 @@ export function occurrenceDates(args: {
   const to = args.to.trim();
   const fromCarrier = parseCivilDateCarrier(from);
   const toCarrier = parseCivilDateCarrier(to);
-  if (!fromCarrier || !toCarrier || fromCarrier.getTime() > toCarrier.getTime()) {
+  if (
+    !fromCarrier ||
+    !toCarrier ||
+    fromCarrier.getTime() > toCarrier.getTime()
+  ) {
     return [];
   }
   const parsed = parseRruleBlob(args.rrule);
@@ -217,7 +228,9 @@ export function occurrenceDates(args: {
 
   let dates: Date[];
   try {
-    const set = rrule.rrulestr(toRuleText(body, dtstartCarrier), { forceset: true });
+    const set = rrule.rrulestr(toRuleText(body, dtstartCarrier), {
+      forceset: true,
+    });
     // Widen ±1 day (same as the Rust side), then filter to the exact window
     // below. `between` terminates at its bound, so infinite rules are safe.
     dates = set.between(
@@ -276,7 +289,10 @@ function byDayLabels(raw: string | undefined): string {
   if (!raw) return '';
   const labels: string[] = [];
   for (const token of raw.split(',')) {
-    const code = token.trim().replace(/^[+-]?\d{1,2}/, '').toUpperCase();
+    const code = token
+      .trim()
+      .replace(/^[+-]?\d{1,2}/, '')
+      .toUpperCase();
     const label = BYDAY_LABELS[code];
     if (!label) return ''; // unknown token → caller falls back to no days
     labels.push(label);
@@ -303,7 +319,10 @@ export function rruleParts(rrule: string): Map<string, string> {
 
 /** True when UNTIL's clock (HHMMSS, optional trailing Z) equals the civil
  *  dtstart time (`YYYY-MM-DDTHH:MM:SS`). Date-only UNTIL is not a match. */
-export function untilMatchesDtstartTime(until: string, dtstart: string): boolean {
+export function untilMatchesDtstartTime(
+  until: string,
+  dtstart: string,
+): boolean {
   const untilTime = until.trim().toUpperCase().replace(/Z$/, '');
   const t = untilTime.indexOf('T');
   if (t < 0) return false;

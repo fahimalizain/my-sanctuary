@@ -382,7 +382,10 @@ export function HomePage() {
     setItems((prev) =>
       prev.map((entry) =>
         entry.id === item.id && entry.occurrence
-          ? { ...entry, occurrence: { ...entry.occurrence, status: 'in_progress' } }
+          ? {
+              ...entry,
+              occurrence: { ...entry.occurrence, status: 'in_progress' },
+            }
           : entry,
       ),
     );
