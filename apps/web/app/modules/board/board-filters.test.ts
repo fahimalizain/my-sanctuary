@@ -8,6 +8,7 @@ import {
   childIdsOf,
   expandCategorySelection,
   isImpliedByParent,
+  selectedCategoryRows,
   taskMatchesSearch,
   toggleCategoryId,
 } from './board-filters';
@@ -398,6 +399,112 @@ test('buildCategoryTree: query is trimmed and case-insensitive', () => {
 
 test('buildCategoryTree: no matches → []', () => {
   assert.deepEqual(buildCategoryTree(lists, categories, 'zzzz'), []);
+});
+
+// ── selectedCategoryRows ─────────────────────────────────────────────────
+
+test('selectedCategoryRows: empty selection → []', () => {
+  assert.deepEqual(selectedCategoryRows([], lists, categories), []);
+});
+
+test('selectedCategoryRows: one root → one row with parentTitle null', () => {
+  assert.deepEqual(selectedCategoryRows(['root-dev'], lists, categories), [
+    {
+      id: 'root-dev',
+      title: 'Development',
+      color: '#8b5cf6',
+      parentTitle: null,
+    },
+  ]);
+});
+
+test('selectedCategoryRows: one child → row carrying its root title', () => {
+  assert.deepEqual(selectedCategoryRows(['child-ui'], lists, categories), [
+    { id: 'child-ui', title: 'UI', color: '#8b5cf6', parentTitle: 'Design' },
+  ]);
+});
+
+test('selectedCategoryRows: mixed selection emits in tree order, not selection order', () => {
+  assert.deepEqual(
+    selectedCategoryRows(
+      ['root-life', 'child-frontend', 'root-dev'],
+      lists,
+      categories,
+    ),
+    [
+      {
+        id: 'root-dev',
+        title: 'Development',
+        color: '#8b5cf6',
+        parentTitle: null,
+      },
+      {
+        id: 'child-frontend',
+        title: 'Frontend',
+        color: '#8b5cf6',
+        parentTitle: 'Development',
+      },
+      {
+        id: 'root-life',
+        title: 'Life Admin',
+        color: '#8b5cf6',
+        parentTitle: null,
+      },
+    ],
+  );
+});
+
+test('selectedCategoryRows: unknown ids are skipped', () => {
+  assert.deepEqual(selectedCategoryRows(['ghost'], lists, categories), []);
+});
+
+test('selectedCategoryRows: untracked is never a picker row, so never a pinned row', () => {
+  assert.deepEqual(selectedCategoryRows(['untracked'], lists, categories), []);
+});
+
+test('selectedCategoryRows: explicit implied child stays alongside its parent (no collapse)', () => {
+  // The URL may carry both the parent and a child it implies; both are
+  // shown rather than rewritten away.
+  assert.deepEqual(
+    selectedCategoryRows(['root-dev', 'child-frontend'], lists, categories),
+    [
+      {
+        id: 'root-dev',
+        title: 'Development',
+        color: '#8b5cf6',
+        parentTitle: null,
+      },
+      {
+        id: 'child-frontend',
+        title: 'Frontend',
+        color: '#8b5cf6',
+        parentTitle: 'Development',
+      },
+    ],
+  );
+});
+
+test('selectedCategoryRows: duplicate ids collapse to one row', () => {
+  assert.deepEqual(
+    selectedCategoryRows(['root-dev', 'root-dev'], lists, categories),
+    [
+      {
+        id: 'root-dev',
+        title: 'Development',
+        color: '#8b5cf6',
+        parentTitle: null,
+      },
+    ],
+  );
+});
+
+test('selectedCategoryRows: selecting a parent alone does not pull in its children', () => {
+  const rows = selectedCategoryRows(['root-dev'], lists, categories);
+  assert.equal(rows.length, 1);
+  assert.deepEqual(
+    rows.map((r) => r.title),
+    ['Development'],
+  );
 });
 
 // ── taskMatchesSearch ────────────────────────────────────────────────────
