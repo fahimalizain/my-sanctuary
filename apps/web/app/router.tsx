@@ -13,6 +13,7 @@ import type { BoardSearch } from '@/app/modules/board';
 import { CategoriesComponent } from './routes/categories';
 import { CalendarComponent } from './routes/calendar';
 import { ConsistencyComponent } from './routes/consistency';
+import { RoutinesComponent } from './routes/routines';
 import { SettingsComponent } from './routes/settings';
 import { AuthGuard } from './components/AuthGuard';
 
@@ -104,6 +105,14 @@ const consistencyRoute = createRoute({
   component: withAuth(ConsistencyComponent),
 });
 
+// ADR 0004: /routines is deliberately NOT a nav tab — it is linked from Home
+// (and Settings), so the floating nav stays at five items.
+const routinesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/routines',
+  component: withAuth(RoutinesComponent),
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/settings',
@@ -118,6 +127,7 @@ const routeTree = rootRoute.addChildren([
   categoriesRoute,
   calendarRoute,
   consistencyRoute,
+  routinesRoute,
   settingsRoute,
 ]);
 

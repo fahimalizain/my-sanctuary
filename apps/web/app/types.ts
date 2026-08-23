@@ -342,3 +342,62 @@ export interface FocusTaskResponse {
   previous: TaskRecord | null;
   events: CalendarEvent[];
 }
+
+// A routine (ADR 0004): a standing definition of repeated work — never
+// completable, never on the Board. The `routines` row shape (snake_case)
+// plus the computed `category`; `exdates` arrives parsed (the API stores it
+// as JSON text).
+export interface RoutineRecord {
+  id: string;
+  user_id: string;
+  title: string;
+  estimated_minutes: number;
+  // Naive local civil datetime `YYYY-MM-DDTHH:MM:SS` (no offset, no Z).
+  dtstart: string;
+  // RFC 5545 RRULE body (`FREQ=…`) — never a `DTSTART:`-prefixed content
+  // line.
+  rrule: string;
+  // Local `YYYY-MM-DD` dates excluded from occurrence expansion.
+  exdates: string[];
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+  // Computed per title with the same matcher as tasks (never fails — an
+  // unmatched title keeps the `untracked` summary).
+  category: TaskCategorySummary;
+}
+
+// The envelope returned by GET /api/routines
+export interface RoutinesResponse {
+  routines: RoutineRecord[];
+}
+
+// The envelope returned by POST /api/routines and PATCH /api/routines/:id
+export interface RoutineResponse {
+  routine: RoutineRecord;
+}
+
+// Request body for POST /api/routines. `estimated_minutes` defaults to 15
+// server-side (min 1); `exdates` defaults to `[]`. The title must uniquely
+// match a non-untracked category (the server decides and explains 400s);
+// `dtstart`/`rrule` must parse together as a valid recurrence.
+export interface NewRoutineInput {
+  title: string;
+  estimated_minutes?: number;
+  dtstart: string;
+  rrule: string;
+  exdates?: string[];
+}
+
+// Request body for PATCH /api/routines/:id — every field optional. A present
+// `title` must uniquely match a non-untracked category; when either half of
+// the recurrence changes, the effective pair is validated against the stored
+// other side. `exdates` replaces the whole set when present.
+export interface UpdateRoutineInput {
+  title?: string;
+  estimated_minutes?: number;
+  dtstart?: string;
+  rrule?: string;
+  exdates?: string[];
+  sort_order?: number;
+}
