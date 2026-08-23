@@ -812,6 +812,16 @@ pub struct NewEventInput {
     /// carrier — slice 4). `None` for hand-created events.
     #[serde(default)]
     pub task_id: Option<String>,
+    /// When set (with `occurrence_id`), the created event carries
+    /// `extendedProperties.shared.sanctuary_routine_id` (slice 6 — a
+    /// started occurrence's one-shot log). Mutually exclusive with
+    /// `task_id` at the call sites; the two carriers never mix on one event.
+    #[serde(default)]
+    pub routine_id: Option<String>,
+    /// When set (with `routine_id`), the created event carries
+    /// `extendedProperties.shared.sanctuary_occurrence_id` (slice 6).
+    #[serde(default)]
+    pub occurrence_id: Option<String>,
     /// Google event `colorId` (`"1"`..=`"11"`). Omitted from the Google
     /// payload when `None`. `start_task` copies the matched category's
     /// stored `google_color_id`. Hand-created events leave this unset.

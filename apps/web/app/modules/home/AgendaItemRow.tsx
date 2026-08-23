@@ -31,7 +31,11 @@ interface AgendaItemRowProps {
   onOpenTask: (task: TaskRecord) => void;
   onCompleteOccurrence: (item: AgendaItemRecord) => void;
   onSkipOccurrence: (item: AgendaItemRecord) => void;
+  onStartOccurrence: (item: AgendaItemRecord) => void;
   onRenameOccurrence: (occurrence: OccurrenceRecord) => void;
+  /** Start is today-only (ADR 0004): Home renders Play for pending
+   *  occurrences only when the selected date is the civil today. */
+  showStartOccurrence?: boolean;
 }
 
 /** Round check circle — the row's complete control (tasks and occurrences
@@ -131,6 +135,8 @@ function OccurrenceRow({
   onMove,
   onComplete,
   onSkip,
+  onStart,
+  showStart,
   onRename,
 }: {
   item: AgendaItemRecord;
@@ -140,6 +146,8 @@ function OccurrenceRow({
   onMove: AgendaItemRowProps['onMove'];
   onComplete: () => void;
   onSkip: () => void;
+  onStart: () => void;
+  showStart: boolean;
   onRename: () => void;
 }) {
   const crossed =
@@ -209,6 +217,20 @@ function OccurrenceRow({
             className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
           >
             <CalendarX2 className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        )}
+        {/* Start is pending-only AND today-only: a one-shot Google log opens
+            and the chip reads In progress (a repeat on in_progress would be
+            a server-side 200 no-op, but the button is hidden anyway). */}
+        {occurrence.status === 'pending' && showStart && (
+          <button
+            type="button"
+            onClick={onStart}
+            aria-label={`Start ${occurrence.resolved_title}`}
+            title="Start"
+            className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
+          >
+            <Play className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
         )}
         <MoveButtons
@@ -327,6 +349,8 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         onMove={props.onMove}
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
+        onStart={() => props.onStartOccurrence(item)}
+        showStart={props.showStartOccurrence ?? false}
         onRename={() => props.onRenameOccurrence(item.occurrence!)}
       />
     );

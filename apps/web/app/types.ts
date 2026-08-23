@@ -495,3 +495,11 @@ export interface MoveAgendaItemInput {
 export interface OccurrenceResponse {
   occurrence: OccurrenceRecord;
 }
+
+// The envelope returned by POST /api/occurrences/:id/start: the fresh
+// occurrence plus the one-shot Google log this start created (`event` is null
+// on the idempotent in_progress no-op — no second event was opened).
+export interface OccurrenceActionResponse {
+  occurrence: OccurrenceRecord;
+  event: CalendarEvent | null;
+}

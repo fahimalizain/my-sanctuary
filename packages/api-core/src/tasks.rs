@@ -1010,6 +1010,8 @@ pub async fn start_task(
             start: start_rfc3339,
             end: end_rfc3339,
             task_id: Some(task.id.clone()),
+            routine_id: None,
+            occurrence_id: None,
             color_id: target.google_color_id,
             // Start never takes focus: the started chip is unfocused.
             sanctuary_focus: false,
@@ -1484,9 +1486,13 @@ async fn stop_running_event(
 pub struct ElongateReport {
     /// Tasks whose Google event end was extended in this run.
     pub elongated: usize,
-    /// Tasks skipped: no started log / empty ids / missing cache row, an
-    /// unparseable stored end, Google 404 (the event is gone), or a current
-    /// end already at/after the target (never shrink).
+    /// Occurrences whose one-shot Google event end was extended in this run
+    /// (slice 6 — [`crate::agenda::run_elongate_occurrences`] folds into the
+    /// same report; `skipped`/`errors` are shared between both kinds).
+    pub occurrences_elongated: usize,
+    /// Tasks/occurrences skipped: no started log / empty ids / missing cache
+    /// row, an unparseable stored end, Google 404 (the event is gone), or a
+    /// current end already at/after the target (never shrink).
     pub skipped: usize,
     /// Human-readable failures; empty when everything worked.
     pub errors: Vec<String>,
@@ -2120,6 +2126,8 @@ async fn create_focus_segment(
             start: start_rfc3339,
             end: end_rfc3339,
             task_id: Some(task.id.clone()),
+            routine_id: None,
+            occurrence_id: None,
             color_id,
             sanctuary_focus: focused,
             // Create-time snapshot of the task's P/D — never patched later.

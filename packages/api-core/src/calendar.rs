@@ -333,14 +333,15 @@ pub async fn list_events(
 
 /// Builds `extendedProperties.shared` for an `events.insert`.
 ///
-/// Returns `None` when there is no task carrier — hand-created events
-/// send no extendedProperties at all. When `Some`, `sanctuary_task_id`
-/// is always set; `sanctuary_focus` is `"1"` only if focused (never
-/// `"0"`); `sanctuary_priority` / `sanctuary_difficulty` are present
-/// only when the input carried a non-empty snapshot. Never a partial
-/// map without the carrier.
+/// Returns `None` when there is no carrier — hand-created events send no
+/// extendedProperties at all. A **task** carrier (`task_id`) is always
+/// `sanctuary_task_id` (plus `sanctuary_focus` `"1"` only if focused, never
+/// `"0"`, and the priority/difficulty snapshots only when non-empty). An
+/// **occurrence** carrier (both `routine_id` and `occurrence_id` present)
+/// sends exactly `sanctuary_routine_id` + `sanctuary_occurrence_id` — no
+/// task_id, no focus/priority/difficulty (focus stays task-only). Never a
+/// partial map without a carrier, and never both carriers at once.
 fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEventSharedProperties> {
-    let task_id = input.task_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
     let trim_opt = |value: &Option<String>| {
         value
             .as_deref()
@@ -348,12 +349,35 @@ fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEventSharedPro
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    Some(GoogleEventSharedProperties {
-        sanctuary_task_id: Some(task_id.to_string()),
-        sanctuary_focus: input.sanctuary_focus.then(|| "1".to_string()),
-        sanctuary_priority: trim_opt(&input.priority),
-        sanctuary_difficulty: trim_opt(&input.difficulty),
-    })
+    if let Some(task_id) = input.task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(GoogleEventSharedProperties {
+            sanctuary_task_id: Some(task_id.to_string()),
+            sanctuary_focus: input.sanctuary_focus.then(|| "1".to_string()),
+            sanctuary_priority: trim_opt(&input.priority),
+            sanctuary_difficulty: trim_opt(&input.difficulty),
+            sanctuary_routine_id: None,
+            sanctuary_occurrence_id: None,
+        });
+    }
+    // Occurrence carrier: BOTH ids must be present (a partial pair is a
+    // caller bug — never emit a partial map).
+    let routine_id = input.routine_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let occurrence_id = input
+        .occurrence_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (routine_id, occurrence_id) {
+        (Some(routine_id), Some(occurrence_id)) => Some(GoogleEventSharedProperties {
+            sanctuary_task_id: None,
+            sanctuary_focus: None,
+            sanctuary_priority: None,
+            sanctuary_difficulty: None,
+            sanctuary_routine_id: Some(routine_id.to_string()),
+            sanctuary_occurrence_id: Some(occurrence_id.to_string()),
+        }),
+        _ => None,
+    }
 }
 
 /// Creates an event on Google (`events.insert`) and upserts the returned row
@@ -371,6 +395,13 @@ fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEventSharedPro
 /// stamped next to the carrier at insert time only — they are never patched
 /// when the task later changes. Unfocused creates send the carrier (plus any
 /// snapshots) alone.
+///
+/// When instead `routine_id` AND `occurrence_id` are both set (slice 6 — a
+/// started occurrence's one-shot log), the shared map carries exactly
+/// `sanctuary_routine_id` + `sanctuary_occurrence_id`; `calendar_events.task_id`
+/// stays empty (occurrence events are resolved through the occurrence row,
+/// never through the task column). `task_id` and the occurrence pair are
+/// mutually exclusive at the call sites.
 pub async fn create_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -458,6 +489,66 @@ pub async fn patch_event(
     );
     let payload = serde_json::json!({
         "end": { "dateTime": end_rfc3339 },
+    });
+    let body =
+        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
+    let (status, response) = http.patch_json(&url, &access.access_token, &body).await?;
+    if !(200..300).contains(&status) {
+        return Err(CalendarError::GoogleApi(format!(
+            "google events.patch returned {status}"
+        )));
+    }
+    let patched: GoogleEvent = serde_json::from_slice(&response)
+        .map_err(|err| CalendarError::InvalidResponse(format!("events.patch body: {err}")))?;
+
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let new_event = map_google_event(&patched, &cal.id, &now_rfc3339);
+    let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
+        Ok(id) => id,
+        Err(err) => {
+            return Ok(CreateEventOutput {
+                event: row_from_new_event(new_event, "".to_string(), &now_rfc3339),
+                source: "google".to_string(),
+                cache_error: Some(err.to_string()),
+            });
+        }
+    };
+
+    Ok(CreateEventOutput {
+        event: row_from_new_event(new_event, id, &now_rfc3339),
+        source: "google".to_string(),
+        cache_error: None,
+    })
+}
+
+/// Patches an event's `summary` on Google (`events.patch`) and upserts the
+/// returned row into the local cache — the occurrence title PATCH's Google
+/// write (slice 6): when an occurrence override changes after a chip exists,
+/// the one-shot log's `summary` follows the **resolved** title. Google echoes
+/// the stored `extendedProperties` back, so the upsert preserves the
+/// `sanctuary_routine_id`/`sanctuary_occurrence_id` link. Cache failures are
+/// logged ([`CreateEventOutput::cache_error`]), never fatal.
+pub async fn patch_event_summary(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+    google_event_id: &str,
+    summary: &str,
+    now_unix: i64,
+) -> Result<CreateEventOutput, CalendarError> {
+    let Some(cal) = calendars.get_by_id(calendar_id).await? else {
+        return Err(CalendarError::NotFound);
+    };
+
+    let url = format!(
+        "{GOOGLE_EVENTS_BASE_URL}/{}/events/{}",
+        encode_path_segment(&cal.google_calendar_id),
+        encode_path_segment(google_event_id)
+    );
+    let payload = serde_json::json!({
+        "summary": summary,
     });
     let body =
         serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
@@ -1351,10 +1442,12 @@ struct GoogleEventExtendedProperties {
 
 /// `extendedProperties.shared` of a Google event. Every key we write is
 /// modelled here: `sanctuary_task_id` (the task timer's carrier),
-/// `sanctuary_focus` (focused-segment flag), and the create-time snapshots
-/// `sanctuary_priority` / `sanctuary_difficulty`. Absent keys deserialize to
-/// `None`; `None` values are skipped on serialize, so the wire shape never
-/// carries `"0"`/empty placeholders.
+/// `sanctuary_focus` (focused-segment flag), the create-time snapshots
+/// `sanctuary_priority` / `sanctuary_difficulty`, and the occurrence
+/// carriers `sanctuary_routine_id` / `sanctuary_occurrence_id` (slice 6 —
+/// a started occurrence's one-shot log; never sent next to the task
+/// carrier). Absent keys deserialize to `None`; `None` values are skipped
+/// on serialize, so the wire shape never carries `"0"`/empty placeholders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 struct GoogleEventSharedProperties {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_task_id")]
@@ -1365,6 +1458,10 @@ struct GoogleEventSharedProperties {
     sanctuary_priority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_difficulty")]
     sanctuary_difficulty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_routine_id")]
+    sanctuary_routine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_occurrence_id")]
+    sanctuary_occurrence_id: Option<String>,
 }
 
 /// `start`/`end` of a Google event; all-day events carry `date` instead of
@@ -3307,6 +3404,8 @@ mod tests {
             start: "2026-08-19T09:00:00Z".to_string(),
             end: "2026-08-19T10:00:00Z".to_string(),
             task_id: None,
+            routine_id: None,
+            occurrence_id: None,
             color_id: None,
             sanctuary_focus: false,
             priority: None,

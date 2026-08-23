@@ -1,13 +1,16 @@
-//! Agenda + occurrence service (ADR 0004, slice 4): the date-scoped
-//! run-of-show and its occurrence verbs.
+//! Agenda + occurrence service (ADR 0004): the date-scoped run-of-show and
+//! its occurrence verbs, including the slice-6 Google writes: `/start`
+//! creates the one-shot log, complete/skip close a running chip, the title
+//! PATCH updates a chip's `summary`, and the elongate cron grows living
+//! in_progress occurrence events.
 //!
 //! Pure Rust and unit-testable: persistence goes through [`OccurrenceRepo`] /
 //! [`AgendaItemRepo`] / [`RoutineRepo`] / [`TaskRepo`] (faked with in-memory
-//! impls in tests); the Worker layers session checks on top
-//! (`apps/worker/src/agenda.rs`).
+//! impls in tests), Google HTTP through [`HttpClient`], and "now" comes from
+//! the caller — never `SystemTime`. The Worker layers session checks and
+//! token refresh on top (`apps/worker/src/agenda.rs`).
 //!
-//! Domain rules (ADR 0004, locked; this slice implements everything except
-//! the Google writes and `/start`, which slice 6 adds):
+//! Domain rules (ADR 0004, locked):
 //! - `GET /api/agenda?date=` **seeds on read** (not a cron): for every living
 //!   routine whose RRULE + exdates covers the date, ensure the occurrence row
 //!   (idempotent via `UNIQUE (routine_id, local_date)`) and append an
@@ -27,12 +30,30 @@
 //! - `DELETE` on an occurrence-kind item is refused (400 "skip is the
 //!   decline"); task-kind items are hard-deleted (unpin).
 //! - `PATCH /api/occurrences/:id { title }` writes the override; `""`/
-//!   whitespace clears it back to inheritance (NULL). No Google PATCH this
-//!   slice. Missing/other-user/soft-deleted-routine → 404.
-//! - `complete`/`skip` follow the locked verb matrix except Google: pending →
-//!   done/skipped, in_progress → done/skipped (no chip close yet), done →
-//!   done (no-op)/skipped, skipped → done/skipped (no-op). `/start` is NOT
-//!   implemented this slice.
+//!   whitespace clears it back to inheritance (NULL). When `google_event_id`
+//!   is set and the **resolved** title actually changed, the Google event's
+//!   `summary` is PATCHed too (unlike tasks — locked in the ADR). A Google
+//!   404 proceeds (the chip is gone; the override still writes).
+//!   Missing/other-user/soft-deleted-routine → 404.
+//! - `complete`/`skip` follow the locked verb matrix. From `in_progress`
+//!   **with** stored ids the open event's end is PATCHed closed (snapped to
+//!   now, `start + 60s` when now <= start — the same invert guard as task
+//!   exits) before the status flip; a Google 404 still flips. Without ids
+//!   (or with `http`/`access` `None`) the flip is session-only.
+//! - `/start` is **today-only** (`local_date == civil date of now in
+//!   Asia/Kolkata`) and `pending`-only: it creates the one-shot Google log
+//!   (summary = the **resolved** title, carriers
+//!   `sanctuary_routine_id`/`sanctuary_occurrence_id`, never a task_id,
+//!   never an RRULE, `T … T + START_EVENT_MINUTES` on the minute grid),
+//!   stores `calendar_id` + `google_event_id` on the occurrence, and flips it
+//!   to `in_progress`. Repeating on `in_progress` is a 200 no-op (no second
+//!   event); `done`/`skipped` → 400. Calendar pick is the same inheritance as
+//!   `start_task` (pattern → category → parent root → primary; missing/
+//!   read-only named calendar → primary; no writable calendar → 400).
+//! - The elongate cron ([`run_elongate_occurrences`]) grows every living
+//!   in_progress occurrence event the same way it grows task events
+//!   (`ceil_5min_unix_in_zone`, never shrink, never recreate, never flip
+//!   status); token refresh per occurrence owner.
 //! - Occurrence category is classified from the **resolved** title
 //!   (`override ?? routine.title`) with the same matcher as tasks; a read
 //!   never 400s on classification (untracked summary when nothing matches).
@@ -41,20 +62,31 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
+use crate::calendar::{
+    create_event, patch_event, patch_event_summary, CalendarError, CreateEventOutput,
+};
 use crate::categories::{
     classify, ensure_taxonomy, first_matching_pattern, CalendarScope, CategoryWithPatterns,
     ClassifyOutcome,
 };
+use crate::config::OAuthConfig;
 use crate::models::{
-    AgendaItem, NewAgendaItem, NewAgendaItemInput, NewRoutineOccurrence, Routine,
-    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, UpdateOccurrence,
+    AgendaItem, CalendarEvent, GoogleCalendar, NewAgendaItem, NewAgendaItemInput,
+    NewEventInput, NewRoutineOccurrence, Routine, RoutineOccurrence, Task, TaskCategory,
+    TaskCategoryPattern, UpdateOccurrence,
 };
+use crate::oauth::HttpClient;
 use crate::repo::{
-    AgendaItemRepo, OccurrenceRepo, RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo,
-    TaskRepo,
+    AgendaItemRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError, RoutineRepo,
+    TaskCategoryRepo, TaskListRepo, TaskRepo, TokenRepo,
 };
 use crate::routines::occurrence_dates;
-use crate::tasks::{TaskCategorySummary, TaskView};
+use crate::tasks::{ElongateReport, START_EVENT_MINUTES, TaskCategorySummary, TaskView};
+use crate::time::{
+    ceil_5min_unix_in_zone, civil_date_in_offset, nearest_minute_unix, rfc3339_to_unix_secs,
+    unix_secs_to_rfc3339,
+};
+use crate::token::{refresh_if_needed, GoogleAccess};
 
 /// Occurrence states (lowercase on purpose — these are NOT task statuses).
 pub const OCCURRENCE_STATUS_PENDING: &str = "pending";
@@ -67,15 +99,35 @@ pub const AGENDA_KIND_TASK: &str = "task";
 pub const AGENDA_KIND_OCCURRENCE: &str = "occurrence";
 
 /// Errors produced by the agenda/occurrence service. The Worker maps Invalid →
-/// 400, NotFound → 404, Repo → 500 (no 502 this slice — no Google writes).
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
+/// 400, NotFound → 404, GoogleApi → 502, Calendar (any other calendar-layer
+/// surprise) and Repo → 500.
+///
+/// No `PartialEq`/`Eq`: the `Calendar` variant wraps [`CalendarError`] (which
+/// carries non-`Eq` HTTP errors) — tests match with `matches!`, never `==`.
+#[derive(Debug, Clone, Error)]
 pub enum AgendaError {
     #[error("{0}")]
     Invalid(String),
     #[error("not found")]
     NotFound,
+    #[error("google api error: {0}")]
+    GoogleApi(String),
+    #[error("calendar error: {0}")]
+    Calendar(CalendarError),
     #[error("database error: {0}")]
     Repo(#[from] RepoError),
+}
+
+/// Mirrors `tasks.rs`: a Google `GoogleApi` failure surfaces its message
+/// (the worker maps it to 502); any other calendar-layer error is a
+/// 500-shaped surprise (missing calendar row, HTTP transport failure…).
+impl From<CalendarError> for AgendaError {
+    fn from(err: CalendarError) -> Self {
+        match err {
+            CalendarError::GoogleApi(message) => AgendaError::GoogleApi(message),
+            other => AgendaError::Calendar(other),
+        }
+    }
 }
 
 /// `ensure_taxonomy` errors fold into [`AgendaError`] (same mapping as the
@@ -115,6 +167,15 @@ pub struct DeleteAgendaItemResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OccurrenceResponse {
     pub occurrence: OccurrenceView,
+}
+
+/// Response envelope for `POST /api/occurrences/:id/start`: the fresh
+/// occurrence plus the one-shot Google log this start created (`None` on the
+/// idempotent in_progress no-op — no second event was opened).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OccurrenceActionResponse {
+    pub occurrence: OccurrenceView,
+    pub event: Option<CalendarEvent>,
 }
 
 /// HTTP shape of one agenda membership row with its embed: the task (kind
@@ -434,9 +495,21 @@ pub async fn delete_agenda_item(
 /// A present `title` writes the override; `""` or whitespace-only **clears**
 /// it back to inheritance (stores NULL, resolved title becomes the routine
 /// title again). Empty body → 400 "nothing to update". Missing / other-user /
-/// soft-deleted-routine → 404. **No Google PATCH this slice** (slice 6 adds
-/// the `summary` write when a chip exists).
+/// soft-deleted-routine → 404.
+///
+/// **Google write (slice 6):** when the occurrence already has a chip
+/// (`google_event_id` set) AND the **resolved** title actually changed
+/// (`override ?? routine.title`, before vs after — clearing back to
+/// inheritance counts), the chip's `summary` is PATCHed to the new resolved
+/// title — the one difference from tasks, locked in the ADR. A Google 404
+/// proceeds (the chip is gone; the override still writes). The worker gates
+/// the write on a refreshable token; here `http`/`calendars`/`events`/
+/// `access` are `Option` so session-only patches (no chip yet) keep working.
 pub async fn patch_occurrence(
+    http: Option<&dyn HttpClient>,
+    calendars: Option<&dyn CalendarRepo>,
+    events: Option<&dyn CalendarEventRepo>,
+    access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     routine_repo: &dyn RoutineRepo,
@@ -444,13 +517,21 @@ pub async fn patch_occurrence(
     user_id: &str,
     id: &str,
     updates: &UpdateOccurrence,
+    now_unix: i64,
 ) -> Result<OccurrenceResponse, AgendaError> {
     if updates.title.is_none() {
         return Err(AgendaError::Invalid("nothing to update".to_string()));
     }
-    // The gate: missing / other-user / soft-deleted-routine → 404. The
-    // loaded row itself is not needed — the reload below carries the update.
-    let _occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
+    let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
+    let routine = routine_repo
+        .get_by_id(&occurrence.routine_id)
+        .await?
+        .ok_or(AgendaError::NotFound)?;
+    let resolved_before = occurrence
+        .title
+        .as_deref()
+        .unwrap_or(&routine.title)
+        .to_string();
     let trimmed = updates.title.as_deref().map(str::trim);
     let stored = match trimmed {
         // `""` / whitespace-only → clear the override (inherit again).
@@ -459,59 +540,326 @@ pub async fn patch_occurrence(
         None => None, // guarded above; keeps the match exhaustive
     };
     occurrence_repo.update_title(id, stored.as_deref()).await?;
-    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
     let updated = occurrence_repo.get_by_id(id).await?.ok_or(AgendaError::NotFound)?;
     let routine = routine_repo
         .get_by_id(&updated.routine_id)
         .await?
         .ok_or(AgendaError::NotFound)?;
+    let resolved_after = updated
+        .title
+        .as_deref()
+        .unwrap_or(&routine.title)
+        .to_string();
+
+    // The chip's summary follows the resolved title (ADR 0004: occurrence
+    // title PATCH updates `summary` when a chip exists). A 404 means the
+    // event is gone on Google's side — proceed, never fail the override on a
+    // ghost chip.
+    if resolved_before != resolved_after
+        && updated.google_event_id.is_some()
+        && updated.calendar_id.is_some()
+    {
+        if let (Some(http), Some(calendars), Some(events), Some(access)) =
+            (http, calendars, events, access)
+        {
+            let output = patch_event_summary(
+                http,
+                calendars,
+                events,
+                access,
+                updated.calendar_id.as_deref().expect("checked above"),
+                updated.google_event_id.as_deref().expect("checked above"),
+                &resolved_after,
+                now_unix,
+            )
+            .await;
+            match output {
+                Ok(_) => {}
+                Err(CalendarError::GoogleApi(message)) if message.contains("404") => {}
+                Err(err) => return Err(AgendaError::from(err)),
+            }
+        }
+    }
+
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
     Ok(OccurrenceResponse {
         occurrence: occurrence_view(&updated, &routine, &taxonomy),
     })
 }
 
 // ──────────────────────────────────────────
-// POST /api/occurrences/:id/complete and /skip — verb matrix (no Google)
+// POST /api/occurrences/:id/start, /complete and /skip — verb matrix + Google
 // ──────────────────────────────────────────
 
-/// `POST /api/occurrences/:id/complete` → `{"occurrence":…}`.
+/// `POST /api/occurrences/:id/start` → 200 `{"occurrence":…,"event":…}`.
 ///
-/// Verb matrix (Google writes deferred to slice 6):
-/// `pending` → `done`, `in_progress` → `done`, `done` → 200 no-op,
-/// `skipped` → `done`. Missing / other-user / soft-deleted-routine → 404.
+/// Starts a **pending, today-only** occurrence: creates the one-shot Google
+/// log (summary = the **resolved** title, carriers
+/// `sanctuary_routine_id`/`sanctuary_occurrence_id`, never a task_id, never
+/// an RRULE, `T … T + START_EVENT_MINUTES` on the minute grid), stores
+/// `calendar_id` + `google_event_id` on the occurrence, and flips it to
+/// `in_progress`. One Google event per occurrence, ever.
+///
+/// Verb matrix (locked): `pending` → start; `in_progress` → **200 no-op**
+/// (no second event); `done`/`skipped` → 400. Start is valid only when
+/// `local_date` is today — the civil date of `now_unix` in `Asia/Kolkata`
+/// (production TZ, already in the locked offset table); otherwise 400.
+/// Missing / other-user / soft-deleted-routine → 404. No writable calendar →
+/// 400. Focus stays task-only: `sanctuary_focus` is never set here.
+pub async fn start_occurrence(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    routine_repo: &dyn RoutineRepo,
+    occurrence_repo: &dyn OccurrenceRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    id: &str,
+    now_unix: i64,
+) -> Result<OccurrenceActionResponse, AgendaError> {
+    let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
+    let routine = routine_repo
+        .get_by_id(&occurrence.routine_id)
+        .await?
+        .ok_or(AgendaError::NotFound)?;
+
+    // Terminal states are closed for start (the ADR's locked matrix).
+    if occurrence.status != OCCURRENCE_STATUS_PENDING {
+        if occurrence.status == OCCURRENCE_STATUS_IN_PROGRESS {
+            // Idempotent 200 no-op: the chip exists, never open a second one.
+            let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+            return Ok(OccurrenceActionResponse {
+                occurrence: occurrence_view(&occurrence, &routine, &taxonomy),
+                event: None,
+            });
+        }
+        return Err(AgendaError::Invalid(format!(
+            "cannot start a {status} occurrence",
+            status = occurrence.status
+        )));
+    }
+    // Today-only (ADR 0004 § Start): the production offset table decides the
+    // civil date — a planned occurrence is started the day it is planned.
+    if occurrence.local_date != civil_date_in_offset(now_unix, "Asia/Kolkata") {
+        return Err(AgendaError::Invalid(
+            "occurrence can only be started on its local date".to_string(),
+        ));
+    }
+
+    let resolved_title = occurrence
+        .title
+        .as_deref()
+        .unwrap_or(&routine.title)
+        .to_string();
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+    let target = resolve_occurrence_calendar(calendars, &taxonomy, &resolved_title, user_id).await?;
+
+    // The same minute-grid window as task start — `estimated_minutes` is only
+    // a planned estimate on the card and never sizes the chip.
+    let t_unix = nearest_minute_unix(now_unix);
+    let start_rfc3339 = unix_secs_to_rfc3339(t_unix);
+    let end_rfc3339 = unix_secs_to_rfc3339(t_unix + START_EVENT_MINUTES * 60);
+    let output: CreateEventOutput = create_event(
+        http,
+        calendars,
+        events,
+        access,
+        &NewEventInput {
+            calendar_id: target.calendar_id.clone(),
+            summary: resolved_title,
+            description: None,
+            start: start_rfc3339,
+            end: end_rfc3339,
+            task_id: None,
+            // The occurrence carriers — the sync path never maps them onto
+            // `calendar_events.task_id`, keeping the two worlds apart.
+            routine_id: Some(occurrence.routine_id.clone()),
+            occurrence_id: Some(occurrence.id.clone()),
+            color_id: target.google_color_id,
+            // Focus stays task-only (ADR 0004): a running routine never takes
+            // `users.focused_task_id`, so the chip is never focused.
+            sanctuary_focus: false,
+            priority: None,
+            difficulty: None,
+        },
+        now_unix,
+    )
+    .await?;
+    let event = output.event;
+
+    occurrence_repo
+        .set_event_ids(&occurrence.id, &target.calendar_id, &event.google_event_id)
+        .await?;
+    occurrence_repo
+        .set_status(&occurrence.id, OCCURRENCE_STATUS_IN_PROGRESS)
+        .await?;
+
+    let updated = occurrence_repo.get_by_id(id).await?.ok_or(AgendaError::NotFound)?;
+    let routine = routine_repo
+        .get_by_id(&updated.routine_id)
+        .await?
+        .ok_or(AgendaError::NotFound)?;
+    Ok(OccurrenceActionResponse {
+        occurrence: occurrence_view(&updated, &routine, &taxonomy),
+        event: Some(event),
+    })
+}
+
+/// `POST /api/occurrences/:id/complete` → 200 `{"occurrence":…}`.
+///
+/// Verb matrix (locked): `pending` → `done`, `in_progress` → `done` (the open
+/// chip's end is PATCHed closed first when ids are stored and Google is
+/// available), `done` → 200 no-op, `skipped` → `done`. Missing / other-user /
+/// soft-deleted-routine → 404.
 pub async fn complete_occurrence(
+    http: Option<&dyn HttpClient>,
+    calendars: Option<&dyn CalendarRepo>,
+    events: Option<&dyn CalendarEventRepo>,
+    access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     routine_repo: &dyn RoutineRepo,
     occurrence_repo: &dyn OccurrenceRepo,
     user_id: &str,
     id: &str,
+    now_unix: i64,
+) -> Result<OccurrenceResponse, AgendaError> {
+    exit_occurrence(
+        http, calendars, events, access, list_repo, category_repo, routine_repo,
+        occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_DONE,
+    )
+    .await
+}
+
+/// `POST /api/occurrences/:id/skip` → 200 `{"occurrence":…}`.
+///
+/// Verb matrix (locked): `pending` → `skipped`, `in_progress` → `skipped`
+/// (the open chip's end is PATCHed closed first when ids are stored and
+/// Google is available), `done` → `skipped`, `skipped` → 200 no-op. Missing /
+/// other-user / soft-deleted-routine → 404.
+pub async fn skip_occurrence(
+    http: Option<&dyn HttpClient>,
+    calendars: Option<&dyn CalendarRepo>,
+    events: Option<&dyn CalendarEventRepo>,
+    access: Option<&GoogleAccess>,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    routine_repo: &dyn RoutineRepo,
+    occurrence_repo: &dyn OccurrenceRepo,
+    user_id: &str,
+    id: &str,
+    now_unix: i64,
+) -> Result<OccurrenceResponse, AgendaError> {
+    exit_occurrence(
+        http, calendars, events, access, list_repo, category_repo, routine_repo,
+        occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_SKIPPED,
+    )
+    .await
+}
+
+/// The shared complete/skip machinery: close the running chip when leaving
+/// `in_progress` with stored ids (Google optional — `http`/`access` `None`
+/// means session-only, the flip still happens), then flip the status.
+/// Already in the target status → 200 no-op (no Google write).
+async fn exit_occurrence(
+    http: Option<&dyn HttpClient>,
+    calendars: Option<&dyn CalendarRepo>,
+    events: Option<&dyn CalendarEventRepo>,
+    access: Option<&GoogleAccess>,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    routine_repo: &dyn RoutineRepo,
+    occurrence_repo: &dyn OccurrenceRepo,
+    user_id: &str,
+    id: &str,
+    now_unix: i64,
+    target_status: &str,
 ) -> Result<OccurrenceResponse, AgendaError> {
     let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
-    if occurrence.status != OCCURRENCE_STATUS_DONE {
-        occurrence_repo.set_status(id, OCCURRENCE_STATUS_DONE).await?;
+    if occurrence.status == target_status {
+        // Idempotent 200 no-op: nothing to flip, no Google write.
+        return occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id).await;
     }
+
+    // Status is the lock: only an `in_progress` occurrence has a living chip.
+    // When ids are stored AND Google is available, snap the end closed first —
+    // the same exit semantics as task stop/pause/complete (never fail the
+    // flip on a ghost event: Google 404 proceeds).
+    if occurrence.status == OCCURRENCE_STATUS_IN_PROGRESS
+        && occurrence.calendar_id.is_some()
+        && occurrence.google_event_id.is_some()
+    {
+        if let (Some(http), Some(calendars), Some(events), Some(access)) =
+            (http, calendars, events, access)
+        {
+            close_occurrence_event(
+                http,
+                calendars,
+                events,
+                access,
+                occurrence.calendar_id.as_deref().expect("checked above"),
+                occurrence.google_event_id.as_deref().expect("checked above"),
+                now_unix,
+            )
+            .await?;
+        }
+    }
+
+    occurrence_repo.set_status(id, target_status).await?;
     occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id).await
 }
 
-/// `POST /api/occurrences/:id/skip` → `{"occurrence":…}`.
-///
-/// Verb matrix (Google writes deferred to slice 6):
-/// `pending` → `skipped`, `in_progress` → `skipped`, `done` → `skipped`,
-/// `skipped` → 200 no-op. Missing / other-user / soft-deleted-routine → 404.
-pub async fn skip_occurrence(
-    list_repo: &dyn TaskListRepo,
-    category_repo: &dyn TaskCategoryRepo,
-    routine_repo: &dyn RoutineRepo,
-    occurrence_repo: &dyn OccurrenceRepo,
-    user_id: &str,
-    id: &str,
-) -> Result<OccurrenceResponse, AgendaError> {
-    let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
-    if occurrence.status != OCCURRENCE_STATUS_SKIPPED {
-        occurrence_repo.set_status(id, OCCURRENCE_STATUS_SKIPPED).await?;
+/// PATCHes an occurrence chip's `end` to snapped now (`start + 60s` when
+/// `now <= start` — the invert guard, on the minute grid, same as task
+/// exits). Resolved through the stored ids on the occurrence row — never
+/// through the event window — so a run whose window already lapsed still
+/// closes. A Google 404 is treated like task exits: the event is gone, the
+/// caller proceeds with the status flip.
+async fn close_occurrence_event(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+    google_event_id: &str,
+    now_unix: i64,
+) -> Result<(), AgendaError> {
+    // The cached row supplies the `start` for the invert guard; a missing
+    // cache row still snaps (the guard falls back to `now`, so the PATCH is
+    // `start + 60s` from the cache's perspective — skipped, see below).
+    let found = events
+        .get_by_calendar_and_google_id(calendar_id, google_event_id)
+        .await?;
+    let start_unix = found
+        .as_ref()
+        .and_then(|event| rfc3339_to_unix_secs(&event.start_time))
+        .unwrap_or(now_unix);
+    let snapped = nearest_minute_unix(now_unix);
+    let end_unix = if snapped <= start_unix {
+        start_unix + 60
+    } else {
+        snapped
+    };
+    match patch_event(
+        http,
+        calendars,
+        events,
+        access,
+        calendar_id,
+        google_event_id,
+        &unix_secs_to_rfc3339(end_unix),
+        now_unix,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        // The event is gone on Google's side (404): fall through — the
+        // status flip still happens, exactly like task exits.
+        Err(CalendarError::GoogleApi(message)) if message.contains("404") => Ok(()),
+        Err(err) => Err(AgendaError::from(err)),
     }
-    occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id).await
 }
 
 // ──────────────────────────────────────────
@@ -608,6 +956,223 @@ async fn embed_item(
         task,
         occurrence,
     }))
+}
+
+/// A resolved target calendar for a started occurrence (local
+/// `google_calendars.id` — the Google id itself lives on the row the event
+/// insert re-reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetCalendar {
+    calendar_id: String,
+    /// Stored `google_color_id` of the matched category; `None` when the
+    /// resolved title is untracked or the category has no stored color.
+    google_color_id: Option<String>,
+}
+
+/// Resolves the Google calendar a started occurrence's one-shot log lands on
+/// — a deliberate copy of `tasks.rs::resolve_target_calendar` (the slice
+/// brief: duplicate rather than refactor tasks.rs). `wanted` is the first
+/// non-empty of the matched category's first regex-matching pattern's
+/// `google_calendar_id` (patterns walked in stored `sort_order`), the
+/// matched category's `google_calendar_id`, and the parent root's
+/// `google_calendar_id`. The event lands on `wanted` when that calendar
+/// exists for the user and is writable (`access_role` owner/writer); a
+/// missing or read-only named calendar falls back to the user's **primary**
+/// calendar, never to the next inheritance slot. No writable calendar → 400.
+async fn resolve_occurrence_calendar(
+    calendars: &dyn CalendarRepo,
+    taxonomy: &Taxonomy,
+    resolved_title: &str,
+    user_id: &str,
+) -> Result<TargetCalendar, AgendaError> {
+    let user_cals = calendars.list_by_user_id(user_id).await?;
+    let category = match classify(resolved_title, CalendarScope::Ignore, &taxonomy.matchers) {
+        ClassifyOutcome::Matched { category_id } => taxonomy
+            .categories
+            .iter()
+            .find(|category| category.id == category_id),
+        // A title that matches nothing (or conflicts) has no inheritance
+        // chain — `wanted` stays None and the primary fallback below runs:
+        // starting is a read, never a validation.
+        ClassifyOutcome::Untracked { .. } => None,
+    };
+    let matcher = category.and_then(|category| {
+        taxonomy
+            .matchers
+            .iter()
+            .find(|matcher| matcher.category_id == category.id)
+    });
+    // One-level tree: `parent_id` is at most a root.
+    let parent = category
+        .and_then(|category| category.parent_id.as_deref())
+        .and_then(|parent_id| taxonomy.categories.iter().find(|entry| entry.id == parent_id));
+    let wanted = matcher
+        .and_then(|matcher| first_matching_pattern(resolved_title, CalendarScope::Ignore, matcher))
+        .and_then(|pattern| pattern.google_calendar_id.as_deref())
+        .or_else(|| category.and_then(|category| category.google_calendar_id.as_deref()))
+        .or_else(|| parent.and_then(|parent| parent.google_calendar_id.as_deref()));
+    let target = wanted
+        // A named-but-missing or read-only calendar never falls through to
+        // the next inheritance slot: straight to the user's primary.
+        .and_then(|wanted| {
+            user_cals
+                .iter()
+                .find(|cal| cal.google_calendar_id == wanted && is_writable(cal))
+        })
+        .or_else(|| {
+            user_cals
+                .iter()
+                .find(|cal| cal.is_primary && is_writable(cal))
+        })
+        .ok_or_else(|| AgendaError::Invalid("no writable calendar".to_string()))?;
+    Ok(TargetCalendar {
+        calendar_id: target.id.clone(),
+        // The matched category's STORED color, or `None` for untracked /
+        // categories without one — the event insert omits `colorId` then.
+        google_color_id: category.and_then(|category| category.google_color_id.clone()),
+    })
+}
+
+/// Whether a calendar looks writable: Google `access_role` is `owner` or
+/// `writer` (a copy of `tasks.rs::is_writable`).
+fn is_writable(calendar: &GoogleCalendar) -> bool {
+    calendar.access_role == "owner" || calendar.access_role == "writer"
+}
+
+// ──────────────────────────────────────────
+// Elongate cron (slice 6): grow in_progress occurrence events
+// ──────────────────────────────────────────
+
+/// The occurrence half of the elongate cron (called from the same worker
+/// tick as [`crate::tasks::run_elongate_cron`]): while an occurrence stays
+/// `in_progress`, grow its one-shot Google log so the live calendar block
+/// does not look finished — the exact same rule as tasks.
+///
+/// Target: `end = max(current_end, ceil_5min(now + 5min)` in the event
+/// calendar's IANA time zone), persisted as a UTC `…Z` string.
+///
+/// Per occurrence, in order:
+/// 1. `refresh_if_needed` for the occurrence's owner. On failure the
+///    occurrence is skipped entirely (one error) — other users still grow.
+/// 2. Resolve the cached event through the occurrence's stored ids
+///    (`calendar_id` + `google_event_id` — the work list only returns rows
+///    that have both). A missing cache row → skipped: the event is gone,
+///    never recreate it, never flip status.
+/// 3. Parse `event.end_time`. Unparseable → skipped.
+/// 4. Load the event's calendar for `time_zone`; a missing calendar or an
+///    empty/unknown zone falls back to UTC.
+/// 5. PATCH only when `target > current_end` (never shrink). A Google 404 →
+///    skipped (the event vanished; never recreate). Other errors are
+///    collected and the loop continues.
+///
+/// Status is deliberately never touched here, exactly like tasks.
+pub async fn run_elongate_occurrences(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    occurrences: &dyn OccurrenceRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    now_unix: i64,
+) -> ElongateReport {
+    let mut report = ElongateReport::default();
+    let running = match occurrences.list_in_progress().await {
+        Ok(running) => running,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("occurrence list_in_progress failed: {err}"));
+            return report;
+        }
+    };
+
+    for occurrence in &running {
+        let access = match refresh_if_needed(http, tokens, oauth, &occurrence.user_id, now_unix).await
+        {
+            Ok(access) => access,
+            Err(err) => {
+                report.errors.push(format!(
+                    "token refresh failed for user {} (occurrence {}): {err}",
+                    occurrence.user_id, occurrence.id
+                ));
+                continue;
+            }
+        };
+        // The ids the work list guaranteed. A missing cache row means there
+        // is nothing to grow: skip (do not recreate, do not flip status).
+        let Some(calendar_id) = occurrence.calendar_id.as_deref() else {
+            report.skipped += 1;
+            continue;
+        };
+        let Some(google_event_id) = occurrence.google_event_id.as_deref() else {
+            report.skipped += 1;
+            continue;
+        };
+        let event = match events
+            .get_by_calendar_and_google_id(calendar_id, google_event_id)
+            .await
+        {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                report.skipped += 1;
+                continue;
+            }
+            Err(err) => {
+                report.errors.push(format!(
+                    "event lookup failed for occurrence {} (event {}): {err}",
+                    occurrence.id, google_event_id
+                ));
+                continue;
+            }
+        };
+        let Some(current_end_unix) = rfc3339_to_unix_secs(&event.end_time) else {
+            report.skipped += 1;
+            continue;
+        };
+        // The calendar's IANA time_zone decides the 5-minute grid (the offset
+        // resolver falls back to UTC for empty/missing/unknown zones).
+        let time_zone = match calendars.get_by_id(&event.calendar_id).await {
+            Ok(Some(cal)) => cal.time_zone,
+            Ok(None) => "UTC".to_string(),
+            Err(err) => {
+                report.errors.push(format!(
+                    "calendar lookup failed for occurrence {} (calendar {}): {err}",
+                    occurrence.id, event.calendar_id
+                ));
+                "UTC".to_string()
+            }
+        };
+        let target_unix = ceil_5min_unix_in_zone(now_unix, &time_zone);
+        if current_end_unix >= target_unix {
+            // Never shrink: the event already covers the target instant.
+            report.skipped += 1;
+            continue;
+        }
+        match patch_event(
+            http,
+            calendars,
+            events,
+            &access,
+            &event.calendar_id,
+            &event.google_event_id,
+            &unix_secs_to_rfc3339(target_unix),
+            now_unix,
+        )
+        .await
+        {
+            Ok(_) => report.occurrences_elongated += 1,
+            // The event is gone on Google's side (404): skip — never
+            // recreate it, never touch the status.
+            Err(CalendarError::GoogleApi(message)) if message.contains("404") => {
+                report.skipped += 1;
+            }
+            Err(err) => report.errors.push(format!(
+                "elongate failed for occurrence {} (event {}): {err}",
+                occurrence.id, google_event_id
+            )),
+        }
+    }
+    report
 }
 
 /// The task-only embed (add path — the task row is already loaded).
@@ -844,9 +1409,11 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        NewRoutine, NewTask, NewTaskCategory, NewTaskCategoryPattern, NewTaskList, Task, TaskList,
+        GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewRoutine, NewTask,
+        NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, Task, TaskList,
         UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList,
     };
+    use crate::oauth::{HttpClient, HttpError};
 
     // ──────────────────────────────────────────
     // Fakes
@@ -1331,12 +1898,41 @@ mod tests {
             Ok(())
         }
 
+        async fn set_event_ids(
+            &self,
+            id: &str,
+            calendar_id: &str,
+            google_event_id: &str,
+        ) -> Result<(), RepoError> {
+            if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
+                row.calendar_id = Some(calendar_id.to_string());
+                row.google_event_id = Some(google_event_id.to_string());
+                row.updated_at = "2026-08-23T02:00:00Z".to_string();
+            }
+            Ok(())
+        }
+
         async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError> {
             if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
                 row.status = status.to_string();
                 row.updated_at = "2026-08-23T02:00:00Z".to_string();
             }
             Ok(())
+        }
+
+        async fn list_in_progress(&self) -> Result<Vec<RoutineOccurrence>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.status == OCCURRENCE_STATUS_IN_PROGRESS
+                        && row.calendar_id.is_some()
+                        && row.google_event_id.is_some()
+                })
+                .cloned()
+                .collect())
         }
     }
 
@@ -1642,6 +2238,330 @@ mod tests {
         }
     }
 
+    /// Scripted HTTP fake with POST/PATCH routes — enough for the
+    /// occurrence verbs' `events.insert`, `events.patch` and summary PATCH
+    /// calls (a copy of the tasks tests' fake).
+    struct FakeHttp {
+        routes: Vec<(String, u16, String)>,
+        posts: Mutex<Vec<(String, String)>>,
+        patches: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeHttp {
+        fn new(routes: Vec<(&str, u16, &str)>) -> Self {
+            Self {
+                routes: routes
+                    .into_iter()
+                    .map(|(substr, status, body)| {
+                        (substr.to_string(), status, body.to_string())
+                    })
+                    .collect(),
+                posts: Mutex::new(Vec::new()),
+                patches: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn route(&self, url: &str) -> (u16, Vec<u8>) {
+            for (substr, status, body) in &self.routes {
+                if url.contains(substr) {
+                    return (*status, body.clone().into_bytes());
+                }
+            }
+            panic!("no route for {url}");
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl HttpClient for FakeHttp {
+        async fn post_form(&self, _url: &str, _form: &[(&str, &str)]) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_bearer(&self, _url: &str, _token: &str) -> Result<Vec<u8>, HttpError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_bearer_raw(
+            &self,
+            _url: &str,
+            _token: &str,
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            Ok((200, Vec::new()))
+        }
+
+        async fn post_json(
+            &self,
+            url: &str,
+            _token: &str,
+            body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
+            Ok(self.route(url))
+        }
+
+        async fn patch_json(
+            &self,
+            url: &str,
+            _token: &str,
+            body: &[u8],
+        ) -> Result<(u16, Vec<u8>), HttpError> {
+            self.patches
+                .lock()
+                .unwrap()
+                .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
+            Ok(self.route(url))
+        }
+    }
+
+    /// In-memory `CalendarRepo`: a fixed set of stored calendars.
+    struct FakeCalendarRepo {
+        stored: Mutex<Vec<GoogleCalendar>>,
+    }
+
+    impl FakeCalendarRepo {
+        fn with(calendars: Vec<GoogleCalendar>) -> Self {
+            Self {
+                stored: Mutex::new(calendars),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CalendarRepo for FakeCalendarRepo {
+        async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|cal| cal.user_id == user_id && cal.deleted_at.is_none())
+                .cloned()
+                .collect())
+        }
+
+        async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+
+        async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|cal| cal.id == id && cal.deleted_at.is_none())
+                .cloned())
+        }
+
+        async fn get_by_google_cal_id(
+            &self,
+            _user_id: &str,
+            google_cal_id: &str,
+        ) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|cal| cal.google_calendar_id == google_cal_id)
+                .cloned())
+        }
+
+        async fn upsert(&self, _calendar: NewCalendar) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn upsert_batch(&self, _calendars: Vec<NewCalendar>) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn update_sync_state(
+            &self,
+            _id: &str,
+            _sync_token: &str,
+            _last_synced_at_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn set_sync_enabled(
+            &self,
+            _id: &str,
+            _enabled: bool,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// In-memory event repo: upserts materialize `CalendarEvent` rows (so
+    /// `get_by_calendar_and_google_id` sees them — the close/elongate paths
+    /// resolve the cached row first) and every write is recorded.
+    struct FakeEventRepo {
+        stored: Mutex<Vec<CalendarEvent>>,
+        upserted: Mutex<Vec<NewCalendarEvent>>,
+        next_id: Mutex<u64>,
+    }
+
+    impl FakeEventRepo {
+        fn new() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                upserted: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl CalendarEventRepo for FakeEventRepo {
+        async fn upsert(
+            &self,
+            event: NewCalendarEvent,
+            now_rfc3339: &str,
+        ) -> Result<String, RepoError> {
+            let mut next = self.next_id.lock().unwrap();
+            let id = format!("evt-{next}");
+            *next += 1;
+            self.upserted.lock().unwrap().push(event.clone());
+            let mut stored = self.stored.lock().unwrap();
+            // Mirrors the ON CONFLICT(calendar_id, google_event_id) replace.
+            stored.retain(|row| {
+                !(row.calendar_id == event.calendar_id && row.google_event_id == event.google_event_id)
+            });
+            stored.push(CalendarEvent {
+                id: id.clone(),
+                calendar_id: event.calendar_id.clone(),
+                google_event_id: event.google_event_id.clone(),
+                google_etag: event.google_etag.clone(),
+                google_updated_at: event.google_updated_at.clone(),
+                last_synced_at: event.last_synced_at.clone(),
+                title: event.title.clone(),
+                description: event.description.clone(),
+                start_time: event.start_time.clone(),
+                end_time: event.end_time.clone(),
+                recurrence: event.recurrence.clone(),
+                task_id: event.task_id.clone(),
+                created_at: now_rfc3339.to_string(),
+                updated_at: now_rfc3339.to_string(),
+                deleted_at: None,
+            });
+            Ok(id)
+        }
+
+        async fn upsert_batch(
+            &self,
+            _events: Vec<NewCalendarEvent>,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn get_by_id(&self, _id: &str) -> Result<Option<CalendarEvent>, RepoError> {
+            Ok(None)
+        }
+
+        async fn get_by_calendar_and_google_id(
+            &self,
+            calendar_id: &str,
+            google_event_id: &str,
+        ) -> Result<Option<CalendarEvent>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| {
+                    event.deleted_at.is_none()
+                        && event.calendar_id == calendar_id
+                        && event.google_event_id == google_event_id
+                })
+                .cloned())
+        }
+
+        async fn list_by_user_id_and_time_range(
+            &self,
+            _user_id: &str,
+            _start_rfc3339: &str,
+            _end_rfc3339: &str,
+        ) -> Result<Vec<CalendarEvent>, RepoError> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+
+        async fn list_running_by_user_id(
+            &self,
+            _user_id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<Vec<CalendarEvent>, RepoError> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+
+        async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete_by_google_event_id(
+            &self,
+            _calendar_id: &str,
+            _google_event_id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete_stale(
+            &self,
+            _calendar_id: &str,
+            _older_than_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    /// Token repo for the elongate cron tests: returns a stored token per
+    /// user (expiring far in the future, so `refresh_if_needed` never POSTs).
+    struct FakeTokenRepo {
+        stored: Mutex<HashMap<String, GoogleOAuthToken>>,
+    }
+
+    impl FakeTokenRepo {
+        fn with(tokens: Vec<GoogleOAuthToken>) -> Self {
+            let stored = tokens
+                .into_iter()
+                .map(|token| (token.user_id.clone(), token))
+                .collect();
+            Self {
+                stored: Mutex::new(stored),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TokenRepo for FakeTokenRepo {
+        async fn get_by_user_id(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<GoogleOAuthToken>, RepoError> {
+            Ok(self.stored.lock().unwrap().get(user_id).cloned())
+        }
+
+        async fn upsert(&self, _token: NewToken) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _user_id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
     struct Repos {
         lists: FakeTaskListRepo,
         categories: FakeTaskCategoryRepo,
@@ -1740,23 +2660,27 @@ mod tests {
 
     fn complete(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(complete_occurrence(
+            None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
             user_id,
             id,
+            NOW_UNIX,
         ))
     }
 
     fn skip(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(skip_occurrence(
+            None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
             &repos.occurrences,
             user_id,
             id,
+            NOW_UNIX,
         ))
     }
 
@@ -1767,6 +2691,7 @@ mod tests {
         updates: &UpdateOccurrence,
     ) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(patch_occurrence(
+            None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -1774,6 +2699,158 @@ mod tests {
             user_id,
             id,
             updates,
+            NOW_UNIX,
+        ))
+    }
+
+    // ──────────────────────────────────────────
+    // Google fixtures (slice 6)
+    // ──────────────────────────────────────────
+
+    /// `2026-08-23T10:00:00Z` — its civil date is `2026-08-23` in both UTC
+    /// and Asia/Kolkata, so occurrence `local_date` fixtures of `2026-08-23`
+    /// pass the start's today-only gate.
+    const NOW_UNIX: i64 = 1_787_479_200;
+
+    fn access() -> GoogleAccess {
+        GoogleAccess {
+            access_token: "at-1".to_string(),
+            token_type: "Bearer".to_string(),
+        }
+    }
+
+    /// A writable primary calendar for `u-1` — the default start target.
+    fn calendar(google_cal_id: &str, is_primary: bool) -> GoogleCalendar {
+        GoogleCalendar {
+            id: format!("cal-{google_cal_id}"),
+            user_id: "u-1".to_string(),
+            google_calendar_id: google_cal_id.to_string(),
+            summary: "Work".to_string(),
+            time_zone: "UTC".to_string(),
+            is_primary,
+            access_role: "owner".to_string(),
+            sync_enabled: true,
+            sync_token: String::new(),
+            last_synced_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// The Google `events.insert` echo for an occurrence start — the exact
+    /// shape Google returns (including the two occurrence carriers and the
+    /// summary it was sent, i.e. the resolved title).
+    fn created_occurrence_json(routine_id: &str, occurrence_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"g-1","summary":"Fajr Qadha","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_routine_id":"{routine_id}","sanctuary_occurrence_id":"{occurrence_id}"}}}}}}"#
+        )
+    }
+
+    /// The `events.patch` echo: same occurrence event with a new end.
+    fn patched_occurrence_json(routine_id: &str, occurrence_id: &str, start: &str, end: &str) -> String {
+        format!(
+            r#"{{"id":"g-1","summary":"Fajr Qadha","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_routine_id":"{routine_id}","sanctuary_occurrence_id":"{occurrence_id}"}}}}}}"#
+        )
+    }
+
+    /// A cached `calendar_events` row for an occurrence's chip (the close and
+    /// elongate paths resolve it through the occurrence's stored ids).
+    fn cached_occurrence_event(
+        calendar_id: &str,
+        google_id: &str,
+        start: &str,
+        end: &str,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            id: "evt-1".to_string(),
+            calendar_id: calendar_id.to_string(),
+            google_event_id: google_id.to_string(),
+            google_etag: String::new(),
+            google_updated_at: String::new(),
+            last_synced_at: "2026-08-23T00:00:00Z".to_string(),
+            title: "Fajr".to_string(),
+            description: String::new(),
+            start_time: start.to_string(),
+            end_time: end.to_string(),
+            recurrence: String::new(),
+            // Occurrence events NEVER carry a task link — the two worlds stay
+            // apart (the cache maps only sanctuary_task_id onto this column).
+            task_id: String::new(),
+            created_at: "2026-08-23T00:00:00Z".to_string(),
+            updated_at: "2026-08-23T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// A stored OAuth token whose expiry is centuries out, so
+    /// `refresh_if_needed` returns it as-is (no refresh POST).
+    fn fresh_token(user_id: &str, access_token: &str) -> GoogleOAuthToken {
+        GoogleOAuthToken {
+            id: format!("tok-{user_id}"),
+            user_id: user_id.to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expiry: "2099-01-01T00:00:00Z".to_string(),
+            token_type: "Bearer".to_string(),
+            scope: Some("calendar".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// OAuth client credentials for the elongate test; the fresh token above
+    /// means `refresh_if_needed` never uses them.
+    fn oauth_config() -> OAuthConfig {
+        OAuthConfig {
+            client_id: "client-id.apps.googleusercontent.com".to_string(),
+            client_secret: "client-secret".to_string(),
+            redirect_url: "http://localhost:5173/auth/google/callback".to_string(),
+        }
+    }
+
+    /// Wires a Fajr routine + occurrence of `status` into `repos` and returns
+    /// the occurrence id.
+    fn seed_occurrence(repos: &Repos, status: &str) -> String {
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "2026-01-01T05:30:00",
+            "FREQ=DAILY",
+            "[]",
+        ));
+        let mut occurrence =
+            FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-23", status);
+        occurrence.title = Some("Fajr Qadha".to_string());
+        repos.occurrences.stored.lock().unwrap().push(occurrence);
+        "occ-1".to_string()
+    }
+
+    /// `POST /api/occurrences/:id/start` with the default primary calendar and
+    /// a scripted insert echo.
+    fn start(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceActionResponse, AgendaError> {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_occurrence_json("rt-1", id, "2026-08-23T10:00:00Z", "2026-08-23T10:15:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        pollster::block_on(start_occurrence(
+            &http,
+            &calendars,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &access(),
+            user_id,
+            id,
+            NOW_UNIX,
         ))
     }
 
@@ -2561,5 +3638,757 @@ mod tests {
         assert!(!unfocused.items[0].task.as_ref().unwrap().focused);
         // The add response itself carries the same full shape.
         assert_eq!(item.item.task.as_ref().unwrap().id, "t-1");
+    }
+
+    // ──────────────────────────────────────────
+    // POST /api/occurrences/:id/start (slice 6)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn start_pending_today_creates_one_shot_log_and_stores_ids() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:15:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(start_occurrence(
+            &http,
+            &calendars,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &access(),
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Status flipped and the ids were stored on the occurrence.
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_IN_PROGRESS);
+        assert_eq!(
+            response.occurrence.calendar_id.as_deref(),
+            Some("cal-primary@example.com")
+        );
+        assert_eq!(response.occurrence.google_event_id.as_deref(), Some("g-1"));
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_IN_PROGRESS);
+        assert_eq!(stored.calendar_id.as_deref(), Some("cal-primary@example.com"));
+        assert_eq!(stored.google_event_id.as_deref(), Some("g-1"));
+
+        // The insert payload: resolved title (the override), the minute-grid
+        // window, the two occurrence carriers, NO task_id, NO focus, and —
+        // the hard rule — no recurrence/RRULE anywhere.
+        let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("primary%40example.com"), "{url}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["summary"], "Fajr Qadha", "resolved title at start");
+        assert_eq!(body["start"]["dateTime"], "2026-08-23T10:00:00Z");
+        assert_eq!(
+            body["end"]["dateTime"], "2026-08-23T10:15:00Z",
+            "T … T + START_EVENT_MINUTES"
+        );
+        assert!(body.get("recurrence").is_none(), "never an RRULE: {body}");
+        let shared = &body["extendedProperties"]["shared"];
+        assert_eq!(shared["sanctuary_routine_id"], "rt-1");
+        assert_eq!(shared["sanctuary_occurrence_id"], "occ-1");
+        assert!(
+            shared.get("sanctuary_task_id").is_none(),
+            "task carrier never set: {body}"
+        );
+        assert!(
+            shared.get("sanctuary_focus").is_none(),
+            "focus stays task-only: {body}"
+        );
+        assert!(
+            shared.get("sanctuary_priority").is_none(),
+            "no task snapshots: {body}"
+        );
+        assert_eq!(
+            shared.as_object().unwrap().len(),
+            2,
+            "exactly the two carriers: {body}"
+        );
+
+        // The cached event row carries NO task link — the two worlds stay apart.
+        let upserted = events.upserted.lock().unwrap();
+        assert_eq!(upserted.len(), 1);
+        assert_eq!(upserted[0].task_id, "", "calendar_events.task_id stays empty");
+        assert_eq!(upserted[0].title, "Fajr Qadha", "the response echo maps the summary");
+        assert_eq!(upserted[0].recurrence, "", "no recurrence on the cache row");
+    }
+
+    #[test]
+    fn start_in_progress_is_200_noop_without_a_second_event() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_IN_PROGRESS);
+        // No routes: any Google call would make the fake panic — the no-op
+        // must not touch Google at all.
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(start_occurrence(
+            &http,
+            &calendars,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &access(),
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_IN_PROGRESS);
+        assert!(response.event.is_none(), "no second event on the no-op");
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google writes");
+        assert!(events.upserted.lock().unwrap().is_empty());
+        assert_eq!(
+            pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+                .unwrap()
+                .unwrap()
+                .status,
+            OCCURRENCE_STATUS_IN_PROGRESS,
+            "row untouched"
+        );
+    }
+
+    #[test]
+    fn start_done_or_skipped_is_invalid() {
+        let repos = repos();
+        for status in [OCCURRENCE_STATUS_DONE, OCCURRENCE_STATUS_SKIPPED] {
+            seed_occurrence(&repos, status);
+            let err = start(&repos, "u-1", "occ-1").unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m.contains("cannot start")),
+                "{err:?} from {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_wrong_date_is_invalid() {
+        let repos = repos();
+        // Tomorrow (2026-08-24) — start is today-only.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "2026-01-01T05:30:00",
+            "FREQ=DAILY",
+            "[]",
+        ));
+        repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-24", "pending"));
+
+        let err = start(&repos, "u-1", "occ-1").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "occurrence can only be started on its local date"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn start_missing_other_user_or_soft_deleted_routine_is_not_found() {
+        let repos = repos();
+        // Missing occurrence → 404.
+        assert!(matches!(start(&repos, "u-1", "nope").unwrap_err(), AgendaError::NotFound));
+
+        // Another user's occurrence → 404 (never leak existence).
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-2",
+            "Fajr",
+            0,
+            "2026-01-01T05:30:00",
+            "FREQ=DAILY",
+            "[]",
+        ));
+        repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeOccurrenceRepo::row("occ-2", "rt-1", "u-2", "2026-08-23", "pending"));
+        assert!(matches!(start(&repos, "u-1", "occ-2").unwrap_err(), AgendaError::NotFound));
+
+        // Soft-deleted routine → its occurrence is 404.
+        let mut routine = FakeRoutineRepo::row(
+            "rt-3",
+            "u-1",
+            "Fajr",
+            0,
+            "2026-01-01T05:30:00",
+            "FREQ=DAILY",
+            "[]",
+        );
+        routine.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
+        repos.routines.stored.lock().unwrap().push(routine);
+        repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeOccurrenceRepo::row("occ-3", "rt-3", "u-1", "2026-08-23", "pending"));
+        assert!(matches!(start(&repos, "u-1", "occ-3").unwrap_err(), AgendaError::NotFound));
+    }
+
+    #[test]
+    fn start_falls_back_to_primary_when_the_named_calendar_is_read_only() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+        // "Fajr Qadha" classifies untracked, so the pick never names a
+        // calendar; the fixture instead proves the read-only named calendar →
+        // primary fallback (the same locked rule as start_task).
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:15:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![
+            GoogleCalendar {
+                access_role: "reader".to_string(),
+                ..calendar("named@example.com", false)
+            },
+            calendar("primary@example.com", true),
+        ]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(start_occurrence(
+            &http,
+            &calendars,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &access(),
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            response.occurrence.calendar_id.as_deref(),
+            Some("cal-primary@example.com"),
+            "read-only named calendar never receives the chip"
+        );
+    }
+
+    #[test]
+    fn start_without_any_writable_calendar_is_invalid() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(start_occurrence(
+            &http,
+            &calendars,
+            &events,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &access(),
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "no writable calendar"),
+            "{err:?}"
+        );
+    }
+
+    // ──────────────────────────────────────────
+    // complete / skip while in_progress — close the chip (slice 6)
+    // ──────────────────────────────────────────
+
+    /// Seeds an in_progress occurrence WITH stored ids plus the cached event
+    /// its chip resolves to (`cal-primary@example.com` / `g-1`, 10:00 →
+    /// 10:15). `NOW_UNIX` (10:00:00) snapped == start, so the exit's invert
+    /// guard lands the end at `start + 60s` — the same rule as task exits.
+    fn seed_running_chip(repos: &Repos) {
+        let mut occurrence =
+            FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-23", "in_progress");
+        occurrence.calendar_id = Some("cal-primary@example.com".to_string());
+        occurrence.google_event_id = Some("g-1".to_string());
+        repos.occurrences.stored.lock().unwrap().push(occurrence);
+        repos
+            .routines
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeRoutineRepo::row(
+                "rt-1",
+                "u-1",
+                "Fajr",
+                0,
+                "2026-01-01T05:30:00",
+                "FREQ=DAILY",
+                "[]",
+            ));
+    }
+
+    #[test]
+    fn complete_while_in_progress_patches_end_then_flips_status() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            200,
+            &patched_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:01:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        // The cached row supplies `start` for the invert guard (10:00:00).
+        pollster::block_on(events.upsert(
+            NewCalendarEvent {
+                calendar_id: "cal-primary@example.com".to_string(),
+                google_event_id: "g-1".to_string(),
+                google_etag: String::new(),
+                google_updated_at: String::new(),
+                last_synced_at: "2026-08-23T00:00:00Z".to_string(),
+                title: "Fajr".to_string(),
+                description: String::new(),
+                start_time: "2026-08-23T10:00:00Z".to_string(),
+                end_time: "2026-08-23T10:15:00Z".to_string(),
+                recurrence: String::new(),
+                task_id: String::new(),
+            },
+            "2026-08-23T00:00:00Z",
+        ))
+        .unwrap();
+
+        let response = pollster::block_on(complete_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_DONE);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_DONE, "status flipped after the close");
+
+        // The PATCH closed the chip: snapped now == start → start + 60s.
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2026-08-23T10:01:00Z");
+        assert!(patches[0].0.contains("events/g-1"), "{}", patches[0].0);
+    }
+
+    #[test]
+    fn skip_while_in_progress_patches_end_then_flips_status() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            200,
+            &patched_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:01:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        pollster::block_on(events.upsert(
+            NewCalendarEvent {
+                calendar_id: "cal-primary@example.com".to_string(),
+                google_event_id: "g-1".to_string(),
+                google_etag: String::new(),
+                google_updated_at: String::new(),
+                last_synced_at: "2026-08-23T00:00:00Z".to_string(),
+                title: "Fajr".to_string(),
+                description: String::new(),
+                start_time: "2026-08-23T10:00:00Z".to_string(),
+                end_time: "2026-08-23T10:15:00Z".to_string(),
+                recurrence: String::new(),
+                task_id: String::new(),
+            },
+            "2026-08-23T00:00:00Z",
+        ))
+        .unwrap();
+
+        let response = pollster::block_on(skip_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_SKIPPED);
+        assert_eq!(
+            pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+                .unwrap()
+                .unwrap()
+                .status,
+            OCCURRENCE_STATUS_SKIPPED
+        );
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "chip closed on skip");
+    }
+
+    #[test]
+    fn complete_while_in_progress_without_google_is_session_only() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        // No routes: any Google call would panic — the session-only flip must
+        // not touch Google (the worker decides the gate; here it is off).
+        let response = complete(&repos, "u-1", "occ-1").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_DONE);
+        assert_eq!(
+            pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+                .unwrap()
+                .unwrap()
+                .status,
+            OCCURRENCE_STATUS_DONE
+        );
+    }
+
+    #[test]
+    fn complete_while_in_progress_404_on_google_still_flips_status() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        // The chip is gone on Google's side: the close proceeds, the flip
+        // still happens — never fail a complete on a ghost event.
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            404,
+            r#"{"error":"not found"}"#,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(complete_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_DONE);
+    }
+
+    // ──────────────────────────────────────────
+    // PATCH title with a chip — summary follows (slice 6)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn patch_title_with_chip_patches_the_google_summary() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            200,
+            &patched_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:15:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(patch_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            &UpdateOccurrence {
+                title: Some("Fajr Chips".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.resolved_title, "Fajr Chips");
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "the summary PATCH happened");
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["summary"], "Fajr Chips", "resolved title follows the rename");
+    }
+
+    #[test]
+    fn patch_title_with_chip_404_proceeds_without_failing_the_override() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            404,
+            r#"{"error":"not found"}"#,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(patch_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            &UpdateOccurrence {
+                title: Some("Fajr Chips".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            response.occurrence.resolved_title, "Fajr Chips",
+            "the override writes even when the chip is gone"
+        );
+    }
+
+    #[test]
+    fn patch_title_without_a_chip_never_touches_google() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+        // No routes: any Google call would make the fake panic.
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(patch_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            &UpdateOccurrence {
+                title: Some("Fajr Chips".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.resolved_title, "Fajr Chips");
+        assert!(http.patches.lock().unwrap().is_empty(), "no chip → no Google");
+    }
+
+    #[test]
+    fn patch_unchanged_resolved_title_does_not_patch_the_summary() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        // Give the chip-bearing occurrence the override we are about to write
+        // — the resolved title does not change, so no Google PATCH.
+        {
+            let mut stored = repos.occurrences.stored.lock().unwrap();
+            let row = stored.iter_mut().find(|row| row.id == "occ-1").unwrap();
+            row.title = Some("Fajr Qadha".to_string());
+        }
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let response = pollster::block_on(patch_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            &UpdateOccurrence {
+                title: Some("Fajr Qadha".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.resolved_title, "Fajr Qadha");
+        assert!(http.patches.lock().unwrap().is_empty(), "same title → no summary PATCH");
+    }
+
+    // ──────────────────────────────────────────
+    // Elongate cron (slice 6): grow in_progress occurrence events
+    // ──────────────────────────────────────────
+
+    /// `2026-08-23T10:12:55Z` — +5 min slack ceils to 10:20:00Z on the grid.
+    fn elongate_now() -> i64 {
+        rfc3339_to_unix_secs("2026-08-23T10:12:55Z").unwrap()
+    }
+
+    /// Runs the occurrence elongate over the seeded repos. `events` may
+    /// pre-seed the cached chip row; the token repo must cover `user_id`.
+    fn elongate(
+        http: &FakeHttp,
+        calendars: &FakeCalendarRepo,
+        events: &FakeEventRepo,
+        occurrences: &FakeOccurrenceRepo,
+    ) -> ElongateReport {
+        pollster::block_on(run_elongate_occurrences(
+            http,
+            calendars,
+            events,
+            occurrences,
+            &FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]),
+            &oauth_config(),
+            elongate_now(),
+        ))
+    }
+
+    #[test]
+    fn elongate_grows_an_in_progress_occurrence_event() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            200,
+            &patched_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:20:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        pollster::block_on(events.upsert(
+            NewCalendarEvent {
+                calendar_id: "cal-primary@example.com".to_string(),
+                google_event_id: "g-1".to_string(),
+                google_etag: String::new(),
+                google_updated_at: String::new(),
+                last_synced_at: "2026-08-23T00:00:00Z".to_string(),
+                title: "Fajr".to_string(),
+                description: String::new(),
+                start_time: "2026-08-23T10:00:00Z".to_string(),
+                // Current end is before the 10:20 target → it must grow.
+                end_time: "2026-08-23T10:15:00Z".to_string(),
+                recurrence: String::new(),
+                task_id: String::new(),
+            },
+            "2026-08-23T00:00:00Z",
+        ))
+        .unwrap();
+
+        let report = elongate(&http, &calendars, &events, &repos.occurrences);
+
+        assert_eq!(report.occurrences_elongated, 1);
+        assert_eq!(report.elongated, 0, "task counter untouched");
+        assert!(report.errors.is_empty());
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2026-08-23T10:20:00Z", "ceil-5min(now+5min)");
+        // Status is never touched by the cron.
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_IN_PROGRESS);
+    }
+
+    #[test]
+    fn elongate_skips_when_the_end_already_covers_the_target() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        // No routes: a PATCH here would panic — the never-shrink rule must
+        // skip when the current end (10:30) is already past the 10:20 target.
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        pollster::block_on(events.upsert(
+            NewCalendarEvent {
+                calendar_id: "cal-primary@example.com".to_string(),
+                google_event_id: "g-1".to_string(),
+                google_etag: String::new(),
+                google_updated_at: String::new(),
+                last_synced_at: "2026-08-23T00:00:00Z".to_string(),
+                title: "Fajr".to_string(),
+                description: String::new(),
+                start_time: "2026-08-23T10:00:00Z".to_string(),
+                end_time: "2026-08-23T10:30:00Z".to_string(),
+                recurrence: String::new(),
+                task_id: String::new(),
+            },
+            "2026-08-23T00:00:00Z",
+        ))
+        .unwrap();
+
+        let report = elongate(&http, &calendars, &events, &repos.occurrences);
+
+        assert_eq!(report.occurrences_elongated, 0);
+        assert_eq!(report.skipped, 1, "never shrink");
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn elongate_skips_occurrences_without_a_cached_chip() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        // The occurrence has stored ids but no cached event row — the chip is
+        // gone: skip, never recreate, never flip status.
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let report = elongate(&http, &calendars, &events, &repos.occurrences);
+
+        assert_eq!(report.occurrences_elongated, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(
+            pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+                .unwrap()
+                .unwrap()
+                .status,
+            OCCURRENCE_STATUS_IN_PROGRESS,
+            "the cron never flips status"
+        );
     }
 }

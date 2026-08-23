@@ -24,9 +24,10 @@ mod session;
 
 pub use agenda::{
     add_agenda_item, complete_occurrence, delete_agenda_item, get_agenda, move_agenda_item,
-    patch_occurrence, skip_occurrence, AgendaError, AgendaItemResponse, AgendaItemView,
-    AgendaResponse, DeleteAgendaItemResponse, OccurrenceResponse, OccurrenceView,
-    AGENDA_KIND_OCCURRENCE, AGENDA_KIND_TASK, OCCURRENCE_STATUS_DONE, OCCURRENCE_STATUS_IN_PROGRESS,
+    patch_occurrence, run_elongate_occurrences, skip_occurrence, start_occurrence, AgendaError,
+    AgendaItemResponse, AgendaItemView, AgendaResponse, DeleteAgendaItemResponse,
+    OccurrenceActionResponse, OccurrenceResponse, OccurrenceView, AGENDA_KIND_OCCURRENCE,
+    AGENDA_KIND_TASK, OCCURRENCE_STATUS_DONE, OCCURRENCE_STATUS_IN_PROGRESS,
     OCCURRENCE_STATUS_PENDING, OCCURRENCE_STATUS_SKIPPED,
 };
 pub use calendar::{
@@ -74,7 +75,8 @@ pub use repo::{
     CALENDAR_LIST_SYNC_ENABLED_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
-    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
+    OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
     ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,

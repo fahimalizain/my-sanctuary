@@ -407,9 +407,22 @@ pub trait OccurrenceRepo: Send + Sync {
     /// Writes the title override; `None` clears it back to inheritance
     /// (stores NULL). No soft-delete filter — the table has none.
     async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError>;
+    /// Stores the one-shot log's ids on the occurrence (slice 6 — `/start`).
+    /// Both are written together; neither may be empty.
+    async fn set_event_ids(
+        &self,
+        id: &str,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<(), RepoError>;
     /// Transitions `status` (`pending | in_progress | done | skipped`). No
     /// soft-delete filter — the table has none.
     async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError>;
+    /// Every `in_progress` occurrence across ALL users that carries both ids
+    /// (`calendar_id`/`google_event_id` NOT NULL) — the elongate cron's
+    /// occurrence work list (slice 6: grow living in_progress one-shot logs
+    /// the same way tasks are grown; rows without a chip are never recreated).
+    async fn list_in_progress(&self) -> Result<Vec<RoutineOccurrence>, RepoError>;
 }
 
 /// Agenda membership persistence (`agenda_items` rows, ADR 0004).
@@ -1122,9 +1135,25 @@ pub const OCCURRENCE_INSERT_SQL: &str = "
 pub const OCCURRENCE_UPDATE_TITLE_SQL: &str =
     "UPDATE routine_occurrences SET title = ?, updated_at = ? WHERE id = ?";
 
+/// Stores the one-shot log's ids on the occurrence (slice 6 — `/start`).
+/// No `deleted_at` filter — the table has none.
+pub const OCCURRENCE_SET_EVENT_IDS_SQL: &str =
+    "UPDATE routine_occurrences SET calendar_id = ?, google_event_id = ?, updated_at = ? WHERE id = ?";
+
 /// Occurrence status transitions (complete/skip). No `deleted_at` filter.
 pub const OCCURRENCE_SET_STATUS_SQL: &str =
     "UPDATE routine_occurrences SET status = ?, updated_at = ? WHERE id = ?";
+
+/// The elongate cron's occurrence work list (slice 6): every `in_progress`
+/// occurrence that actually has a chip. Rows without ids are never recreated
+/// here — a start stores both ids together, so a missing one means the row
+/// never started (or the ids were lost) and there is nothing to grow.
+pub const OCCURRENCE_LIST_IN_PROGRESS_SQL: &str = "
+    SELECT * FROM routine_occurrences
+    WHERE status = 'in_progress'
+      AND calendar_id IS NOT NULL AND calendar_id != ''
+      AND google_event_id IS NOT NULL AND google_event_id != ''
+";
 
 // ──────────────────────────────────────────
 // Agenda item SQL (ADR 0004)
@@ -1831,6 +1860,17 @@ mod tests {
         assert_eq!(OCCURRENCE_INSERT_SQL.matches('?').count(), 6, "{}", OCCURRENCE_INSERT_SQL);
         assert_eq!(OCCURRENCE_UPDATE_TITLE_SQL.matches('?').count(), 3, "{}", OCCURRENCE_UPDATE_TITLE_SQL);
         assert_eq!(OCCURRENCE_SET_STATUS_SQL.matches('?').count(), 3, "{}", OCCURRENCE_SET_STATUS_SQL);
+        assert_eq!(OCCURRENCE_SET_EVENT_IDS_SQL.matches('?').count(), 4, "{}", OCCURRENCE_SET_EVENT_IDS_SQL);
+        assert!(
+            OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("status = 'in_progress'"),
+            "{}",
+            OCCURRENCE_LIST_IN_PROGRESS_SQL
+        );
+        assert!(
+            OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("calendar_id") && OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("google_event_id"),
+            "both ids required: {}",
+            OCCURRENCE_LIST_IN_PROGRESS_SQL
+        );
     }
 
     #[test]

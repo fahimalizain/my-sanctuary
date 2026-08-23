@@ -1,9 +1,9 @@
 // Home — the daily Agenda (ADR 0004 § Surfaces — Home): date-scoped mixed
 // list of tasks + routine occurrences, date selector (prev / today / next +
-// calendar pick), add-task picker, reorder, check-off, skip, occurrence
-// rename, and the existing TaskModal for task edits. Replaces the mock
-// timeline (SkewedTimeline stays in components/, unused — no drive-by
-// delete). Occurrence start lands in slice 6.
+// calendar pick), add-task picker, reorder, check-off, skip, start (today's
+// pending occurrences), occurrence rename, and the existing TaskModal for
+// task edits. Replaces the mock timeline (SkewedTimeline stays in
+// components/, unused — no drive-by delete).
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
@@ -38,6 +38,7 @@ import type {
   MoveTaskInput,
   MoveTaskResponse,
   NewAgendaItemInput,
+  OccurrenceActionResponse,
   OccurrenceRecord,
   OccurrenceResponse,
   OccurrenceStatus,
@@ -306,6 +307,48 @@ export function HomePage() {
     );
   };
 
+  /** Occurrence start (slice 6): creates the one-shot Google log and flips
+   *  the chip to in_progress. Today-only on the server; the Play button is
+   *  only rendered for today's pending occurrences. Optimistic → the chip
+   *  reads In progress immediately; a 401/400 rolls back with a banner. */
+  const handleStartOccurrence = async (item: AgendaItemRecord) => {
+    const occurrence = item.occurrence;
+    if (!occurrence) return;
+    const snapshot = itemsRef.current;
+    setItems((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id && entry.occurrence
+          ? { ...entry, occurrence: { ...entry.occurrence, status: 'in_progress' } }
+          : entry,
+      ),
+    );
+    setActionError(null);
+    let res: Response;
+    try {
+      res = await fetch(
+        `${API_BASE_URL}/api/occurrences/${occurrence.id}/start`,
+        { method: 'POST', credentials: 'include' },
+      );
+    } catch (err) {
+      setItems(snapshot);
+      setActionError(err instanceof Error ? err.message : 'Start failed');
+      return;
+    }
+    if (!res.ok) {
+      setItems(snapshot);
+      setActionError(await readError(res));
+      return;
+    }
+    const data = (await res.json()) as OccurrenceActionResponse;
+    setItems((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id && entry.occurrence
+          ? { ...entry, occurrence: data.occurrence }
+          : entry,
+      ),
+    );
+  };
+
   // ──────────────────────────────────────────
   // Add task (picker → POST /api/agenda/items)
   // ──────────────────────────────────────────
@@ -454,6 +497,7 @@ export function HomePage() {
   // ──────────────────────────────────────────
 
   const dateLabel = agendaDateLabel(date, civilToday());
+  const isToday = date === civilToday();
   const excludedTaskIds = new Set(
     items
       .filter((entry) => entry.kind === 'task' && entry.task)
@@ -615,7 +659,11 @@ export function HomePage() {
                     onSkipOccurrence={(entry) =>
                       void setOccurrenceStatus(entry, 'skipped', 'skip')
                     }
+                    onStartOccurrence={(entry) =>
+                      void handleStartOccurrence(entry)
+                    }
                     onRenameOccurrence={(occurrence) => openRename(occurrence)}
+                    showStartOccurrence={isToday}
                   />
                 ))}
               </div>

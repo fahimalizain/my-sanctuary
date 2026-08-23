@@ -33,7 +33,8 @@ use api_core::repo::{
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
-    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
+    OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL, ROUTINE_LIST_BY_USER_ID_SQL,
     ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
     TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
@@ -938,6 +939,26 @@ impl OccurrenceRepo for D1OccurrenceRepo {
         run_stmt(stmt).await
     }
 
+    async fn set_event_ids(
+        &self,
+        id: &str,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<(), RepoError> {
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_SET_EVENT_IDS_SQL)
+            .bind_refs(&[
+                D1Type::Text(calendar_id),
+                D1Type::Text(google_event_id),
+                D1Type::Text(&now),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
     async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError> {
         let now = now_rfc3339();
         let stmt = self
@@ -946,6 +967,13 @@ impl OccurrenceRepo for D1OccurrenceRepo {
             .bind_refs(&[D1Type::Text(status), D1Type::Text(&now), D1Type::Text(id)])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    async fn list_in_progress(&self) -> Result<Vec<RoutineOccurrence>, RepoError> {
+        // The elongate cron's occurrence work list: every `in_progress` row
+        // that carries both ids, all users. No binds — `prepare` returns the
+        // statement directly when there is nothing to bind.
+        query_vec(self.db.prepare(OCCURRENCE_LIST_IN_PROGRESS_SQL)).await
     }
 }
 
