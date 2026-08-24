@@ -1,5 +1,6 @@
 // Pure helpers for the Home agenda (ADR 0004 § Surfaces — Home). Date label,
-// add-task picker filter, and the reorder rank math live here so they can be
+// add-task picker filter, the reorder rank math, and the living / Completed
+// dump split (ADR 0004 amendment 2026-08-24) live here so they can be
 // unit-tested without a DOM.
 
 import type { AgendaItemRecord, TaskRecord, TaskStatus } from '../../types';
@@ -170,4 +171,45 @@ export function canReschedule(item: AgendaItemRecord): boolean {
     return item.task.status !== 'COMPLETED' && item.task.status !== 'DISCARDED';
   }
   return false;
+}
+
+/** True when the row belongs under the Completed dump: a task embed in a
+ *  terminal status (COMPLETED | DISCARDED) or a `done` occurrence. Orphans
+ *  (embedless rows) are never parked — the dump must never hide one. */
+export function isAgendaItemParked(item: AgendaItemRecord): boolean {
+  if (item.kind === 'task' && item.task) {
+    return item.task.status === 'COMPLETED' || item.task.status === 'DISCARDED';
+  }
+  if (item.kind === 'occurrence' && item.occurrence) {
+    return item.occurrence.status === 'done';
+  }
+  return false;
+}
+
+/** The embed's `updated_at` in ms since epoch (the Completed dump sort key).
+ *  Missing/invalid timestamps count as 0 — the oldest possible slot. */
+function embedUpdatedAtMs(item: AgendaItemRecord): number {
+  const raw = item.occurrence?.updated_at ?? item.task?.updated_at;
+  if (!raw) return 0;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/** Split one date's pile. `living` is sort_order asc; `completed` is newest
+ *  embed updated_at first (id asc on ties). Does not mutate the input. */
+export function partitionAgendaItems(items: AgendaItemRecord[]): {
+  living: AgendaItemRecord[];
+  completed: AgendaItemRecord[];
+} {
+  const living: AgendaItemRecord[] = [];
+  const completed: AgendaItemRecord[] = [];
+  for (const entry of items) {
+    (isAgendaItemParked(entry) ? completed : living).push(entry);
+  }
+  living.sort((a, b) => a.sort_order - b.sort_order);
+  completed.sort((a, b) => {
+    const byTime = embedUpdatedAtMs(b) - embedUpdatedAtMs(a);
+    return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
+  });
+  return { living, completed };
 }

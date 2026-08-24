@@ -1,7 +1,7 @@
 // Unit tests for the Home agenda's pure helpers (date label, add-task picker
-// filter, reorder rank math). The reorder tests pin the exact server
-// semantics of `POST /api/agenda/items/:id/move`: peers at/after the target
-// rank shift up one and the item lands on it.
+// filter, reorder rank math, living / Completed dump split). The reorder
+// tests pin the exact server semantics of `POST /api/agenda/items/:id/move`:
+// peers at/after the target rank shift up one and the item lands on it.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,6 +18,8 @@ import {
   applyAgendaMove,
   canReschedule,
   filterAgendaPickerTasks,
+  isAgendaItemParked,
+  partitionAgendaItems,
 } from './agenda-helpers';
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -26,6 +28,7 @@ function task(
   id: string,
   status: TaskRecord['status'],
   title = `Task ${id}`,
+  updatedAt = '2026-08-23T00:00:00Z',
 ): TaskRecord {
   return {
     id,
@@ -39,7 +42,7 @@ function task(
     sort_order: 0,
     status,
     created_at: '2026-08-23T00:00:00Z',
-    updated_at: '2026-08-23T00:00:00Z',
+    updated_at: updatedAt,
     focused: false,
     category: {
       id: 'cat-1',
@@ -67,14 +70,19 @@ function item(id: string, sortOrder: number): AgendaItemRecord {
 }
 
 /** A task-kind agenda row with its task embed. */
-function taskItem(id: string, status: TaskRecord['status']): AgendaItemRecord {
-  return { ...item(id, 0), task: task(id, status) };
+function taskItem(
+  id: string,
+  status: TaskRecord['status'],
+  updatedAt?: string,
+): AgendaItemRecord {
+  return { ...item(id, 0), task: task(id, status, `Task ${id}`, updatedAt) };
 }
 
 /** An occurrence-kind agenda row with its occurrence embed. */
 function occurrenceItem(
   id: string,
   status: OccurrenceRecord['status'],
+  updatedAt = '2026-08-23T00:00:00Z',
 ): AgendaItemRecord {
   return {
     ...item(id, 0),
@@ -93,7 +101,7 @@ function occurrenceItem(
       calendar_id: null,
       google_event_id: null,
       created_at: '2026-08-23T00:00:00Z',
-      updated_at: '2026-08-23T00:00:00Z',
+      updated_at: updatedAt,
       category: {
         id: 'cat-1',
         title: 'Work',
@@ -354,4 +362,124 @@ test('canReschedule: tasks move while living; completed/discarded stay put', () 
 
 test('canReschedule: an embedless row (orphan) is never reschedulable', () => {
   assert.equal(canReschedule(item('orphan', 0)), false);
+});
+
+// ── isAgendaItemParked ──────────────────────────────────────────────────
+
+test('isAgendaItemParked: terminal tasks park, living tasks stay', () => {
+  assert.equal(isAgendaItemParked(taskItem('a', 'COMPLETED')), true);
+  assert.equal(isAgendaItemParked(taskItem('b', 'DISCARDED')), true);
+  assert.equal(isAgendaItemParked(taskItem('c', 'OPEN')), false);
+  assert.equal(isAgendaItemParked(taskItem('d', 'PLANNED')), false);
+  assert.equal(isAgendaItemParked(taskItem('e', 'IN_PROGRESS')), false);
+});
+
+test('isAgendaItemParked: only done occurrences park', () => {
+  assert.equal(isAgendaItemParked(occurrenceItem('a', 'done')), true);
+  // skipped is a decline, not a finish — it stays living.
+  assert.equal(isAgendaItemParked(occurrenceItem('b', 'pending')), false);
+  assert.equal(isAgendaItemParked(occurrenceItem('c', 'skipped')), false);
+  assert.equal(isAgendaItemParked(occurrenceItem('d', 'in_progress')), false);
+});
+
+test('isAgendaItemParked: orphans never park', () => {
+  assert.equal(isAgendaItemParked(item('orphan', 0)), false);
+});
+
+// ── partitionAgendaItems ────────────────────────────────────────────────
+
+test('partitionAgendaItems: splits a mixed pile; living keeps sort_order', () => {
+  const pile = [
+    {
+      ...taskItem('t-done', 'COMPLETED', '2026-08-23T09:00:00Z'),
+      sort_order: 1,
+    },
+    {
+      ...occurrenceItem('o-done', 'done', '2026-08-23T08:00:00Z'),
+      sort_order: 2,
+    },
+    { ...occurrenceItem('o-skipped', 'skipped'), sort_order: 3 },
+    { ...occurrenceItem('o-pending', 'pending'), sort_order: 4 },
+    { ...occurrenceItem('o-progress', 'in_progress'), sort_order: 5 },
+    { ...taskItem('t-open', 'OPEN'), sort_order: 6 },
+    {
+      ...taskItem('t-drop', 'DISCARDED', '2026-08-23T07:00:00Z'),
+      sort_order: 7,
+    },
+    { ...item('orphan', 8) },
+  ];
+  const { living, completed } = partitionAgendaItems(pile);
+  // Living: skipped + pending + in_progress + living task + orphan, ranked.
+  assert.deepEqual(
+    living.map((e) => e.id),
+    ['o-skipped', 'o-pending', 'o-progress', 't-open', 'orphan'],
+  );
+  // Completed: done occurrence + COMPLETED + DISCARDED, newest updated_at
+  // first (t-done 09:00 → o-done 08:00 → t-drop 07:00).
+  assert.deepEqual(
+    completed.map((e) => e.id),
+    ['t-done', 'o-done', 't-drop'],
+  );
+});
+
+test('partitionAgendaItems: completed sorts newest embed updated_at first', () => {
+  const pile = [
+    occurrenceItem('old', 'done', '2026-08-20T00:00:00Z'),
+    taskItem('mid', 'COMPLETED', '2026-08-22T00:00:00Z'),
+    taskItem('new', 'COMPLETED', '2026-08-23T00:00:00Z'),
+  ];
+  const { completed } = partitionAgendaItems(pile);
+  assert.deepEqual(
+    completed.map((e) => e.id),
+    ['new', 'mid', 'old'],
+  );
+});
+
+test('partitionAgendaItems: equal updated_at tie-breaks by id ascending', () => {
+  const pile = [
+    taskItem('b', 'COMPLETED'),
+    occurrenceItem('a', 'done'),
+    taskItem('c', 'DISCARDED'),
+  ];
+  const { completed } = partitionAgendaItems(pile);
+  assert.deepEqual(
+    completed.map((e) => e.id),
+    ['a', 'b', 'c'],
+  );
+});
+
+test('partitionAgendaItems: missing/invalid updated_at sorts last (epoch 0)', () => {
+  const pile = [
+    taskItem('bad', 'COMPLETED', 'not-a-date'),
+    taskItem('empty', 'DISCARDED', ''),
+    taskItem('fresh', 'COMPLETED', '2026-08-23T00:00:00Z'),
+  ];
+  const { completed } = partitionAgendaItems(pile);
+  // fresh has a real timestamp; bad and empty both read as epoch 0 and
+  // tie-break by id ascending ('bad' before 'empty').
+  assert.deepEqual(
+    completed.map((e) => e.id),
+    ['fresh', 'bad', 'empty'],
+  );
+});
+
+test('partitionAgendaItems: does not mutate the input array', () => {
+  const pile = [
+    taskItem('a', 'COMPLETED'),
+    occurrenceItem('b', 'done'),
+    occurrenceItem('c', 'pending'),
+    taskItem('d', 'OPEN'),
+    item('e', 2),
+  ];
+  const before = [...pile];
+  partitionAgendaItems(pile);
+  // Same references, same order, unchanged after the call.
+  assert.equal(pile.length, before.length);
+  before.forEach((entry, i) => assert.equal(pile[i], entry));
+});
+
+test('partitionAgendaItems: empty input yields two empty piles', () => {
+  const { living, completed } = partitionAgendaItems([]);
+  assert.deepEqual(living, []);
+  assert.deepEqual(completed, []);
 });

@@ -3,6 +3,27 @@
 Status: Accepted
 Date: 2026-08-23
 
+> Amendment (2026-08-24): Home splits **one** `GET /api/agenda` response into
+> two piles, **client-only** — a ranked **living** list and a **Completed**
+> dump below it. No new endpoint, no `completed_at`. **Completed
+> membership:** a task-kind item parks when its embed status is `COMPLETED |
+DISCARDED`; an occurrence-kind item parks when its embed status is `done`.
+> `skipped` stays **living** — it is a decline, not a finish. Embedless
+> orphan rows never park (the dump must never hide one). **Sort:** the dump
+> is newest embed `updated_at` first (`occurrence.updated_at` ??
+> `task.updated_at`); missing/invalid timestamps sort as epoch 0 (oldest);
+> equal timestamps tie-break by `id` ascending. Renaming a completed task
+> bumps its `updated_at` and may reshuffle the dump — accepted. **Uncheck /
+> reopen** does **not** rewrite `sort_order`: the row returns to the living
+> pile at its stored rank. **No handle, no cross-pile drag** — the dump is
+> not a drop target; complete/undo happen only via the row's checkbox. The
+> pile header label is **Completed** (sentence case), muted, and hidden
+> while the dump is empty; the dashed "Nothing on this day" placeholder
+> shows only when **both** piles are empty. Overlay semantics are unchanged:
+> a completed task parks on **every** day it is pinned; occurrence `done` is
+> per instance. The optimistic complete stamps the embed `updated_at` so the
+> row jumps into the dump immediately. § Surfaces (Home) is amended.
+
 > Amendment (2026-08-24): a dedicated **reopen** verb joins the occurrence
 > matrix: `POST /api/occurrences/:id/reopen` returns `done`/`skipped` →
 > `pending` and **clears the stored chip ids** (`calendar_id` +
@@ -302,13 +323,13 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 
 ### Surfaces
 
-| Surface           | This train                                                                                                                                                                                                                                                                                                                                                                      |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Home (`/`)**    | The working surface. Date selector (prev / today / next + calendar pick). Mixed Agenda list for the selected date. Add-task picker. Reorder. Check-off. Skip. Start. Tap occurrence to rename. Tap task → existing `TaskModal`. Replace the mock `todayItems` list; **remove** the mock timeline (`SkewedTimeline`) from Home so the page is the Agenda, not two competing UIs. |
-| **`/routines`**   | CRUD for standing routines. RRULE builder via npm `rrule`, next-N preview, `estimated_minutes`, standing order. **Not** a nav tab — linked from Home ("Routines") and optionally Settings. Creating a routine does not put it on a date; the next matching Agenda GET seeds it.                                                                                                 |
-| **Board**         | Frozen. Tasks only. Unaware of routines.                                                                                                                                                                                                                                                                                                                                        |
-| **Calendar page** | Frozen. Logs appear as ordinary events after start.                                                                                                                                                                                                                                                                                                                             |
-| **Consistency**   | Out of this train. Will later read occurrence history.                                                                                                                                                                                                                                                                                                                          |
+| Surface           | This train                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Home (`/`)**    | The working surface. Date selector (prev / today / next + calendar pick). Mixed Agenda list for the selected date — a ranked **living** pile plus a **Completed** dump below it (newest embed `updated_at` first; see the 2026-08-24 amendment). Add-task picker. Reorder. Check-off. Skip. Start. Tap occurrence to rename. Tap task → existing `TaskModal`. Replace the mock `todayItems` list; **remove** the mock timeline (`SkewedTimeline`) from Home so the page is the Agenda, not two competing UIs. |
+| **`/routines`**   | CRUD for standing routines. RRULE builder via npm `rrule`, next-N preview, `estimated_minutes`, standing order. **Not** a nav tab — linked from Home ("Routines") and optionally Settings. Creating a routine does not put it on a date; the next matching Agenda GET seeds it.                                                                                                                                                                                                                               |
+| **Board**         | Frozen. Tasks only. Unaware of routines.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| **Calendar page** | Frozen. Logs appear as ordinary events after start.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **Consistency**   | Out of this train. Will later read occurrence history.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 Existing Google recurring events are not imported; the owner deletes the old series by hand once the routine lives in Sanctuary (see § Out of scope).
 
