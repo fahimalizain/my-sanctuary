@@ -13,6 +13,7 @@ import type {
 import {
   agendaDateLabel,
   agendaMoveTarget,
+  agendaMoveTargetAt,
   agendaTaskMatches,
   applyAgendaMove,
   canReschedule,
@@ -207,6 +208,42 @@ test('agendaMoveTarget: rank gaps keep working (after an unpin)', () => {
   const items = [item('a', 0), item('c', 2)];
   assert.equal(agendaMoveTarget(items, 'c', 'up'), 0);
   assert.equal(agendaMoveTarget(items, 'a', 'down'), 3);
+});
+
+// ── agendaMoveTargetAt ───────────────────────────────────────────────────
+
+test('agendaMoveTargetAt: dropped above takes the target rank', () => {
+  const items = [item('a', 0), item('b', 1), item('c', 2)];
+  // b (index 1) onto a's slot (index 0) → a's rank.
+  assert.equal(agendaMoveTargetAt(items, 1, 0), items[0].sort_order);
+  // c (index 2) onto b's slot (index 1) → b's rank.
+  assert.equal(agendaMoveTargetAt(items, 2, 1), items[1].sort_order);
+});
+
+test('agendaMoveTargetAt: dropped below lands just after the target row', () => {
+  const items = [item('a', 0), item('b', 1), item('c', 2)];
+  // a (index 0) onto b's slot (index 1) → lands after b.
+  assert.equal(agendaMoveTargetAt(items, 0, 1), items[1].sort_order + 1);
+  assert.equal(agendaMoveTargetAt(items, 0, 2), items[2].sort_order + 1);
+});
+
+test('agendaMoveTargetAt: same index and out-of-range return null', () => {
+  const items = [item('a', 0), item('b', 1)];
+  assert.equal(agendaMoveTargetAt(items, 0, 0), null);
+  assert.equal(agendaMoveTargetAt(items, 1, 1), null);
+  assert.equal(agendaMoveTargetAt(items, -1, 0), null);
+  assert.equal(agendaMoveTargetAt(items, 0, -1), null);
+  assert.equal(agendaMoveTargetAt(items, 2, 0), null);
+  assert.equal(agendaMoveTargetAt(items, 0, 2), null);
+  assert.equal(agendaMoveTargetAt([], 0, 0), null);
+});
+
+test('agendaMoveTargetAt: rank gaps keep working (after an unpin)', () => {
+  // Server keeps ranks after a hard delete, so a gap is legal — the target
+  // reads the stored rank, not the pile position.
+  const items = [item('a', 0), item('c', 2)];
+  assert.equal(agendaMoveTargetAt(items, 1, 0), 0);
+  assert.equal(agendaMoveTargetAt(items, 0, 1), 3);
 });
 
 // ── applyAgendaMove ──────────────────────────────────────────────────────

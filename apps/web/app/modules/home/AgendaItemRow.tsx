@@ -1,16 +1,26 @@
 // One agenda row for Home (ADR 0004 § Surfaces — Home): the occurrence
-// variant (checkbox → complete, status chip, skip, rename, move-to-another-
-// day) and the task variant (checkbox → complete, start, remove-from-day,
-// move-to-another-day, tap → TaskModal). Pure presentational — every
-// mutation lives in HomePage.
+// variant (checkbox toggles done ↔ pending, status chip, skip toggles
+// skipped ↔ pending hidden while done, rename, reschedule popover) and the
+// task variant (checkbox toggles completed ↔ planned, start, remove-from-day,
+// reschedule popover, tap → TaskModal). Both rows lead with a grab handle
+// (ADR 0004 amendment — reorder is a handle, chevrons are gone): the grip is
+// the ONLY drag activator, so a tap on checkbox / title / skip / play /
+// calendar / unpin never starts a drag. Pure presentational — every mutation
+// lives in HomePage; HomePage owns the verb branch (reopen vs complete/skip).
 
 import { useState } from 'react';
+import { useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import type {
+  DraggableAttributes,
+  DraggableSyntheticListeners,
+} from '@dnd-kit/core';
 import {
+  Calendar,
   CalendarClock,
   CalendarX2,
   Check,
-  ChevronDown,
-  ChevronUp,
+  GripVertical,
   Pencil,
   Play,
   X,
@@ -24,12 +34,20 @@ import { TASK_PRIORITY_LABELS } from '../../types';
 import { cn } from '@/lib/utils';
 import { canReschedule } from './agenda-helpers';
 import { addCivilDays } from '../routines/rrule-preview';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
 
 interface AgendaItemRowProps {
   item: AgendaItemRecord;
-  isFirst: boolean;
-  isLast: boolean;
-  onMove: (itemId: string, direction: 'up' | 'down') => void;
+  /** dnd-kit activator props for the grip — spread ONLY on the handle so a
+   *  tap on checkbox / title / skip / play / calendar / unpin never starts
+   *  a drag. */
+  attributes: DraggableAttributes;
+  listeners: DraggableSyntheticListeners;
+  isDragging: boolean;
   /** Move the slot to another day (`YYYY-MM-DD`) — HomePage fires
    *  `POST /api/agenda/items/:id/reschedule` optimistically. */
   onReschedule: (item: AgendaItemRecord, date: string) => void;
@@ -46,8 +64,9 @@ interface AgendaItemRowProps {
   showStartOccurrence?: boolean;
 }
 
-/** Round check circle — the row's complete control (tasks and occurrences
- *  both cross off through it). */
+/** Round check circle — the row's done toggle (tasks and occurrences both
+ *  cross off through it; clicking a checked circle unchecks — HomePage
+ *  decides reopen vs complete/skip). */
 function CheckCircle({
   checked,
   label,
@@ -61,7 +80,7 @@ function CheckCircle({
     <button
       type="button"
       onClick={onClick}
-      aria-label={checked ? `${label} — marked done` : `Complete ${label}`}
+      aria-label={checked ? `Undo done — ${label}` : `Complete ${label}`}
       className={cn(
         'h-5 w-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-colors',
         checked
@@ -74,50 +93,49 @@ function CheckCircle({
   );
 }
 
-/** Up/down reorder stack — disabled at the pile's edges. */
-function MoveButtons({
-  isFirst,
-  isLast,
-  onMove,
-  itemId,
+/** The reorder grip — the FIRST control on the row (before the checkbox)
+ *  and the only drag activator: the dnd-kit listeners live here and nowhere
+ *  else, so row taps (checkbox, title, skip, play, calendar, unpin) never
+ *  start a drag. `touch-none` stops a grab from scrolling the page; the
+ *  cursor flips to grabbing while the drag is live. */
+function DragHandle({
+  attributes,
+  listeners,
+  label,
+  isDragging,
 }: {
-  isFirst: boolean;
-  isLast: boolean;
-  onMove: (itemId: string, direction: 'up' | 'down') => void;
-  itemId: string;
+  attributes: DraggableAttributes;
+  listeners: DraggableSyntheticListeners;
+  label: string;
+  isDragging: boolean;
 }) {
   return (
-    <div className="flex flex-col flex-shrink-0">
-      <button
-        type="button"
-        disabled={isFirst}
-        onClick={() => onMove(itemId, 'up')}
-        aria-label="Move up"
-        title="Move up"
-        className="p-0.5 rounded hover:bg-muted transition-colors disabled:opacity-25 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-      >
-        <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
-      </button>
-      <button
-        type="button"
-        disabled={isLast}
-        onClick={() => onMove(itemId, 'down')}
-        aria-label="Move down"
-        title="Move down"
-        className="p-0.5 rounded hover:bg-muted transition-colors disabled:opacity-25 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-      >
-        <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-      </button>
-    </div>
+    <button
+      type="button"
+      aria-label={`Reorder ${label}`}
+      title="Reorder"
+      className={cn(
+        'p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0 touch-none',
+        isDragging ? 'cursor-grabbing' : 'cursor-grab',
+      )}
+      {...attributes}
+      {...listeners}
+    >
+      <GripVertical className="h-3.5 w-3.5 text-muted-foreground" />
+    </button>
   );
 }
 
-/** Move-to-another-day control (ADR 0004 amendment — reschedule): a primary
- *  "Tomorrow" action plus a compact native date picker for any other day.
- *  Both fire immediately — no confirm — so the row's optimistic drop in
- *  HomePage is instant; failures revert + banner. "Tomorrow" is the ROW's
- *  own date +1 civil day (moving from a future day still means "the next
- *  day"), never the browser's today. */
+/** Move-to-another-day control (ADR 0004 amendment — reschedule): a
+ *  calendar icon opens a small popover with a primary "Tomorrow" action
+ *  plus a compact native date picker for any other day. Both fire
+ *  immediately — no confirm — so the row's optimistic drop in HomePage is
+ *  instant; failures revert + banner. "Tomorrow" is the ROW's own date +1
+ *  civil day (moving from a future day still means "the next day"), never
+ *  the browser's today. The popover closes and the picker resets after
+ *  either action so it never reads as a filter. Skip stays its own control
+ *  (ADR 0004 amendment — the calendar popover is Tomorrow + pick-a-day
+ *  only). */
 function RescheduleControl({
   item,
   label,
@@ -127,37 +145,51 @@ function RescheduleControl({
   label: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
 }) {
+  const [open, setOpen] = useState(false);
   const [pickDate, setPickDate] = useState('');
   const tomorrow = addCivilDays(item.local_date, 1);
   return (
-    <span className="flex items-center gap-1 flex-shrink-0">
-      <button
-        type="button"
-        onClick={() => onReschedule(item, tomorrow)}
-        aria-label={`Move ${label} to tomorrow`}
-        title="Move to tomorrow"
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors flex-shrink-0"
-      >
-        <CalendarClock className="h-3.5 w-3.5" />
-        Tomorrow
-      </button>
-      <input
-        type="date"
-        value={pickDate}
-        onChange={(e) => {
-          const next = e.target.value;
-          // No confirm: picking a day reschedules immediately, then the
-          // control resets so it never reads as a filter.
-          if (next) {
-            setPickDate('');
-            onReschedule(item, next);
-          }
-        }}
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
         aria-label={`Move ${label} to another day`}
-        title="Move to another day"
-        className="w-32 rounded-md border border-input bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all flex-shrink-0"
-      />
-    </span>
+        title={`Move ${label} to another day`}
+        className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
+      >
+        <Calendar className="h-3.5 w-3.5 text-muted-foreground" />
+      </PopoverTrigger>
+      <PopoverContent className="w-48 flex flex-col gap-1">
+        <button
+          type="button"
+          onClick={() => {
+            setOpen(false);
+            onReschedule(item, tomorrow);
+          }}
+          aria-label={`Move ${label} to tomorrow`}
+          title="Move to tomorrow"
+          className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+        >
+          <CalendarClock className="h-3.5 w-3.5" />
+          Tomorrow
+        </button>
+        <input
+          type="date"
+          value={pickDate}
+          onChange={(e) => {
+            const next = e.target.value;
+            // No confirm: picking a day reschedules immediately, then the
+            // control resets so it never reads as a filter.
+            if (next) {
+              setPickDate('');
+              setOpen(false);
+              onReschedule(item, next);
+            }
+          }}
+          aria-label={`Move ${label} to another day`}
+          title="Move to another day"
+          className="w-full rounded-md border border-input bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+        />
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -187,9 +219,9 @@ function StatusChip({
 function OccurrenceRow({
   item,
   occurrence,
-  isFirst,
-  isLast,
-  onMove,
+  attributes,
+  listeners,
+  isDragging,
   onReschedule,
   onComplete,
   onSkip,
@@ -199,9 +231,9 @@ function OccurrenceRow({
 }: {
   item: AgendaItemRecord;
   occurrence: OccurrenceRecord;
-  isFirst: boolean;
-  isLast: boolean;
-  onMove: AgendaItemRowProps['onMove'];
+  attributes: DraggableAttributes;
+  listeners: DraggableSyntheticListeners;
+  isDragging: boolean;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onSkip: () => void;
@@ -219,6 +251,12 @@ function OccurrenceRow({
       )}
     >
       <div className="flex items-center gap-2.5">
+        <DragHandle
+          attributes={attributes}
+          listeners={listeners}
+          label={occurrence.resolved_title}
+          isDragging={isDragging}
+        />
         <CheckCircle
           checked={occurrence.status === 'done'}
           label={occurrence.resolved_title}
@@ -267,12 +305,18 @@ function OccurrenceRow({
             }
           />
         )}
-        {occurrence.status !== 'done' && occurrence.status !== 'skipped' && (
+        {/* Skip toggles skipped ↔ pending; hidden only while done (a done
+            row unchecks first — two taps: uncheck, then skip). */}
+        {occurrence.status !== 'done' && (
           <button
             type="button"
             onClick={onSkip}
-            aria-label={`Skip ${occurrence.resolved_title}`}
-            title="Skip"
+            aria-label={
+              occurrence.status === 'skipped'
+                ? `Undo skip ${occurrence.resolved_title}`
+                : `Skip ${occurrence.resolved_title}`
+            }
+            title={occurrence.status === 'skipped' ? 'Undo skip' : 'Skip'}
             className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
           >
             <CalendarX2 className="h-3.5 w-3.5 text-muted-foreground" />
@@ -301,12 +345,6 @@ function OccurrenceRow({
             onReschedule={onReschedule}
           />
         )}
-        <MoveButtons
-          isFirst={isFirst}
-          isLast={isLast}
-          onMove={onMove}
-          itemId={item.id}
-        />
       </div>
     </div>
   );
@@ -315,9 +353,9 @@ function OccurrenceRow({
 function TaskRow({
   item,
   task,
-  isFirst,
-  isLast,
-  onMove,
+  attributes,
+  listeners,
+  isDragging,
   onReschedule,
   onComplete,
   onStart,
@@ -326,9 +364,9 @@ function TaskRow({
 }: {
   item: AgendaItemRecord;
   task: TaskRecord;
-  isFirst: boolean;
-  isLast: boolean;
-  onMove: AgendaItemRowProps['onMove'];
+  attributes: DraggableAttributes;
+  listeners: DraggableSyntheticListeners;
+  isDragging: boolean;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onStart: () => void;
@@ -344,6 +382,12 @@ function TaskRow({
       )}
     >
       <div className="flex items-center gap-2.5">
+        <DragHandle
+          attributes={attributes}
+          listeners={listeners}
+          label={task.display_title}
+          isDragging={isDragging}
+        />
         <CheckCircle
           checked={crossed}
           label={task.display_title}
@@ -405,12 +449,6 @@ function TaskRow({
             onReschedule={onReschedule}
           />
         )}
-        <MoveButtons
-          isFirst={isFirst}
-          isLast={isLast}
-          onMove={onMove}
-          itemId={item.id}
-        />
       </div>
     </div>
   );
@@ -423,9 +461,9 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
       <OccurrenceRow
         item={item}
         occurrence={item.occurrence}
-        isFirst={props.isFirst}
-        isLast={props.isLast}
-        onMove={props.onMove}
+        attributes={props.attributes}
+        listeners={props.listeners}
+        isDragging={props.isDragging}
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
@@ -440,9 +478,9 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
       <TaskRow
         item={item}
         task={item.task}
-        isFirst={props.isFirst}
-        isLast={props.isLast}
-        onMove={props.onMove}
+        attributes={props.attributes}
+        listeners={props.listeners}
+        isDragging={props.isDragging}
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteTask(item)}
         onStart={() => props.onStartTask(item)}
@@ -454,4 +492,39 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
   // The API never returns a member row without its embed (orphans are
   // omitted); a defensive null keeps a malformed row from crashing the list.
   return null;
+}
+
+/** The draggable wrapper of an agenda row (same idea as the board's
+ *  SortableTaskCard): applies the sortable transform + transition on an
+ *  outer div while the row itself stays the plain presentational card. While
+ *  dragging, the source row dims — HomePage's DragOverlay shows the floating
+ *  title. The activator props are handed to the row, which spreads them on
+ *  the grip ONLY, so the rest of the row never starts a drag. */
+export function SortableAgendaItemRow(
+  props: Omit<AgendaItemRowProps, 'attributes' | 'listeners' | 'isDragging'>,
+) {
+  const { item } = props;
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: item.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn(isDragging && 'opacity-40')}
+    >
+      <AgendaItemRow
+        {...props}
+        attributes={attributes}
+        listeners={listeners}
+        isDragging={isDragging}
+      />
+    </div>
+  );
 }

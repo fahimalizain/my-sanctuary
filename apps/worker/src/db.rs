@@ -19,11 +19,13 @@ use api_core::models::{
     UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, AgendaItemRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo,
-    RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo,
-    UserRepo, WatchChannelRepo,
+    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_event_upsert_sql,
+    build_occurrence_insert_sql, build_occurrence_list_by_ids_sql, AgendaItemRepo,
+    CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError, RoutineRepo, TaskCategoryRepo,
+    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
     AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
-    AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
+    AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,
+    AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
     AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL,
     AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
@@ -34,8 +36,9 @@ use api_core::repo::{
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
+    OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
     OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
-    OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
+    OCCURRENCE_CLEAR_EVENT_IDS_SQL, OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
     OCCURRENCE_UPDATE_TITLE_SQL,
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL, ROUTINE_LIST_BY_USER_ID_SQL,
     ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
@@ -88,6 +91,15 @@ where
 {
     let result = stmt.all().await.map_err(backend)?;
     result.results::<T>().map_err(backend)
+}
+
+/// Binds all-string args as `D1Type::Text` — the batch SQL builders
+/// (`build_occurrence_insert_sql`, `build_agenda_item_insert_sql`,
+/// `build_occurrence_list_by_ids_sql`, `build_agenda_item_list_by_refs_sql`)
+/// return string args; INTEGER columns coerce the text via their affinity
+/// (same pattern as `D1CalendarEventRepo::run_upsert`).
+fn bind_text(args: &[String]) -> Vec<D1Type> {
+    args.iter().map(|arg| D1Type::Text(arg)).collect()
 }
 
 /// `users` table persistence.
@@ -911,6 +923,46 @@ impl OccurrenceRepo for D1OccurrenceRepo {
             .ok_or_else(|| RepoError::Backend("occurrence insert produced no row".to_string()))
     }
 
+    async fn list_by_ids(&self, ids: &[String]) -> Result<Vec<RoutineOccurrence>, RepoError> {
+        // Empty IN list → no SQL at all.
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE) {
+            let (sql, args) = build_occurrence_list_by_ids_sql(chunk);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            rows.extend(query_vec(stmt).await?);
+        }
+        Ok(rows)
+    }
+
+    async fn insert_many(&self, rows: Vec<NewRoutineOccurrence>) -> Result<(), RepoError> {
+        // Empty batch → no SQL at all.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Chunk to stay under D1's 100 bound-parameter limit (16 rows of 6
+        // columns per statement); each chunk is one D1 subrequest. INSERT OR
+        // IGNORE absorbs concurrent duplicates; the caller re-lists for ids.
+        let now = now_rfc3339();
+        for chunk in rows.chunks(OCCURRENCE_INSERT_CHUNK_SIZE) {
+            let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            let (sql, args) = build_occurrence_insert_sql(chunk, &now, ids);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
+    }
+
     async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError> {
         let now = now_rfc3339();
         let stmt = self
@@ -937,6 +989,16 @@ impl OccurrenceRepo for D1OccurrenceRepo {
                 D1Type::Text(&now),
                 D1Type::Text(id),
             ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn clear_event_ids(&self, id: &str) -> Result<(), RepoError> {
+        let now = now_rfc3339();
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_CLEAR_EVENT_IDS_SQL)
+            .bind_refs(&[D1Type::Text(&now), D1Type::Text(id)])
             .map_err(backend)?;
         run_stmt(stmt).await
     }
@@ -1054,6 +1116,51 @@ impl AgendaItemRepo for D1AgendaItemRepo {
         self.get_by_key(&item.user_id, &item.local_date, &item.kind, &item.ref_id)
             .await?
             .ok_or_else(|| RepoError::Backend("agenda item insert produced no row".to_string()))
+    }
+
+    async fn list_by_refs(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_ids: &[String],
+    ) -> Result<Vec<AgendaItem>, RepoError> {
+        // Empty IN list → no SQL at all.
+        if ref_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = Vec::with_capacity(ref_ids.len());
+        for chunk in ref_ids.chunks(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE) {
+            let (sql, args) = build_agenda_item_list_by_refs_sql(user_id, kind, chunk);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            rows.extend(query_vec(stmt).await?);
+        }
+        Ok(rows)
+    }
+
+    async fn insert_many(&self, rows: Vec<NewAgendaItem>) -> Result<(), RepoError> {
+        // Empty batch → no SQL at all.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Chunk to stay under D1's 100 bound-parameter limit (12 rows of 8
+        // columns per statement); each chunk is one D1 subrequest. INSERT OR
+        // IGNORE skips duplicates (their stored sort_order wins).
+        let now = now_rfc3339();
+        for chunk in rows.chunks(AGENDA_ITEM_INSERT_CHUNK_SIZE) {
+            let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            let (sql, args) = build_agenda_item_insert_sql(chunk, &now, ids);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
     }
 
     async fn hard_delete(&self, id: &str) -> Result<(), RepoError> {

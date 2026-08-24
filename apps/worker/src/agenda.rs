@@ -605,3 +605,41 @@ occurrence_exit!(
     api_core::skip_occurrence,
     "POST /api/occurrences/:id/skip → 200 `{\"occurrence\":{...}}` — the verb matrix; from `in_progress` with stored ids the running chip's end is PATCHed closed (Google gate), otherwise session-only."
 );
+
+/// `POST /api/occurrences/:id/reopen` → 200 `{"occurrence":{...}}`.
+///
+/// The dedicated un-do verb (ADR 0004 amendment): `done`/`skipped` →
+/// `pending` with the stored one-shot log ids cleared, so a later start mints
+/// a NEW Google event (the closed chip stays on Google as an orphaned log,
+/// never PATCHed or deleted). `pending` → 200 no-op; `in_progress` → 400 (no
+/// abort). Session-only — never touches Google, so no token refresh here.
+/// Deliberately NOT the `occurrence_exit!` macro: that one Google-gates
+/// `in_progress`; reopen never writes Google.
+pub async fn reopen_occurrence(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id") else {
+        return json_error(&ctx, 404, "not found");
+    };
+
+    match api_core::reopen_occurrence(
+        &lists_d1(&ctx)?,
+        &categories_d1(&ctx)?,
+        &routines_d1(&ctx)?,
+        &occurrences_d1(&ctx)?,
+        &user.id,
+        id,
+    )
+    .await
+    {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}

@@ -138,10 +138,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .post_async("/api/occurrences/:id/start", agenda::start_occurrence)
         .post_async("/api/occurrences/:id/complete", agenda::complete_occurrence)
         .post_async("/api/occurrences/:id/skip", agenda::skip_occurrence)
+        .post_async("/api/occurrences/:id/reopen", agenda::reopen_occurrence)
         .options("/api/occurrences/:id", auth::options)
         .options("/api/occurrences/:id/start", auth::options)
         .options("/api/occurrences/:id/complete", auth::options)
         .options("/api/occurrences/:id/skip", auth::options)
+        .options("/api/occurrences/:id/reopen", auth::options)
         .run(req, env)
         .await
 }

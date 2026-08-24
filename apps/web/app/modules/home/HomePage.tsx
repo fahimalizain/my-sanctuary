@@ -1,13 +1,28 @@
 // Home — the daily Agenda (ADR 0004 § Surfaces — Home): date-scoped mixed
 // list of tasks + routine occurrences, date selector (prev / today / next +
-// calendar pick), add-task picker, reorder, check-off, skip, start (today's
-// pending occurrences), reschedule (Tomorrow / pick a day), occurrence
-// rename, and the existing TaskModal for task edits. Replaces the mock
-// timeline (SkewedTimeline stays in components/, unused — no drive-by
-// delete).
+// calendar pick), add-task picker, reorder by grab handle (dnd-kit —
+// same-day only, ADR 0004 amendment: reorder is a handle, chevrons are
+// gone), check-off, skip, start (today's pending occurrences), reschedule
+// (the calendar popover — Tomorrow / pick a day), occurrence rename, and the
+// existing TaskModal for task edits. Replaces the mock timeline
+// (SkewedTimeline stays in components/, unused — no drive-by delete).
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
+import {
+  DndContext,
+  DragOverlay,
+  MouseSensor,
+  TouchSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
 import { ChevronLeft, ChevronRight, Loader2, Plus, Repeat } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -32,6 +47,7 @@ import {
 import { queryKeys } from '@/app/queries/keys';
 import {
   useCompleteOccurrence,
+  useReopenOccurrence,
   useSkipOccurrence,
   useStartOccurrence,
   useUpdateOccurrence,
@@ -44,12 +60,12 @@ import {
   useUpdateTask,
 } from '@/app/queries/tasks';
 import { queryClient } from '@/lib/queryClient';
-import { AgendaItemRow } from './AgendaItemRow';
+import { SortableAgendaItemRow } from './AgendaItemRow';
 import { TaskPickerDialog } from './TaskPickerDialog';
 import { addCivilDays } from '@/app/modules/routines/rrule-preview';
 import {
   agendaDateLabel,
-  agendaMoveTarget,
+  agendaMoveTargetAt,
   applyAgendaMove,
 } from './agenda-helpers';
 import type {
@@ -97,6 +113,8 @@ export function HomePage() {
   // Action failures (move/complete/skip/etc.): a banner above the still-
   // visible list — rows are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
+  // The row currently dragged — feeds the DragOverlay title chip.
+  const [activeDrag, setActiveDrag] = useState<AgendaItemRecord | null>(null);
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [taskModal, setTaskModal] = useState<TaskRecord | null>(null);
@@ -137,6 +155,7 @@ export function HomePage() {
   const deleteAgendaItemMutation = useDeleteAgendaItem();
   const completeOccurrenceMutation = useCompleteOccurrence();
   const skipOccurrenceMutation = useSkipOccurrence();
+  const reopenOccurrenceMutation = useReopenOccurrence();
   const startOccurrenceMutation = useStartOccurrence();
   const updateOccurrenceMutation = useUpdateOccurrence();
   // Task writes reuse the shared task mutations from `queries/tasks.ts`;
@@ -148,19 +167,36 @@ export function HomePage() {
   const deleteTaskMutation = useDeleteTask();
   const moveTaskMutation = useMoveTask();
 
+  // Agenda reorder sensors: a vertical list with a dedicated grip means a
+  // short move activates — Mouse 8px + Touch 8px, still NO 250ms hold
+  // (unlike the board, whose delay beats its horizontal pan). PointerSensor
+  // is gone: Chrome DevTools device mode and many phones speak touch
+  // events, not pointer, so it never fires for them. The listeners live
+  // only on the grip (touch-none), so taps on any other row control never
+  // reach a sensor; the distance constraint stops a tap from dragging while
+  // a swipe on the handle still starts a drag.
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { distance: 8 } }),
+  );
+
   const changeDate = (next: string) => {
     if (!next || next === date) return;
     setDate(next);
   };
 
   // ──────────────────────────────────────────
-  // Reorder (up/down — POST the absolute rank)
+  // Reorder (grab handle → POST the absolute rank)
   // ──────────────────────────────────────────
 
-  const handleMove = async (itemId: string, direction: 'up' | 'down') => {
-    const target = agendaMoveTarget(itemsRef.current, itemId, direction);
-    if (target === null) return;
+  /** Optimistic move onto the slot at `toIndex` — the same snapshot /
+   *  POST / merge path the chevrons used, with `agendaMoveTargetAt` keeping
+   *  the rank math server-exact. */
+  const handleMoveTo = async (itemId: string, toIndex: number) => {
     const snapshot = itemsRef.current;
+    const fromIndex = snapshot.findIndex((entry) => entry.id === itemId);
+    const target = agendaMoveTargetAt(snapshot, fromIndex, toIndex);
+    if (target === null) return;
     // Optimistic paint that mirrors the server's shift exactly.
     setItems(applyAgendaMove(snapshot, itemId, target));
     setActionError(null);
@@ -180,6 +216,18 @@ export function HomePage() {
       setItems(snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
     }
+  };
+
+  /** dnd-kit drop: resolve the active/over ids against the CURRENT pile
+   *  (ranks may have shifted since the drag started) and hand the target
+   *  slot to the shared move path. A drop on itself, no target, or a
+   *  stale id is a no-op — `agendaMoveTargetAt` returns null. */
+  const handleDragEnd = (event: DragEndEvent) => {
+    setActiveDrag(null);
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const toIndex = itemsRef.current.findIndex((entry) => entry.id === over.id);
+    void handleMoveTo(String(active.id), toIndex);
   };
 
   // ──────────────────────────────────────────
@@ -221,12 +269,47 @@ export function HomePage() {
   // Check-off / skip (optimistic, per the verb contracts)
   // ──────────────────────────────────────────
 
-  /** Task → the existing `/complete` (Board → Done). The agenda row stays as
+  /** Task → the existing `/complete` (Board → Done) or, for a checked-off
+   *  row, back to PLANNED via the existing Board move (ADR 0004 amendment —
+   *  uncheck is the Board reopen, no new endpoint). The agenda row stays as
    *  a crossed-off row for the rest of that date (ADR 0004 § Crossing off). */
   const handleCompleteTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
     const snapshot = itemsRef.current;
+    // Uncheck: COMPLETED → PLANNED (living again — Play/Reschedule return
+    // because the row is no longer a finished card).
+    if (task.status === 'COMPLETED') {
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: { ...entry.task, status: 'PLANNED' } }
+            : entry,
+        ),
+      );
+      setActionError(null);
+      try {
+        const data = await moveTaskMutation.mutateAsync({
+          id: task.id,
+          input: { status: 'PLANNED' } satisfies MoveTaskInput,
+        });
+        setItems((prev) =>
+          prev.map((entry) =>
+            entry.id === item.id && entry.task
+              ? { ...entry, task: data.task }
+              : entry,
+          ),
+        );
+        // Patch the shared tasks cache so Board/Lists see the fresh row.
+        setTasksCache((prev) =>
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+        );
+      } catch (err) {
+        setItems(snapshot);
+        setActionError(err instanceof Error ? err.message : 'Uncheck failed');
+      }
+      return;
+    }
     setItems((prev) =>
       prev.map((entry) =>
         entry.id === item.id && entry.task
@@ -331,6 +414,52 @@ export function HomePage() {
               id: occurrence.id,
               date: dateRef.current,
             });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
+      );
+    } catch (err) {
+      setItems(snapshot);
+      setActionError(err instanceof Error ? err.message : 'Update failed');
+    }
+  };
+
+  /** Occurrence reopen — the uncheck/unskip path (ADR 0004 amendment):
+   *  done/skipped → pending with the chip ids cleared (`calendar_id` +
+   *  `google_event_id` → null, matching the server's reopen). Same
+   *  optimistic shape as setOccurrenceStatus: paint pending immediately,
+   *  merge the authoritative occurrence on success, snapshot-rollback +
+   *  banner on failure. Play returns when showStartOccurrence is on and the
+   *  status is pending; Calendar/RescheduleControl return via the existing
+   *  canReschedule. */
+  const handleReopenOccurrence = async (item: AgendaItemRecord) => {
+    const occurrence = item.occurrence;
+    if (!occurrence) return;
+    const snapshot = itemsRef.current;
+    setItems((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id && entry.occurrence
+          ? {
+              ...entry,
+              occurrence: {
+                ...entry.occurrence,
+                status: 'pending',
+                calendar_id: null,
+                google_event_id: null,
+              },
+            }
+          : entry,
+      ),
+    );
+    setActionError(null);
+    try {
+      const data = await reopenOccurrenceMutation.mutateAsync({
+        id: occurrence.id,
+        date: dateRef.current,
+      });
       setItems((prev) =>
         prev.map((entry) =>
           entry.id === item.id && entry.occurrence
@@ -678,39 +807,81 @@ export function HomePage() {
               </div>
             )}
 
-            {/* The mixed pile — API order = sort_order */}
+            {/* The mixed pile — API order = sort_order; same-day reorder
+                only (each date is its own pile, no cross-date drag) */}
             {items.length > 0 && (
-              <div className="space-y-2">
-                {items.map((item, index) => (
-                  <AgendaItemRow
-                    key={item.id}
-                    item={item}
-                    isFirst={index === 0}
-                    isLast={index === items.length - 1}
-                    onMove={(itemId, direction) =>
-                      void handleMove(itemId, direction)
-                    }
-                    onReschedule={(entry, targetDate) =>
-                      void handleReschedule(entry, targetDate)
-                    }
-                    onCompleteTask={(entry) => void handleCompleteTask(entry)}
-                    onStartTask={(entry) => void handleStartTask(entry)}
-                    onRemoveTask={(entry) => void handleRemoveTask(entry)}
-                    onOpenTask={(task) => setTaskModal(task)}
-                    onCompleteOccurrence={(entry) =>
-                      void setOccurrenceStatus(entry, 'done', 'complete')
-                    }
-                    onSkipOccurrence={(entry) =>
-                      void setOccurrenceStatus(entry, 'skipped', 'skip')
-                    }
-                    onStartOccurrence={(entry) =>
-                      void handleStartOccurrence(entry)
-                    }
-                    onRenameOccurrence={(occurrence) => openRename(occurrence)}
-                    showStartOccurrence={isToday}
-                  />
-                ))}
-              </div>
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                onDragStart={(event) =>
+                  setActiveDrag(
+                    itemsRef.current.find(
+                      (entry) => entry.id === event.active.id,
+                    ) ?? null,
+                  )
+                }
+                onDragEnd={handleDragEnd}
+                onDragCancel={() => setActiveDrag(null)}
+              >
+                <SortableContext
+                  items={items.map((entry) => entry.id)}
+                  strategy={verticalListSortingStrategy}
+                >
+                  <div className="space-y-2">
+                    {items.map((item) => (
+                      <SortableAgendaItemRow
+                        key={item.id}
+                        item={item}
+                        onReschedule={(entry, targetDate) =>
+                          void handleReschedule(entry, targetDate)
+                        }
+                        onCompleteTask={(entry) =>
+                          void handleCompleteTask(entry)
+                        }
+                        onStartTask={(entry) => void handleStartTask(entry)}
+                        onRemoveTask={(entry) => void handleRemoveTask(entry)}
+                        onOpenTask={(task) => setTaskModal(task)}
+                        onCompleteOccurrence={(entry) =>
+                          entry.occurrence?.status === 'done'
+                            ? void handleReopenOccurrence(entry)
+                            : void setOccurrenceStatus(
+                                entry,
+                                'done',
+                                'complete',
+                              )
+                        }
+                        onSkipOccurrence={(entry) =>
+                          entry.occurrence?.status === 'skipped'
+                            ? void handleReopenOccurrence(entry)
+                            : void setOccurrenceStatus(entry, 'skipped', 'skip')
+                        }
+                        onStartOccurrence={(entry) =>
+                          void handleStartOccurrence(entry)
+                        }
+                        onRenameOccurrence={(occurrence) =>
+                          openRename(occurrence)
+                        }
+                        showStartOccurrence={isToday}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+
+                {/* Floating title chip while dragging — the source row stays
+                    in place, dimmed (opacity-40 on its wrapper) */}
+                <DragOverlay>
+                  {activeDrag && (
+                    <div className="cursor-grabbing rounded-lg border border-border bg-background px-3 py-2 shadow-xl ring-1 ring-border/60">
+                      <span className="text-sm font-medium text-foreground">
+                        {activeDrag.kind === 'occurrence' &&
+                        activeDrag.occurrence
+                          ? activeDrag.occurrence.resolved_title
+                          : (activeDrag.task?.display_title ?? '')}
+                      </span>
+                    </div>
+                  )}
+                </DragOverlay>
+              </DndContext>
             )}
           </div>
 

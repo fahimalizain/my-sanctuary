@@ -15,10 +15,13 @@
 //!   routine whose rrule blob covers the date, ensure the occurrence row
 //!   (idempotent via `UNIQUE (routine_id, local_date)`) and append an
 //!   occurrence agenda item **only when this occurrence has no agenda item on
-//!   ANY date** (`get_by_ref`), landing **after** already-present items, in
+//!   ANY date** (`list_by_refs`), landing **after** already-present items, in
 //!   standing `routines.sort_order` relative to each other. A list the user
 //!   already reordered is never reshuffled; a rescheduled occurrence is never
-//!   re-attached to its rule date. Tasks never auto-land.
+//!   re-attached to its rule date. Tasks never auto-land. The seed is a
+//!   handful of **set reads** (`list_by_user_and_date` + `list_by_refs`) with
+//!   batched `insert_many` of only what is missing — never a per-routine
+//!   `insert`/`get_by_ref` loop.
 //! - The response omits occurrence items whose routine is missing/
 //!   soft-deleted and task items whose task is missing/soft-deleted; the
 //!   orphan membership rows stay in D1 (membership is hard-deleted only by
@@ -54,7 +57,17 @@
 //!   **with** stored ids the open event's end is PATCHed closed (snapped to
 //!   now, `start + 60s` when now <= start — the same invert guard as task
 //!   exits) before the status flip; a Google 404 still flips. Without ids
-//!   (or with `http`/`access` `None`) the flip is session-only.
+//!   (or with `http`/`access` `None`) the flip is session-only. The
+//!   `complete` ↔ `skip` flips stay; the **dedicated un-do path is `reopen`**
+//!   (below) — there is no other way back from `done`/`skipped`.
+//! - `reopen` is the dedicated un-do verb: `done`/`skipped` return to
+//!   `pending` with the stored chip ids **cleared** (`clear_event_ids` —
+//!   literal NULLs). A start afterwards mints a **NEW** one-shot event — one
+//!   *living* chip; the closed Google event stays as an orphaned log, never
+//!   PATCHed or deleted. `pending` → 200 no-op (ids are never cleared),
+//!   `in_progress` → 400 (`cannot reopen an in_progress occurrence` — no
+//!   abort; a running occurrence exits only via complete/skip). Session-only,
+//!   never a Google write.
 //! - `/start` is **agenda-today-only** (this occurrence has an agenda item
 //!   whose `local_date` is the user's ONE civil today — the primary Google
 //!   calendar's IANA `time_zone` via chrono-tz, never a hardcoded zone; NOT
@@ -76,7 +89,7 @@
 //!   (`override ?? routine.title`) with the same matcher as tasks; a read
 //!   never 400s on classification (untracked summary when nothing matches).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -295,7 +308,12 @@ async fn user_today(
 /// a reschedule moves the item to another day, so a GET on the rule date must
 /// not re-attach it; the item lands **after** already-present items (standing
 /// `routines.sort_order` relative to each other), never reshuffling a list the
-/// user reordered. Tasks never auto-land.
+/// user reordered. Tasks never auto-land. The seed is batched: one
+/// `list_by_user_and_date` (occurrences) to find what is missing, one
+/// `insert_many` of the missing occurrences, one `list_by_refs` for the
+/// no-membership-anywhere check, and one `insert_many` of the new agenda rows
+/// — a warm GET (everything already present) performs zero writes and zero
+/// per-routine reads.
 ///
 /// `focused_task_id` is the caller's pointer into this user's focus lock —
 /// it only paints the embedded tasks' `focused` flag (reads never write the
@@ -322,59 +340,162 @@ pub async fn get_agenda(
 
     // Living routines in standing order — the seed order.
     let routines = routine_repo.list_by_user_id(user_id).await?;
-    for routine in &routines {
-        // A stored rule that no longer parses (hand-edited row) degrades to
-        // "no seed" — a read never 400s on stored-data decay.
-        let covers = occurrence_dates(&routine.rrule, &date, &date)
-            .map(|dates| dates.contains(&date))
-            .unwrap_or(false);
-        if !covers {
-            continue;
-        }
-        // Ensure the occurrence (idempotent: INSERT OR IGNORE + re-read).
-        let occurrence = occurrence_repo
-            .insert(NewRoutineOccurrence {
+
+    // Covering routines (standing order). A stored rule that no longer parses
+    // (hand-edited row) degrades to "no seed" — a read never 400s on
+    // stored-data decay. Zero covering routines (a tasks-only day) skips the
+    // whole occurrence seed path.
+    let covering: Vec<Routine> = routines
+        .iter()
+        .filter(|routine| {
+            occurrence_dates(&routine.rrule, &date, &date)
+                .map(|dates| dates.contains(&date))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    if !covering.is_empty() {
+        // One set read tells us which occurrences already exist for the date.
+        let mut seeded = occurrence_repo.list_by_user_and_date(user_id, &date).await?;
+        let existing_routines: HashSet<&str> =
+            seeded.iter().map(|occ| occ.routine_id.as_str()).collect();
+
+        // Insert only the covering routines with no occurrence on this date.
+        let missing: Vec<NewRoutineOccurrence> = covering
+            .iter()
+            .filter(|routine| !existing_routines.contains(routine.id.as_str()))
+            .map(|routine| NewRoutineOccurrence {
                 routine_id: routine.id.clone(),
                 user_id: user_id.to_string(),
                 local_date: date.clone(),
             })
+            .collect();
+        if !missing.is_empty() {
+            occurrence_repo.insert_many(missing).await?;
+            // INSERT OR IGNORE can drop a generated UUID on a concurrent
+            // duplicate — re-list so we seed membership from the surviving ids.
+            seeded = occurrence_repo.list_by_user_and_date(user_id, &date).await?;
+        }
+        let seeded_by_routine: HashMap<&str, &RoutineOccurrence> =
+            seeded.iter().map(|occ| (occ.routine_id.as_str(), occ)).collect();
+        let seeded_by_id: HashMap<&str, &RoutineOccurrence> =
+            seeded.iter().map(|occ| (occ.id.as_str(), occ)).collect();
+
+        // The covering routines' occurrence ids, in standing order.
+        let occurrence_ids: Vec<String> = covering
+            .iter()
+            .filter_map(|routine| {
+                seeded_by_routine
+                    .get(routine.id.as_str())
+                    .map(|occ| occ.id.clone())
+            })
+            .collect();
+
+        // Append a membership row only for occurrences with NO item on ANY
+        // date — a rescheduled occurrence keeps its moved row, so the rule
+        // date never re-attaches it (and a list the user reordered keeps its
+        // ranks). `list_by_refs` returns every matching row (not LIMIT 1).
+        let memberships = agenda_repo
+            .list_by_refs(user_id, AGENDA_KIND_OCCURRENCE, &occurrence_ids)
             .await?;
-        // Append the membership row only when this occurrence has NO item on
-        // ANY date — a rescheduled occurrence keeps its moved row, so the
-        // rule date never re-attaches it (and a list the user reordered keeps
-        // its ranks).
-        if agenda_repo
-            .get_by_ref(user_id, AGENDA_KIND_OCCURRENCE, &occurrence.id)
-            .await?
-            .is_none()
-        {
-            let rank = agenda_repo
+        let membership_refs: HashSet<&str> =
+            memberships.iter().map(|item| item.ref_id.as_str()).collect();
+        let to_append: Vec<&RoutineOccurrence> = occurrence_ids
+            .iter()
+            .filter(|id| !membership_refs.contains(id.as_str()))
+            .filter_map(|id| seeded_by_id.get(id.as_str()).copied())
+            .collect();
+        if !to_append.is_empty() {
+            let base = agenda_repo
                 .max_sort_order(user_id, &date)
                 .await?
                 .map(|max| max + 1)
                 .unwrap_or(0);
-            agenda_repo
-                .insert(NewAgendaItem {
+            let rows: Vec<NewAgendaItem> = to_append
+                .iter()
+                .enumerate()
+                .map(|(index, occ)| NewAgendaItem {
                     user_id: user_id.to_string(),
                     local_date: date.clone(),
                     kind: AGENDA_KIND_OCCURRENCE.to_string(),
-                    ref_id: occurrence.id.clone(),
-                    sort_order: rank,
+                    ref_id: occ.id.clone(),
+                    sort_order: base + index as i64,
                 })
-                .await?;
+                .collect();
+            agenda_repo.insert_many(rows).await?;
         }
     }
 
     // The response: pile order, omitting orphaned embeds (missing/soft-deleted
-    // task or routine) while their membership rows stay in D1.
+    // task or routine) while their membership rows stay in D1. Hydration is
+    // batched — no per-row `get_by_id`: the pile's occurrence `ref_id`s resolve
+    // in one `list_by_ids` (a row rescheduled onto this date still resolves,
+    // because it matches by ref_id, never by `local_date`), tasks come from the
+    // user's living list, and routines from the living list already loaded.
     let items = agenda_repo.list_by_user_and_date(user_id, &date).await?;
     let mut views = Vec::with_capacity(items.len());
-    for item in &items {
-        if let Some(view) =
-            embed_item(task_repo, occurrence_repo, routine_repo, item, &taxonomy, focused_task_id)
-                .await?
-        {
-            views.push(view);
+    if !items.is_empty() {
+        let user_tasks = task_repo.list_by_user_id(user_id).await?;
+        let tasks: HashMap<&str, &Task> =
+            user_tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+
+        let occurrence_ids: Vec<String> = items
+            .iter()
+            .filter(|item| item.kind == AGENDA_KIND_OCCURRENCE)
+            .map(|item| item.ref_id.clone())
+            .collect();
+        let fetched_occurrences: Vec<RoutineOccurrence> = if occurrence_ids.is_empty() {
+            Vec::new()
+        } else {
+            occurrence_repo.list_by_ids(&occurrence_ids).await?
+        };
+        let occurrences: HashMap<&str, &RoutineOccurrence> = fetched_occurrences
+            .iter()
+            .map(|occ| (occ.id.as_str(), occ))
+            .collect();
+        let routines_by_id: HashMap<&str, &Routine> =
+            routines.iter().map(|routine| (routine.id.as_str(), routine)).collect();
+
+        for item in &items {
+            let (task, occurrence) = match item.kind.as_str() {
+                AGENDA_KIND_TASK => {
+                    // `list_by_user_id` filters soft-deleted tasks — a
+                    // deleted/missing task omits the whole item (orphan
+                    // membership rows stay in D1).
+                    let Some(task) = tasks.get(item.ref_id.as_str()) else {
+                        continue;
+                    };
+                    (Some(task_view(task, &taxonomy, focused_task_id)), None)
+                }
+                AGENDA_KIND_OCCURRENCE => {
+                    let Some(occ) = occurrences.get(item.ref_id.as_str()) else {
+                        continue;
+                    };
+                    // Never leak another user's occurrence through a
+                    // hand-edited row.
+                    if occ.user_id != item.user_id {
+                        continue;
+                    }
+                    // `list_by_user_id` filters soft-deleted routines — a
+                    // soft-deleted routine omits its leftover agenda item.
+                    let Some(routine) = routines_by_id.get(occ.routine_id.as_str()) else {
+                        continue;
+                    };
+                    (None, Some(occurrence_view(occ, routine, &taxonomy)))
+                }
+                _ => continue,
+            };
+            views.push(AgendaItemView {
+                id: item.id.clone(),
+                user_id: item.user_id.clone(),
+                local_date: item.local_date.clone(),
+                kind: item.kind.clone(),
+                ref_id: item.ref_id.clone(),
+                sort_order: item.sort_order,
+                task,
+                occurrence,
+            });
         }
     }
     Ok(AgendaResponse {
@@ -886,7 +1007,9 @@ pub async fn patch_occurrence(
 /// `sanctuary_routine_id`/`sanctuary_occurrence_id`, never a task_id, never
 /// an RRULE, `T … T + START_EVENT_MINUTES` on the minute grid), stores
 /// `calendar_id` + `google_event_id` on the occurrence, and flips it to
-/// `in_progress`. One Google event per occurrence, ever.
+/// `in_progress`. One **living** chip per occurrence: reopen clears the
+/// stored ids, so a later start mints a new event (the closed one stays as an
+/// orphaned log).
 ///
 /// Verb matrix (locked): `pending` → start; `in_progress` → **200 no-op**
 /// (no second event); `done`/`skipped` → 400. Start is valid only when this
@@ -1014,8 +1137,9 @@ pub async fn start_occurrence(
 ///
 /// Verb matrix (locked): `pending` → `done`, `in_progress` → `done` (the open
 /// chip's end is PATCHed closed first when ids are stored and Google is
-/// available), `done` → 200 no-op, `skipped` → `done`. Missing / other-user /
-/// soft-deleted-routine → 404.
+/// available), `done` → 200 no-op, `skipped` → `done`. The dedicated un-do
+/// verb is `reopen_occurrence` (`done`/`skipped` → `pending`, ids cleared).
+/// Missing / other-user / soft-deleted-routine → 404.
 pub async fn complete_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
@@ -1040,8 +1164,10 @@ pub async fn complete_occurrence(
 ///
 /// Verb matrix (locked): `pending` → `skipped`, `in_progress` → `skipped`
 /// (the open chip's end is PATCHed closed first when ids are stored and
-/// Google is available), `done` → `skipped`, `skipped` → 200 no-op. Missing /
-/// other-user / soft-deleted-routine → 404.
+/// Google is available), `done` → `skipped`, `skipped` → 200 no-op. The
+/// dedicated unskip path is `reopen_occurrence` (`skipped`/`done` →
+/// `pending`, ids cleared). Missing / other-user / soft-deleted-routine →
+/// 404.
 pub async fn skip_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
@@ -1060,6 +1186,52 @@ pub async fn skip_occurrence(
         occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_SKIPPED,
     )
     .await
+}
+
+/// `POST /api/occurrences/:id/reopen` → 200 `{"occurrence":…}`.
+///
+/// The dedicated un-do verb (ADR 0004 amendment): `done`/`skipped` return to
+/// `pending` with the stored chip ids **cleared** — a later start mints a NEW
+/// one-shot event; the closed Google event stays as an orphaned log, never
+/// PATCHed or deleted. `pending` → **200 no-op** (ids are never cleared —
+/// they are only written by a fresh start). `in_progress` → 400 (no abort: a
+/// running occurrence exits only via complete/skip). Session-only — never a
+/// Google write of any kind. Missing / other-user / soft-deleted-routine →
+/// 404.
+pub async fn reopen_occurrence(
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    routine_repo: &dyn RoutineRepo,
+    occurrence_repo: &dyn OccurrenceRepo,
+    user_id: &str,
+    id: &str,
+) -> Result<OccurrenceResponse, AgendaError> {
+    let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
+    match occurrence.status.as_str() {
+        // 200 no-op: nothing to un-do, and ids are NEVER cleared here — a
+        // pending occurrence that somehow carries a chip keeps it.
+        OCCURRENCE_STATUS_PENDING => {
+            occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id)
+                .await
+        }
+        // No abort: a running occurrence exits only via complete/skip.
+        OCCURRENCE_STATUS_IN_PROGRESS => Err(AgendaError::Invalid(
+            "cannot reopen an in_progress occurrence".to_string(),
+        )),
+        // The un-do path: chip ids first (the old closed event becomes an
+        // orphaned log), then the flip back to pending.
+        OCCURRENCE_STATUS_DONE | OCCURRENCE_STATUS_SKIPPED => {
+            occurrence_repo.clear_event_ids(id).await?;
+            occurrence_repo
+                .set_status(id, OCCURRENCE_STATUS_PENDING)
+                .await?;
+            occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id)
+                .await
+        }
+        other => Err(AgendaError::Invalid(format!(
+            "cannot reopen a {other} occurrence"
+        ))),
+    }
 }
 
 /// The shared complete/skip machinery: close the running chip when leaving
@@ -1699,7 +1871,7 @@ fn split_affixes(title: &str, matcher: &CategoryWithPatterns) -> (String, String
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     use super::*;
@@ -1713,6 +1885,21 @@ mod tests {
     // ──────────────────────────────────────────
     // Fakes
     // ──────────────────────────────────────────
+
+    /// Cheap call counters on the occurrence/agenda fakes — the warm-GET test
+    /// snapshots these to prove a second read of an already-seeded date makes
+    /// zero per-row calls (`insert`/`insert_many`/`get_by_ref`/`get_by_id`)
+    /// and uses only the batched set reads.
+    #[derive(Debug, Clone, Default)]
+    struct CallCounters {
+        insert: u64,
+        insert_many: u64,
+        get_by_id: u64,
+        get_by_ref: u64,
+        list_by_refs: u64,
+        list_by_ids: u64,
+        list_by_user_and_date: u64,
+    }
 
     /// In-memory `TaskListRepo` for the taxonomy seed path (same as the
     /// routines tests).
@@ -2104,6 +2291,7 @@ mod tests {
     struct FakeOccurrenceRepo {
         stored: Mutex<Vec<RoutineOccurrence>>,
         next_id: Mutex<u64>,
+        calls: Mutex<CallCounters>,
     }
 
     impl FakeOccurrenceRepo {
@@ -2111,7 +2299,16 @@ mod tests {
             Self {
                 stored: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                calls: Mutex::new(CallCounters::default()),
             }
+        }
+
+        fn call_counts(&self) -> CallCounters {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn reset_calls(&self) {
+            *self.calls.lock().unwrap() = CallCounters::default();
         }
 
         fn row(id: &str, routine_id: &str, user_id: &str, date: &str, status: &str) -> RoutineOccurrence {
@@ -2133,6 +2330,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl OccurrenceRepo for FakeOccurrenceRepo {
         async fn get_by_id(&self, id: &str) -> Result<Option<RoutineOccurrence>, RepoError> {
+            self.calls.lock().unwrap().get_by_id += 1;
             Ok(self
                 .stored
                 .lock()
@@ -2161,6 +2359,7 @@ mod tests {
             user_id: &str,
             local_date: &str,
         ) -> Result<Vec<RoutineOccurrence>, RepoError> {
+            self.calls.lock().unwrap().list_by_user_and_date += 1;
             let mut rows: Vec<RoutineOccurrence> = self
                 .stored
                 .lock()
@@ -2173,7 +2372,24 @@ mod tests {
             Ok(rows)
         }
 
+        async fn list_by_ids(&self, ids: &[String]) -> Result<Vec<RoutineOccurrence>, RepoError> {
+            self.calls.lock().unwrap().list_by_ids += 1;
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let id_set: HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| id_set.contains(row.id.as_str()))
+                .cloned()
+                .collect())
+        }
+
         async fn insert(&self, occurrence: NewRoutineOccurrence) -> Result<RoutineOccurrence, RepoError> {
+            self.calls.lock().unwrap().insert += 1;
             let mut stored = self.stored.lock().unwrap();
             // INSERT OR IGNORE semantics: the UNIQUE (routine_id, local_date)
             // slot already holds a row → return it unchanged.
@@ -2201,6 +2417,17 @@ mod tests {
             Ok(row)
         }
 
+        async fn insert_many(
+            &self,
+            rows: Vec<NewRoutineOccurrence>,
+        ) -> Result<(), RepoError> {
+            self.calls.lock().unwrap().insert_many += 1;
+            for row in rows {
+                self.insert(row).await?;
+            }
+            Ok(())
+        }
+
         async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError> {
             if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
                 row.title = title.map(|t| t.to_string());
@@ -2218,6 +2445,15 @@ mod tests {
             if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
                 row.calendar_id = Some(calendar_id.to_string());
                 row.google_event_id = Some(google_event_id.to_string());
+                row.updated_at = "2026-08-23T02:00:00Z".to_string();
+            }
+            Ok(())
+        }
+
+        async fn clear_event_ids(&self, id: &str) -> Result<(), RepoError> {
+            if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
+                row.calendar_id = None;
+                row.google_event_id = None;
                 row.updated_at = "2026-08-23T02:00:00Z".to_string();
             }
             Ok(())
@@ -2253,6 +2489,7 @@ mod tests {
     struct FakeAgendaItemRepo {
         stored: Mutex<Vec<AgendaItem>>,
         next_id: Mutex<u64>,
+        calls: Mutex<CallCounters>,
     }
 
     impl FakeAgendaItemRepo {
@@ -2260,7 +2497,16 @@ mod tests {
             Self {
                 stored: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                calls: Mutex::new(CallCounters::default()),
             }
+        }
+
+        fn call_counts(&self) -> CallCounters {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn reset_calls(&self) {
+            *self.calls.lock().unwrap() = CallCounters::default();
         }
     }
 
@@ -2271,6 +2517,7 @@ mod tests {
             user_id: &str,
             local_date: &str,
         ) -> Result<Vec<AgendaItem>, RepoError> {
+            self.calls.lock().unwrap().list_by_user_and_date += 1;
             let mut rows: Vec<AgendaItem> = self
                 .stored
                 .lock()
@@ -2284,6 +2531,7 @@ mod tests {
         }
 
         async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError> {
+            self.calls.lock().unwrap().get_by_id += 1;
             Ok(self
                 .stored
                 .lock()
@@ -2320,6 +2568,7 @@ mod tests {
             kind: &str,
             ref_id: &str,
         ) -> Result<Option<AgendaItem>, RepoError> {
+            self.calls.lock().unwrap().get_by_ref += 1;
             Ok(self
                 .stored
                 .lock()
@@ -2331,7 +2580,31 @@ mod tests {
                 .cloned())
         }
 
+        async fn list_by_refs(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_ids: &[String],
+        ) -> Result<Vec<AgendaItem>, RepoError> {
+            self.calls.lock().unwrap().list_by_refs += 1;
+            if ref_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let ref_set: HashSet<&str> = ref_ids.iter().map(|id| id.as_str()).collect();
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.user_id == user_id && row.kind == kind && ref_set.contains(row.ref_id.as_str())
+                })
+                .cloned()
+                .collect())
+        }
+
         async fn insert(&self, item: NewAgendaItem) -> Result<AgendaItem, RepoError> {
+            self.calls.lock().unwrap().insert += 1;
             let mut stored = self.stored.lock().unwrap();
             // INSERT OR IGNORE semantics: the UNIQUE key already holds a row →
             // return it unchanged (an add never reshuffles an existing item).
@@ -2357,6 +2630,14 @@ mod tests {
             *next += 1;
             stored.push(row.clone());
             Ok(row)
+        }
+
+        async fn insert_many(&self, rows: Vec<NewAgendaItem>) -> Result<(), RepoError> {
+            self.calls.lock().unwrap().insert_many += 1;
+            for row in rows {
+                self.insert(row).await?;
+            }
+            Ok(())
         }
 
         async fn hard_delete(&self, id: &str) -> Result<(), RepoError> {
@@ -3072,6 +3353,17 @@ mod tests {
         ))
     }
 
+    fn reopen(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
+        pollster::block_on(reopen_occurrence(
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            user_id,
+            id,
+        ))
+    }
+
     fn patch(
         repos: &Repos,
         user_id: &str,
@@ -3398,6 +3690,42 @@ mod tests {
         );
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 1, "no dupes");
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "no dupes");
+    }
+
+    #[test]
+    fn second_get_of_seeded_date_is_write_free_and_uses_only_set_reads() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().extend([
+            FakeRoutineRepo::row("rt-a", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-b", "u-1", "Salat", 1, "DTSTART:20260101T120000\nRRULE:FREQ=DAILY"),
+        ]);
+
+        // Cold GET seeds both routines (occurrence + agenda rows).
+        let first = get(&repos, "u-1", "2026-08-23").unwrap();
+        assert_eq!(first.items.len(), 2);
+
+        // Reset the counters; the warm GET must not write or re-read per row.
+        repos.occurrences.reset_calls();
+        repos.agenda.reset_calls();
+        let second = get(&repos, "u-1", "2026-08-23").unwrap();
+        assert_eq!(second.items.len(), 2);
+
+        let occurrences = repos.occurrences.call_counts();
+        assert_eq!(occurrences.insert, 0, "no per-row occurrence insert on a warm GET");
+        assert_eq!(occurrences.insert_many, 0, "no occurrence insert_many on a warm GET");
+        assert_eq!(occurrences.get_by_id, 0, "no per-row occurrence get_by_id on a warm GET");
+        assert_eq!(
+            occurrences.list_by_user_and_date, 1,
+            "one occurrence set read finds nothing missing"
+        );
+        assert_eq!(occurrences.list_by_ids, 1, "hydrate resolves all refs in one batch");
+
+        let agenda = repos.agenda.call_counts();
+        assert_eq!(agenda.insert, 0, "no per-row agenda insert on a warm GET");
+        assert_eq!(agenda.insert_many, 0, "no agenda insert_many on a warm GET");
+        assert_eq!(agenda.get_by_ref, 0, "no per-row get_by_ref on a warm GET");
+        assert_eq!(agenda.list_by_user_and_date, 1, "one pile read");
+        assert_eq!(agenda.list_by_refs, 1, "no-membership check is one set read");
     }
 
     #[test]
@@ -4220,6 +4548,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reopen_matrix_all_four_states() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+
+        // `pending` → 200 no-op: row untouched, ids kept even if set.
+        let mut pending = FakeOccurrenceRepo::row("occ-pending", "rt-1", "u-1", "2026-08-23", "pending");
+        pending.calendar_id = Some("cal-1".to_string());
+        pending.google_event_id = Some("g-1".to_string());
+        repos.occurrences.stored.lock().unwrap().push(pending);
+        let response = reopen(&repos, "u-1", "occ-pending").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-pending")).unwrap().unwrap();
+        assert_eq!(stored.updated_at, "2026-08-23T01:00:00Z", "pending reopen is a no-op");
+        assert_eq!(stored.calendar_id.as_deref(), Some("cal-1"), "ids untouched on a no-op");
+        assert_eq!(stored.google_event_id.as_deref(), Some("g-1"), "ids untouched on a no-op");
+
+        // `in_progress` → 400 with the exact locked message (no abort).
+        repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+            "occ-in_progress", "rt-1", "u-1", "2026-08-23", "in_progress",
+        ));
+        let err = reopen(&repos, "u-1", "occ-in_progress").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "cannot reopen an in_progress occurrence"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-in_progress")).unwrap().unwrap();
+        assert_eq!(stored.status, "in_progress", "reject wrote nothing");
+
+        // `done` → `pending`.
+        repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+            "occ-done", "rt-1", "u-1", "2026-08-23", "done",
+        ));
+        let response = reopen(&repos, "u-1", "occ-done").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-done")).unwrap().unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_PENDING);
+        assert_eq!(stored.calendar_id, None);
+        assert_eq!(stored.google_event_id, None);
+        assert_eq!(stored.updated_at, "2026-08-23T02:00:00Z");
+
+        // `skipped` → `pending`.
+        repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+            "occ-skipped", "rt-1", "u-1", "2026-08-23", "skipped",
+        ));
+        let response = reopen(&repos, "u-1", "occ-skipped").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-skipped")).unwrap().unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_PENDING);
+        assert_eq!(stored.calendar_id, None);
+        assert_eq!(stored.google_event_id, None);
+        assert_eq!(stored.updated_at, "2026-08-23T02:00:00Z");
+    }
+
+    #[test]
+    fn reopen_done_with_stored_ids_clears_the_chip() {
+        // The chip-clear contract: a done occurrence that carried a one-shot
+        // log comes back to pending with BOTH ids None, so a later start
+        // mints a NEW Google event (the closed one stays as an orphaned log).
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        let mut done = FakeOccurrenceRepo::row("occ-1", "rt-1", "u-1", "2026-08-23", "done");
+        done.calendar_id = Some("cal-1".to_string());
+        done.google_event_id = Some("g-1".to_string());
+        repos.occurrences.stored.lock().unwrap().push(done);
+
+        let response = reopen(&repos, "u-1", "occ-1").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1")).unwrap().unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_PENDING);
+        assert_eq!(stored.calendar_id, None, "chip cleared on reopen");
+        assert_eq!(stored.google_event_id, None, "chip cleared on reopen");
+        assert_eq!(stored.updated_at, "2026-08-23T02:00:00Z");
+    }
+
     // ──────────────────────────────────────────
     // PATCH /api/occurrences/:id — title override
     // ──────────────────────────────────────────
@@ -4316,6 +4719,7 @@ mod tests {
 
         assert!(matches!(complete(&repos, "u-1", "occ-1").unwrap_err(), AgendaError::NotFound));
         assert!(matches!(skip(&repos, "u-1", "occ-1").unwrap_err(), AgendaError::NotFound));
+        assert!(matches!(reopen(&repos, "u-1", "occ-1").unwrap_err(), AgendaError::NotFound));
         assert!(matches!(
             patch(
                 &repos,
@@ -4349,6 +4753,7 @@ mod tests {
 
         assert!(matches!(complete(&repos, "u-1", "occ-1").unwrap_err(), AgendaError::NotFound));
         assert!(matches!(skip(&repos, "u-1", "occ-1").unwrap_err(), AgendaError::NotFound));
+        assert!(matches!(reopen(&repos, "u-1", "occ-1").unwrap_err(), AgendaError::NotFound));
         assert!(matches!(
             patch(
                 &repos,
