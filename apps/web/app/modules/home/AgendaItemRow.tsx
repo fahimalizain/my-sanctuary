@@ -34,7 +34,11 @@ import { TASK_PRIORITY_LABELS } from '../../types';
 import { cn } from '@/lib/utils';
 import { canReschedule } from './agenda-helpers';
 import { addCivilDays } from '../routines/rrule-preview';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
 
 interface AgendaItemRowProps {
   item: AgendaItemRecord;

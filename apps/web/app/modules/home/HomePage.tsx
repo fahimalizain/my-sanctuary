@@ -226,9 +226,7 @@ export function HomePage() {
     setActiveDrag(null);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    const toIndex = itemsRef.current.findIndex(
-      (entry) => entry.id === over.id,
-    );
+    const toIndex = itemsRef.current.findIndex((entry) => entry.id === over.id);
     void handleMoveTo(String(active.id), toIndex);
   };
 
@@ -878,7 +876,7 @@ export function HomePage() {
                         {activeDrag.kind === 'occurrence' &&
                         activeDrag.occurrence
                           ? activeDrag.occurrence.resolved_title
-                          : activeDrag.task?.display_title ?? ''}
+                          : (activeDrag.task?.display_title ?? '')}
                       </span>
                     </div>
                   )}
