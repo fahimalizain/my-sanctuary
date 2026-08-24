@@ -106,6 +106,33 @@ export function agendaMoveTarget(
     : items[neighborIdx].sort_order + 1;
 }
 
+/** The absolute rank `POST /api/agenda/items/:id/move { sort_order }` should
+ *  carry to land the item at `fromIndex` on the slot now held by `toIndex`
+ *  (the dnd-kit drop). Same server contract as `agendaMoveTarget`:
+ *  - dropped above (`toIndex < fromIndex`): the item takes the target row's
+ *    rank (that row shifts up);
+ *  - dropped below (`toIndex > fromIndex`): the item lands just AFTER the
+ *    target row (`items[toIndex].sort_order + 1`).
+ *  Returns `null` when either index is out of range or they are equal. */
+export function agendaMoveTargetAt(
+  items: AgendaItemRecord[],
+  fromIndex: number,
+  toIndex: number,
+): number | null {
+  if (
+    fromIndex < 0 ||
+    toIndex < 0 ||
+    fromIndex >= items.length ||
+    toIndex >= items.length ||
+    fromIndex === toIndex
+  ) {
+    return null;
+  }
+  return toIndex < fromIndex
+    ? items[toIndex].sort_order
+    : items[toIndex].sort_order + 1;
+}
+
 /** Optimistic mirror of the server's `shift_sort_order` + `set_sort_order`:
  *  the moved item lands on `target`, every other peer at/after `target`
  *  shifts up one. Returns a new array sorted by rank — identical ranks to
