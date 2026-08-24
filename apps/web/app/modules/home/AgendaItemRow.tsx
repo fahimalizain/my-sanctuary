@@ -8,6 +8,7 @@
 
 import { useState } from 'react';
 import {
+  Calendar,
   CalendarClock,
   CalendarX2,
   Check,
@@ -26,6 +27,7 @@ import { TASK_PRIORITY_LABELS } from '../../types';
 import { cn } from '@/lib/utils';
 import { canReschedule } from './agenda-helpers';
 import { addCivilDays } from '../routines/rrule-preview';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 
 interface AgendaItemRowProps {
   item: AgendaItemRecord;
@@ -115,12 +117,16 @@ function MoveButtons({
   );
 }
 
-/** Move-to-another-day control (ADR 0004 amendment — reschedule): a primary
- *  "Tomorrow" action plus a compact native date picker for any other day.
- *  Both fire immediately — no confirm — so the row's optimistic drop in
- *  HomePage is instant; failures revert + banner. "Tomorrow" is the ROW's
- *  own date +1 civil day (moving from a future day still means "the next
- *  day"), never the browser's today. */
+/** Move-to-another-day control (ADR 0004 amendment — reschedule): a
+ *  calendar icon opens a small popover with a primary "Tomorrow" action
+ *  plus a compact native date picker for any other day. Both fire
+ *  immediately — no confirm — so the row's optimistic drop in HomePage is
+ *  instant; failures revert + banner. "Tomorrow" is the ROW's own date +1
+ *  civil day (moving from a future day still means "the next day"), never
+ *  the browser's today. The popover closes and the picker resets after
+ *  either action so it never reads as a filter. Skip stays its own control
+ *  (ADR 0004 amendment — the calendar popover is Tomorrow + pick-a-day
+ *  only). */
 function RescheduleControl({
   item,
   label,
@@ -130,37 +136,51 @@ function RescheduleControl({
   label: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
 }) {
+  const [open, setOpen] = useState(false);
   const [pickDate, setPickDate] = useState('');
   const tomorrow = addCivilDays(item.local_date, 1);
   return (
-    <span className="flex items-center gap-1 flex-shrink-0">
-      <button
-        type="button"
-        onClick={() => onReschedule(item, tomorrow)}
-        aria-label={`Move ${label} to tomorrow`}
-        title="Move to tomorrow"
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors flex-shrink-0"
-      >
-        <CalendarClock className="h-3.5 w-3.5" />
-        Tomorrow
-      </button>
-      <input
-        type="date"
-        value={pickDate}
-        onChange={(e) => {
-          const next = e.target.value;
-          // No confirm: picking a day reschedules immediately, then the
-          // control resets so it never reads as a filter.
-          if (next) {
-            setPickDate('');
-            onReschedule(item, next);
-          }
-        }}
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
         aria-label={`Move ${label} to another day`}
-        title="Move to another day"
-        className="w-32 rounded-md border border-input bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all flex-shrink-0"
-      />
-    </span>
+        title={`Move ${label} to another day`}
+        className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
+      >
+        <Calendar className="h-3.5 w-3.5 text-muted-foreground" />
+      </PopoverTrigger>
+      <PopoverContent className="w-48 flex flex-col gap-1">
+        <button
+          type="button"
+          onClick={() => {
+            setOpen(false);
+            onReschedule(item, tomorrow);
+          }}
+          aria-label={`Move ${label} to tomorrow`}
+          title="Move to tomorrow"
+          className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+        >
+          <CalendarClock className="h-3.5 w-3.5" />
+          Tomorrow
+        </button>
+        <input
+          type="date"
+          value={pickDate}
+          onChange={(e) => {
+            const next = e.target.value;
+            // No confirm: picking a day reschedules immediately, then the
+            // control resets so it never reads as a filter.
+            if (next) {
+              setPickDate('');
+              setOpen(false);
+              onReschedule(item, next);
+            }
+          }}
+          aria-label={`Move ${label} to another day`}
+          title="Move to another day"
+          className="w-full rounded-md border border-input bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+        />
+      </PopoverContent>
+    </Popover>
   );
 }
 
