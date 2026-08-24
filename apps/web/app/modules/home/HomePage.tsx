@@ -32,6 +32,7 @@ import {
 import { queryKeys } from '@/app/queries/keys';
 import {
   useCompleteOccurrence,
+  useReopenOccurrence,
   useSkipOccurrence,
   useStartOccurrence,
   useUpdateOccurrence,
@@ -137,6 +138,7 @@ export function HomePage() {
   const deleteAgendaItemMutation = useDeleteAgendaItem();
   const completeOccurrenceMutation = useCompleteOccurrence();
   const skipOccurrenceMutation = useSkipOccurrence();
+  const reopenOccurrenceMutation = useReopenOccurrence();
   const startOccurrenceMutation = useStartOccurrence();
   const updateOccurrenceMutation = useUpdateOccurrence();
   // Task writes reuse the shared task mutations from `queries/tasks.ts`;
@@ -221,12 +223,47 @@ export function HomePage() {
   // Check-off / skip (optimistic, per the verb contracts)
   // ──────────────────────────────────────────
 
-  /** Task → the existing `/complete` (Board → Done). The agenda row stays as
+  /** Task → the existing `/complete` (Board → Done) or, for a checked-off
+   *  row, back to PLANNED via the existing Board move (ADR 0004 amendment —
+   *  uncheck is the Board reopen, no new endpoint). The agenda row stays as
    *  a crossed-off row for the rest of that date (ADR 0004 § Crossing off). */
   const handleCompleteTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
     const snapshot = itemsRef.current;
+    // Uncheck: COMPLETED → PLANNED (living again — Play/Reschedule return
+    // because the row is no longer a finished card).
+    if (task.status === 'COMPLETED') {
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: { ...entry.task, status: 'PLANNED' } }
+            : entry,
+        ),
+      );
+      setActionError(null);
+      try {
+        const data = await moveTaskMutation.mutateAsync({
+          id: task.id,
+          input: { status: 'PLANNED' } satisfies MoveTaskInput,
+        });
+        setItems((prev) =>
+          prev.map((entry) =>
+            entry.id === item.id && entry.task
+              ? { ...entry, task: data.task }
+              : entry,
+          ),
+        );
+        // Patch the shared tasks cache so Board/Lists see the fresh row.
+        setTasksCache((prev) =>
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+        );
+      } catch (err) {
+        setItems(snapshot);
+        setActionError(err instanceof Error ? err.message : 'Uncheck failed');
+      }
+      return;
+    }
     setItems((prev) =>
       prev.map((entry) =>
         entry.id === item.id && entry.task
@@ -331,6 +368,52 @@ export function HomePage() {
               id: occurrence.id,
               date: dateRef.current,
             });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
+      );
+    } catch (err) {
+      setItems(snapshot);
+      setActionError(err instanceof Error ? err.message : 'Update failed');
+    }
+  };
+
+  /** Occurrence reopen — the uncheck/unskip path (ADR 0004 amendment):
+   *  done/skipped → pending with the chip ids cleared (`calendar_id` +
+   *  `google_event_id` → null, matching the server's reopen). Same
+   *  optimistic shape as setOccurrenceStatus: paint pending immediately,
+   *  merge the authoritative occurrence on success, snapshot-rollback +
+   *  banner on failure. Play returns when showStartOccurrence is on and the
+   *  status is pending; Calendar/RescheduleControl return via the existing
+   *  canReschedule. */
+  const handleReopenOccurrence = async (item: AgendaItemRecord) => {
+    const occurrence = item.occurrence;
+    if (!occurrence) return;
+    const snapshot = itemsRef.current;
+    setItems((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id && entry.occurrence
+          ? {
+              ...entry,
+              occurrence: {
+                ...entry.occurrence,
+                status: 'pending',
+                calendar_id: null,
+                google_event_id: null,
+              },
+            }
+          : entry,
+      ),
+    );
+    setActionError(null);
+    try {
+      const data = await reopenOccurrenceMutation.mutateAsync({
+        id: occurrence.id,
+        date: dateRef.current,
+      });
       setItems((prev) =>
         prev.map((entry) =>
           entry.id === item.id && entry.occurrence
@@ -698,10 +781,14 @@ export function HomePage() {
                     onRemoveTask={(entry) => void handleRemoveTask(entry)}
                     onOpenTask={(task) => setTaskModal(task)}
                     onCompleteOccurrence={(entry) =>
-                      void setOccurrenceStatus(entry, 'done', 'complete')
+                      entry.occurrence?.status === 'done'
+                        ? void handleReopenOccurrence(entry)
+                        : void setOccurrenceStatus(entry, 'done', 'complete')
                     }
                     onSkipOccurrence={(entry) =>
-                      void setOccurrenceStatus(entry, 'skipped', 'skip')
+                      entry.occurrence?.status === 'skipped'
+                        ? void handleReopenOccurrence(entry)
+                        : void setOccurrenceStatus(entry, 'skipped', 'skip')
                     }
                     onStartOccurrence={(entry) =>
                       void handleStartOccurrence(entry)

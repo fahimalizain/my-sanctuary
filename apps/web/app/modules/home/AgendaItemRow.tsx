@@ -1,8 +1,10 @@
 // One agenda row for Home (ADR 0004 § Surfaces — Home): the occurrence
-// variant (checkbox → complete, status chip, skip, rename, move-to-another-
-// day) and the task variant (checkbox → complete, start, remove-from-day,
+// variant (checkbox toggles done ↔ pending, status chip, skip toggles
+// skipped ↔ pending hidden while done, rename, move-to-another-day) and the
+// task variant (checkbox toggles completed ↔ planned, start, remove-from-day,
 // move-to-another-day, tap → TaskModal). Pure presentational — every
-// mutation lives in HomePage.
+// mutation lives in HomePage; HomePage owns the verb branch (reopen vs
+// complete/skip).
 
 import { useState } from 'react';
 import {
@@ -46,8 +48,9 @@ interface AgendaItemRowProps {
   showStartOccurrence?: boolean;
 }
 
-/** Round check circle — the row's complete control (tasks and occurrences
- *  both cross off through it). */
+/** Round check circle — the row's done toggle (tasks and occurrences both
+ *  cross off through it; clicking a checked circle unchecks — HomePage
+ *  decides reopen vs complete/skip). */
 function CheckCircle({
   checked,
   label,
@@ -61,7 +64,7 @@ function CheckCircle({
     <button
       type="button"
       onClick={onClick}
-      aria-label={checked ? `${label} — marked done` : `Complete ${label}`}
+      aria-label={checked ? `Undo done — ${label}` : `Complete ${label}`}
       className={cn(
         'h-5 w-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-colors',
         checked
@@ -267,12 +270,18 @@ function OccurrenceRow({
             }
           />
         )}
-        {occurrence.status !== 'done' && occurrence.status !== 'skipped' && (
+        {/* Skip toggles skipped ↔ pending; hidden only while done (a done
+            row unchecks first — two taps: uncheck, then skip). */}
+        {occurrence.status !== 'done' && (
           <button
             type="button"
             onClick={onSkip}
-            aria-label={`Skip ${occurrence.resolved_title}`}
-            title="Skip"
+            aria-label={
+              occurrence.status === 'skipped'
+                ? `Undo skip ${occurrence.resolved_title}`
+                : `Skip ${occurrence.resolved_title}`
+            }
+            title={occurrence.status === 'skipped' ? 'Undo skip' : 'Skip'}
             className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
           >
             <CalendarX2 className="h-3.5 w-3.5 text-muted-foreground" />

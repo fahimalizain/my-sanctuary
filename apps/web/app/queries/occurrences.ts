@@ -1,6 +1,7 @@
 import { useMutation } from '@tanstack/react-query';
 import {
   completeOccurrence,
+  reopenOccurrence,
   skipOccurrence,
   startOccurrence,
   updateOccurrence,
@@ -27,6 +28,13 @@ export function useCompleteOccurrence() {
 export function useSkipOccurrence() {
   return useMutation({
     mutationFn: ({ id }: { id: string; date: string }) => skipOccurrence(id),
+    onMutate: ({ date }) => cancelAgendaQuery(date),
+  });
+}
+
+export function useReopenOccurrence() {
+  return useMutation({
+    mutationFn: ({ id }: { id: string; date: string }) => reopenOccurrence(id),
     onMutate: ({ date }) => cancelAgendaQuery(date),
   });
 }

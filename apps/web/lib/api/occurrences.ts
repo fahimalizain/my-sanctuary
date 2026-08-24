@@ -27,6 +27,12 @@ export function skipOccurrence(id: string): Promise<OccurrenceResponse> {
   });
 }
 
+export function reopenOccurrence(id: string): Promise<OccurrenceResponse> {
+  return fetchJson<OccurrenceResponse>(`/api/occurrences/${id}/reopen`, {
+    method: 'POST',
+  });
+}
+
 export function startOccurrence(id: string): Promise<OccurrenceActionResponse> {
   return fetchJson<OccurrenceActionResponse>(`/api/occurrences/${id}/start`, {
     method: 'POST',
