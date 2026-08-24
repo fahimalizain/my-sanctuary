@@ -390,13 +390,22 @@ test('isAgendaItemParked: orphans never park', () => {
 
 test('partitionAgendaItems: splits a mixed pile; living keeps sort_order', () => {
   const pile = [
-    { ...taskItem('t-done', 'COMPLETED', '2026-08-23T09:00:00Z'), sort_order: 1 },
-    { ...occurrenceItem('o-done', 'done', '2026-08-23T08:00:00Z'), sort_order: 2 },
+    {
+      ...taskItem('t-done', 'COMPLETED', '2026-08-23T09:00:00Z'),
+      sort_order: 1,
+    },
+    {
+      ...occurrenceItem('o-done', 'done', '2026-08-23T08:00:00Z'),
+      sort_order: 2,
+    },
     { ...occurrenceItem('o-skipped', 'skipped'), sort_order: 3 },
     { ...occurrenceItem('o-pending', 'pending'), sort_order: 4 },
     { ...occurrenceItem('o-progress', 'in_progress'), sort_order: 5 },
     { ...taskItem('t-open', 'OPEN'), sort_order: 6 },
-    { ...taskItem('t-drop', 'DISCARDED', '2026-08-23T07:00:00Z'), sort_order: 7 },
+    {
+      ...taskItem('t-drop', 'DISCARDED', '2026-08-23T07:00:00Z'),
+      sort_order: 7,
+    },
     { ...item('orphan', 8) },
   ];
   const { living, completed } = partitionAgendaItems(pile);

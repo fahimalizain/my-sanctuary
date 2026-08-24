@@ -957,20 +957,14 @@ export function HomePage() {
                       onReschedule={(entry, targetDate) =>
                         void handleReschedule(entry, targetDate)
                       }
-                      onCompleteTask={(entry) =>
-                        void handleCompleteTask(entry)
-                      }
+                      onCompleteTask={(entry) => void handleCompleteTask(entry)}
                       onStartTask={(entry) => void handleStartTask(entry)}
                       onRemoveTask={(entry) => void handleRemoveTask(entry)}
                       onOpenTask={(task) => setTaskModal(task)}
                       onCompleteOccurrence={(entry) =>
                         entry.occurrence?.status === 'done'
                           ? void handleReopenOccurrence(entry)
-                          : void setOccurrenceStatus(
-                              entry,
-                              'done',
-                              'complete',
-                            )
+                          : void setOccurrenceStatus(entry, 'done', 'complete')
                       }
                       onSkipOccurrence={(entry) =>
                         entry.occurrence?.status === 'skipped'

@@ -178,9 +178,7 @@ export function canReschedule(item: AgendaItemRecord): boolean {
  *  (embedless rows) are never parked — the dump must never hide one. */
 export function isAgendaItemParked(item: AgendaItemRecord): boolean {
   if (item.kind === 'task' && item.task) {
-    return (
-      item.task.status === 'COMPLETED' || item.task.status === 'DISCARDED'
-    );
+    return item.task.status === 'COMPLETED' || item.task.status === 'DISCARDED';
   }
   if (item.kind === 'occurrence' && item.occurrence) {
     return item.occurrence.status === 'done';
