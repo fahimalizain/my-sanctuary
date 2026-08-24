@@ -1,13 +1,16 @@
-// Home — the daily Agenda (ADR 0004 § Surfaces — Home): date-scoped mixed
-// list of tasks + routine occurrences, date selector (prev / today / next +
-// calendar pick), add-task picker, reorder by grab handle (dnd-kit —
-// same-day only, ADR 0004 amendment: reorder is a handle, chevrons are
-// gone), check-off, skip, start (today's pending occurrences), reschedule
-// (the calendar popover — Tomorrow / pick a day), occurrence rename, and the
-// existing TaskModal for task edits. Replaces the mock timeline
-// (SkewedTimeline stays in components/, unused — no drive-by delete).
+// Home — the daily Agenda (ADR 0004 § Surfaces — Home): a ranked LIVING
+// list of tasks + routine occurrences above a muted Completed dump (ADR
+// 0004 amendment — parked rows: terminal tasks + done occurrences, newest
+// embed `updated_at` first, no grip, not a drop target), date selector
+// (prev / today / next + calendar pick), add-task picker, reorder by grab
+// handle on living rows only (dnd-kit — same-day only, ADR 0004 amendment:
+// reorder is a handle, chevrons are gone), check-off, skip, start (today's
+// pending occurrences), reschedule (the calendar popover — Tomorrow / pick
+// a day), occurrence rename, and the existing TaskModal for task edits.
+// Replaces the mock timeline (SkewedTimeline stays in components/, unused
+// — no drive-by delete).
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import {
   DndContext,
@@ -60,13 +63,14 @@ import {
   useUpdateTask,
 } from '@/app/queries/tasks';
 import { queryClient } from '@/lib/queryClient';
-import { SortableAgendaItemRow } from './AgendaItemRow';
+import { AgendaItemRow, SortableAgendaItemRow } from './AgendaItemRow';
 import { TaskPickerDialog } from './TaskPickerDialog';
 import { addCivilDays } from '@/app/modules/routines/rrule-preview';
 import {
   agendaDateLabel,
   agendaMoveTargetAt,
   applyAgendaMove,
+  partitionAgendaItems,
 } from './agenda-helpers';
 import type {
   AgendaItemRecord,
@@ -110,6 +114,20 @@ export function HomePage() {
   // pattern as RoutinesPage's routinesRef).
   const dateRef = useRef(date);
   dateRef.current = date;
+  // The two piles (ADR 0004 amendment): `living` is the ranked, sortable
+  // list (sort_order asc); `completed` is the parked dump below it (newest
+  // embed `updated_at` first). Both derive from the same `items` — the
+  // server has no concept of a pile; partitioning is purely presentational.
+  const { living, completed } = useMemo(
+    () => partitionAgendaItems(items),
+    [items],
+  );
+  // Latest `living` for the drag handlers (same pattern as itemsRef):
+  // dnd-kit resolves the drop index against what is currently on screen —
+  // the sortable list — never against the full pile, which also holds the
+  // parked rows.
+  const livingRef = useRef(living);
+  livingRef.current = living;
   // Action failures (move/complete/skip/etc.): a banner above the still-
   // visible list — rows are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -191,11 +209,16 @@ export function HomePage() {
 
   /** Optimistic move onto the slot at `toIndex` — the same snapshot /
    *  POST / merge path the chevrons used, with `agendaMoveTargetAt` keeping
-   *  the rank math server-exact. */
+   *  the rank math server-exact. from/to resolve against the LIVING pile
+   *  (parked rows sit in the Completed dump, not the sortable list, so a
+   *  parked row between living ones must not shift the drop target), while
+   *  `applyAgendaMove` still shifts the FULL pile — the server shifts every
+   *  peer on the date, parked ranks included. */
   const handleMoveTo = async (itemId: string, toIndex: number) => {
     const snapshot = itemsRef.current;
-    const fromIndex = snapshot.findIndex((entry) => entry.id === itemId);
-    const target = agendaMoveTargetAt(snapshot, fromIndex, toIndex);
+    const livingNow = partitionAgendaItems(snapshot).living;
+    const fromIndex = livingNow.findIndex((entry) => entry.id === itemId);
+    const target = agendaMoveTargetAt(livingNow, fromIndex, toIndex);
     if (target === null) return;
     // Optimistic paint that mirrors the server's shift exactly.
     setItems(applyAgendaMove(snapshot, itemId, target));
@@ -218,15 +241,18 @@ export function HomePage() {
     }
   };
 
-  /** dnd-kit drop: resolve the active/over ids against the CURRENT pile
-   *  (ranks may have shifted since the drag started) and hand the target
-   *  slot to the shared move path. A drop on itself, no target, or a
+  /** dnd-kit drop: resolve the active/over ids against the CURRENT LIVING
+   *  pile — the sortable list on screen, which never contains parked rows
+   *  (ranks may also have shifted since the drag started) — and hand the
+   *  target slot to the shared move path. A drop on itself, no target, or a
    *  stale id is a no-op — `agendaMoveTargetAt` returns null. */
   const handleDragEnd = (event: DragEndEvent) => {
     setActiveDrag(null);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    const toIndex = itemsRef.current.findIndex((entry) => entry.id === over.id);
+    const toIndex = livingRef.current.findIndex(
+      (entry) => entry.id === over.id,
+    );
     void handleMoveTo(String(active.id), toIndex);
   };
 
@@ -271,8 +297,11 @@ export function HomePage() {
 
   /** Task → the existing `/complete` (Board → Done) or, for a checked-off
    *  row, back to PLANNED via the existing Board move (ADR 0004 amendment —
-   *  uncheck is the Board reopen, no new endpoint). The agenda row stays as
-   *  a crossed-off row for the rest of that date (ADR 0004 § Crossing off). */
+   *  uncheck is the Board reopen, no new endpoint). Completing parks the
+   *  row under the Completed dump right away: the optimistic embed stamps
+   *  a fresh `updated_at` so the dump's newest-first sort jumps the row to
+   *  the top. Unchecking does NOT stamp — living sorts by `sort_order`, and
+   *  partition drops the row back in at its stored rank. */
   const handleCompleteTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
@@ -313,7 +342,15 @@ export function HomePage() {
     setItems((prev) =>
       prev.map((entry) =>
         entry.id === item.id && entry.task
-          ? { ...entry, task: { ...entry.task, status: 'COMPLETED' } }
+          ? {
+              ...entry,
+              task: {
+                ...entry.task,
+                status: 'COMPLETED',
+                // Fresh stamp → the Completed dump sorts this row first.
+                updated_at: new Date().toISOString(),
+              },
+            }
           : entry,
       ),
     );
@@ -386,7 +423,10 @@ export function HomePage() {
   };
 
   /** Occurrence complete/skip — one shared optimistic path over the two
-   *  verbs (the verb matrix is server-side; the UI just flips the chip). */
+   *  verbs (the verb matrix is server-side; the UI just flips the chip).
+   *  Complete ALSO stamps a fresh `updated_at` on the embed so the row
+   *  parks at the top of the Completed dump; skip stays living (sorted by
+   *  `sort_order`), so its stamp is untouched. */
   const setOccurrenceStatus = async (
     item: AgendaItemRecord,
     status: OccurrenceStatus,
@@ -398,7 +438,17 @@ export function HomePage() {
     setItems((prev) =>
       prev.map((entry) =>
         entry.id === item.id && entry.occurrence
-          ? { ...entry, occurrence: { ...entry.occurrence, status } }
+          ? {
+              ...entry,
+              occurrence: {
+                ...entry.occurrence,
+                status,
+                updated_at:
+                  verb === 'complete'
+                    ? new Date().toISOString()
+                    : entry.occurrence.updated_at,
+              },
+            }
           : entry,
       ),
     );
@@ -807,9 +857,11 @@ export function HomePage() {
               </div>
             )}
 
-            {/* The mixed pile — API order = sort_order; same-day reorder
-                only (each date is its own pile, no cross-date drag) */}
-            {items.length > 0 && (
+            {/* The living pile — sort_order asc; same-day reorder only (each
+                date is its own pile, no cross-date drag). Parked rows are
+                NOT here: the Completed dump renders below, outside the
+                DndContext, so it is never a drop target. */}
+            {living.length > 0 && (
               <DndContext
                 sensors={sensors}
                 collisionDetection={closestCenter}
@@ -824,11 +876,11 @@ export function HomePage() {
                 onDragCancel={() => setActiveDrag(null)}
               >
                 <SortableContext
-                  items={items.map((entry) => entry.id)}
+                  items={living.map((entry) => entry.id)}
                   strategy={verticalListSortingStrategy}
                 >
                   <div className="space-y-2">
-                    {items.map((item) => (
+                    {living.map((item) => (
                       <SortableAgendaItemRow
                         key={item.id}
                         item={item}
@@ -882,6 +934,60 @@ export function HomePage() {
                   )}
                 </DragOverlay>
               </DndContext>
+            )}
+
+            {/* The Completed dump (ADR 0004 amendment): parked rows —
+                terminal tasks (COMPLETED | DISCARDED) and done occurrences
+                — newest embed `updated_at` first. Sibling below the living
+                list, OUTSIDE the DndContext: plain rows with no grip, never
+                a drop target. Unchecking a row here repartitions it back
+                into the living pile at its stored `sort_order`. */}
+            {completed.length > 0 && (
+              <section className="space-y-2 pt-4">
+                <h2 className="px-1 text-xs font-medium tracking-wide text-muted-foreground">
+                  Completed
+                </h2>
+                <div className="space-y-2">
+                  {completed.map((item) => (
+                    <AgendaItemRow
+                      key={item.id}
+                      item={item}
+                      showHandle={false}
+                      isDragging={false}
+                      onReschedule={(entry, targetDate) =>
+                        void handleReschedule(entry, targetDate)
+                      }
+                      onCompleteTask={(entry) =>
+                        void handleCompleteTask(entry)
+                      }
+                      onStartTask={(entry) => void handleStartTask(entry)}
+                      onRemoveTask={(entry) => void handleRemoveTask(entry)}
+                      onOpenTask={(task) => setTaskModal(task)}
+                      onCompleteOccurrence={(entry) =>
+                        entry.occurrence?.status === 'done'
+                          ? void handleReopenOccurrence(entry)
+                          : void setOccurrenceStatus(
+                              entry,
+                              'done',
+                              'complete',
+                            )
+                      }
+                      onSkipOccurrence={(entry) =>
+                        entry.occurrence?.status === 'skipped'
+                          ? void handleReopenOccurrence(entry)
+                          : void setOccurrenceStatus(entry, 'skipped', 'skip')
+                      }
+                      onStartOccurrence={(entry) =>
+                        void handleStartOccurrence(entry)
+                      }
+                      onRenameOccurrence={(occurrence) =>
+                        openRename(occurrence)
+                      }
+                      showStartOccurrence={isToday}
+                    />
+                  ))}
+                </div>
+              </section>
             )}
           </div>
 

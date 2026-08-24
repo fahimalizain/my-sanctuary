@@ -2,11 +2,15 @@
 // variant (checkbox toggles done ↔ pending, status chip, skip toggles
 // skipped ↔ pending hidden while done, rename, reschedule popover) and the
 // task variant (checkbox toggles completed ↔ planned, start, remove-from-day,
-// reschedule popover, tap → TaskModal). Both rows lead with a grab handle
+// reschedule popover, tap → TaskModal). Living rows lead with a grab handle
 // (ADR 0004 amendment — reorder is a handle, chevrons are gone): the grip is
 // the ONLY drag activator, so a tap on checkbox / title / skip / play /
-// calendar / unpin never starts a drag. Pure presentational — every mutation
-// lives in HomePage; HomePage owns the verb branch (reopen vs complete/skip).
+// calendar / unpin never starts a drag. Parked rows (the Completed dump —
+// ADR 0004 amendment) render the same card WITHOUT the grip: the dump is not
+// a drop target, so `showHandle={false}` omits the DragHandle and HomePage
+// renders the plain component, never the sortable wrapper. Pure
+// presentational — every mutation lives in HomePage; HomePage owns the verb
+// branch (reopen vs complete/skip).
 
 import { useState } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
@@ -44,10 +48,16 @@ interface AgendaItemRowProps {
   item: AgendaItemRecord;
   /** dnd-kit activator props for the grip — spread ONLY on the handle so a
    *  tap on checkbox / title / skip / play / calendar / unpin never starts
-   *  a drag. */
-  attributes: DraggableAttributes;
-  listeners: DraggableSyntheticListeners;
+   *  a drag. Present on living rows (the SortableAgendaItemRow wrapper
+   *  supplies them); parked rows in the Completed dump render without a
+   *  grip and omit them. */
+  attributes?: DraggableAttributes;
+  listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
+  /** Render the grab handle? Defaults to true. HomePage passes
+   *  `showHandle={false}` for parked rows — the Completed dump is not
+   *  sortable, so there is nothing to grab. */
+  showHandle?: boolean;
   /** Move the slot to another day (`YYYY-MM-DD`) — HomePage fires
    *  `POST /api/agenda/items/:id/reschedule` optimistically. */
   onReschedule: (item: AgendaItemRecord, date: string) => void;
@@ -93,19 +103,21 @@ function CheckCircle({
   );
 }
 
-/** The reorder grip — the FIRST control on the row (before the checkbox)
- *  and the only drag activator: the dnd-kit listeners live here and nowhere
- *  else, so row taps (checkbox, title, skip, play, calendar, unpin) never
- *  start a drag. `touch-none` stops a grab from scrolling the page; the
- *  cursor flips to grabbing while the drag is live. */
+/** The reorder grip — the FIRST control on a LIVING row (before the
+ *  checkbox) and the only drag activator: the dnd-kit listeners live here
+ *  and nowhere else, so row taps (checkbox, title, skip, play, calendar,
+ *  unpin) never start a drag. `touch-none` stops a grab from scrolling the
+ *  page; the cursor flips to grabbing while the drag is live. Rows in the
+ *  Completed dump never render it (`showHandle={false}` in the rows below),
+ *  so its props are optional here too. */
 function DragHandle({
   attributes,
   listeners,
   label,
   isDragging,
 }: {
-  attributes: DraggableAttributes;
-  listeners: DraggableSyntheticListeners;
+  attributes?: DraggableAttributes;
+  listeners?: DraggableSyntheticListeners;
   label: string;
   isDragging: boolean;
 }) {
@@ -222,6 +234,7 @@ function OccurrenceRow({
   attributes,
   listeners,
   isDragging,
+  showHandle,
   onReschedule,
   onComplete,
   onSkip,
@@ -231,9 +244,10 @@ function OccurrenceRow({
 }: {
   item: AgendaItemRecord;
   occurrence: OccurrenceRecord;
-  attributes: DraggableAttributes;
-  listeners: DraggableSyntheticListeners;
+  attributes?: DraggableAttributes;
+  listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
+  showHandle: boolean;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onSkip: () => void;
@@ -251,12 +265,14 @@ function OccurrenceRow({
       )}
     >
       <div className="flex items-center gap-2.5">
-        <DragHandle
-          attributes={attributes}
-          listeners={listeners}
-          label={occurrence.resolved_title}
-          isDragging={isDragging}
-        />
+        {showHandle && (
+          <DragHandle
+            attributes={attributes}
+            listeners={listeners}
+            label={occurrence.resolved_title}
+            isDragging={isDragging}
+          />
+        )}
         <CheckCircle
           checked={occurrence.status === 'done'}
           label={occurrence.resolved_title}
@@ -356,6 +372,7 @@ function TaskRow({
   attributes,
   listeners,
   isDragging,
+  showHandle,
   onReschedule,
   onComplete,
   onStart,
@@ -364,9 +381,10 @@ function TaskRow({
 }: {
   item: AgendaItemRecord;
   task: TaskRecord;
-  attributes: DraggableAttributes;
-  listeners: DraggableSyntheticListeners;
+  attributes?: DraggableAttributes;
+  listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
+  showHandle: boolean;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onStart: () => void;
@@ -382,12 +400,14 @@ function TaskRow({
       )}
     >
       <div className="flex items-center gap-2.5">
-        <DragHandle
-          attributes={attributes}
-          listeners={listeners}
-          label={task.display_title}
-          isDragging={isDragging}
-        />
+        {showHandle && (
+          <DragHandle
+            attributes={attributes}
+            listeners={listeners}
+            label={task.display_title}
+            isDragging={isDragging}
+          />
+        )}
         <CheckCircle
           checked={crossed}
           label={task.display_title}
@@ -456,6 +476,7 @@ function TaskRow({
 
 export function AgendaItemRow(props: AgendaItemRowProps) {
   const { item } = props;
+  const showHandle = props.showHandle ?? true;
   if (item.kind === 'occurrence' && item.occurrence) {
     return (
       <OccurrenceRow
@@ -464,6 +485,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         attributes={props.attributes}
         listeners={props.listeners}
         isDragging={props.isDragging}
+        showHandle={showHandle}
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
@@ -481,6 +503,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         attributes={props.attributes}
         listeners={props.listeners}
         isDragging={props.isDragging}
+        showHandle={showHandle}
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteTask(item)}
         onStart={() => props.onStartTask(item)}
