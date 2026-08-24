@@ -3,6 +3,25 @@
 Status: Accepted
 Date: 2026-08-23
 
+> Amendment (2026-08-24): a dedicated **reopen** verb joins the occurrence
+> matrix: `POST /api/occurrences/:id/reopen` returns `done`/`skipped` →
+> `pending` and **clears the stored chip ids** (`calendar_id` +
+> `google_event_id` → NULL, literal NULLs never bound empty strings). A start
+> after reopen mints a **new** one-shot Google event — one *living* chip; the
+> old closed event stays on Google as an orphaned log, never PATCHed, never
+> deleted. `pending` → 200 no-op (ids are never cleared), `in_progress` → 400
+> (`cannot reopen an in_progress occurrence` — no abort: a running occurrence
+> exits only via complete/skip). `done`/`skipped` remain terminal for `start`
+> until reopened. There is now a dedicated unskip/uncomplete path (reopen);
+> `complete` ↔ `skip` flips stay. Session-only, never a Google write. §
+> Occurrence verb matrix / the API table are amended. The next slice's Home
+> chrome is locked here as the source of truth: the occurrence checkbox
+> toggles Done ↔ Pending; Skip toggles Skip ↔ Pending and is hidden while
+> Done; the calendar icon is Tomorrow + pick a date only (Skip stays its own
+> control); reorder is a grab handle (chevrons go). Task uncheck on the
+> agenda reopens via the existing `POST /api/tasks/:id/move`
+> `{ status: "PLANNED" }` (ADR 0002 — no Google write).
+
 > Amendment (2026-08-23): recurrence is **one `routines.rrule` TEXT blob** —
 > exactly two `\n`-separated lines, `DTSTART:YYYYMMDDTHHMMSS` (floating
 > local, no `Z`, no `TZID`) + `RRULE:<body>` (the body may keep a Z-form
@@ -262,20 +281,20 @@ The agenda is date-scoped. `GET /api/agenda?date=YYYY-MM-DD` is the read. Missin
 
 - A task on Home uses the existing `/start` (Board → In Progress, one-shot Google log as today).
 - An occurrence start creates the one-shot Google log, moves the occurrence to `in_progress`, and stores `calendar_id` + `google_event_id` on the occurrence. Start is valid **only when this occurrence has an agenda item whose `local_date` is civil today** (civil today via the offset table); otherwise 400 (`"occurrence can only be started on a day it is scheduled"`). The gate is agenda membership, NOT `occurrence.local_date` — a rescheduled occurrence starts where its item sits, not on its rule date.
-- One Google event per occurrence, ever. Repeating start while `in_progress` is a 200 no-op (no new event).
+- One **living** chip per occurrence. Reopen clears the stored ids; a later start creates a new event. The previous closed event is not PATCHed or deleted — it stays on Google as an orphaned log. Repeating start while `in_progress` is a 200 no-op (no new event).
 - The elongate cron must grow living `in_progress` occurrence events the same way it grows `IN_PROGRESS` task events (slice 6). Documented here; not implemented before then.
 
 **Occurrence verb matrix (locked across all slices):**
 
-| status ↓ / verb → | `start`                        | `complete`                            | `skip`                                   |
-| ----------------- | ------------------------------ | ------------------------------------- | ---------------------------------------- |
-| `pending`         | starts — today-only (else 400) | → `done`; no Google                   | → `skipped`; no Google                   |
-| `in_progress`     | 200 no-op                      | → `done`; PATCH open event end closed | → `skipped`; PATCH open event end closed |
-| `done`            | 400                            | 200 no-op                             | → `skipped`; no Google                   |
-| `skipped`         | 400                            | → `done`; no Google                   | 200 no-op                                |
+| status ↓ / verb → | `start`                        | `complete`                            | `skip`                                   | `reopen`                                                    |
+| ----------------- | ------------------------------ | ------------------------------------- | ---------------------------------------- | ----------------------------------------------------------- |
+| `pending`         | starts — today-only (else 400) | → `done`; no Google                   | → `skipped`; no Google                   | 200 no-op (ids never cleared)                               |
+| `in_progress`     | 200 no-op                      | → `done`; PATCH open event end closed | → `skipped`; PATCH open event end closed | 400 — no abort                                              |
+| `done`            | 400                            | 200 no-op                             | → `skipped`; no Google                   | → `pending`; **clear** `calendar_id` + `google_event_id`    |
+| `skipped`         | 400                            | → `done`; no Google                   | 200 no-op                                | → `pending`; **clear** ids                                  |
 
-- `done` / `skipped` are terminal for `start`.
-- `complete` ↔ `skip` flips are allowed; there is no dedicated unskip verb.
+- `done` / `skipped` are terminal for `start` until reopened.
+- `complete` ↔ `skip` flips are allowed; the dedicated unskip/uncomplete path is `reopen`.
 - Skip while running must close the chip (PATCH the open event's end), same as complete while running.
 - A missing, other-user, or soft-deleted-routine occurrence is **404** on every verb.
 
@@ -311,7 +330,8 @@ Shapes are locked here; the Rust module layout is not. Endpoints are session-gat
 | `PATCH /api/occurrences/:id`            | `{ title? }` writes the override; PATCHes the Google event `summary` when a chip exists.                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `POST /api/occurrences/:id/start`       | One-shot Google log, occurrence → `in_progress`, store ids. Today-only (else 400). Repeat while `in_progress` → 200 no-op.                                                                                                                                                                                                                                                                                                                                                                                           |
 | `POST /api/occurrences/:id/complete`    | Occurrence → `done`; closes an open event if one is running, otherwise no Google write.                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `POST /api/occurrences/:id/skip`        | Occurrence → `skipped`. No Google write.                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `POST /api/occurrences/:id/skip`        | Occurrence → `skipped`. No Google write.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `POST /api/occurrences/:id/reopen`      | Session-only. `done`/`skipped` → `pending` + **clear** chip ids (a later start mints a new one-shot event; the closed one stays as an orphaned log). `pending` → 200 no-op. `in_progress` → 400.                                                                                                                                                                                                                                                                                                                                                                     |
 
 Errors, across all of the above:
 

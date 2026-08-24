@@ -428,6 +428,11 @@ pub trait OccurrenceRepo: Send + Sync {
         calendar_id: &str,
         google_event_id: &str,
     ) -> Result<(), RepoError>;
+    /// Clears the one-shot log's ids on the occurrence (`/reopen`) — the row
+    /// goes back to chip-less so a later start mints a NEW Google event; the
+    /// closed chip stays on Google as an orphaned log. Literal NULLs, never
+    /// bound empty strings. No soft-delete filter — the table has none.
+    async fn clear_event_ids(&self, id: &str) -> Result<(), RepoError>;
     /// Transitions `status` (`pending | in_progress | done | skipped`). No
     /// soft-delete filter — the table has none.
     async fn set_status(&self, id: &str, status: &str) -> Result<(), RepoError>;
@@ -1185,6 +1190,11 @@ pub const OCCURRENCE_UPDATE_TITLE_SQL: &str =
 /// No `deleted_at` filter — the table has none.
 pub const OCCURRENCE_SET_EVENT_IDS_SQL: &str =
     "UPDATE routine_occurrences SET calendar_id = ?, google_event_id = ?, updated_at = ? WHERE id = ?";
+
+/// Clears the one-shot log's ids on the occurrence (`/reopen`). Literal NULLs
+/// — never bound empty strings. No `deleted_at` filter — the table has none.
+pub const OCCURRENCE_CLEAR_EVENT_IDS_SQL: &str =
+    "UPDATE routine_occurrences SET calendar_id = NULL, google_event_id = NULL, updated_at = ? WHERE id = ?";
 
 /// Occurrence status transitions (complete/skip). No `deleted_at` filter.
 pub const OCCURRENCE_SET_STATUS_SQL: &str =
@@ -2074,6 +2084,14 @@ mod tests {
         assert_eq!(OCCURRENCE_UPDATE_TITLE_SQL.matches('?').count(), 3, "{}", OCCURRENCE_UPDATE_TITLE_SQL);
         assert_eq!(OCCURRENCE_SET_STATUS_SQL.matches('?').count(), 3, "{}", OCCURRENCE_SET_STATUS_SQL);
         assert_eq!(OCCURRENCE_SET_EVENT_IDS_SQL.matches('?').count(), 4, "{}", OCCURRENCE_SET_EVENT_IDS_SQL);
+        let clear = OCCURRENCE_CLEAR_EVENT_IDS_SQL;
+        assert!(clear.trim_start().starts_with("UPDATE"), "{clear}");
+        assert!(
+            clear.contains("calendar_id = NULL") && clear.contains("google_event_id = NULL"),
+            "literal NULLs, never bound empty strings: {clear}"
+        );
+        assert!(!clear.contains("deleted_at"), "no soft-delete on occurrences: {clear}");
+        assert_eq!(clear.matches('?').count(), 2, "{clear}");
         assert!(
             OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("status = 'in_progress'"),
             "{}",
