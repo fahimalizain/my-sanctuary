@@ -12,7 +12,8 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import {
   DndContext,
   DragOverlay,
-  PointerSensor,
+  MouseSensor,
+  TouchSensor,
   closestCenter,
   useSensor,
   useSensors,
@@ -167,11 +168,16 @@ export function HomePage() {
   const moveTaskMutation = useMoveTask();
 
   // Agenda reorder sensors: a vertical list with a dedicated grip means a
-  // short pointer move activates — distance 8px, NO touch hold (unlike the
-  // board, whose 250ms delay beats its horizontal pan). The listeners live
-  // only on the grip, so taps on any other row control never reach a sensor.
+  // short move activates — Mouse 8px + Touch 8px, still NO 250ms hold
+  // (unlike the board, whose delay beats its horizontal pan). PointerSensor
+  // is gone: Chrome DevTools device mode and many phones speak touch
+  // events, not pointer, so it never fires for them. The listeners live
+  // only on the grip (touch-none), so taps on any other row control never
+  // reach a sensor; the distance constraint stops a tap from dragging while
+  // a swipe on the handle still starts a drag.
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { distance: 8 } }),
   );
 
   const changeDate = (next: string) => {
