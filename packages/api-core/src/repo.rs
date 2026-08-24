@@ -403,6 +403,20 @@ pub trait OccurrenceRepo: Send + Sync {
     /// existing one. Callers get a row either way — seed-on-GET never 500s on
     /// a concurrent duplicate.
     async fn insert(&self, occurrence: NewRoutineOccurrence) -> Result<RoutineOccurrence, RepoError>;
+    /// The occurrences whose local `id` is in `ids` — the batch embed source
+    /// for an agenda read's kind=occurrence items. Resolution is by `id`
+    /// (`ref_id`), NEVER by `local_date`: a pile row rescheduled onto this
+    /// date still resolves, because its occurrence's `local_date` is the rule
+    /// date. NOT user-scoped (same as `get_by_id`); no `deleted_at` filter
+    /// (the table has none). Empty `ids` → `Ok(vec![])`.
+    async fn list_by_ids(&self, ids: &[String]) -> Result<Vec<RoutineOccurrence>, RepoError>;
+    /// **Idempotent batch ensure** (seed-on-GET): `INSERT OR IGNORE` for many
+    /// rows, absorbing the `UNIQUE (routine_id, local_date)` race. Returns
+    /// `Ok(())` even when every row already existed (duplicates are silently
+    /// not written) — the caller re-lists via [`OccurrenceRepo::list_by_user_and_date`]
+    /// to get the surviving ids (a generated UUID can be lost on a concurrent
+    /// duplicate). Empty `rows` → `Ok(())` without touching the DB.
+    async fn insert_many(&self, rows: Vec<NewRoutineOccurrence>) -> Result<(), RepoError>;
     /// Writes the title override; `None` clears it back to inheritance
     /// (stores NULL). No soft-delete filter — the table has none.
     async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError>;
@@ -464,6 +478,22 @@ pub trait AgendaItemRepo: Send + Sync {
     /// key already holds a row, loads and returns the existing one (the
     /// caller's sort_order is then ignored — a duplicate never reshuffles).
     async fn insert(&self, item: NewAgendaItem) -> Result<AgendaItem, RepoError>;
+    /// The user's items of `kind` referencing any `ref_id` in `ref_ids`, on
+    /// ANY date — the batched "no membership anywhere" seed check, and the
+    /// hydrate's resolved-ref batch. All matching rows (not `LIMIT 1`); no
+    /// `local_date` filter (rescheduled rows live on other dates). Empty
+    /// `ref_ids` → `Ok(vec![])` without touching the DB.
+    async fn list_by_refs(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_ids: &[String],
+    ) -> Result<Vec<AgendaItem>, RepoError>;
+    /// **Idempotent batch ensure** (seed-on-GET): `INSERT OR IGNORE` for many
+    /// rows; a duplicate key is silently skipped (its stored `sort_order`
+    /// wins — an append never reshuffles). Empty `rows` → `Ok(())` without
+    /// touching the DB.
+    async fn insert_many(&self, rows: Vec<NewAgendaItem>) -> Result<(), RepoError>;
     /// HARD delete (unpin). The referenced task/occurrence is untouched.
     async fn hard_delete(&self, id: &str) -> Result<(), RepoError>;
     /// Highest `sort_order` in the user's `local_date` pile, or `None` when
@@ -1171,6 +1201,75 @@ pub const OCCURRENCE_LIST_IN_PROGRESS_SQL: &str = "
       AND google_event_id IS NOT NULL AND google_event_id != ''
 ";
 
+/// `routine_occurrences` insert binds 6 columns per row (`id`, `routine_id`,
+/// `user_id`, `local_date`, and `created_at`/`updated_at` — `title`/`status`
+/// are literal schema defaults) → max 16 rows per statement under D1's 100
+/// bound-parameter limit.
+pub const OCCURRENCE_INSERT_COL_COUNT: usize = 6;
+pub const OCCURRENCE_INSERT_CHUNK_SIZE: usize = 100 / OCCURRENCE_INSERT_COL_COUNT; // 16
+
+/// `list_by_ids` binds 1 id per row → up to 100 ids per statement.
+pub const OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE: usize = 100;
+
+/// Builds a multi-row `INSERT OR IGNORE` statement for one chunk of
+/// occurrences (non-empty and ≤ `OCCURRENCE_INSERT_CHUNK_SIZE`). `ids`
+/// supplies the new UUID for each row and must match `rows.len()` — the D1
+/// implementation generates them (api-core stays free of a UUID dependency).
+/// Reuses `OCCURRENCE_INSERT_SQL`'s column/value template (`title NULL`,
+/// `status 'pending'`), repeating the VALUES tuple. Returns `(sql, args)`
+/// where every arg is a string; the D1 implementation binds them as
+/// `D1Type::Text`.
+pub fn build_occurrence_insert_sql(
+    rows: &[NewRoutineOccurrence],
+    now_rfc3339: &str,
+    ids: Vec<String>,
+) -> (String, Vec<String>) {
+    assert!(!rows.is_empty(), "occurrence insert chunk must not be empty");
+    assert!(
+        rows.len() <= OCCURRENCE_INSERT_CHUNK_SIZE,
+        "occurrence insert chunk exceeds {OCCURRENCE_INSERT_CHUNK_SIZE} rows"
+    );
+    assert_eq!(rows.len(), ids.len(), "one id per occurrence required");
+
+    let mut sql = String::from(
+        "INSERT OR IGNORE INTO routine_occurrences
+        (id, routine_id, user_id, local_date, title, status, created_at, updated_at)
+        VALUES ",
+    );
+    let mut args: Vec<String> = Vec::with_capacity(rows.len() * OCCURRENCE_INSERT_COL_COUNT);
+    for (index, (row, id)) in rows.iter().zip(ids).enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,?,?,?,NULL,'pending',?,?)");
+        args.extend([
+            id,
+            row.routine_id.clone(),
+            row.user_id.clone(),
+            row.local_date.clone(),
+            now_rfc3339.to_string(),
+            now_rfc3339.to_string(),
+        ]);
+    }
+    (sql, args)
+}
+
+/// Builds a `SELECT * FROM routine_occurrences WHERE id IN (…)` statement for
+/// one chunk of ids (non-empty and ≤ `OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE`) —
+/// the batch embed source for an agenda read. No `deleted_at` filter (the
+/// table has none). Returns `(sql, args)` with every arg a string (bound as
+/// `D1Type::Text`).
+pub fn build_occurrence_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>) {
+    assert!(!ids.is_empty(), "occurrence id list must not be empty");
+    assert!(
+        ids.len() <= OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
+        "occurrence id list exceeds {OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE} ids"
+    );
+    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let sql = format!("SELECT * FROM routine_occurrences WHERE id IN ({})", placeholders.join(","));
+    (sql, ids.to_vec())
+}
+
 // ──────────────────────────────────────────
 // Agenda item SQL (ADR 0004)
 // ──────────────────────────────────────────
@@ -1231,6 +1330,90 @@ pub const AGENDA_ITEM_SHIFT_SORT_ORDER_SQL: &str = "
     SET sort_order = sort_order + ?
     WHERE user_id = ? AND local_date = ? AND sort_order >= ?
 ";
+
+/// `agenda_items` insert binds 8 columns per row (`id`, `user_id`,
+/// `local_date`, `kind`, `ref_id`, `sort_order`, and `created_at`/`updated_at`)
+/// → max 12 rows per statement under D1's 100 bound-parameter limit.
+pub const AGENDA_ITEM_INSERT_COL_COUNT: usize = 8;
+pub const AGENDA_ITEM_INSERT_CHUNK_SIZE: usize = 100 / AGENDA_ITEM_INSERT_COL_COUNT; // 12
+
+/// `list_by_refs` binds 2 fixed args (`user_id`, `kind`) plus 1 id per ref →
+/// max 98 refs per statement (2 + 98 = 100).
+pub const AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE: usize = 98;
+
+/// Builds a multi-row `INSERT OR IGNORE` statement for one chunk of agenda
+/// items (non-empty and ≤ `AGENDA_ITEM_INSERT_CHUNK_SIZE`). `ids` supplies the
+/// new UUID for each row and must match `rows.len()` — the D1 implementation
+/// generates them (api-core stays free of a UUID dependency). Reuses
+/// `AGENDA_ITEM_INSERT_SQL`'s column template, repeating the VALUES tuple.
+/// Returns `(sql, args)` where every arg is a string (`sort_order` included —
+/// the column's INTEGER affinity coerces it); the D1 implementation binds them
+/// as `D1Type::Text`.
+pub fn build_agenda_item_insert_sql(
+    rows: &[NewAgendaItem],
+    now_rfc3339: &str,
+    ids: Vec<String>,
+) -> (String, Vec<String>) {
+    assert!(!rows.is_empty(), "agenda item insert chunk must not be empty");
+    assert!(
+        rows.len() <= AGENDA_ITEM_INSERT_CHUNK_SIZE,
+        "agenda item insert chunk exceeds {AGENDA_ITEM_INSERT_CHUNK_SIZE} rows"
+    );
+    assert_eq!(rows.len(), ids.len(), "one id per agenda item required");
+
+    let mut sql = String::from(
+        "INSERT OR IGNORE INTO agenda_items
+        (id, user_id, local_date, kind, ref_id, sort_order, created_at, updated_at)
+        VALUES ",
+    );
+    let mut args: Vec<String> = Vec::with_capacity(rows.len() * AGENDA_ITEM_INSERT_COL_COUNT);
+    for (index, (row, id)) in rows.iter().zip(ids).enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,?,?,?,?,?,?,?)");
+        args.extend([
+            id,
+            row.user_id.clone(),
+            row.local_date.clone(),
+            row.kind.clone(),
+            row.ref_id.clone(),
+            row.sort_order.to_string(),
+            now_rfc3339.to_string(),
+            now_rfc3339.to_string(),
+        ]);
+    }
+    (sql, args)
+}
+
+/// Builds a `SELECT * FROM agenda_items WHERE user_id = ? AND kind = ? AND
+/// ref_id IN (…)` statement for one chunk of refs (non-empty and ≤
+/// `AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE`) — the batched "no membership
+/// anywhere" read plus the hydrate's resolved-ref batch. Deliberately NO
+/// `local_date` filter: rescheduled rows live on other dates and must still
+/// match. Returns `(sql, args)` with every arg a string (bound as
+/// `D1Type::Text`); `args[0]`/`args[1]` are `user_id`/`kind`.
+pub fn build_agenda_item_list_by_refs_sql(
+    user_id: &str,
+    kind: &str,
+    ref_ids: &[String],
+) -> (String, Vec<String>) {
+    assert!(!ref_ids.is_empty(), "agenda ref list must not be empty");
+    assert!(
+        ref_ids.len() <= AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE,
+        "agenda ref list exceeds {AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE} refs"
+    );
+    let placeholders: Vec<&str> = ref_ids.iter().map(|_| "?").collect();
+    let sql = format!(
+        "SELECT * FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id IN ({})",
+        placeholders.join(",")
+    );
+    let mut args = Vec::with_capacity(ref_ids.len() + 2);
+    args.push(user_id.to_string());
+    args.push(kind.to_string());
+    args.extend(ref_ids.iter().cloned());
+    (sql, args)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1940,5 +2123,91 @@ mod tests {
         assert!(!set_date.contains("updated_at"), "a slot move never bumps updated_at: {set_date}");
         assert!(!set_date.contains("deleted_at"), "hard-delete table: {set_date}");
         assert_eq!(set_date.matches('?').count(), 3, "{set_date}");
+    }
+
+    #[test]
+    fn occurrence_insert_many_stays_idempotent_and_chunks_to_100_params() {
+        // Column template mirrors OCCURRENCE_INSERT_SQL: title/status are
+        // literal schema defaults, `INSERT OR IGNORE` preserved.
+        assert_eq!(OCCURRENCE_INSERT_COL_COUNT, 6);
+        assert_eq!(OCCURRENCE_INSERT_CHUNK_SIZE, 16);
+        assert!(OCCURRENCE_INSERT_CHUNK_SIZE * OCCURRENCE_INSERT_COL_COUNT <= 100);
+        assert_eq!(OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE, 100);
+
+        let row = NewRoutineOccurrence {
+            routine_id: "rt-1".to_string(),
+            user_id: "u-1".to_string(),
+            local_date: "2026-08-23".to_string(),
+        };
+        let rows: Vec<NewRoutineOccurrence> = vec![row.clone(); 2];
+        let ids: Vec<String> = vec!["occ-1".to_string(), "occ-2".to_string()];
+        let (sql, args) = build_occurrence_insert_sql(&rows, "2026-08-23T00:00:00Z", ids);
+
+        assert!(sql.trim_start().starts_with("INSERT OR IGNORE INTO routine_occurrences"), "{sql}");
+        assert_eq!(sql.matches('?').count(), 2 * OCCURRENCE_INSERT_COL_COUNT, "{sql}");
+        assert_eq!(args.len(), 2 * OCCURRENCE_INSERT_COL_COUNT);
+        assert_eq!(args[0], "occ-1");
+        assert_eq!(args[1], "rt-1");
+        assert_eq!(args[3], "2026-08-23");
+        assert_eq!(args[4], "2026-08-23T00:00:00Z", "created_at bound");
+        assert_eq!(args[5], "2026-08-23T00:00:00Z", "updated_at bound");
+        assert_eq!(args[6], "occ-2");
+    }
+
+    #[test]
+    fn occurrence_list_by_ids_is_id_scoped_with_no_deleted_filter() {
+        let (sql, args) = build_occurrence_list_by_ids_sql(&[
+            "occ-1".to_string(),
+            "occ-2".to_string(),
+            "occ-3".to_string(),
+        ]);
+        assert!(sql.starts_with("SELECT * FROM routine_occurrences"), "{sql}");
+        assert!(sql.contains("id IN (?,?,?)"), "{sql}");
+        assert!(!sql.contains("deleted_at"), "no soft-delete on occurrences: {sql}");
+        assert!(!sql.contains("user_id"), "not user-scoped, same as get_by_id: {sql}");
+        assert!(!sql.contains("local_date"), "hydration is by ref_id, never local_date: {sql}");
+        assert_eq!(args, vec!["occ-1", "occ-2", "occ-3"]);
+        assert_eq!(sql.matches('?').count(), 3, "{sql}");
+    }
+
+    #[test]
+    fn agenda_item_insert_many_stays_idempotent_and_chunks_to_100_params() {
+        assert_eq!(AGENDA_ITEM_INSERT_COL_COUNT, 8);
+        assert_eq!(AGENDA_ITEM_INSERT_CHUNK_SIZE, 12);
+        assert!(AGENDA_ITEM_INSERT_CHUNK_SIZE * AGENDA_ITEM_INSERT_COL_COUNT <= 100);
+        assert_eq!(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, 98);
+        assert_eq!(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE + 2, 100, "2 fixed binds + refs");
+
+        let row = NewAgendaItem {
+            user_id: "u-1".to_string(),
+            local_date: "2026-08-23".to_string(),
+            kind: "occurrence".to_string(),
+            ref_id: "occ-1".to_string(),
+            sort_order: 3,
+        };
+        let rows: Vec<NewAgendaItem> = vec![row; 1];
+        let (sql, args) = build_agenda_item_insert_sql(&rows, "2026-08-23T00:00:00Z", vec!["ai-1".to_string()]);
+
+        assert!(sql.trim_start().starts_with("INSERT OR IGNORE INTO agenda_items"), "{sql}");
+        assert_eq!(sql.matches('?').count(), AGENDA_ITEM_INSERT_COL_COUNT, "{sql}");
+        assert_eq!(args.len(), AGENDA_ITEM_INSERT_COL_COUNT);
+        assert_eq!(args[0], "ai-1");
+        assert_eq!(args[4], "occ-1");
+        assert_eq!(args[5], "3", "sort_order bound as text, coerced by INTEGER affinity");
+    }
+
+    #[test]
+    fn agenda_item_list_by_refs_is_any_date_and_all_matching_rows() {
+        let (sql, args) = build_agenda_item_list_by_refs_sql(
+            "u-1",
+            "occurrence",
+            &["occ-1".to_string(), "occ-2".to_string()],
+        );
+        assert!(sql.starts_with("SELECT * FROM agenda_items"), "{sql}");
+        assert!(sql.contains("user_id = ? AND kind = ? AND ref_id IN (?,?)"), "{sql}");
+        assert!(!sql.contains("local_date"), "any date, never a local_date filter: {sql}");
+        assert!(!sql.contains("LIMIT"), "all matching rows, not LIMIT 1: {sql}");
+        assert_eq!(sql.matches('?').count(), 4, "{sql}");
+        assert_eq!(args, vec!["u-1", "occurrence", "occ-1", "occ-2"]);
     }
 }
