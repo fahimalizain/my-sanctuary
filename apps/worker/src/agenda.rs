@@ -2,7 +2,7 @@
 //!
 //! Session-gated via the session cookie — like `/api/lists/*` and
 //! `/api/routines`. The Google-touching verbs gate on a refreshable token:
-//! `/start` always, complete/skip **when the occurrence is `in_progress`
+//! `/start` always, pause/complete/skip **when the occurrence is `in_progress`
 //! with stored ids** (load first, like the focused delete), and the title
 //! PATCH **when a chip exists** (`google_event_id` set). Everything else is
 //! session-only. The orchestration lives in `api_core::agenda` (pure,
@@ -515,7 +515,7 @@ pub async fn start_occurrence(
     }
 }
 
-/// Shared body of the complete/skip handlers: session-only unless the
+/// Shared body of the pause/complete/skip handlers: session-only unless the
 /// occurrence is `in_progress` **with** stored ids — then the running chip
 /// gets closed and a refreshable token is required (401 otherwise). The
 /// occurrence is loaded before the gate (like the focused delete / move), so
@@ -595,6 +595,12 @@ macro_rules! occurrence_exit {
 }
 
 occurrence_exit!(
+    pause_occurrence,
+    api_core::pause_occurrence,
+    "POST /api/occurrences/:id/pause → 200 `{\"occurrence\":{...}}` — `in_progress` → `pending` after the chip close (Google gate when ids are stored), then ids cleared; `pending` → 200 no-op; `done`/`skipped` → 400."
+);
+
+occurrence_exit!(
     complete_occurrence,
     api_core::complete_occurrence,
     "POST /api/occurrences/:id/complete → 200 `{\"occurrence\":{...}}` — the verb matrix; from `in_progress` with stored ids the running chip's end is PATCHed closed (Google gate), otherwise session-only."
@@ -612,7 +618,8 @@ occurrence_exit!(
 /// `pending` with the stored one-shot log ids cleared, so a later start mints
 /// a NEW Google event (the closed chip stays on Google as an orphaned log,
 /// never PATCHed or deleted). `pending` → 200 no-op; `in_progress` → 400 (no
-/// abort). Session-only — never touches Google, so no token refresh here.
+/// abort via reopen — pause is the Google-writing exit). Session-only —
+/// never touches Google, so no token refresh here.
 /// Deliberately NOT the `occurrence_exit!` macro: that one Google-gates
 /// `in_progress`; reopen never writes Google.
 pub async fn reopen_occurrence(
