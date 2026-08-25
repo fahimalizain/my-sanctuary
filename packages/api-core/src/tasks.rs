@@ -4274,6 +4274,9 @@ mod tests {
             sync_enabled: true,
             sync_token: String::new(),
             last_synced_at: None,
+            // `"[]"` = label cache already fetched (no labels); tasks never
+            // syncs, so the value only needs to be a plausible default.
+            event_labels: "[]".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4356,6 +4359,21 @@ mod tests {
             _enabled: bool,
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn set_event_labels(
+            &self,
+            id: &str,
+            event_labels_json: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            // Persist into the in-memory rows (tasks never reads it back, but
+            // the fake must mirror the D1 write).
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.event_labels = event_labels_json.to_string();
+            }
             Ok(())
         }
 

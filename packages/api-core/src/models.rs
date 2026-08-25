@@ -169,6 +169,10 @@ pub struct GoogleCalendar {
     pub sync_token: String,
     /// RFC 3339 instant of the last successful sync; `None` when never synced.
     pub last_synced_at: Option<String>,
+    /// Cached `calendars.get` `labelProperties.eventLabels` JSON.
+    /// Empty string = never fetched. `"[]"` or `[{id, backgroundColor}]` = fetched.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub event_labels: String,
     pub created_at: String,
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.

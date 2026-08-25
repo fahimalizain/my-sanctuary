@@ -107,6 +107,14 @@ pub trait CalendarRepo: Send + Sync {
         enabled: bool,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Stores the cached `calendars.get` `labelProperties.eventLabels` JSON
+    /// (empty string = never fetched; `"[]"`/JSON array = fetched).
+    async fn set_event_labels(
+        &self,
+        id: &str,
+        event_labels_json: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
@@ -687,6 +695,13 @@ pub const CALENDAR_UPDATE_SYNC_STATE_SQL: &str =
 
 pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
     "UPDATE google_calendars SET sync_enabled = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// Writes the cached `calendars.get` `labelProperties.eventLabels` JSON onto
+/// the living row (see `GoogleCalendar::event_labels` for the empty-string /
+/// `"[]"` / JSON-array convention). Deliberately a dedicated UPDATE — the
+/// calendarList upsert must never wipe the cache.
+pub const CALENDAR_SET_EVENT_LABELS_SQL: &str =
+    "UPDATE google_calendars SET event_labels = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
 /// SOFT delete: stamps `deleted_at`, keeping the row's UNIQUE
 /// `(user_id, google_calendar_id)` slot.
@@ -1506,6 +1521,30 @@ mod tests {
             ),
             "{CALENDAR_UPSERT_SQL}"
         );
+    }
+
+    #[test]
+    fn calendar_upsert_never_mentions_event_labels() {
+        // The event-label cache is a dedicated UPDATE
+        // (`CALENDAR_SET_EVENT_LABELS_SQL`); a calendarList re-import must not
+        // wipe an existing cache, so the upsert must not write the column.
+        assert!(
+            !CALENDAR_UPSERT_SQL.contains("event_labels"),
+            "upsert must not touch event_labels: {CALENDAR_UPSERT_SQL}"
+        );
+        assert!(
+            !CALENDAR_UPSERT_SQL.contains("eventLabels"),
+            "upsert must not touch event labels: {CALENDAR_UPSERT_SQL}"
+        );
+    }
+
+    #[test]
+    fn calendar_set_event_labels_writes_column_and_stamps_updated_at() {
+        let sql = CALENDAR_SET_EVENT_LABELS_SQL;
+        assert!(sql.contains("event_labels = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
     }
 
     #[test]

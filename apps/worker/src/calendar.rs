@@ -151,6 +151,7 @@ pub async fn list_calendars(
     let tokens = crate::db::D1TokenRepo::new(d1()?);
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
     let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
         Ok(access) => access,
         Err(err) => {
@@ -160,10 +161,15 @@ pub async fn list_calendars(
     };
 
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
-    let response =
-        match api_core::list_calendars(&crate::http::WorkerHttp, &calendars, &access, &user_id)
-            .await
-        {
+    let response = match api_core::list_calendars(
+        &crate::http::WorkerHttp,
+        &calendars,
+        &access,
+        &user_id,
+        &now_rfc3339,
+    )
+    .await
+    {
             Ok(output) => Response::from_json(&output)?,
             Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
             Err(err) => {

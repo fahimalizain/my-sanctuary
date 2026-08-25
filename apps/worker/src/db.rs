@@ -437,6 +437,24 @@ impl CalendarRepo for D1CalendarRepo {
         run_stmt(stmt).await
     }
 
+    async fn set_event_labels(
+        &self,
+        id: &str,
+        event_labels_json: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_SET_EVENT_LABELS_SQL)
+            .bind_refs(&[
+                D1Type::Text(event_labels_json),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
         let stmt = self
             .db
