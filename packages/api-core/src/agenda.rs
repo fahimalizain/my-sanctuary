@@ -1,6 +1,6 @@
 //! Agenda + occurrence service (ADR 0004): the date-scoped run-of-show and
 //! its occurrence verbs, including the slice-6 Google writes: `/start`
-//! creates the one-shot log, complete/skip close a running chip, the title
+//! creates the one-shot log, complete/skip/pause close a running chip, the title
 //! PATCH updates a chip's `summary`, and the elongate cron grows living
 //! in_progress occurrence events.
 //!
@@ -60,14 +60,18 @@
 //!   (or with `http`/`access` `None`) the flip is session-only. The
 //!   `complete` ↔ `skip` flips stay; the **dedicated un-do path is `reopen`**
 //!   (below) — there is no other way back from `done`/`skipped`.
+//! - `pause` is the dedicated abort: `in_progress` → `pending` after the
+//!   same chip close as complete/skip, then the stored ids are **cleared**
+//!   so a later start mints a NEW one-shot event. `pending` → 200 no-op
+//!   (ids never cleared). `done`/`skipped` → 400 (reopen is the undo).
 //! - `reopen` is the dedicated un-do verb: `done`/`skipped` return to
 //!   `pending` with the stored chip ids **cleared** (`clear_event_ids` —
 //!   literal NULLs). A start afterwards mints a **NEW** one-shot event — one
 //!   *living* chip; the closed Google event stays as an orphaned log, never
 //!   PATCHed or deleted. `pending` → 200 no-op (ids are never cleared),
 //!   `in_progress` → 400 (`cannot reopen an in_progress occurrence` — no
-//!   abort; a running occurrence exits only via complete/skip). Session-only,
-//!   never a Google write.
+//!   abort via reopen; a running occurrence exits via complete/skip/pause).
+//!   Session-only, never a Google write.
 //! - `/start` is **agenda-today-only** (this occurrence has an agenda item
 //!   whose `local_date` is the user's ONE civil today — the primary Google
 //!   calendar's IANA `time_zone` via chrono-tz, never a hardcoded zone; NOT
@@ -202,7 +206,8 @@ pub struct DeleteAgendaItemResponse {
 }
 
 /// Response envelope for `PATCH /api/occurrences/:id`,
-/// `POST /api/occurrences/:id/complete` and `POST /api/occurrences/:id/skip`.
+/// `POST /api/occurrences/:id/complete`, `POST /api/occurrences/:id/skip`,
+/// `POST /api/occurrences/:id/pause`, and `POST /api/occurrences/:id/reopen`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct OccurrenceResponse {
     pub occurrence: OccurrenceView,
@@ -997,7 +1002,7 @@ pub async fn patch_occurrence(
 }
 
 // ──────────────────────────────────────────
-// POST /api/occurrences/:id/start, /complete and /skip — verb matrix + Google
+// POST /api/occurrences/:id/start, /pause, /complete and /skip — verb matrix + Google
 // ──────────────────────────────────────────
 
 /// `POST /api/occurrences/:id/start` → 200 `{"occurrence":…,"event":…}`.
@@ -1188,16 +1193,74 @@ pub async fn skip_occurrence(
     .await
 }
 
+/// `POST /api/occurrences/:id/pause` → 200 `{"occurrence":…}`.
+///
+/// The dedicated abort (ADR 0004 amendment): `in_progress` → `pending` after
+/// the open chip's end is PATCHed closed (same invert guard as complete/skip
+/// when ids are stored and Google is available), then the stored chip ids
+/// are **cleared** so a later start mints a NEW one-shot event. `pending` →
+/// 200 no-op (ids never cleared). `done`/`skipped` → 400 (reopen is the
+/// undo). Google optional — `http`/`access` `None` still flips + clears.
+/// Missing / other-user / soft-deleted-routine → 404.
+pub async fn pause_occurrence(
+    http: Option<&dyn HttpClient>,
+    calendars: Option<&dyn CalendarRepo>,
+    events: Option<&dyn CalendarEventRepo>,
+    access: Option<&GoogleAccess>,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    routine_repo: &dyn RoutineRepo,
+    occurrence_repo: &dyn OccurrenceRepo,
+    user_id: &str,
+    id: &str,
+    now_unix: i64,
+) -> Result<OccurrenceResponse, AgendaError> {
+    let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
+    match occurrence.status.as_str() {
+        OCCURRENCE_STATUS_PENDING => {
+            occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id)
+                .await
+        }
+        OCCURRENCE_STATUS_IN_PROGRESS => {
+            if occurrence.calendar_id.is_some() && occurrence.google_event_id.is_some() {
+                if let (Some(http), Some(calendars), Some(events), Some(access)) =
+                    (http, calendars, events, access)
+                {
+                    close_occurrence_event(
+                        http,
+                        calendars,
+                        events,
+                        access,
+                        occurrence.calendar_id.as_deref().expect("checked above"),
+                        occurrence.google_event_id.as_deref().expect("checked above"),
+                        now_unix,
+                    )
+                    .await?;
+                }
+            }
+            occurrence_repo.clear_event_ids(id).await?;
+            occurrence_repo
+                .set_status(id, OCCURRENCE_STATUS_PENDING)
+                .await?;
+            occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id)
+                .await
+        }
+        other => Err(AgendaError::Invalid(format!(
+            "cannot pause a {other} occurrence"
+        ))),
+    }
+}
+
 /// `POST /api/occurrences/:id/reopen` → 200 `{"occurrence":…}`.
 ///
 /// The dedicated un-do verb (ADR 0004 amendment): `done`/`skipped` return to
 /// `pending` with the stored chip ids **cleared** — a later start mints a NEW
 /// one-shot event; the closed Google event stays as an orphaned log, never
 /// PATCHed or deleted. `pending` → **200 no-op** (ids are never cleared —
-/// they are only written by a fresh start). `in_progress` → 400 (no abort: a
-/// running occurrence exits only via complete/skip). Session-only — never a
-/// Google write of any kind. Missing / other-user / soft-deleted-routine →
-/// 404.
+/// they are only written by a fresh start). `in_progress` → 400 (no abort
+/// via reopen: a running occurrence exits via complete/skip/pause).
+/// Session-only — never a Google write of any kind. Missing / other-user /
+/// soft-deleted-routine → 404.
 pub async fn reopen_occurrence(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -1214,7 +1277,8 @@ pub async fn reopen_occurrence(
             occurrence_response(list_repo, category_repo, routine_repo, occurrence_repo, user_id, id)
                 .await
         }
-        // No abort: a running occurrence exits only via complete/skip.
+        // No abort via reopen: a running occurrence exits via
+        // complete/skip/pause.
         OCCURRENCE_STATUS_IN_PROGRESS => Err(AgendaError::Invalid(
             "cannot reopen an in_progress occurrence".to_string(),
         )),
@@ -3364,6 +3428,19 @@ mod tests {
         ))
     }
 
+    fn pause(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
+        pollster::block_on(pause_occurrence(
+            None, None, None, None,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            user_id,
+            id,
+            NOW_UNIX,
+        ))
+    }
+
     fn patch(
         repos: &Repos,
         user_id: &str,
@@ -4623,6 +4700,63 @@ mod tests {
         assert_eq!(stored.updated_at, "2026-08-23T02:00:00Z");
     }
 
+    #[test]
+    fn pause_matrix_all_four_states() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+
+        // `pending` → 200 no-op: row untouched, ids kept even if set.
+        let mut pending = FakeOccurrenceRepo::row("occ-pending", "rt-1", "u-1", "2026-08-23", "pending");
+        pending.calendar_id = Some("cal-1".to_string());
+        pending.google_event_id = Some("g-1".to_string());
+        repos.occurrences.stored.lock().unwrap().push(pending);
+        let response = pause(&repos, "u-1", "occ-pending").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-pending")).unwrap().unwrap();
+        assert_eq!(stored.updated_at, "2026-08-23T01:00:00Z", "pending pause is a no-op");
+        assert_eq!(stored.calendar_id.as_deref(), Some("cal-1"), "ids untouched on a no-op");
+        assert_eq!(stored.google_event_id.as_deref(), Some("g-1"), "ids untouched on a no-op");
+
+        // `in_progress` → `pending` + ids cleared (session-only here).
+        let mut running = FakeOccurrenceRepo::row("occ-in_progress", "rt-1", "u-1", "2026-08-23", "in_progress");
+        running.calendar_id = Some("cal-1".to_string());
+        running.google_event_id = Some("g-1".to_string());
+        repos.occurrences.stored.lock().unwrap().push(running);
+        let response = pause(&repos, "u-1", "occ-in_progress").unwrap();
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-in_progress")).unwrap().unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_PENDING);
+        assert_eq!(stored.calendar_id, None, "chip cleared on pause");
+        assert_eq!(stored.google_event_id, None, "chip cleared on pause");
+        assert_eq!(stored.updated_at, "2026-08-23T02:00:00Z");
+
+        // `done` / `skipped` → 400 (reopen is the undo).
+        for from in ["done", "skipped"] {
+            let id = format!("occ-{from}");
+            repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+                &id, "rt-1", "u-1", "2026-08-23", from,
+            ));
+            let err = pause(&repos, "u-1", &id).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == &format!("cannot pause a {from} occurrence")),
+                "{from}: {err:?}"
+            );
+            let stored = pollster::block_on(repos.occurrences.get_by_id(&id)).unwrap().unwrap();
+            assert_eq!(stored.status, from, "reject wrote nothing");
+        }
+    }
+
+    #[test]
+    fn pause_missing_or_other_user_is_not_found() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+            "occ-1", "rt-1", "u-1", "2026-08-23", "in_progress",
+        ));
+        assert!(matches!(pause(&repos, "u-1", "missing").unwrap_err(), AgendaError::NotFound));
+        assert!(matches!(pause(&repos, "u-2", "occ-1").unwrap_err(), AgendaError::NotFound));
+    }
+
     // ──────────────────────────────────────────
     // PATCH /api/occurrences/:id — title override
     // ──────────────────────────────────────────
@@ -5323,6 +5457,65 @@ mod tests {
             OCCURRENCE_STATUS_SKIPPED
         );
         assert_eq!(http.patches.lock().unwrap().len(), 1, "chip closed on skip");
+    }
+
+    #[test]
+    fn pause_while_in_progress_patches_end_clears_ids_lands_pending() {
+        let repos = repos();
+        seed_running_chip(&repos);
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-1",
+            200,
+            &patched_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:01:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        pollster::block_on(events.upsert(
+            NewCalendarEvent {
+                calendar_id: "cal-primary@example.com".to_string(),
+                google_event_id: "g-1".to_string(),
+                google_etag: String::new(),
+                google_updated_at: String::new(),
+                last_synced_at: "2026-08-23T00:00:00Z".to_string(),
+                title: "Fajr".to_string(),
+                description: String::new(),
+                start_time: "2026-08-23T10:00:00Z".to_string(),
+                end_time: "2026-08-23T10:15:00Z".to_string(),
+                recurrence: String::new(),
+                task_id: String::new(),
+            },
+            "2026-08-23T00:00:00Z",
+        ))
+        .unwrap();
+
+        let response = pollster::block_on(pause_occurrence(
+            Some(&http),
+            Some(&calendars),
+            Some(&events),
+            Some(&access()),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_PENDING);
+        let stored = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, OCCURRENCE_STATUS_PENDING);
+        assert_eq!(stored.calendar_id, None, "chip cleared so the next start mints a new event");
+        assert_eq!(stored.google_event_id, None);
+
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2026-08-23T10:01:00Z");
+        assert!(patches[0].0.contains("events/g-1"), "{}", patches[0].0);
     }
 
     #[test]

@@ -5,7 +5,9 @@
 // (prev / today / next + calendar pick), add-task picker, reorder by grab
 // handle on living rows only (dnd-kit — same-day only, ADR 0004 amendment:
 // reorder is a handle, chevrons are gone), check-off, skip, start (today's
-// pending occurrences), reschedule (the calendar popover — Tomorrow / pick
+// pending occurrences), pause (in-progress tasks — ADR 0002 `/pause`;
+// in-progress occurrences — ADR 0004 `/pause` → pending + clear ids),
+// reschedule (the calendar popover — Tomorrow / pick
 // a day), occurrence rename, and the existing TaskModal for task edits.
 // Replaces the mock timeline (SkewedTimeline stays in components/, unused
 // — no drive-by delete).
@@ -50,6 +52,7 @@ import {
 import { queryKeys } from '@/app/queries/keys';
 import {
   useCompleteOccurrence,
+  usePauseOccurrence,
   useReopenOccurrence,
   useSkipOccurrence,
   useStartOccurrence,
@@ -175,6 +178,7 @@ export function HomePage() {
   const skipOccurrenceMutation = useSkipOccurrence();
   const reopenOccurrenceMutation = useReopenOccurrence();
   const startOccurrenceMutation = useStartOccurrence();
+  const pauseOccurrenceMutation = usePauseOccurrence();
   const updateOccurrenceMutation = useUpdateOccurrence();
   // Task writes reuse the shared task mutations from `queries/tasks.ts`;
   // after each success the handler also patches the `['tasks']` cache so
@@ -404,6 +408,33 @@ export function HomePage() {
     }
   };
 
+  /** Task → `/pause` (ADR 0002: IN_PROGRESS → PLANNED, event end patched
+   *  closed). Same cache-patch as start; Play returns once the row is
+   *  planned again. Occurrence pause is a separate verb. */
+  const handlePauseTask = async (item: AgendaItemRecord) => {
+    const task = item.task;
+    if (!task) return;
+    setActionError(null);
+    try {
+      const data = await runTaskActionMutation.mutateAsync({
+        id: task.id,
+        action: 'pause',
+      });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.task
+            ? { ...entry, task: data.task }
+            : entry,
+        ),
+      );
+      setTasksCache((prev) =>
+        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Pause failed');
+    }
+  };
+
   /** Remove from today = hard-delete the membership row (unpin). The task
    *  stays on the Board. Occurrence-kind items are refused by the API —
    *  skip is the decline. */
@@ -581,6 +612,47 @@ export function HomePage() {
       return null;
     } catch (err) {
       return err instanceof Error ? err.message : 'Add failed';
+    }
+  };
+
+  /** Occurrence pause (ADR 0004 amendment): close the living chip and
+   *  return to pending with ids cleared. Optimistic → Play returns
+   *  immediately; a 401/400 rolls back with a banner. */
+  const handlePauseOccurrence = async (item: AgendaItemRecord) => {
+    const occurrence = item.occurrence;
+    if (!occurrence) return;
+    const snapshot = itemsRef.current;
+    setItems((prev) =>
+      prev.map((entry) =>
+        entry.id === item.id && entry.occurrence
+          ? {
+              ...entry,
+              occurrence: {
+                ...entry.occurrence,
+                status: 'pending',
+                calendar_id: null,
+                google_event_id: null,
+              },
+            }
+          : entry,
+      ),
+    );
+    setActionError(null);
+    try {
+      const data = await pauseOccurrenceMutation.mutateAsync({
+        id: occurrence.id,
+        date: dateRef.current,
+      });
+      setItems((prev) =>
+        prev.map((entry) =>
+          entry.id === item.id && entry.occurrence
+            ? { ...entry, occurrence: data.occurrence }
+            : entry,
+        ),
+      );
+    } catch (err) {
+      setItems(snapshot);
+      setActionError(err instanceof Error ? err.message : 'Pause failed');
     }
   };
 
@@ -891,6 +963,7 @@ export function HomePage() {
                           void handleCompleteTask(entry)
                         }
                         onStartTask={(entry) => void handleStartTask(entry)}
+                        onPauseTask={(entry) => void handlePauseTask(entry)}
                         onRemoveTask={(entry) => void handleRemoveTask(entry)}
                         onOpenTask={(task) => setTaskModal(task)}
                         onCompleteOccurrence={(entry) =>
@@ -909,6 +982,9 @@ export function HomePage() {
                         }
                         onStartOccurrence={(entry) =>
                           void handleStartOccurrence(entry)
+                        }
+                        onPauseOccurrence={(entry) =>
+                          void handlePauseOccurrence(entry)
                         }
                         onRenameOccurrence={(occurrence) =>
                           openRename(occurrence)
@@ -959,6 +1035,7 @@ export function HomePage() {
                       }
                       onCompleteTask={(entry) => void handleCompleteTask(entry)}
                       onStartTask={(entry) => void handleStartTask(entry)}
+                      onPauseTask={(entry) => void handlePauseTask(entry)}
                       onRemoveTask={(entry) => void handleRemoveTask(entry)}
                       onOpenTask={(task) => setTaskModal(task)}
                       onCompleteOccurrence={(entry) =>
@@ -973,6 +1050,9 @@ export function HomePage() {
                       }
                       onStartOccurrence={(entry) =>
                         void handleStartOccurrence(entry)
+                      }
+                      onPauseOccurrence={(entry) =>
+                        void handlePauseOccurrence(entry)
                       }
                       onRenameOccurrence={(occurrence) =>
                         openRename(occurrence)

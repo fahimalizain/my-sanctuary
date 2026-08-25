@@ -509,7 +509,7 @@ export interface RescheduleAgendaItemInput {
 }
 
 // The envelope returned by PATCH /api/occurrences/:id,
-// POST /api/occurrences/:id/complete and POST /api/occurrences/:id/skip.
+// POST /api/occurrences/:id/complete, /skip, /pause, and /reopen.
 export interface OccurrenceResponse {
   occurrence: OccurrenceRecord;
 }

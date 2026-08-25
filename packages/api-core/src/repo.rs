@@ -428,7 +428,7 @@ pub trait OccurrenceRepo: Send + Sync {
         calendar_id: &str,
         google_event_id: &str,
     ) -> Result<(), RepoError>;
-    /// Clears the one-shot log's ids on the occurrence (`/reopen`) — the row
+    /// Clears the one-shot log's ids on the occurrence (`/reopen`, `/pause`) — the row
     /// goes back to chip-less so a later start mints a NEW Google event; the
     /// closed chip stays on Google as an orphaned log. Literal NULLs, never
     /// bound empty strings. No soft-delete filter — the table has none.
@@ -1191,12 +1191,12 @@ pub const OCCURRENCE_UPDATE_TITLE_SQL: &str =
 pub const OCCURRENCE_SET_EVENT_IDS_SQL: &str =
     "UPDATE routine_occurrences SET calendar_id = ?, google_event_id = ?, updated_at = ? WHERE id = ?";
 
-/// Clears the one-shot log's ids on the occurrence (`/reopen`). Literal NULLs
+/// Clears the one-shot log's ids on the occurrence (`/reopen`, `/pause`). Literal NULLs
 /// — never bound empty strings. No `deleted_at` filter — the table has none.
 pub const OCCURRENCE_CLEAR_EVENT_IDS_SQL: &str =
     "UPDATE routine_occurrences SET calendar_id = NULL, google_event_id = NULL, updated_at = ? WHERE id = ?";
 
-/// Occurrence status transitions (complete/skip). No `deleted_at` filter.
+/// Occurrence status transitions (start/pause/complete/skip/reopen). No `deleted_at` filter.
 pub const OCCURRENCE_SET_STATUS_SQL: &str =
     "UPDATE routine_occurrences SET status = ?, updated_at = ? WHERE id = ?";
 
