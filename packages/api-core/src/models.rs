@@ -825,11 +825,12 @@ pub struct NewEventInput {
     /// `extendedProperties.shared.sanctuary_occurrence_id` (slice 6).
     #[serde(default)]
     pub occurrence_id: Option<String>,
-    /// Google event `colorId` (`"1"`..=`"11"`). Omitted from the Google
-    /// payload when `None`. `start_task` copies the matched category's
-    /// stored `google_color_id`. Hand-created events leave this unset.
+    /// Category hex (any `#rgb`/`#rrggbb`); `create_event` snaps it onto the
+    /// 24 event-label palette and sends the matching cached label id with
+    /// `eventLabelVersion=1`. Omitted from the Google payload when `None` or
+    /// blank after trim — hand-created events stay uncolored.
     #[serde(default)]
-    pub color_id: Option<String>,
+    pub color_hex: Option<String>,
     /// Focus segment flag (task-focus, slice 3): when `task_id` is set AND
     /// this is `true`, the insert payload also carries
     /// `extendedProperties.shared.sanctuary_focus = "1"` next to the task

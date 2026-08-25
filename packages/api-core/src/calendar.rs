@@ -48,7 +48,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::OAuthConfig;
-use crate::google_color::canonicalize_hex;
+use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
     CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput, NewWatchChannel,
     WatchChannel,
@@ -96,6 +96,8 @@ pub const WATCH_DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 pub enum CalendarError {
     #[error("{0}")]
     InvalidRange(String),
+    #[error("{0}")]
+    Invalid(String),
     #[error("calendar not found")]
     NotFound,
     /// Google returned 404 for `events.list` (calendar does not support it).
@@ -428,11 +430,41 @@ pub async fn create_event(
     if let Some(shared) = build_shared_properties(input) {
         payload["extendedProperties"] = serde_json::json!({ "shared": shared });
     }
-    // The stored category color, copied verbatim by `start_task`. Never
-    // included for hand-created events (`None`) or when blank after trim.
-    if let Some(color_id) = input.color_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        payload["colorId"] = serde_json::json!(color_id);
-    }
+    // Category color → Google event label: snap the caller's hex onto the 24
+    // event-label palette (chroma-first, persisted nowhere), then resolve the
+    // label's id against the calendar's CACHED `event_labels`. A cache miss
+    // or a missing match fails the start (400) — never a `calendars.get` and
+    // never a label write. `colorId` is never sent. Hand-created events
+    // (`None` / blank after trim) stay uncolored: no `eventLabelId`, and the
+    // POST URL stays without `eventLabelVersion`.
+    let url = match input.color_hex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(color_hex) => {
+            let snapped = snap_to_event_label_hex(color_hex)
+                .map_err(|err| CalendarError::Invalid(err.to_string()))?;
+            if cal.event_labels.is_empty() {
+                return Err(CalendarError::Invalid(
+                    "calendar event-label cache is empty".to_string(),
+                ));
+            }
+            let labels: Vec<CachedEventLabel> = serde_json::from_str(&cal.event_labels)
+                .map_err(|err| {
+                    CalendarError::Invalid(format!("invalid calendar event-label cache: {err}"))
+                })?;
+            let label_id = labels
+                .iter()
+                .find(|label| label.background_color.eq_ignore_ascii_case(&snapped))
+                .map(|label| label.id.clone())
+                .ok_or_else(|| {
+                    CalendarError::Invalid("no event label matches category color".to_string())
+                })?;
+            payload["eventLabelId"] = serde_json::json!(label_id);
+            format!(
+                "{GOOGLE_EVENTS_BASE_URL}/{}/events?eventLabelVersion=1",
+                encode_path_segment(&cal.google_calendar_id)
+            )
+        }
+        None => url,
+    };
     let body =
         serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
     let (status, response) = http.post_json(&url, &access.access_token, &body).await?;
@@ -1174,7 +1206,9 @@ struct GoogleEventLabel {
 
 /// The cached form persisted onto `google_calendars.event_labels` — a JSON
 /// array of `{"id","backgroundColor"}` (background colors canonicalized).
-#[derive(Debug, Serialize)]
+/// Deserializable again on the create path, where the caller's snapped hex
+/// is resolved against the cache to pick the label id to send.
+#[derive(Debug, Serialize, Deserialize)]
 struct CachedEventLabel {
     id: String,
     #[serde(rename = "backgroundColor")]
@@ -3720,7 +3754,7 @@ mod tests {
             task_id: None,
             routine_id: None,
             occurrence_id: None,
-            color_id: None,
+            color_hex: None,
             sanctuary_focus: false,
             priority: None,
             difficulty: None,
@@ -3774,6 +3808,14 @@ mod tests {
         assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
         assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z");
         assert!(body.get("colorId").is_none(), "hand-created events carry no colorId");
+        assert!(
+            body.get("eventLabelId").is_none(),
+            "hand-created events carry no eventLabelId"
+        );
+        assert!(
+            !url.contains("eventLabelVersion"),
+            "hand-created events do not require eventLabelVersion: {url}"
+        );
 
         // Cache upsert happened with the mapped row.
         let (google_id, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
@@ -3782,27 +3824,37 @@ mod tests {
     }
 
     #[test]
-    fn create_with_color_id_sends_color_id() {
+    fn create_with_color_hex_sends_event_label_id() {
+        // `#535050` snaps chroma-first to graphite `#616161`; the cache maps
+        // graphite to a stable fake id.
         let http = FakeHttp::new(vec![(
             "/calendars/primary%40example.com/events",
             200,
             CREATED_JSON,
         )]);
-        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            event_labels: r##"[{"id":"label-graphite","backgroundColor":"#616161"}]"##.to_string(),
+            ..calendar("cal-1", "primary@example.com", true)
+        }]);
         let events = FakeEventRepo::new();
         let mut input = input();
-        input.color_id = Some("7".to_string());
+        input.color_hex = Some("#535050".to_string());
 
         pollster::block_on(create_event(&http, &calendars, &events, &access(), &input, NOW_UNIX))
             .unwrap();
 
-        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("eventLabelVersion=1"), "{url}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["colorId"], "7");
+        assert_eq!(body["eventLabelId"], "label-graphite");
+        assert!(
+            body.get("colorId").is_none(),
+            "create_event never sends colorId: {body}"
+        );
     }
 
     #[test]
-    fn create_with_blank_color_id_omits_the_key() {
+    fn create_with_blank_color_hex_omits_color_keys() {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
         for blank in ["", "   ", "\t"] {
@@ -3812,20 +3864,88 @@ mod tests {
                 CREATED_JSON,
             )]);
             let mut input = input();
-            input.color_id = Some(blank.to_string());
+            input.color_hex = Some(blank.to_string());
 
             pollster::block_on(create_event(
                 &http, &calendars, &events, &access(), &input, NOW_UNIX,
             ))
             .unwrap();
 
-            let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+            let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(
-                body.get("colorId").is_none(),
-                "blank color_id {blank:?} must omit the key"
+                body.get("colorId").is_none() && body.get("eventLabelId").is_none(),
+                "blank color_hex {blank:?} must omit both color keys"
+            );
+            assert!(
+                !url.contains("eventLabelVersion"),
+                "blank color_hex {blank:?} must not require eventLabelVersion: {url}"
             );
         }
+    }
+
+    #[test]
+    fn create_with_color_hex_and_empty_label_cache_is_invalid() {
+        // Empty string = cache miss. The start must fail with a 400-shaped
+        // Invalid — no `calendars.get`, no POST.
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            event_labels: String::new(),
+            ..calendar("cal-1", "primary@example.com", true)
+        }]);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![]);
+        let mut input = input();
+        input.color_hex = Some("#4285f4".to_string());
+
+        let err = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, CalendarError::Invalid(m) if m == "calendar event-label cache is empty"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
+    }
+
+    #[test]
+    fn create_with_color_hex_and_no_matching_label_is_invalid() {
+        // Fetched-but-empty cache (`"[]"` = no labels on the calendar).
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![]);
+        let mut cobalt_input = input();
+        cobalt_input.color_hex = Some("#4285f4".to_string());
+
+        let err = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &cobalt_input, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, CalendarError::Invalid(m) if m == "no event label matches category color"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
+
+        // A populated cache that lacks the snapped hex — same failure.
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            event_labels: r##"[{"id":"label-banana","backgroundColor":"#f6bf26"}]"##.to_string(),
+            ..calendar("cal-1", "primary@example.com", true)
+        }]);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![]);
+        let mut banana_input = input();
+        banana_input.color_hex = Some("#4285f4".to_string());
+
+        let err = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &banana_input, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, CalendarError::Invalid(m) if m == "no event label matches category color"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
     }
 
     #[test]

@@ -234,6 +234,7 @@ pub async fn create_event(
                 .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "calendar not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
         Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
         Err(CalendarError::GoogleNotFound) => {
             json_error(&ctx, 502, "google returned 404 for events.list")
