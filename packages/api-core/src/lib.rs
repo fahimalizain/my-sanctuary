@@ -43,7 +43,12 @@ pub use calendar::{
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
 };
-pub use google_color::{closest_google_color_id, parse_hex_rgb, GOOGLE_EVENT_COLORS, HexColorError};
+pub use google_color::{
+    canonicalize_hex, closest_google_color_id, is_event_label_hex, parse_hex_rgb,
+    snap_to_event_label_hex, DEFAULT_EVENT_LABEL_COLOR, GOOGLE_EVENT_COLORS,
+    GOOGLE_EVENT_LABEL_COLORS, GOOGLE_EVENT_LABEL_NEUTRALS, HexColorError,
+    NEUTRAL_CHROMA_THRESHOLD,
+};
 pub use health::{HealthResponse, VersionResponse};
 pub use lists::{
     create_list, delete_list, list_lists, update_list, DeleteListResponse, ListsError,
