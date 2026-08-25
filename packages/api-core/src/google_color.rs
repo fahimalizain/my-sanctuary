@@ -1,44 +1,20 @@
-//! Google Calendar event color mapping.
+//! Google Calendar event-label hex handling.
 //!
-//! Maps a CSS hex color to the nearest Google Calendar event `colorId`
-//! (`"1"`..=`"11"`) by squared Euclidean RGB distance against the compiled-in
-//! `colors.get` **event.background** palette. Pure std-only Rust — no I/O, no
+//! Strict CSS hex parsing and canonicalization ([`parse_hex_rgb`],
+//! [`canonicalize_hex`], [`is_event_label_hex`]) plus
+//! [`snap_to_event_label_hex`], which maps any hex onto the 24 default
+//! event-label hexes Google seeds on owned calendars
+//! ([`GOOGLE_EVENT_LABEL_COLORS`]).
+//!
+//! That palette is a third set — it matches neither `colors.get` `.event`
+//! (11) nor `.calendar` (24). The snap is chroma-first CIE76 ΔE in CIE Lab
+//! (D65): sources below [`NEUTRAL_CHROMA_THRESHOLD`] chroma snap only among
+//! [`GOOGLE_EVENT_LABEL_NEUTRALS`], so near-neutral colors stay neutral
+//! instead of landing on a saturated label. Pure std-only Rust — no I/O, no
 //! `worker` dependency — so it unit-tests natively (`cargo test -p api-core`)
 //! and stays allocation-light on `wasm32-unknown-unknown`.
-//!
-//! The math mirrors the journal's `closestGoogleColorId` (`mcp-gcal-journal`
-//! `src/auth/client.ts`): `dist = (r1-r2)^2 + (g1-g2)^2 + (b1-b2)^2`, no sqrt,
-//! no Lab. Squares are computed in `i32` so `u8` differences cannot overflow.
-//!
-//! [`snap_to_event_label_hex`] is a second, unrelated mapping onto the 24
-//! default event-label hexes Google seeds on owned calendars (a third set —
-//! matches neither `colors.get` `.event` nor `.calendar`). It is chroma-first
-//! CIE76 ΔE in CIE Lab (D65): sources below [`NEUTRAL_CHROMA_THRESHOLD`]
-//! chroma snap only among [`GOOGLE_EVENT_LABEL_NEUTRALS`], so near-neutral
-//! colors stay neutral instead of landing on a saturated label.
 
 use thiserror::Error;
-
-/// Google event color backgrounds, id 1..=11, in scan order.
-///
-/// Source of truth: Google Calendar API `colors.get` `event.background`
-/// values (the actual event fills — not the darker UI picker names). The
-/// journal reads the same hexes from `colorDef.background`. Scan order is
-/// id 1 then 2 … 11, and the first minimum distance wins, so ties resolve
-/// to the lowest id.
-pub const GOOGLE_EVENT_COLORS: [(u8, &str); 11] = [
-    (1, "#a4bdfc"),
-    (2, "#7ae7bf"),
-    (3, "#dbadff"),
-    (4, "#ff887c"),
-    (5, "#fbd75b"),
-    (6, "#ffb878"),
-    (7, "#46d6db"),
-    (8, "#e1e1e1"),
-    (9, "#5484ed"),
-    (10, "#51b749"),
-    (11, "#dc2127"),
-];
 
 /// Errors produced while parsing a hex color.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -85,32 +61,6 @@ fn hex_nibble(byte: u8) -> Result<u8, HexColorError> {
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(HexColorError::Invalid),
     }
-}
-
-/// Nearest Google event colorId (`"1"`..=`"11"`) for a hex color.
-///
-/// Distance is squared Euclidean RGB, computed in `i32` so the squares cannot
-/// overflow `u8`: `dist = (r1-r2)^2 + (g1-g2)^2 + (b1-b2)^2`. The palette is
-/// scanned in id order and only a *strictly* smaller distance replaces the
-/// current best, so ties keep the lowest id. Returns
-/// [`HexColorError::Invalid`] if the hex does not parse.
-pub fn closest_google_color_id(hex: &str) -> Result<String, HexColorError> {
-    let (r1, g1, b1) = parse_hex_rgb(hex)?;
-    let mut best_id = GOOGLE_EVENT_COLORS[0].0;
-    let mut best_dist = i32::MAX;
-    for &(id, bg) in &GOOGLE_EVENT_COLORS {
-        // Palette hexes are statically valid `#rrggbb`.
-        let (r2, g2, b2) = parse_hex_rgb(bg).expect("palette hexes are valid");
-        let dr = r1 as i32 - r2 as i32;
-        let dg = g1 as i32 - g2 as i32;
-        let db = b1 as i32 - b2 as i32;
-        let dist = dr * dr + dg * dg + db * db;
-        if dist < best_dist {
-            best_dist = dist;
-            best_id = id;
-        }
-    }
-    Ok(best_id.to_string())
 }
 
 /// The 24 default Google event-label backgrounds, as seeded on owned
@@ -272,36 +222,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_palette_hex_maps_to_its_own_id() {
-        for (id, bg) in GOOGLE_EVENT_COLORS {
-            // Distance 0 to itself; a later id at distance 0 would be a tie
-            // broken by scan order, so this also proves first-min wins.
-            assert_eq!(closest_google_color_id(bg).unwrap(), id.to_string(), "{bg}");
-        }
-    }
-
-    #[test]
-    fn palette_scan_is_case_insensitive() {
-        assert_eq!(closest_google_color_id("#A4BDFC").unwrap(), "1");
-        assert_eq!(closest_google_color_id("#DC2127").unwrap(), "11");
-    }
-
-    #[test]
-    fn journals_work_blue_maps_to_id_9() {
-        // mcp-gcal-journal's Work blue.
-        assert_eq!(closest_google_color_id("#4285F4").unwrap(), "9");
-        // Sanctuary's Work seed color.
-        assert_eq!(closest_google_color_id("#2a5c8a").unwrap(), "9");
-    }
-
-    #[test]
     fn shorthand_expands_by_doubling_nibbles() {
         assert_eq!(parse_hex_rgb("#abc").unwrap(), parse_hex_rgb("#aabbcc").unwrap());
         assert_eq!(parse_hex_rgb("#abc").unwrap(), (0xaa, 0xbb, 0xcc));
-        assert_eq!(
-            closest_google_color_id("#abc").unwrap(),
-            closest_google_color_id("#aabbcc").unwrap()
-        );
         assert_eq!(parse_hex_rgb("#fff").unwrap(), (0xff, 0xff, 0xff));
         assert_eq!(parse_hex_rgb("#000").unwrap(), (0x00, 0x00, 0x00));
     }
@@ -309,7 +232,6 @@ mod tests {
     #[test]
     fn surrounding_whitespace_is_trimmed() {
         assert_eq!(parse_hex_rgb("  #2a5c8a  ").unwrap(), (0x2a, 0x5c, 0x8a));
-        assert_eq!(closest_google_color_id("  #2a5c8a  ").unwrap(), "9");
     }
 
     #[test]
@@ -327,11 +249,6 @@ mod tests {
             "#ffff",       // 4 digits
         ] {
             assert_eq!(parse_hex_rgb(bad), Err(HexColorError::Invalid), "{bad:?}");
-            assert_eq!(
-                closest_google_color_id(bad),
-                Err(HexColorError::Invalid),
-                "{bad:?}"
-            );
         }
     }
 
@@ -341,17 +258,6 @@ mod tests {
             HexColorError::Invalid.to_string(),
             "color must be #rgb or #rrggbb"
         );
-    }
-
-    #[test]
-    fn extremes_parse_and_land_on_some_palette_id() {
-        for hex in ["#000", "#000000", "#fff", "#ffffff"] {
-            let id = closest_google_color_id(hex).unwrap();
-            assert!(
-                (1..=11).contains(&id.parse::<u8>().unwrap()),
-                "{hex} -> {id}"
-            );
-        }
     }
 
     // --- GOOGLE_EVENT_LABEL_COLORS + chroma-first snap ---
