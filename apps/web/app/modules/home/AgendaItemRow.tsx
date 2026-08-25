@@ -1,18 +1,21 @@
 // One agenda row for Home (ADR 0004 § Surfaces — Home): the occurrence
 // variant (checkbox toggles done ↔ pending, status chip, skip toggles
-// skipped ↔ pending hidden while done, rename, reschedule popover) and the
-// task variant (checkbox toggles completed ↔ planned, start, remove-from-day,
+// skipped ↔ pending hidden while done, start, pause while in progress —
+// ADR 0004 `/pause` lands pending + clears chip ids — rename, reschedule
+// popover) and the
+// task variant (checkbox toggles completed ↔ planned, start, pause while
+// in progress — ADR 0002 `/pause` lands PLANNED — remove-from-day,
 // reschedule popover, tap → TaskModal). Living rows lead with a grab handle
 // (ADR 0004 amendment — reorder is a handle, chevrons are gone): the grip is
 // the ONLY drag activator, so a tap on checkbox / title / skip / play /
-// calendar / unpin never starts a drag. Parked rows (the Completed dump —
+// pause / calendar / unpin never starts a drag. Parked rows (the Completed dump —
 // ADR 0004 amendment) render the same card WITHOUT the grip: the dump is not
 // a drop target, so `showHandle={false}` omits the DragHandle and HomePage
 // renders the plain component, never the sortable wrapper. Pure
 // presentational — every mutation lives in HomePage; HomePage owns the verb
 // branch (reopen vs complete/skip).
 
-import { useState } from 'react';
+import { Children, useState, type ReactNode } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type {
@@ -25,6 +28,7 @@ import {
   CalendarX2,
   Check,
   GripVertical,
+  Pause,
   Pencil,
   Play,
   X,
@@ -32,6 +36,7 @@ import {
 import type {
   AgendaItemRecord,
   OccurrenceRecord,
+  TaskPriority,
   TaskRecord,
 } from '../../types';
 import { TASK_PRIORITY_LABELS } from '../../types';
@@ -47,7 +52,7 @@ import {
 interface AgendaItemRowProps {
   item: AgendaItemRecord;
   /** dnd-kit activator props for the grip — spread ONLY on the handle so a
-   *  tap on checkbox / title / skip / play / calendar / unpin never starts
+   *  tap on checkbox / title / skip / play / pause / calendar / unpin never starts
    *  a drag. Present on living rows (the SortableAgendaItemRow wrapper
    *  supplies them); parked rows in the Completed dump render without a
    *  grip and omit them. */
@@ -63,20 +68,128 @@ interface AgendaItemRowProps {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
   onCompleteTask: (item: AgendaItemRecord) => void;
   onStartTask: (item: AgendaItemRecord) => void;
+  /** Pause an in-progress task (ADR 0002 `/pause` → PLANNED). */
+  onPauseTask: (item: AgendaItemRecord) => void;
   onRemoveTask: (item: AgendaItemRecord) => void;
   onOpenTask: (task: TaskRecord) => void;
   onCompleteOccurrence: (item: AgendaItemRecord) => void;
   onSkipOccurrence: (item: AgendaItemRecord) => void;
   onStartOccurrence: (item: AgendaItemRecord) => void;
+  /** Pause an in-progress occurrence (ADR 0004 `/pause` → pending + clear
+   *  chip ids). No today gate — a civil-day rollover can still be running. */
+  onPauseOccurrence: (item: AgendaItemRecord) => void;
   onRenameOccurrence: (occurrence: OccurrenceRecord) => void;
   /** Start is today-only (ADR 0004): Home renders Play for pending
    *  occurrences only when the selected date is the civil today. */
   showStartOccurrence?: boolean;
 }
 
+/** Shared icon-button: 28px circle in the mobile action pill, compact on desktop. */
+const ICON_BTN =
+  'flex h-7 w-7 items-center justify-center rounded-full text-muted-foreground hover:bg-background/80 hover:text-foreground transition-colors flex-shrink-0 sm:h-auto sm:w-auto sm:rounded-md sm:p-1.5 sm:hover:bg-muted';
+
+const TITLE_TEXT =
+  'block min-w-0 truncate text-sm font-medium leading-snug text-foreground';
+
+function ColorMark({
+  color,
+  className,
+}: {
+  color: string;
+  className?: string;
+}) {
+  const fill = color.trim();
+  return (
+    <span
+      className={cn(!fill && 'bg-muted-foreground/40', className)}
+      style={fill ? { backgroundColor: fill } : undefined}
+      aria-hidden
+    />
+  );
+}
+
+/** Two-line below sm (title, then meta/actions), single row at sm+.
+ *  Category color is a TaskCard-style left ribbon at every breakpoint. */
+function AgendaRowShell({
+  crossed,
+  handle,
+  check,
+  color,
+  title,
+  meta,
+}: {
+  crossed: boolean;
+  handle: ReactNode;
+  check: ReactNode;
+  color: string;
+  title: ReactNode;
+  meta: ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        'overflow-hidden rounded-xl border border-border/60 bg-background transition-opacity',
+        crossed && 'opacity-60',
+      )}
+    >
+      <div className="flex">
+        <ColorMark color={color} className="w-1 shrink-0 self-stretch" />
+        <div className="flex min-w-0 flex-1 items-center gap-1 px-2 py-1.5 sm:gap-2.5 sm:px-3 sm:py-2.5">
+          {handle}
+          {check}
+          <div className="flex min-w-0 flex-1 flex-col ml-1 gap-0.5 sm:flex-row sm:items-center sm:gap-2.5">
+            {title}
+            {meta}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgendaRowMeta({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-1.5 sm:contents">{children}</div>
+  );
+}
+
+function AgendaRowActions({ children }: { children: ReactNode }) {
+  if (Children.toArray(children).length === 0) return null;
+  return (
+    <div className="ml-auto flex items-center rounded-full bg-muted/70 p-0.5 sm:contents">
+      {children}
+    </div>
+  );
+}
+
+function MinutesMark({ minutes }: { minutes: number }) {
+  return (
+    <span className="flex-shrink-0 text-[11px] tabular-nums text-muted-foreground">
+      {minutes} min
+    </span>
+  );
+}
+
+function PriorityMark({ priority }: { priority: TaskPriority }) {
+  if (priority === 'low') return null;
+  return (
+    <span
+      className={cn(
+        'flex-shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-semibold tracking-wide',
+        priority === 'high'
+          ? 'bg-red-400/15 text-red-500'
+          : 'bg-amber-400/15 text-amber-600',
+      )}
+    >
+      {TASK_PRIORITY_LABELS[priority]}
+    </span>
+  );
+}
+
 /** Round check circle — the row's done toggle (tasks and occurrences both
  *  cross off through it; clicking a checked circle unchecks — HomePage
- *  decides reopen vs complete/skip). */
+ *  decides reopen vs complete/skip). Visual stays 20px; padding is hit slop
+ *  only (negative margin keeps the layout size). */
 function CheckCircle({
   checked,
   label,
@@ -91,22 +204,26 @@ function CheckCircle({
       type="button"
       onClick={onClick}
       aria-label={checked ? `Undo done — ${label}` : `Complete ${label}`}
-      className={cn(
-        'h-5 w-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-colors',
-        checked
-          ? 'bg-primary border-primary text-primary-foreground'
-          : 'border-input hover:border-primary',
-      )}
+      className="flex-shrink-0 p-2.5 -m-2.5 sm:p-0 sm:m-0"
     >
-      {checked && <Check className="h-3 w-3" strokeWidth={3} />}
+      <span
+        className={cn(
+          'h-5 w-5 rounded-full border-2 flex items-center justify-center transition-colors',
+          checked
+            ? 'bg-primary border-primary text-primary-foreground'
+            : 'border-input hover:border-primary',
+        )}
+      >
+        {checked && <Check className="h-3 w-3" strokeWidth={3} />}
+      </span>
     </button>
   );
 }
 
 /** The reorder grip — the FIRST control on a LIVING row (before the
  *  checkbox) and the only drag activator: the dnd-kit listeners live here
- *  and nowhere else, so row taps (checkbox, title, skip, play, calendar,
- *  unpin) never start a drag. `touch-none` stops a grab from scrolling the
+ *  and nowhere else, so row taps (checkbox, title, skip, play, pause,
+ *  calendar, unpin) never start a drag. `touch-none` stops a grab from scrolling the
  *  page; the cursor flips to grabbing while the drag is live. Rows in the
  *  Completed dump never render it (`showHandle={false}` in the rows below),
  *  so its props are optional here too. */
@@ -127,13 +244,13 @@ function DragHandle({
       aria-label={`Reorder ${label}`}
       title="Reorder"
       className={cn(
-        'p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0 touch-none',
+        'flex-shrink-0 touch-none rounded-md p-1 -ml-0.5 text-muted-foreground/50 hover:bg-muted hover:text-muted-foreground sm:ml-0 sm:p-1.5',
         isDragging ? 'cursor-grabbing' : 'cursor-grab',
       )}
       {...attributes}
       {...listeners}
     >
-      <GripVertical className="h-3.5 w-3.5 text-muted-foreground" />
+      <GripVertical className="h-3.5 w-3.5 text-muted-foreground/50" />
     </button>
   );
 }
@@ -165,11 +282,11 @@ function RescheduleControl({
       <PopoverTrigger
         aria-label={`Move ${label} to another day`}
         title={`Move ${label} to another day`}
-        className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
+        className={ICON_BTN}
       >
-        <Calendar className="h-3.5 w-3.5 text-muted-foreground" />
+        <Calendar className="h-3.5 w-3.5" />
       </PopoverTrigger>
-      <PopoverContent className="w-48 flex flex-col gap-1">
+      <PopoverContent className="w-[min(12rem,calc(100vw-2rem))] flex flex-col gap-1">
         <button
           type="button"
           onClick={() => {
@@ -203,6 +320,50 @@ function RescheduleControl({
       </PopoverContent>
     </Popover>
   );
+}
+
+/** Shared Play ↔ Pause swap for both row kinds. Play when `canStart`;
+ *  Pause when `running`; nothing otherwise. */
+function PlayPauseControl({
+  label,
+  canStart,
+  running,
+  onStart,
+  onPause,
+}: {
+  label: string;
+  canStart: boolean;
+  running: boolean;
+  onStart: () => void;
+  onPause: () => void;
+}) {
+  if (running) {
+    return (
+      <button
+        type="button"
+        onClick={onPause}
+        aria-label={`Pause ${label}`}
+        title="Pause"
+        className={ICON_BTN}
+      >
+        <Pause className="h-3.5 w-3.5" />
+      </button>
+    );
+  }
+  if (canStart) {
+    return (
+      <button
+        type="button"
+        onClick={onStart}
+        aria-label={`Start ${label}`}
+        title="Start"
+        className={ICON_BTN}
+      >
+        <Play className="h-3.5 w-3.5" />
+      </button>
+    );
+  }
+  return null;
 }
 
 /** Status chip: done/skipped/in_progress for occurrences, done/in_progress
@@ -239,6 +400,7 @@ function OccurrenceRow({
   onComplete,
   onSkip,
   onStart,
+  onPause,
   showStart,
   onRename,
 }: {
@@ -252,117 +414,101 @@ function OccurrenceRow({
   onComplete: () => void;
   onSkip: () => void;
   onStart: () => void;
+  onPause: () => void;
   showStart: boolean;
   onRename: () => void;
 }) {
   const crossed =
     occurrence.status === 'done' || occurrence.status === 'skipped';
   return (
-    <div
-      className={cn(
-        'rounded-lg border border-border bg-background p-3 transition-opacity',
-        crossed && 'opacity-60',
-      )}
-    >
-      <div className="flex items-center gap-2.5">
-        {showHandle && (
+    <AgendaRowShell
+      crossed={crossed}
+      color={occurrence.category.color}
+      handle={
+        showHandle ? (
           <DragHandle
             attributes={attributes}
             listeners={listeners}
             label={occurrence.resolved_title}
             isDragging={isDragging}
           />
-        )}
+        ) : null
+      }
+      check={
         <CheckCircle
           checked={occurrence.status === 'done'}
           label={occurrence.resolved_title}
           onClick={onComplete}
         />
-        <span
-          className="h-2.5 w-2.5 rounded-full flex-shrink-0"
-          style={{ backgroundColor: occurrence.category.color }}
-        />
-        {/* Tap the title (or the pencil) to rename — a day-level override,
-            never the routine definition */}
+      }
+      title={
         <button
           type="button"
           onClick={onRename}
           aria-label={`Rename ${occurrence.resolved_title}`}
-          className="group flex-1 min-w-0 flex items-center gap-1 text-left"
+          className="group flex min-w-0 items-center gap-1 text-left sm:flex-1"
         >
-          <span
-            className={cn(
-              'block truncate text-sm font-medium text-foreground',
-              crossed && 'line-through',
-            )}
-          >
+          <span className={cn(TITLE_TEXT, crossed && 'line-through')}>
             {occurrence.resolved_title}
           </span>
-          <Pencil className="h-3 w-3 text-muted-foreground/50 group-hover:text-muted-foreground flex-shrink-0" />
+          <Pencil className="h-3 w-3 flex-shrink-0 text-muted-foreground/50 group-hover:text-muted-foreground [@media(hover:none)]:text-muted-foreground" />
         </button>
-        <span className="flex-shrink-0 text-xs text-muted-foreground">
-          {occurrence.estimated_minutes} min
-        </span>
-        {occurrence.status !== 'pending' && (
-          <StatusChip
-            label={
-              occurrence.status === 'done'
-                ? 'Done'
-                : occurrence.status === 'skipped'
-                  ? 'Skipped'
-                  : 'In progress'
-            }
-            tone={
-              occurrence.status === 'done'
-                ? 'done'
-                : occurrence.status === 'skipped'
-                  ? 'skipped'
-                  : 'running'
-            }
-          />
-        )}
-        {/* Skip toggles skipped ↔ pending; hidden only while done (a done
-            row unchecks first — two taps: uncheck, then skip). */}
-        {occurrence.status !== 'done' && (
-          <button
-            type="button"
-            onClick={onSkip}
-            aria-label={
-              occurrence.status === 'skipped'
-                ? `Undo skip ${occurrence.resolved_title}`
-                : `Skip ${occurrence.resolved_title}`
-            }
-            title={occurrence.status === 'skipped' ? 'Undo skip' : 'Skip'}
-            className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
-          >
-            <CalendarX2 className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        )}
-        {/* Start is pending-only AND today-only: a one-shot Google log opens
-            and the chip reads In progress (a repeat on in_progress would be
-            a server-side 200 no-op, but the button is hidden anyway). */}
-        {occurrence.status === 'pending' && showStart && (
-          <button
-            type="button"
-            onClick={onStart}
-            aria-label={`Start ${occurrence.resolved_title}`}
-            title="Start"
-            className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
-          >
-            <Play className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        )}
-        {/* Move-to-another-day — pending/skipped only (in_progress/done
-            → API 400, so the control hides with the chip). */}
-        {canReschedule(item) && (
-          <RescheduleControl
-            item={item}
-            label={occurrence.resolved_title}
-            onReschedule={onReschedule}
-          />
-        )}
-      </div>
-    </div>
+      }
+      meta={
+        <AgendaRowMeta>
+          <MinutesMark minutes={occurrence.estimated_minutes} />
+          {occurrence.status !== 'pending' && (
+            <StatusChip
+              label={
+                occurrence.status === 'done'
+                  ? 'Done'
+                  : occurrence.status === 'skipped'
+                    ? 'Skipped'
+                    : 'In progress'
+              }
+              tone={
+                occurrence.status === 'done'
+                  ? 'done'
+                  : occurrence.status === 'skipped'
+                    ? 'skipped'
+                    : 'running'
+              }
+            />
+          )}
+          <AgendaRowActions>
+            <PlayPauseControl
+              label={occurrence.resolved_title}
+              canStart={occurrence.status === 'pending' && showStart}
+              running={occurrence.status === 'in_progress'}
+              onStart={onStart}
+              onPause={onPause}
+            />
+            {occurrence.status !== 'done' && (
+              <button
+                type="button"
+                onClick={onSkip}
+                aria-label={
+                  occurrence.status === 'skipped'
+                    ? `Undo skip ${occurrence.resolved_title}`
+                    : `Skip ${occurrence.resolved_title}`
+                }
+                title={occurrence.status === 'skipped' ? 'Undo skip' : 'Skip'}
+                className={ICON_BTN}
+              >
+                <CalendarX2 className="h-3.5 w-3.5" />
+              </button>
+            )}
+            {canReschedule(item) && (
+              <RescheduleControl
+                item={item}
+                label={occurrence.resolved_title}
+                onReschedule={onReschedule}
+              />
+            )}
+          </AgendaRowActions>
+        </AgendaRowMeta>
+      }
+    />
   );
 }
 
@@ -376,6 +522,7 @@ function TaskRow({
   onReschedule,
   onComplete,
   onStart,
+  onPause,
   onRemove,
   onOpen,
 }: {
@@ -388,89 +535,85 @@ function TaskRow({
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onStart: () => void;
+  onPause: () => void;
   onRemove: () => void;
   onOpen: () => void;
 }) {
   const crossed = task.status === 'COMPLETED';
   return (
-    <div
-      className={cn(
-        'rounded-lg border border-border bg-background p-3 transition-opacity',
-        crossed && 'opacity-60',
-      )}
-    >
-      <div className="flex items-center gap-2.5">
-        {showHandle && (
+    <AgendaRowShell
+      crossed={crossed}
+      color={task.category.color}
+      handle={
+        showHandle ? (
           <DragHandle
             attributes={attributes}
             listeners={listeners}
             label={task.display_title}
             isDragging={isDragging}
           />
-        )}
+        ) : null
+      }
+      check={
         <CheckCircle
           checked={crossed}
           label={task.display_title}
           onClick={onComplete}
         />
-        <span
-          className="h-2.5 w-2.5 rounded-full flex-shrink-0"
-          style={{ backgroundColor: task.category.color }}
-        />
-        {/* Tap the row to edit in the existing TaskModal */}
+      }
+      title={
         <button
           type="button"
           onClick={onOpen}
           aria-label={`Edit ${task.display_title}`}
-          className="flex-1 min-w-0 text-left"
+          className="min-w-0 text-left sm:flex-1"
         >
-          <span
-            className={cn(
-              'block truncate text-sm font-medium text-foreground',
-              crossed && 'line-through',
-            )}
-          >
+          <span className={cn(TITLE_TEXT, crossed && 'line-through')}>
             {task.display_title}
           </span>
         </button>
-        <span className="flex-shrink-0 text-xs text-muted-foreground">
-          {TASK_PRIORITY_LABELS[task.priority]} · {task.duration_minutes} min
-        </span>
-        {task.status === 'COMPLETED' && <StatusChip label="Done" tone="done" />}
-        {task.status === 'IN_PROGRESS' && (
-          <StatusChip label="In progress" tone="running" />
-        )}
-        {(task.status === 'OPEN' || task.status === 'PLANNED') && (
-          <button
-            type="button"
-            onClick={onStart}
-            aria-label={`Start ${task.display_title}`}
-            title="Start"
-            className="p-1.5 rounded-md hover:bg-muted transition-colors flex-shrink-0"
-          >
-            <Play className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={onRemove}
-          aria-label={`Remove ${task.display_title} from this day`}
-          title="Remove from this day"
-          className="p-1.5 rounded-md hover:bg-destructive/10 hover:text-destructive transition-colors flex-shrink-0"
-        >
-          <X className="h-3.5 w-3.5 text-muted-foreground" />
-        </button>
-        {/* Move-to-another-day — living tasks only (COMPLETED/DISCARDED
-            cards stay put: Home never invites moving a finished card). */}
-        {canReschedule(item) && (
-          <RescheduleControl
-            item={item}
-            label={task.display_title}
-            onReschedule={onReschedule}
-          />
-        )}
-      </div>
-    </div>
+      }
+      meta={
+        <AgendaRowMeta>
+          <PriorityMark priority={task.priority} />
+          <MinutesMark minutes={task.duration_minutes} />
+          {task.status === 'COMPLETED' && (
+            <StatusChip label="Done" tone="done" />
+          )}
+          {task.status === 'IN_PROGRESS' && (
+            <StatusChip label="In progress" tone="running" />
+          )}
+          <AgendaRowActions>
+            <PlayPauseControl
+              label={task.display_title}
+              canStart={task.status === 'OPEN' || task.status === 'PLANNED'}
+              running={task.status === 'IN_PROGRESS'}
+              onStart={onStart}
+              onPause={onPause}
+            />
+            <button
+              type="button"
+              onClick={onRemove}
+              aria-label={`Remove ${task.display_title} from this day`}
+              title="Remove from this day"
+              className={cn(
+                ICON_BTN,
+                'hover:bg-destructive/10 hover:text-destructive',
+              )}
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+            {canReschedule(item) && (
+              <RescheduleControl
+                item={item}
+                label={task.display_title}
+                onReschedule={onReschedule}
+              />
+            )}
+          </AgendaRowActions>
+        </AgendaRowMeta>
+      }
+    />
   );
 }
 
@@ -490,6 +633,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
         onStart={() => props.onStartOccurrence(item)}
+        onPause={() => props.onPauseOccurrence(item)}
         showStart={props.showStartOccurrence ?? false}
         onRename={() => props.onRenameOccurrence(item.occurrence!)}
       />
@@ -507,6 +651,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteTask(item)}
         onStart={() => props.onStartTask(item)}
+        onPause={() => props.onPauseTask(item)}
         onRemove={() => props.onRemoveTask(item)}
         onOpen={() => props.onOpenTask(item.task!)}
       />

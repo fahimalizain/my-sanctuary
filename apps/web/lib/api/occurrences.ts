@@ -38,3 +38,9 @@ export function startOccurrence(id: string): Promise<OccurrenceActionResponse> {
     method: 'POST',
   });
 }
+
+export function pauseOccurrence(id: string): Promise<OccurrenceResponse> {
+  return fetchJson<OccurrenceResponse>(`/api/occurrences/${id}/pause`, {
+    method: 'POST',
+  });
+}
