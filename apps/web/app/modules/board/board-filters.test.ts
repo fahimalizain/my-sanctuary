@@ -48,7 +48,6 @@ function cat(overrides: Partial<Category> & { title: string }): Category {
     color: '#8b5cf6',
     is_productive: true,
     google_calendar_id: null,
-    google_color_id: null,
     sort_order: 0,
     is_untracked: false,
     created_at: '2026-08-20T00:00:00Z',

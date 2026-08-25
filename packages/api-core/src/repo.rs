@@ -107,6 +107,14 @@ pub trait CalendarRepo: Send + Sync {
         enabled: bool,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Stores the cached `calendars.get` `labelProperties.eventLabels` JSON
+    /// (empty string = never fetched; `"[]"`/JSON array = fetched).
+    async fn set_event_labels(
+        &self,
+        id: &str,
+        event_labels_json: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
 }
@@ -688,6 +696,13 @@ pub const CALENDAR_UPDATE_SYNC_STATE_SQL: &str =
 pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
     "UPDATE google_calendars SET sync_enabled = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
+/// Writes the cached `calendars.get` `labelProperties.eventLabels` JSON onto
+/// the living row (see `GoogleCalendar::event_labels` for the empty-string /
+/// `"[]"` / JSON-array convention). Deliberately a dedicated UPDATE — the
+/// calendarList upsert must never wipe the cache.
+pub const CALENDAR_SET_EVENT_LABELS_SQL: &str =
+    "UPDATE google_calendars SET event_labels = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
 /// SOFT delete: stamps `deleted_at`, keeping the row's UNIQUE
 /// `(user_id, google_calendar_id)` slot.
 pub const CALENDAR_DELETE_SQL: &str =
@@ -878,8 +893,8 @@ pub const TASK_CATEGORY_GET_BY_ID_SQL: &str =
 /// for `is_productive`/`is_untracked`.
 pub const TASK_CATEGORY_INSERT_SQL: &str = "
     INSERT INTO task_categories
-        (id, user_id, list_id, parent_id, title, slug, color, is_productive, google_calendar_id, google_color_id, sort_order, is_untracked, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, user_id, list_id, parent_id, title, slug, color, is_productive, google_calendar_id, sort_order, is_untracked, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). A
@@ -897,7 +912,6 @@ pub const TASK_CATEGORY_UPDATE_SQL: &str = "
         color = COALESCE(?, color),
         is_productive = COALESCE(?, is_productive),
         google_calendar_id = COALESCE(?, google_calendar_id),
-        google_color_id = COALESCE(?, google_color_id),
         sort_order = COALESCE(?, sort_order),
         parent_id = COALESCE(?, parent_id),
         list_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE COALESCE(?, list_id) END,
@@ -1509,6 +1523,30 @@ mod tests {
     }
 
     #[test]
+    fn calendar_upsert_never_mentions_event_labels() {
+        // The event-label cache is a dedicated UPDATE
+        // (`CALENDAR_SET_EVENT_LABELS_SQL`); a calendarList re-import must not
+        // wipe an existing cache, so the upsert must not write the column.
+        assert!(
+            !CALENDAR_UPSERT_SQL.contains("event_labels"),
+            "upsert must not touch event_labels: {CALENDAR_UPSERT_SQL}"
+        );
+        assert!(
+            !CALENDAR_UPSERT_SQL.contains("eventLabels"),
+            "upsert must not touch event labels: {CALENDAR_UPSERT_SQL}"
+        );
+    }
+
+    #[test]
+    fn calendar_set_event_labels_writes_column_and_stamps_updated_at() {
+        let sql = CALENDAR_SET_EVENT_LABELS_SQL;
+        assert!(sql.contains("event_labels = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
     fn calendar_list_orders_primary_first_then_summary() {
         let sql = CALENDAR_LIST_BY_USER_ID_SQL;
         let order_start = sql.find("ORDER BY").expect("has ORDER BY");
@@ -1693,18 +1731,18 @@ mod tests {
     }
 
     #[test]
-    fn task_category_insert_binds_all_14_columns() {
+    fn task_category_insert_binds_all_13_columns() {
         assert!(TASK_CATEGORY_INSERT_SQL.contains("INSERT INTO task_categories"), "{}", TASK_CATEGORY_INSERT_SQL);
         assert!(!TASK_CATEGORY_INSERT_SQL.contains("ON CONFLICT"), "{}", TASK_CATEGORY_INSERT_SQL);
         assert_eq!(
             TASK_CATEGORY_INSERT_SQL.matches('?').count(),
-            14,
+            13,
             "one placeholder per column: {}",
             TASK_CATEGORY_INSERT_SQL
         );
         for column in [
             "id", "user_id", "list_id", "parent_id", "title", "slug", "color",
-            "is_productive", "google_calendar_id", "google_color_id", "sort_order",
+            "is_productive", "google_calendar_id", "sort_order",
             "is_untracked", "created_at", "updated_at",
         ] {
             assert!(TASK_CATEGORY_INSERT_SQL.contains(column), "missing {column}");
@@ -1720,8 +1758,8 @@ mod tests {
         assert!(sql.contains("COALESCE(?, list_id)"), "{sql}");
         assert!(sql.contains("CASE WHEN ? IS NOT NULL THEN NULL"), "{sql}");
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
-        // 11 mutable/now bindings + the id: nothing else.
-        assert_eq!(sql.matches('?').count(), 12, "{sql}");
+        // 10 mutable/now bindings + the id: nothing else.
+        assert_eq!(sql.matches('?').count(), 11, "{sql}");
     }
 
     #[test]

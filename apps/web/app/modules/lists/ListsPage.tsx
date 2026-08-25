@@ -19,9 +19,14 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { EventLabelColorPicker } from '@/app/components/EventLabelColorPicker';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate } from '@tanstack/react-router';
 import { ApiError } from '@/lib/api';
+import {
+  DEFAULT_EVENT_LABEL_COLOR,
+  isEventLabelHex,
+} from '@/lib/event-label-colors';
 import {
   useCreateList,
   useDeleteList,
@@ -93,7 +98,7 @@ export function ListsPage() {
   // List dialog state.
   const [listForm, setListForm] = useState<ListFormState | null>(null);
   const [listName, setListName] = useState('');
-  const [listColor, setListColor] = useState('#2a5c8a');
+  const [listColor, setListColor] = useState(DEFAULT_EVENT_LABEL_COLOR);
 
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -176,14 +181,21 @@ export function ListsPage() {
   const openCreateList = () => {
     setListForm({ mode: 'create' });
     setListName('');
-    setListColor('#2a5c8a');
+    setListColor(DEFAULT_EVENT_LABEL_COLOR);
     setFormError(null);
   };
 
   const openEditList = (list: TaskList) => {
     setListForm({ mode: 'edit', list });
     setListName(list.name);
-    setListColor(list.color);
+    // A stale non-palette hex must never survive an edit round-trip: if the
+    // stored color is not one of the 24 swatches, reset to peacock (the API
+    // rejects non-palette hexes on PATCH).
+    setListColor(
+      isEventLabelHex(list.color)
+        ? list.color.trim().toLowerCase()
+        : DEFAULT_EVENT_LABEL_COLOR,
+    );
     setFormError(null);
   };
 
@@ -515,18 +527,14 @@ export function ListsPage() {
               <label className="text-sm font-medium text-foreground">
                 Color
               </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="color"
-                  value={listColor}
-                  onChange={(e) => setListColor(e.target.value)}
-                  className="h-10 w-14 rounded-lg border border-input bg-background cursor-pointer"
-                  aria-label="List color"
-                />
-                <span className="text-sm text-muted-foreground font-mono">
-                  {listColor}
-                </span>
-              </div>
+              <EventLabelColorPicker
+                value={listColor}
+                onChange={setListColor}
+                aria-label="List color"
+              />
+              <p className="text-xs text-muted-foreground font-mono">
+                {listColor}
+              </p>
             </div>
 
             {formError && (

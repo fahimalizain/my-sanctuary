@@ -211,6 +211,9 @@ impl From<CalendarError> for TasksError {
     fn from(err: CalendarError) -> Self {
         match err {
             CalendarError::GoogleApi(message) => TasksError::GoogleApi(message),
+            // A category color that cannot snap/resolve to a cached label is
+            // a caller-side 400, folded onto the tasks Invalid arm.
+            CalendarError::Invalid(message) => TasksError::Invalid(message),
             // The timer only ever touches calendars it resolved itself, so a
             // NotFound/InvalidResponse/Http here is a 500-shaped surprise —
             // surface the message and let the worker pick the status.
@@ -1012,7 +1015,7 @@ pub async fn start_task(
             task_id: Some(task.id.clone()),
             routine_id: None,
             occurrence_id: None,
-            color_id: target.google_color_id,
+            color_hex: target.color_hex,
             // Start never takes focus: the started chip is unfocused.
             sanctuary_focus: false,
             // Create-time snapshot of the task's P/D — never patched later.
@@ -2057,17 +2060,18 @@ pub async fn move_task(
 // Task-focus (slice 3): POST /api/tasks/:id/focus and DELETE /api/focus
 // ──────────────────────────────────────────
 
-/// The matched category's stored `google_color_id`, or `None` when the title
-/// is untracked or the category has no stored color. Focus segments re-resolve
-/// their color from the category here — the event cache has no color column,
-/// so the replaced chip cannot supply it.
-fn category_color_id(taxonomy: &Taxonomy, title: &str) -> Option<String> {
+/// The matched category's hex color, or `None` when the title is untracked
+/// or the category has no (non-blank) color. Focus segments re-resolve their
+/// color from the category here — the event cache has no color column, so
+/// the replaced chip cannot supply it.
+fn category_color_hex(taxonomy: &Taxonomy, title: &str) -> Option<String> {
     match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
         ClassifyOutcome::Matched { category_id } => taxonomy
             .categories
             .iter()
             .find(|category| category.id == category_id)
-            .and_then(|category| category.google_color_id.clone()),
+            .map(|category| category.color.trim().to_string())
+            .filter(|color| !color.is_empty()),
         ClassifyOutcome::Untracked { .. } => None,
     }
 }
@@ -2078,7 +2082,7 @@ fn category_color_id(taxonomy: &Taxonomy, title: &str) -> Option<String> {
 ///
 /// The new event inherits its `calendar_id` from the chip it replaces (the
 /// task's newest event-bearing log → cached row); with no living chip it falls
-/// back to `resolve_target_calendar` exactly like `start_task`. `color_id` is
+/// back to `resolve_target_calendar` exactly like `start_task`. `color_hex` is
 /// re-resolved from the category (the cache has no color column). `focused`
 /// controls the `sanctuary_focus = "1"` flag; the summary is the task title
 /// exactly, never a `▶` prefix.
@@ -2112,7 +2116,7 @@ async fn create_focus_segment(
             .await?
             .calendar_id,
     };
-    let color_id = category_color_id(taxonomy, &task.title);
+    let color_hex = category_color_hex(taxonomy, &task.title);
 
     let output = create_event(
         http,
@@ -2128,7 +2132,7 @@ async fn create_focus_segment(
             task_id: Some(task.id.clone()),
             routine_id: None,
             occurrence_id: None,
-            color_id,
+            color_hex,
             sanctuary_focus: focused,
             // Create-time snapshot of the task's P/D — never patched later.
             priority: Some(task.priority.clone()),
@@ -2449,10 +2453,12 @@ async fn resolve_target_calendar(
         .ok_or_else(|| TasksError::Invalid("no writable calendar".to_string()))?;
     Ok(TargetCalendar {
         calendar_id: target.id.clone(),
-        // The matched category's STORED color, or `None` for untracked /
-        // categories without one — the event insert omits `colorId` then.
-        // Never inherited from the pattern or the parent.
-        google_color_id: category.and_then(|category| category.google_color_id.clone()),
+        // The matched category's hex color, or `None` for untracked /
+        // categories without one (or a blank one) — the event insert omits
+        // the label then. Never inherited from the pattern or the parent.
+        color_hex: category
+            .map(|category| category.color.trim().to_string())
+            .filter(|color| !color.is_empty()),
     })
 }
 
@@ -2461,9 +2467,10 @@ async fn resolve_target_calendar(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetCalendar {
     calendar_id: String,
-    /// Stored `google_color_id` of the matched category; `None` when the
-    /// title is untracked or the category has no stored color.
-    google_color_id: Option<String>,
+    /// Matched category's hex color; `None` when the title is untracked or
+    /// the category has no (non-blank) color — the event insert omits the
+    /// label then.
+    color_hex: Option<String>,
 }
 
 /// Whether a calendar looks writable: Google `access_role` is `owner` or
@@ -3094,7 +3101,6 @@ mod tests {
                 color: category.color,
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id,
-                google_color_id: category.google_color_id,
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -3442,10 +3448,9 @@ mod tests {
             &NewTaskCategoryInput {
                 title: "Coding".to_string(),
                 slug: None,
-                color: "#2a5c8a".to_string(),
+                color: "#4285f4".to_string(),
                 is_productive: None,
                 google_calendar_id: None,
-                google_color_id: None,
                 list_id: None,
                 parent_id: Some(ids["work"].clone()),
                 sort_order: None,
@@ -4261,6 +4266,24 @@ mod tests {
         }
     }
 
+    /// All 24 event-label hexes as a cached `event_labels` JSON array with
+    /// stable fake ids (`label-0` … `label-23`) — the fixture's default
+    /// cache, so colored starts resolve their label id locally (create_event
+    /// never fetches).
+    fn event_labels_json() -> String {
+        let labels: Vec<serde_json::Value> = crate::GOOGLE_EVENT_LABEL_COLORS
+            .iter()
+            .enumerate()
+            .map(|(index, hex)| {
+                serde_json::json!({
+                    "id": format!("label-{index}"),
+                    "backgroundColor": hex,
+                })
+            })
+            .collect();
+        serde_json::to_string(&labels).expect("event labels serialize")
+    }
+
     /// A writable primary calendar for `u-1` — the default target.
     fn calendar(google_cal_id: &str, is_primary: bool) -> GoogleCalendar {
         GoogleCalendar {
@@ -4274,6 +4297,9 @@ mod tests {
             sync_enabled: true,
             sync_token: String::new(),
             last_synced_at: None,
+            // The 24 seeded labels with stable fake ids — tasks never syncs,
+            // so this is the cache `create_event` resolves colors against.
+            event_labels: event_labels_json(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4356,6 +4382,21 @@ mod tests {
             _enabled: bool,
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn set_event_labels(
+            &self,
+            id: &str,
+            event_labels_json: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            // Persist into the in-memory rows (tasks never reads it back, but
+            // the fake must mirror the D1 write).
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.event_labels = event_labels_json.to_string();
+            }
             Ok(())
         }
 
@@ -4648,10 +4689,9 @@ mod tests {
             &NewTaskCategoryInput {
                 title: "SpicyHome".to_string(),
                 slug: None,
-                color: "#2a5c8a".to_string(),
+                color: "#4285f4".to_string(),
                 is_productive: None,
                 google_calendar_id: category_calendar.map(str::to_string),
-                google_color_id: None,
                 list_id: None,
                 parent_id: Some(ids["work"].clone()),
                 sort_order: None,
@@ -4818,8 +4858,20 @@ mod tests {
             "start never takes focus: {body}"
         );
         assert!(body.get("private").is_none(), "carrier is shared, not private");
-        // The matched Work category's stored color (seed hex #2a5c8a → "9").
-        assert_eq!(body["colorId"], "9");
+        // The matched Work category's hex (#4285f4, cobalt) resolves to its
+        // cached label id — never a `colorId`, and the POST carries
+        // `eventLabelVersion=1`.
+        let cobalt_index = crate::GOOGLE_EVENT_LABEL_COLORS
+            .iter()
+            .position(|hex| *hex == "#4285f4")
+            .expect("cobalt is one of the 24 labels");
+        let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("eventLabelVersion=1"), "{url}");
+        assert_eq!(body["eventLabelId"], format!("label-{cobalt_index}"));
+        assert!(
+            body.get("colorId").is_none(),
+            "the event insert never sends colorId: {body}"
+        );
 
         // `started` log with the event's calendar + google ids.
         let inserted = logs.inserted.lock().unwrap().clone();
@@ -5210,7 +5262,7 @@ mod tests {
     }
 
     #[test]
-    fn start_omits_color_id_when_category_has_none() {
+    fn start_omits_event_label_when_category_has_no_color() {
         let (lists, categories, tasks) = seeded();
         let task = work_task(&lists, &categories, &tasks);
         // Erase the stored color (direct store mutation — the fake's update
@@ -5221,7 +5273,7 @@ mod tests {
                 .iter_mut()
                 .find(|row| row.slug == "work" && row.user_id == "u-1")
                 .unwrap();
-            work.google_color_id = None;
+            work.color = String::new();
         }
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
@@ -5240,11 +5292,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
-        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
+            body.get("eventLabelId").is_none(),
+            "no category color → the event insert omits eventLabelId"
+        );
+        assert!(
             body.get("colorId").is_none(),
-            "no stored color → the event insert omits colorId"
+            "no category color → the event insert omits colorId"
+        );
+        assert!(
+            !url.contains("eventLabelVersion"),
+            "no category color → no eventLabelVersion: {url}"
         );
     }
 

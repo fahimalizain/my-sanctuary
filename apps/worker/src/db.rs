@@ -30,7 +30,8 @@ use api_core::repo::{
     AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
-    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL,
+    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
@@ -430,6 +431,24 @@ impl CalendarRepo for D1CalendarRepo {
             .prepare(CALENDAR_SET_SYNC_ENABLED_SQL)
             .bind_refs(&[
                 D1Type::Integer(i32::from(enabled)),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn set_event_labels(
+        &self,
+        id: &str,
+        event_labels_json: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_SET_EVENT_LABELS_SQL)
+            .bind_refs(&[
+                D1Type::Text(event_labels_json),
                 D1Type::Text(now_rfc3339),
                 D1Type::Text(id),
             ])
@@ -1269,7 +1288,6 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
         let list_id = optional_text(category.list_id.as_deref());
         let parent_id = optional_text(category.parent_id.as_deref());
         let google_calendar_id = optional_text(category.google_calendar_id.as_deref());
-        let google_color_id = optional_text(category.google_color_id.as_deref());
         let stmt = self
             .db
             .prepare(TASK_CATEGORY_INSERT_SQL)
@@ -1283,7 +1301,6 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
                 D1Type::Text(&category.color),
                 D1Type::Integer(i32::from(category.is_productive)),
                 google_calendar_id,
-                google_color_id,
                 D1Type::Integer(category.sort_order as i32),
                 D1Type::Integer(i32::from(category.is_untracked)),
                 D1Type::Text(&now),
@@ -1301,7 +1318,6 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
             color: category.color,
             is_productive: category.is_productive,
             google_calendar_id: category.google_calendar_id,
-            google_color_id: category.google_color_id,
             sort_order: category.sort_order,
             is_untracked: category.is_untracked,
             created_at: now.clone(),
@@ -1327,7 +1343,6 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
             None => D1Type::Null,
         };
         let google_calendar_id = optional_text(updates.google_calendar_id.as_deref());
-        let google_color_id = optional_text(updates.google_color_id.as_deref());
         let sort_order = match updates.sort_order {
             Some(value) => D1Type::Integer(value as i32),
             None => D1Type::Null,
@@ -1343,7 +1358,6 @@ impl TaskCategoryRepo for D1TaskCategoryRepo {
             color,
             is_productive,
             google_calendar_id,
-            google_color_id,
             sort_order,
             optional_text(parent_id),
             optional_text(parent_id),

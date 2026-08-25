@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
 import { CalendarPicker } from '@/app/components/CalendarPicker';
+import { EventLabelColorPicker } from '@/app/components/EventLabelColorPicker';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -18,6 +19,10 @@ import {
 } from '@/app/queries/categories';
 import { useCalendarsQuery } from '@/app/queries/calendar';
 import { useListsQuery } from '@/app/queries/lists';
+import {
+  DEFAULT_EVENT_LABEL_COLOR,
+  isEventLabelHex,
+} from '@/lib/event-label-colors';
 import type {
   Category,
   NewCategoryInput,
@@ -79,7 +84,7 @@ export function CategoriesPage() {
   // Category dialog state.
   const [form, setForm] = useState<CategoryFormState | null>(null);
   const [title, setTitle] = useState('');
-  const [color, setColor] = useState('#2a5c8a');
+  const [color, setColor] = useState(DEFAULT_EVENT_LABEL_COLOR);
   const [isProductive, setIsProductive] = useState(false);
   const [googleCalendarId, setGoogleCalendarId] = useState('');
   const [patterns, setPatterns] = useState<PatternDraft[]>([]);
@@ -123,7 +128,9 @@ export function CategoriesPage() {
   const openCreateRoot = (list: TaskList) => {
     setForm({ mode: 'create', list });
     setTitle('');
-    setColor(list.color);
+    // Create always opens on peacock — never the list's color (locked
+    // product decision: the category is its own row, not a list echo).
+    setColor(DEFAULT_EVENT_LABEL_COLOR);
     setIsProductive(false);
     setGoogleCalendarId('');
     setPatterns([]);
@@ -133,7 +140,7 @@ export function CategoriesPage() {
   const openCreateChild = (parent: Category) => {
     setForm({ mode: 'create', parent });
     setTitle('');
-    setColor(parent.color || '#2a5c8a');
+    setColor(DEFAULT_EVENT_LABEL_COLOR);
     setIsProductive(false);
     setGoogleCalendarId('');
     setPatterns([]);
@@ -143,7 +150,14 @@ export function CategoriesPage() {
   const openEditCategory = (category: Category) => {
     setForm({ mode: 'edit', category });
     setTitle(category.title);
-    setColor(category.color || '#2a5c8a');
+    // A stale non-palette hex must never survive an edit round-trip: if the
+    // stored color is not one of the 24 swatches, reset to peacock (the API
+    // rejects non-palette hexes on PATCH).
+    setColor(
+      isEventLabelHex(category.color)
+        ? category.color.trim().toLowerCase()
+        : DEFAULT_EVENT_LABEL_COLOR,
+    );
     setIsProductive(category.is_productive);
     setGoogleCalendarId(category.google_calendar_id ?? '');
     setPatterns(
@@ -520,18 +534,12 @@ export function CategoriesPage() {
               <label className="text-sm font-medium text-foreground">
                 Color
               </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="color"
-                  value={color}
-                  onChange={(e) => setColor(e.target.value)}
-                  className="h-10 w-14 rounded-lg border border-input bg-background cursor-pointer"
-                  aria-label="Category color"
-                />
-                <span className="text-sm text-muted-foreground font-mono">
-                  {color}
-                </span>
-              </div>
+              <EventLabelColorPicker
+                value={color}
+                onChange={setColor}
+                aria-label="Category color"
+              />
+              <p className="text-xs text-muted-foreground font-mono">{color}</p>
             </div>
 
             <div className="flex items-center gap-2 mb-5">

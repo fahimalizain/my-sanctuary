@@ -19,20 +19,25 @@
 //! Error/ownership rules:
 //! - Missing, soft-deleted, or another user's list is always [`ListsError::NotFound`]
 //!   — ownership is never leaked as a different status.
-//! - Invalid input (empty name/color, empty PATCH body) is
+//! - Invalid input (empty name/color, non-palette color, empty PATCH body) is
 //!   [`ListsError::Invalid`] → HTTP 400.
 
 use thiserror::Error;
 
+use crate::google_color::{canonicalize_hex, is_event_label_hex};
 use crate::models::{NewTaskList, TaskList, UpdateTaskList};
 use crate::repo::{RepoError, TaskCategoryRepo, TaskListRepo};
 
 /// The first-visit seed: the four default lists, `sort_order` 0..3.
+///
+/// Colors are event-label palette hexes (see [`crate::google_color`]):
+/// Work = cobalt, Fitness = tangerine, Family = grape, Personal = basil.
+/// Existing rows are never migrated — only brand-new users see these.
 pub const SEED_LISTS: [(&str, &str, i64); 4] = [
-    ("Work", "#2a5c8a", 0),
-    ("Fitness", "#c45a2c", 1),
-    ("Family", "#7a4a6a", 2),
-    ("Personal", "#3a7a5a", 3),
+    ("Work", "#4285f4", 0),
+    ("Fitness", "#f4511e", 1),
+    ("Family", "#8e24aa", 2),
+    ("Personal", "#0b8043", 3),
 ];
 
 /// Errors produced by the lists service.
@@ -120,9 +125,10 @@ pub async fn list_lists(
 
 /// Creates a list for the user.
 ///
-/// `name` is trimmed and must not be empty; `color` is trimmed and must not be
-/// empty (the UI sends hex like `#2a5c8a`). Both violations are
-/// [`ListsError::Invalid`] → HTTP 400.
+/// `name` is trimmed and must not be empty; `color` must be one of the 24
+/// Google event-label hexes (trimmed, case-insensitive) and is stored in its
+/// canonical lowercase `#rrggbb` form. Violations are [`ListsError::Invalid`]
+/// → HTTP 400.
 pub async fn create_list(
     repo: &dyn TaskListRepo,
     user_id: &str,
@@ -133,15 +139,12 @@ pub async fn create_list(
     if name.is_empty() {
         return Err(ListsError::Invalid("name must not be empty".to_string()));
     }
-    let color = color.trim();
-    if color.is_empty() {
-        return Err(ListsError::Invalid("color must not be empty".to_string()));
-    }
+    let color = validate_color(color)?;
     let list = repo
         .insert(NewTaskList {
             user_id: user_id.to_string(),
             name: name.to_string(),
-            color: color.to_string(),
+            color,
             sort_order: 0,
         })
         .await?;
@@ -151,8 +154,11 @@ pub async fn create_list(
 /// Updates a list's `name`/`color`/`sort_order` (`None` = unchanged).
 ///
 /// - A body with nothing to update is [`ListsError::Invalid`] (400).
-/// - A name that trims to empty, or a color that trims to empty, is
-///   [`ListsError::Invalid`] (400).
+/// - A name that trims to empty is [`ListsError::Invalid`] (400).
+/// - A `color` that trims to empty, is not a hex, or is not one of the 24
+///   Google event-label hexes is [`ListsError::Invalid`] (400). A present
+///   color is stored canonicalized; an omitted one leaves the stored hex
+///   untouched (stale non-palette hexes keep loading until a color PATCH).
 /// - A missing, soft-deleted, or another user's list is
 ///   [`ListsError::NotFound`] (404) — ownership is never leaked.
 pub async fn update_list(
@@ -161,6 +167,7 @@ pub async fn update_list(
     id: &str,
     updates: &UpdateTaskList,
 ) -> Result<TaskListResponse, ListsError> {
+    let mut updates = updates.clone();
     if updates.name.is_none() && updates.color.is_none() && updates.sort_order.is_none() {
         return Err(ListsError::Invalid("nothing to update".to_string()));
     }
@@ -170,9 +177,8 @@ pub async fn update_list(
         }
     }
     if let Some(color) = updates.color.as_deref() {
-        if color.trim().is_empty() {
-            return Err(ListsError::Invalid("color must not be empty".to_string()));
-        }
+        let color = validate_color(color)?;
+        updates.color = Some(color);
     }
 
     let Some(list) = repo.get_by_id(id).await? else {
@@ -184,7 +190,7 @@ pub async fn update_list(
         return Err(ListsError::NotFound);
     }
 
-    let Some(updated) = repo.update(id, updates).await? else {
+    let Some(updated) = repo.update(id, &updates).await? else {
         // Deleted between the read and the write.
         return Err(ListsError::NotFound);
     };
@@ -217,6 +223,29 @@ pub async fn delete_list(
     }
     repo.soft_delete(id, now_rfc3339).await?;
     Ok(DeleteListResponse { success: true })
+}
+
+/// Validates a list color for writes: trimmed, must be a hex that is exactly
+/// one of the 24 Google event-label hexes (case-insensitive); returns the
+/// canonical lowercase `#rrggbb` form to persist.
+///
+/// - empty → `"color must not be empty"`
+/// - unparseable hex (`blue`, `#gg0000`) → `"color must be #rgb or #rrggbb"`
+/// - parseable but not among the 24 (`#535050`, `#2a5c8a`) → the palette
+///   message below
+fn validate_color(color: &str) -> Result<String, ListsError> {
+    let color = color.trim();
+    if color.is_empty() {
+        return Err(ListsError::Invalid("color must not be empty".to_string()));
+    }
+    let canonical = canonicalize_hex(color)
+        .map_err(|err| ListsError::Invalid(err.to_string()))?;
+    if !is_event_label_hex(&canonical) {
+        return Err(ListsError::Invalid(
+            "color must be one of the 24 Google event-label hexes".to_string(),
+        ));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -433,7 +462,6 @@ mod tests {
                 color: category.color.clone(),
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id.clone(),
-                google_color_id: category.google_color_id.clone(),
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -552,7 +580,7 @@ mod tests {
         let orders: Vec<i64> = response.lists.iter().map(|list| list.sort_order).collect();
         assert_eq!(orders, [0, 1, 2, 3]);
         let colors: Vec<&str> = response.lists.iter().map(|list| list.color.as_str()).collect();
-        assert_eq!(colors, ["#2a5c8a", "#c45a2c", "#7a4a6a", "#3a7a5a"]);
+        assert_eq!(colors, ["#4285f4", "#f4511e", "#8e24aa", "#0b8043"]);
         assert!(response.lists.iter().all(|list| list.user_id == "u-1"));
     }
 
@@ -597,12 +625,12 @@ mod tests {
     // ──────────────────────────────────────────
 
     #[test]
-    fn create_list_trims_name_and_color() {
+    fn create_list_trims_name_and_canonicalizes_color() {
         let repo = FakeTaskListRepo::with(Vec::new());
-        let response = pollster::block_on(create_list(&repo, "u-1", "  Work?  ", "  #2a5c8a  "))
+        let response = pollster::block_on(create_list(&repo, "u-1", "  Work?  ", "  #039BE5  "))
             .unwrap();
         assert_eq!(response.list.name, "Work?");
-        assert_eq!(response.list.color, "#2a5c8a");
+        assert_eq!(response.list.color, "#039be5", "palette hex stored canonical lowercase");
         assert_eq!(response.list.sort_order, 0);
         assert_eq!(response.list.user_id, "u-1");
     }
@@ -610,9 +638,9 @@ mod tests {
     #[test]
     fn create_list_rejects_empty_or_whitespace_name() {
         let repo = FakeTaskListRepo::with(Vec::new());
-        let empty = pollster::block_on(create_list(&repo, "u-1", "", "#2a5c8a"));
+        let empty = pollster::block_on(create_list(&repo, "u-1", "", "#039be5"));
         assert!(matches!(empty, Err(ListsError::Invalid(m)) if m == "name must not be empty"));
-        let blank = pollster::block_on(create_list(&repo, "u-1", "   ", "#2a5c8a"));
+        let blank = pollster::block_on(create_list(&repo, "u-1", "   ", "#039be5"));
         assert!(matches!(blank, Err(ListsError::Invalid(_))));
         assert!(repo.inserted.lock().unwrap().is_empty(), "nothing persisted");
     }
@@ -622,6 +650,34 @@ mod tests {
         let repo = FakeTaskListRepo::with(Vec::new());
         let empty = pollster::block_on(create_list(&repo, "u-1", "Work", ""));
         assert!(matches!(empty, Err(ListsError::Invalid(m)) if m == "color must not be empty"));
+        let blank = pollster::block_on(create_list(&repo, "u-1", "Work", "   "));
+        assert!(matches!(blank, Err(ListsError::Invalid(m)) if m == "color must not be empty"));
+        assert!(repo.inserted.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    #[test]
+    fn create_list_rejects_non_palette_hexes() {
+        let repo = FakeTaskListRepo::with(Vec::new());
+        // Parseable hexes that are not among the 24 event labels.
+        for bad in ["#535050", "#2a5c8a", "#3a3a3a"] {
+            assert!(
+                matches!(
+                    pollster::block_on(create_list(&repo, "u-1", "Work", bad)),
+                    Err(ListsError::Invalid(m)) if m == "color must be one of the 24 Google event-label hexes"
+                ),
+                "color {bad:?} must be rejected as not-in-palette"
+            );
+        }
+        // Non-hex strings keep the parse message.
+        for bad in ["blue", "#gg0000", "2a5c8a"] {
+            assert!(
+                matches!(
+                    pollster::block_on(create_list(&repo, "u-1", "Work", bad)),
+                    Err(ListsError::Invalid(m)) if m == "color must be #rgb or #rrggbb"
+                ),
+                "color {bad:?} must be rejected as non-hex"
+            );
+        }
         assert!(repo.inserted.lock().unwrap().is_empty(), "nothing persisted");
     }
 
@@ -642,6 +698,64 @@ mod tests {
         let response = pollster::block_on(update_list(&repo, "u-1", "l-1", &updates)).unwrap();
         assert_eq!(response.list.name, "Deep Work");
         assert_eq!(response.list.color, "#2a5c8a", "color left unchanged");
+    }
+
+    #[test]
+    fn update_list_name_only_leaves_stale_non_palette_color_untouched() {
+        // A PATCH that does not send `color` must succeed even when the
+        // stored hex is not one of the 24 event labels.
+        let repo = FakeTaskListRepo::with(vec![
+            FakeTaskListRepo::row("l-1", "u-1", "Work", "#2a5c8a", 0),
+        ]);
+        let updates = UpdateTaskList {
+            name: Some("Renamed".to_string()),
+            color: None,
+            sort_order: None,
+        };
+        let response = pollster::block_on(update_list(&repo, "u-1", "l-1", &updates)).unwrap();
+        assert_eq!(response.list.name, "Renamed");
+        assert_eq!(
+            response.list.color, "#2a5c8a",
+            "stale non-palette hex survives a color-less PATCH"
+        );
+    }
+
+    #[test]
+    fn update_list_color_is_canonicalized_and_must_be_palette() {
+        let repo = FakeTaskListRepo::with(vec![
+            FakeTaskListRepo::row("l-1", "u-1", "Work", "#2a5c8a", 0),
+        ]);
+        // A parseable but non-palette hex is a 400 and the row is untouched.
+        let bad = UpdateTaskList {
+            name: None,
+            color: Some("#535050".to_string()),
+            sort_order: None,
+        };
+        assert!(matches!(
+            pollster::block_on(update_list(&repo, "u-1", "l-1", &bad)),
+            Err(ListsError::Invalid(m)) if m == "color must be one of the 24 Google event-label hexes"
+        ));
+        let stale = UpdateTaskList {
+            name: None,
+            color: Some("#2a5c8a".to_string()),
+            sort_order: None,
+        };
+        assert!(matches!(
+            pollster::block_on(update_list(&repo, "u-1", "l-1", &stale)),
+            Err(ListsError::Invalid(m)) if m == "color must be one of the 24 Google event-label hexes"
+        ));
+        // The stored row still carries its original hex.
+        let row = pollster::block_on(repo.get_by_id("l-1")).unwrap().unwrap();
+        assert_eq!(row.color, "#2a5c8a");
+
+        // A palette hex is canonicalized (case + whitespace folded).
+        let ok = UpdateTaskList {
+            name: None,
+            color: Some("  #4285F4  ".to_string()),
+            sort_order: None,
+        };
+        let response = pollster::block_on(update_list(&repo, "u-1", "l-1", &ok)).unwrap();
+        assert_eq!(response.list.color, "#4285f4");
     }
 
     #[test]

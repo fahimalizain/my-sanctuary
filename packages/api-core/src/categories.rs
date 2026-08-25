@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use thiserror::Error;
 
-use crate::google_color::closest_google_color_id;
+use crate::google_color::{canonicalize_hex, is_event_label_hex};
 use crate::lists::SEED_LISTS;
 use crate::models::{
     NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, TaskCategory,
@@ -90,7 +90,6 @@ pub struct CategoryView {
     pub color: String,
     pub is_productive: bool,
     pub google_calendar_id: Option<String>,
-    pub google_color_id: Option<String>,
     pub sort_order: i64,
     pub is_untracked: bool,
     pub created_at: String,
@@ -334,9 +333,6 @@ pub async fn ensure_taxonomy(
                     color: list.color.clone(),
                     is_productive: matches!(name, "Work" | "Fitness"),
                     google_calendar_id: None,
-                    // Derived from the list's hex color (seed hexes are
-                    // valid `#rrggbb`); map errors instead of panicking.
-                    google_color_id: Some(map_color(&list.color)?),
                     sort_order: list.sort_order,
                     is_untracked: false,
                 })
@@ -368,7 +364,6 @@ pub async fn ensure_taxonomy(
                 color: String::new(),
                 is_productive: false,
                 google_calendar_id: None,
-                google_color_id: None,
                 sort_order: UNTRACKED_SORT_ORDER,
                 is_untracked: true,
             })
@@ -448,7 +443,9 @@ pub async fn list_categories(
 /// Creates a category (root when `parent_id` is absent, child otherwise).
 ///
 /// Validation (all 400 unless noted):
-/// - `title`/`color` must not be empty; `slug` is slugified from `title`
+/// - `title` must not be empty; `color` must be one of the 24 Google
+///   event-label hexes (trimmed, case-insensitive) and is stored in its
+///   canonical lowercase `#rrggbb` form; `slug` is slugified from `title`
 ///   when omitted, and must be unique among the user's living categories
 ///   (Conflict).
 /// - `is_untracked` cannot be set via the API (the sink is system-seeded).
@@ -468,10 +465,7 @@ pub async fn create_category(
     if title.is_empty() {
         return Err(CategoriesError::Invalid("title must not be empty".to_string()));
     }
-    let color = input.color.trim().to_string();
-    if color.is_empty() {
-        return Err(CategoriesError::Invalid("color must not be empty".to_string()));
-    }
+    let color = validate_color(&input.color)?;
     if input.is_untracked == Some(true) {
         return Err(CategoriesError::Invalid(
             "is_untracked can only be set by the system".to_string(),
@@ -486,9 +480,6 @@ pub async fn create_category(
         validate_pattern(pattern)?;
     }
     let google_calendar_id = normalize_optional(input.google_calendar_id.as_deref());
-    // The client's `google_color_id` is ignored: the stored id is derived
-    // from the (non-empty, hex) `color` above.
-    let google_color_id = Some(map_color(&color)?);
     let sort_order = input.sort_order.unwrap_or(0);
 
     let (parent_id, list_id, parent) = match input.parent_id.as_deref() {
@@ -540,7 +531,6 @@ pub async fn create_category(
             color,
             is_productive: input.is_productive.unwrap_or(false),
             google_calendar_id,
-            google_color_id,
             sort_order,
             is_untracked: false,
         })
@@ -580,19 +570,13 @@ pub async fn update_category(
     id: &str,
     updates: &UpdateTaskCategory,
 ) -> Result<CategoryResponse, CategoriesError> {
-    // Work on an owned clone — the caller's struct is never mutated. The
-    // client's `google_color_id` is not a write: the stored id is derived
-    // from `color` below (or preserved by the repo's COALESCE when `color`
-    // is absent), so it is cleared first. A body that sends *only*
-    // `google_color_id` therefore falls out as "nothing to update".
+    // Work on an owned clone — the caller's struct is never mutated.
     let mut updates = updates.clone();
-    updates.google_color_id = None;
     if updates.title.is_none()
         && updates.slug.is_none()
         && updates.color.is_none()
         && updates.is_productive.is_none()
         && updates.google_calendar_id.is_none()
-        && updates.google_color_id.is_none()
         && updates.list_id.is_none()
         && updates.parent_id.is_none()
         && updates.sort_order.is_none()
@@ -625,12 +609,10 @@ pub async fn update_category(
         }
     }
     if let Some(color) = updates.color.as_deref() {
-        if color.trim().is_empty() {
-            return Err(CategoriesError::Invalid("color must not be empty".to_string()));
-        }
-        // The stored google_color_id always derives from the hex color;
-        // `None` here would leave the old id via the repo's COALESCE.
-        updates.google_color_id = Some(map_color(color)?);
+        // A present color must be one of the 24 event-label hexes; it is
+        // stored canonicalized.
+        let color = validate_color(color)?;
+        updates.color = Some(color.clone());
     }
     if let Some(slug) = updates.slug.as_deref() {
         let slug = slug.trim();
@@ -765,7 +747,6 @@ fn to_view(
         color: category.color.clone(),
         is_productive: category.is_productive,
         google_calendar_id: category.google_calendar_id.clone(),
-        google_color_id: category.google_color_id.clone(),
         sort_order: category.sort_order,
         is_untracked: category.is_untracked,
         created_at: category.created_at.clone(),
@@ -783,14 +764,31 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Maps a hex color to the nearest Google event colorId (`"1"`..=`"11"`).
+/// Validates a category color for writes: trimmed, must be a hex that is
+/// exactly one of the 24 Google event-label hexes (case-insensitive); returns
+/// the canonical lowercase `#rrggbb` form to persist.
 ///
-/// The client's `google_color_id` is never trusted: create/update/seed all
-/// derive the stored id from the category's hex `color` through
-/// [`closest_google_color_id`]. Non-hex colors (not `#rgb` / `#rrggbb`) are
-/// rejected with `CategoriesError::Invalid`.
-fn map_color(color: &str) -> Result<String, CategoriesError> {
-    closest_google_color_id(color).map_err(|err| CategoriesError::Invalid(err.to_string()))
+/// - empty → `"color must not be empty"`
+/// - unparseable hex (`blue`, `#gg0000`) → `"color must be #rgb or #rrggbb"`
+/// - parseable but not among the 24 (`#535050`, `#2a5c8a`) → the palette
+///   message below
+///
+/// Only `create_category`/`update_category` run this check; the taxonomy
+/// seed (`ensure_taxonomy`) inserts via the repo so the system `untracked`
+/// sink keeps an empty color.
+fn validate_color(color: &str) -> Result<String, CategoriesError> {
+    let color = color.trim();
+    if color.is_empty() {
+        return Err(CategoriesError::Invalid("color must not be empty".to_string()));
+    }
+    let canonical = canonicalize_hex(color)
+        .map_err(|err| CategoriesError::Invalid(err.to_string()))?;
+    if !is_event_label_hex(&canonical) {
+        return Err(CategoriesError::Invalid(
+            "color must be one of the 24 Google event-label hexes".to_string(),
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Normalizes a pattern set: trimmed regex, blank calendar ids → `None`.
@@ -882,7 +880,6 @@ mod tests {
                 color: "#2a5c8a".to_string(),
                 is_productive,
                 google_calendar_id: None,
-                google_color_id: None,
                 sort_order,
                 is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -938,7 +935,6 @@ mod tests {
                 color: category.color.clone(),
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id.clone(),
-                google_color_id: category.google_color_id.clone(),
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -978,9 +974,6 @@ mod tests {
             }
             if let Some(google_calendar_id) = &updates.google_calendar_id {
                 row.google_calendar_id = Some(google_calendar_id.clone());
-            }
-            if let Some(google_color_id) = &updates.google_color_id {
-                row.google_color_id = Some(google_color_id.clone());
             }
             if let Some(sort_order) = updates.sort_order {
                 row.sort_order = sort_order;
@@ -1269,7 +1262,6 @@ mod tests {
             color: color.to_string(),
             is_productive: None,
             google_calendar_id: None,
-            google_color_id: None,
             list_id: None,
             parent_id: None,
             sort_order: None,
@@ -1564,17 +1556,6 @@ mod tests {
         let family = categories.iter().find(|cat| cat.slug == "family").unwrap();
         assert!(!family.is_productive, "Family is not productive");
 
-        // Each root's stored google_color_id derives from its hex color.
-        for cat in categories.iter().filter(|cat| !cat.is_untracked) {
-            assert_eq!(
-                cat.google_color_id,
-                Some(closest_google_color_id(&cat.color).unwrap()),
-                "{} ({}) derives its google color id",
-                cat.title,
-                cat.color
-            );
-        }
-
         // Two patterns per root, none on untracked.
         let mut pattern_count = 0;
         for category in &categories {
@@ -1590,10 +1571,6 @@ mod tests {
         let untracked = categories.iter().find(|cat| cat.is_untracked).unwrap();
         assert_eq!(untracked.slug, "untracked");
         assert_eq!(untracked.list_id, None);
-        assert_eq!(
-            untracked.google_color_id, None,
-            "untracked has no color, so no derived google color id"
-        );
         assert_eq!(
             pollster::block_on(category_repo.list_patterns_by_category_id(&untracked.id))
                 .unwrap()
@@ -1647,10 +1624,6 @@ mod tests {
         let categories = pollster::block_on(category_repo.list_by_user_id("u-1")).unwrap();
         assert_eq!(categories.len(), 1);
         assert!(categories[0].is_untracked);
-        assert_eq!(
-            categories[0].google_color_id, None,
-            "untracked is inserted without a google color id"
-        );
     }
 
     // ──────────────────────────────────────────
@@ -1742,7 +1715,7 @@ mod tests {
     fn create_root_with_list_id_and_patterns() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
-        let mut new_input = input("  Deep Work  ", "  #2a5c8a  ");
+        let mut new_input = input("  Deep Work  ", "  #039BE5  ");
         new_input.list_id = Some("l-1".to_string());
         new_input.is_productive = Some(true);
         new_input.patterns = vec![pattern("^Deep Work$"), pattern("^.* [|] Deep Work$")];
@@ -1751,11 +1724,9 @@ mod tests {
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.slug, "deep-work", "slugified from the title");
-        assert_eq!(category.color, "#2a5c8a");
         assert_eq!(
-            category.google_color_id.as_deref(),
-            Some("9"),
-            "stored google_color_id derives from the hex color"
+            category.color, "#039be5",
+            "uppercase/whitespace palette hex is stored canonical lowercase"
         );
         assert!(category.is_productive);
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
@@ -1765,18 +1736,16 @@ mod tests {
     }
 
     #[test]
-    fn create_derives_google_color_id_and_ignores_client_value() {
+    fn create_stores_canonical_hex_color() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
-        let mut new_input = input("Work", "#2a5c8a");
+        let mut new_input = input("Work", "#4285f4");
         new_input.list_id = Some("l-1".to_string());
-        new_input.google_color_id = Some("1".to_string());
 
         let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
         assert_eq!(
-            response.category.google_color_id.as_deref(),
-            Some("9"),
-            "the client's google_color_id is ignored in favor of the derived id"
+            response.category.color, "#4285f4",
+            "the canonical hex is stored; no google_color_id is derived or served"
         );
     }
 
@@ -1811,17 +1780,37 @@ mod tests {
     }
 
     #[test]
-    fn create_accepts_shorthand_hex() {
+    fn create_accepts_uppercase_and_whitespace_palette_hex_and_stores_canonical() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
-        let mut new_input = input("Work", "#abc");
+        let mut new_input = input("Work", "  #4285F4  ");
         new_input.list_id = Some("l-1".to_string());
 
         let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
+        assert_eq!(response.category.color, "#4285f4");
+    }
+
+    #[test]
+    fn create_rejects_parseable_hexes_not_in_the_event_label_palette() {
+        let repo = FakeTaskCategoryRepo::new();
+        let lists = FakeTaskListRepo::new();
+        // #abc expands to #aabbcc; #535050/#2a5c8a are valid hexes — none is
+        // one of the 24 event-label hexes.
+        for bad in ["#abc", "#535050", "#2a5c8a", "#3a3a3a"] {
+            let mut new_input = input("Work", bad);
+            new_input.list_id = Some("l-1".to_string());
+            assert!(
+                matches!(
+                    pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
+                    Err(CategoriesError::Invalid(message)) if message == "color must be one of the 24 Google event-label hexes"
+                ),
+                "color {bad:?} must be rejected as not-in-palette"
+            );
+        }
         assert_eq!(
-            response.category.google_color_id,
-            Some(closest_google_color_id("#abc").unwrap()),
-            "#rgb expands by doubling nibbles before mapping"
+            pollster::block_on(repo.count_by_user_id("u-1")).unwrap(),
+            0,
+            "nothing persisted"
         );
     }
 
@@ -1832,7 +1821,7 @@ mod tests {
             FakeTaskCategoryRepo::row("l-1", "u-2", None, None, "Other", "other", false, false, 0),
         ]);
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
-        let mut new_input = input("Code Reviews", "#2a5c8a");
+        let mut new_input = input("Code Reviews", "#4285f4");
         new_input.parent_id = Some("root".to_string());
 
         let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
@@ -1848,7 +1837,7 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
         let lists = FakeTaskListRepo::new();
-        let mut new_input = input("Child", "#2a5c8a");
+        let mut new_input = input("Child", "#4285f4");
         new_input.parent_id = Some("root".to_string());
         new_input.list_id = Some("l-1".to_string());
         assert!(matches!(
@@ -1862,7 +1851,7 @@ mod tests {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::new();
         assert!(matches!(
-            pollster::block_on(create_category(&repo, &lists, "u-1", &input("Work", "#2a5c8a"))),
+            pollster::block_on(create_category(&repo, &lists, "u-1", &input("Work", "#4285f4"))),
             Err(CategoriesError::Invalid(message)) if message == "root categories must have a list_id"
         ));
     }
@@ -1874,7 +1863,7 @@ mod tests {
             FakeTaskCategoryRepo::row("child", "u-1", None, Some("root"), "Coding", "coding", false, false, 0),
         ]);
         let lists = FakeTaskListRepo::new();
-        let mut new_input = input("Grandchild", "#2a5c8a");
+        let mut new_input = input("Grandchild", "#4285f4");
         new_input.parent_id = Some("child".to_string());
         assert!(matches!(
             pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
@@ -1888,13 +1877,13 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-2", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
         let lists = FakeTaskListRepo::new();
-        let mut new_input = input("Child", "#2a5c8a");
+        let mut new_input = input("Child", "#4285f4");
         new_input.parent_id = Some("root".to_string());
         assert!(matches!(
             pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
             Err(CategoriesError::NotFound)
         ));
-        let mut other = input("Child", "#2a5c8a");
+        let mut other = input("Child", "#4285f4");
         other.parent_id = Some("nope".to_string());
         assert!(matches!(
             pollster::block_on(create_category(&repo, &lists, "u-1", &other)),
@@ -1907,7 +1896,7 @@ mod tests {
     fn create_rejects_empty_title_color_and_untracked_flag() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::new();
-        let mut no_title = input("   ", "#2a5c8a");
+        let mut no_title = input("   ", "#4285f4");
         no_title.list_id = Some("l-1".to_string());
         assert!(matches!(
             pollster::block_on(create_category(&repo, &lists, "u-1", &no_title)),
@@ -1919,7 +1908,7 @@ mod tests {
             pollster::block_on(create_category(&repo, &lists, "u-1", &no_color)),
             Err(CategoriesError::Invalid(message)) if message == "color must not be empty"
         ));
-        let mut sink = input("Work", "#2a5c8a");
+        let mut sink = input("Work", "#4285f4");
         sink.list_id = Some("l-1".to_string());
         sink.is_untracked = Some(true);
         assert!(matches!(
@@ -1933,7 +1922,7 @@ mod tests {
     fn create_rejects_bad_patterns() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::new();
-        let mut empty_pattern = input("Work", "#2a5c8a");
+        let mut empty_pattern = input("Work", "#4285f4");
         empty_pattern.list_id = Some("l-1".to_string());
         empty_pattern.patterns = vec![pattern("   ")];
         assert!(matches!(
@@ -1941,7 +1930,7 @@ mod tests {
             Err(CategoriesError::Invalid(message)) if message == "pattern regex must not be empty"
         ));
 
-        let mut bad_regex = input("Work", "#2a5c8a");
+        let mut bad_regex = input("Work", "#4285f4");
         bad_regex.list_id = Some("l-1".to_string());
         bad_regex.patterns = vec![pattern("(unclosed")];
         assert!(matches!(
@@ -1949,7 +1938,7 @@ mod tests {
             Err(CategoriesError::Invalid(message)) if message == "pattern regex does not compile"
         ));
 
-        let mut long_pattern = input("Work", "#2a5c8a");
+        let mut long_pattern = input("Work", "#4285f4");
         long_pattern.list_id = Some("l-1".to_string());
         long_pattern.patterns = vec![pattern(&"a".repeat(257))];
         assert!(matches!(
@@ -1965,7 +1954,7 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
-        let mut new_input = input("Work", "#2a5c8a");
+        let mut new_input = input("Work", "#4285f4");
         new_input.list_id = Some("l-1".to_string());
         assert!(matches!(
             pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
@@ -1977,7 +1966,7 @@ mod tests {
     fn create_root_rejects_another_users_list() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-2", "Theirs", 0)]);
-        let mut new_input = input("Work", "#2a5c8a");
+        let mut new_input = input("Work", "#4285f4");
         new_input.list_id = Some("l-1".to_string());
         assert!(
             matches!(
@@ -1993,7 +1982,7 @@ mod tests {
     fn create_root_rejects_missing_list() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::new();
-        let mut new_input = input("Work", "#2a5c8a");
+        let mut new_input = input("Work", "#4285f4");
         new_input.list_id = Some("no-such-list".to_string());
         assert!(matches!(
             pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)),
@@ -2006,7 +1995,7 @@ mod tests {
     fn create_root_with_own_list_is_ok() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
-        let mut new_input = input("Deep Work", "#2a5c8a");
+        let mut new_input = input("Deep Work", "#4285f4");
         new_input.list_id = Some("l-1".to_string());
         let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
         assert_eq!(response.category.inherited_list_id.as_deref(), Some("l-1"));
@@ -2029,7 +2018,7 @@ mod tests {
         let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             title: Some("Deep Work".to_string()),
-            color: Some("#3a3a3a".to_string()),
+            color: Some("#4285f4".to_string()),
             is_productive: Some(false),
             patterns: Some(vec![pattern("^Deep Work$")]),
             ..UpdateTaskCategory::default()
@@ -2037,12 +2026,7 @@ mod tests {
         let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
-        assert_eq!(category.color, "#3a3a3a");
-        assert_eq!(
-            category.google_color_id,
-            Some(closest_google_color_id("#3a3a3a").unwrap()),
-            "stored google_color_id derives from the new color"
-        );
+        assert_eq!(category.color, "#4285f4");
         assert!(!category.is_productive);
         assert_eq!(category.slug, "work", "slug untouched when omitted");
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
@@ -2051,32 +2035,10 @@ mod tests {
     }
 
     #[test]
-    fn update_derives_google_color_id_and_ignores_client_value() {
+    fn update_without_color_keeps_stored_color() {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
-        let lists = FakeTaskListRepo::new();
-        let updates = UpdateTaskCategory {
-            color: Some("#2a5c8a".to_string()),
-            google_color_id: Some("1".to_string()),
-            ..UpdateTaskCategory::default()
-        };
-        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
-        assert_eq!(
-            response.category.google_color_id.as_deref(),
-            Some("9"),
-            "the client's google_color_id is ignored; the id derives from the color"
-        );
-    }
-
-    #[test]
-    fn update_without_color_keeps_stored_google_color_id() {
-        let repo = FakeTaskCategoryRepo::with(vec![
-            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
-        ]);
-        // The fake `row()` helper hardcodes google_color_id None; seed the
-        // stored row directly.
-        repo.stored.lock().unwrap()[0].google_color_id = Some("7".to_string());
         let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             title: Some("Deep Work".to_string()),
@@ -2085,26 +2047,33 @@ mod tests {
         let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
         assert_eq!(response.category.title, "Deep Work");
         assert_eq!(
-            response.category.google_color_id.as_deref(),
-            Some("7"),
-            "COALESCE keeps the stored id when color is untouched"
+            response.category.color, "#2a5c8a",
+            "a stale non-palette hex survives a color-less PATCH"
         );
     }
 
     #[test]
-    fn update_google_color_id_alone_is_nothing_to_update() {
+    fn update_rejects_parseable_hexes_not_in_the_event_label_palette() {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
         let lists = FakeTaskListRepo::new();
-        let updates = UpdateTaskCategory {
-            google_color_id: Some("7".to_string()),
-            ..UpdateTaskCategory::default()
-        };
-        assert!(matches!(
-            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
-            Err(CategoriesError::Invalid(message)) if message == "nothing to update"
-        ));
+        for bad in ["#535050", "#2a5c8a"] {
+            let updates = UpdateTaskCategory {
+                color: Some(bad.to_string()),
+                ..UpdateTaskCategory::default()
+            };
+            assert!(
+                matches!(
+                    pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
+                    Err(CategoriesError::Invalid(message)) if message == "color must be one of the 24 Google event-label hexes"
+                ),
+                "color {bad:?} must be rejected as not-in-palette"
+            );
+        }
+        // Nothing persisted: the stored row is untouched.
+        let stored = pollster::block_on(repo.get_by_id("root")).unwrap().unwrap();
+        assert_eq!(stored.color, "#2a5c8a");
     }
 
     #[test]
@@ -2124,7 +2093,6 @@ mod tests {
         // Nothing persisted: the stored row is untouched.
         let stored = pollster::block_on(repo.get_by_id("root")).unwrap().unwrap();
         assert_eq!(stored.color, "#2a5c8a");
-        assert_eq!(stored.google_color_id, None);
     }
 
     #[test]
@@ -2313,7 +2281,7 @@ mod tests {
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
         let lists = FakeTaskListRepo::new();
-        let mut new_input = input("Code Reviews", "#2a5c8a");
+        let mut new_input = input("Code Reviews", "#4285f4");
         new_input.parent_id = Some("root".to_string());
         new_input.patterns = vec![pattern("^Review$")];
         let created =

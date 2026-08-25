@@ -48,6 +48,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::OAuthConfig;
+use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
     CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput, NewWatchChannel,
     WatchChannel,
@@ -95,6 +96,8 @@ pub const WATCH_DEFAULT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 pub enum CalendarError {
     #[error("{0}")]
     InvalidRange(String),
+    #[error("{0}")]
+    Invalid(String),
     #[error("calendar not found")]
     NotFound,
     /// Google returned 404 for `events.list` (calendar does not support it).
@@ -226,14 +229,14 @@ pub async fn list_events(
     now_unix: i64,
     watch_callback_url: Option<&str>,
 ) -> Result<CalendarListOutput, CalendarError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let mut cals = calendars.list_by_user_id(user_id).await?;
     if cals.is_empty() {
         // First contact with Google: import the calendar list, then re-read.
-        refresh_calendar_list(http, calendars, access, user_id).await?;
+        refresh_calendar_list(http, calendars, access, user_id, &now_rfc3339).await?;
         cals = calendars.list_by_user_id(user_id).await?;
     }
 
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let mut sync_errors: Vec<String> = Vec::new();
     let watch_callback_url = watch_callback_url.filter(|url| is_public_https_callback(url));
     for cal in &cals {
@@ -427,11 +430,41 @@ pub async fn create_event(
     if let Some(shared) = build_shared_properties(input) {
         payload["extendedProperties"] = serde_json::json!({ "shared": shared });
     }
-    // The stored category color, copied verbatim by `start_task`. Never
-    // included for hand-created events (`None`) or when blank after trim.
-    if let Some(color_id) = input.color_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        payload["colorId"] = serde_json::json!(color_id);
-    }
+    // Category color → Google event label: snap the caller's hex onto the 24
+    // event-label palette (chroma-first, persisted nowhere), then resolve the
+    // label's id against the calendar's CACHED `event_labels`. A cache miss
+    // or a missing match fails the start (400) — never a `calendars.get` and
+    // never a label write. `colorId` is never sent. Hand-created events
+    // (`None` / blank after trim) stay uncolored: no `eventLabelId`, and the
+    // POST URL stays without `eventLabelVersion`.
+    let url = match input.color_hex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(color_hex) => {
+            let snapped = snap_to_event_label_hex(color_hex)
+                .map_err(|err| CalendarError::Invalid(err.to_string()))?;
+            if cal.event_labels.is_empty() {
+                return Err(CalendarError::Invalid(
+                    "calendar event-label cache is empty".to_string(),
+                ));
+            }
+            let labels: Vec<CachedEventLabel> = serde_json::from_str(&cal.event_labels)
+                .map_err(|err| {
+                    CalendarError::Invalid(format!("invalid calendar event-label cache: {err}"))
+                })?;
+            let label_id = labels
+                .iter()
+                .find(|label| label.background_color.eq_ignore_ascii_case(&snapped))
+                .map(|label| label.id.clone())
+                .ok_or_else(|| {
+                    CalendarError::Invalid("no event label matches category color".to_string())
+                })?;
+            payload["eventLabelId"] = serde_json::json!(label_id);
+            format!(
+                "{GOOGLE_EVENTS_BASE_URL}/{}/events?eventLabelVersion=1",
+                encode_path_segment(&cal.google_calendar_id)
+            )
+        }
+        None => url,
+    };
     let body =
         serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
     let (status, response) = http.post_json(&url, &access.access_token, &body).await?;
@@ -599,11 +632,12 @@ pub async fn list_calendars(
     calendars: &dyn CalendarRepo,
     access: &GoogleAccess,
     user_id: &str,
+    now_rfc3339: &str,
 ) -> Result<CalendarsResponse, CalendarError> {
     let mut rows = calendars.list_by_user_id(user_id).await?;
     if rows.is_empty() {
         // First contact with Google: import the calendar list, then re-read.
-        refresh_calendar_list(http, calendars, access, user_id).await?;
+        refresh_calendar_list(http, calendars, access, user_id, now_rfc3339).await?;
         rows = calendars.list_by_user_id(user_id).await?;
     }
     Ok(CalendarsResponse {
@@ -1146,13 +1180,109 @@ pub fn decide_webhook(
     WebhookDecision::Ignore
 }
 
+/// Subset of the `calendars.get` response: the label properties carrying the
+/// calendar's event labels (`labelProperties.eventLabels[]`, each
+/// `{id, backgroundColor}` — `name` is often null and is ignored).
+#[derive(Debug, Deserialize)]
+struct CalendarGetResponse {
+    #[serde(default, rename = "labelProperties")]
+    label_properties: Option<LabelProperties>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelProperties {
+    #[serde(default, rename = "eventLabels")]
+    event_labels: Option<Vec<GoogleEventLabel>>,
+}
+
+/// One `labelProperties.eventLabels` entry exactly as Google sends it.
+#[derive(Debug, Deserialize)]
+struct GoogleEventLabel {
+    #[serde(default)]
+    id: String,
+    #[serde(default, rename = "backgroundColor")]
+    background_color: String,
+}
+
+/// The cached form persisted onto `google_calendars.event_labels` — a JSON
+/// array of `{"id","backgroundColor"}` (background colors canonicalized).
+/// Deserializable again on the create path, where the caller's snapped hex
+/// is resolved against the cache to pick the label id to send.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedEventLabel {
+    id: String,
+    #[serde(rename = "backgroundColor")]
+    background_color: String,
+}
+
+/// Fetches a calendar's `labelProperties.eventLabels` via `calendars.get` and
+/// persists them as a JSON array on the `google_calendars` row.
+///
+/// URL: `{GOOGLE_EVENTS_BASE_URL}/{url-encoded-id}` (NOT `.../events`).
+/// Absent `labelProperties.eventLabels` → `[]` (holiday/reader calendars).
+/// Each `backgroundColor` is canonicalized via [`canonicalize_hex`] when it
+/// parses (lowercased `#rrggbb`); the original is kept when it does not.
+/// Skipped entirely when `cal.event_labels` is non-empty (already fetched);
+/// Google 4xx/5xx is a hard [`CalendarError::GoogleApi`] — an import must not
+/// silently leave the cache empty.
+async fn ensure_event_labels(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    now_rfc3339: &str,
+) -> Result<(), CalendarError> {
+    if !cal.event_labels.is_empty() {
+        return Ok(());
+    }
+    let url = format!(
+        "{GOOGLE_EVENTS_BASE_URL}/{}",
+        encode_path_segment(&cal.google_calendar_id)
+    );
+    let (status, body) = http.get_bearer_raw(&url, &access.access_token).await?;
+    if !(200..300).contains(&status) {
+        return Err(CalendarError::GoogleApi(format!(
+            "calendars.get returned {status} for calendar {}",
+            cal.google_calendar_id
+        )));
+    }
+    let get: CalendarGetResponse = serde_json::from_slice(&body)
+        .map_err(|err| CalendarError::InvalidResponse(format!("calendars.get body: {err}")))?;
+    let labels = get
+        .label_properties
+        .and_then(|props| props.event_labels)
+        .unwrap_or_default();
+    let cached: Vec<CachedEventLabel> = labels
+        .into_iter()
+        .filter_map(|label| {
+            if label.id.is_empty() && label.background_color.is_empty() {
+                return None;
+            }
+            Some(CachedEventLabel {
+                id: label.id,
+                background_color: canonicalize_hex(&label.background_color)
+                    .unwrap_or(label.background_color),
+            })
+        })
+        .collect();
+    let json = serde_json::to_string(&cached)
+        .map_err(|err| CalendarError::InvalidResponse(format!("serialize event labels: {err}")))?;
+    calendars
+        .set_event_labels(&cal.id, &json, now_rfc3339)
+        .await?;
+    Ok(())
+}
+
 /// Imports `/users/me/calendarList` and upserts each entry (all imported
-/// calendars default to `sync_enabled = true`).
+/// calendars default to `sync_enabled = true`). After the upsert, re-reads the
+/// user's rows and backfills the event-label cache for any row that has none
+/// (first import, or the deploy backfill on next sync).
 async fn refresh_calendar_list(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     access: &GoogleAccess,
     user_id: &str,
+    now_rfc3339: &str,
 ) -> Result<(), CalendarError> {
     let (status, body) = http
         .get_bearer_raw(GOOGLE_CALENDAR_LIST_URL, &access.access_token)
@@ -1183,6 +1313,14 @@ async fn refresh_calendar_list(
     if !rows.is_empty() {
         calendars.upsert_batch(rows).await?;
     }
+    // Backfill the event-label cache: every imported row starts with an empty
+    // `event_labels` (cache miss), so fetch + persist it right away.
+    let imported = calendars.list_by_user_id(user_id).await?;
+    for cal in &imported {
+        if cal.event_labels.is_empty() {
+            ensure_event_labels(http, calendars, access, cal, now_rfc3339).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1200,6 +1338,10 @@ pub async fn sync_calendar(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
 ) -> Result<(), CalendarError> {
+    // Deploy backfill: existing rows have an empty event-label cache; fill it
+    // before the first (and every cache-miss) sync.
+    ensure_event_labels(http, calendars, access, cal, now_rfc3339).await?;
+
     let mut all_items: Vec<GoogleEvent> = Vec::new();
     let mut next_sync_token: Option<String> = None;
     let mut sync_token = if cal.sync_token.is_empty() {
@@ -1523,6 +1665,16 @@ mod tests {
                     return (*status, body.clone().into_bytes());
                 }
             }
+            // Default for the `calendars.get` event-label backfill: any URL
+            // that is a bare calendar resource (not `.../events`, not the
+            // calendarList) returns "no labels", so first-import and sync tests
+            // do not need to script a route for it.
+            if url.contains("/calendar/v3/calendars/")
+                && !url.contains("/events")
+                && !url.contains("calendarList")
+            {
+                return (200, br#"{"labelProperties":{"eventLabels":[]}}"#.to_vec());
+            }
             panic!("no route for {url}");
         }
     }
@@ -1580,6 +1732,7 @@ mod tests {
         upserted: Mutex<Vec<NewCalendar>>,
         sync_states: Mutex<Vec<(String, String, String)>>,
         disabled: Mutex<Vec<(String, bool)>>,
+        label_updates: Mutex<Vec<(String, String)>>,
         next_id: Mutex<u64>,
     }
 
@@ -1590,6 +1743,7 @@ mod tests {
                 upserted: Mutex::new(Vec::new()),
                 sync_states: Mutex::new(Vec::new()),
                 disabled: Mutex::new(Vec::new()),
+                label_updates: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
             }
         }
@@ -1654,6 +1808,9 @@ mod tests {
                     sync_enabled: cal.sync_enabled,
                     sync_token: cal.sync_token.clone(),
                     last_synced_at: cal.last_synced_at.clone(),
+                    // Freshly imported rows start with an empty label cache
+                    // (cache miss) — `refresh_calendar_list` backfills it.
+                    event_labels: String::new(),
                     created_at: "2026-08-17T00:00:00Z".to_string(),
                     updated_at: "2026-08-17T00:00:00Z".to_string(),
                     deleted_at: None,
@@ -1686,6 +1843,23 @@ mod tests {
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             self.disabled.lock().unwrap().push((id.to_string(), enabled));
+            Ok(())
+        }
+
+        async fn set_event_labels(
+            &self,
+            id: &str,
+            event_labels_json: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            self.label_updates
+                .lock()
+                .unwrap()
+                .push((id.to_string(), event_labels_json.to_string()));
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.event_labels = event_labels_json.to_string();
+            }
             Ok(())
         }
 
@@ -1994,6 +2168,10 @@ mod tests {
             sync_enabled,
             sync_token: String::new(),
             last_synced_at: None,
+            // `"[]"` = label cache already fetched (no labels) — existing sync
+            // tests skip the `calendars.get` backfill. Tests exercising the
+            // cache-miss path construct rows with an empty string explicitly.
+            event_labels: "[]".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -2184,10 +2362,25 @@ mod tests {
         assert!(output.events.is_empty());
         assert!(output.sync_errors.is_empty());
 
-        // calendarList fetched, rows upserted (sync_enabled defaults true).
+        // calendarList fetched, rows upserted (sync_enabled defaults true),
+        // then each imported row's event-label cache backfilled via
+        // `calendars.get` (empty `event_labels` = cache miss).
         let gets = http.gets.lock().unwrap();
-        assert_eq!(gets.len(), 3, "calendarList + one events.list per imported calendar");
+        assert_eq!(
+            gets.len(),
+            5,
+            "calendarList + 2 calendars.get backfill + 2 events.list"
+        );
         assert!(gets[0].contains("calendarList"), "{gets:?}");
+        assert!(
+            gets[1].contains("/calendars/primary%40example.com") && !gets[1].contains("/events"),
+            "{gets:?}"
+        );
+        assert!(
+            gets[2].contains("/calendars/en.usa%23holiday%40group.v.calendar.google.com")
+                && !gets[2].contains("/events"),
+            "{gets:?}"
+        );
         let upserted = calendars.upserted.lock().unwrap();
         assert_eq!(upserted.len(), 2);
         assert!(upserted.iter().all(|cal| cal.sync_enabled));
@@ -2197,11 +2390,123 @@ mod tests {
         // Freshly imported calendars have never synced (stale), so the same
         // request also syncs them (Go behavior: refreshCalendarList then the
         // staleness loop). The encoded `#`/`@` show in the events.list URLs.
-        assert!(gets[1].contains("primary%40example.com/events"), "{gets:?}");
-        assert!(gets[2].contains("en.usa%23holiday%40group.v.calendar.google.com/events"), "{gets:?}");
+        assert!(gets[3].contains("primary%40example.com/events"), "{gets:?}");
+        assert!(gets[4].contains("en.usa%23holiday%40group.v.calendar.google.com/events"), "{gets:?}");
         let states = calendars.sync_states.lock().unwrap();
         assert_eq!(states.len(), 2, "both imported calendars synced");
         assert!(states.iter().all(|(_, token, _)| token == "st-1"));
+    }
+
+    #[test]
+    fn first_import_backfills_event_label_cache() {
+        // Empty store: first contact imports calendarList, then every imported
+        // row (empty `event_labels` = cache miss) is fetched via
+        // `calendars.get` and the event labels are persisted.
+        let http = FakeHttp::new(vec![
+            ("calendarList", 200, CALENDAR_LIST_JSON),
+            ("/events", 200, r#"{"items":[],"nextSyncToken":"st-1"}"#),
+            (
+                "/calendars/",
+                200,
+                r##"{"id":"ignored","labelProperties":{"eventLabels":[
+                    {"id":"1","backgroundColor":"#AC725E","name":null},
+                    {"id":"2","backgroundColor":"#d06b64"},
+                    {"id":"3","backgroundColor":"not-a-hex"}
+                ]}}"##,
+            ),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+        assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
+
+        // Both imported rows carry the cached labels: background colors are
+        // canonicalized to lowercase #rrggbb when they parse, the original is
+        // kept otherwise, and null `name` is ignored.
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        let expected = r##"[{"id":"1","backgroundColor":"#ac725e"},{"id":"2","backgroundColor":"#d06b64"},{"id":"3","backgroundColor":"not-a-hex"}]"##;
+        assert!(
+            stored.iter().all(|cal| cal.event_labels == expected),
+            "label cache filled on every imported row: {stored:?}"
+        );
+        // The writes went through the dedicated set_event_labels path.
+        let updates = calendars.label_updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        assert!(updates.iter().all(|(_, json)| json == &expected));
+    }
+
+    #[test]
+    fn calendar_get_without_label_properties_stores_empty_array() {
+        // Holiday-style `calendars.get` body: no `labelProperties` at all.
+        // The cache must read `"[]"` (fetched, no labels) — never stay empty.
+        let http = FakeHttp::new(vec![
+            ("calendarList", 200, CALENDAR_LIST_JSON),
+            (
+                "/calendars/",
+                200,
+                r#"{"id":"en.usa#holiday@group.v.calendar.google.com","summary":"Holidays","timeZone":"UTC"}"#,
+            ),
+            ("/events", 200, r#"{"items":[],"nextSyncToken":"st-1"}"#),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+        assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored.iter().all(|cal| cal.event_labels == "[]"),
+            "absent labelProperties must cache as an empty array: {stored:?}"
+        );
+    }
+
+    #[test]
+    fn sync_skips_calendars_get_when_label_cache_is_filled() {
+        // Both variants of a filled cache — `"[]"` (fetched, no labels) and a
+        // non-empty JSON array — must skip the `calendars.get` backfill.
+        let mut empty_labels = calendar("cal-1", "primary@example.com", true);
+        empty_labels.event_labels = "[]".to_string();
+        let mut filled_labels = calendar("cal-2", "work@example.com", true);
+        filled_labels.event_labels = r##"[{"id":"1","backgroundColor":"#ac725e"}]"##.to_string();
+
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![empty_labels, filled_labels]);
+        let events = FakeEventRepo::new();
+
+        let rows = calendars.stored.lock().unwrap().clone();
+        for cal in &rows {
+            pollster::block_on(sync_calendar(
+                &http, &calendars, &events, &access(), cal, "2023-11-14T22:13:20Z",
+            ))
+            .unwrap();
+        }
+
+        // events.list still ran for both calendars; no URL is the bare
+        // calendar resource (which would be the backfill GET).
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 2, "one events.list per calendar: {gets:?}");
+        assert!(
+            gets.iter().all(|url| url.contains("/events")),
+            "no bare calendars.get when the cache is filled: {gets:?}"
+        );
+        assert!(
+            calendars.label_updates.lock().unwrap().is_empty(),
+            "no label writes"
+        );
     }
 
     #[test]
@@ -2511,13 +2816,20 @@ mod tests {
 
     #[test]
     fn list_calendars_empty_store_imports_calendar_list_without_syncing_events() {
-        // Only a calendarList route: any events.list or watch call would make
-        // the fake panic — this test proves list_calendars does neither.
+        // Only a calendarList route + the FakeHttp default for bare
+        // `calendars.get` backfill URLs: any events.list or watch call would
+        // make the fake panic — this test proves list_calendars does neither.
         let http = FakeHttp::new(vec![("calendarList", 200, CALENDAR_LIST_JSON)]);
         let calendars = FakeCalendarRepo::with(vec![]);
 
-        let output =
-            pollster::block_on(list_calendars(&http, &calendars, &access(), "u-1")).unwrap();
+        let output = pollster::block_on(list_calendars(
+            &http,
+            &calendars,
+            &access(),
+            "u-1",
+            "2026-08-17T00:00:00Z",
+        ))
+        .unwrap();
 
         let views = output.calendars;
         assert_eq!(views.len(), 2);
@@ -2533,15 +2845,39 @@ mod tests {
         assert!(!views[1].is_primary);
         assert_eq!(views[1].access_role, "reader");
 
-        // Exactly one Google GET — the calendarList import.
+        // The calendarList import plus one `calendars.get` event-label
+        // backfill per imported row (the FakeHttp default answers them) —
+        // and nothing else.
         let gets = http.gets.lock().unwrap();
-        assert_eq!(gets.len(), 1, "calendarList import only");
+        assert_eq!(
+            gets.len(),
+            3,
+            "calendarList import + 2 event-label backfills"
+        );
         assert!(gets[0].contains("calendarList"), "{gets:?}");
+        assert!(
+            gets[1..].iter().all(|url| url.contains("/calendar/v3/calendars/")
+                && !url.contains("/events")
+                && !url.contains("calendarList")),
+            "backfills hit the bare calendar resource: {gets:?}"
+        );
         assert!(http.posts.lock().unwrap().is_empty(), "no watch POSTs");
         assert_eq!(calendars.upserted.lock().unwrap().len(), 2);
         assert!(
             calendars.sync_states.lock().unwrap().is_empty(),
             "no event sync"
+        );
+        // Every imported row got the backfilled cache (`[]` = fetched, no
+        // labels — the FakeHttp default body has no labels).
+        assert_eq!(calendars.label_updates.lock().unwrap().len(), 2);
+        assert!(
+            calendars
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|cal| cal.event_labels == "[]"),
+            "all imported rows have a fetched label cache"
         );
     }
 
@@ -2552,8 +2888,14 @@ mod tests {
         let calendars =
             FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
 
-        let output =
-            pollster::block_on(list_calendars(&http, &calendars, &access(), "u-1")).unwrap();
+        let output = pollster::block_on(list_calendars(
+            &http,
+            &calendars,
+            &access(),
+            "u-1",
+            "2026-08-17T00:00:00Z",
+        ))
+        .unwrap();
 
         assert!(
             http.gets.lock().unwrap().is_empty(),
@@ -2577,8 +2919,14 @@ mod tests {
         let http = FakeHttp::new(vec![("calendarList", 500, "nope")]);
         let calendars = FakeCalendarRepo::with(vec![]);
 
-        let err =
-            pollster::block_on(list_calendars(&http, &calendars, &access(), "u-1")).unwrap_err();
+        let err = pollster::block_on(list_calendars(
+            &http,
+            &calendars,
+            &access(),
+            "u-1",
+            "2026-08-17T00:00:00Z",
+        ))
+        .unwrap_err();
 
         assert!(err.to_string().contains("calendarList fetch"), "{err}");
     }
@@ -3406,7 +3754,7 @@ mod tests {
             task_id: None,
             routine_id: None,
             occurrence_id: None,
-            color_id: None,
+            color_hex: None,
             sanctuary_focus: false,
             priority: None,
             difficulty: None,
@@ -3460,6 +3808,14 @@ mod tests {
         assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
         assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z");
         assert!(body.get("colorId").is_none(), "hand-created events carry no colorId");
+        assert!(
+            body.get("eventLabelId").is_none(),
+            "hand-created events carry no eventLabelId"
+        );
+        assert!(
+            !url.contains("eventLabelVersion"),
+            "hand-created events do not require eventLabelVersion: {url}"
+        );
 
         // Cache upsert happened with the mapped row.
         let (google_id, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
@@ -3468,27 +3824,37 @@ mod tests {
     }
 
     #[test]
-    fn create_with_color_id_sends_color_id() {
+    fn create_with_color_hex_sends_event_label_id() {
+        // `#535050` snaps chroma-first to graphite `#616161`; the cache maps
+        // graphite to a stable fake id.
         let http = FakeHttp::new(vec![(
             "/calendars/primary%40example.com/events",
             200,
             CREATED_JSON,
         )]);
-        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            event_labels: r##"[{"id":"label-graphite","backgroundColor":"#616161"}]"##.to_string(),
+            ..calendar("cal-1", "primary@example.com", true)
+        }]);
         let events = FakeEventRepo::new();
         let mut input = input();
-        input.color_id = Some("7".to_string());
+        input.color_hex = Some("#535050".to_string());
 
         pollster::block_on(create_event(&http, &calendars, &events, &access(), &input, NOW_UNIX))
             .unwrap();
 
-        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        assert!(url.contains("eventLabelVersion=1"), "{url}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["colorId"], "7");
+        assert_eq!(body["eventLabelId"], "label-graphite");
+        assert!(
+            body.get("colorId").is_none(),
+            "create_event never sends colorId: {body}"
+        );
     }
 
     #[test]
-    fn create_with_blank_color_id_omits_the_key() {
+    fn create_with_blank_color_hex_omits_color_keys() {
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
         for blank in ["", "   ", "\t"] {
@@ -3498,20 +3864,88 @@ mod tests {
                 CREATED_JSON,
             )]);
             let mut input = input();
-            input.color_id = Some(blank.to_string());
+            input.color_hex = Some(blank.to_string());
 
             pollster::block_on(create_event(
                 &http, &calendars, &events, &access(), &input, NOW_UNIX,
             ))
             .unwrap();
 
-            let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+            let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(
-                body.get("colorId").is_none(),
-                "blank color_id {blank:?} must omit the key"
+                body.get("colorId").is_none() && body.get("eventLabelId").is_none(),
+                "blank color_hex {blank:?} must omit both color keys"
+            );
+            assert!(
+                !url.contains("eventLabelVersion"),
+                "blank color_hex {blank:?} must not require eventLabelVersion: {url}"
             );
         }
+    }
+
+    #[test]
+    fn create_with_color_hex_and_empty_label_cache_is_invalid() {
+        // Empty string = cache miss. The start must fail with a 400-shaped
+        // Invalid — no `calendars.get`, no POST.
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            event_labels: String::new(),
+            ..calendar("cal-1", "primary@example.com", true)
+        }]);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![]);
+        let mut input = input();
+        input.color_hex = Some("#4285f4".to_string());
+
+        let err = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, CalendarError::Invalid(m) if m == "calendar event-label cache is empty"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
+    }
+
+    #[test]
+    fn create_with_color_hex_and_no_matching_label_is_invalid() {
+        // Fetched-but-empty cache (`"[]"` = no labels on the calendar).
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![]);
+        let mut cobalt_input = input();
+        cobalt_input.color_hex = Some("#4285f4".to_string());
+
+        let err = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &cobalt_input, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, CalendarError::Invalid(m) if m == "no event label matches category color"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
+
+        // A populated cache that lacks the snapped hex — same failure.
+        let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
+            event_labels: r##"[{"id":"label-banana","backgroundColor":"#f6bf26"}]"##.to_string(),
+            ..calendar("cal-1", "primary@example.com", true)
+        }]);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![]);
+        let mut banana_input = input();
+        banana_input.color_hex = Some("#4285f4".to_string());
+
+        let err = pollster::block_on(create_event(
+            &http, &calendars, &events, &access(), &banana_input, NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(&err, CalendarError::Invalid(m) if m == "no event label matches category color"),
+            "got {err:?}"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
     }
 
     #[test]

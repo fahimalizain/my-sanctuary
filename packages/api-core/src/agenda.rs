@@ -160,6 +160,9 @@ impl From<CalendarError> for AgendaError {
     fn from(err: CalendarError) -> Self {
         match err {
             CalendarError::GoogleApi(message) => AgendaError::GoogleApi(message),
+            // A category color that cannot snap/resolve to a cached label is
+            // a caller-side 400, folded onto the agenda Invalid arm.
+            CalendarError::Invalid(message) => AgendaError::Invalid(message),
             other => AgendaError::Calendar(other),
         }
     }
@@ -1108,7 +1111,7 @@ pub async fn start_occurrence(
             // `calendar_events.task_id`, keeping the two worlds apart.
             routine_id: Some(occurrence.routine_id.clone()),
             occurrence_id: Some(occurrence.id.clone()),
-            color_id: target.google_color_id,
+            color_hex: target.color_hex,
             // Focus stays task-only (ADR 0004): a running routine never takes
             // `users.focused_task_id`, so the chip is never focused.
             sanctuary_focus: false,
@@ -1503,9 +1506,10 @@ async fn embed_item(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetCalendar {
     calendar_id: String,
-    /// Stored `google_color_id` of the matched category; `None` when the
-    /// resolved title is untracked or the category has no stored color.
-    google_color_id: Option<String>,
+    /// Matched category's hex color; `None` when the resolved title is
+    /// untracked or the category has no (non-blank) color — the event insert
+    /// omits the label then.
+    color_hex: Option<String>,
 }
 
 /// Resolves the Google calendar a started occurrence's one-shot log lands on
@@ -1566,9 +1570,12 @@ async fn resolve_occurrence_calendar(
         .ok_or_else(|| AgendaError::Invalid("no writable calendar".to_string()))?;
     Ok(TargetCalendar {
         calendar_id: target.id.clone(),
-        // The matched category's STORED color, or `None` for untracked /
-        // categories without one — the event insert omits `colorId` then.
-        google_color_id: category.and_then(|category| category.google_color_id.clone()),
+        // The matched category's hex color, or `None` for untracked /
+        // categories without one (or a blank one) — the event insert omits
+        // the label then.
+        color_hex: category
+            .map(|category| category.color.trim().to_string())
+            .filter(|color| !color.is_empty()),
     })
 }
 
@@ -2100,7 +2107,6 @@ mod tests {
                 color: category.color,
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id,
-                google_color_id: category.google_color_id,
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -3083,6 +3089,21 @@ mod tests {
             Ok(())
         }
 
+        async fn set_event_labels(
+            &self,
+            id: &str,
+            event_labels_json: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            // Persist into the in-memory rows (agenda never reads it back, but
+            // the fake must mirror the D1 write).
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.event_labels = event_labels_json.to_string();
+            }
+            Ok(())
+        }
+
         async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
             Ok(())
         }
@@ -3477,6 +3498,24 @@ mod tests {
         }
     }
 
+    /// All 24 event-label hexes as a cached `event_labels` JSON array with
+    /// stable fake ids (`label-0` … `label-23`) — the fixture's default
+    /// cache, so colored starts resolve their label id locally (create_event
+    /// never fetches).
+    fn event_labels_json() -> String {
+        let labels: Vec<serde_json::Value> = crate::GOOGLE_EVENT_LABEL_COLORS
+            .iter()
+            .enumerate()
+            .map(|(index, hex)| {
+                serde_json::json!({
+                    "id": format!("label-{index}"),
+                    "backgroundColor": hex,
+                })
+            })
+            .collect();
+        serde_json::to_string(&labels).expect("event labels serialize")
+    }
+
     /// A writable primary calendar for `u-1` — the default start target. Its
     /// `time_zone` is UTC, so `NOW_UNIX` reads as `2026-08-23` (ADR 0004
     /// amendment: the primary calendar's zone decides civil today).
@@ -3492,6 +3531,9 @@ mod tests {
             sync_enabled: true,
             sync_token: String::new(),
             last_synced_at: None,
+            // The 24 seeded labels with stable fake ids — agenda never syncs,
+            // so this is the cache `create_event` resolves colors against.
+            event_labels: event_labels_json(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
