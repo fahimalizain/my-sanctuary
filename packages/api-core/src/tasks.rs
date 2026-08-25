@@ -3442,7 +3442,7 @@ mod tests {
             &NewTaskCategoryInput {
                 title: "Coding".to_string(),
                 slug: None,
-                color: "#2a5c8a".to_string(),
+                color: "#4285f4".to_string(),
                 is_productive: None,
                 google_calendar_id: None,
                 google_color_id: None,
@@ -4648,7 +4648,7 @@ mod tests {
             &NewTaskCategoryInput {
                 title: "SpicyHome".to_string(),
                 slug: None,
-                color: "#2a5c8a".to_string(),
+                color: "#4285f4".to_string(),
                 is_productive: None,
                 google_calendar_id: category_calendar.map(str::to_string),
                 google_color_id: None,
