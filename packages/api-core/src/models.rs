@@ -335,7 +335,6 @@ pub struct TaskCategory {
     pub is_productive: bool,
     /// Optional Google Calendar id that anchors this category to a calendar.
     pub google_calendar_id: Option<String>,
-    pub google_color_id: Option<String>,
     pub sort_order: i64,
     /// `1` only for the undeletable `untracked` sink category.
     #[serde(default, deserialize_with = "de_d1_bool")]
@@ -362,7 +361,6 @@ pub struct NewTaskCategory {
     pub color: String,
     pub is_productive: bool,
     pub google_calendar_id: Option<String>,
-    pub google_color_id: Option<String>,
     pub sort_order: i64,
     /// `true` only for `untracked` (seeded by the system, never via the API).
     pub is_untracked: bool,
@@ -380,7 +378,6 @@ pub struct NewTaskCategoryInput {
     pub color: String,
     pub is_productive: Option<bool>,
     pub google_calendar_id: Option<String>,
-    pub google_color_id: Option<String>,
     /// Required for roots, forbidden for children (service 400).
     pub list_id: Option<String>,
     /// Required for children, forbidden for grandchildren (service 400).
@@ -402,7 +399,6 @@ pub struct UpdateTaskCategory {
     pub color: Option<String>,
     pub is_productive: Option<bool>,
     pub google_calendar_id: Option<String>,
-    pub google_color_id: Option<String>,
     /// `Some` only for roots; a child given a non-null `list_id` is a 400.
     pub list_id: Option<String>,
     /// `Some` moves this category under a root; never settable to a child.
@@ -1008,7 +1004,7 @@ mod tests {
             r##"{
                 "id": "c-1", "user_id": "u-1", "list_id": "l-1", "parent_id": null,
                 "title": "Deep Work", "slug": "deep-work", "color": "#2a5c8a",
-                "is_productive": 1, "google_calendar_id": null, "google_color_id": null,
+                "is_productive": 1, "google_calendar_id": null,
                 "sort_order": 0, "is_untracked": 0,
                 "created_at": "2026-08-18T00:00:00Z", "updated_at": "2026-08-18T00:00:00Z",
                 "deleted_at": null
@@ -1029,7 +1025,7 @@ mod tests {
             r##"{
                 "id": "c-2", "user_id": "u-1", "list_id": null, "parent_id": "c-1",
                 "title": "Code Reviews", "slug": "code-reviews", "color": "",
-                "is_productive": 0, "google_calendar_id": "work@x.com", "google_color_id": "7",
+                "is_productive": 0, "google_calendar_id": "work@x.com",
                 "sort_order": 1, "is_untracked": 0,
                 "created_at": "2026-08-18T00:00:00Z", "updated_at": "2026-08-18T00:00:00Z",
                 "deleted_at": null

@@ -133,7 +133,6 @@ export interface Category {
   color: string;
   is_productive: boolean;
   google_calendar_id: string | null;
-  google_color_id: string | null;
   sort_order: number;
   is_untracked: boolean;
   created_at: string;
@@ -171,7 +170,6 @@ export interface NewCategoryInput {
   color: string;
   is_productive?: boolean;
   google_calendar_id?: string | null;
-  google_color_id?: string | null;
   list_id?: string | null;
   parent_id?: string | null;
   sort_order?: number;
@@ -186,7 +184,6 @@ export interface UpdateCategoryInput {
   color?: string;
   is_productive?: boolean;
   google_calendar_id?: string | null;
-  google_color_id?: string | null;
   sort_order?: number;
   patterns?: NewCategoryPatternInput[];
 }

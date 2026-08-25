@@ -462,7 +462,6 @@ mod tests {
                 color: category.color.clone(),
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id.clone(),
-                google_color_id: category.google_color_id.clone(),
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),

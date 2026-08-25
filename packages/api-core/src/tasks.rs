@@ -2063,8 +2063,7 @@ pub async fn move_task(
 /// The matched category's hex color, or `None` when the title is untracked
 /// or the category has no (non-blank) color. Focus segments re-resolve their
 /// color from the category here — the event cache has no color column, so
-/// the replaced chip cannot supply it. `google_color_id` is not read on this
-/// write path.
+/// the replaced chip cannot supply it.
 fn category_color_hex(taxonomy: &Taxonomy, title: &str) -> Option<String> {
     match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
         ClassifyOutcome::Matched { category_id } => taxonomy
@@ -2457,7 +2456,6 @@ async fn resolve_target_calendar(
         // The matched category's hex color, or `None` for untracked /
         // categories without one (or a blank one) — the event insert omits
         // the label then. Never inherited from the pattern or the parent.
-        // `google_color_id` is not read on this path.
         color_hex: category
             .map(|category| category.color.trim().to_string())
             .filter(|color| !color.is_empty()),
@@ -3103,7 +3101,6 @@ mod tests {
                 color: category.color,
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id,
-                google_color_id: category.google_color_id,
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -3454,7 +3451,6 @@ mod tests {
                 color: "#4285f4".to_string(),
                 is_productive: None,
                 google_calendar_id: None,
-                google_color_id: None,
                 list_id: None,
                 parent_id: Some(ids["work"].clone()),
                 sort_order: None,
@@ -4696,7 +4692,6 @@ mod tests {
                 color: "#4285f4".to_string(),
                 is_productive: None,
                 google_calendar_id: category_calendar.map(str::to_string),
-                google_color_id: None,
                 list_id: None,
                 parent_id: Some(ids["work"].clone()),
                 sort_order: None,

@@ -1572,7 +1572,7 @@ async fn resolve_occurrence_calendar(
         calendar_id: target.id.clone(),
         // The matched category's hex color, or `None` for untracked /
         // categories without one (or a blank one) — the event insert omits
-        // the label then. `google_color_id` is not read on this path.
+        // the label then.
         color_hex: category
             .map(|category| category.color.trim().to_string())
             .filter(|color| !color.is_empty()),
@@ -2107,7 +2107,6 @@ mod tests {
                 color: category.color,
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id,
-                google_color_id: category.google_color_id,
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),

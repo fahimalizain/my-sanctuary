@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use regex::Regex;
 use thiserror::Error;
 
-use crate::google_color::{canonicalize_hex, closest_google_color_id, is_event_label_hex};
+use crate::google_color::{canonicalize_hex, is_event_label_hex};
 use crate::lists::SEED_LISTS;
 use crate::models::{
     NewTaskCategory, NewTaskCategoryInput, NewTaskCategoryPattern, TaskCategory,
@@ -90,7 +90,6 @@ pub struct CategoryView {
     pub color: String,
     pub is_productive: bool,
     pub google_calendar_id: Option<String>,
-    pub google_color_id: Option<String>,
     pub sort_order: i64,
     pub is_untracked: bool,
     pub created_at: String,
@@ -334,9 +333,6 @@ pub async fn ensure_taxonomy(
                     color: list.color.clone(),
                     is_productive: matches!(name, "Work" | "Fitness"),
                     google_calendar_id: None,
-                    // Derived from the list's hex color (seed hexes are
-                    // valid `#rrggbb`); map errors instead of panicking.
-                    google_color_id: Some(map_color(&list.color)?),
                     sort_order: list.sort_order,
                     is_untracked: false,
                 })
@@ -368,7 +364,6 @@ pub async fn ensure_taxonomy(
                 color: String::new(),
                 is_productive: false,
                 google_calendar_id: None,
-                google_color_id: None,
                 sort_order: UNTRACKED_SORT_ORDER,
                 is_untracked: true,
             })
@@ -485,9 +480,6 @@ pub async fn create_category(
         validate_pattern(pattern)?;
     }
     let google_calendar_id = normalize_optional(input.google_calendar_id.as_deref());
-    // The client's `google_color_id` is ignored: the stored id is derived
-    // from the (non-empty, hex) `color` above.
-    let google_color_id = Some(map_color(&color)?);
     let sort_order = input.sort_order.unwrap_or(0);
 
     let (parent_id, list_id, parent) = match input.parent_id.as_deref() {
@@ -539,7 +531,6 @@ pub async fn create_category(
             color,
             is_productive: input.is_productive.unwrap_or(false),
             google_calendar_id,
-            google_color_id,
             sort_order,
             is_untracked: false,
         })
@@ -579,19 +570,13 @@ pub async fn update_category(
     id: &str,
     updates: &UpdateTaskCategory,
 ) -> Result<CategoryResponse, CategoriesError> {
-    // Work on an owned clone — the caller's struct is never mutated. The
-    // client's `google_color_id` is not a write: the stored id is derived
-    // from `color` below (or preserved by the repo's COALESCE when `color`
-    // is absent), so it is cleared first. A body that sends *only*
-    // `google_color_id` therefore falls out as "nothing to update".
+    // Work on an owned clone — the caller's struct is never mutated.
     let mut updates = updates.clone();
-    updates.google_color_id = None;
     if updates.title.is_none()
         && updates.slug.is_none()
         && updates.color.is_none()
         && updates.is_productive.is_none()
         && updates.google_calendar_id.is_none()
-        && updates.google_color_id.is_none()
         && updates.list_id.is_none()
         && updates.parent_id.is_none()
         && updates.sort_order.is_none()
@@ -625,12 +610,9 @@ pub async fn update_category(
     }
     if let Some(color) = updates.color.as_deref() {
         // A present color must be one of the 24 event-label hexes; it is
-        // stored canonicalized. The stored google_color_id always derives
-        // from the canonical hex; `None` here would leave the old id via the
-        // repo's COALESCE.
+        // stored canonicalized.
         let color = validate_color(color)?;
         updates.color = Some(color.clone());
-        updates.google_color_id = Some(map_color(&color)?);
     }
     if let Some(slug) = updates.slug.as_deref() {
         let slug = slug.trim();
@@ -765,7 +747,6 @@ fn to_view(
         color: category.color.clone(),
         is_productive: category.is_productive,
         google_calendar_id: category.google_calendar_id.clone(),
-        google_color_id: category.google_color_id.clone(),
         sort_order: category.sort_order,
         is_untracked: category.is_untracked,
         created_at: category.created_at.clone(),
@@ -781,16 +762,6 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-/// Maps a hex color to the nearest Google event colorId (`"1"`..=`"11"`).
-///
-/// The client's `google_color_id` is never trusted: create/update/seed all
-/// derive the stored id from the category's hex `color` through
-/// [`closest_google_color_id`]. Non-hex colors (not `#rgb` / `#rrggbb`) are
-/// rejected with `CategoriesError::Invalid`.
-fn map_color(color: &str) -> Result<String, CategoriesError> {
-    closest_google_color_id(color).map_err(|err| CategoriesError::Invalid(err.to_string()))
 }
 
 /// Validates a category color for writes: trimmed, must be a hex that is
@@ -909,7 +880,6 @@ mod tests {
                 color: "#2a5c8a".to_string(),
                 is_productive,
                 google_calendar_id: None,
-                google_color_id: None,
                 sort_order,
                 is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -965,7 +935,6 @@ mod tests {
                 color: category.color.clone(),
                 is_productive: category.is_productive,
                 google_calendar_id: category.google_calendar_id.clone(),
-                google_color_id: category.google_color_id.clone(),
                 sort_order: category.sort_order,
                 is_untracked: category.is_untracked,
                 created_at: "2026-08-18T00:00:00Z".to_string(),
@@ -1005,9 +974,6 @@ mod tests {
             }
             if let Some(google_calendar_id) = &updates.google_calendar_id {
                 row.google_calendar_id = Some(google_calendar_id.clone());
-            }
-            if let Some(google_color_id) = &updates.google_color_id {
-                row.google_color_id = Some(google_color_id.clone());
             }
             if let Some(sort_order) = updates.sort_order {
                 row.sort_order = sort_order;
@@ -1296,7 +1262,6 @@ mod tests {
             color: color.to_string(),
             is_productive: None,
             google_calendar_id: None,
-            google_color_id: None,
             list_id: None,
             parent_id: None,
             sort_order: None,
@@ -1591,17 +1556,6 @@ mod tests {
         let family = categories.iter().find(|cat| cat.slug == "family").unwrap();
         assert!(!family.is_productive, "Family is not productive");
 
-        // Each root's stored google_color_id derives from its hex color.
-        for cat in categories.iter().filter(|cat| !cat.is_untracked) {
-            assert_eq!(
-                cat.google_color_id,
-                Some(closest_google_color_id(&cat.color).unwrap()),
-                "{} ({}) derives its google color id",
-                cat.title,
-                cat.color
-            );
-        }
-
         // Two patterns per root, none on untracked.
         let mut pattern_count = 0;
         for category in &categories {
@@ -1617,10 +1571,6 @@ mod tests {
         let untracked = categories.iter().find(|cat| cat.is_untracked).unwrap();
         assert_eq!(untracked.slug, "untracked");
         assert_eq!(untracked.list_id, None);
-        assert_eq!(
-            untracked.google_color_id, None,
-            "untracked has no color, so no derived google color id"
-        );
         assert_eq!(
             pollster::block_on(category_repo.list_patterns_by_category_id(&untracked.id))
                 .unwrap()
@@ -1674,10 +1624,6 @@ mod tests {
         let categories = pollster::block_on(category_repo.list_by_user_id("u-1")).unwrap();
         assert_eq!(categories.len(), 1);
         assert!(categories[0].is_untracked);
-        assert_eq!(
-            categories[0].google_color_id, None,
-            "untracked is inserted without a google color id"
-        );
     }
 
     // ──────────────────────────────────────────
@@ -1782,11 +1728,6 @@ mod tests {
             category.color, "#039be5",
             "uppercase/whitespace palette hex is stored canonical lowercase"
         );
-        assert_eq!(
-            category.google_color_id,
-            Some(closest_google_color_id("#039be5").unwrap()),
-            "stored google_color_id derives from the canonical hex color"
-        );
         assert!(category.is_productive);
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
         assert_eq!(category.list_id.as_deref(), Some("l-1"));
@@ -1795,18 +1736,16 @@ mod tests {
     }
 
     #[test]
-    fn create_derives_google_color_id_and_ignores_client_value() {
+    fn create_stores_canonical_hex_color() {
         let repo = FakeTaskCategoryRepo::new();
         let lists = FakeTaskListRepo::with(vec![FakeTaskListRepo::row("l-1", "u-1", "Work", 0)]);
         let mut new_input = input("Work", "#4285f4");
         new_input.list_id = Some("l-1".to_string());
-        new_input.google_color_id = Some("1".to_string());
 
         let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
         assert_eq!(
-            response.category.google_color_id.as_deref(),
-            Some("9"),
-            "the client's google_color_id is ignored in favor of the derived id"
+            response.category.color, "#4285f4",
+            "the canonical hex is stored; no google_color_id is derived or served"
         );
     }
 
@@ -1849,11 +1788,6 @@ mod tests {
 
         let response = pollster::block_on(create_category(&repo, &lists, "u-1", &new_input)).unwrap();
         assert_eq!(response.category.color, "#4285f4");
-        assert_eq!(
-            response.category.google_color_id,
-            Some(closest_google_color_id("#4285f4").unwrap()),
-            "the stored google_color_id derives from the canonical hex"
-        );
     }
 
     #[test]
@@ -2093,11 +2027,6 @@ mod tests {
         let category = response.category;
         assert_eq!(category.title, "Deep Work");
         assert_eq!(category.color, "#4285f4");
-        assert_eq!(
-            category.google_color_id,
-            Some(closest_google_color_id("#4285f4").unwrap()),
-            "stored google_color_id derives from the new color"
-        );
         assert!(!category.is_productive);
         assert_eq!(category.slug, "work", "slug untouched when omitted");
         assert_eq!(category.inherited_list_id.as_deref(), Some("l-1"));
@@ -2106,32 +2035,10 @@ mod tests {
     }
 
     #[test]
-    fn update_derives_google_color_id_and_ignores_client_value() {
+    fn update_without_color_keeps_stored_color() {
         let repo = FakeTaskCategoryRepo::with(vec![
             FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
         ]);
-        let lists = FakeTaskListRepo::new();
-        let updates = UpdateTaskCategory {
-            color: Some("#4285f4".to_string()),
-            google_color_id: Some("1".to_string()),
-            ..UpdateTaskCategory::default()
-        };
-        let response = pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)).unwrap();
-        assert_eq!(
-            response.category.google_color_id.as_deref(),
-            Some("9"),
-            "the client's google_color_id is ignored; the id derives from the color"
-        );
-    }
-
-    #[test]
-    fn update_without_color_keeps_stored_google_color_id() {
-        let repo = FakeTaskCategoryRepo::with(vec![
-            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
-        ]);
-        // The fake `row()` helper hardcodes google_color_id None and a stale
-        // `#2a5c8a` color; seed the stored id directly.
-        repo.stored.lock().unwrap()[0].google_color_id = Some("7".to_string());
         let lists = FakeTaskListRepo::new();
         let updates = UpdateTaskCategory {
             title: Some("Deep Work".to_string()),
@@ -2142,11 +2049,6 @@ mod tests {
         assert_eq!(
             response.category.color, "#2a5c8a",
             "a stale non-palette hex survives a color-less PATCH"
-        );
-        assert_eq!(
-            response.category.google_color_id.as_deref(),
-            Some("7"),
-            "COALESCE keeps the stored id when color is untouched"
         );
     }
 
@@ -2172,23 +2074,6 @@ mod tests {
         // Nothing persisted: the stored row is untouched.
         let stored = pollster::block_on(repo.get_by_id("root")).unwrap().unwrap();
         assert_eq!(stored.color, "#2a5c8a");
-        assert_eq!(stored.google_color_id, None);
-    }
-
-    #[test]
-    fn update_google_color_id_alone_is_nothing_to_update() {
-        let repo = FakeTaskCategoryRepo::with(vec![
-            FakeTaskCategoryRepo::row("root", "u-1", Some("l-1"), None, "Work", "work", true, false, 0),
-        ]);
-        let lists = FakeTaskListRepo::new();
-        let updates = UpdateTaskCategory {
-            google_color_id: Some("7".to_string()),
-            ..UpdateTaskCategory::default()
-        };
-        assert!(matches!(
-            pollster::block_on(update_category(&repo, &lists, "u-1", "root", &updates)),
-            Err(CategoriesError::Invalid(message)) if message == "nothing to update"
-        ));
     }
 
     #[test]
@@ -2208,7 +2093,6 @@ mod tests {
         // Nothing persisted: the stored row is untouched.
         let stored = pollster::block_on(repo.get_by_id("root")).unwrap().unwrap();
         assert_eq!(stored.color, "#2a5c8a");
-        assert_eq!(stored.google_color_id, None);
     }
 
     #[test]
