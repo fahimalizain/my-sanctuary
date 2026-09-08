@@ -5,7 +5,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { ChevronLeft, ChevronRight, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -19,10 +18,17 @@ import {
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { AllDayRow, type AllDayChip } from './AllDayRow';
-import { CalendarSidebar } from './CalendarSidebar';
-import { EventInspector } from './EventInspector';
 import {
-  CHIP_MARGIN_RIGHT,
+  allDayPreviewIndices,
+  timedPreviewSegments,
+  type DragSlot,
+  type TimedRange,
+} from './calendar-drag';
+import { CalendarSidebar } from './CalendarSidebar';
+import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
+import { EventInspector } from './EventInspector';
+import { useCalendarDrag } from './useCalendarDrag';
+import {
   COL_HEADER_H,
   DAYS_PER_PERIOD,
   DEFAULT_EVENT_DURATION_MIN,
@@ -39,18 +45,13 @@ import {
   eventHeightPx,
   eventTopPx,
   formatDayRangeTitle,
-  formatEventTime,
-  formatEventTimeRange,
   formatHourLabel,
   gutterWithRemainder,
-  hexToRgba,
   hourHeight as computeHourHeight,
-  isCompactChip,
   isMultiDay,
   isSameDay,
   isWeekend,
   lastOccupiedCivilDate,
-  minutesFromY,
   nowLineY,
   packAllDayLanes,
   packDayEvents,
@@ -58,7 +59,6 @@ import {
   scrollLeftForIndex,
   shiftWindowStart,
   shouldRebase,
-  snapMinutes,
   startOfDay,
   startOfWeek,
   stripDayCount,
@@ -66,8 +66,6 @@ import {
 } from './week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
-const CHIP_FILL_ALPHA = 0.22;
-const CHIP_FILL_ALPHA_SELECTED = 0.4;
 
 /** Mon-based short name for a local date (WEEK_DAYS is Mon→Sun). */
 function dayNameShort(date: Date): string {
@@ -77,23 +75,14 @@ function dayNameShort(date: Date): string {
 }
 
 /**
- * Click-to-create payload from a day-column click. Returns null when the
- * click originated on an event chip (those select, they don't create).
+ * Click-to-create range from a snapped slot: default 30 min, kept inside the day.
  */
-function clickCreateTimes(
-  e: ReactMouseEvent<HTMLElement>,
-  day: Date,
-  hourH: number,
-): { start: Date; end: Date } | null {
-  const target = e.target as HTMLElement | null;
-  if (target?.closest('.event-chip')) return null;
-
-  const col = e.currentTarget;
-  const y = e.clientY - col.getBoundingClientRect().top;
-  const startMin = snapMinutes(minutesFromY(y, hourH));
-  // Keep a full default duration inside the day when possible.
-  const endMin = Math.min(MINUTES_PER_DAY, startMin + DEFAULT_EVENT_DURATION_MIN);
-  // If snapped to end-of-day, back up so we still get a 30-min slot.
+function clickCreateTimesFromSlot(slot: DragSlot): TimedRange {
+  const startMin = slot.minutes;
+  const endMin = Math.min(
+    MINUTES_PER_DAY,
+    startMin + DEFAULT_EVENT_DURATION_MIN,
+  );
   const adjustedStart =
     endMin - startMin < DEFAULT_EVENT_DURATION_MIN && startMin > 0
       ? Math.max(0, MINUTES_PER_DAY - DEFAULT_EVENT_DURATION_MIN)
@@ -103,109 +92,9 @@ function clickCreateTimes(
     adjustedStart + DEFAULT_EVENT_DURATION_MIN,
   );
   return {
-    start: dateOnDay(day, adjustedStart),
-    end: dateOnDay(day, adjustedEnd),
+    start: dateOnDay(slot.day, adjustedStart),
+    end: dateOnDay(slot.day, adjustedEnd),
   };
-}
-
-interface PositionedEvent {
-  event: CalendarEvent;
-  startMin: number;
-  endMin: number;
-  top: number;
-  height: number;
-  col: number;
-  cols: number;
-  span: number;
-  color: string;
-}
-
-interface EventChipProps {
-  positioned: PositionedEvent;
-  selected: boolean;
-  onSelect: (eventId: string) => void;
-}
-
-function EventChip({ positioned, selected, onSelect }: EventChipProps) {
-  const { event, top, height, col, cols, span, color, startMin, endMin } =
-    positioned;
-  const start = new Date(event.start_time);
-  const end = new Date(event.end_time);
-  const timeLabel = formatEventTime(start);
-  const rangeLabel = formatEventTimeRange(start, end);
-  const compact = isCompactChip(height);
-
-  const leftPct = (col / cols) * 100;
-  const widthPct = (span / cols) * 100;
-  const fillAlpha = selected ? CHIP_FILL_ALPHA_SELECTED : CHIP_FILL_ALPHA;
-
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      className={cn(
-        'event-chip absolute overflow-hidden rounded-[6px] pointer-events-auto cursor-pointer',
-        selected && 'ring-1 ring-foreground/25',
-      )}
-      style={{
-        top,
-        height,
-        left: `${leftPct}%`,
-        width: `calc(${widthPct}% - ${CHIP_MARGIN_RIGHT}px)`,
-        color: 'var(--foreground)',
-      }}
-      title={`${event.title} · ${rangeLabel}`}
-      data-event-chip
-      data-event-id={event.id}
-      data-start-min={startMin}
-      data-end-min={endMin}
-      onClick={(e) => {
-        e.stopPropagation();
-        onSelect(event.id);
-      }}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          e.stopPropagation();
-          onSelect(event.id);
-        }
-      }}
-    >
-      {/* 4px left ribbon (not a border) */}
-      <div
-        className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-        style={{ backgroundColor: color }}
-        aria-hidden
-      />
-      <div
-        className={cn(
-          'h-full min-w-0 pl-2 pr-1',
-          compact ? 'flex items-center gap-1 py-0' : 'py-px',
-        )}
-        style={{ backgroundColor: hexToRgba(color, fillAlpha) }}
-      >
-        {compact ? (
-          <>
-            <span className="truncate text-[11px] font-medium leading-[13px]">
-              {event.title}
-            </span>
-            <span className="shrink-0 text-[9px] leading-[11px] text-muted-foreground">
-              {timeLabel}
-            </span>
-          </>
-        ) : (
-          <>
-            <div className="truncate text-[11px] font-medium leading-[13px]">
-              {event.title}
-            </div>
-            <div className="mt-0.5 truncate text-[9px] leading-[11px] text-muted-foreground">
-              {timeLabel}
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
 }
 
 export function CalendarPage() {
@@ -556,23 +445,22 @@ export function CalendarPage() {
   );
   const totalHoursH = hourH * 24;
 
-  const handleDayColumnClick = useCallback(
-    (e: ReactMouseEvent<HTMLElement>, day: Date) => {
-      const times = clickCreateTimes(e, day, hourH);
-      if (!times) return;
+  const setStripLocked = useCallback((locked: boolean) => {
+    suppressRebaseRef.current = locked;
+  }, []);
 
-      // Empty-slot click with no writable calendar: close inspector, no POST.
+  const commitCreate = useCallback(
+    (range: TimedRange) => {
       if (!writableCalendar) {
         closeInspector();
         return;
       }
-
       createEvent.mutate(
         {
           calendar_id: writableCalendar.id,
           summary: 'New event',
-          start: times.start.toISOString(),
-          end: times.end.toISOString(),
+          start: range.start.toISOString(),
+          end: range.end.toISOString(),
         },
         {
           onSuccess: (result) => {
@@ -583,8 +471,57 @@ export function CalendarPage() {
         },
       );
     },
-    [hourH, writableCalendar, createEvent, closeInspector],
+    [writableCalendar, createEvent, closeInspector],
   );
+
+  const handleMoveOrResize = useCallback(
+    (eventId: string, range: TimedRange) => {
+      void updateEvent.mutateAsync({
+        id: eventId,
+        input: {
+          start: range.start.toISOString(),
+          end: range.end.toISOString(),
+        },
+      });
+    },
+    [updateEvent],
+  );
+
+  const drag = useCalendarDrag({
+    hourH,
+    setStripLocked,
+    onClickCreate: (slot) => commitCreate(clickCreateTimesFromSlot(slot)),
+    onDragCreate: commitCreate,
+    onMove: handleMoveOrResize,
+    onResize: handleMoveOrResize,
+    onAllDayCreate: commitCreate,
+    onChipTap: selectEvent,
+  });
+
+  const timedPreviewByDay = useMemo(
+    () =>
+      timedPreviewSegments(drag.preview, drag.previewKind, days, hourH),
+    [drag.preview, drag.previewKind, days, hourH],
+  );
+
+  const allDayPreview = useMemo(() => {
+    const idx = allDayPreviewIndices(drag.preview, drag.previewKind, days);
+    if (!idx) return null;
+    const color = writableCalendar
+      ? colorForCalendar(writableCalendar.id)
+      : colorForCalendar('preview');
+    return { ...idx, color };
+  }, [drag.preview, drag.previewKind, days, writableCalendar]);
+
+  const activeDragEvent = drag.activeEventId
+    ? events.find((e) => e.id === drag.activeEventId)
+    : undefined;
+  const previewColor = activeDragEvent
+    ? colorForCalendar(activeDragEvent.calendar_id || activeDragEvent.id)
+    : writableCalendar
+      ? colorForCalendar(writableCalendar.id)
+      : colorForCalendar('preview');
+  const previewTitle = activeDragEvent?.title ?? 'New event';
 
   // Tick "now" so the now-line creeps forward while the page is open.
   const [now, setNow] = useState(() => new Date());
@@ -930,6 +867,10 @@ export function CalendarPage() {
                   height={allDayHeight}
                   chips={allDayChips}
                   todayIndex={todayIndex}
+                  onDayPointerDown={drag.onAllDayPointerDown}
+                  onChipSelect={selectEvent}
+                  selectedEventId={selectedEventId}
+                  preview={allDayPreview}
                 />
               </div>
 
@@ -962,21 +903,25 @@ export function CalendarPage() {
                 {days.map((day) => {
                   const isTodayCol = isSameDay(day, today);
                   const weekend = isWeekend(day);
-                  const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
+                  const dayKey = day.toDateString();
+                  const dayEvents = eventsByDay.get(dayKey) ?? [];
                   const showNow = isTodayCol;
+                  const ghost = timedPreviewByDay.get(dayKey);
 
                   return (
                     <div
                       key={day.toISOString()}
+                      data-day-col={day.toISOString()}
                       className={cn(
                         'relative shrink-0 border-r last:border-r-0 cursor-pointer',
                         weekend ? 'border-border/60' : 'border-border/40',
                         isTodayCol
                           ? 'bg-primary/[0.03]'
                           : weekend && 'bg-muted/40',
+                        drag.isDragging && 'select-none',
                       )}
                       style={{ width: colW, height: totalHoursH }}
-                      onClick={(e) => handleDayColumnClick(e, day)}
+                      onPointerDown={(e) => drag.onColumnPointerDown(e, day)}
                     >
                       {/* Hour hairlines */}
                       {hourLabels.map((h) => (
@@ -993,9 +938,27 @@ export function CalendarPage() {
                           key={p.event.id}
                           positioned={p}
                           selected={p.event.id === selectedEventId}
-                          onSelect={selectEvent}
+                          onSelect={(id) => {
+                            if (drag.suppressNextClick()) return;
+                            selectEvent(id);
+                          }}
+                          onPointerDown={drag.onChipPointerDown}
+                          dragging={
+                            drag.isDragging &&
+                            drag.activeEventId === p.event.id
+                          }
                         />
                       ))}
+
+                      {/* Drag ghost */}
+                      {ghost && (
+                        <PreviewChip
+                          top={ghost.top}
+                          height={ghost.height}
+                          color={previewColor}
+                          title={previewTitle}
+                        />
+                      )}
 
                       {/* Now line */}
                       {showNow && (

@@ -1,0 +1,225 @@
+// Unit tests for calendar drag geometry helpers.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  DRAG_THRESHOLD_PX,
+  RESIZE_HANDLE_PX,
+  allDayPreviewIndices,
+  movedEnough,
+  movedRange,
+  rangeFromSlots,
+  resizeEdgeAt,
+  resizedRange,
+  timedPreviewSegments,
+  type DragSlot,
+} from './calendar-drag';
+import { SNAP_MINUTES, addDays } from './week-layout';
+
+function localDay(y: number, m: number, d: number): Date {
+  return new Date(y, m, d);
+}
+
+function slot(day: Date, minutes: number): DragSlot {
+  return { day, minutes };
+}
+
+// ── movedEnough ─────────────────────────────────────────────────────────
+
+test('movedEnough: under threshold is false', () => {
+  assert.equal(movedEnough(3, 0), false);
+  assert.equal(movedEnough(0, 3), false);
+  // 3-4-5 triangle: hypot(2.4, 1.8) = 3 < 4
+  assert.equal(movedEnough(2.4, 1.8), false);
+});
+
+test('movedEnough: at threshold is true', () => {
+  assert.equal(movedEnough(DRAG_THRESHOLD_PX, 0), true);
+  assert.equal(movedEnough(0, DRAG_THRESHOLD_PX), true);
+  assert.equal(movedEnough(4, 0), true);
+});
+
+// ── resizeEdgeAt ────────────────────────────────────────────────────────
+
+test('resizeEdgeAt: top handle → start', () => {
+  assert.equal(resizeEdgeAt(2, 80), 'start');
+  assert.equal(resizeEdgeAt(0, 80), 'start');
+  assert.equal(resizeEdgeAt(RESIZE_HANDLE_PX, 80), 'start');
+});
+
+test('resizeEdgeAt: bottom handle → end', () => {
+  assert.equal(resizeEdgeAt(78, 80), 'end');
+  assert.equal(resizeEdgeAt(80, 80), 'end');
+  assert.equal(resizeEdgeAt(80 - RESIZE_HANDLE_PX, 80), 'end');
+});
+
+test('resizeEdgeAt: middle → null', () => {
+  assert.equal(resizeEdgeAt(40, 80), null);
+  assert.equal(resizeEdgeAt(RESIZE_HANDLE_PX + 1, 80), null);
+});
+
+test('resizeEdgeAt: short chip splits at mid', () => {
+  // height 10 < 2*6 → mid = 5
+  assert.equal(resizeEdgeAt(2, 10), 'start');
+  assert.equal(resizeEdgeAt(7, 10), 'end');
+  assert.equal(resizeEdgeAt(4.9, 10), 'start');
+  assert.equal(resizeEdgeAt(5, 10), 'end');
+});
+
+// ── rangeFromSlots timed ────────────────────────────────────────────────
+
+test('rangeFromSlots timed: same day 9:00–10:30', () => {
+  const mon = localDay(2024, 0, 1); // Mon Jan 1 2024
+  const r = rangeFromSlots(slot(mon, 9 * 60), slot(mon, 10 * 60 + 30), 'timed');
+  assert.equal(r.start.getHours(), 9);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getHours(), 10);
+  assert.equal(r.end.getMinutes(), 30);
+  assert.equal(r.start.getDate(), 1);
+  assert.equal(r.end.getDate(), 1);
+});
+
+test('rangeFromSlots timed: inverted pointers still ordered', () => {
+  const mon = localDay(2024, 0, 1);
+  const r = rangeFromSlots(slot(mon, 14 * 60), slot(mon, 12 * 60), 'timed');
+  assert.equal(r.start.getHours(), 12);
+  assert.equal(r.end.getHours(), 14);
+});
+
+test('rangeFromSlots timed: same slot → SNAP_MINUTES duration', () => {
+  const mon = localDay(2024, 0, 1);
+  const r = rangeFromSlots(slot(mon, 9 * 60), slot(mon, 9 * 60), 'timed');
+  const durMin = (r.end.getTime() - r.start.getTime()) / 60_000;
+  assert.equal(durMin, SNAP_MINUTES);
+  assert.equal(r.start.getHours(), 9);
+  assert.equal(r.end.getHours(), 9);
+  assert.equal(r.end.getMinutes(), 15);
+});
+
+// ── rangeFromSlots allday ───────────────────────────────────────────────
+
+test('rangeFromSlots allday: Mon–Wed → Mon 00:00 to Thu 00:00', () => {
+  const mon = localDay(2024, 0, 1);
+  const wed = localDay(2024, 0, 3);
+  const r = rangeFromSlots(slot(mon, 0), slot(wed, 0), 'allday');
+  assert.equal(r.start.getFullYear(), 2024);
+  assert.equal(r.start.getMonth(), 0);
+  assert.equal(r.start.getDate(), 1);
+  assert.equal(r.start.getHours(), 0);
+  // exclusive end = Thu Jan 4
+  assert.equal(r.end.getDate(), 4);
+  assert.equal(r.end.getHours(), 0);
+});
+
+test('rangeFromSlots allday: inverted days still ordered', () => {
+  const mon = localDay(2024, 0, 1);
+  const wed = localDay(2024, 0, 3);
+  const r = rangeFromSlots(slot(wed, 0), slot(mon, 0), 'allday');
+  assert.equal(r.start.getDate(), 1);
+  assert.equal(r.end.getDate(), 4);
+});
+
+test('rangeFromSlots allday: single day click → next midnight exclusive', () => {
+  const mon = localDay(2024, 0, 1);
+  const r = rangeFromSlots(slot(mon, 0), slot(mon, 0), 'allday');
+  assert.equal(r.start.getDate(), 1);
+  assert.equal(r.end.getDate(), 2);
+  assert.equal(r.end.getHours(), 0);
+});
+
+// ── movedRange ──────────────────────────────────────────────────────────
+
+test('movedRange: 60-min event dropped at Tue 14:00 → 14:00–15:00', () => {
+  const mon = localDay(2024, 0, 1);
+  const originalStart = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const originalEnd = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const tue = localDay(2024, 0, 2);
+  const r = movedRange(originalStart, originalEnd, slot(tue, 14 * 60));
+  assert.equal(r.start.getDate(), 2);
+  assert.equal(r.start.getHours(), 14);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getDate(), 2);
+  assert.equal(r.end.getHours(), 15);
+  assert.equal(r.end.getMinutes(), 0);
+  // silence unused
+  void mon;
+});
+
+// ── resizedRange ────────────────────────────────────────────────────────
+
+test('resizedRange: end dragged earlier than start+15 → clamped', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 12, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // Drag end to 10:00 (same as start) → clamp to 10:15
+  const r = resizedRange(start, end, 'end', slot(day, 10 * 60));
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getHours(), 10);
+  assert.equal(r.end.getMinutes(), 15);
+});
+
+test('resizedRange: start dragged later than end-15 → clamped', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 12, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // Drag start to 12:00 → clamp to 11:45
+  const r = resizedRange(start, end, 'start', slot(day, 12 * 60));
+  assert.equal(r.end.getTime(), end.getTime());
+  assert.equal(r.start.getHours(), 11);
+  assert.equal(r.start.getMinutes(), 45);
+});
+
+test('resizedRange: end extended freely', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(start, end, 'end', slot(day, 14 * 60));
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.end.getHours(), 14);
+});
+
+test('resizedRange: start pulled earlier', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(start, end, 'start', slot(day, 8 * 60));
+  assert.equal(r.start.getHours(), 8);
+  assert.equal(r.end.getHours(), 11);
+});
+
+// ── preview geometry ────────────────────────────────────────────────────
+
+test('timedPreviewSegments: splits overnight range across two days', () => {
+  const mon = localDay(2024, 0, 1);
+  const tue = localDay(2024, 0, 2);
+  const days = [mon, tue];
+  const preview = {
+    start: new Date(2024, 0, 1, 22, 0, 0, 0),
+    end: new Date(2024, 0, 2, 2, 0, 0, 0),
+  };
+  const segs = timedPreviewSegments(preview, 'move', days, 60);
+  assert.ok(segs.has(mon.toDateString()));
+  assert.ok(segs.has(tue.toDateString()));
+  // Mon: 22:00–24:00 → top = 22*60 = 1320 at hourH=60
+  assert.equal(segs.get(mon.toDateString())!.top, 22 * 60);
+  // Tue: 00:00–02:00 → top = 0
+  assert.equal(segs.get(tue.toDateString())!.top, 0);
+});
+
+test('allDayPreviewIndices: Mon–Wed exclusive end → indices 0..2', () => {
+  const mon = localDay(2024, 0, 1);
+  const days = Array.from({ length: 7 }, (_, i) => addDays(mon, i));
+  const preview = {
+    start: mon,
+    end: addDays(mon, 3), // exclusive Thu
+  };
+  const idx = allDayPreviewIndices(preview, 'allday-create', days);
+  assert.deepEqual(idx, { startDay: 0, endDay: 2 });
+});
+
+test('allDayPreviewIndices: null for timed kind', () => {
+  const mon = localDay(2024, 0, 1);
+  const days = [mon];
+  const preview = { start: mon, end: addDays(mon, 1) };
+  assert.equal(allDayPreviewIndices(preview, 'create', days), null);
+});
