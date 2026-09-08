@@ -744,7 +744,7 @@ export function CalendarPage() {
               >
                 {/* Time gutter */}
                 <div
-                  className="shrink-0 sticky left-0 z-30 relative border-r border-border/60 bg-cream"
+                  className="shrink-0 sticky left-0 z-30 border-r border-border/60 bg-cream"
                   style={{ width: gutterW, height: totalHoursH }}
                 >
                   {hourLabels.map((h) => {
