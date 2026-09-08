@@ -388,3 +388,144 @@ export function colorForCalendar(calendarId: string): string {
   const hash = hashString(calendarId || 'default');
   return EVENT_COLORS[Math.abs(hash) % EVENT_COLORS.length];
 }
+
+// ── All-day band (Notion Cron Xme tokens) ───────────────────────────────
+
+export const ALLDAY_CHIP = 19;
+export const ALLDAY_GAP = 2;
+export const ALLDAY_PAD = 3;
+export const ALLDAY_MIN = 25;
+export const ALLDAY_MAX = 137.5;
+
+/**
+ * Monday-aligned first cell of the 6×7 mini-month grid for the month
+ * containing `viewDate`.
+ */
+export function monthGridStart(viewDate: Date): Date {
+  const firstOfMonth = new Date(
+    viewDate.getFullYear(),
+    viewDate.getMonth(),
+    1,
+  );
+  return startOfWeek(firstOfMonth);
+}
+
+/** 42 local midnights covering the mini-month grid for `viewDate`'s month. */
+export function monthGridDays(viewDate: Date): Date[] {
+  const start = monthGridStart(viewDate);
+  return Array.from({ length: 42 }, (_, i) => addDays(start, i));
+}
+
+/**
+ * Multi-day (all-day band) events: occupies ≥2 distinct local civil dates
+ * AND duration ≥ 12 hours. Short overnights (e.g. 11pm–1am) stay on the
+ * time grid.
+ */
+export function isMultiDay(start: Date, end: Date): boolean {
+  if (isSameDay(start, end)) return false;
+  const durationMs = end.getTime() - start.getTime();
+  return durationMs >= 12 * 60 * 60 * 1000;
+}
+
+export interface AllDayPackInput {
+  id: string;
+  /** Inclusive day index in the visible week (0 = Mon … 6 = Sun). */
+  startDay: number;
+  /** Inclusive day index in the visible week (0 = Mon … 6 = Sun). */
+  endDay: number;
+}
+
+export interface AllDayPackResult {
+  id: string;
+  lane: number;
+}
+
+function dayRangesOverlap(
+  aStart: number,
+  aEnd: number,
+  bStart: number,
+  bEnd: number,
+): boolean {
+  // Inclusive ranges on the day axis.
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+/**
+ * First-fit lane packing for all-day chips.
+ * `topIndex` = smallest non-negative integer not used by an overlapping chip.
+ * Caller must clamp each event to the visible week before calling.
+ */
+export function packAllDayLanes(items: AllDayPackInput[]): AllDayPackResult[] {
+  if (items.length === 0) return [];
+
+  const sorted = [...items].sort((a, b) => {
+    if (a.startDay !== b.startDay) return a.startDay - b.startDay;
+    const spanA = a.endDay - a.startDay;
+    const spanB = b.endDay - b.startDay;
+    if (spanA !== spanB) return spanB - spanA; // longer first
+    return a.id.localeCompare(b.id);
+  });
+
+  const results: AllDayPackResult[] = [];
+  const laneRanges: { startDay: number; endDay: number }[][] = [];
+
+  for (const item of sorted) {
+    let lane = 0;
+    for (;;) {
+      const occupied = laneRanges[lane] ?? [];
+      const free = occupied.every(
+        (r) =>
+          !dayRangesOverlap(
+            item.startDay,
+            item.endDay,
+            r.startDay,
+            r.endDay,
+          ),
+      );
+      if (free) {
+        if (!laneRanges[lane]) laneRanges[lane] = [];
+        laneRanges[lane].push({
+          startDay: item.startDay,
+          endDay: item.endDay,
+        });
+        results.push({ id: item.id, lane });
+        break;
+      }
+      lane += 1;
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Height of the all-day section.
+ * `null` / no items → ALLDAY_MIN.
+ * Else clamp(max(MIN, PAD + (CHIP+GAP)*(maxLane+1) + 1), MIN, MAX).
+ */
+export function allDaySectionHeight(maxLaneIndex: number | null): number {
+  if (maxLaneIndex === null || maxLaneIndex < 0) return ALLDAY_MIN;
+  const raw =
+    ALLDAY_PAD +
+    (ALLDAY_CHIP + ALLDAY_GAP) * (maxLaneIndex + 1) +
+    1;
+  return clamp(Math.max(ALLDAY_MIN, raw), ALLDAY_MIN, ALLDAY_MAX);
+}
+
+/**
+ * Inclusive last civil date occupied by [start, end).
+ * When `end` is exactly local midnight (exclusive end-of-day boundary),
+ * the previous calendar day is the last occupied day.
+ */
+export function lastOccupiedCivilDate(start: Date, end: Date): Date {
+  const endCivil = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  if (end.getTime() === endCivil.getTime() && end.getTime() > start.getTime()) {
+    return addDays(endCivil, -1);
+  }
+  return endCivil;
+}
+
+/** Local midnight of the civil date containing `date`. */
+export function startOfDay(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}

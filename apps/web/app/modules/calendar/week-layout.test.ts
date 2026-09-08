@@ -4,16 +4,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  ALLDAY_MAX,
+  ALLDAY_MIN,
   CHIP_MIN_H,
   HOUR_H_BASE,
   HOUR_H_MAX,
   HOUR_H_MIN,
+  allDaySectionHeight,
   clampMinutesToDay,
   eventHeightPx,
   eventTopPx,
   formatWeekTitle,
   hourHeight,
+  isMultiDay,
+  monthGridDays,
+  monthGridStart,
   nowLineY,
+  packAllDayLanes,
   packDayEvents,
   startOfWeek,
   weekRangeIso,
@@ -233,4 +240,95 @@ test('hourHeight: never below 16; tall-enough stretches above base', () => {
   // Invalid / zero → base
   assert.equal(hourHeight(0), HOUR_H_BASE);
   assert.equal(hourHeight(-10), HOUR_H_BASE);
+});
+
+// ── monthGridStart / monthGridDays ──────────────────────────────────────
+
+test('monthGridStart: Sep 2026 (Tue 1st) → Mon Aug 31', () => {
+  // 2026-09-01 is a Tuesday → grid starts Mon Aug 31.
+  const start = monthGridStart(new Date(2026, 8, 15));
+  assert.equal(start.getFullYear(), 2026);
+  assert.equal(start.getMonth(), 7); // August
+  assert.equal(start.getDate(), 31);
+  assert.equal(start.getHours(), 0);
+  assert.equal(start.getDay(), 1); // Monday
+});
+
+test('monthGridDays: always 42 local midnights', () => {
+  const days = monthGridDays(new Date(2026, 8, 1));
+  assert.equal(days.length, 42);
+  const first = monthGridStart(new Date(2026, 8, 1));
+  assert.equal(days[0].getTime(), first.getTime());
+  assert.equal(
+    days[41].getTime() - days[0].getTime(),
+    41 * 24 * 60 * 60 * 1000,
+  );
+  for (const d of days) {
+    assert.equal(d.getHours(), 0);
+    assert.equal(d.getMinutes(), 0);
+  }
+});
+
+// ── isMultiDay ──────────────────────────────────────────────────────────
+
+test('isMultiDay: 2h overnight is false (stays on time grid)', () => {
+  // Tue 11pm → Wed 1am
+  const start = new Date(2026, 8, 8, 23, 0, 0, 0);
+  const end = new Date(2026, 8, 9, 1, 0, 0, 0);
+  assert.equal(isMultiDay(start, end), false);
+});
+
+test('isMultiDay: 36h trip is true', () => {
+  const start = new Date(2026, 8, 8, 8, 0, 0, 0);
+  const end = new Date(2026, 8, 9, 20, 0, 0, 0); // 36h
+  assert.equal(isMultiDay(start, end), true);
+});
+
+test('isMultiDay: same-day 8h is false', () => {
+  const start = new Date(2026, 8, 8, 9, 0, 0, 0);
+  const end = new Date(2026, 8, 8, 17, 0, 0, 0);
+  assert.equal(isMultiDay(start, end), false);
+});
+
+// ── packAllDayLanes ─────────────────────────────────────────────────────
+
+test('packAllDayLanes: non-overlapping same-week spans share lane 0', () => {
+  const packed = packAllDayLanes([
+    { id: 'a', startDay: 0, endDay: 1 }, // Mon–Tue
+    { id: 'b', startDay: 3, endDay: 5 }, // Thu–Sat
+  ]);
+  const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
+  assert.equal(byId.a.lane, 0);
+  assert.equal(byId.b.lane, 0);
+});
+
+test('packAllDayLanes: overlapping spans get lanes 0 and 1', () => {
+  const packed = packAllDayLanes([
+    { id: 'a', startDay: 0, endDay: 3 }, // Mon–Thu
+    { id: 'b', startDay: 2, endDay: 5 }, // Wed–Sat
+  ]);
+  const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
+  assert.equal(byId.a.lane, 0);
+  assert.equal(byId.b.lane, 1);
+});
+
+// ── allDaySectionHeight ─────────────────────────────────────────────────
+
+test('allDaySectionHeight: null → ALLDAY_MIN (25)', () => {
+  assert.equal(allDaySectionHeight(null), ALLDAY_MIN);
+  assert.equal(allDaySectionHeight(null), 25);
+});
+
+test('allDaySectionHeight: lane 0 → ≥25', () => {
+  // PAD + (CHIP+GAP)*1 + 1 = 3 + 21 + 1 = 25
+  assert.ok(allDaySectionHeight(0) >= ALLDAY_MIN);
+  assert.equal(allDaySectionHeight(0), 25);
+});
+
+test('allDaySectionHeight: high lane capped at ALLDAY_MAX (137.5)', () => {
+  // lane 5 → 3 + 21*6 + 1 = 130 (under cap)
+  assert.ok(allDaySectionHeight(5) <= ALLDAY_MAX);
+  // lane 6 → 3 + 21*7 + 1 = 151 → clamp 137.5
+  assert.equal(allDaySectionHeight(6), ALLDAY_MAX);
+  assert.equal(allDaySectionHeight(20), ALLDAY_MAX);
 });

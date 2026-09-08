@@ -8,15 +8,21 @@ import {
 } from 'react';
 import { ChevronLeft, ChevronRight, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { useCalendarEventsQuery } from '@/app/queries/calendar';
+import {
+  useCalendarEventsQuery,
+  useCalendarsQuery,
+} from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
+import { AllDayRow, type AllDayChip } from './AllDayRow';
+import { CalendarSidebar } from './CalendarSidebar';
 import {
   CHIP_MARGIN_RIGHT,
   COL_HEADER_H,
   TIME_GUTTER_W,
   WEEK_DAYS,
   addDays,
+  allDaySectionHeight,
   clampMinutesToDay,
   colorForCalendar,
   eventHeightPx,
@@ -26,9 +32,13 @@ import {
   formatHourLabel,
   formatWeekTitle,
   hourHeight as computeHourHeight,
+  isMultiDay,
   isSameDay,
+  lastOccupiedCivilDate,
   nowLineY,
+  packAllDayLanes,
   packDayEvents,
+  startOfDay,
   startOfWeek,
   weekDays,
   weekRangeIso,
@@ -137,6 +147,72 @@ export function CalendarPage() {
     void eventsQuery.refetch();
   };
 
+  // Calendars for sidebar list + visibility filter.
+  const calendarsQuery = useCalendarsQuery();
+  const calendars = calendarsQuery.data?.calendars ?? [];
+  const calendarsError =
+    calendarsQuery.error instanceof Error
+      ? calendarsQuery.error.message
+      : calendarsQuery.error
+        ? 'Failed to load calendars'
+        : null;
+
+  const [selectedCalendarIds, setSelectedCalendarIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+
+  // Default: select every calendar once the list first arrives.
+  useEffect(() => {
+    if (calendars.length === 0) return;
+    setSelectedCalendarIds((prev) => {
+      if (prev.size > 0) return prev;
+      return new Set(calendars.map((c) => c.id));
+    });
+  }, [calendars]);
+
+  const knownCalendarIds = useMemo(
+    () => new Set(calendars.map((c) => c.id)),
+    [calendars],
+  );
+
+  const toggleCalendar = useCallback((calendarId: string) => {
+    setSelectedCalendarIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(calendarId)) {
+        next.delete(calendarId);
+      } else {
+        next.add(calendarId);
+      }
+      return next;
+    });
+  }, []);
+
+  // Events whose calendar is selected, plus stale calendar_ids not in the list.
+  // Empty selection (pre-init) shows everything.
+  const visibleEvents = useMemo(() => {
+    return events.filter((e) => {
+      if (selectedCalendarIds.size === 0) return true;
+      if (selectedCalendarIds.has(e.calendar_id)) return true;
+      if (!knownCalendarIds.has(e.calendar_id)) return true;
+      return false;
+    });
+  }, [events, selectedCalendarIds, knownCalendarIds]);
+
+  const { timedEvents, allDayEvents } = useMemo(() => {
+    const timed: CalendarEvent[] = [];
+    const allDay: CalendarEvent[] = [];
+    for (const e of visibleEvents) {
+      const start = new Date(e.start_time);
+      const end = new Date(e.end_time);
+      if (isMultiDay(start, end)) {
+        allDay.push(e);
+      } else {
+        timed.push(e);
+      }
+    }
+    return { timedEvents: timed, allDayEvents: allDay };
+  }, [visibleEvents]);
+
   const days = useMemo(() => weekDays(weekStart), [weekStart]);
   const weekTitle = useMemo(() => formatWeekTitle(weekStart), [weekStart]);
 
@@ -201,7 +277,7 @@ export function CalendarPage() {
     shouldScrollToNowRef.current = false;
   }, [availableHoursPx, hourH, days, today, now]);
 
-  // Position events per day column.
+  // Position timed events per day column (multi-day events excluded).
   const eventsByDay = useMemo(() => {
     const map = new Map<string, PositionedEvent[]>();
 
@@ -213,7 +289,7 @@ export function CalendarPage() {
         endMin: number;
       }[] = [];
 
-      for (const event of events) {
+      for (const event of timedEvents) {
         const start = new Date(event.start_time);
         const end = new Date(event.end_time);
         const clamped = clampMinutesToDay(start, end, day);
@@ -253,7 +329,78 @@ export function CalendarPage() {
     }
 
     return map;
-  }, [days, events, hourH]);
+  }, [days, timedEvents, hourH]);
+
+  // All-day chips: clamp multi-day events to the visible week, pack lanes.
+  const { allDayChips, allDayHeight } = useMemo(() => {
+    const weekOrigin = days[0];
+    if (!weekOrigin) {
+      return { allDayChips: [] as AllDayChip[], allDayHeight: allDaySectionHeight(null) };
+    }
+
+    const msPerDay = 24 * 60 * 60 * 1000;
+    const inputs: {
+      id: string;
+      startDay: number;
+      endDay: number;
+      event: CalendarEvent;
+    }[] = [];
+
+    for (const event of allDayEvents) {
+      const start = new Date(event.start_time);
+      const end = new Date(event.end_time);
+      const first = startOfDay(start);
+      const last = lastOccupiedCivilDate(start, end);
+
+      let startDay = Math.round(
+        (first.getTime() - weekOrigin.getTime()) / msPerDay,
+      );
+      let endDay = Math.round(
+        (last.getTime() - weekOrigin.getTime()) / msPerDay,
+      );
+
+      // No overlap with visible week [0, 6].
+      if (endDay < 0 || startDay > 6) continue;
+      startDay = Math.max(0, Math.min(6, startDay));
+      endDay = Math.max(0, Math.min(6, endDay));
+      if (endDay < startDay) continue;
+
+      inputs.push({ id: event.id, startDay, endDay, event });
+    }
+
+    const packed = packAllDayLanes(
+      inputs.map((i) => ({
+        id: i.id,
+        startDay: i.startDay,
+        endDay: i.endDay,
+      })),
+    );
+    const laneById = new Map(packed.map((p) => [p.id, p.lane]));
+
+    let maxLane: number | null = null;
+    const chips: AllDayChip[] = inputs.map((i) => {
+      const lane = laneById.get(i.id) ?? 0;
+      if (maxLane === null || lane > maxLane) maxLane = lane;
+      return {
+        id: i.id,
+        title: i.event.title,
+        startDay: i.startDay,
+        endDay: i.endDay,
+        lane,
+        color: colorForCalendar(i.event.calendar_id || i.event.id),
+      };
+    });
+
+    return {
+      allDayChips: chips,
+      allDayHeight: allDaySectionHeight(maxLane),
+    };
+  }, [days, allDayEvents]);
+
+  const todayIndex = useMemo(() => {
+    const idx = days.findIndex((d) => isSameDay(d, today));
+    return idx >= 0 ? idx : null;
+  }, [days, today]);
 
   const shiftWeek = useCallback((deltaWeeks: number) => {
     shouldScrollToNowRef.current = false;
@@ -264,6 +411,15 @@ export function CalendarPage() {
     shouldScrollToNowRef.current = true;
     setWeekStart(startOfWeek(new Date()));
   }, []);
+
+  const goToDate = useCallback(
+    (date: Date) => {
+      // Scroll-to-now only when the clicked day is today.
+      shouldScrollToNowRef.current = isSameDay(date, today);
+      setWeekStart(startOfWeek(date));
+    },
+    [today],
+  );
 
   const hourLabels = useMemo(
     () => Array.from({ length: 24 }, (_, h) => h),
@@ -324,153 +480,175 @@ export function CalendarPage() {
         </div>
       )}
 
-      {/* Grid body — always mounted so measure/scroll-to-now effects attach */}
-      <div className="flex-1 min-h-0 flex flex-col relative">
-        <div
-          ref={scrollerRef}
-          className={cn(
-            'flex-1 min-h-0 overflow-auto',
-            isRefreshing && 'opacity-70',
-          )}
-        >
-          {/* Sticky day headers row (gutter spacer + 7 days) */}
-          <div
-            className="sticky top-0 z-20 flex bg-cream border-b border-border"
-            style={{ height: COL_HEADER_H }}
-          >
-            <div
-              className="shrink-0 border-r border-border/60"
-              style={{ width: TIME_GUTTER_W }}
-              aria-hidden
-            />
-            {days.map((day, i) => {
-              const isToday = isSameDay(day, today);
-              return (
-                <div
-                  key={day.toISOString()}
-                  className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
-                >
-                  <span
-                    className={cn(
-                      'text-[11px] font-medium uppercase tracking-wide',
-                      isToday ? 'text-primary' : 'text-muted-foreground',
-                    )}
-                  >
-                    {WEEK_DAYS[i]}
-                  </span>
-                  <span
-                    className={cn(
-                      'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
-                      isToday
-                        ? 'bg-primary text-primary-foreground'
-                        : 'text-foreground',
-                    )}
-                  >
-                    {day.getDate()}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
+      {/* Body: sidebar + grid */}
+      <div className="flex-1 min-h-0 flex">
+        <CalendarSidebar
+          weekStart={weekStart}
+          onGoToDate={goToDate}
+          calendars={calendars}
+          calendarsLoading={calendarsQuery.isLoading}
+          calendarsError={calendarsError}
+          onRetryCalendars={() => {
+            void calendarsQuery.refetch();
+          }}
+          selectedCalendarIds={selectedCalendarIds}
+          onToggleCalendar={toggleCalendar}
+        />
 
-          {/* Hours: gutter + 7 columns, shared scroll (parent scroller) */}
-          <div className="relative flex" style={{ height: totalHoursH }}>
-            {/* Time gutter */}
+        {/* Grid column — always mounted so measure/scroll-to-now effects attach */}
+        <div className="flex-1 min-h-0 flex flex-col relative">
+          <AllDayRow
+            height={allDayHeight}
+            chips={allDayChips}
+            todayIndex={todayIndex}
+          />
+
+          <div
+            ref={scrollerRef}
+            className={cn(
+              'flex-1 min-h-0 overflow-auto',
+              isRefreshing && 'opacity-70',
+            )}
+          >
+            {/* Sticky day headers row (gutter spacer + 7 days) */}
             <div
-              className="shrink-0 relative border-r border-border/60"
-              style={{ width: TIME_GUTTER_W }}
+              className="sticky top-0 z-20 flex bg-cream border-b border-border"
+              style={{ height: COL_HEADER_H }}
             >
-              {hourLabels.map((h) => {
-                const label = formatHourLabel(h);
-                if (!label) return null;
+              <div
+                className="shrink-0 border-r border-border/60"
+                style={{ width: TIME_GUTTER_W }}
+                aria-hidden
+              />
+              {days.map((day, i) => {
+                const isToday = isSameDay(day, today);
                 return (
                   <div
-                    key={h}
-                    className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
-                    style={{ top: h * hourH }}
+                    key={day.toISOString()}
+                    className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
                   >
-                    {label}
+                    <span
+                      className={cn(
+                        'text-[11px] font-medium uppercase tracking-wide',
+                        isToday ? 'text-primary' : 'text-muted-foreground',
+                      )}
+                    >
+                      {WEEK_DAYS[i]}
+                    </span>
+                    <span
+                      className={cn(
+                        'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
+                        isToday
+                          ? 'bg-primary text-primary-foreground'
+                          : 'text-foreground',
+                      )}
+                    >
+                      {day.getDate()}
+                    </span>
                   </div>
                 );
               })}
             </div>
 
-            {/* Day columns */}
-            {days.map((day) => {
-              const isToday = isSameDay(day, today);
-              const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
-              const showNow = isToday;
-
-              return (
-                <div
-                  key={day.toISOString()}
-                  className={cn(
-                    'relative flex-1 min-w-0 border-r border-border/40 last:border-r-0',
-                    isToday && 'bg-primary/[0.03]',
-                  )}
-                >
-                  {/* Hour hairlines */}
-                  {hourLabels.map((h) => (
+            {/* Hours: gutter + 7 columns, shared scroll (parent scroller) */}
+            <div className="relative flex" style={{ height: totalHoursH }}>
+              {/* Time gutter */}
+              <div
+                className="shrink-0 relative border-r border-border/60"
+                style={{ width: TIME_GUTTER_W }}
+              >
+                {hourLabels.map((h) => {
+                  const label = formatHourLabel(h);
+                  if (!label) return null;
+                  return (
                     <div
                       key={h}
-                      className="absolute left-0 right-0 border-t border-border/50"
+                      className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
                       style={{ top: h * hourH }}
-                    />
-                  ))}
-
-                  {/* Event chips */}
-                  {dayEvents.map((p) => (
-                    <EventChip key={p.event.id} positioned={p} />
-                  ))}
-
-                  {/* Now line */}
-                  {showNow && (
-                    <div
-                      className="absolute left-0 right-0 z-10 pointer-events-none"
-                      style={{ top: nowLineY(now, hourH) }}
-                      aria-hidden
                     >
-                      <div
-                        className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
-                        style={{ backgroundColor: NOW_LINE_COLOR }}
-                      />
-                      <div
-                        className="h-px w-full"
-                        style={{ backgroundColor: NOW_LINE_COLOR }}
-                      />
+                      {label}
                     </div>
-                  )}
-                </div>
-              );
-            })}
+                  );
+                })}
+              </div>
+
+              {/* Day columns */}
+              {days.map((day) => {
+                const isToday = isSameDay(day, today);
+                const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
+                const showNow = isToday;
+
+                return (
+                  <div
+                    key={day.toISOString()}
+                    className={cn(
+                      'relative flex-1 min-w-0 border-r border-border/40 last:border-r-0',
+                      isToday && 'bg-primary/[0.03]',
+                    )}
+                  >
+                    {/* Hour hairlines */}
+                    {hourLabels.map((h) => (
+                      <div
+                        key={h}
+                        className="absolute left-0 right-0 border-t border-border/50"
+                        style={{ top: h * hourH }}
+                      />
+                    ))}
+
+                    {/* Event chips */}
+                    {dayEvents.map((p) => (
+                      <EventChip key={p.event.id} positioned={p} />
+                    ))}
+
+                    {/* Now line */}
+                    {showNow && (
+                      <div
+                        className="absolute left-0 right-0 z-10 pointer-events-none"
+                        style={{ top: nowLineY(now, hourH) }}
+                        aria-hidden
+                      >
+                        <div
+                          className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
+                          style={{ backgroundColor: NOW_LINE_COLOR }}
+                        />
+                        <div
+                          className="h-px w-full"
+                          style={{ backgroundColor: NOW_LINE_COLOR }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
+
+          {/* Loading overlay — grid stays mounted and measurable underneath */}
+          {isLoading && events.length === 0 && (
+            <div
+              className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 pointer-events-none"
+              aria-busy="true"
+              aria-label="Loading events"
+            >
+              <Loader2 className="h-8 w-8 animate-spin mb-3 text-muted-foreground" />
+              <p className="text-sm text-muted-foreground">Loading events...</p>
+            </div>
+          )}
+
+          {/* Hard error overlay — empty grid still mounted underneath */}
+          {error && events.length === 0 && !isLoading && (
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 text-center px-4">
+              <p className="text-foreground font-medium mb-2">
+                Failed to load events
+              </p>
+              <p className="text-sm text-muted-foreground mb-4">{error}</p>
+              <Button variant="outline" onClick={retry}>
+                <RefreshCw className="h-4 w-4 mr-2" />
+                Retry
+              </Button>
+            </div>
+          )}
         </div>
-
-        {/* Loading overlay — grid stays mounted and measurable underneath */}
-        {isLoading && events.length === 0 && (
-          <div
-            className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 pointer-events-none"
-            aria-busy="true"
-            aria-label="Loading events"
-          >
-            <Loader2 className="h-8 w-8 animate-spin mb-3 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">Loading events...</p>
-          </div>
-        )}
-
-        {/* Hard error overlay — empty grid still mounted underneath */}
-        {error && events.length === 0 && !isLoading && (
-          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 text-center px-4">
-            <p className="text-foreground font-medium mb-2">
-              Failed to load events
-            </p>
-            <p className="text-sm text-muted-foreground mb-4">{error}</p>
-            <Button variant="outline" onClick={retry}>
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Retry
-            </Button>
-          </div>
-        )}
       </div>
     </div>
   );
