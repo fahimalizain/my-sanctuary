@@ -6,6 +6,7 @@
 
 pub mod agenda;
 pub mod calendar;
+pub mod calendar_color;
 pub mod categories;
 pub mod google_color;
 pub mod lists;
@@ -40,6 +41,10 @@ pub use calendar::{
     CronReport, DeleteEventResponse, WebhookDecision, CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL,
     GOOGLE_CHANNELS_STOP_URL, GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS,
     WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
+};
+pub use calendar_color::{
+    color_for_event_title, paint_events, paint_events_default, paint_events_for_user,
+    CalendarEventView,
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,

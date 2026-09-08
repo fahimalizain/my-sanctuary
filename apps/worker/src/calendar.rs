@@ -17,7 +17,10 @@
 use worker::*;
 
 use api_core::repo::{CalendarRepo, WatchChannelRepo};
-use api_core::{models::NewEventInput, models::PatchEventFields, CalendarError, OAuthConfig};
+use api_core::{
+    models::NewEventInput, models::PatchEventFields, paint_events_default, paint_events_for_user,
+    CalendarError, CalendarEventView, OAuthConfig,
+};
 
 /// 401 body for missing/invalid sessions and failed token refreshes.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -52,6 +55,58 @@ fn session_and_oauth<'a>(
         return Ok(None);
     };
     Ok(Some((user.id, oauth)))
+}
+
+/// Paint cached events with category colors. Taxonomy failures are logged and
+/// every event falls back to [`api_core::DEFAULT_EVENT_LABEL_COLOR`] — listing
+/// must never 500 because paint failed.
+async fn paint_listed_events(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user_id: &str,
+    events: Vec<api_core::models::CalendarEvent>,
+) -> Result<Vec<CalendarEventView>> {
+    paint_events_with_fallback(ctx, user_id, events).await
+}
+
+async fn paint_single_event(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user_id: &str,
+    event: api_core::models::CalendarEvent,
+) -> Result<CalendarEventView> {
+    let mut views = paint_events_with_fallback(ctx, user_id, vec![event]).await?;
+    Ok(views
+        .pop()
+        .expect("paint_events_with_fallback preserves one event"))
+}
+
+async fn paint_events_with_fallback(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user_id: &str,
+    events: Vec<api_core::models::CalendarEvent>,
+) -> Result<Vec<CalendarEventView>> {
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
+    let list_repo = crate::db::D1TaskListRepo::new(d1()?);
+    let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let cals = match calendars.list_by_user_id(user_id).await {
+        Ok(cals) => cals,
+        Err(err) => {
+            console_log!("calendar: paint calendars load failed: {err}");
+            return Ok(paint_events_default(events));
+        }
+    };
+    // Clone so taxonomy failure can still return a default-colored response.
+    let fallback = events.clone();
+    match paint_events_for_user(&list_repo, &category_repo, &cals, events, user_id).await {
+        Ok(views) => Ok(views),
+        Err(err) => {
+            console_log!("calendar: paint events failed: {err}");
+            Ok(paint_events_default(fallback))
+        }
+    }
 }
 
 /// `GET /api/calendar/events` → 200 `{"events":[...],"source":"cache"}`.
@@ -122,8 +177,10 @@ pub async fn list_events(
         console_log!("calendar sync: {error}");
     }
 
+    let events = paint_listed_events(&ctx, &user_id, output.events).await?;
+
     let response = Response::from_json(&api_core::CalendarEventsResponse {
-        events: output.events,
+        events,
         source: "cache".to_string(),
     })?;
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
@@ -226,8 +283,9 @@ pub async fn create_event(
             if let Some(error) = &output.cache_error {
                 console_log!("calendar: cache upsert failed for created event: {error}");
             }
+            let event = paint_single_event(&ctx, &user_id, output.event).await?;
             let response = Response::from_json(&api_core::CreateEventResponse {
-                event: output.event,
+                event,
                 source: output.source,
             })?;
             Ok(response
@@ -296,8 +354,9 @@ pub async fn update_event(
             if let Some(error) = &output.cache_error {
                 console_log!("calendar: cache upsert failed for patched event: {error}");
             }
+            let event = paint_single_event(&ctx, &user_id, output.event).await?;
             let response = Response::from_json(&api_core::CreateEventResponse {
-                event: output.event,
+                event,
                 source: output.source,
             })?;
             Ok(response

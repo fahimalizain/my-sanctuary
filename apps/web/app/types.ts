@@ -42,6 +42,8 @@ export interface CalendarEvent {
   start_time: string; // ISO 8601
   end_time: string; // ISO 8601
   last_synced_at: string;
+  /** Matched category color from the API (`#rrggbb`). May be absent from older workers. */
+  color?: string;
 }
 
 // The envelope returned by GET /api/calendar/events

@@ -97,6 +97,13 @@ function clickCreateTimesFromSlot(slot: DragSlot): TimedRange {
   };
 }
 
+/** Category color from the API when present; otherwise hash the calendar id. */
+function eventChipColor(event: CalendarEvent): string {
+  const fromApi = event.color?.trim();
+  if (fromApi) return fromApi;
+  return colorForCalendar(event.calendar_id || event.id);
+}
+
 export function CalendarPage() {
   // Strip window: first *rendered* day. Visible period is windowStart + scroll offset.
   // Initial: overscan before current Mon–Sun so current week is centered in the buffer.
@@ -423,7 +430,7 @@ export function CalendarPage() {
         startDay: i.startDay,
         endDay: i.endDay,
         lane,
-        color: colorForCalendar(i.event.calendar_id || i.event.id),
+        color: eventChipColor(i.event),
       };
     });
 
@@ -517,7 +524,7 @@ export function CalendarPage() {
     ? events.find((e) => e.id === drag.activeEventId)
     : undefined;
   const previewColor = activeDragEvent
-    ? colorForCalendar(activeDragEvent.calendar_id || activeDragEvent.id)
+    ? eventChipColor(activeDragEvent)
     : writableCalendar
       ? colorForCalendar(writableCalendar.id)
       : colorForCalendar('preview');
@@ -671,7 +678,7 @@ export function CalendarPage() {
           col: pack.col,
           cols: pack.cols,
           span: pack.span,
-          color: colorForCalendar(d.event.calendar_id || d.event.id),
+          color: eventChipColor(d.event),
         };
       });
 

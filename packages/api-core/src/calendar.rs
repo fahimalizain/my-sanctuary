@@ -132,17 +132,23 @@ pub struct CreateEventOutput {
 }
 
 /// Response envelope for `GET /api/calendar/events`.
+///
+/// Events are painted with the matched category color via
+/// [`crate::calendar_color::paint_events_for_user`] before serialization.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CalendarEventsResponse {
-    pub events: Vec<CalendarEvent>,
+    pub events: Vec<crate::calendar_color::CalendarEventView>,
     pub source: String,
 }
 
 /// Response envelope for `POST /api/calendar/events` and
 /// `PATCH /api/calendar/events/:id`.
+///
+/// The event is painted with the matched category color via
+/// [`crate::calendar_color::paint_events_for_user`] before serialization.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CreateEventResponse {
-    pub event: CalendarEvent,
+    pub event: crate::calendar_color::CalendarEventView,
     pub source: String,
 }
 
