@@ -24,7 +24,7 @@ import {
   startOfDay,
   stripDayCount,
   visibleStartIndex as computeVisibleStartIndex,
-} from './week-layout';
+} from '../lib/week-layout';
 
 export interface CalendarStrip {
   periodLength: number;

@@ -8,7 +8,7 @@ import {
   formatEventTimeRange,
   hexToRgba,
   isCompactChip,
-} from './week-layout';
+} from '../lib/week-layout';
 
 const PREVIEW_FILL_ALPHA = 0.18;
 

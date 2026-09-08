@@ -13,7 +13,7 @@ import {
   monthGridDays,
   monthGridStart,
   startOfDay,
-} from './week-layout';
+} from '../lib/week-layout';
 
 const MONTH_LABEL = [
   'January',

@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { AllDayRow, type AllDayChip, type AllDayPreview } from './AllDayRow';
-import { dayNameShort } from './calendar-model';
+import { dayNameShort } from '../lib/calendar-model';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
 import { type PositionedEvent } from './EventChip';
 import {
@@ -15,7 +15,7 @@ import {
   formatHourLabel,
   isSameDay,
   isWeekend,
-} from './week-layout';
+} from '../lib/week-layout';
 
 /** Stable empty list so DayColumn memo is not busted on empty days. */
 const EMPTY_DAY_EVENTS: PositionedEvent[] = [];

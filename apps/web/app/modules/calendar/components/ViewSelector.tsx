@@ -7,7 +7,7 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
-import { periodLabel } from './week-layout';
+import { periodLabel } from '../lib/week-layout';
 
 const GROUP_1: { n: number; label: string; shortcut: string }[] = [
   { n: 1, label: 'Day', shortcut: '1' },

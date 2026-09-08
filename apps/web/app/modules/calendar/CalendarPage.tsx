@@ -1,18 +1,18 @@
 import { useLayoutEffect } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { CalendarHeader } from './CalendarHeader';
-import { CalendarSidebar } from './CalendarSidebar';
-import { CalendarWeekGrid } from './CalendarWeekGrid';
-import { EventInspector } from './EventInspector';
-import { useCalendarSession } from './useCalendarSession';
-import { useCalendarStrip } from './useCalendarStrip';
+import { CalendarHeader } from './components/CalendarHeader';
+import { CalendarSidebar } from './components/CalendarSidebar';
+import { CalendarWeekGrid } from './components/CalendarWeekGrid';
+import { EventInspector } from './components/EventInspector';
+import { useCalendarSession } from './hooks/useCalendarSession';
+import { useCalendarStrip } from './hooks/useCalendarStrip';
 import {
   COL_HEADER_H,
   addDays,
   isSameDay,
   nowLineY,
-} from './week-layout';
+} from './lib/week-layout';
 
 export function CalendarPage() {
   const strip = useCalendarStrip();

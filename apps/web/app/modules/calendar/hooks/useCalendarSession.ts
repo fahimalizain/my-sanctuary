@@ -16,13 +16,13 @@ import {
   allDayPreviewIndices,
   timedPreviewSegments,
   type TimedRange,
-} from './calendar-drag';
+} from '../lib/calendar-drag';
 import {
   buildAllDayChips,
   buildEventsByDay,
   clickCreateTimesFromSlot,
   eventChipColor,
-} from './calendar-model';
+} from '../lib/calendar-model';
 import { useCalendarDrag } from './useCalendarDrag';
 import {
   COL_HEADER_H,
@@ -32,7 +32,7 @@ import {
   hourHeight as computeHourHeight,
   isMultiDay,
   isSameDay,
-} from './week-layout';
+} from '../lib/week-layout';
 
 export interface CalendarSessionInput {
   timeMin: string;

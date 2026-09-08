@@ -6,7 +6,7 @@ import {
   contrastingInk,
   isWeekend,
   hexToRgba,
-} from './week-layout';
+} from '../lib/week-layout';
 import { cn } from '@/lib/utils';
 
 const PREVIEW_FILL_ALPHA = 0.18;

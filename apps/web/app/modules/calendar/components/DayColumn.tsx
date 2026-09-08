@@ -5,7 +5,7 @@ import {
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
-import { nowLineY } from './week-layout';
+import { nowLineY } from '../lib/week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
 

@@ -3,7 +3,7 @@ import { Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
-import { formatEventTimeRange } from './week-layout';
+import { formatEventTimeRange } from '../lib/week-layout';
 
 export interface EventInspectorProps {
   event: CalendarEvent;

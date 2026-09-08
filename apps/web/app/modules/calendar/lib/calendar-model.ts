@@ -3,9 +3,9 @@
 // No React. Deterministic. Native Date only.
 
 import type { CalendarEvent } from '@/app/types';
-import type { AllDayChip } from './AllDayRow';
+import type { AllDayChip } from '../components/AllDayRow';
 import type { DragSlot, TimedRange } from './calendar-drag';
-import type { PositionedEvent } from './EventChip';
+import type { PositionedEvent } from '../components/EventChip';
 import {
   DEFAULT_EVENT_DURATION_MIN,
   MINUTES_PER_DAY,

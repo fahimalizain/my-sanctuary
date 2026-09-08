@@ -17,12 +17,12 @@ import {
   rangeFromSlots,
   resizeEdgeAt,
   resizedRange,
-} from './calendar-drag';
+} from '../lib/calendar-drag';
 import {
   minutesFromY,
   snapMinutes,
   startOfDay,
-} from './week-layout';
+} from '../lib/week-layout';
 import type { CalendarEvent } from '@/app/types';
 
 export interface UseCalendarDragOptions {
