@@ -11,6 +11,7 @@ import {
   applyEventOverlays,
   type EventOverlay,
 } from './lib/event-overlays';
+import { useCalendarRealtime } from './useCalendarRealtime';
 
 export interface CalendarEventsQueue {
   /** Snapshot of pending overlays (one entry per event id). */
@@ -46,6 +47,9 @@ export function CalendarEventsProvider({
 }: {
   children: React.ReactNode;
 }) {
+  // One app-wide UserHub socket; invalidates events queries on remote changes.
+  useCalendarRealtime();
+
   // Map is the physical store (last write per id). version forces re-renders
   // so consumers re-run apply() after mutations; getOverlay always reads ref.
   const mapRef = useRef(new Map<string, EventOverlay>());
