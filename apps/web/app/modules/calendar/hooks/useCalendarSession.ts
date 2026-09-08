@@ -5,6 +5,7 @@ import {
   useState,
 } from 'react';
 import {
+  removeCalendarEventFromCache,
   upsertCalendarEventInCache,
   useCalendarEventsQuery,
   useCalendarsQuery,
@@ -25,6 +26,10 @@ import {
   clickCreateTimesFromSlot,
   eventChipColor,
 } from '../lib/calendar-model';
+import {
+  isTempEventId,
+  newTempEventId,
+} from '../lib/event-overlays';
 import { useCalendarDrag } from './useCalendarDrag';
 import {
   COL_HEADER_H,
@@ -71,7 +76,7 @@ export function useCalendarSession({
     void eventsQuery.refetch();
   };
 
-  // Optimistic move/resize overlay (read-time; not setQueryData).
+  // Optimistic create/move/resize/delete overlay (read-time; not setQueryData).
   const queue = useCalendarEventsQueue();
 
   // Calendars for sidebar list + visibility filter.
@@ -95,9 +100,6 @@ export function useCalendarSession({
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   // Focus title only right after click-to-create, not on every chip select.
   const [focusTitleOnOpen, setFocusTitleOnOpen] = useState(false);
-  // Hold the just-created event until the list query includes it (inspector
-  // opens immediately; chip appears after invalidate).
-  const [pendingEvent, setPendingEvent] = useState<CalendarEvent | null>(null);
 
   const createEvent = useCreateCalendarEvent();
   const updateEvent = useUpdateCalendarEvent();
@@ -115,7 +117,7 @@ export function useCalendarSession({
     setSelectionReady(true);
   }, [calendars, selectionReady]);
 
-  // Overlay first so inspector shows optimistic move/resize times.
+  // Overlay first so inspector shows optimistic create/move/resize.
   const overlaidEvents = useMemo(
     () => queue.apply(events),
     [queue, events],
@@ -123,39 +125,20 @@ export function useCalendarSession({
 
   const selectedEvent = useMemo(() => {
     if (!selectedEventId) return null;
-    const fromList = overlaidEvents.find((e) => e.id === selectedEventId);
-    if (fromList) return fromList;
-    if (pendingEvent?.id === selectedEventId) return pendingEvent;
-    return null;
-  }, [overlaidEvents, selectedEventId, pendingEvent]);
-
-  // Clear pending once the list catches up.
-  useEffect(() => {
-    if (
-      pendingEvent &&
-      events.some((e) => e.id === pendingEvent.id)
-    ) {
-      setPendingEvent(null);
-    }
-  }, [events, pendingEvent]);
+    return overlaidEvents.find((e) => e.id === selectedEventId) ?? null;
+  }, [overlaidEvents, selectedEventId]);
 
   // Drop selection if the event disappeared (deleted / filtered out of cache).
   useEffect(() => {
     if (
       selectedEventId &&
       !selectedEvent &&
-      !pendingEvent &&
       !eventsQuery.isFetching
     ) {
       setSelectedEventId(null);
       setFocusTitleOnOpen(false);
     }
-  }, [
-    selectedEventId,
-    selectedEvent,
-    pendingEvent,
-    eventsQuery.isFetching,
-  ]);
+  }, [selectedEventId, selectedEvent, eventsQuery.isFetching]);
 
   const selectedEventCalendar = useMemo(() => {
     if (!selectedEvent) return undefined;
@@ -165,31 +148,72 @@ export function useCalendarSession({
   const closeInspector = useCallback(() => {
     setSelectedEventId(null);
     setFocusTitleOnOpen(false);
-    setPendingEvent(null);
   }, []);
 
   const selectEvent = useCallback((eventId: string) => {
     setSelectedEventId(eventId);
     setFocusTitleOnOpen(false);
-    setPendingEvent(null);
   }, []);
 
   const handleSaveTitle = useCallback(
     async (summary: string) => {
       if (!selectedEventId) return;
-      await updateEvent.mutateAsync({
-        id: selectedEventId,
-        input: { summary },
-      });
+      const current = overlaidEvents.find((e) => e.id === selectedEventId);
+      if (!current) return;
+
+      // Paint immediately.
+      queue.upsert({ ...current, title: summary });
+
+      // Temp ids have no server row yet — create onSuccess will flush the title.
+      if (isTempEventId(selectedEventId)) return;
+
+      try {
+        const result = await updateEvent.mutateAsync({
+          id: selectedEventId,
+          input: { summary },
+        });
+        upsertCalendarEventInCache(result.event);
+        const latest = queue.getOverlay(selectedEventId);
+        if (
+          !latest ||
+          (latest.op === 'upsert' &&
+            latest.event.title === result.event.title &&
+            latest.event.start_time === result.event.start_time &&
+            latest.event.end_time === result.event.end_time)
+        ) {
+          queue.clear(selectedEventId);
+        }
+      } catch {
+        // Revert only if overlay was not superseded by a newer edit.
+        const latest = queue.getOverlay(selectedEventId);
+        if (latest?.op === 'upsert' && latest.event.title === summary) {
+          queue.clear(selectedEventId);
+        }
+      }
     },
-    [selectedEventId, updateEvent],
+    [selectedEventId, overlaidEvents, queue, updateEvent],
   );
 
   const handleDeleteEvent = useCallback(async () => {
     if (!selectedEventId) return;
-    await deleteEvent.mutateAsync(selectedEventId);
+    const id = selectedEventId;
+
+    // Chip gone now; close inspector immediately.
+    queue.remove(id);
     closeInspector();
-  }, [selectedEventId, deleteEvent, closeInspector]);
+
+    // Temp ids were never on the server — abandon in-flight create.
+    if (isTempEventId(id)) return;
+
+    try {
+      await deleteEvent.mutateAsync(id);
+      removeCalendarEventFromCache(id);
+      queue.clear(id);
+    } catch {
+      // Clear delete overlay so the event reappears from the server list.
+      queue.clear(id);
+    }
+  }, [selectedEventId, queue, closeInspector, deleteEvent]);
 
   const knownCalendarIds = useMemo(
     () => new Set(calendars.map((c) => c.id)),
@@ -208,28 +232,19 @@ export function useCalendarSession({
     });
   }, []);
 
-  // Overlay first, then calendar-visibility filter. Merge a just-created
-  // pending event so the chip paints before invalidate (slice 3 owns create).
+  // Overlay first, then calendar-visibility filter.
   const visibleEvents = useMemo(() => {
-    const base = overlaidEvents.filter((e) => {
+    return overlaidEvents.filter((e) => {
       if (!selectionReady) return true;
       if (selectedCalendarIds.has(e.calendar_id)) return true;
       if (!knownCalendarIds.has(e.calendar_id)) return true;
       return false;
     });
-    if (
-      pendingEvent &&
-      !base.some((e) => e.id === pendingEvent.id)
-    ) {
-      return [...base, pendingEvent];
-    }
-    return base;
   }, [
     overlaidEvents,
     selectedCalendarIds,
     knownCalendarIds,
     selectionReady,
-    pendingEvent,
   ]);
 
   const { timedEvents, allDayEvents } = useMemo(() => {
@@ -271,23 +286,137 @@ export function useCalendarSession({
         closeInspector();
         return;
       }
+
+      const tempId = newTempEventId();
+      const startIso = range.start.toISOString();
+      const endIso = range.end.toISOString();
+      const postedSummary = 'New event';
+
+      const optimistic: CalendarEvent = {
+        id: tempId,
+        calendar_id: writableCalendar.id,
+        google_event_id: '',
+        title: postedSummary,
+        description: '',
+        start_time: startIso,
+        end_time: endIso,
+        last_synced_at: new Date().toISOString(),
+        color: colorForCalendar(writableCalendar.id),
+      };
+
+      // Paint chip + open inspector immediately under the temp id.
+      queue.upsert(optimistic);
+      setSelectedEventId(tempId);
+      setFocusTitleOnOpen(true);
+
       createEvent.mutate(
         {
           calendar_id: writableCalendar.id,
-          summary: 'New event',
-          start: range.start.toISOString(),
-          end: range.end.toISOString(),
+          summary: postedSummary,
+          start: startIso,
+          end: endIso,
         },
         {
           onSuccess: (result) => {
-            setPendingEvent(result.event);
-            setSelectedEventId(result.event.id);
-            setFocusTitleOnOpen(true);
+            const latest = queue.getOverlay(tempId);
+
+            // User deleted while create was in flight — do not cache-write;
+            // DELETE the just-created server event so Google has no ghost.
+            if (!latest || latest.op === 'delete') {
+              queue.clear(tempId);
+              void deleteEvent.mutateAsync(result.event.id).then(() => {
+                removeCalendarEventFromCache(result.event.id);
+              });
+              return;
+            }
+
+            queue.clear(tempId);
+            upsertCalendarEventInCache(result.event);
+
+            // If the user renamed / moved the temp event before POST returned,
+            // keep those fields under the server id and flush a PATCH.
+            if (latest.op === 'upsert') {
+              const local = latest.event;
+              const titleDiffers = local.title !== postedSummary;
+              const startDiffers = local.start_time !== startIso;
+              const endDiffers = local.end_time !== endIso;
+
+              if (titleDiffers || startDiffers || endDiffers) {
+                const merged: CalendarEvent = {
+                  ...result.event,
+                  title: local.title,
+                  start_time: local.start_time,
+                  end_time: local.end_time,
+                };
+                queue.upsert(merged);
+
+                const input: {
+                  summary?: string;
+                  start?: string;
+                  end?: string;
+                } = {};
+                if (titleDiffers) input.summary = local.title;
+                if (startDiffers) input.start = local.start_time;
+                if (endDiffers) input.end = local.end_time;
+
+                const serverId = result.event.id;
+                void updateEvent
+                  .mutateAsync({ id: serverId, input })
+                  .then((patchResult) => {
+                    upsertCalendarEventInCache(patchResult.event);
+                    const after = queue.getOverlay(serverId);
+                    if (
+                      !after ||
+                      (after.op === 'upsert' &&
+                        after.event.title === patchResult.event.title &&
+                        after.event.start_time ===
+                          patchResult.event.start_time &&
+                        after.event.end_time === patchResult.event.end_time)
+                    ) {
+                      queue.clear(serverId);
+                    }
+                  })
+                  .catch(() => {
+                    // Revert only if overlay still matches what we tried to flush.
+                    const after = queue.getOverlay(serverId);
+                    if (
+                      after?.op === 'upsert' &&
+                      after.event.title === local.title &&
+                      after.event.start_time === local.start_time &&
+                      after.event.end_time === local.end_time
+                    ) {
+                      queue.clear(serverId);
+                    }
+                  });
+              }
+            }
+
+            // Remap selection from temp id → server id (keep inspector open).
+            setSelectedEventId((prev) =>
+              prev === tempId ? result.event.id : prev,
+            );
+          },
+          onError: () => {
+            queue.clear(tempId);
+            setSelectedEventId((prev) => {
+              if (prev === tempId) {
+                setFocusTitleOnOpen(false);
+                return null;
+              }
+              return prev;
+            });
           },
         },
       );
     },
-    [writableCalendar, createEvent, closeInspector],
+    [
+      writableCalendar,
+      createEvent,
+      closeInspector,
+      queue,
+      deleteEvent,
+      updateEvent,
+    ],
   );
 
   const handleMoveOrResize = useCallback(
@@ -301,8 +430,12 @@ export function useCalendarSession({
         start_time: range.start.toISOString(),
         end_time: range.end.toISOString(),
       };
-      // Paint immediately; PATCH follows. Overlay wins until reconcile.
+      // Paint immediately; PATCH follows (unless still a temp id).
       queue.upsert(next);
+
+      // Temp events have no server row — create onSuccess will flush times.
+      if (isTempEventId(eventId)) return;
+
       void updateEvent
         .mutateAsync({
           id: eventId,

@@ -82,12 +82,30 @@ export function upsertCalendarEventInCache(event: CalendarEvent): void {
   );
 }
 
+/**
+ * Drop `id` from every cached events query. Preserves each entry's `source`.
+ * Used after a successful DELETE so the durable cache matches the server
+ * without a full invalidate.
+ */
+export function removeCalendarEventFromCache(id: string): void {
+  queryClient.setQueriesData<CalendarEventsResponse>(
+    { queryKey: calendarEventsQueryKey },
+    (old) => {
+      if (!old?.events) return old;
+      const events = old.events.filter((e) => e.id !== id);
+      if (events.length === old.events.length) return old;
+      return { ...old, events };
+    },
+  );
+}
+
+// Create is thin like update: cancel in-flight events queries on mutate,
+// no invalidate on success. The session owns optimistic paint (temp overlay)
+// and merges the authoritative row via upsertCalendarEventInCache.
 export function useCreateCalendarEvent() {
   return useMutation({
     mutationFn: createCalendarEvent,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.calendar.all });
-    },
+    onMutate: cancelCalendarEventsQuery,
   });
 }
 
@@ -107,11 +125,11 @@ export function useUpdateCalendarEvent() {
   });
 }
 
+// Delete: cancel in-flight events queries on mutate, no invalidate on success.
+// Session paints via queue.remove and drops the row via removeCalendarEventFromCache.
 export function useDeleteCalendarEvent() {
   return useMutation({
     mutationFn: (id: string) => deleteCalendarEvent(id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.calendar.all });
-    },
+    onMutate: cancelCalendarEventsQuery,
   });
 }

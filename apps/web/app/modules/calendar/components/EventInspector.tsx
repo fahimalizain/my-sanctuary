@@ -36,8 +36,11 @@ export function EventInspector({
   // Track the last-saved title so blur after an unchanged edit is a no-op.
   const savedTitleRef = useRef(event.title);
 
-  // Sync local title when the selected event changes.
+  // Sync local title when the selected event changes — but keep a dirty
+  // (unblurred) edit across temp→server id remap so typed text is not lost.
   useEffect(() => {
+    const dirty = title !== savedTitleRef.current;
+    if (dirty) return;
     setTitle(event.title);
     savedTitleRef.current = event.title;
   }, [event.id, event.title]);

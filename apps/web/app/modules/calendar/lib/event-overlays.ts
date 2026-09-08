@@ -1,5 +1,16 @@
 import type { CalendarEvent } from '@/app/types';
 
+/** Client-only id prefix for events painted before POST returns a server id. */
+export const TEMP_EVENT_PREFIX = 'tmp_';
+
+export function isTempEventId(id: string): boolean {
+  return id.startsWith(TEMP_EVENT_PREFIX);
+}
+
+export function newTempEventId(): string {
+  return `${TEMP_EVENT_PREFIX}${crypto.randomUUID()}`;
+}
+
 /** Pending write painted over server calendar event lists. */
 export type EventOverlay =
   | { op: 'upsert'; event: CalendarEvent }

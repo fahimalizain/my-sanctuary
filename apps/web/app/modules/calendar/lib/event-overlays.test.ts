@@ -5,8 +5,25 @@ import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
 import {
   applyEventOverlays,
+  isTempEventId,
+  TEMP_EVENT_PREFIX,
   type EventOverlay,
 } from './event-overlays';
+
+test('isTempEventId: true for tmp_ prefix', () => {
+  assert.equal(isTempEventId(`${TEMP_EVENT_PREFIX}abc`), true);
+  assert.equal(isTempEventId('tmp_'), true);
+});
+
+test('isTempEventId: false for server ids', () => {
+  assert.equal(isTempEventId('evt-123'), false);
+  assert.equal(isTempEventId('tmp'), false);
+  assert.equal(isTempEventId('xtmp_1'), false);
+});
+
+test('isTempEventId: false for empty string', () => {
+  assert.equal(isTempEventId(''), false);
+});
 
 function makeEvent(
   overrides: Partial<CalendarEvent> &
