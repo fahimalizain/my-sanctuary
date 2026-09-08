@@ -136,6 +136,14 @@ test('formatDayRangeTitle: cross-year', () => {
   );
 });
 
+test('formatDayRangeTitle: single day includes weekday', () => {
+  // Tue Sep 8, 2026
+  assert.equal(
+    formatDayRangeTitle(new Date(2026, 8, 8), new Date(2026, 8, 8)),
+    'Tue, Sep 8, 2026',
+  );
+});
+
 // ── rangeIso ────────────────────────────────────────────────────────────
 
 test('rangeIso: N-day window; timeMax is start+N midnights', () => {

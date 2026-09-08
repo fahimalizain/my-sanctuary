@@ -29,6 +29,7 @@ import { DayColumn, TimedPreviewLayer } from './DayColumn';
 import { type PositionedEvent } from './EventChip';
 import { EventInspector } from './EventInspector';
 import { useCalendarDrag } from './useCalendarDrag';
+import { ViewSelector } from './ViewSelector';
 import {
   COL_HEADER_H,
   DAYS_PER_PERIOD,
@@ -39,12 +40,14 @@ import {
   addDays,
   allDaySectionHeight,
   clampMinutesToDay,
+  clampPeriodLength,
   colWidth as computeColWidth,
   colorForCalendar,
   dateOnDay,
   defaultWritableCalendar,
   eventHeightPx,
   eventTopPx,
+  fitPeriodStart,
   formatDayRangeTitle,
   formatHourLabel,
   gutterWithRemainder,
@@ -62,7 +65,6 @@ import {
   shiftWindowStart,
   shouldRebase,
   startOfDay,
-  startOfWeek,
   stripDayCount,
   visibleStartIndex as computeVisibleStartIndex,
 } from './week-layout';
@@ -108,17 +110,20 @@ function eventChipColor(event: CalendarEvent): string {
 }
 
 export function CalendarPage() {
+  // Visible day-column count (1–7). Session-only; not persisted.
+  const [periodLength, setPeriodLength] = useState(DAYS_PER_PERIOD);
+
   // Strip window: first *rendered* day. Visible period is windowStart + scroll offset.
   // Initial: overscan before current Mon–Sun so current week is centered in the buffer.
   const [windowStart, setWindowStart] = useState(() =>
-    addDays(startOfWeek(new Date()), -STRIP_OVERSCAN),
+    addDays(fitPeriodStart(new Date(), DAYS_PER_PERIOD), -STRIP_OVERSCAN),
   );
 
-  // First visible day index into the rendered strip (0 … dayCount-7).
-  // Seeded at overscan so the current Mon–Sun shows before measure/scroll attach.
+  // First visible day index into the rendered strip (0 … dayCount-periodLength).
+  // Seeded at overscan so the current period shows before measure/scroll attach.
   const [visibleStartIdx, setVisibleStartIdx] = useState(STRIP_OVERSCAN);
 
-  const dayCount = stripDayCount();
+  const dayCount = stripDayCount(periodLength);
   const range = useMemo(
     () => rangeIso(windowStart, dayCount),
     [windowStart, dayCount],
@@ -306,20 +311,20 @@ export function CalendarPage() {
     return { timedEvents: timed, allDayEvents: allDay };
   }, [visibleEvents]);
 
-  // Full rendered strip (21 days).
+  // Full rendered strip (period + overscan each side).
   const days = useMemo(() => {
     const origin = startOfDay(windowStart);
     return Array.from({ length: dayCount }, (_, i) => addDays(origin, i));
   }, [windowStart, dayCount]);
 
-  // First day of the 7-day visible period (drives title + sidebar highlight).
+  // First day of the visible period (drives title + sidebar highlight).
   const visibleStart = useMemo(
     () => addDays(startOfDay(windowStart), visibleStartIdx),
     [windowStart, visibleStartIdx],
   );
   const visibleEnd = useMemo(
-    () => addDays(visibleStart, DAYS_PER_PERIOD - 1),
-    [visibleStart],
+    () => addDays(visibleStart, periodLength - 1),
+    [visibleStart, periodLength],
   );
   const rangeTitle = useMemo(
     () => formatDayRangeTitle(visibleStart, visibleEnd),
@@ -367,10 +372,13 @@ export function CalendarPage() {
     return () => ro.disconnect();
   }, []);
 
-  const colW = useMemo(() => computeColWidth(mainWidth), [mainWidth]);
+  const colW = useMemo(
+    () => computeColWidth(mainWidth, periodLength),
+    [mainWidth, periodLength],
+  );
   const gutterW = useMemo(
-    () => gutterWithRemainder(mainWidth, colW),
-    [mainWidth, colW],
+    () => gutterWithRemainder(mainWidth, colW, periodLength),
+    [mainWidth, colW, periodLength],
   );
   const trackWidth = dayCount * colW;
   const contentWidth = gutterW + trackWidth;
@@ -564,23 +572,30 @@ export function CalendarPage() {
     const scroller = scrollerRef.current;
     if (!scroller || colW <= 0) return;
 
-    // Rebase first: shift window ±7 days and compensate scrollLeft so the
-    // picture does not jump. Must run before paint.
+    // Rebase first: shift window ±periodLength days and compensate scrollLeft
+    // so the picture does not jump. Must run before paint.
     const dir = pendingRebaseRef.current;
     if (dir !== 0) {
       pendingRebaseRef.current = 0;
-      const compensation = -dir * DAYS_PER_PERIOD * colW;
+      const compensation = -dir * periodLength * colW;
       suppressRebaseRef.current = true;
-      setWindowStart((prev) => shiftWindowStart(startOfDay(prev), dir));
+      setWindowStart((prev) =>
+        shiftWindowStart(startOfDay(prev), dir, periodLength),
+      );
       scroller.scrollLeft = scroller.scrollLeft + compensation;
       setVisibleStartIdx(
-        computeVisibleStartIndex(scroller.scrollLeft, colW, dayCount),
+        computeVisibleStartIndex(
+          scroller.scrollLeft,
+          colW,
+          dayCount,
+          periodLength,
+        ),
       );
       releaseSuppressRebase();
       return;
     }
 
-    // Initial mount: park scroll so current Mon–Sun is the visible period.
+    // Initial mount: park scroll so current period is visible.
     if (!didInitScrollRef.current) {
       didInitScrollRef.current = true;
       suppressRebaseRef.current = true;
@@ -589,7 +604,7 @@ export function CalendarPage() {
       releaseSuppressRebase();
     }
 
-    // Programmatic jump (Today / mini-month): park at overscan index.
+    // Programmatic jump (Today / mini-month / period change): park at overscan.
     if (pendingScrollLeftRef.current !== null) {
       pendingScrollLeftRef.current = null;
       suppressRebaseRef.current = true;
@@ -597,7 +612,7 @@ export function CalendarPage() {
       setVisibleStartIdx(STRIP_OVERSCAN);
       releaseSuppressRebase();
     }
-  }, [colW, dayCount, windowStart, scrollNonce]);
+  }, [colW, dayCount, periodLength, windowStart, scrollNonce]);
 
   // Scroll so the now line sits ~⅓ down the visible hours area — once per
   // mount / Today jump, and only when the visible period contains today.
@@ -608,7 +623,7 @@ export function CalendarPage() {
     const scroller = scrollerRef.current;
     if (!scroller) return;
 
-    const visibleDays = Array.from({ length: DAYS_PER_PERIOD }, (_, i) =>
+    const visibleDays = Array.from({ length: periodLength }, (_, i) =>
       addDays(visibleStart, i),
     );
     const periodContainsToday = visibleDays.some((d) => isSameDay(d, today));
@@ -627,6 +642,7 @@ export function CalendarPage() {
     availableHoursPx,
     hourH,
     visibleStart,
+    periodLength,
     today,
     now,
     allDayHeight,
@@ -637,17 +653,22 @@ export function CalendarPage() {
     const scroller = scrollerRef.current;
     if (!scroller || colW <= 0) return;
 
-    const idx = computeVisibleStartIndex(scroller.scrollLeft, colW, dayCount);
+    const idx = computeVisibleStartIndex(
+      scroller.scrollLeft,
+      colW,
+      dayCount,
+      periodLength,
+    );
     setVisibleStartIdx((prev) => (prev === idx ? prev : idx));
 
     if (suppressRebaseRef.current) return;
 
-    const dir = shouldRebase(idx, dayCount);
+    const dir = shouldRebase(idx, dayCount, periodLength);
     if (dir !== 0 && pendingRebaseRef.current === 0) {
       pendingRebaseRef.current = dir;
       setScrollNonce((n) => n + 1);
     }
-  }, [colW, dayCount]);
+  }, [colW, dayCount, periodLength]);
 
   // Position timed events per day column (multi-day events excluded).
   const eventsByDay = useMemo(() => {
@@ -728,24 +749,72 @@ export function CalendarPage() {
       shouldScrollToNowRef.current = false;
       const scroller = scrollerRef.current;
       if (!scroller || colW <= 0) return;
-      scroller.scrollLeft += deltaPeriods * DAYS_PER_PERIOD * colW;
+      scroller.scrollLeft += deltaPeriods * periodLength * colW;
       // onScroll will update visibleStartIdx and rebase if needed.
       onScrollerScroll();
     },
-    [colW, onScrollerScroll],
+    [colW, periodLength, onScrollerScroll],
   );
 
   const goToToday = useCallback(() => {
-    jumpToVisibleStart(startOfWeek(new Date()), true);
-  }, [jumpToVisibleStart]);
+    jumpToVisibleStart(fitPeriodStart(new Date(), periodLength), true);
+  }, [jumpToVisibleStart, periodLength]);
 
   const goToDate = useCallback(
     (date: Date) => {
-      // Monday-snap for mini-month (and Today). Free scroll can land anywhere.
-      jumpToVisibleStart(startOfWeek(date), isSameDay(date, today));
+      // fitPeriodStart Monday-snaps for 5–7 day views; shorter views land on the day.
+      jumpToVisibleStart(
+        fitPeriodStart(date, periodLength),
+        isSameDay(date, today),
+      );
     },
-    [jumpToVisibleStart, today],
+    [jumpToVisibleStart, periodLength, today],
   );
+
+  const handlePeriodChange = useCallback(
+    (n: number) => {
+      const next = clampPeriodLength(n);
+      setPeriodLength(next);
+      const nextStart = fitPeriodStart(visibleStart, next);
+      const nextDays = Array.from({ length: next }, (_, i) =>
+        addDays(nextStart, i),
+      );
+      const containsToday = nextDays.some((d) => isSameDay(d, today));
+      jumpToVisibleStart(nextStart, containsToday);
+    },
+    [visibleStart, today, jumpToVisibleStart],
+  );
+
+  // Notion-style period shortcuts (ignore when typing in a field).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target;
+      if (t instanceof HTMLElement) {
+        const tag = t.tagName;
+        if (
+          tag === 'INPUT' ||
+          tag === 'TEXTAREA' ||
+          tag === 'SELECT' ||
+          t.isContentEditable
+        ) {
+          return;
+        }
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key;
+      let next: number | null = null;
+      if (key === '1' || key === 'd' || key === 'D') next = 1;
+      else if (key === 'w' || key === 'W' || key === '0') next = 7;
+      else if (key >= '2' && key <= '6') next = Number(key);
+
+      if (next === null) return;
+      e.preventDefault();
+      handlePeriodChange(next);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handlePeriodChange]);
 
   const hourLabels = useMemo(
     () => Array.from({ length: 24 }, (_, h) => h),
@@ -769,9 +838,10 @@ export function CalendarPage() {
           />
         )}
 
-        <span className="hidden sm:inline text-xs font-medium text-muted-foreground px-2">
-          Week
-        </span>
+        <ViewSelector
+          periodLength={periodLength}
+          onChange={handlePeriodChange}
+        />
 
         <Button variant="outline" size="sm" onClick={goToToday}>
           Today
@@ -781,7 +851,7 @@ export function CalendarPage() {
           size="icon"
           className="h-8 w-8"
           onClick={() => shiftPeriod(-1)}
-          aria-label="Previous week"
+          aria-label="Previous period"
         >
           <ChevronLeft className="h-4 w-4" />
         </Button>
@@ -790,7 +860,7 @@ export function CalendarPage() {
           size="icon"
           className="h-8 w-8"
           onClick={() => shiftPeriod(1)}
-          aria-label="Next week"
+          aria-label="Next period"
         >
           <ChevronRight className="h-4 w-4" />
         </Button>
@@ -812,6 +882,7 @@ export function CalendarPage() {
       <div className="flex-1 min-h-0 flex relative">
         <CalendarSidebar
           weekStart={visibleStart}
+          periodLength={periodLength}
           onGoToDate={goToDate}
           calendars={calendars}
           calendarsLoading={calendarsQuery.isLoading}

@@ -7,6 +7,7 @@ import {
   DAYS_PER_PERIOD,
   WEEK_DAYS,
   addDays,
+  clampPeriodLength,
   colorForCalendar,
   isSameDay,
   monthGridDays,
@@ -30,9 +31,11 @@ const MONTH_LABEL = [
 ] as const;
 
 export interface CalendarSidebarProps {
-  /** First day of the 7-day visible period (not necessarily Monday). */
+  /** First day of the visible period (not necessarily Monday). */
   weekStart: Date;
-  /** Jump the main strip so the week containing this date is visible. */
+  /** Number of day columns currently shown in the main grid. */
+  periodLength?: number;
+  /** Jump the main strip so the period containing this date is visible. */
   onGoToDate: (date: Date) => void;
   calendars: GoogleCalendar[];
   calendarsLoading?: boolean;
@@ -53,6 +56,7 @@ function sortCalendars(calendars: GoogleCalendar[]): GoogleCalendar[] {
 
 export function CalendarSidebar({
   weekStart,
+  periodLength = DAYS_PER_PERIOD,
   onGoToDate,
   calendars,
   calendarsLoading = false,
@@ -71,20 +75,22 @@ export function CalendarSidebar({
     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   }, []);
 
-  // Highlight the 7 consecutive visible days (free-scroll; not Mon-locked).
+  const daysInPeriod = clampPeriodLength(periodLength);
+
+  // Highlight the consecutive visible days (free-scroll; not Mon-locked).
   const visibleWeekDays = useMemo(() => {
     const origin = startOfDay(weekStart);
-    return Array.from({ length: DAYS_PER_PERIOD }, (_, i) =>
+    return Array.from({ length: daysInPeriod }, (_, i) =>
       addDays(origin, i),
     );
-  }, [weekStart]);
+  }, [weekStart, daysInPeriod]);
   const gridDays = useMemo(() => monthGridDays(viewMonth), [viewMonth]);
 
   // When the main visible period moves outside the mini-month grid, follow it.
   useEffect(() => {
     const gridStart = monthGridStart(viewMonth);
     const gridEnd = addDays(gridStart, 41);
-    const weekEnd = addDays(startOfDay(weekStart), DAYS_PER_PERIOD - 1);
+    const weekEnd = addDays(startOfDay(weekStart), daysInPeriod - 1);
     const origin = startOfDay(weekStart);
     const overlaps =
       origin.getTime() <= gridEnd.getTime() &&
@@ -94,7 +100,7 @@ export function CalendarSidebar({
         new Date(weekStart.getFullYear(), weekStart.getMonth(), 1),
       );
     }
-  }, [weekStart, viewMonth]);
+  }, [weekStart, viewMonth, daysInPeriod]);
 
   const monthLabel = `${MONTH_LABEL[viewMonth.getMonth()]} ${viewMonth.getFullYear()}`;
   const viewMonthIndex = viewMonth.getMonth();

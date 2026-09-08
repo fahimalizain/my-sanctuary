@@ -308,6 +308,7 @@ export function shiftWindowStart(
 
 /**
  * Notion-style day-range title (inclusive first…last):
+ *   same day   → "Tue, Sep 8, 2026"
  *   same month → "Sep 7–13, 2026"
  *   cross-month → "Sep 28 – Oct 4, 2026"
  *   cross-year  → "Dec 29, 2025 – Jan 4, 2026"
@@ -320,6 +321,11 @@ export function formatDayRangeTitle(first: Date, last: Date): string {
   const sd = first.getDate();
   const ed = last.getDate();
 
+  if (sy === ey && sm === em && sd === ed) {
+    const jsDay = first.getDay(); // 0 = Sun … 6 = Sat
+    const monIndex = jsDay === 0 ? 6 : jsDay - 1;
+    return `${WEEK_DAYS[monIndex]}, ${MONTH_SHORT[sm]} ${sd}, ${sy}`;
+  }
   if (sy === ey && sm === em) {
     return `${MONTH_SHORT[sm]} ${sd}–${ed}, ${sy}`;
   }
