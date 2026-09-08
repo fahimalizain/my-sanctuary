@@ -18,6 +18,10 @@ export const HOUR_H_MAX = 208;
 export const CHIP_MARGIN_RIGHT = 13;
 export const CHIP_MARGIN_BOTTOM = 3;
 export const CHIP_MIN_H = 18;
+/** Base z-index for timed chips; actual = CHIP_Z_BASE + layerIndex. */
+export const CHIP_Z_BASE = 2;
+/** Selected / manipulating chip sits above every layerIndex. */
+export const CHIP_Z_SELECTED = 40;
 export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
@@ -411,143 +415,16 @@ export function eventHeightPx(
   return Math.max(raw, CHIP_MIN_H);
 }
 
-export interface PackInput {
-  id: string;
-  startMin: number;
-  endMin: number;
-}
-
-export interface PackResult {
-  id: string;
-  col: number;
-  cols: number;
-  span: number;
-}
-
-function intervalsOverlap(
-  aStart: number,
-  aEnd: number,
-  bStart: number,
-  bEnd: number,
-): boolean {
-  // Treat zero-duration as a point that still collides if nested in another.
-  const aE = aEnd > aStart ? aEnd : aStart + 0.001;
-  const bE = bEnd > bStart ? bEnd : bStart + 0.001;
-  return aStart < bE && bStart < aE;
-}
-
-/**
- * Google/Cron-style column packing for one day (core only — no half-column
- * steal rules).
- *
- * 1. Sort: earlier start first; same start → longer duration first.
- * 2. Cluster: greedy — joins the first cluster that already contains an
- *    overlapping event; else new cluster.
- * 3. Per cluster: leftmost column with no overlap; optional right-span into
- *    empty later columns.
- */
-export function packDayEvents(items: PackInput[]): PackResult[] {
-  if (items.length === 0) return [];
-
-  const sorted = [...items].sort((a, b) => {
-    if (a.startMin !== b.startMin) return a.startMin - b.startMin;
-    const durA = a.endMin - a.startMin;
-    const durB = b.endMin - b.startMin;
-    if (durA !== durB) return durB - durA; // longer first
-    return a.id.localeCompare(b.id);
-  });
-
-  // Greedy clusters (connected components by overlap, order-preserving).
-  const clusters: PackInput[][] = [];
-  for (const item of sorted) {
-    let placed = false;
-    for (const cluster of clusters) {
-      if (
-        cluster.some((other) =>
-          intervalsOverlap(
-            item.startMin,
-            item.endMin,
-            other.startMin,
-            other.endMin,
-          ),
-        )
-      ) {
-        cluster.push(item);
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) clusters.push([item]);
-  }
-
-  const results: PackResult[] = [];
-
-  for (const cluster of clusters) {
-    // Assign leftmost free column.
-    const assignments: { item: PackInput; col: number }[] = [];
-    // Per column: list of placed intervals.
-    const colIntervals: { startMin: number; endMin: number }[][] = [];
-
-    for (const item of cluster) {
-      let col = 0;
-      for (;;) {
-        const intervals = colIntervals[col] ?? [];
-        const free = intervals.every(
-          (iv) =>
-            !intervalsOverlap(
-              item.startMin,
-              item.endMin,
-              iv.startMin,
-              iv.endMin,
-            ),
-        );
-        if (free) {
-          if (!colIntervals[col]) colIntervals[col] = [];
-          colIntervals[col].push({
-            startMin: item.startMin,
-            endMin: item.endMin,
-          });
-          assignments.push({ item, col });
-          break;
-        }
-        col += 1;
-      }
-    }
-
-    const nCols = colIntervals.length;
-
-    for (const { item, col } of assignments) {
-      // Right-span: grow while later columns have no overlap in [start, end).
-      let span = 1;
-      for (let c = col + 1; c < nCols; c++) {
-        const intervals = colIntervals[c] ?? [];
-        const blocked = intervals.some((iv) =>
-          intervalsOverlap(
-            item.startMin,
-            item.endMin,
-            iv.startMin,
-            iv.endMin,
-          ),
-        );
-        if (blocked) break;
-        // Also blocked if another event in this cluster was assigned to `c`
-        // and overlaps — colIntervals already holds those.
-        span += 1;
-      }
-
-      // Don't span into a column that has a different event assigned that
-      // we "skipped" — the check above is sufficient because every placed
-      // event is in colIntervals.
-      // Cap span so we don't cover a column that has a non-overlapping event
-      // that sits beside us visually for the full width — actually spanning
-      // empty space is the point. Done.
-
-      results.push({ id: item.id, col, cols: nCols, span });
-    }
-  }
-
-  return results;
-}
+// Timed packing lives in notion-pack.ts (Notion cascade). Re-export for
+// existing call sites (calendar-model, tests).
+export {
+  packDayEvents,
+  intervalsOverlap,
+  PACK_STEAL_MINUTES,
+  PACK_PEEK_GUTTER,
+  type PackInput,
+  type PackResult,
+} from './notion-pack';
 
 /** Y position of the now line within the hours area. */
 export function nowLineY(now: Date, hourH: number): number {

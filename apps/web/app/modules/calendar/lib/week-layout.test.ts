@@ -372,9 +372,33 @@ test('eventHeightPx: 15 min gets CHIP_MIN_H', () => {
   assert.equal(eventHeightPx(100, 100, 88), CHIP_MIN_H);
 });
 
-// ── packDayEvents ───────────────────────────────────────────────────────
+// ── packDayEvents (Notion cascade — notion-event-packing.md examples 1–6) ─
 
-test('packDayEvents: no overlap → all col 0, cols 1', () => {
+const PACK_EPS = 1e-9;
+
+function assertPackClose(
+  actual: { leftPercent: number; widthPercent: number; layerIndex: number; leftPixels: number },
+  expected: { leftPercent: number; widthPercent: number; layerIndex: number; leftPixels?: number },
+  label: string,
+) {
+  assert.ok(
+    Math.abs(actual.leftPercent - expected.leftPercent) < PACK_EPS,
+    `${label}.leftPercent: got ${actual.leftPercent}, want ${expected.leftPercent}`,
+  );
+  assert.ok(
+    Math.abs(actual.widthPercent - expected.widthPercent) < PACK_EPS,
+    `${label}.widthPercent: got ${actual.widthPercent}, want ${expected.widthPercent}`,
+  );
+  assert.equal(actual.layerIndex, expected.layerIndex, `${label}.layerIndex`);
+  assert.equal(
+    actual.leftPixels,
+    expected.leftPixels ?? 0,
+    `${label}.leftPixels`,
+  );
+}
+
+// Spec § Worked example 1 — No overlap
+test('packDayEvents: example 1 — no overlap → full width each cluster', () => {
   const packed = packDayEvents([
     { id: 'a', startMin: 9 * 60, endMin: 10 * 60 },
     { id: 'b', startMin: 11 * 60, endMin: 12 * 60 },
@@ -382,53 +406,86 @@ test('packDayEvents: no overlap → all col 0, cols 1', () => {
   ]);
   assert.equal(packed.length, 3);
   for (const p of packed) {
-    assert.equal(p.col, 0);
-    assert.equal(p.cols, 1);
-    assert.equal(p.span, 1);
+    assertPackClose(p, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, p.id);
   }
 });
 
-test('packDayEvents: two overlapping → cols 2, different col', () => {
+// Spec § Worked example 2 — Two overlap
+test('packDayEvents: example 2 — two overlap → peek + steal', () => {
   const packed = packDayEvents([
     { id: 'a', startMin: 9 * 60, endMin: 11 * 60 },
     { id: 'b', startMin: 10 * 60, endMin: 12 * 60 },
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
-  assert.equal(byId.a.cols, 2);
-  assert.equal(byId.b.cols, 2);
-  assert.notEqual(byId.a.col, byId.b.col);
-  // a starts earlier → col 0
-  assert.equal(byId.a.col, 0);
-  assert.equal(byId.b.col, 1);
+  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'a');
+  assertPackClose(byId.b, { leftPercent: 0.05, widthPercent: 0.95, layerIndex: 2 }, 'b');
 });
 
-test('packDayEvents: three nested / chain overlaps', () => {
-  // A 9-12, B 10-11, C 10:30-13 → all one cluster, 3 cols
+// Spec § Worked example 3 — Same start, longer first
+test('packDayEvents: example 3 — same start, longer first → half-peek', () => {
+  const packed = packDayEvents([
+    { id: 'short', startMin: 9 * 60, endMin: 10 * 60 },
+    { id: 'long', startMin: 9 * 60, endMin: 12 * 60 },
+  ]);
+  const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
+  assertPackClose(
+    byId.long,
+    { leftPercent: 0, widthPercent: 0.75, layerIndex: 1 },
+    'long',
+  );
+  assertPackClose(
+    byId.short,
+    { leftPercent: 0.5, widthPercent: 0.5, layerIndex: 2 },
+    'short',
+  );
+});
+
+// Spec § Worked example 4 — Chain
+test('packDayEvents: example 4 — chain A/B/C with stolen cascade', () => {
   const packed = packDayEvents([
     { id: 'a', startMin: 9 * 60, endMin: 12 * 60 },
     { id: 'b', startMin: 10 * 60, endMin: 11 * 60 },
     { id: 'c', startMin: 10 * 60 + 30, endMin: 13 * 60 },
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
-  assert.equal(byId.a.cols, 3);
-  assert.equal(byId.b.cols, 3);
-  assert.equal(byId.c.cols, 3);
-  // a earliest → col 0; b next → col 1; c → col 2
-  assert.equal(byId.a.col, 0);
-  assert.equal(byId.b.col, 1);
-  assert.equal(byId.c.col, 2);
+  // A: base 1/3; full peek B +1/3; full peek C +1/3 → 1
+  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'a');
+  // B: left = 0.05; width = 0.5 + 1/3 - 0.05 = 5/6 - 0.05
+  assertPackClose(
+    byId.b,
+    { leftPercent: 0.05, widthPercent: 0.5 + 1 / 3 - 0.05, layerIndex: 2 },
+    'b',
+  );
+  // C: left = 1/3 + 0.05; width = 2/3 - 0.05
+  assertPackClose(
+    byId.c,
+    { leftPercent: 1 / 3 + 0.05, widthPercent: 2 / 3 - 0.05, layerIndex: 3 },
+    'c',
+  );
 });
 
-test('packDayEvents: same start, longer first (longer gets col 0)', () => {
+// Spec § Worked example 5 — B and C share a column
+test('packDayEvents: example 5 — B and C share column after left-compact', () => {
   const packed = packDayEvents([
-    { id: 'short', startMin: 9 * 60, endMin: 10 * 60 },
-    { id: 'long', startMin: 9 * 60, endMin: 12 * 60 },
+    { id: 'a', startMin: 9 * 60, endMin: 12 * 60 },
+    { id: 'b', startMin: 9 * 60, endMin: 10 * 60 },
+    { id: 'c', startMin: 11 * 60, endMin: 12 * 60 },
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
-  assert.equal(byId.long.col, 0);
-  assert.equal(byId.short.col, 1);
-  assert.equal(byId.long.cols, 2);
-  assert.equal(byId.short.cols, 2);
+  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 0.75, layerIndex: 1 }, 'a');
+  assertPackClose(byId.b, { leftPercent: 0.5, widthPercent: 0.5, layerIndex: 2 }, 'b');
+  assertPackClose(byId.c, { leftPercent: 0.05, widthPercent: 0.95, layerIndex: 2 }, 'c');
+});
+
+// Spec § Worked example 6 — Touching endpoints (half-open)
+test('packDayEvents: example 6 — touching endpoints → separate full-width clusters', () => {
+  const packed = packDayEvents([
+    { id: 'a', startMin: 9 * 60, endMin: 10 * 60 },
+    { id: 'b', startMin: 10 * 60, endMin: 11 * 60 },
+  ]);
+  const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
+  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'a');
+  assertPackClose(byId.b, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'b');
 });
 
 // ── nowLineY ────────────────────────────────────────────────────────────

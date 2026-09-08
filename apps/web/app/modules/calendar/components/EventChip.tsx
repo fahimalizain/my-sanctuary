@@ -3,6 +3,8 @@ import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import {
   CHIP_MARGIN_RIGHT,
+  CHIP_Z_BASE,
+  CHIP_Z_SELECTED,
   contrastingInk,
   formatEventTime,
   formatEventTimeRange,
@@ -36,9 +38,10 @@ export interface PositionedEvent {
   endMin: number;
   top: number;
   height: number;
-  col: number;
-  cols: number;
-  span: number;
+  leftPercent: number;
+  widthPercent: number;
+  layerIndex: number;
+  leftPixels: number;
   color: string;
 }
 
@@ -62,16 +65,23 @@ export const EventChip = memo(function EventChip({
   onPointerDown,
   dragging = false,
 }: EventChipProps) {
-  const { event, top, height, col, cols, span, color, startMin, endMin } =
-    positioned;
+  const {
+    event,
+    top,
+    height,
+    leftPercent,
+    widthPercent,
+    layerIndex,
+    leftPixels,
+    color,
+    startMin,
+    endMin,
+  } = positioned;
   const start = new Date(event.start_time);
   const end = new Date(event.end_time);
   const timeLabel = formatEventTime(start);
   const rangeLabel = formatEventTimeRange(start, end);
   const compact = isCompactChip(height);
-
-  const leftPct = (col / cols) * 100;
-  const widthPct = (span / cols) * 100;
 
   return (
     <div
@@ -86,8 +96,10 @@ export const EventChip = memo(function EventChip({
       style={{
         top,
         height,
-        left: `${leftPct}%`,
-        width: `calc(${widthPct}% - ${CHIP_MARGIN_RIGHT}px)`,
+        left: `${leftPixels}px`,
+        marginLeft: `${leftPercent * 100}%`,
+        width: `calc(${widthPercent * 100}% - ${leftPixels}px - ${CHIP_MARGIN_RIGHT}px)`,
+        zIndex: selected ? CHIP_Z_SELECTED : CHIP_Z_BASE + layerIndex,
         backgroundColor: color,
         color: contrastingInk(color),
       }}
@@ -175,7 +187,7 @@ export const PreviewChip = memo(function PreviewChip({
 }) {
   return (
     <div
-      className="absolute overflow-hidden rounded-[6px] pointer-events-none z-20 opacity-70"
+      className="absolute overflow-hidden rounded-[6px] pointer-events-none z-[50] opacity-70"
       style={{
         top,
         height,

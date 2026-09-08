@@ -182,9 +182,10 @@ export function buildEventsByDay(
         endMin: d.endMin,
         top: eventTopPx(d.startMin, hourH),
         height: eventHeightPx(d.startMin, d.endMin, hourH),
-        col: pack.col,
-        cols: pack.cols,
-        span: pack.span,
+        leftPercent: pack.leftPercent,
+        widthPercent: pack.widthPercent,
+        layerIndex: pack.layerIndex,
+        leftPixels: pack.leftPixels,
         color: eventChipColor(d.event),
       };
     });
