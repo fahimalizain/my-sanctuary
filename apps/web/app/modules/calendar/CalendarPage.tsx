@@ -5,7 +5,7 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { ChevronLeft, ChevronRight, Loader2, RefreshCw } from 'lucide-react';
+import { RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   useCalendarEventsQuery,
@@ -15,8 +15,6 @@ import {
   useUpdateCalendarEvent,
 } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
-import { cn } from '@/lib/utils';
-import { AllDayRow } from './AllDayRow';
 import {
   allDayPreviewIndices,
   timedPreviewSegments,
@@ -26,32 +24,25 @@ import {
   buildAllDayChips,
   buildEventsByDay,
   clickCreateTimesFromSlot,
-  dayNameShort,
   eventChipColor,
 } from './calendar-model';
+import { CalendarHeader } from './CalendarHeader';
 import { CalendarSidebar } from './CalendarSidebar';
-import { DayColumn, TimedPreviewLayer } from './DayColumn';
-import { type PositionedEvent } from './EventChip';
+import { CalendarWeekGrid } from './CalendarWeekGrid';
 import { EventInspector } from './EventInspector';
 import { useCalendarDrag } from './useCalendarDrag';
 import { useCalendarStrip } from './useCalendarStrip';
-import { ViewSelector } from './ViewSelector';
 import {
   COL_HEADER_H,
   addDays,
   colorForCalendar,
   defaultWritableCalendar,
-  formatHourLabel,
   hourGridBackground,
   hourHeight as computeHourHeight,
   isMultiDay,
   isSameDay,
-  isWeekend,
   nowLineY,
 } from './week-layout';
-
-/** Stable empty list so DayColumn memo is not busted on empty days. */
-const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
 
 export function CalendarPage() {
   const strip = useCalendarStrip();
@@ -428,46 +419,15 @@ export function CalendarPage() {
 
   return (
     <div className="h-[100dvh] bg-cream flex flex-col pb-20">
-      {/* Header */}
-      <header className="h-12 shrink-0 flex items-center gap-2 px-3 sm:px-4 border-b border-border/60">
-        <h1 className="font-heading text-base sm:text-lg font-semibold text-foreground truncate min-w-0 flex-1">
-          {rangeTitle}
-        </h1>
-
-        {isRefreshing && (
-          <Loader2
-            className="h-4 w-4 animate-spin text-muted-foreground shrink-0"
-            aria-label="Refreshing events"
-          />
-        )}
-
-        <ViewSelector
-          periodLength={periodLength}
-          onChange={handlePeriodChange}
-        />
-
-        <Button variant="outline" size="sm" onClick={goToToday}>
-          Today
-        </Button>
-        <Button
-          variant="outline"
-          size="icon"
-          className="h-8 w-8"
-          onClick={() => shiftPeriod(-1)}
-          aria-label="Previous period"
-        >
-          <ChevronLeft className="h-4 w-4" />
-        </Button>
-        <Button
-          variant="outline"
-          size="icon"
-          className="h-8 w-8"
-          onClick={() => shiftPeriod(1)}
-          aria-label="Next period"
-        >
-          <ChevronRight className="h-4 w-4" />
-        </Button>
-      </header>
+      <CalendarHeader
+        rangeTitle={rangeTitle}
+        isRefreshing={isRefreshing}
+        periodLength={periodLength}
+        onPeriodChange={handlePeriodChange}
+        onToday={goToToday}
+        onPrevPeriod={() => shiftPeriod(-1)}
+        onNextPeriod={() => shiftPeriod(1)}
+      />
 
       {error && events.length > 0 && (
         <div className="shrink-0 flex items-center justify-between gap-3 border-b border-border bg-muted/50 px-4 py-2 text-sm">
@@ -497,175 +457,42 @@ export function CalendarPage() {
           onToggleCalendar={toggleCalendar}
         />
 
-        {/* Grid column — always mounted so measure/scroll-to-now effects attach */}
-        <div
-          ref={gridColumnRef}
-          className="flex-1 min-h-0 flex flex-col relative min-w-0"
-        >
-          <div
-            ref={scrollerRef}
-            className="flex-1 min-h-0 overflow-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
-            onScroll={onScrollerScroll}
-          >
-            {/* Content: sticky headers + all-day + hours strip */}
-            <div style={{ width: contentWidth, minHeight: '100%' }}>
-              {/* Day headers — sticky top */}
-              <div
-                className="sticky top-0 z-20 flex bg-cream border-b border-border"
-                style={{ height: COL_HEADER_H, width: contentWidth }}
-              >
-                <div
-                  className="shrink-0 sticky left-0 top-0 z-40 border-r border-border/60 bg-cream"
-                  style={{ width: gutterW }}
-                  aria-hidden
-                />
-                {days.map((day) => {
-                  const isToday = isSameDay(day, today);
-                  return (
-                    <div
-                      key={day.toISOString()}
-                      className="shrink-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
-                      style={{ width: colW }}
-                    >
-                      <span
-                        className={cn(
-                          'text-[11px] font-medium uppercase tracking-wide',
-                          isToday ? 'text-primary' : 'text-muted-foreground',
-                        )}
-                      >
-                        {dayNameShort(day)}
-                      </span>
-                      <span
-                        className={cn(
-                          'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
-                          isToday
-                            ? 'bg-primary text-primary-foreground'
-                            : 'text-foreground',
-                        )}
-                      >
-                        {day.getDate()}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* All-day band — sticky under headers */}
-              <div
-                className="sticky z-20 bg-cream"
-                style={{ top: COL_HEADER_H }}
-              >
-                <AllDayRow
-                  days={days}
-                  colWidth={colW}
-                  gutterWidth={gutterW}
-                  height={allDayHeight}
-                  chips={allDayChips}
-                  todayIndex={todayIndex}
-                  onDayPointerDown={drag.onAllDayPointerDown}
-                  onChipSelect={selectEvent}
-                  selectedEventId={selectedEventId}
-                  preview={allDayPreview}
-                />
-              </div>
-
-              {/* Hours: sticky left gutter + day columns */}
-              <div
-                className={cn(
-                  'relative flex',
-                  drag.isDragging && 'select-none',
-                )}
-                style={{ height: totalHoursH, width: contentWidth }}
-              >
-                {/* Time gutter */}
-                <div
-                  className="shrink-0 sticky left-0 z-30 border-r border-border/60 bg-cream"
-                  style={{ width: gutterW, height: totalHoursH }}
-                >
-                  {hourLabels.map((h) => {
-                    const label = formatHourLabel(h);
-                    if (!label) return null;
-                    return (
-                      <div
-                        key={h}
-                        className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
-                        style={{ top: h * hourH }}
-                      >
-                        {label}
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* Day columns — memoized; drag preview is a sibling overlay */}
-                {days.map((day) => {
-                  const isTodayCol = isSameDay(day, today);
-                  const dayKey = day.toDateString();
-                  const dayEvents =
-                    eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
-
-                  return (
-                    <DayColumn
-                      key={day.toISOString()}
-                      day={day}
-                      colW={colW}
-                      totalHoursH={totalHoursH}
-                      hourH={hourH}
-                      hourGridBg={hourGridBg}
-                      events={dayEvents}
-                      selectedEventId={selectedEventId}
-                      draggingEventId={draggingEventId}
-                      isToday={isTodayCol}
-                      isWeekend={isWeekend(day)}
-                      showNow={isTodayCol}
-                      now={isTodayCol ? now : undefined}
-                      onColumnPointerDown={drag.onColumnPointerDown}
-                      onChipPointerDown={drag.onChipPointerDown}
-                      onSelectChip={handleSelectChip}
-                    />
-                  );
-                })}
-
-                <TimedPreviewLayer
-                  days={days}
-                  colW={colW}
-                  gutterW={gutterW}
-                  trackWidth={trackWidth}
-                  totalHoursH={totalHoursH}
-                  timedPreviewByDay={timedPreviewByDay}
-                  previewColor={previewColor}
-                  previewTitle={previewTitle}
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Loading overlay — grid stays mounted and measurable underneath */}
-          {isLoading && events.length === 0 && (
-            <div
-              className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cream/70 pointer-events-none"
-              aria-busy="true"
-              aria-label="Loading events"
-            >
-              <Loader2 className="h-8 w-8 animate-spin mb-3 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground">Loading events...</p>
-            </div>
-          )}
-
-          {/* Hard error overlay — empty grid still mounted underneath */}
-          {error && events.length === 0 && !isLoading && (
-            <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cream/70 text-center px-4">
-              <p className="text-foreground font-medium mb-2">
-                Failed to load events
-              </p>
-              <p className="text-sm text-muted-foreground mb-4">{error}</p>
-              <Button variant="outline" onClick={retry}>
-                <RefreshCw className="h-4 w-4 mr-2" />
-                Retry
-              </Button>
-            </div>
-          )}
-        </div>
+        <CalendarWeekGrid
+          gridColumnRef={gridColumnRef}
+          scrollerRef={scrollerRef}
+          onScroll={onScrollerScroll}
+          contentWidth={contentWidth}
+          colW={colW}
+          gutterW={gutterW}
+          trackWidth={trackWidth}
+          days={days}
+          today={today}
+          now={now}
+          hourH={hourH}
+          totalHoursH={totalHoursH}
+          hourGridBg={hourGridBg}
+          hourLabels={hourLabels}
+          allDayHeight={allDayHeight}
+          allDayChips={allDayChips}
+          todayIndex={todayIndex}
+          eventsByDay={eventsByDay}
+          selectedEventId={selectedEventId}
+          draggingEventId={draggingEventId}
+          onColumnPointerDown={drag.onColumnPointerDown}
+          onChipPointerDown={drag.onChipPointerDown}
+          onSelectChip={handleSelectChip}
+          onAllDayPointerDown={drag.onAllDayPointerDown}
+          onChipSelect={selectEvent}
+          isDragging={drag.isDragging}
+          timedPreviewByDay={timedPreviewByDay}
+          previewColor={previewColor}
+          previewTitle={previewTitle}
+          allDayPreview={allDayPreview}
+          isLoading={isLoading}
+          eventsEmpty={events.length === 0}
+          error={error}
+          onRetry={retry}
+        />
 
         {selectedEvent && (
           <EventInspector
