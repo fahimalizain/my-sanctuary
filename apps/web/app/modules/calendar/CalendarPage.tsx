@@ -806,10 +806,7 @@ export function CalendarPage() {
         >
           <div
             ref={scrollerRef}
-            className={cn(
-              'flex-1 min-h-0 overflow-auto',
-              isRefreshing && 'opacity-70',
-            )}
+            className="flex-1 min-h-0 overflow-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
             onScroll={onScrollerScroll}
           >
             {/* Content: sticky headers + all-day + hours strip */}

@@ -1,4 +1,9 @@
-import { queryOptions, useMutation, useQuery } from '@tanstack/react-query';
+import {
+  keepPreviousData,
+  queryOptions,
+  useMutation,
+  useQuery,
+} from '@tanstack/react-query';
 import {
   createCalendarEvent,
   deleteCalendarEvent,
@@ -13,11 +18,14 @@ import { queryClient } from '@/lib/queryClient';
 // Same split as lists.ts: React-free `queryOptions` factory + hooks.
 // Query's signal is forwarded so a month change aborts the in-flight
 // request for the previous range instead of racing it.
+// placeholderData keeps the prior range painted while a strip rebase
+// fetches the new window — avoids a full-grid "Loading events" flash.
 
 export function calendarEventsQueryOptions(timeMin: string, timeMax: string) {
   return queryOptions({
     queryKey: queryKeys.calendar.events(timeMin, timeMax),
     queryFn: ({ signal }) => listCalendarEvents({ timeMin, timeMax, signal }),
+    placeholderData: keepPreviousData,
   });
 }
 
