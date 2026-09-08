@@ -5,6 +5,7 @@ import {
   useState,
 } from 'react';
 import {
+  upsertCalendarEventInCache,
   useCalendarEventsQuery,
   useCalendarsQuery,
   useCreateCalendarEvent,
@@ -12,6 +13,7 @@ import {
   useUpdateCalendarEvent,
 } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
+import { useCalendarEventsQueue } from '../events-context';
 import {
   allDayPreviewIndices,
   timedPreviewSegments,
@@ -69,6 +71,9 @@ export function useCalendarSession({
     void eventsQuery.refetch();
   };
 
+  // Optimistic move/resize overlay (read-time; not setQueryData).
+  const queue = useCalendarEventsQueue();
+
   // Calendars for sidebar list + visibility filter.
   const calendarsQuery = useCalendarsQuery();
   const calendars = calendarsQuery.data?.calendars ?? [];
@@ -110,13 +115,19 @@ export function useCalendarSession({
     setSelectionReady(true);
   }, [calendars, selectionReady]);
 
+  // Overlay first so inspector shows optimistic move/resize times.
+  const overlaidEvents = useMemo(
+    () => queue.apply(events),
+    [queue, events],
+  );
+
   const selectedEvent = useMemo(() => {
     if (!selectedEventId) return null;
-    const fromList = events.find((e) => e.id === selectedEventId);
+    const fromList = overlaidEvents.find((e) => e.id === selectedEventId);
     if (fromList) return fromList;
     if (pendingEvent?.id === selectedEventId) return pendingEvent;
     return null;
-  }, [events, selectedEventId, pendingEvent]);
+  }, [overlaidEvents, selectedEventId, pendingEvent]);
 
   // Clear pending once the list catches up.
   useEffect(() => {
@@ -197,11 +208,10 @@ export function useCalendarSession({
     });
   }, []);
 
-  // Events whose calendar is selected, plus stale calendar_ids not in the list.
-  // Pre-init (!selectionReady) shows everything; after ready, empty Set = none.
-  // Merge a just-created pending event so the chip paints before invalidate.
+  // Overlay first, then calendar-visibility filter. Merge a just-created
+  // pending event so the chip paints before invalidate (slice 3 owns create).
   const visibleEvents = useMemo(() => {
-    const base = events.filter((e) => {
+    const base = overlaidEvents.filter((e) => {
       if (!selectionReady) return true;
       if (selectedCalendarIds.has(e.calendar_id)) return true;
       if (!knownCalendarIds.has(e.calendar_id)) return true;
@@ -215,7 +225,7 @@ export function useCalendarSession({
     }
     return base;
   }, [
-    events,
+    overlaidEvents,
     selectedCalendarIds,
     knownCalendarIds,
     selectionReady,
@@ -282,15 +292,50 @@ export function useCalendarSession({
 
   const handleMoveOrResize = useCallback(
     (eventId: string, range: TimedRange) => {
-      void updateEvent.mutateAsync({
-        id: eventId,
-        input: {
-          start: range.start.toISOString(),
-          end: range.end.toISOString(),
-        },
-      });
+      const current =
+        overlaidEvents.find((e) => e.id === eventId) ??
+        events.find((e) => e.id === eventId);
+      if (!current) return;
+      const next: CalendarEvent = {
+        ...current,
+        start_time: range.start.toISOString(),
+        end_time: range.end.toISOString(),
+      };
+      // Paint immediately; PATCH follows. Overlay wins until reconcile.
+      queue.upsert(next);
+      void updateEvent
+        .mutateAsync({
+          id: eventId,
+          input: { start: next.start_time, end: next.end_time },
+        })
+        .then((result) => {
+          upsertCalendarEventInCache(result.event);
+          // Reconcile THIS event only: drop overlay if it still matches the
+          // response (a newer upsert for the same id must stay).
+          const latest = queue.getOverlay(eventId);
+          if (
+            !latest ||
+            (latest.op === 'upsert' &&
+              latest.event.start_time === result.event.start_time &&
+              latest.event.end_time === result.event.end_time &&
+              latest.event.title === result.event.title)
+          ) {
+            queue.clear(eventId);
+          }
+        })
+        .catch(() => {
+          // Revert only if overlay was not superseded by a newer drag.
+          const latest = queue.getOverlay(eventId);
+          if (
+            latest?.op === 'upsert' &&
+            latest.event.start_time === next.start_time &&
+            latest.event.end_time === next.end_time
+          ) {
+            queue.clear(eventId);
+          }
+        });
     },
-    [updateEvent],
+    [overlaidEvents, events, queue, updateEvent],
   );
 
   const drag = useCalendarDrag({
@@ -332,7 +377,7 @@ export function useCalendarSession({
   }, [drag.preview, drag.previewKind, days, writableCalendar]);
 
   const activeDragEvent = drag.activeEventId
-    ? events.find((e) => e.id === drag.activeEventId)
+    ? overlaidEvents.find((e) => e.id === drag.activeEventId)
     : undefined;
   const previewColor = activeDragEvent
     ? eventChipColor(activeDragEvent)
