@@ -222,9 +222,7 @@ export function CalendarSidebar({
             const label =
               cal.summary.length > 0 ? cal.summary : cal.google_calendar_id;
             const color = colorForCalendar(cal.id);
-            const checked =
-              selectedCalendarIds.size === 0 ||
-              selectedCalendarIds.has(cal.id);
+            const checked = selectedCalendarIds.has(cal.id);
 
             return (
               <li key={cal.id}>

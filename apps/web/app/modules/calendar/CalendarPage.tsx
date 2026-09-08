@@ -160,15 +160,16 @@ export function CalendarPage() {
   const [selectedCalendarIds, setSelectedCalendarIds] = useState<Set<string>>(
     () => new Set(),
   );
+  // Distinguishes pre-init (empty Set = show all) from user unchecking every
+  // calendar (empty Set = show none). Flipped once calendars first arrive.
+  const [selectionReady, setSelectionReady] = useState(false);
 
   // Default: select every calendar once the list first arrives.
   useEffect(() => {
-    if (calendars.length === 0) return;
-    setSelectedCalendarIds((prev) => {
-      if (prev.size > 0) return prev;
-      return new Set(calendars.map((c) => c.id));
-    });
-  }, [calendars]);
+    if (calendars.length === 0 || selectionReady) return;
+    setSelectedCalendarIds(new Set(calendars.map((c) => c.id)));
+    setSelectionReady(true);
+  }, [calendars, selectionReady]);
 
   const knownCalendarIds = useMemo(
     () => new Set(calendars.map((c) => c.id)),
@@ -188,15 +189,15 @@ export function CalendarPage() {
   }, []);
 
   // Events whose calendar is selected, plus stale calendar_ids not in the list.
-  // Empty selection (pre-init) shows everything.
+  // Pre-init (!selectionReady) shows everything; after ready, empty Set = none.
   const visibleEvents = useMemo(() => {
     return events.filter((e) => {
-      if (selectedCalendarIds.size === 0) return true;
+      if (!selectionReady) return true;
       if (selectedCalendarIds.has(e.calendar_id)) return true;
       if (!knownCalendarIds.has(e.calendar_id)) return true;
       return false;
     });
-  }, [events, selectedCalendarIds, knownCalendarIds]);
+  }, [events, selectedCalendarIds, knownCalendarIds, selectionReady]);
 
   const { timedEvents, allDayEvents } = useMemo(() => {
     const timed: CalendarEvent[] = [];
@@ -232,8 +233,8 @@ export function CalendarPage() {
     if (!el) return;
 
     const measure = () => {
-      // Visible hours area ≈ scroller client height minus sticky day headers.
-      const h = Math.max(0, el.clientHeight - COL_HEADER_H);
+      // Day headers live outside the scroller; hours area is full clientHeight.
+      const h = Math.max(0, el.clientHeight);
       setAvailableHoursPx(h);
     };
     measure();
@@ -272,7 +273,7 @@ export function CalendarPage() {
     }
 
     const y = nowLineY(now, hourH);
-    const visibleH = Math.max(0, scroller.clientHeight - COL_HEADER_H);
+    const visibleH = Math.max(0, scroller.clientHeight);
     scroller.scrollTop = Math.max(0, y - visibleH / 3);
     shouldScrollToNowRef.current = false;
   }, [availableHoursPx, hourH, days, today, now]);
@@ -497,6 +498,46 @@ export function CalendarPage() {
 
         {/* Grid column — always mounted so measure/scroll-to-now effects attach */}
         <div className="flex-1 min-h-0 flex flex-col relative">
+          {/* Day headers (gutter spacer + 7 days) — above all-day, outside scroller */}
+          <div
+            className="shrink-0 flex bg-cream border-b border-border"
+            style={{ height: COL_HEADER_H }}
+          >
+            <div
+              className="shrink-0 border-r border-border/60"
+              style={{ width: TIME_GUTTER_W }}
+              aria-hidden
+            />
+            {days.map((day, i) => {
+              const isToday = isSameDay(day, today);
+              return (
+                <div
+                  key={day.toISOString()}
+                  className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
+                >
+                  <span
+                    className={cn(
+                      'text-[11px] font-medium uppercase tracking-wide',
+                      isToday ? 'text-primary' : 'text-muted-foreground',
+                    )}
+                  >
+                    {WEEK_DAYS[i]}
+                  </span>
+                  <span
+                    className={cn(
+                      'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
+                      isToday
+                        ? 'bg-primary text-primary-foreground'
+                        : 'text-foreground',
+                    )}
+                  >
+                    {day.getDate()}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
           <AllDayRow
             height={allDayHeight}
             chips={allDayChips}
@@ -510,47 +551,7 @@ export function CalendarPage() {
               isRefreshing && 'opacity-70',
             )}
           >
-            {/* Sticky day headers row (gutter spacer + 7 days) */}
-            <div
-              className="sticky top-0 z-20 flex bg-cream border-b border-border"
-              style={{ height: COL_HEADER_H }}
-            >
-              <div
-                className="shrink-0 border-r border-border/60"
-                style={{ width: TIME_GUTTER_W }}
-                aria-hidden
-              />
-              {days.map((day, i) => {
-                const isToday = isSameDay(day, today);
-                return (
-                  <div
-                    key={day.toISOString()}
-                    className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
-                  >
-                    <span
-                      className={cn(
-                        'text-[11px] font-medium uppercase tracking-wide',
-                        isToday ? 'text-primary' : 'text-muted-foreground',
-                      )}
-                    >
-                      {WEEK_DAYS[i]}
-                    </span>
-                    <span
-                      className={cn(
-                        'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
-                        isToday
-                          ? 'bg-primary text-primary-foreground'
-                          : 'text-foreground',
-                      )}
-                    >
-                      {day.getDate()}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Hours: gutter + 7 columns, shared scroll (parent scroller) */}
+            {/* Hours: gutter + 7 columns */}
             <div className="relative flex" style={{ height: totalHoursH }}>
               {/* Time gutter */}
               <div
