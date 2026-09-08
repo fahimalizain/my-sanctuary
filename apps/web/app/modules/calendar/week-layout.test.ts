@@ -15,7 +15,9 @@ import {
   eventHeightPx,
   eventTopPx,
   formatWeekTitle,
+  hexToRgba,
   hourHeight,
+  isCompactChip,
   isMultiDay,
   monthGridDays,
   monthGridStart,
@@ -331,4 +333,26 @@ test('allDaySectionHeight: high lane capped at ALLDAY_MAX (137.5)', () => {
   // lane 6 → 3 + 21*7 + 1 = 151 → clamp 137.5
   assert.equal(allDaySectionHeight(6), ALLDAY_MAX);
   assert.equal(allDaySectionHeight(20), ALLDAY_MAX);
+});
+
+// ── hexToRgba ───────────────────────────────────────────────────────────
+
+test('hexToRgba: #2a5c8a @ 0.22', () => {
+  assert.equal(hexToRgba('#2a5c8a', 0.22), 'rgba(42, 92, 138, 0.22)');
+});
+
+test('hexToRgba: short #rgb expands', () => {
+  assert.equal(hexToRgba('#f00', 0.5), 'rgba(255, 0, 0, 0.5)');
+});
+
+// ── isCompactChip ───────────────────────────────────────────────────────
+
+test('isCompactChip: Notion threshold (inner < timeLine + timeMarginTop)', () => {
+  // inner = h - padTop(1) - padBottom(1) - timeLine(11) - marginBottom(3)
+  //       = h - 16
+  // compact when inner < 11 + 2 = 13  →  h < 29
+  assert.equal(isCompactChip(28), true);
+  assert.equal(isCompactChip(29), false);
+  assert.equal(isCompactChip(CHIP_MIN_H), true); // 18
+  assert.equal(isCompactChip(48), false);
 });

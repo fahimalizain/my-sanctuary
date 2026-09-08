@@ -31,9 +31,12 @@ import {
   formatEventTimeRange,
   formatHourLabel,
   formatWeekTitle,
+  hexToRgba,
   hourHeight as computeHourHeight,
+  isCompactChip,
   isMultiDay,
   isSameDay,
+  isWeekend,
   lastOccupiedCivilDate,
   nowLineY,
   packAllDayLanes,
@@ -45,6 +48,7 @@ import {
 } from './week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
+const CHIP_FILL_ALPHA = 0.22;
 
 interface PositionedEvent {
   event: CalendarEvent;
@@ -58,22 +62,6 @@ interface PositionedEvent {
   color: string;
 }
 
-function hexToRgba(hex: string, alpha: number): string {
-  const h = hex.replace('#', '');
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  const n = parseInt(full, 16);
-  const r = (n >> 16) & 255;
-  const g = (n >> 8) & 255;
-  const b = n & 255;
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
 interface EventChipProps {
   positioned: PositionedEvent;
 }
@@ -85,44 +73,58 @@ function EventChip({ positioned }: EventChipProps) {
   const end = new Date(event.end_time);
   const timeLabel = formatEventTime(start);
   const rangeLabel = formatEventTimeRange(start, end);
-  const compact = height < 32;
+  const compact = isCompactChip(height);
 
   const leftPct = (col / cols) * 100;
   const widthPct = (span / cols) * 100;
 
   return (
     <div
-      className="absolute overflow-hidden rounded-md px-1.5 py-0.5 pointer-events-auto"
+      className="absolute overflow-hidden rounded-[6px] pointer-events-auto"
       style={{
         top,
         height,
         left: `${leftPct}%`,
         width: `calc(${widthPct}% - ${CHIP_MARGIN_RIGHT}px)`,
-        backgroundColor: hexToRgba(color, 0.28),
-        borderLeft: `3px solid ${color}`,
         color: 'var(--foreground)',
       }}
       title={`${event.title} · ${rangeLabel}`}
       data-start-min={startMin}
       data-end-min={endMin}
     >
-      {compact ? (
-        <div className="flex items-baseline gap-1 min-w-0 leading-tight">
-          <span className="truncate text-[11px] font-medium">{event.title}</span>
-          <span className="shrink-0 text-[9px] text-muted-foreground">
-            {timeLabel}
-          </span>
-        </div>
-      ) : (
-        <div className="min-w-0 leading-tight">
-          <div className="truncate text-[11px] font-medium leading-[13px]">
-            {event.title}
-          </div>
-          <div className="truncate text-[9px] text-muted-foreground leading-[11px]">
-            {timeLabel}
-          </div>
-        </div>
-      )}
+      {/* 4px left ribbon (not a border) */}
+      <div
+        className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
+        style={{ backgroundColor: color }}
+        aria-hidden
+      />
+      <div
+        className={cn(
+          'h-full min-w-0 pl-2 pr-1',
+          compact ? 'flex items-center gap-1 py-0' : 'py-px',
+        )}
+        style={{ backgroundColor: hexToRgba(color, CHIP_FILL_ALPHA) }}
+      >
+        {compact ? (
+          <>
+            <span className="truncate text-[11px] font-medium leading-[13px]">
+              {event.title}
+            </span>
+            <span className="shrink-0 text-[9px] leading-[11px] text-muted-foreground">
+              {timeLabel}
+            </span>
+          </>
+        ) : (
+          <>
+            <div className="truncate text-[11px] font-medium leading-[13px]">
+              {event.title}
+            </div>
+            <div className="mt-0.5 truncate text-[9px] leading-[11px] text-muted-foreground">
+              {timeLabel}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -576,6 +578,7 @@ export function CalendarPage() {
               {/* Day columns */}
               {days.map((day) => {
                 const isToday = isSameDay(day, today);
+                const weekend = isWeekend(day);
                 const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
                 const showNow = isToday;
 
@@ -583,8 +586,12 @@ export function CalendarPage() {
                   <div
                     key={day.toISOString()}
                     className={cn(
-                      'relative flex-1 min-w-0 border-r border-border/40 last:border-r-0',
-                      isToday && 'bg-primary/[0.03]',
+                      'relative flex-1 min-w-0 border-r last:border-r-0',
+                      // Weekend rules slightly stronger; today wash wins over weekend.
+                      weekend ? 'border-border/60' : 'border-border/40',
+                      isToday
+                        ? 'bg-primary/[0.03]'
+                        : weekend && 'bg-muted/40',
                     )}
                   >
                     {/* Hour hairlines */}

@@ -3,23 +3,15 @@ import {
   ALLDAY_GAP,
   ALLDAY_PAD,
   TIME_GUTTER_W,
+  hexToRgba,
 } from './week-layout';
 import { cn } from '@/lib/utils';
 
-function hexToRgba(hex: string, alpha: number): string {
-  const h = hex.replace('#', '');
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  const n = parseInt(full, 16);
-  const r = (n >> 16) & 255;
-  const g = (n >> 8) & 255;
-  const b = n & 255;
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+const CHIP_FILL_ALPHA = 0.22;
+
+/** Mon-start week: Sat = 5, Sun = 6. */
+function isWeekendIndex(dayIndex: number): boolean {
+  return dayIndex === 5 || dayIndex === 6;
 }
 
 export interface AllDayChip {
@@ -63,17 +55,24 @@ export function AllDayRow({
 
       {/* 7-day chip track */}
       <div className="relative flex-1 min-w-0">
-        {/* Column hairlines + optional today tint */}
+        {/* Column hairlines + weekend / today wash (today wins) */}
         <div className="absolute inset-0 flex pointer-events-none">
-          {Array.from({ length: 7 }, (_, i) => (
-            <div
-              key={i}
-              className={cn(
-                'flex-1 min-w-0 border-r border-border/40 last:border-r-0',
-                todayIndex === i && 'bg-primary/[0.03]',
-              )}
-            />
-          ))}
+          {Array.from({ length: 7 }, (_, i) => {
+            const weekend = isWeekendIndex(i);
+            const isToday = todayIndex === i;
+            return (
+              <div
+                key={i}
+                className={cn(
+                  'flex-1 min-w-0 border-r last:border-r-0',
+                  weekend ? 'border-border/60' : 'border-border/40',
+                  isToday
+                    ? 'bg-primary/[0.03]'
+                    : weekend && 'bg-muted/40',
+                )}
+              />
+            );
+          })}
         </div>
 
         {chips.map((chip) => {
@@ -86,20 +85,31 @@ export function AllDayRow({
           return (
             <div
               key={chip.id}
-              className="absolute overflow-hidden rounded px-1.5 pointer-events-auto"
+              className="absolute overflow-hidden rounded-[6px] pointer-events-auto"
               style={{
                 top,
                 height: ALLDAY_CHIP,
                 left: `calc(${leftPct}% + 1px)`,
                 width: `calc(${widthPct}% - 2px)`,
-                backgroundColor: hexToRgba(chip.color, 0.28),
-                borderLeft: `3px solid ${chip.color}`,
                 color: 'var(--foreground)',
               }}
               title={chip.title}
             >
-              <div className="truncate text-[11px] font-medium leading-[19px]">
-                {chip.title}
+              {/* 4px left ribbon */}
+              <div
+                className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
+                style={{ backgroundColor: chip.color }}
+                aria-hidden
+              />
+              <div
+                className="h-full pl-2 pr-1 py-px"
+                style={{
+                  backgroundColor: hexToRgba(chip.color, CHIP_FILL_ALPHA),
+                }}
+              >
+                <div className="truncate text-[11px] font-medium leading-[17px]">
+                  {chip.title}
+                </div>
               </div>
             </div>
           );

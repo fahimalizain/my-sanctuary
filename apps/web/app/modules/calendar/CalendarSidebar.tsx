@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
+import { Check, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
@@ -233,6 +233,7 @@ export function CalendarSidebar({
                     checked={checked}
                     onChange={() => onToggleCalendar(cal.id)}
                   />
+                  {/* Colored checkbox is the color mark (Notion — no extra dot). */}
                   <span
                     className={cn(
                       'flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
@@ -243,29 +244,18 @@ export function CalendarSidebar({
                     style={
                       checked
                         ? { backgroundColor: color, borderColor: color }
-                        : undefined
+                        : { borderColor: color }
                     }
                     aria-hidden
                   >
                     {checked && (
-                      <svg
-                        viewBox="0 0 12 12"
-                        className="h-2.5 w-2.5 text-white"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <path d="M2.5 6.5 L5 9 L9.5 3.5" />
-                      </svg>
+                      <Check
+                        className="h-3 w-3 text-white"
+                        strokeWidth={3}
+                        aria-hidden
+                      />
                     )}
                   </span>
-                  <span
-                    className="h-2 w-2 shrink-0 rounded-full"
-                    style={{ backgroundColor: color }}
-                    aria-hidden
-                  />
                   <span className="min-w-0 flex-1 truncate text-[13px] text-foreground">
                     {label}
                   </span>

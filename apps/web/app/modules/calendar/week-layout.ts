@@ -389,6 +389,50 @@ export function colorForCalendar(calendarId: string): string {
   return EVENT_COLORS[Math.abs(hash) % EVENT_COLORS.length];
 }
 
+/**
+ * Convert `#rgb` / `#rrggbb` to `rgba(r, g, b, alpha)`.
+ * Shared by timed chips, all-day chips, and any muted calendar fill.
+ */
+export function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const full =
+    h.length === 3
+      ? h
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : h;
+  const n = parseInt(full, 16);
+  const r = (n >> 16) & 255;
+  const g = (n >> 8) & 255;
+  const b = n & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+// Notion chip chrome tokens used by isCompactChip.
+const CHIP_PAD_TOP = 1; // py-px
+const CHIP_PAD_BOTTOM = 1;
+const CHIP_TIME_LINE_H = 11; // text-[9px] leading-[11px]
+const CHIP_TIME_MARGIN_TOP = 2;
+
+/**
+ * Notion compact-vs-stacked rule for timed event chips.
+ * When the remaining vertical space for the title is tighter than one time
+ * line (+ its top margin), collapse title+time onto a single row.
+ *
+ *   inner = height - padTop - padBottom - timeLineH - marginBottom
+ *   compact = inner < timeLineH + timeMarginTop
+ */
+export function isCompactChip(heightPx: number): boolean {
+  const inner =
+    heightPx -
+    CHIP_PAD_TOP -
+    CHIP_PAD_BOTTOM -
+    CHIP_TIME_LINE_H -
+    CHIP_MARGIN_BOTTOM;
+  return inner < CHIP_TIME_LINE_H + CHIP_TIME_MARGIN_TOP;
+}
+
 // ── All-day band (Notion Cron Xme tokens) ───────────────────────────────
 
 export const ALLDAY_CHIP = 19;
