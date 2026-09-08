@@ -166,38 +166,81 @@ export function rangeIso(
 
 // ── Infinite horizontal day strip ───────────────────────────────────────
 
-/** Visible day columns that fill the viewport (Notion period length). */
+/** Visible day columns that fill the viewport (Notion period length default). */
 export const DAYS_PER_PERIOD = 7;
+/** Minimum selectable period length (Day view). */
+export const MIN_PERIOD_LENGTH = 1;
+/**
+ * Maximum selectable period length (Week view).
+ * Numbered Notion items 1–7; Month/Other are separate surfaces.
+ */
+export const MAX_PERIOD_LENGTH = 7;
 /** Extra days rendered on each side of the visible period. */
 export const STRIP_OVERSCAN = 7;
 /** Rebase when the first visible day is this close to a rendered edge. */
 export const STRIP_REBASE_THRESHOLD = 3;
 
-/** Floor column width so exactly 7 columns fit; leftover px go to the gutter. */
-export function colWidth(availablePx: number): number {
+/**
+ * Clamp a period length to `[MIN_PERIOD_LENGTH, MAX_PERIOD_LENGTH]`.
+ * Non-finite values fall back to `DAYS_PER_PERIOD` (7).
+ */
+export function clampPeriodLength(n: number): number {
+  if (!Number.isFinite(n)) return DAYS_PER_PERIOD;
+  return clamp(Math.trunc(n), MIN_PERIOD_LENGTH, MAX_PERIOD_LENGTH);
+}
+
+/** Notion button label: 1 → "Day", 7 → "Week", else `${n} days`. */
+export function periodLabel(periodLength: number): string {
+  const n = clampPeriodLength(periodLength);
+  if (n === 1) return 'Day';
+  if (n === DAYS_PER_PERIOD) return 'Week';
+  return `${n} days`;
+}
+
+/**
+ * Notion `fitPeriodStartDate`: if periodLength ≥ 5 (weekLength 7 − 2),
+ * snap to Monday; else the civil day itself is the left edge.
+ */
+export function fitPeriodStart(date: Date, periodLength: number): Date {
+  const n = clampPeriodLength(periodLength);
+  if (n >= DAYS_PER_PERIOD - 2) {
+    return startOfWeek(date);
+  }
+  return startOfDay(date);
+}
+
+/** Floor column width so exactly `periodLength` columns fit; leftover px go to the gutter. */
+export function colWidth(
+  availablePx: number,
+  periodLength: number = DAYS_PER_PERIOD,
+): number {
+  const n = clampPeriodLength(periodLength);
   if (!Number.isFinite(availablePx) || availablePx <= 0) {
     return 16;
   }
-  return Math.max(
-    16,
-    Math.floor((availablePx - TIME_GUTTER_W) / DAYS_PER_PERIOD),
-  );
+  return Math.max(16, Math.floor((availablePx - TIME_GUTTER_W) / n));
 }
 
 /**
  * Gutter width including the fractional leftover after flooring colWidth.
- * `gutter + colW * 7` equals `availablePx` (when availablePx ≥ TIME_GUTTER_W + 16*7).
+ * `gutter + colW * periodLength` equals `availablePx`
+ * (when availablePx ≥ TIME_GUTTER_W + 16*periodLength).
  */
-export function gutterWithRemainder(availablePx: number, colW: number): number {
+export function gutterWithRemainder(
+  availablePx: number,
+  colW: number,
+  periodLength: number = DAYS_PER_PERIOD,
+): number {
+  const n = clampPeriodLength(periodLength);
   if (!Number.isFinite(availablePx) || availablePx <= 0) {
     return TIME_GUTTER_W;
   }
-  return TIME_GUTTER_W + (availablePx - TIME_GUTTER_W - colW * DAYS_PER_PERIOD);
+  return TIME_GUTTER_W + (availablePx - TIME_GUTTER_W - colW * n);
 }
 
 /** Total days in the rendered strip window (period + overscan each side). */
-export function stripDayCount(): number {
-  return DAYS_PER_PERIOD + STRIP_OVERSCAN * 2;
+export function stripDayCount(periodLength: number = DAYS_PER_PERIOD): number {
+  return clampPeriodLength(periodLength) + STRIP_OVERSCAN * 2;
 }
 
 /**
@@ -212,18 +255,20 @@ export function dayIndexFromScroll(scrollLeft: number, colW: number): number {
 }
 
 /**
- * Index of the first day of the visible 7-day period (snap via round).
- * Clamped so a full period always fits in `[0, dayCount - DAYS_PER_PERIOD]`.
+ * Index of the first day of the visible period (snap via round).
+ * Clamped so a full period always fits in `[0, dayCount - periodLength]`.
  */
 export function visibleStartIndex(
   scrollLeft: number,
   colW: number,
   dayCount: number,
+  periodLength: number = DAYS_PER_PERIOD,
 ): number {
+  const n = clampPeriodLength(periodLength);
   if (!Number.isFinite(scrollLeft) || !Number.isFinite(colW) || colW <= 0) {
     return 0;
   }
-  const maxStart = Math.max(0, dayCount - DAYS_PER_PERIOD);
+  const maxStart = Math.max(0, dayCount - n);
   return clamp(Math.round(scrollLeft / colW), 0, maxStart);
 }
 
@@ -242,12 +287,11 @@ export function scrollLeftForIndex(index: number, colW: number): number {
 export function shouldRebase(
   visibleStart: number,
   dayCount: number,
+  periodLength: number = DAYS_PER_PERIOD,
 ): -1 | 0 | 1 {
+  const n = clampPeriodLength(periodLength);
   if (visibleStart < STRIP_REBASE_THRESHOLD) return -1;
-  if (
-    visibleStart >
-    dayCount - DAYS_PER_PERIOD - STRIP_REBASE_THRESHOLD
-  ) {
+  if (visibleStart > dayCount - n - STRIP_REBASE_THRESHOLD) {
     return 1;
   }
   return 0;
@@ -257,8 +301,9 @@ export function shouldRebase(
 export function shiftWindowStart(
   windowStart: Date,
   direction: -1 | 1,
+  periodLength: number = DAYS_PER_PERIOD,
 ): Date {
-  return addDays(windowStart, direction * DAYS_PER_PERIOD);
+  return addDays(windowStart, direction * clampPeriodLength(periodLength));
 }
 
 /**

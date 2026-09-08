@@ -16,10 +16,12 @@ import {
   TIME_GUTTER_W,
   allDaySectionHeight,
   clampMinutesToDay,
+  clampPeriodLength,
   colWidth,
   dayIndexFromScroll,
   eventHeightPx,
   eventTopPx,
+  fitPeriodStart,
   formatDayRangeTitle,
   formatWeekTitle,
   gutterWithRemainder,
@@ -35,6 +37,7 @@ import {
   nowLineY,
   packAllDayLanes,
   packDayEvents,
+  periodLabel,
   rangeIso,
   scrollLeftForIndex,
   shiftWindowStart,
@@ -148,6 +151,41 @@ test('rangeIso: N-day window; timeMax is start+N midnights', () => {
   assert.equal(max.getTime() - min.getTime(), 21 * 24 * 60 * 60 * 1000);
 });
 
+// ── Period length ───────────────────────────────────────────────────────
+
+test('clampPeriodLength: 0→1, 3→3, 9→7, NaN→7', () => {
+  assert.equal(clampPeriodLength(0), 1);
+  assert.equal(clampPeriodLength(3), 3);
+  assert.equal(clampPeriodLength(9), 7);
+  assert.equal(clampPeriodLength(NaN), 7);
+  assert.equal(clampPeriodLength(Infinity), 7);
+});
+
+test('periodLabel: 1 Day, 3 "3 days", 7 Week', () => {
+  assert.equal(periodLabel(1), 'Day');
+  assert.equal(periodLabel(3), '3 days');
+  assert.equal(periodLabel(7), 'Week');
+});
+
+test('fitPeriodStart: short period keeps civil day; long snaps to Monday', () => {
+  // 2026-09-09 is a Wednesday.
+  const wed = new Date(2026, 8, 9, 15, 30, 0, 0);
+  const short = fitPeriodStart(wed, 3);
+  assert.equal(short.getFullYear(), 2026);
+  assert.equal(short.getMonth(), 8);
+  assert.equal(short.getDate(), 9); // that Wednesday
+  assert.equal(short.getHours(), 0);
+  assert.equal(short.getMinutes(), 0);
+  assert.equal(short.getSeconds(), 0);
+  assert.equal(short.getMilliseconds(), 0);
+
+  const week = fitPeriodStart(wed, 7);
+  assert.equal(week.getFullYear(), 2026);
+  assert.equal(week.getMonth(), 8);
+  assert.equal(week.getDate(), 7); // preceding Monday
+  assert.equal(week.getHours(), 0);
+});
+
 // ── Infinite strip geometry ─────────────────────────────────────────────
 
 test('colWidth / gutterWithRemainder: available 800 → 7 cols + gutter = 800', () => {
@@ -160,6 +198,14 @@ test('colWidth / gutterWithRemainder: available 800 → 7 cols + gutter = 800', 
   assert.ok(gutter >= TIME_GUTTER_W);
 });
 
+test('colWidth / gutterWithRemainder: period 3 → gutter + colW * 3 = 800', () => {
+  const available = 800;
+  const colW = colWidth(available, 3);
+  const gutter = gutterWithRemainder(available, colW, 3);
+  assert.equal(colW, Math.floor((800 - TIME_GUTTER_W) / 3));
+  assert.equal(gutter + colW * 3, available);
+});
+
 test('colWidth: never below 16', () => {
   assert.equal(colWidth(0), 16);
   assert.equal(colWidth(10), 16);
@@ -168,6 +214,11 @@ test('colWidth: never below 16', () => {
 test('stripDayCount: period + overscan each side = 21', () => {
   assert.equal(stripDayCount(), DAYS_PER_PERIOD + STRIP_OVERSCAN * 2);
   assert.equal(stripDayCount(), 21);
+});
+
+test('stripDayCount: period 3 → 3 + 14 = 17', () => {
+  assert.equal(stripDayCount(3), 3 + STRIP_OVERSCAN * 2);
+  assert.equal(stripDayCount(3), 17);
 });
 
 test('dayIndexFromScroll / scrollLeftForIndex round-trip', () => {
@@ -212,6 +263,24 @@ test('shouldRebase: middle 0, near left -1, near right +1', () => {
   assert.equal(shouldRebase(14, dayCount), 1);
 });
 
+test('shouldRebase: period 3 — rebase near edges using period 3', () => {
+  const period = 3;
+  const dayCount = stripDayCount(period); // 17
+  // Safe band: visibleStart >= 3 and <= 17-3-3 = 11
+  assert.equal(shouldRebase(STRIP_REBASE_THRESHOLD, dayCount, period), 0);
+  assert.equal(shouldRebase(7, dayCount, period), 0);
+  assert.equal(
+    shouldRebase(dayCount - period - STRIP_REBASE_THRESHOLD, dayCount, period),
+    0,
+  );
+  // Near left
+  assert.equal(shouldRebase(0, dayCount, period), -1);
+  assert.equal(shouldRebase(STRIP_REBASE_THRESHOLD - 1, dayCount, period), -1);
+  // Near right: max start = 17-3=14; threshold when > 14-3=11
+  assert.equal(shouldRebase(12, dayCount, period), 1);
+  assert.equal(shouldRebase(14, dayCount, period), 1);
+});
+
 test('shiftWindowStart: ±7 days', () => {
   const origin = new Date(2026, 8, 7); // Mon Sep 7
   const left = shiftWindowStart(origin, -1);
@@ -222,6 +291,18 @@ test('shiftWindowStart: ±7 days', () => {
   assert.equal(right.getFullYear(), 2026);
   assert.equal(right.getMonth(), 8);
   assert.equal(right.getDate(), 14);
+});
+
+test('shiftWindowStart: period 3 → ±3 days', () => {
+  const origin = new Date(2026, 8, 7); // Mon Sep 7
+  const left = shiftWindowStart(origin, -1, 3);
+  const right = shiftWindowStart(origin, 1, 3);
+  assert.equal(left.getFullYear(), 2026);
+  assert.equal(left.getMonth(), 8);
+  assert.equal(left.getDate(), 4); // Fri Sep 4
+  assert.equal(right.getFullYear(), 2026);
+  assert.equal(right.getMonth(), 8);
+  assert.equal(right.getDate(), 10); // Thu Sep 10
 });
 
 // ── clampMinutesToDay ───────────────────────────────────────────────────
