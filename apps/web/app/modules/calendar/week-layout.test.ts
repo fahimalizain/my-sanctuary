@@ -7,14 +7,22 @@ import {
   ALLDAY_MAX,
   ALLDAY_MIN,
   CHIP_MIN_H,
+  DAYS_PER_PERIOD,
   HOUR_H_BASE,
   HOUR_H_MAX,
   HOUR_H_MIN,
+  STRIP_OVERSCAN,
+  STRIP_REBASE_THRESHOLD,
+  TIME_GUTTER_W,
   allDaySectionHeight,
   clampMinutesToDay,
+  colWidth,
+  dayIndexFromScroll,
   eventHeightPx,
   eventTopPx,
+  formatDayRangeTitle,
   formatWeekTitle,
+  gutterWithRemainder,
   hexToRgba,
   hourHeight,
   isCompactChip,
@@ -24,7 +32,13 @@ import {
   nowLineY,
   packAllDayLanes,
   packDayEvents,
+  rangeIso,
+  scrollLeftForIndex,
+  shiftWindowStart,
+  shouldRebase,
   startOfWeek,
+  stripDayCount,
+  visibleStartIndex,
   weekRangeIso,
 } from './week-layout';
 
@@ -95,6 +109,112 @@ test('formatWeekTitle: cross-month range', () => {
     formatWeekTitle(new Date(2026, 8, 28)),
     'Sep 28 – Oct 4, 2026',
   );
+});
+
+test('formatDayRangeTitle: Wed–Tue cross-month', () => {
+  // Wed Sep 30 – Tue Oct 6, 2026
+  assert.equal(
+    formatDayRangeTitle(new Date(2026, 8, 30), new Date(2026, 9, 6)),
+    'Sep 30 – Oct 6, 2026',
+  );
+});
+
+test('formatDayRangeTitle: cross-year', () => {
+  assert.equal(
+    formatDayRangeTitle(new Date(2025, 11, 29), new Date(2026, 0, 4)),
+    'Dec 29, 2025 – Jan 4, 2026',
+  );
+});
+
+// ── rangeIso ────────────────────────────────────────────────────────────
+
+test('rangeIso: N-day window; timeMax is start+N midnights', () => {
+  const start = new Date(2026, 8, 7); // Mon Sep 7 local
+  const { timeMin, timeMax } = rangeIso(start, 21);
+
+  const min = new Date(timeMin);
+  const max = new Date(timeMax);
+  const expectedMin = new Date(2026, 8, 7, 0, 0, 0, 0);
+  const expectedMax = new Date(2026, 8, 28, 0, 0, 0, 0); // +21 days
+  assert.equal(min.getTime(), expectedMin.getTime());
+  assert.equal(max.getTime(), expectedMax.getTime());
+  assert.equal(max.getTime() - min.getTime(), 21 * 24 * 60 * 60 * 1000);
+});
+
+// ── Infinite strip geometry ─────────────────────────────────────────────
+
+test('colWidth / gutterWithRemainder: available 800 → 7 cols + gutter = 800', () => {
+  const available = 800;
+  const colW = colWidth(available);
+  const gutter = gutterWithRemainder(available, colW);
+  assert.equal(colW, Math.floor((800 - TIME_GUTTER_W) / 7));
+  assert.equal(gutter + colW * DAYS_PER_PERIOD, available);
+  assert.ok(colW >= 16);
+  assert.ok(gutter >= TIME_GUTTER_W);
+});
+
+test('colWidth: never below 16', () => {
+  assert.equal(colWidth(0), 16);
+  assert.equal(colWidth(10), 16);
+});
+
+test('stripDayCount: period + overscan each side = 21', () => {
+  assert.equal(stripDayCount(), DAYS_PER_PERIOD + STRIP_OVERSCAN * 2);
+  assert.equal(stripDayCount(), 21);
+});
+
+test('dayIndexFromScroll / scrollLeftForIndex round-trip', () => {
+  const colW = 100;
+  for (const idx of [0, 3, 7, 14]) {
+    const left = scrollLeftForIndex(idx, colW);
+    assert.equal(left, idx * colW);
+    assert.equal(dayIndexFromScroll(left, colW), idx);
+    // Mid-column still floors to the same index.
+    assert.equal(dayIndexFromScroll(left + colW / 2 - 1, colW), idx);
+  }
+});
+
+test('visibleStartIndex: rounds and clamps to a full period', () => {
+  const colW = 100;
+  const dayCount = 21;
+  assert.equal(visibleStartIndex(0, colW, dayCount), 0);
+  assert.equal(visibleStartIndex(7 * colW, colW, dayCount), 7);
+  // Halfway past a column snaps forward.
+  assert.equal(visibleStartIndex(7 * colW + 50, colW, dayCount), 8);
+  // Past the last full period clamps.
+  assert.equal(
+    visibleStartIndex(100 * colW, colW, dayCount),
+    dayCount - DAYS_PER_PERIOD,
+  );
+});
+
+test('shouldRebase: middle 0, near left -1, near right +1', () => {
+  const dayCount = stripDayCount(); // 21
+  // Visible start in the safe band → 0
+  assert.equal(shouldRebase(STRIP_REBASE_THRESHOLD, dayCount), 0);
+  assert.equal(shouldRebase(7, dayCount), 0);
+  assert.equal(
+    shouldRebase(dayCount - DAYS_PER_PERIOD - STRIP_REBASE_THRESHOLD, dayCount),
+    0,
+  );
+  // Near left edge
+  assert.equal(shouldRebase(0, dayCount), -1);
+  assert.equal(shouldRebase(STRIP_REBASE_THRESHOLD - 1, dayCount), -1);
+  // Near right edge: max start = 21-7=14; threshold when > 14-3=11
+  assert.equal(shouldRebase(12, dayCount), 1);
+  assert.equal(shouldRebase(14, dayCount), 1);
+});
+
+test('shiftWindowStart: ±7 days', () => {
+  const origin = new Date(2026, 8, 7); // Mon Sep 7
+  const left = shiftWindowStart(origin, -1);
+  const right = shiftWindowStart(origin, 1);
+  assert.equal(left.getFullYear(), 2026);
+  assert.equal(left.getMonth(), 7); // August
+  assert.equal(left.getDate(), 31);
+  assert.equal(right.getFullYear(), 2026);
+  assert.equal(right.getMonth(), 8);
+  assert.equal(right.getDate(), 14);
 });
 
 // ── clampMinutesToDay ───────────────────────────────────────────────────

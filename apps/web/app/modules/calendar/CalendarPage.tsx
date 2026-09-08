@@ -19,18 +19,21 @@ import { CalendarSidebar } from './CalendarSidebar';
 import {
   CHIP_MARGIN_RIGHT,
   COL_HEADER_H,
-  TIME_GUTTER_W,
+  DAYS_PER_PERIOD,
+  STRIP_OVERSCAN,
   WEEK_DAYS,
   addDays,
   allDaySectionHeight,
   clampMinutesToDay,
+  colWidth as computeColWidth,
   colorForCalendar,
   eventHeightPx,
   eventTopPx,
+  formatDayRangeTitle,
   formatEventTime,
   formatEventTimeRange,
   formatHourLabel,
-  formatWeekTitle,
+  gutterWithRemainder,
   hexToRgba,
   hourHeight as computeHourHeight,
   isCompactChip,
@@ -41,14 +44,25 @@ import {
   nowLineY,
   packAllDayLanes,
   packDayEvents,
+  rangeIso,
+  scrollLeftForIndex,
+  shiftWindowStart,
+  shouldRebase,
   startOfDay,
   startOfWeek,
-  weekDays,
-  weekRangeIso,
+  stripDayCount,
+  visibleStartIndex as computeVisibleStartIndex,
 } from './week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
 const CHIP_FILL_ALPHA = 0.22;
+
+/** Mon-based short name for a local date (WEEK_DAYS is Mon→Sun). */
+function dayNameShort(date: Date): string {
+  const jsDay = date.getDay(); // 0 = Sun … 6 = Sat
+  const monIndex = jsDay === 0 ? 6 : jsDay - 1;
+  return WEEK_DAYS[monIndex];
+}
 
 interface PositionedEvent {
   event: CalendarEvent;
@@ -130,10 +144,21 @@ function EventChip({ positioned }: EventChipProps) {
 }
 
 export function CalendarPage() {
-  // Week containing "today" on first mount; prev/next shift by 7 days.
-  const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()));
+  // Strip window: first *rendered* day. Visible period is windowStart + scroll offset.
+  // Initial: overscan before current Mon–Sun so current week is centered in the buffer.
+  const [windowStart, setWindowStart] = useState(() =>
+    addDays(startOfWeek(new Date()), -STRIP_OVERSCAN),
+  );
 
-  const range = useMemo(() => weekRangeIso(weekStart), [weekStart]);
+  // First visible day index into the rendered strip (0 … dayCount-7).
+  // Seeded at overscan so the current Mon–Sun shows before measure/scroll attach.
+  const [visibleStartIdx, setVisibleStartIdx] = useState(STRIP_OVERSCAN);
+
+  const dayCount = stripDayCount();
+  const range = useMemo(
+    () => rangeIso(windowStart, dayCount),
+    [windowStart, dayCount],
+  );
 
   const eventsQuery = useCalendarEventsQuery(range.timeMin, range.timeMax);
   const events = eventsQuery.data?.events ?? [];
@@ -216,35 +241,148 @@ export function CalendarPage() {
     return { timedEvents: timed, allDayEvents: allDay };
   }, [visibleEvents]);
 
-  const days = useMemo(() => weekDays(weekStart), [weekStart]);
-  const weekTitle = useMemo(() => formatWeekTitle(weekStart), [weekStart]);
+  // Full rendered strip (21 days).
+  const days = useMemo(() => {
+    const origin = startOfDay(windowStart);
+    return Array.from({ length: dayCount }, (_, i) => addDays(origin, i));
+  }, [windowStart, dayCount]);
+
+  // First day of the 7-day visible period (drives title + sidebar highlight).
+  const visibleStart = useMemo(
+    () => addDays(startOfDay(windowStart), visibleStartIdx),
+    [windowStart, visibleStartIdx],
+  );
+  const visibleEnd = useMemo(
+    () => addDays(visibleStart, DAYS_PER_PERIOD - 1),
+    [visibleStart],
+  );
+  const rangeTitle = useMemo(
+    () => formatDayRangeTitle(visibleStart, visibleEnd),
+    [visibleStart, visibleEnd],
+  );
 
   const today = useMemo(() => {
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   }, []);
 
-  // Hours-area measurement for hourHeight stretch.
+  // Measure the grid column (not the scroller) for colWidth / gutter remainder.
+  const gridColumnRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const [availableHoursPx, setAvailableHoursPx] = useState(0);
+  const [mainWidth, setMainWidth] = useState(0);
+  const [scrollerHeight, setScrollerHeight] = useState(0);
+
   // Scroll-to-now only once per mount / when jumping to Today.
   const shouldScrollToNowRef = useRef(true);
+  // Pending horizontal scroll position after programmatic window moves.
+  const pendingScrollLeftRef = useRef<number | null>(null);
+  // Seed initial H-scroll once colWidth is known.
+  const didInitScrollRef = useRef(false);
+  // Rebase direction requested by the scroll handler; applied in layout effect.
+  const pendingRebaseRef = useRef<-1 | 0 | 1>(0);
+  const [scrollNonce, setScrollNonce] = useState(0);
+  // Suppress rebase while applying a programmatic scrollLeft write.
+  const suppressRebaseRef = useRef(false);
 
   useLayoutEffect(() => {
-    const el = scrollerRef.current;
+    const el = gridColumnRef.current;
     if (!el) return;
 
     const measure = () => {
-      // Day headers live outside the scroller; hours area is full clientHeight.
-      const h = Math.max(0, el.clientHeight);
-      setAvailableHoursPx(h);
+      setMainWidth(el.clientWidth);
+      const scroller = scrollerRef.current;
+      if (scroller) setScrollerHeight(scroller.clientHeight);
     };
     measure();
 
     const ro = new ResizeObserver(measure);
     ro.observe(el);
+    const scroller = scrollerRef.current;
+    if (scroller) ro.observe(scroller);
     return () => ro.disconnect();
   }, []);
+
+  const colW = useMemo(() => computeColWidth(mainWidth), [mainWidth]);
+  const gutterW = useMemo(
+    () => gutterWithRemainder(mainWidth, colW),
+    [mainWidth, colW],
+  );
+  const trackWidth = dayCount * colW;
+  const contentWidth = gutterW + trackWidth;
+
+  // All-day chips first so we know band height for hour stretch.
+  const { allDayChips, allDayHeight } = useMemo(() => {
+    const origin = days[0];
+    if (!origin) {
+      return {
+        allDayChips: [] as AllDayChip[],
+        allDayHeight: allDaySectionHeight(null),
+      };
+    }
+
+    const msPerDay = 24 * 60 * 60 * 1000;
+    const lastIdx = dayCount - 1;
+    const inputs: {
+      id: string;
+      startDay: number;
+      endDay: number;
+      event: CalendarEvent;
+    }[] = [];
+
+    for (const event of allDayEvents) {
+      const start = new Date(event.start_time);
+      const end = new Date(event.end_time);
+      const first = startOfDay(start);
+      const last = lastOccupiedCivilDate(start, end);
+
+      let startDay = Math.round(
+        (first.getTime() - origin.getTime()) / msPerDay,
+      );
+      let endDay = Math.round((last.getTime() - origin.getTime()) / msPerDay);
+
+      // No overlap with rendered window [0, dayCount).
+      if (endDay < 0 || startDay > lastIdx) continue;
+      startDay = Math.max(0, Math.min(lastIdx, startDay));
+      endDay = Math.max(0, Math.min(lastIdx, endDay));
+      if (endDay < startDay) continue;
+
+      inputs.push({ id: event.id, startDay, endDay, event });
+    }
+
+    const packed = packAllDayLanes(
+      inputs.map((i) => ({
+        id: i.id,
+        startDay: i.startDay,
+        endDay: i.endDay,
+      })),
+    );
+    const laneById = new Map(packed.map((p) => [p.id, p.lane]));
+
+    let maxLane: number | null = null;
+    const chips: AllDayChip[] = inputs.map((i) => {
+      const lane = laneById.get(i.id) ?? 0;
+      if (maxLane === null || lane > maxLane) maxLane = lane;
+      return {
+        id: i.id,
+        title: i.event.title,
+        startDay: i.startDay,
+        endDay: i.endDay,
+        lane,
+        color: colorForCalendar(i.event.calendar_id || i.event.id),
+      };
+    });
+
+    return {
+      allDayChips: chips,
+      allDayHeight: allDaySectionHeight(maxLane),
+    };
+  }, [days, allDayEvents, dayCount]);
+
+  // Headers + all-day are sticky inside the scroller; hours fill the rest.
+  const availableHoursPx = useMemo(() => {
+    if (scrollerHeight <= 0) return 0;
+    return Math.max(0, scrollerHeight - COL_HEADER_H - allDayHeight);
+  }, [scrollerHeight, allDayHeight]);
 
   const hourH = useMemo(
     () => computeHourHeight(availableHoursPx),
@@ -259,8 +397,55 @@ export function CalendarPage() {
     return () => window.clearInterval(id);
   }, []);
 
+  const releaseSuppressRebase = () => {
+    // scroll events from programmatic scrollLeft can be sync or rAF-deferred.
+    requestAnimationFrame(() => {
+      suppressRebaseRef.current = false;
+    });
+  };
+
+  // Apply pending horizontal scroll (init / Today / mini-month) and rebase.
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller || colW <= 0) return;
+
+    // Rebase first: shift window ±7 days and compensate scrollLeft so the
+    // picture does not jump. Must run before paint.
+    const dir = pendingRebaseRef.current;
+    if (dir !== 0) {
+      pendingRebaseRef.current = 0;
+      const compensation = -dir * DAYS_PER_PERIOD * colW;
+      suppressRebaseRef.current = true;
+      setWindowStart((prev) => shiftWindowStart(startOfDay(prev), dir));
+      scroller.scrollLeft = scroller.scrollLeft + compensation;
+      setVisibleStartIdx(
+        computeVisibleStartIndex(scroller.scrollLeft, colW, dayCount),
+      );
+      releaseSuppressRebase();
+      return;
+    }
+
+    // Initial mount: park scroll so current Mon–Sun is the visible period.
+    if (!didInitScrollRef.current) {
+      didInitScrollRef.current = true;
+      suppressRebaseRef.current = true;
+      scroller.scrollLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
+      setVisibleStartIdx(STRIP_OVERSCAN);
+      releaseSuppressRebase();
+    }
+
+    // Programmatic jump (Today / mini-month): park at overscan index.
+    if (pendingScrollLeftRef.current !== null) {
+      pendingScrollLeftRef.current = null;
+      suppressRebaseRef.current = true;
+      scroller.scrollLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
+      setVisibleStartIdx(STRIP_OVERSCAN);
+      releaseSuppressRebase();
+    }
+  }, [colW, dayCount, windowStart, scrollNonce]);
+
   // Scroll so the now line sits ~⅓ down the visible hours area — once per
-  // mount / Today jump, and only when we're looking at the current week.
+  // mount / Today jump, and only when the visible period contains today.
   useLayoutEffect(() => {
     if (!shouldScrollToNowRef.current) return;
     if (availableHoursPx <= 0 || hourH <= 0) return;
@@ -268,17 +453,46 @@ export function CalendarPage() {
     const scroller = scrollerRef.current;
     if (!scroller) return;
 
-    const weekContainsToday = days.some((d) => isSameDay(d, today));
-    if (!weekContainsToday) {
+    const visibleDays = Array.from({ length: DAYS_PER_PERIOD }, (_, i) =>
+      addDays(visibleStart, i),
+    );
+    const periodContainsToday = visibleDays.some((d) => isSameDay(d, today));
+    if (!periodContainsToday) {
       shouldScrollToNowRef.current = false;
       return;
     }
 
     const y = nowLineY(now, hourH);
+    // Hours sit below sticky headers + all-day inside the content box.
+    const contentY = COL_HEADER_H + allDayHeight + y;
     const visibleH = Math.max(0, scroller.clientHeight);
-    scroller.scrollTop = Math.max(0, y - visibleH / 3);
+    scroller.scrollTop = Math.max(0, contentY - visibleH / 3);
     shouldScrollToNowRef.current = false;
-  }, [availableHoursPx, hourH, days, today, now]);
+  }, [
+    availableHoursPx,
+    hourH,
+    visibleStart,
+    today,
+    now,
+    allDayHeight,
+  ]);
+
+  // Horizontal scroll: update visible start; request rebase near the edges.
+  const onScrollerScroll = useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller || colW <= 0) return;
+
+    const idx = computeVisibleStartIndex(scroller.scrollLeft, colW, dayCount);
+    setVisibleStartIdx((prev) => (prev === idx ? prev : idx));
+
+    if (suppressRebaseRef.current) return;
+
+    const dir = shouldRebase(idx, dayCount);
+    if (dir !== 0 && pendingRebaseRef.current === 0) {
+      pendingRebaseRef.current = dir;
+      setScrollNonce((n) => n + 1);
+    }
+  }, [colW, dayCount]);
 
   // Position timed events per day column (multi-day events excluded).
   const eventsByDay = useMemo(() => {
@@ -334,94 +548,48 @@ export function CalendarPage() {
     return map;
   }, [days, timedEvents, hourH]);
 
-  // All-day chips: clamp multi-day events to the visible week, pack lanes.
-  const { allDayChips, allDayHeight } = useMemo(() => {
-    const weekOrigin = days[0];
-    if (!weekOrigin) {
-      return { allDayChips: [] as AllDayChip[], allDayHeight: allDaySectionHeight(null) };
-    }
-
-    const msPerDay = 24 * 60 * 60 * 1000;
-    const inputs: {
-      id: string;
-      startDay: number;
-      endDay: number;
-      event: CalendarEvent;
-    }[] = [];
-
-    for (const event of allDayEvents) {
-      const start = new Date(event.start_time);
-      const end = new Date(event.end_time);
-      const first = startOfDay(start);
-      const last = lastOccupiedCivilDate(start, end);
-
-      let startDay = Math.round(
-        (first.getTime() - weekOrigin.getTime()) / msPerDay,
-      );
-      let endDay = Math.round(
-        (last.getTime() - weekOrigin.getTime()) / msPerDay,
-      );
-
-      // No overlap with visible week [0, 6].
-      if (endDay < 0 || startDay > 6) continue;
-      startDay = Math.max(0, Math.min(6, startDay));
-      endDay = Math.max(0, Math.min(6, endDay));
-      if (endDay < startDay) continue;
-
-      inputs.push({ id: event.id, startDay, endDay, event });
-    }
-
-    const packed = packAllDayLanes(
-      inputs.map((i) => ({
-        id: i.id,
-        startDay: i.startDay,
-        endDay: i.endDay,
-      })),
-    );
-    const laneById = new Map(packed.map((p) => [p.id, p.lane]));
-
-    let maxLane: number | null = null;
-    const chips: AllDayChip[] = inputs.map((i) => {
-      const lane = laneById.get(i.id) ?? 0;
-      if (maxLane === null || lane > maxLane) maxLane = lane;
-      return {
-        id: i.id,
-        title: i.event.title,
-        startDay: i.startDay,
-        endDay: i.endDay,
-        lane,
-        color: colorForCalendar(i.event.calendar_id || i.event.id),
-      };
-    });
-
-    return {
-      allDayChips: chips,
-      allDayHeight: allDaySectionHeight(maxLane),
-    };
-  }, [days, allDayEvents]);
-
   const todayIndex = useMemo(() => {
     const idx = days.findIndex((d) => isSameDay(d, today));
     return idx >= 0 ? idx : null;
   }, [days, today]);
 
-  const shiftWeek = useCallback((deltaWeeks: number) => {
-    shouldScrollToNowRef.current = false;
-    setWeekStart((prev) => addDays(prev, deltaWeeks * 7));
-  }, []);
+  /** Park the strip so `firstVisible` is the left edge of the viewport. */
+  const jumpToVisibleStart = useCallback(
+    (firstVisible: Date, scrollToNow: boolean) => {
+      shouldScrollToNowRef.current = scrollToNow;
+      pendingRebaseRef.current = 0;
+      const origin = addDays(startOfDay(firstVisible), -STRIP_OVERSCAN);
+      setWindowStart(origin);
+      setVisibleStartIdx(STRIP_OVERSCAN);
+      // Layout effect parks scrollLeft at overscan once colW is known.
+      pendingScrollLeftRef.current = 0; // non-null sentinel
+      setScrollNonce((n) => n + 1);
+    },
+    [],
+  );
+
+  const shiftPeriod = useCallback(
+    (deltaPeriods: number) => {
+      shouldScrollToNowRef.current = false;
+      const scroller = scrollerRef.current;
+      if (!scroller || colW <= 0) return;
+      scroller.scrollLeft += deltaPeriods * DAYS_PER_PERIOD * colW;
+      // onScroll will update visibleStartIdx and rebase if needed.
+      onScrollerScroll();
+    },
+    [colW, onScrollerScroll],
+  );
 
   const goToToday = useCallback(() => {
-    shouldScrollToNowRef.current = true;
-    setWeekStart(startOfWeek(new Date()));
-  }, []);
+    jumpToVisibleStart(startOfWeek(new Date()), true);
+  }, [jumpToVisibleStart]);
 
   const goToDate = useCallback(
     (date: Date) => {
-      // Scroll-to-now only when the clicked day is today.
-      shouldScrollToNowRef.current = isSameDay(date, today);
-      setWeekStart(startOfWeek(date));
+      // Monday-snap for mini-month (and Today). Free scroll can land anywhere.
+      jumpToVisibleStart(startOfWeek(date), isSameDay(date, today));
     },
-    [today],
+    [jumpToVisibleStart, today],
   );
 
   const hourLabels = useMemo(
@@ -434,7 +602,7 @@ export function CalendarPage() {
       {/* Header */}
       <header className="h-12 shrink-0 flex items-center gap-2 px-3 sm:px-4 border-b border-border/60">
         <h1 className="font-heading text-base sm:text-lg font-semibold text-foreground truncate min-w-0 flex-1">
-          {weekTitle}
+          {rangeTitle}
         </h1>
 
         {isRefreshing && (
@@ -455,7 +623,7 @@ export function CalendarPage() {
           variant="outline"
           size="icon"
           className="h-8 w-8"
-          onClick={() => shiftWeek(-1)}
+          onClick={() => shiftPeriod(-1)}
           aria-label="Previous week"
         >
           <ChevronLeft className="h-4 w-4" />
@@ -464,7 +632,7 @@ export function CalendarPage() {
           variant="outline"
           size="icon"
           className="h-8 w-8"
-          onClick={() => shiftWeek(1)}
+          onClick={() => shiftPeriod(1)}
           aria-label="Next week"
         >
           <ChevronRight className="h-4 w-4" />
@@ -486,7 +654,7 @@ export function CalendarPage() {
       {/* Body: sidebar + grid */}
       <div className="flex-1 min-h-0 flex">
         <CalendarSidebar
-          weekStart={weekStart}
+          weekStart={visibleStart}
           onGoToDate={goToDate}
           calendars={calendars}
           calendarsLoading={calendarsQuery.isLoading}
@@ -499,142 +667,162 @@ export function CalendarPage() {
         />
 
         {/* Grid column — always mounted so measure/scroll-to-now effects attach */}
-        <div className="flex-1 min-h-0 flex flex-col relative">
-          {/* Day headers (gutter spacer + 7 days) — above all-day, outside scroller */}
-          <div
-            className="shrink-0 flex bg-cream border-b border-border"
-            style={{ height: COL_HEADER_H }}
-          >
-            <div
-              className="shrink-0 border-r border-border/60"
-              style={{ width: TIME_GUTTER_W }}
-              aria-hidden
-            />
-            {days.map((day, i) => {
-              const isToday = isSameDay(day, today);
-              return (
-                <div
-                  key={day.toISOString()}
-                  className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
-                >
-                  <span
-                    className={cn(
-                      'text-[11px] font-medium uppercase tracking-wide',
-                      isToday ? 'text-primary' : 'text-muted-foreground',
-                    )}
-                  >
-                    {WEEK_DAYS[i]}
-                  </span>
-                  <span
-                    className={cn(
-                      'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
-                      isToday
-                        ? 'bg-primary text-primary-foreground'
-                        : 'text-foreground',
-                    )}
-                  >
-                    {day.getDate()}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-
-          <AllDayRow
-            height={allDayHeight}
-            chips={allDayChips}
-            todayIndex={todayIndex}
-          />
-
+        <div
+          ref={gridColumnRef}
+          className="flex-1 min-h-0 flex flex-col relative"
+        >
           <div
             ref={scrollerRef}
             className={cn(
               'flex-1 min-h-0 overflow-auto',
               isRefreshing && 'opacity-70',
             )}
+            onScroll={onScrollerScroll}
           >
-            {/* Hours: gutter + 7 columns */}
-            <div className="relative flex" style={{ height: totalHoursH }}>
-              {/* Time gutter */}
+            {/* Content: sticky headers + all-day + hours strip */}
+            <div style={{ width: contentWidth, minHeight: '100%' }}>
+              {/* Day headers — sticky top */}
               <div
-                className="shrink-0 relative border-r border-border/60"
-                style={{ width: TIME_GUTTER_W }}
+                className="sticky top-0 z-20 flex bg-cream border-b border-border"
+                style={{ height: COL_HEADER_H, width: contentWidth }}
               >
-                {hourLabels.map((h) => {
-                  const label = formatHourLabel(h);
-                  if (!label) return null;
+                <div
+                  className="shrink-0 sticky left-0 top-0 z-40 border-r border-border/60 bg-cream"
+                  style={{ width: gutterW }}
+                  aria-hidden
+                />
+                {days.map((day) => {
+                  const isToday = isSameDay(day, today);
                   return (
                     <div
-                      key={h}
-                      className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
-                      style={{ top: h * hourH }}
+                      key={day.toISOString()}
+                      className="shrink-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
+                      style={{ width: colW }}
                     >
-                      {label}
+                      <span
+                        className={cn(
+                          'text-[11px] font-medium uppercase tracking-wide',
+                          isToday ? 'text-primary' : 'text-muted-foreground',
+                        )}
+                      >
+                        {dayNameShort(day)}
+                      </span>
+                      <span
+                        className={cn(
+                          'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
+                          isToday
+                            ? 'bg-primary text-primary-foreground'
+                            : 'text-foreground',
+                        )}
+                      >
+                        {day.getDate()}
+                      </span>
                     </div>
                   );
                 })}
               </div>
 
-              {/* Day columns */}
-              {days.map((day) => {
-                const isToday = isSameDay(day, today);
-                const weekend = isWeekend(day);
-                const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
-                const showNow = isToday;
+              {/* All-day band — sticky under headers */}
+              <div
+                className="sticky z-20 bg-cream"
+                style={{ top: COL_HEADER_H }}
+              >
+                <AllDayRow
+                  days={days}
+                  colWidth={colW}
+                  gutterWidth={gutterW}
+                  height={allDayHeight}
+                  chips={allDayChips}
+                  todayIndex={todayIndex}
+                />
+              </div>
 
-                return (
-                  <div
-                    key={day.toISOString()}
-                    className={cn(
-                      'relative flex-1 min-w-0 border-r last:border-r-0',
-                      // Weekend rules slightly stronger; today wash wins over weekend.
-                      weekend ? 'border-border/60' : 'border-border/40',
-                      isToday
-                        ? 'bg-primary/[0.03]'
-                        : weekend && 'bg-muted/40',
-                    )}
-                  >
-                    {/* Hour hairlines */}
-                    {hourLabels.map((h) => (
+              {/* Hours: sticky left gutter + day columns */}
+              <div
+                className="relative flex"
+                style={{ height: totalHoursH, width: contentWidth }}
+              >
+                {/* Time gutter */}
+                <div
+                  className="shrink-0 sticky left-0 z-30 relative border-r border-border/60 bg-cream"
+                  style={{ width: gutterW, height: totalHoursH }}
+                >
+                  {hourLabels.map((h) => {
+                    const label = formatHourLabel(h);
+                    if (!label) return null;
+                    return (
                       <div
                         key={h}
-                        className="absolute left-0 right-0 border-t border-border/50"
+                        className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
                         style={{ top: h * hourH }}
-                      />
-                    ))}
-
-                    {/* Event chips */}
-                    {dayEvents.map((p) => (
-                      <EventChip key={p.event.id} positioned={p} />
-                    ))}
-
-                    {/* Now line */}
-                    {showNow && (
-                      <div
-                        className="absolute left-0 right-0 z-10 pointer-events-none"
-                        style={{ top: nowLineY(now, hourH) }}
-                        aria-hidden
                       >
-                        <div
-                          className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
-                          style={{ backgroundColor: NOW_LINE_COLOR }}
-                        />
-                        <div
-                          className="h-px w-full"
-                          style={{ backgroundColor: NOW_LINE_COLOR }}
-                        />
+                        {label}
                       </div>
-                    )}
-                  </div>
-                );
-              })}
+                    );
+                  })}
+                </div>
+
+                {/* Day columns */}
+                {days.map((day) => {
+                  const isTodayCol = isSameDay(day, today);
+                  const weekend = isWeekend(day);
+                  const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
+                  const showNow = isTodayCol;
+
+                  return (
+                    <div
+                      key={day.toISOString()}
+                      className={cn(
+                        'relative shrink-0 border-r last:border-r-0',
+                        weekend ? 'border-border/60' : 'border-border/40',
+                        isTodayCol
+                          ? 'bg-primary/[0.03]'
+                          : weekend && 'bg-muted/40',
+                      )}
+                      style={{ width: colW, height: totalHoursH }}
+                    >
+                      {/* Hour hairlines */}
+                      {hourLabels.map((h) => (
+                        <div
+                          key={h}
+                          className="absolute left-0 right-0 border-t border-border/50"
+                          style={{ top: h * hourH }}
+                        />
+                      ))}
+
+                      {/* Event chips */}
+                      {dayEvents.map((p) => (
+                        <EventChip key={p.event.id} positioned={p} />
+                      ))}
+
+                      {/* Now line */}
+                      {showNow && (
+                        <div
+                          className="absolute left-0 right-0 z-10 pointer-events-none"
+                          style={{ top: nowLineY(now, hourH) }}
+                          aria-hidden
+                        >
+                          <div
+                            className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
+                            style={{ backgroundColor: NOW_LINE_COLOR }}
+                          />
+                          <div
+                            className="h-px w-full"
+                            style={{ backgroundColor: NOW_LINE_COLOR }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
 
           {/* Loading overlay — grid stays mounted and measurable underneath */}
           {isLoading && events.length === 0 && (
             <div
-              className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 pointer-events-none"
+              className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cream/70 pointer-events-none"
               aria-busy="true"
               aria-label="Loading events"
             >
@@ -645,7 +833,7 @@ export function CalendarPage() {
 
           {/* Hard error overlay — empty grid still mounted underneath */}
           {error && events.length === 0 && !isLoading && (
-            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 text-center px-4">
+            <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-cream/70 text-center px-4">
               <p className="text-foreground font-medium mb-2">
                 Failed to load events
               </p>

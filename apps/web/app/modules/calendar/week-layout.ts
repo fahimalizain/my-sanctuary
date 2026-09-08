@@ -144,26 +144,132 @@ export function weekRangeIso(weekStart: Date): {
   timeMax: string;
 } {
   const start = startOfWeek(weekStart);
-  const end = addDays(start, 7);
-  return { timeMin: start.toISOString(), timeMax: end.toISOString() };
+  return rangeIso(start, 7);
 }
 
 /**
- * Notion-style week title:
+ * Query window of `dayCount` local midnights starting at `start`:
+ * [start midnight, start + dayCount midnight), as absolute UTC ISO strings.
+ */
+export function rangeIso(
+  start: Date,
+  dayCount: number,
+): { timeMin: string; timeMax: string } {
+  const origin = startOfDay(start);
+  const end = addDays(origin, dayCount);
+  return { timeMin: origin.toISOString(), timeMax: end.toISOString() };
+}
+
+// ── Infinite horizontal day strip ───────────────────────────────────────
+
+/** Visible day columns that fill the viewport (Notion period length). */
+export const DAYS_PER_PERIOD = 7;
+/** Extra days rendered on each side of the visible period. */
+export const STRIP_OVERSCAN = 7;
+/** Rebase when the first visible day is this close to a rendered edge. */
+export const STRIP_REBASE_THRESHOLD = 3;
+
+/** Floor column width so exactly 7 columns fit; leftover px go to the gutter. */
+export function colWidth(availablePx: number): number {
+  if (!Number.isFinite(availablePx) || availablePx <= 0) {
+    return 16;
+  }
+  return Math.max(
+    16,
+    Math.floor((availablePx - TIME_GUTTER_W) / DAYS_PER_PERIOD),
+  );
+}
+
+/**
+ * Gutter width including the fractional leftover after flooring colWidth.
+ * `gutter + colW * 7` equals `availablePx` (when availablePx ≥ TIME_GUTTER_W + 16*7).
+ */
+export function gutterWithRemainder(availablePx: number, colW: number): number {
+  if (!Number.isFinite(availablePx) || availablePx <= 0) {
+    return TIME_GUTTER_W;
+  }
+  return TIME_GUTTER_W + (availablePx - TIME_GUTTER_W - colW * DAYS_PER_PERIOD);
+}
+
+/** Total days in the rendered strip window (period + overscan each side). */
+export function stripDayCount(): number {
+  return DAYS_PER_PERIOD + STRIP_OVERSCAN * 2;
+}
+
+/**
+ * Day index of the left edge of the viewport (first partially/fully visible
+ * column), using floor. Not clamped.
+ */
+export function dayIndexFromScroll(scrollLeft: number, colW: number): number {
+  if (!Number.isFinite(scrollLeft) || !Number.isFinite(colW) || colW <= 0) {
+    return 0;
+  }
+  return Math.floor(scrollLeft / colW);
+}
+
+/**
+ * Index of the first day of the visible 7-day period (snap via round).
+ * Clamped so a full period always fits in `[0, dayCount - DAYS_PER_PERIOD]`.
+ */
+export function visibleStartIndex(
+  scrollLeft: number,
+  colW: number,
+  dayCount: number,
+): number {
+  if (!Number.isFinite(scrollLeft) || !Number.isFinite(colW) || colW <= 0) {
+    return 0;
+  }
+  const maxStart = Math.max(0, dayCount - DAYS_PER_PERIOD);
+  return clamp(Math.round(scrollLeft / colW), 0, maxStart);
+}
+
+/** scrollLeft that aligns column `index` with the left edge of the track. */
+export function scrollLeftForIndex(index: number, colW: number): number {
+  if (!Number.isFinite(index) || !Number.isFinite(colW) || colW <= 0) {
+    return 0;
+  }
+  return index * colW;
+}
+
+/**
+ * Whether the strip window should slide left (−1) or right (+1) so the
+ * visible period stays away from the rendered edges. 0 = no rebase.
+ */
+export function shouldRebase(
+  visibleStart: number,
+  dayCount: number,
+): -1 | 0 | 1 {
+  if (visibleStart < STRIP_REBASE_THRESHOLD) return -1;
+  if (
+    visibleStart >
+    dayCount - DAYS_PER_PERIOD - STRIP_REBASE_THRESHOLD
+  ) {
+    return 1;
+  }
+  return 0;
+}
+
+/** Shift the strip window by one period in `direction`. */
+export function shiftWindowStart(
+  windowStart: Date,
+  direction: -1 | 1,
+): Date {
+  return addDays(windowStart, direction * DAYS_PER_PERIOD);
+}
+
+/**
+ * Notion-style day-range title (inclusive first…last):
  *   same month → "Sep 7–13, 2026"
  *   cross-month → "Sep 28 – Oct 4, 2026"
  *   cross-year  → "Dec 29, 2025 – Jan 4, 2026"
  */
-export function formatWeekTitle(weekStart: Date): string {
-  const start = startOfWeek(weekStart);
-  const end = addDays(start, 6); // inclusive last day of the week
-
-  const sm = start.getMonth();
-  const sy = start.getFullYear();
-  const em = end.getMonth();
-  const ey = end.getFullYear();
-  const sd = start.getDate();
-  const ed = end.getDate();
+export function formatDayRangeTitle(first: Date, last: Date): string {
+  const sm = first.getMonth();
+  const sy = first.getFullYear();
+  const em = last.getMonth();
+  const ey = last.getFullYear();
+  const sd = first.getDate();
+  const ed = last.getDate();
 
   if (sy === ey && sm === em) {
     return `${MONTH_SHORT[sm]} ${sd}–${ed}, ${sy}`;
@@ -172,6 +278,15 @@ export function formatWeekTitle(weekStart: Date): string {
     return `${MONTH_SHORT[sm]} ${sd} – ${MONTH_SHORT[em]} ${ed}, ${sy}`;
   }
   return `${MONTH_SHORT[sm]} ${sd}, ${sy} – ${MONTH_SHORT[em]} ${ed}, ${ey}`;
+}
+
+/**
+ * Notion-style week title for the Mon–Sun week containing `weekStart`.
+ * Wrapper around formatDayRangeTitle.
+ */
+export function formatWeekTitle(weekStart: Date): string {
+  const start = startOfWeek(weekStart);
+  return formatDayRangeTitle(start, addDays(start, 6));
 }
 
 /** Hour gutter label: 1AM…11PM. Hour 0 returns empty (Notion has no midnight label). */

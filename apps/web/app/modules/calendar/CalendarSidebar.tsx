@@ -4,13 +4,14 @@ import { Button } from '@/components/ui/button';
 import type { GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
 import {
+  DAYS_PER_PERIOD,
   WEEK_DAYS,
   addDays,
   colorForCalendar,
   isSameDay,
   monthGridDays,
   monthGridStart,
-  weekDays,
+  startOfDay,
 } from './week-layout';
 
 const MONTH_LABEL = [
@@ -29,8 +30,9 @@ const MONTH_LABEL = [
 ] as const;
 
 export interface CalendarSidebarProps {
+  /** First day of the 7-day visible period (not necessarily Monday). */
   weekStart: Date;
-  /** Jump the main week to the week containing this date. */
+  /** Jump the main strip so the week containing this date is visible. */
   onGoToDate: (date: Date) => void;
   calendars: GoogleCalendar[];
   calendarsLoading?: boolean;
@@ -69,15 +71,23 @@ export function CalendarSidebar({
     return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   }, []);
 
-  const visibleWeekDays = useMemo(() => weekDays(weekStart), [weekStart]);
+  // Highlight the 7 consecutive visible days (free-scroll; not Mon-locked).
+  const visibleWeekDays = useMemo(() => {
+    const origin = startOfDay(weekStart);
+    return Array.from({ length: DAYS_PER_PERIOD }, (_, i) =>
+      addDays(origin, i),
+    );
+  }, [weekStart]);
   const gridDays = useMemo(() => monthGridDays(viewMonth), [viewMonth]);
 
-  // When the main week moves outside the mini-month grid, follow it.
+  // When the main visible period moves outside the mini-month grid, follow it.
   useEffect(() => {
     const gridStart = monthGridStart(viewMonth);
     const gridEnd = addDays(gridStart, 41);
-    const weekEnd = addDays(weekStart, 6);
-    const overlaps = weekStart.getTime() <= gridEnd.getTime() &&
+    const weekEnd = addDays(startOfDay(weekStart), DAYS_PER_PERIOD - 1);
+    const origin = startOfDay(weekStart);
+    const overlaps =
+      origin.getTime() <= gridEnd.getTime() &&
       weekEnd.getTime() >= gridStart.getTime();
     if (!overlaps) {
       setViewMonth(
