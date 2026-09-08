@@ -1,4 +1,4 @@
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import { memo, type PointerEvent as ReactPointerEvent } from 'react';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import {
@@ -55,7 +55,7 @@ interface EventChipProps {
   dragging?: boolean;
 }
 
-export function EventChip({
+export const EventChip = memo(function EventChip({
   positioned,
   selected,
   onSelect,
@@ -159,10 +159,10 @@ export function EventChip({
       </div>
     </div>
   );
-}
+});
 
 /** Ghost chip painted during drag-create / move / resize. */
-export function PreviewChip({
+export const PreviewChip = memo(function PreviewChip({
   top,
   height,
   color,
@@ -199,4 +199,4 @@ export function PreviewChip({
       </div>
     </div>
   );
-}
+});

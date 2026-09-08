@@ -333,6 +333,16 @@ export function hourHeight(availablePx: number): number {
   return clamp(Math.max(HOUR_H_BASE, stretched), HOUR_H_MIN, HOUR_H_MAX);
 }
 
+/**
+ * CSS `background-image` for 24 hour hairlines on a day column.
+ * One layer replaces 24 absolutely-positioned border divs.
+ */
+export function hourGridBackground(hourH: number): string {
+  const h = Number.isFinite(hourH) && hourH > 0 ? hourH : HOUR_H_BASE;
+  const line = h - 1;
+  return `repeating-linear-gradient(to bottom, transparent 0, transparent ${line}px, hsl(var(--border) / 0.5) ${line}px, hsl(var(--border) / 0.5) ${h}px)`;
+}
+
 export function eventTopPx(startMin: number, hourH: number): number {
   return (startMin / 60) * hourH;
 }

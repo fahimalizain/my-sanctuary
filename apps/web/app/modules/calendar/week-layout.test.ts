@@ -26,6 +26,7 @@ import {
   contrastingInk,
   hexLuminance,
   hexToRgba,
+  hourGridBackground,
   hourHeight,
   isCompactChip,
   isMultiDay,
@@ -368,6 +369,15 @@ test('hourHeight: never below 16; tall-enough stretches above base', () => {
   // Invalid / zero → base
   assert.equal(hourHeight(0), HOUR_H_BASE);
   assert.equal(hourHeight(-10), HOUR_H_BASE);
+});
+
+// ── hourGridBackground ──────────────────────────────────────────────────
+
+test('hourGridBackground: period uses hourH and hourH-1', () => {
+  const bg = hourGridBackground(48);
+  assert.ok(bg.includes('48px'));
+  assert.ok(bg.includes('47px'));
+  assert.ok(bg.startsWith('repeating-linear-gradient'));
 });
 
 // ── monthGridStart / monthGridDays ──────────────────────────────────────

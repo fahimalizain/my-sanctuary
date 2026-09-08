@@ -25,7 +25,8 @@ import {
   type TimedRange,
 } from './calendar-drag';
 import { CalendarSidebar } from './CalendarSidebar';
-import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
+import { DayColumn, TimedPreviewLayer } from './DayColumn';
+import { type PositionedEvent } from './EventChip';
 import { EventInspector } from './EventInspector';
 import { useCalendarDrag } from './useCalendarDrag';
 import {
@@ -47,6 +48,7 @@ import {
   formatDayRangeTitle,
   formatHourLabel,
   gutterWithRemainder,
+  hourGridBackground,
   hourHeight as computeHourHeight,
   isMultiDay,
   isSameDay,
@@ -65,7 +67,8 @@ import {
   visibleStartIndex as computeVisibleStartIndex,
 } from './week-layout';
 
-const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
+/** Stable empty list so DayColumn memo is not busted on empty days. */
+const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
 
 /** Mon-based short name for a local date (WEEK_DAYS is Mon→Sun). */
 function dayNameShort(date: Date): string {
@@ -505,6 +508,18 @@ export function CalendarPage() {
     onChipTap: selectEvent,
   });
 
+  // Stable across pointermove — only flips at drag start/end (not every move).
+  const draggingEventId =
+    drag.isDragging && drag.activeEventId ? drag.activeEventId : null;
+
+  const handleSelectChip = useCallback(
+    (eventId: string) => {
+      if (drag.suppressNextClick()) return;
+      selectEvent(eventId);
+    },
+    [drag.suppressNextClick, selectEvent],
+  );
+
   const timedPreviewByDay = useMemo(
     () =>
       timedPreviewSegments(drag.preview, drag.previewKind, days, hourH),
@@ -737,6 +752,8 @@ export function CalendarPage() {
     [],
   );
 
+  const hourGridBg = useMemo(() => hourGridBackground(hourH), [hourH]);
+
   return (
     <div className="h-[100dvh] bg-cream flex flex-col pb-20">
       {/* Header */}
@@ -880,7 +897,10 @@ export function CalendarPage() {
 
               {/* Hours: sticky left gutter + day columns */}
               <div
-                className="relative flex"
+                className={cn(
+                  'relative flex',
+                  drag.isDragging && 'select-none',
+                )}
                 style={{ height: totalHoursH, width: contentWidth }}
               >
                 {/* Time gutter */}
@@ -903,87 +923,45 @@ export function CalendarPage() {
                   })}
                 </div>
 
-                {/* Day columns */}
+                {/* Day columns — memoized; drag preview is a sibling overlay */}
                 {days.map((day) => {
                   const isTodayCol = isSameDay(day, today);
-                  const weekend = isWeekend(day);
                   const dayKey = day.toDateString();
-                  const dayEvents = eventsByDay.get(dayKey) ?? [];
-                  const showNow = isTodayCol;
-                  const ghost = timedPreviewByDay.get(dayKey);
+                  const dayEvents =
+                    eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
 
                   return (
-                    <div
+                    <DayColumn
                       key={day.toISOString()}
-                      data-day-col={day.toISOString()}
-                      className={cn(
-                        'relative shrink-0 border-r last:border-r-0 cursor-pointer',
-                        weekend ? 'border-border/60' : 'border-border/40',
-                        isTodayCol
-                          ? 'bg-primary/[0.03]'
-                          : weekend && 'bg-muted/40',
-                        drag.isDragging && 'select-none',
-                      )}
-                      style={{ width: colW, height: totalHoursH }}
-                      onPointerDown={(e) => drag.onColumnPointerDown(e, day)}
-                    >
-                      {/* Hour hairlines */}
-                      {hourLabels.map((h) => (
-                        <div
-                          key={h}
-                          className="absolute left-0 right-0 border-t border-border/50 pointer-events-none"
-                          style={{ top: h * hourH }}
-                        />
-                      ))}
-
-                      {/* Event chips */}
-                      {dayEvents.map((p) => (
-                        <EventChip
-                          key={p.event.id}
-                          positioned={p}
-                          selected={p.event.id === selectedEventId}
-                          onSelect={(id) => {
-                            if (drag.suppressNextClick()) return;
-                            selectEvent(id);
-                          }}
-                          onPointerDown={drag.onChipPointerDown}
-                          dragging={
-                            drag.isDragging &&
-                            drag.activeEventId === p.event.id
-                          }
-                        />
-                      ))}
-
-                      {/* Drag ghost */}
-                      {ghost && (
-                        <PreviewChip
-                          top={ghost.top}
-                          height={ghost.height}
-                          color={previewColor}
-                          title={previewTitle}
-                        />
-                      )}
-
-                      {/* Now line */}
-                      {showNow && (
-                        <div
-                          className="absolute left-0 right-0 z-10 pointer-events-none"
-                          style={{ top: nowLineY(now, hourH) }}
-                          aria-hidden
-                        >
-                          <div
-                            className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
-                            style={{ backgroundColor: NOW_LINE_COLOR }}
-                          />
-                          <div
-                            className="h-px w-full"
-                            style={{ backgroundColor: NOW_LINE_COLOR }}
-                          />
-                        </div>
-                      )}
-                    </div>
+                      day={day}
+                      colW={colW}
+                      totalHoursH={totalHoursH}
+                      hourH={hourH}
+                      hourGridBg={hourGridBg}
+                      events={dayEvents}
+                      selectedEventId={selectedEventId}
+                      draggingEventId={draggingEventId}
+                      isToday={isTodayCol}
+                      isWeekend={isWeekend(day)}
+                      showNow={isTodayCol}
+                      now={isTodayCol ? now : undefined}
+                      onColumnPointerDown={drag.onColumnPointerDown}
+                      onChipPointerDown={drag.onChipPointerDown}
+                      onSelectChip={handleSelectChip}
+                    />
                   );
                 })}
+
+                <TimedPreviewLayer
+                  days={days}
+                  colW={colW}
+                  gutterW={gutterW}
+                  trackWidth={trackWidth}
+                  totalHoursH={totalHoursH}
+                  timedPreviewByDay={timedPreviewByDay}
+                  previewColor={previewColor}
+                  previewTitle={previewTitle}
+                />
               </div>
             </div>
           </div>
