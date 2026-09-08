@@ -324,15 +324,143 @@ export function CalendarPage() {
         </div>
       )}
 
-      {/* Grid body */}
+      {/* Grid body — always mounted so measure/scroll-to-now effects attach */}
       <div className="flex-1 min-h-0 flex flex-col relative">
-        {isLoading ? (
-          <div className="flex flex-col items-center justify-center flex-1 text-muted-foreground">
-            <Loader2 className="h-8 w-8 animate-spin mb-3" />
-            <p className="text-sm">Loading events...</p>
+        <div
+          ref={scrollerRef}
+          className={cn(
+            'flex-1 min-h-0 overflow-auto',
+            isRefreshing && 'opacity-70',
+          )}
+        >
+          {/* Sticky day headers row (gutter spacer + 7 days) */}
+          <div
+            className="sticky top-0 z-20 flex bg-cream border-b border-border"
+            style={{ height: COL_HEADER_H }}
+          >
+            <div
+              className="shrink-0 border-r border-border/60"
+              style={{ width: TIME_GUTTER_W }}
+              aria-hidden
+            />
+            {days.map((day, i) => {
+              const isToday = isSameDay(day, today);
+              return (
+                <div
+                  key={day.toISOString()}
+                  className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
+                >
+                  <span
+                    className={cn(
+                      'text-[11px] font-medium uppercase tracking-wide',
+                      isToday ? 'text-primary' : 'text-muted-foreground',
+                    )}
+                  >
+                    {WEEK_DAYS[i]}
+                  </span>
+                  <span
+                    className={cn(
+                      'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
+                      isToday
+                        ? 'bg-primary text-primary-foreground'
+                        : 'text-foreground',
+                    )}
+                  >
+                    {day.getDate()}
+                  </span>
+                </div>
+              );
+            })}
           </div>
-        ) : error && events.length === 0 ? (
-          <div className="flex flex-col items-center justify-center flex-1 text-center px-4">
+
+          {/* Hours: gutter + 7 columns, shared scroll (parent scroller) */}
+          <div className="relative flex" style={{ height: totalHoursH }}>
+            {/* Time gutter */}
+            <div
+              className="shrink-0 relative border-r border-border/60"
+              style={{ width: TIME_GUTTER_W }}
+            >
+              {hourLabels.map((h) => {
+                const label = formatHourLabel(h);
+                if (!label) return null;
+                return (
+                  <div
+                    key={h}
+                    className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
+                    style={{ top: h * hourH }}
+                  >
+                    {label}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Day columns */}
+            {days.map((day) => {
+              const isToday = isSameDay(day, today);
+              const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
+              const showNow = isToday;
+
+              return (
+                <div
+                  key={day.toISOString()}
+                  className={cn(
+                    'relative flex-1 min-w-0 border-r border-border/40 last:border-r-0',
+                    isToday && 'bg-primary/[0.03]',
+                  )}
+                >
+                  {/* Hour hairlines */}
+                  {hourLabels.map((h) => (
+                    <div
+                      key={h}
+                      className="absolute left-0 right-0 border-t border-border/50"
+                      style={{ top: h * hourH }}
+                    />
+                  ))}
+
+                  {/* Event chips */}
+                  {dayEvents.map((p) => (
+                    <EventChip key={p.event.id} positioned={p} />
+                  ))}
+
+                  {/* Now line */}
+                  {showNow && (
+                    <div
+                      className="absolute left-0 right-0 z-10 pointer-events-none"
+                      style={{ top: nowLineY(now, hourH) }}
+                      aria-hidden
+                    >
+                      <div
+                        className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
+                        style={{ backgroundColor: NOW_LINE_COLOR }}
+                      />
+                      <div
+                        className="h-px w-full"
+                        style={{ backgroundColor: NOW_LINE_COLOR }}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Loading overlay — grid stays mounted and measurable underneath */}
+        {isLoading && events.length === 0 && (
+          <div
+            className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 pointer-events-none"
+            aria-busy="true"
+            aria-label="Loading events"
+          >
+            <Loader2 className="h-8 w-8 animate-spin mb-3 text-muted-foreground" />
+            <p className="text-sm text-muted-foreground">Loading events...</p>
+          </div>
+        )}
+
+        {/* Hard error overlay — empty grid still mounted underneath */}
+        {error && events.length === 0 && !isLoading && (
+          <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-cream/70 text-center px-4">
             <p className="text-foreground font-medium mb-2">
               Failed to load events
             </p>
@@ -341,126 +469,6 @@ export function CalendarPage() {
               <RefreshCw className="h-4 w-4 mr-2" />
               Retry
             </Button>
-          </div>
-        ) : (
-          <div
-            ref={scrollerRef}
-            className={cn(
-              'flex-1 min-h-0 overflow-auto',
-              isRefreshing && 'opacity-70',
-            )}
-          >
-            {/* Sticky day headers row (gutter spacer + 7 days) */}
-            <div
-              className="sticky top-0 z-20 flex bg-cream border-b border-border"
-              style={{ height: COL_HEADER_H }}
-            >
-              <div
-                className="shrink-0 border-r border-border/60"
-                style={{ width: TIME_GUTTER_W }}
-                aria-hidden
-              />
-              {days.map((day, i) => {
-                const isToday = isSameDay(day, today);
-                return (
-                  <div
-                    key={day.toISOString()}
-                    className="flex-1 min-w-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
-                  >
-                    <span
-                      className={cn(
-                        'text-[11px] font-medium uppercase tracking-wide',
-                        isToday ? 'text-primary' : 'text-muted-foreground',
-                      )}
-                    >
-                      {WEEK_DAYS[i]}
-                    </span>
-                    <span
-                      className={cn(
-                        'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
-                        isToday
-                          ? 'bg-primary text-primary-foreground'
-                          : 'text-foreground',
-                      )}
-                    >
-                      {day.getDate()}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Hours: gutter + 7 columns, shared scroll (parent scroller) */}
-            <div className="relative flex" style={{ height: totalHoursH }}>
-              {/* Time gutter */}
-              <div
-                className="shrink-0 relative border-r border-border/60"
-                style={{ width: TIME_GUTTER_W }}
-              >
-                {hourLabels.map((h) => {
-                  const label = formatHourLabel(h);
-                  if (!label) return null;
-                  return (
-                    <div
-                      key={h}
-                      className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
-                      style={{ top: h * hourH }}
-                    >
-                      {label}
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Day columns */}
-              {days.map((day) => {
-                const isToday = isSameDay(day, today);
-                const dayEvents = eventsByDay.get(day.toDateString()) ?? [];
-                const showNow = isToday;
-
-                return (
-                  <div
-                    key={day.toISOString()}
-                    className={cn(
-                      'relative flex-1 min-w-0 border-r border-border/40 last:border-r-0',
-                      isToday && 'bg-primary/[0.03]',
-                    )}
-                  >
-                    {/* Hour hairlines */}
-                    {hourLabels.map((h) => (
-                      <div
-                        key={h}
-                        className="absolute left-0 right-0 border-t border-border/50"
-                        style={{ top: h * hourH }}
-                      />
-                    ))}
-
-                    {/* Event chips */}
-                    {dayEvents.map((p) => (
-                      <EventChip key={p.event.id} positioned={p} />
-                    ))}
-
-                    {/* Now line */}
-                    {showNow && (
-                      <div
-                        className="absolute left-0 right-0 z-10 pointer-events-none"
-                        style={{ top: nowLineY(now, hourH) }}
-                        aria-hidden
-                      >
-                        <div
-                          className="absolute -left-[5px] -top-[1px] h-[2px] w-[10px] rounded-full"
-                          style={{ backgroundColor: NOW_LINE_COLOR }}
-                        />
-                        <div
-                          className="h-px w-full"
-                          style={{ backgroundColor: NOW_LINE_COLOR }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
           </div>
         )}
       </div>
