@@ -13,6 +13,7 @@ pub mod lists;
 pub mod models;
 pub mod oauth;
 pub mod pattern_gen;
+pub mod realtime;
 pub mod repo;
 pub mod routines;
 pub mod tasks;
@@ -71,6 +72,7 @@ pub use oauth::{
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
+pub use realtime::{RealtimeKind, RealtimeMessage};
 pub use routines::{
     create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
     validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,
