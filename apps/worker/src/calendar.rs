@@ -284,6 +284,12 @@ pub async fn create_event(
                 console_log!("calendar: cache upsert failed for created event: {error}");
             }
             let event = paint_single_event(&ctx, &user_id, output.event).await?;
+            let _ = crate::user_hub::notify_user(
+                &ctx.env,
+                &user_id,
+                Some(&event.event.calendar_id),
+            )
+            .await;
             let response = Response::from_json(&api_core::CreateEventResponse {
                 event,
                 source: output.source,
@@ -355,6 +361,12 @@ pub async fn update_event(
                 console_log!("calendar: cache upsert failed for patched event: {error}");
             }
             let event = paint_single_event(&ctx, &user_id, output.event).await?;
+            let _ = crate::user_hub::notify_user(
+                &ctx.env,
+                &user_id,
+                Some(&event.event.calendar_id),
+            )
+            .await;
             let response = Response::from_json(&api_core::CreateEventResponse {
                 event,
                 source: output.source,
@@ -416,6 +428,7 @@ pub async fn delete_event(
     .await
     {
         Ok(()) => {
+            let _ = crate::user_hub::notify_user(&ctx.env, &user_id, None).await;
             let response = Response::from_json(&api_core::DeleteEventResponse { success: true })?;
             Ok(response
                 .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
@@ -575,7 +588,7 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                     return;
                 }
             };
-            if let Err(err) = api_core::sync_calendar(
+            match api_core::sync_calendar(
                 &crate::http::WorkerHttp,
                 &calendars,
                 &events,
@@ -585,7 +598,15 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
             )
             .await
             {
-                console_log!("calendar webhook: background sync for {} failed: {err}", calendar.id);
+                Ok(()) => {
+                    crate::user_hub::notify_user(&env, &calendar.user_id, Some(&calendar.id)).await;
+                }
+                Err(err) => {
+                    console_log!(
+                        "calendar webhook: background sync for {} failed: {err}",
+                        calendar.id
+                    );
+                }
             }
         });
     } else {

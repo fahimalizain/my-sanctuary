@@ -8,6 +8,7 @@ mod http;
 mod lists;
 mod routines;
 mod tasks;
+mod user_hub;
 
 use worker::*;
 
@@ -62,6 +63,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // that path — falls through to the Router.
     if is_webhook_request(&req, config.as_ref()) {
         return calendar::notifications(req, env, ctx).await;
+    }
+
+    // WebSocket upgrade must bypass Router — upgrade through Router is flaky.
+    // `/api/*` is already `run_worker_first`, so this path always hits the Worker.
+    if req.path() == "/api/realtime" {
+        return user_hub::connect(req, env, config.as_ref()).await;
     }
 
     Router::with_data(config)
