@@ -330,6 +330,11 @@ export function useCalendarSession({
               return;
             }
 
+            // Remap selection before clear/cache so selectedEvent never
+            // resolves null for the old temp id (effect would close inspector).
+            setSelectedEventId((prev) =>
+              prev === tempId ? result.event.id : prev,
+            );
             queue.clear(tempId);
             upsertCalendarEventInCache(result.event);
 
@@ -390,11 +395,6 @@ export function useCalendarSession({
                   });
               }
             }
-
-            // Remap selection from temp id → server id (keep inspector open).
-            setSelectedEventId((prev) =>
-              prev === tempId ? result.event.id : prev,
-            );
           },
           onError: () => {
             queue.clear(tempId);
