@@ -88,7 +88,7 @@ export const EventChip = memo(function EventChip({
       role="button"
       tabIndex={0}
       className={cn(
-        'event-chip absolute overflow-hidden rounded-[6px] pointer-events-auto',
+        'event-chip group absolute overflow-hidden rounded-[6px] pointer-events-auto',
         'cursor-grab active:cursor-grabbing',
         selected && 'ring-1 ring-foreground/25',
         dragging && 'opacity-40',
@@ -128,14 +128,30 @@ export const EventChip = memo(function EventChip({
       {/* Resize handles — 6px hit targets at top/bottom edges */}
       <div
         data-resize="start"
-        className="absolute inset-x-0 top-0 z-[2] h-1.5 cursor-ns-resize"
+        className="absolute inset-x-0 top-0 z-[2] flex h-1.5 cursor-ns-resize items-center justify-center"
         aria-hidden
-      />
+      >
+        <span
+          className={cn(
+            'pointer-events-none h-[3px] w-[32%] max-w-[40px] rounded-full bg-current opacity-0 transition-opacity',
+            'group-hover:opacity-45',
+            selected && 'opacity-45',
+          )}
+        />
+      </div>
       <div
         data-resize="end"
-        className="absolute inset-x-0 bottom-0 z-[2] h-1.5 cursor-ns-resize"
+        className="absolute inset-x-0 bottom-0 z-[2] flex h-1.5 cursor-ns-resize items-center justify-center"
         aria-hidden
-      />
+      >
+        <span
+          className={cn(
+            'pointer-events-none h-[3px] w-[32%] max-w-[40px] rounded-full bg-current opacity-0 transition-opacity',
+            'group-hover:opacity-45',
+            selected && 'opacity-45',
+          )}
+        />
+      </div>
 
       {/* 4px left ribbon — darker shade so it reads on solid fill */}
       <div
