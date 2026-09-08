@@ -3,15 +3,32 @@ import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import {
   CHIP_MARGIN_RIGHT,
+  contrastingInk,
   formatEventTime,
   formatEventTimeRange,
   hexToRgba,
   isCompactChip,
 } from './week-layout';
 
-const CHIP_FILL_ALPHA = 0.22;
-const CHIP_FILL_ALPHA_SELECTED = 0.4;
 const PREVIEW_FILL_ALPHA = 0.18;
+
+/** Mix hex with black ~20% so the left ribbon still reads on a solid body. */
+function darkerRibbon(hex: string): string {
+  const h = hex.replace('#', '');
+  const full =
+    h.length === 3
+      ? h
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : h;
+  const n = parseInt(full, 16);
+  if (Number.isNaN(n)) return hex;
+  const r = Math.round(((n >> 16) & 255) * 0.8);
+  const g = Math.round(((n >> 8) & 255) * 0.8);
+  const b = Math.round((n & 255) * 0.8);
+  return `rgb(${r}, ${g}, ${b})`;
+}
 
 export interface PositionedEvent {
   event: CalendarEvent;
@@ -55,7 +72,6 @@ export function EventChip({
 
   const leftPct = (col / cols) * 100;
   const widthPct = (span / cols) * 100;
-  const fillAlpha = selected ? CHIP_FILL_ALPHA_SELECTED : CHIP_FILL_ALPHA;
 
   return (
     <div
@@ -72,7 +88,8 @@ export function EventChip({
         height,
         left: `${leftPct}%`,
         width: `calc(${widthPct}% - ${CHIP_MARGIN_RIGHT}px)`,
-        color: 'var(--foreground)',
+        backgroundColor: color,
+        color: contrastingInk(color),
       }}
       title={`${event.title} · ${rangeLabel}`}
       data-event-chip
@@ -108,10 +125,10 @@ export function EventChip({
         aria-hidden
       />
 
-      {/* 4px left ribbon (not a border) */}
+      {/* 4px left ribbon — darker shade so it reads on solid fill */}
       <div
         className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-        style={{ backgroundColor: color }}
+        style={{ backgroundColor: darkerRibbon(color) }}
         aria-hidden
       />
       <div
@@ -119,14 +136,13 @@ export function EventChip({
           'h-full min-w-0 pl-2 pr-1',
           compact ? 'flex items-center gap-1 py-0' : 'py-px',
         )}
-        style={{ backgroundColor: hexToRgba(color, fillAlpha) }}
       >
         {compact ? (
           <>
             <span className="truncate text-[11px] font-medium leading-[13px]">
               {event.title}
             </span>
-            <span className="shrink-0 text-[9px] leading-[11px] text-muted-foreground">
+            <span className="shrink-0 text-[9px] leading-[11px] opacity-80">
               {timeLabel}
             </span>
           </>
@@ -135,7 +151,7 @@ export function EventChip({
             <div className="truncate text-[11px] font-medium leading-[13px]">
               {event.title}
             </div>
-            <div className="mt-0.5 truncate text-[9px] leading-[11px] text-muted-foreground">
+            <div className="mt-0.5 truncate text-[9px] leading-[11px] opacity-80">
               {timeLabel}
             </div>
           </>

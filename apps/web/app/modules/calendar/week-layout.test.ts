@@ -23,6 +23,8 @@ import {
   formatDayRangeTitle,
   formatWeekTitle,
   gutterWithRemainder,
+  contrastingInk,
+  hexLuminance,
   hexToRgba,
   hourHeight,
   isCompactChip,
@@ -467,6 +469,31 @@ test('hexToRgba: #2a5c8a @ 0.22', () => {
 
 test('hexToRgba: short #rgb expands', () => {
   assert.equal(hexToRgba('#f00', 0.5), 'rgba(255, 0, 0, 0.5)');
+});
+
+// ── hexLuminance / contrastingInk ───────────────────────────────────────
+
+test('hexLuminance: black ≈ 0, white ≈ 1', () => {
+  assert.ok(Math.abs(hexLuminance('#000000')) < 1e-9);
+  assert.ok(Math.abs(hexLuminance('#ffffff') - 1) < 1e-9);
+});
+
+test('hexLuminance: dark work-blue < 0.55', () => {
+  assert.ok(hexLuminance('#2a5c8a') < 0.55);
+});
+
+test('contrastingInk: dark fill → light ink', () => {
+  assert.equal(contrastingInk('#2a5c8a'), '#fafafa');
+});
+
+test('contrastingInk: light banana → dark ink', () => {
+  assert.equal(contrastingInk('#f6bf26'), '#1a1a1a');
+});
+
+test('contrastingInk: invalid hex still returns a string', () => {
+  const ink = contrastingInk('not-a-hex');
+  assert.equal(typeof ink, 'string');
+  assert.ok(ink.length > 0);
 });
 
 // ── isCompactChip ───────────────────────────────────────────────────────

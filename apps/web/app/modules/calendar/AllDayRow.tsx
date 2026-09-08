@@ -3,14 +3,31 @@ import {
   ALLDAY_CHIP,
   ALLDAY_GAP,
   ALLDAY_PAD,
+  contrastingInk,
   isWeekend,
   hexToRgba,
 } from './week-layout';
 import { cn } from '@/lib/utils';
 
-const CHIP_FILL_ALPHA = 0.22;
-const CHIP_FILL_ALPHA_SELECTED = 0.4;
 const PREVIEW_FILL_ALPHA = 0.18;
+
+/** Mix hex with black ~20% so the left ribbon still reads on a solid body. */
+function darkerRibbon(hex: string): string {
+  const h = hex.replace('#', '');
+  const full =
+    h.length === 3
+      ? h
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : h;
+  const n = parseInt(full, 16);
+  if (Number.isNaN(n)) return hex;
+  const r = Math.round(((n >> 16) & 255) * 0.8);
+  const g = Math.round(((n >> 8) & 255) * 0.8);
+  const b = Math.round((n & 255) * 0.8);
+  return `rgb(${r}, ${g}, ${b})`;
+}
 
 export interface AllDayChip {
   id: string;
@@ -125,9 +142,6 @@ export function AllDayRow({
           const top =
             (ALLDAY_CHIP + ALLDAY_GAP) * chip.lane + ALLDAY_PAD;
           const selected = chip.id === selectedEventId;
-          const fillAlpha = selected
-            ? CHIP_FILL_ALPHA_SELECTED
-            : CHIP_FILL_ALPHA;
 
           return (
             <div
@@ -145,7 +159,8 @@ export function AllDayRow({
                 height: ALLDAY_CHIP,
                 left: left + 1,
                 width: Math.max(0, width),
-                color: 'var(--foreground)',
+                backgroundColor: chip.color,
+                color: contrastingInk(chip.color),
               }}
               title={chip.title}
               onClick={(e) => {
@@ -164,18 +179,13 @@ export function AllDayRow({
                 e.stopPropagation();
               }}
             >
-              {/* 4px left ribbon */}
+              {/* 4px left ribbon — darker shade so it reads on solid fill */}
               <div
                 className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-                style={{ backgroundColor: chip.color }}
+                style={{ backgroundColor: darkerRibbon(chip.color) }}
                 aria-hidden
               />
-              <div
-                className="h-full pl-2 pr-1 py-px"
-                style={{
-                  backgroundColor: hexToRgba(chip.color, fillAlpha),
-                }}
-              >
+              <div className="h-full pl-2 pr-1 py-px">
                 <div className="truncate text-[11px] font-medium leading-[17px]">
                   {chip.title}
                 </div>

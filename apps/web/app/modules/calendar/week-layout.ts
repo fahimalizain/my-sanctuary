@@ -528,6 +528,45 @@ export function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+/** Parse `#rgb` / `#rrggbb` into 0..255 channels. Invalid → null. */
+function parseHexRgb(hex: string): { r: number; g: number; b: number } | null {
+  const h = hex.replace('#', '');
+  const full =
+    h.length === 3
+      ? h
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : h;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return null;
+  const n = parseInt(full, 16);
+  return {
+    r: (n >> 16) & 255,
+    g: (n >> 8) & 255,
+    b: n & 255,
+  };
+}
+
+/** sRGB channel 0..1 → linear contribution for relative luminance. */
+function srgbToLinear(c: number): number {
+  return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/** Relative luminance 0..1 (sRGB). Invalid hex → 0. */
+export function hexLuminance(hex: string): number {
+  const rgb = parseHexRgb(hex);
+  if (!rgb) return 0;
+  const R = srgbToLinear(rgb.r / 255);
+  const G = srgbToLinear(rgb.g / 255);
+  const B = srgbToLinear(rgb.b / 255);
+  return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+}
+
+/** Ink that contrasts with a solid fill: '#fafafa' if luminance < 0.55, else '#1a1a1a'. */
+export function contrastingInk(hex: string): string {
+  return hexLuminance(hex) < 0.55 ? '#fafafa' : '#1a1a1a';
+}
+
 // Notion chip chrome tokens used by isCompactChip.
 const CHIP_PAD_TOP = 1; // py-px
 const CHIP_PAD_BOTTOM = 1;
