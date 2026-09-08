@@ -134,6 +134,7 @@ test('movedRange: 60-min event dropped at Tue 14:00 → 14:00–15:00', () => {
   const originalStart = new Date(2024, 0, 1, 10, 0, 0, 0);
   const originalEnd = new Date(2024, 0, 1, 11, 0, 0, 0);
   const tue = localDay(2024, 0, 2);
+  // default grabOffsetMin = 0 places start at the slot
   const r = movedRange(originalStart, originalEnd, slot(tue, 14 * 60));
   assert.equal(r.start.getDate(), 2);
   assert.equal(r.start.getHours(), 14);
@@ -143,6 +144,21 @@ test('movedRange: 60-min event dropped at Tue 14:00 → 14:00–15:00', () => {
   assert.equal(r.end.getMinutes(), 0);
   // silence unused
   void mon;
+});
+
+test('movedRange: grab 15 min in, drop at 14:00 → 13:45–14:45', () => {
+  const originalStart = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const originalEnd = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const tue = localDay(2024, 0, 2);
+  const r = movedRange(originalStart, originalEnd, slot(tue, 14 * 60), 15);
+  assert.equal(r.start.getDate(), 2);
+  assert.equal(r.start.getHours(), 13);
+  assert.equal(r.start.getMinutes(), 45);
+  assert.equal(r.end.getDate(), 2);
+  assert.equal(r.end.getHours(), 14);
+  assert.equal(r.end.getMinutes(), 45);
+  const durMin = (r.end.getTime() - r.start.getTime()) / 60_000;
+  assert.equal(durMin, 60);
 });
 
 // ── resizedRange ────────────────────────────────────────────────────────

@@ -70,6 +70,8 @@ interface Session {
   eventId?: string;
   originalStart?: Date;
   originalEnd?: Date;
+  /** Minutes from painted chip start to pointer at pointerdown (move only). */
+  grabOffsetMin?: number;
   pointerId: number;
 }
 
@@ -113,7 +115,14 @@ function hitTestAllDay(clientX: number, clientY: number): DragSlot | null {
 }
 
 function computePreview(session: Session): TimedRange | null {
-  const { kind, originSlot, currentSlot, originalStart, originalEnd } = session;
+  const {
+    kind,
+    originSlot,
+    currentSlot,
+    originalStart,
+    originalEnd,
+    grabOffsetMin,
+  } = session;
   switch (kind) {
     case 'create':
       return rangeFromSlots(originSlot, currentSlot, 'timed');
@@ -121,7 +130,12 @@ function computePreview(session: Session): TimedRange | null {
       return rangeFromSlots(originSlot, currentSlot, 'allday');
     case 'move':
       if (!originalStart || !originalEnd) return null;
-      return movedRange(originalStart, originalEnd, currentSlot);
+      return movedRange(
+        originalStart,
+        originalEnd,
+        currentSlot,
+        grabOffsetMin ?? 0,
+      );
     case 'resize-start':
       if (!originalStart || !originalEnd) return null;
       return resizedRange(originalStart, originalEnd, 'start', currentSlot);
@@ -343,6 +357,16 @@ export function useCalendarDrag(
       if (edge === 'start') kind = 'resize-start';
       else if (edge === 'end') kind = 'resize-end';
 
+      // Grab offset from the painted (possibly clamped overnight) chip start,
+      // not the absolute event start — keeps the hold point under the pointer.
+      let grabOffsetMin = 0;
+      if (kind === 'move') {
+        const startMinOnCol = Number(chipEl.dataset.startMin);
+        if (Number.isFinite(startMinOnCol)) {
+          grabOffsetMin = originSlot.minutes - startMinOnCol;
+        }
+      }
+
       beginSession(
         {
           kind,
@@ -353,6 +377,7 @@ export function useCalendarDrag(
           eventId: event.id,
           originalStart,
           originalEnd,
+          grabOffsetMin: kind === 'move' ? grabOffsetMin : undefined,
           pointerId: e.pointerId,
         },
         chipEl,

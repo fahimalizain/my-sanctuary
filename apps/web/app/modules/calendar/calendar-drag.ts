@@ -101,17 +101,26 @@ export function rangeFromSlots(
   return { start, end };
 }
 
-/** Move: keep duration, place start at the snapped slot. */
+/**
+ * Move: keep duration, place start so the grab point stays under the pointer.
+ * `grabOffsetMin` is minutes from the (painted) event start to the pointer at
+ * pointerdown; default 0 places start at the slot (legacy / no-offset callers).
+ */
 export function movedRange(
   originalStart: Date,
   originalEnd: Date,
   slot: DragSlot,
+  grabOffsetMin = 0,
 ): TimedRange {
   const durationMs = Math.max(
     0,
     originalEnd.getTime() - originalStart.getTime(),
   );
-  const start = slotInstant(slot);
+  const offset = Number.isFinite(grabOffsetMin) ? grabOffsetMin : 0;
+  const start = slotInstant({
+    day: slot.day,
+    minutes: slot.minutes - offset,
+  });
   return {
     start,
     end: new Date(start.getTime() + durationMs),
