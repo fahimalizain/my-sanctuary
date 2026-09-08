@@ -17,7 +17,7 @@
 use worker::*;
 
 use api_core::repo::{CalendarRepo, WatchChannelRepo};
-use api_core::{models::NewEventInput, CalendarError, OAuthConfig};
+use api_core::{models::NewEventInput, models::PatchEventFields, CalendarError, OAuthConfig};
 
 /// 401 body for missing/invalid sessions and failed token refreshes.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -242,6 +242,134 @@ pub async fn create_event(
         Err(err) => {
             console_log!("calendar: create_event failed: {err}");
             json_error(&ctx, 500, "failed to create event")
+        }
+    }
+}
+
+/// `PATCH /api/calendar/events/:id` → 200 `{"event":{...},"source":"google"}`.
+///
+/// Body: `{start?, end?, summary?}` — at least one field required. Looks up
+/// the local event, verifies calendar ownership, then patches Google.
+pub async fn update_event(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
+        return json_error(&ctx, 404, "event not found");
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let tokens = crate::db::D1TokenRepo::new(d1()?);
+
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+        Ok(access) => access,
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            return unauthorized(&ctx);
+        }
+    };
+
+    let fields: PatchEventFields = match req.json().await {
+        Ok(fields) => fields,
+        Err(_) => return json_error(&ctx, 400, "invalid body"),
+    };
+
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    match api_core::update_event_for_user(
+        &crate::http::WorkerHttp,
+        &calendars,
+        &events,
+        &access,
+        &user_id,
+        &id,
+        &fields,
+        now_unix,
+    )
+    .await
+    {
+        Ok(output) => {
+            if let Some(error) = &output.cache_error {
+                console_log!("calendar: cache upsert failed for patched event: {error}");
+            }
+            let response = Response::from_json(&api_core::CreateEventResponse {
+                event: output.event,
+                source: output.source,
+            })?;
+            Ok(response
+                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
+        Err(CalendarError::GoogleNotFound) => {
+            json_error(&ctx, 502, "google returned 404 for events.patch")
+        }
+        Err(err) => {
+            console_log!("calendar: update_event failed: {err}");
+            json_error(&ctx, 500, "failed to update event")
+        }
+    }
+}
+
+/// `DELETE /api/calendar/events/:id` → 200 `{"success":true}`.
+///
+/// Cancels the event on Google (`status: cancelled`) and soft-deletes the
+/// local cache row. Ownership is checked via the parent calendar.
+pub async fn delete_event(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
+        return json_error(&ctx, 404, "event not found");
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let tokens = crate::db::D1TokenRepo::new(d1()?);
+
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+        Ok(access) => access,
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            return unauthorized(&ctx);
+        }
+    };
+
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    match api_core::delete_event_for_user(
+        &crate::http::WorkerHttp,
+        &calendars,
+        &events,
+        &access,
+        &user_id,
+        &id,
+        now_unix,
+    )
+    .await
+    {
+        Ok(()) => {
+            let response = Response::from_json(&api_core::DeleteEventResponse { success: true })?;
+            Ok(response
+                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
+        Err(CalendarError::GoogleNotFound) => {
+            json_error(&ctx, 502, "google returned 404 for events.patch")
+        }
+        Err(err) => {
+            console_log!("calendar: delete_event failed: {err}");
+            json_error(&ctx, 500, "failed to delete event")
         }
     }
 }

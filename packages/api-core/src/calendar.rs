@@ -51,7 +51,7 @@ use crate::config::OAuthConfig;
 use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
     CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput, NewWatchChannel,
-    WatchChannel,
+    PatchEventFields, WatchChannel,
 };
 use crate::oauth::{HttpClient, HttpError};
 use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, WatchChannelRepo};
@@ -138,11 +138,18 @@ pub struct CalendarEventsResponse {
     pub source: String,
 }
 
-/// Response envelope for `POST /api/calendar/events`.
+/// Response envelope for `POST /api/calendar/events` and
+/// `PATCH /api/calendar/events/:id`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CreateEventResponse {
     pub event: CalendarEvent,
     pub source: String,
+}
+
+/// Response envelope for `DELETE /api/calendar/events/:id`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeleteEventResponse {
+    pub success: bool,
 }
 
 /// Public picker row for `GET /api/calendar/calendars`.
@@ -496,21 +503,41 @@ pub async fn create_event(
     })
 }
 
-/// Patches an event's `end` on Google (`events.patch`) and upserts the
-/// returned row into the local cache — the task timer's stop/pause path.
-/// Google echoes the stored `extendedProperties` back, so the upsert
-/// preserves the `sanctuary_task_id` link. Cache failures are logged
+/// Patches selected fields on Google (`events.patch`) and upserts the
+/// returned row into the local cache. Builds a minimal JSON body from
+/// whichever of `start` / `end` / `summary` are `Some`. Empty (all `None`)
+/// → [`CalendarError::Invalid`]. Cache failures are logged
 /// ([`CreateEventOutput::cache_error`]), never fatal.
-pub async fn patch_event(
+pub async fn patch_event_fields(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
     access: &GoogleAccess,
     calendar_id: &str,
     google_event_id: &str,
-    end_rfc3339: &str,
+    fields: &PatchEventFields,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
+    let mut payload = serde_json::Map::new();
+    if let Some(start) = fields.start.as_ref() {
+        payload.insert(
+            "start".to_string(),
+            serde_json::json!({ "dateTime": start }),
+        );
+    }
+    if let Some(end) = fields.end.as_ref() {
+        payload.insert(
+            "end".to_string(),
+            serde_json::json!({ "dateTime": end }),
+        );
+    }
+    if let Some(summary) = fields.summary.as_ref() {
+        payload.insert("summary".to_string(), serde_json::json!(summary));
+    }
+    if payload.is_empty() {
+        return Err(CalendarError::Invalid("empty patch".to_string()));
+    }
+
     let Some(cal) = calendars.get_by_id(calendar_id).await? else {
         return Err(CalendarError::NotFound);
     };
@@ -520,11 +547,8 @@ pub async fn patch_event(
         encode_path_segment(&cal.google_calendar_id),
         encode_path_segment(google_event_id)
     );
-    let payload = serde_json::json!({
-        "end": { "dateTime": end_rfc3339 },
-    });
-    let body =
-        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
+    let body = serde_json::to_vec(&serde_json::Value::Object(payload))
+        .map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
     let (status, response) = http.patch_json(&url, &access.access_token, &body).await?;
     if !(200..300).contains(&status) {
         return Err(CalendarError::GoogleApi(format!(
@@ -554,13 +578,37 @@ pub async fn patch_event(
     })
 }
 
-/// Patches an event's `summary` on Google (`events.patch`) and upserts the
-/// returned row into the local cache — the occurrence title PATCH's Google
-/// write (slice 6): when an occurrence override changes after a chip exists,
-/// the one-shot log's `summary` follows the **resolved** title. Google echoes
-/// the stored `extendedProperties` back, so the upsert preserves the
-/// `sanctuary_routine_id`/`sanctuary_occurrence_id` link. Cache failures are
-/// logged ([`CreateEventOutput::cache_error`]), never fatal.
+/// Patches an event's `end` on Google — the task timer's stop/pause path.
+/// Thin wrapper around [`patch_event_fields`].
+pub async fn patch_event(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+    google_event_id: &str,
+    end_rfc3339: &str,
+    now_unix: i64,
+) -> Result<CreateEventOutput, CalendarError> {
+    patch_event_fields(
+        http,
+        calendars,
+        events,
+        access,
+        calendar_id,
+        google_event_id,
+        &PatchEventFields {
+            start: None,
+            end: Some(end_rfc3339.to_string()),
+            summary: None,
+        },
+        now_unix,
+    )
+    .await
+}
+
+/// Patches an event's `summary` on Google — the occurrence title PATCH's
+/// Google write (slice 6). Thin wrapper around [`patch_event_fields`].
 pub async fn patch_event_summary(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -571,6 +619,64 @@ pub async fn patch_event_summary(
     summary: &str,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
+    patch_event_fields(
+        http,
+        calendars,
+        events,
+        access,
+        calendar_id,
+        google_event_id,
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: Some(summary.to_string()),
+        },
+        now_unix,
+    )
+    .await
+}
+
+/// Looks up a local event by id, verifies the owning calendar belongs to
+/// `user_id`, then patches via [`patch_event_fields`]. Wrong owner / missing
+/// → [`CalendarError::NotFound`] (no Google call).
+pub async fn update_event_for_user(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    event_id: &str,
+    fields: &PatchEventFields,
+    now_unix: i64,
+) -> Result<CreateEventOutput, CalendarError> {
+    let (cal, event) = lookup_owned_event(calendars, events, user_id, event_id).await?;
+    patch_event_fields(
+        http,
+        calendars,
+        events,
+        access,
+        &cal.id,
+        &event.google_event_id,
+        fields,
+        now_unix,
+    )
+    .await
+}
+
+/// Cancels an event on Google (`events.patch` with `status: "cancelled"`)
+/// and soft-deletes the local cache row. Google 404/410 still soft-deletes
+/// locally (already gone). Does **not** use HTTP DELETE — reuses
+/// [`HttpClient::patch_json`] so fakes across tasks/agenda stay unchanged.
+pub async fn delete_event(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+    google_event_id: &str,
+    local_id: &str,
+    now_unix: i64,
+) -> Result<(), CalendarError> {
     let Some(cal) = calendars.get_by_id(calendar_id).await? else {
         return Err(CalendarError::NotFound);
     };
@@ -580,38 +686,65 @@ pub async fn patch_event_summary(
         encode_path_segment(&cal.google_calendar_id),
         encode_path_segment(google_event_id)
     );
-    let payload = serde_json::json!({
-        "summary": summary,
-    });
+    let payload = serde_json::json!({ "status": "cancelled" });
     let body =
         serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
-    let (status, response) = http.patch_json(&url, &access.access_token, &body).await?;
-    if !(200..300).contains(&status) {
+    let (status, _response) = http.patch_json(&url, &access.access_token, &body).await?;
+    // 404/410 = already gone on Google; still soft-delete locally.
+    if status != 404 && status != 410 && !(200..300).contains(&status) {
         return Err(CalendarError::GoogleApi(format!(
-            "google events.patch returned {status}"
+            "google events.patch (cancel) returned {status}"
         )));
     }
-    let patched: GoogleEvent = serde_json::from_slice(&response)
-        .map_err(|err| CalendarError::InvalidResponse(format!("events.patch body: {err}")))?;
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let new_event = map_google_event(&patched, &cal.id, &now_rfc3339);
-    let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
-        Ok(id) => id,
-        Err(err) => {
-            return Ok(CreateEventOutput {
-                event: row_from_new_event(new_event, "".to_string(), &now_rfc3339),
-                source: "google".to_string(),
-                cache_error: Some(err.to_string()),
-            });
-        }
-    };
+    events.delete(local_id, &now_rfc3339).await?;
+    Ok(())
+}
 
-    Ok(CreateEventOutput {
-        event: row_from_new_event(new_event, id, &now_rfc3339),
-        source: "google".to_string(),
-        cache_error: None,
-    })
+/// Looks up a local event by id, verifies ownership, then cancels via
+/// [`delete_event`]. Wrong owner / missing → [`CalendarError::NotFound`].
+pub async fn delete_event_for_user(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    event_id: &str,
+    now_unix: i64,
+) -> Result<(), CalendarError> {
+    let (cal, event) = lookup_owned_event(calendars, events, user_id, event_id).await?;
+    delete_event(
+        http,
+        calendars,
+        events,
+        access,
+        &cal.id,
+        &event.google_event_id,
+        &event.id,
+        now_unix,
+    )
+    .await
+}
+
+/// Resolve `(calendar, event)` for a local event id owned by `user_id`.
+/// Missing event, missing calendar, or wrong owner → NotFound (no leak).
+async fn lookup_owned_event(
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    user_id: &str,
+    event_id: &str,
+) -> Result<(GoogleCalendar, CalendarEvent), CalendarError> {
+    let Some(event) = events.get_by_id(event_id).await? else {
+        return Err(CalendarError::NotFound);
+    };
+    let Some(cal) = calendars.get_by_id(&event.calendar_id).await? else {
+        return Err(CalendarError::NotFound);
+    };
+    if cal.user_id != user_id {
+        return Err(CalendarError::NotFound);
+    }
+    Ok((cal, event))
 }
 
 /// Lists the user's imported calendars for the picker
@@ -1875,6 +2008,7 @@ mod tests {
         upserted_batch: Mutex<Vec<NewCalendarEvent>>,
         upserted_single: Mutex<Option<(String, NewCalendarEvent)>>,
         ranged: Mutex<Vec<(String, String, String)>>,
+        deleted: Mutex<Vec<(String, String)>>,
         deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
         fail_upsert: Mutex<bool>,
         fail_delete: Mutex<bool>,
@@ -1888,6 +2022,7 @@ mod tests {
                 upserted_batch: Mutex::new(Vec::new()),
                 upserted_single: Mutex::new(None),
                 ranged: Mutex::new(Vec::new()),
+                deleted: Mutex::new(Vec::new()),
                 deleted_by_google_event_id: Mutex::new(Vec::new()),
                 fail_upsert: Mutex::new(false),
                 fail_delete: Mutex::new(false),
@@ -1934,8 +2069,14 @@ mod tests {
             Ok(())
         }
 
-        async fn get_by_id(&self, _id: &str) -> Result<Option<CalendarEvent>, RepoError> {
-            Ok(None)
+        async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| event.deleted_at.is_none() && event.id == id)
+                .cloned())
         }
 
         async fn get_by_calendar_and_google_id(
@@ -1991,7 +2132,18 @@ mod tests {
                 .collect())
         }
 
-        async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+        async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+            self.deleted
+                .lock()
+                .unwrap()
+                .push((id.to_string(), now_rfc3339.to_string()));
+            if *self.fail_delete.lock().unwrap() {
+                return Err(RepoError::Backend("cache delete failed".into()));
+            }
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(event) = stored.iter_mut().find(|event| event.id == id) {
+                event.deleted_at = Some(now_rfc3339.to_string());
+            }
             Ok(())
         }
 
@@ -4336,5 +4488,283 @@ mod tests {
             "{:?}",
             output.cache_error
         );
+    }
+
+    // ──────────────────────────────────────────
+    // patch_event_fields
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn patch_fields_start_only_payload() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/google-evt-created",
+            200,
+            PATCHED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        pollster::block_on(patch_event_fields(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "cal-1",
+            "google-evt-created",
+            &PatchEventFields {
+                start: Some("2026-08-19T09:00:00Z".to_string()),
+                end: None,
+                summary: None,
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
+        assert!(body.get("end").is_none(), "{body}");
+        assert!(body.get("summary").is_none(), "{body}");
+    }
+
+    #[test]
+    fn patch_fields_start_end_summary_payload() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/google-evt-created",
+            200,
+            PATCHED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        pollster::block_on(patch_event_fields(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "cal-1",
+            "google-evt-created",
+            &PatchEventFields {
+                start: Some("2026-08-19T09:00:00Z".to_string()),
+                end: Some("2026-08-19T11:00:00Z".to_string()),
+                summary: Some("Renamed".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
+        assert_eq!(body["end"]["dateTime"], "2026-08-19T11:00:00Z");
+        assert_eq!(body["summary"], "Renamed");
+    }
+
+    #[test]
+    fn patch_fields_all_none_is_invalid() {
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(patch_event_fields(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "cal-1",
+            "google-evt-created",
+            &PatchEventFields::default(),
+            NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CalendarError::Invalid(ref m) if m.contains("empty patch")),
+            "got {err:?}"
+        );
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+    }
+
+    // ──────────────────────────────────────────
+    // delete_event / update_event_for_user
+    // ──────────────────────────────────────────
+
+    fn living_event(id: &str, calendar_id: &str, google_event_id: &str) -> CalendarEvent {
+        CalendarEvent {
+            id: id.to_string(),
+            calendar_id: calendar_id.to_string(),
+            google_event_id: google_event_id.to_string(),
+            google_etag: "e1".to_string(),
+            google_updated_at: "2026-08-17T12:00:00Z".to_string(),
+            last_synced_at: "2026-08-17T12:00:00Z".to_string(),
+            title: "Meeting".to_string(),
+            description: String::new(),
+            start_time: "2026-08-19T09:00:00Z".to_string(),
+            end_time: "2026-08-19T10:00:00Z".to_string(),
+            recurrence: String::new(),
+            task_id: String::new(),
+            created_at: "2026-08-17T12:00:00Z".to_string(),
+            updated_at: "2026-08-17T12:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn delete_event_sends_cancelled_and_soft_deletes_cache() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-evt-1",
+            200,
+            r#"{"id":"g-evt-1","status":"cancelled"}"#,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(living_event("local-1", "cal-1", "g-evt-1"));
+
+        pollster::block_on(delete_event(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "cal-1",
+            "g-evt-1",
+            "local-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+        assert_eq!(body["status"], "cancelled");
+        assert!(body.get("end").is_none());
+
+        let deleted = events.deleted.lock().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].0, "local-1");
+    }
+
+    #[test]
+    fn delete_event_google_404_still_soft_deletes_locally() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-evt-1",
+            404,
+            r#"{"error":"notFound"}"#,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        pollster::block_on(delete_event(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "cal-1",
+            "g-evt-1",
+            "local-1",
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(events.deleted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_event_for_user_wrong_owner_is_not_found() {
+        let http = FakeHttp::new(vec![]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar_for_user("other-user", "cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(living_event("local-1", "cal-1", "g-evt-1"));
+
+        let err = pollster::block_on(update_event_for_user(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "u-1",
+            "local-1",
+            &PatchEventFields {
+                start: None,
+                end: None,
+                summary: Some("Nope".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+    }
+
+    #[test]
+    fn delete_event_for_user_wrong_owner_is_not_found() {
+        let http = FakeHttp::new(vec![]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar_for_user("other-user", "cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(living_event("local-1", "cal-1", "g-evt-1"));
+
+        let err = pollster::block_on(delete_event_for_user(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "u-1",
+            "local-1",
+            NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+        assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+        assert!(events.deleted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_event_for_user_patches_owned_event() {
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events/g-evt-1",
+            200,
+            PATCHED_JSON,
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(living_event("local-1", "cal-1", "g-evt-1"));
+
+        let output = pollster::block_on(update_event_for_user(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            "u-1",
+            "local-1",
+            &PatchEventFields {
+                start: None,
+                end: None,
+                summary: Some("Renamed".to_string()),
+            },
+            NOW_UNIX,
+        ))
+        .unwrap();
+
+        assert_eq!(output.event.google_event_id, "google-evt-created");
+        let body: serde_json::Value =
+            serde_json::from_str(&http.patches.lock().unwrap()[0].1).unwrap();
+        assert_eq!(body["summary"], "Renamed");
     }
 }

@@ -21,6 +21,10 @@ export const CHIP_MIN_H = 18;
 export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
+/** Snap click-to-create / drag start times to this many minutes. */
+export const SNAP_MINUTES = 15;
+/** Default duration for a click-created event. */
+export const DEFAULT_EVENT_DURATION_MIN = 30;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -687,4 +691,58 @@ export function lastOccupiedCivilDate(start: Date, end: Date): Date {
 /** Local midnight of the civil date containing `date`. */
 export function startOfDay(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+// ── Click-to-create geometry ────────────────────────────────────────────
+
+/**
+ * Snap minutes-since-midnight to the nearest `SNAP_MINUTES` boundary.
+ * Clamped to `[0, 1440]`; 1440 stays 1440 (end-of-day sentinel).
+ */
+export function snapMinutes(min: number): number {
+  if (!Number.isFinite(min) || min <= 0) return 0;
+  if (min >= MINUTES_PER_DAY) return MINUTES_PER_DAY;
+  return Math.round(min / SNAP_MINUTES) * SNAP_MINUTES;
+}
+
+/** Convert a Y offset (px) within the hours area to minutes since midnight. */
+export function minutesFromY(yPx: number, hourH: number): number {
+  if (!Number.isFinite(yPx) || !Number.isFinite(hourH) || hourH <= 0) {
+    return 0;
+  }
+  return (yPx / hourH) * 60;
+}
+
+/**
+ * Local Date for a civil `day` at `minutes` since midnight.
+ * Minutes may be fractional; seconds/ms are zeroed via the Date constructor.
+ */
+export function dateOnDay(day: Date, minutes: number): Date {
+  const origin = startOfDay(day);
+  const total = Number.isFinite(minutes) ? minutes : 0;
+  const h = Math.floor(total / 60);
+  const m = Math.floor(total - h * 60);
+  return new Date(
+    origin.getFullYear(),
+    origin.getMonth(),
+    origin.getDate(),
+    h,
+    m,
+    0,
+    0,
+  );
+}
+
+/**
+ * Prefer the primary calendar when the user can write to it; otherwise the
+ * first owner/writer. Readers and freeBusyReader are never returned.
+ */
+export function defaultWritableCalendar<
+  T extends { is_primary: boolean; access_role: string },
+>(calendars: T[]): T | undefined {
+  const writable = calendars.filter(
+    (c) => c.access_role === 'owner' || c.access_role === 'writer',
+  );
+  if (writable.length === 0) return undefined;
+  return writable.find((c) => c.is_primary) ?? writable[0];
 }

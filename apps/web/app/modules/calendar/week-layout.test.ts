@@ -40,6 +40,10 @@ import {
   stripDayCount,
   visibleStartIndex,
   weekRangeIso,
+  snapMinutes,
+  minutesFromY,
+  dateOnDay,
+  defaultWritableCalendar,
 } from './week-layout';
 
 // ── startOfWeek ─────────────────────────────────────────────────────────
@@ -475,4 +479,91 @@ test('isCompactChip: Notion threshold (inner < timeLine + timeMarginTop)', () =>
   assert.equal(isCompactChip(29), false);
   assert.equal(isCompactChip(CHIP_MIN_H), true); // 18
   assert.equal(isCompactChip(48), false);
+});
+
+// ── snapMinutes / minutesFromY / dateOnDay ──────────────────────────────
+
+test('snapMinutes: nearest 15, clamp 0..1440', () => {
+  assert.equal(snapMinutes(7), 0);
+  assert.equal(snapMinutes(8), 15);
+  assert.equal(snapMinutes(22), 15);
+  assert.equal(snapMinutes(23), 30);
+  assert.equal(snapMinutes(1440), 1440);
+  assert.equal(snapMinutes(-5), 0);
+  assert.equal(snapMinutes(0), 0);
+  assert.equal(snapMinutes(15), 15);
+});
+
+test('minutesFromY: 88px at hourH=88 → 60', () => {
+  assert.equal(minutesFromY(88, 88), 60);
+  assert.equal(minutesFromY(0, 88), 0);
+  assert.equal(minutesFromY(44, 88), 30);
+});
+
+test('dateOnDay: 9:00 on a known local date', () => {
+  const day = new Date(2026, 8, 8); // Tue Sep 8 local midnight-ish
+  const at9 = dateOnDay(day, 9 * 60);
+  assert.equal(at9.getFullYear(), 2026);
+  assert.equal(at9.getMonth(), 8);
+  assert.equal(at9.getDate(), 8);
+  assert.equal(at9.getHours(), 9);
+  assert.equal(at9.getMinutes(), 0);
+  assert.equal(at9.getSeconds(), 0);
+});
+
+// ── defaultWritableCalendar ─────────────────────────────────────────────
+
+test('defaultWritableCalendar: prefers primary writer; skips reader', () => {
+  const calendars = [
+    {
+      id: 'r1',
+      is_primary: false,
+      access_role: 'reader',
+      summary: 'Shared',
+    },
+    {
+      id: 'w1',
+      is_primary: false,
+      access_role: 'writer',
+      summary: 'Work',
+    },
+    {
+      id: 'p1',
+      is_primary: true,
+      access_role: 'owner',
+      summary: 'Primary',
+    },
+  ];
+  const pick = defaultWritableCalendar(calendars);
+  assert.ok(pick);
+  assert.equal(pick!.id, 'p1');
+});
+
+test('defaultWritableCalendar: falls back to first writer when primary is reader', () => {
+  const calendars = [
+    {
+      id: 'p-ro',
+      is_primary: true,
+      access_role: 'reader',
+      summary: 'Primary RO',
+    },
+    {
+      id: 'w1',
+      is_primary: false,
+      access_role: 'writer',
+      summary: 'Work',
+    },
+  ];
+  const pick = defaultWritableCalendar(calendars);
+  assert.ok(pick);
+  assert.equal(pick!.id, 'w1');
+});
+
+test('defaultWritableCalendar: undefined when only readers', () => {
+  assert.equal(
+    defaultWritableCalendar([
+      { id: 'r1', is_primary: true, access_role: 'reader', summary: 'RO' },
+    ]),
+    undefined,
+  );
 });

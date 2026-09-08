@@ -5,21 +5,28 @@ import {
   useMemo,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import { ChevronLeft, ChevronRight, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   useCalendarEventsQuery,
   useCalendarsQuery,
+  useCreateCalendarEvent,
+  useDeleteCalendarEvent,
+  useUpdateCalendarEvent,
 } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { AllDayRow, type AllDayChip } from './AllDayRow';
 import { CalendarSidebar } from './CalendarSidebar';
+import { EventInspector } from './EventInspector';
 import {
   CHIP_MARGIN_RIGHT,
   COL_HEADER_H,
   DAYS_PER_PERIOD,
+  DEFAULT_EVENT_DURATION_MIN,
+  MINUTES_PER_DAY,
   STRIP_OVERSCAN,
   WEEK_DAYS,
   addDays,
@@ -27,6 +34,8 @@ import {
   clampMinutesToDay,
   colWidth as computeColWidth,
   colorForCalendar,
+  dateOnDay,
+  defaultWritableCalendar,
   eventHeightPx,
   eventTopPx,
   formatDayRangeTitle,
@@ -41,6 +50,7 @@ import {
   isSameDay,
   isWeekend,
   lastOccupiedCivilDate,
+  minutesFromY,
   nowLineY,
   packAllDayLanes,
   packDayEvents,
@@ -48,6 +58,7 @@ import {
   scrollLeftForIndex,
   shiftWindowStart,
   shouldRebase,
+  snapMinutes,
   startOfDay,
   startOfWeek,
   stripDayCount,
@@ -56,12 +67,45 @@ import {
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
 const CHIP_FILL_ALPHA = 0.22;
+const CHIP_FILL_ALPHA_SELECTED = 0.4;
 
 /** Mon-based short name for a local date (WEEK_DAYS is Mon→Sun). */
 function dayNameShort(date: Date): string {
   const jsDay = date.getDay(); // 0 = Sun … 6 = Sat
   const monIndex = jsDay === 0 ? 6 : jsDay - 1;
   return WEEK_DAYS[monIndex];
+}
+
+/**
+ * Click-to-create payload from a day-column click. Returns null when the
+ * click originated on an event chip (those select, they don't create).
+ */
+function clickCreateTimes(
+  e: ReactMouseEvent<HTMLElement>,
+  day: Date,
+  hourH: number,
+): { start: Date; end: Date } | null {
+  const target = e.target as HTMLElement | null;
+  if (target?.closest('.event-chip')) return null;
+
+  const col = e.currentTarget;
+  const y = e.clientY - col.getBoundingClientRect().top;
+  const startMin = snapMinutes(minutesFromY(y, hourH));
+  // Keep a full default duration inside the day when possible.
+  const endMin = Math.min(MINUTES_PER_DAY, startMin + DEFAULT_EVENT_DURATION_MIN);
+  // If snapped to end-of-day, back up so we still get a 30-min slot.
+  const adjustedStart =
+    endMin - startMin < DEFAULT_EVENT_DURATION_MIN && startMin > 0
+      ? Math.max(0, MINUTES_PER_DAY - DEFAULT_EVENT_DURATION_MIN)
+      : startMin;
+  const adjustedEnd = Math.min(
+    MINUTES_PER_DAY,
+    adjustedStart + DEFAULT_EVENT_DURATION_MIN,
+  );
+  return {
+    start: dateOnDay(day, adjustedStart),
+    end: dateOnDay(day, adjustedEnd),
+  };
 }
 
 interface PositionedEvent {
@@ -78,9 +122,11 @@ interface PositionedEvent {
 
 interface EventChipProps {
   positioned: PositionedEvent;
+  selected: boolean;
+  onSelect: (eventId: string) => void;
 }
 
-function EventChip({ positioned }: EventChipProps) {
+function EventChip({ positioned, selected, onSelect }: EventChipProps) {
   const { event, top, height, col, cols, span, color, startMin, endMin } =
     positioned;
   const start = new Date(event.start_time);
@@ -91,10 +137,16 @@ function EventChip({ positioned }: EventChipProps) {
 
   const leftPct = (col / cols) * 100;
   const widthPct = (span / cols) * 100;
+  const fillAlpha = selected ? CHIP_FILL_ALPHA_SELECTED : CHIP_FILL_ALPHA;
 
   return (
     <div
-      className="absolute overflow-hidden rounded-[6px] pointer-events-auto"
+      role="button"
+      tabIndex={0}
+      className={cn(
+        'event-chip absolute overflow-hidden rounded-[6px] pointer-events-auto cursor-pointer',
+        selected && 'ring-1 ring-foreground/25',
+      )}
       style={{
         top,
         height,
@@ -103,8 +155,21 @@ function EventChip({ positioned }: EventChipProps) {
         color: 'var(--foreground)',
       }}
       title={`${event.title} · ${rangeLabel}`}
+      data-event-chip
+      data-event-id={event.id}
       data-start-min={startMin}
       data-end-min={endMin}
+      onClick={(e) => {
+        e.stopPropagation();
+        onSelect(event.id);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          e.stopPropagation();
+          onSelect(event.id);
+        }
+      }}
     >
       {/* 4px left ribbon (not a border) */}
       <div
@@ -117,7 +182,7 @@ function EventChip({ positioned }: EventChipProps) {
           'h-full min-w-0 pl-2 pr-1',
           compact ? 'flex items-center gap-1 py-0' : 'py-px',
         )}
-        style={{ backgroundColor: hexToRgba(color, CHIP_FILL_ALPHA) }}
+        style={{ backgroundColor: hexToRgba(color, fillAlpha) }}
       >
         {compact ? (
           <>
@@ -191,12 +256,99 @@ export function CalendarPage() {
   // calendar (empty Set = show none). Flipped once calendars first arrive.
   const [selectionReady, setSelectionReady] = useState(false);
 
+  // Event inspector selection (chip click or after click-to-create).
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  // Focus title only right after click-to-create, not on every chip select.
+  const [focusTitleOnOpen, setFocusTitleOnOpen] = useState(false);
+  // Hold the just-created event until the list query includes it (inspector
+  // opens immediately; chip appears after invalidate).
+  const [pendingEvent, setPendingEvent] = useState<CalendarEvent | null>(null);
+
+  const createEvent = useCreateCalendarEvent();
+  const updateEvent = useUpdateCalendarEvent();
+  const deleteEvent = useDeleteCalendarEvent();
+
+  const writableCalendar = useMemo(
+    () => defaultWritableCalendar(calendars),
+    [calendars],
+  );
+
   // Default: select every calendar once the list first arrives.
   useEffect(() => {
     if (calendars.length === 0 || selectionReady) return;
     setSelectedCalendarIds(new Set(calendars.map((c) => c.id)));
     setSelectionReady(true);
   }, [calendars, selectionReady]);
+
+  const selectedEvent = useMemo(() => {
+    if (!selectedEventId) return null;
+    const fromList = events.find((e) => e.id === selectedEventId);
+    if (fromList) return fromList;
+    if (pendingEvent?.id === selectedEventId) return pendingEvent;
+    return null;
+  }, [events, selectedEventId, pendingEvent]);
+
+  // Clear pending once the list catches up.
+  useEffect(() => {
+    if (
+      pendingEvent &&
+      events.some((e) => e.id === pendingEvent.id)
+    ) {
+      setPendingEvent(null);
+    }
+  }, [events, pendingEvent]);
+
+  // Drop selection if the event disappeared (deleted / filtered out of cache).
+  useEffect(() => {
+    if (
+      selectedEventId &&
+      !selectedEvent &&
+      !pendingEvent &&
+      !eventsQuery.isFetching
+    ) {
+      setSelectedEventId(null);
+      setFocusTitleOnOpen(false);
+    }
+  }, [
+    selectedEventId,
+    selectedEvent,
+    pendingEvent,
+    eventsQuery.isFetching,
+  ]);
+
+  const selectedEventCalendar = useMemo(() => {
+    if (!selectedEvent) return undefined;
+    return calendars.find((c) => c.id === selectedEvent.calendar_id);
+  }, [calendars, selectedEvent]);
+
+  const closeInspector = useCallback(() => {
+    setSelectedEventId(null);
+    setFocusTitleOnOpen(false);
+    setPendingEvent(null);
+  }, []);
+
+  const selectEvent = useCallback((eventId: string) => {
+    setSelectedEventId(eventId);
+    setFocusTitleOnOpen(false);
+    setPendingEvent(null);
+  }, []);
+
+  const handleSaveTitle = useCallback(
+    async (summary: string) => {
+      if (!selectedEventId) return;
+      await updateEvent.mutateAsync({
+        id: selectedEventId,
+        input: { summary },
+      });
+    },
+    [selectedEventId, updateEvent],
+  );
+
+  const handleDeleteEvent = useCallback(async () => {
+    if (!selectedEventId) return;
+    await deleteEvent.mutateAsync(selectedEventId);
+    closeInspector();
+  }, [selectedEventId, deleteEvent, closeInspector]);
 
   const knownCalendarIds = useMemo(
     () => new Set(calendars.map((c) => c.id)),
@@ -217,14 +369,28 @@ export function CalendarPage() {
 
   // Events whose calendar is selected, plus stale calendar_ids not in the list.
   // Pre-init (!selectionReady) shows everything; after ready, empty Set = none.
+  // Merge a just-created pending event so the chip paints before invalidate.
   const visibleEvents = useMemo(() => {
-    return events.filter((e) => {
+    const base = events.filter((e) => {
       if (!selectionReady) return true;
       if (selectedCalendarIds.has(e.calendar_id)) return true;
       if (!knownCalendarIds.has(e.calendar_id)) return true;
       return false;
     });
-  }, [events, selectedCalendarIds, knownCalendarIds, selectionReady]);
+    if (
+      pendingEvent &&
+      !base.some((e) => e.id === pendingEvent.id)
+    ) {
+      return [...base, pendingEvent];
+    }
+    return base;
+  }, [
+    events,
+    selectedCalendarIds,
+    knownCalendarIds,
+    selectionReady,
+    pendingEvent,
+  ]);
 
   const { timedEvents, allDayEvents } = useMemo(() => {
     const timed: CalendarEvent[] = [];
@@ -389,6 +555,36 @@ export function CalendarPage() {
     [availableHoursPx],
   );
   const totalHoursH = hourH * 24;
+
+  const handleDayColumnClick = useCallback(
+    (e: ReactMouseEvent<HTMLElement>, day: Date) => {
+      const times = clickCreateTimes(e, day, hourH);
+      if (!times) return;
+
+      // Empty-slot click with no writable calendar: close inspector, no POST.
+      if (!writableCalendar) {
+        closeInspector();
+        return;
+      }
+
+      createEvent.mutate(
+        {
+          calendar_id: writableCalendar.id,
+          summary: 'New event',
+          start: times.start.toISOString(),
+          end: times.end.toISOString(),
+        },
+        {
+          onSuccess: (result) => {
+            setPendingEvent(result.event);
+            setSelectedEventId(result.event.id);
+            setFocusTitleOnOpen(true);
+          },
+        },
+      );
+    },
+    [hourH, writableCalendar, createEvent, closeInspector],
+  );
 
   // Tick "now" so the now-line creeps forward while the page is open.
   const [now, setNow] = useState(() => new Date());
@@ -651,8 +847,8 @@ export function CalendarPage() {
         </div>
       )}
 
-      {/* Body: sidebar + grid */}
-      <div className="flex-1 min-h-0 flex">
+      {/* Body: sidebar + grid + inspector */}
+      <div className="flex-1 min-h-0 flex relative">
         <CalendarSidebar
           weekStart={visibleStart}
           onGoToDate={goToDate}
@@ -669,7 +865,7 @@ export function CalendarPage() {
         {/* Grid column — always mounted so measure/scroll-to-now effects attach */}
         <div
           ref={gridColumnRef}
-          className="flex-1 min-h-0 flex flex-col relative"
+          className="flex-1 min-h-0 flex flex-col relative min-w-0"
         >
           <div
             ref={scrollerRef}
@@ -773,26 +969,32 @@ export function CalendarPage() {
                     <div
                       key={day.toISOString()}
                       className={cn(
-                        'relative shrink-0 border-r last:border-r-0',
+                        'relative shrink-0 border-r last:border-r-0 cursor-pointer',
                         weekend ? 'border-border/60' : 'border-border/40',
                         isTodayCol
                           ? 'bg-primary/[0.03]'
                           : weekend && 'bg-muted/40',
                       )}
                       style={{ width: colW, height: totalHoursH }}
+                      onClick={(e) => handleDayColumnClick(e, day)}
                     >
                       {/* Hour hairlines */}
                       {hourLabels.map((h) => (
                         <div
                           key={h}
-                          className="absolute left-0 right-0 border-t border-border/50"
+                          className="absolute left-0 right-0 border-t border-border/50 pointer-events-none"
                           style={{ top: h * hourH }}
                         />
                       ))}
 
                       {/* Event chips */}
                       {dayEvents.map((p) => (
-                        <EventChip key={p.event.id} positioned={p} />
+                        <EventChip
+                          key={p.event.id}
+                          positioned={p}
+                          selected={p.event.id === selectedEventId}
+                          onSelect={selectEvent}
+                        />
                       ))}
 
                       {/* Now line */}
@@ -845,6 +1047,19 @@ export function CalendarPage() {
             </div>
           )}
         </div>
+
+        {selectedEvent && (
+          <EventInspector
+            event={selectedEvent}
+            calendar={selectedEventCalendar}
+            focusTitle={focusTitleOnOpen}
+            onClose={closeInspector}
+            onSaveTitle={handleSaveTitle}
+            onDelete={handleDeleteEvent}
+            isSaving={updateEvent.isPending}
+            isDeleting={deleteEvent.isPending}
+          />
+        )}
       </div>
     </div>
   );

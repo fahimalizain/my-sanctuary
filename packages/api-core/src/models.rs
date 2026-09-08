@@ -794,6 +794,21 @@ pub struct NewWatchChannel {
     pub expiration: String,
 }
 
+/// Request body for `PATCH /api/calendar/events/:id`.
+/// At least one field must be `Some` (empty patch → 400).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct PatchEventFields {
+    /// RFC 3339 dateTime passed through to Google `start.dateTime`.
+    #[serde(default)]
+    pub start: Option<String>,
+    /// RFC 3339 dateTime passed through to Google `end.dateTime`.
+    #[serde(default)]
+    pub end: Option<String>,
+    /// Event title → Google `summary`.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
 /// Request body for `POST /api/calendar/events`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewEventInput {
