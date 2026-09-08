@@ -17,13 +17,19 @@ import {
 } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
-import { AllDayRow, type AllDayChip } from './AllDayRow';
+import { AllDayRow } from './AllDayRow';
 import {
   allDayPreviewIndices,
   timedPreviewSegments,
-  type DragSlot,
   type TimedRange,
 } from './calendar-drag';
+import {
+  buildAllDayChips,
+  buildEventsByDay,
+  clickCreateTimesFromSlot,
+  dayNameShort,
+  eventChipColor,
+} from './calendar-model';
 import { CalendarSidebar } from './CalendarSidebar';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
 import { type PositionedEvent } from './EventChip';
@@ -33,20 +39,12 @@ import { ViewSelector } from './ViewSelector';
 import {
   COL_HEADER_H,
   DAYS_PER_PERIOD,
-  DEFAULT_EVENT_DURATION_MIN,
-  MINUTES_PER_DAY,
   STRIP_OVERSCAN,
-  WEEK_DAYS,
   addDays,
-  allDaySectionHeight,
-  clampMinutesToDay,
   clampPeriodLength,
   colWidth as computeColWidth,
   colorForCalendar,
-  dateOnDay,
   defaultWritableCalendar,
-  eventHeightPx,
-  eventTopPx,
   fitPeriodStart,
   formatDayRangeTitle,
   formatHourLabel,
@@ -56,10 +54,7 @@ import {
   isMultiDay,
   isSameDay,
   isWeekend,
-  lastOccupiedCivilDate,
   nowLineY,
-  packAllDayLanes,
-  packDayEvents,
   rangeIso,
   scrollLeftForIndex,
   shiftWindowStart,
@@ -71,43 +66,6 @@ import {
 
 /** Stable empty list so DayColumn memo is not busted on empty days. */
 const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
-
-/** Mon-based short name for a local date (WEEK_DAYS is Mon→Sun). */
-function dayNameShort(date: Date): string {
-  const jsDay = date.getDay(); // 0 = Sun … 6 = Sat
-  const monIndex = jsDay === 0 ? 6 : jsDay - 1;
-  return WEEK_DAYS[monIndex];
-}
-
-/**
- * Click-to-create range from a snapped slot: default 30 min, kept inside the day.
- */
-function clickCreateTimesFromSlot(slot: DragSlot): TimedRange {
-  const startMin = slot.minutes;
-  const endMin = Math.min(
-    MINUTES_PER_DAY,
-    startMin + DEFAULT_EVENT_DURATION_MIN,
-  );
-  const adjustedStart =
-    endMin - startMin < DEFAULT_EVENT_DURATION_MIN && startMin > 0
-      ? Math.max(0, MINUTES_PER_DAY - DEFAULT_EVENT_DURATION_MIN)
-      : startMin;
-  const adjustedEnd = Math.min(
-    MINUTES_PER_DAY,
-    adjustedStart + DEFAULT_EVENT_DURATION_MIN,
-  );
-  return {
-    start: dateOnDay(slot.day, adjustedStart),
-    end: dateOnDay(slot.day, adjustedEnd),
-  };
-}
-
-/** Category color from the API when present; otherwise hash the calendar id. */
-function eventChipColor(event: CalendarEvent): string {
-  const fromApi = event.color?.trim();
-  if (fromApi) return fromApi;
-  return colorForCalendar(event.calendar_id || event.id);
-}
 
 export function CalendarPage() {
   // Visible day-column count (1–7). Session-only; not persisted.
@@ -384,72 +342,10 @@ export function CalendarPage() {
   const contentWidth = gutterW + trackWidth;
 
   // All-day chips first so we know band height for hour stretch.
-  const { allDayChips, allDayHeight } = useMemo(() => {
-    const origin = days[0];
-    if (!origin) {
-      return {
-        allDayChips: [] as AllDayChip[],
-        allDayHeight: allDaySectionHeight(null),
-      };
-    }
-
-    const msPerDay = 24 * 60 * 60 * 1000;
-    const lastIdx = dayCount - 1;
-    const inputs: {
-      id: string;
-      startDay: number;
-      endDay: number;
-      event: CalendarEvent;
-    }[] = [];
-
-    for (const event of allDayEvents) {
-      const start = new Date(event.start_time);
-      const end = new Date(event.end_time);
-      const first = startOfDay(start);
-      const last = lastOccupiedCivilDate(start, end);
-
-      let startDay = Math.round(
-        (first.getTime() - origin.getTime()) / msPerDay,
-      );
-      let endDay = Math.round((last.getTime() - origin.getTime()) / msPerDay);
-
-      // No overlap with rendered window [0, dayCount).
-      if (endDay < 0 || startDay > lastIdx) continue;
-      startDay = Math.max(0, Math.min(lastIdx, startDay));
-      endDay = Math.max(0, Math.min(lastIdx, endDay));
-      if (endDay < startDay) continue;
-
-      inputs.push({ id: event.id, startDay, endDay, event });
-    }
-
-    const packed = packAllDayLanes(
-      inputs.map((i) => ({
-        id: i.id,
-        startDay: i.startDay,
-        endDay: i.endDay,
-      })),
-    );
-    const laneById = new Map(packed.map((p) => [p.id, p.lane]));
-
-    let maxLane: number | null = null;
-    const chips: AllDayChip[] = inputs.map((i) => {
-      const lane = laneById.get(i.id) ?? 0;
-      if (maxLane === null || lane > maxLane) maxLane = lane;
-      return {
-        id: i.id,
-        title: i.event.title,
-        startDay: i.startDay,
-        endDay: i.endDay,
-        lane,
-        color: eventChipColor(i.event),
-      };
-    });
-
-    return {
-      allDayChips: chips,
-      allDayHeight: allDaySectionHeight(maxLane),
-    };
-  }, [days, allDayEvents, dayCount]);
+  const { allDayChips, allDayHeight } = useMemo(
+    () => buildAllDayChips(days, allDayEvents, dayCount),
+    [days, allDayEvents, dayCount],
+  );
 
   // Headers + all-day are sticky inside the scroller; hours fill the rest.
   const availableHoursPx = useMemo(() => {
@@ -671,58 +567,10 @@ export function CalendarPage() {
   }, [colW, dayCount, periodLength]);
 
   // Position timed events per day column (multi-day events excluded).
-  const eventsByDay = useMemo(() => {
-    const map = new Map<string, PositionedEvent[]>();
-
-    for (const day of days) {
-      const key = day.toDateString();
-      const dayItems: {
-        event: CalendarEvent;
-        startMin: number;
-        endMin: number;
-      }[] = [];
-
-      for (const event of timedEvents) {
-        const start = new Date(event.start_time);
-        const end = new Date(event.end_time);
-        const clamped = clampMinutesToDay(start, end, day);
-        if (!clamped) continue;
-        dayItems.push({
-          event,
-          startMin: clamped.startMin,
-          endMin: clamped.endMin,
-        });
-      }
-
-      const packed = packDayEvents(
-        dayItems.map((d) => ({
-          id: d.event.id,
-          startMin: d.startMin,
-          endMin: d.endMin,
-        })),
-      );
-      const packById = new Map(packed.map((p) => [p.id, p]));
-
-      const positioned: PositionedEvent[] = dayItems.map((d) => {
-        const pack = packById.get(d.event.id)!;
-        return {
-          event: d.event,
-          startMin: d.startMin,
-          endMin: d.endMin,
-          top: eventTopPx(d.startMin, hourH),
-          height: eventHeightPx(d.startMin, d.endMin, hourH),
-          col: pack.col,
-          cols: pack.cols,
-          span: pack.span,
-          color: eventChipColor(d.event),
-        };
-      });
-
-      map.set(key, positioned);
-    }
-
-    return map;
-  }, [days, timedEvents, hourH]);
+  const eventsByDay = useMemo(
+    () => buildEventsByDay(days, timedEvents, hourH),
+    [days, timedEvents, hourH],
+  );
 
   const todayIndex = useMemo(() => {
     const idx = days.findIndex((d) => isSameDay(d, today));
