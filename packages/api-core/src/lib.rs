@@ -43,8 +43,8 @@ pub use calendar::{
     WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
 };
 pub use calendar_color::{
-    color_for_event_title, paint_events, paint_events_default, paint_events_for_user,
-    CalendarEventView,
+    calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
+    paint_events_for_user, CalendarEventView,
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
