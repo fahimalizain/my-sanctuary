@@ -120,6 +120,9 @@ pub enum SyncErrorCode {
     StorageTransient,
     MappingPoison,
     MissingSyncToken,
+    /// calendarList entry with `accessRole=freeBusyReader` — keep the row,
+    /// never run the replica walk (events.list strips details).
+    InsufficientAccess,
     GoogleTransient,
     Unknown,
 }
@@ -134,6 +137,7 @@ impl SyncErrorCode {
             Self::StorageTransient => "storage_transient",
             Self::MappingPoison => "mapping_poison",
             Self::MissingSyncToken => "missing_sync_token",
+            Self::InsufficientAccess => "insufficient_access",
             Self::GoogleTransient => "google_transient",
             Self::Unknown => "unknown",
         }

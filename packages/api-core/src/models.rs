@@ -242,8 +242,10 @@ pub struct NewCalendar {
     pub time_zone: String,
     pub is_primary: bool,
     pub access_role: String,
-    /// Defaults to `true` when importing from calendarList; the upsert's
-    /// `COALESCE` keeps an existing `sync_enabled` when re-imported.
+    /// Defaults to `true` for newly imported calendarList rows. On conflict
+    /// for a **living** row the upsert keeps the stored `sync_enabled` (so a
+    /// deliberate user disable is never clobbered). On conflict when
+    /// resurrecting a soft-deleted row, the incoming value is written.
     pub sync_enabled: bool,
     /// May be empty; the upsert's `COALESCE` keeps any stored sync token.
     pub sync_token: String,

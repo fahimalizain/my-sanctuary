@@ -197,6 +197,23 @@ pub trait CalendarRepo: Send + Sync {
     ) -> Result<(), RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Stored calendarList.list `nextSyncToken` for `user_id`, if any.
+    ///
+    /// `None` or `Some("")` both mean "no cursor → full list".
+    async fn get_calendar_list_sync_token(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<String>, RepoError>;
+    /// UPSERT the calendarList sync cursor. Persist `""` to clear it (410 restart).
+    async fn set_calendar_list_sync_token(
+        &self,
+        user_id: &str,
+        token: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// Distinct living-calendar owners, ordered. Cron uses this so users with
+    /// only disabled calendars still get list refresh (they may add a calendar).
+    async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError>;
 }
 
 /// Cached Google Calendar event persistence (`calendar_events` rows).
@@ -754,6 +771,11 @@ pub const CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL: &str =
 /// `sync_token`/`last_synced_at` preserves the stored value (`COALESCE`), and
 /// `deleted_at = NULL` on conflict resurrects a soft-deleted row so a
 /// re-import of the calendar list brings it back.
+///
+/// `sync_enabled` is written on INSERT (new calendars default true). On
+/// conflict for a **living** row the stored value is kept (user disable is
+/// sticky). On conflict when resurrecting (`deleted_at IS NOT NULL`) the
+/// incoming value is written — a returned calendar is a new appearance.
 pub const CALENDAR_UPSERT_SQL: &str = "
     INSERT INTO google_calendars
         (id, user_id, google_calendar_id, summary, time_zone, is_primary, access_role, sync_enabled, sync_token, last_synced_at, created_at, updated_at)
@@ -763,12 +785,33 @@ pub const CALENDAR_UPSERT_SQL: &str = "
         time_zone = excluded.time_zone,
         is_primary = excluded.is_primary,
         access_role = excluded.access_role,
-        sync_enabled = excluded.sync_enabled,
+        sync_enabled = CASE
+          WHEN google_calendars.deleted_at IS NOT NULL THEN excluded.sync_enabled
+          ELSE google_calendars.sync_enabled
+        END,
         sync_token = COALESCE(NULLIF(excluded.sync_token, ''), google_calendars.sync_token),
         last_synced_at = COALESCE(NULLIF(excluded.last_synced_at, ''), google_calendars.last_synced_at),
         updated_at = excluded.updated_at,
         deleted_at = NULL
 ";
+
+/// Per-user calendarList.list cursor. Binds: user_id.
+pub const CALENDAR_LIST_STATE_GET_SQL: &str =
+    "SELECT sync_token FROM google_calendar_list_state WHERE user_id = ?";
+
+/// UPSERT calendarList cursor. Binds: user_id, sync_token, updated_at.
+/// Empty `sync_token` is allowed (clears the cursor after a 410).
+pub const CALENDAR_LIST_STATE_UPSERT_SQL: &str = "
+    INSERT INTO google_calendar_list_state (user_id, sync_token, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        sync_token = excluded.sync_token,
+        updated_at = excluded.updated_at
+";
+
+/// Distinct owners of living calendars (including sync-disabled). Ordered.
+pub const CALENDAR_LIST_USER_IDS_SQL: &str =
+    "SELECT DISTINCT user_id FROM google_calendars WHERE deleted_at IS NULL ORDER BY user_id ASC";
 
 pub const CALENDAR_UPDATE_SYNC_STATE_SQL: &str =
     "UPDATE google_calendars SET sync_token = ?, last_synced_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
@@ -2022,6 +2065,49 @@ mod tests {
                 "upsert must not touch health column {col}: {CALENDAR_UPSERT_SQL}"
             );
         }
+    }
+
+    #[test]
+    fn calendar_upsert_does_not_unconditionally_clobber_sync_enabled() {
+        // Living rows keep the user's disable; only resurrect writes excluded.
+        assert!(
+            !CALENDAR_UPSERT_SQL.contains("sync_enabled = excluded.sync_enabled"),
+            "unconditional assign would re-enable a user-disabled calendar: {CALENDAR_UPSERT_SQL}"
+        );
+        assert!(
+            CALENDAR_UPSERT_SQL.contains(
+                "sync_enabled = CASE\n          WHEN google_calendars.deleted_at IS NOT NULL THEN excluded.sync_enabled\n          ELSE google_calendars.sync_enabled\n        END"
+            ) || CALENDAR_UPSERT_SQL.contains("WHEN google_calendars.deleted_at IS NOT NULL THEN excluded.sync_enabled"),
+            "expected CASE preserve/resurrect for sync_enabled: {CALENDAR_UPSERT_SQL}"
+        );
+    }
+
+    #[test]
+    fn calendar_list_state_upsert_is_keyed_on_user_id_and_allows_empty_token() {
+        let sql = CALENDAR_LIST_STATE_UPSERT_SQL;
+        assert!(sql.contains("INSERT INTO google_calendar_list_state"), "{sql}");
+        assert!(sql.contains("ON CONFLICT(user_id) DO UPDATE SET"), "{sql}");
+        assert!(sql.contains("sync_token = excluded.sync_token"), "{sql}");
+        assert!(sql.contains("updated_at = excluded.updated_at"), "{sql}");
+        // Empty token is a normal bind value — no NOT NULL guard beyond the
+        // column default; the SQL must not reject ''.
+        assert!(!sql.contains("NULLIF(excluded.sync_token"), "{sql}");
+    }
+
+    #[test]
+    fn calendar_list_state_get_selects_token_by_user() {
+        let sql = CALENDAR_LIST_STATE_GET_SQL;
+        assert!(sql.contains("FROM google_calendar_list_state"), "{sql}");
+        assert!(sql.contains("WHERE user_id = ?"), "{sql}");
+        assert!(sql.contains("sync_token"), "{sql}");
+    }
+
+    #[test]
+    fn calendar_list_user_ids_distinct_living_ordered() {
+        let sql = CALENDAR_LIST_USER_IDS_SQL;
+        assert!(sql.contains("DISTINCT user_id"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("ORDER BY user_id ASC"), "{sql}");
     }
 
     #[test]

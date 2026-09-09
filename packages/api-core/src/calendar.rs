@@ -64,7 +64,7 @@
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use thiserror::Error;
 use url::Url;
@@ -300,7 +300,8 @@ pub async fn list_events(
     let mut cals = calendars.list_by_user_id(user_id).await?;
     if cals.is_empty() {
         // First contact with Google: import the calendar list, then re-read.
-        refresh_calendar_list(http, calendars, access, user_id, &now_rfc3339).await?;
+        refresh_calendar_list(http, calendars, Some(watches), access, user_id, &now_rfc3339)
+            .await?;
         cals = calendars.list_by_user_id(user_id).await?;
     }
 
@@ -895,11 +896,12 @@ async fn lookup_owned_event(
 /// (`GET /api/calendar/calendars`).
 ///
 /// Cache-first, like `list_events`: a non-empty store is served as-is — no
-/// Google HTTP, no re-import. (Re-importing would overwrite `sync_enabled`
-/// via `CALENDAR_UPSERT_SQL`'s `sync_enabled = excluded.sync_enabled`.) An
-/// empty store runs the same first-contact `calendarList` import
-/// `list_events` performs, then re-reads.
-/// Event sync and watch channels are never touched here.
+/// Google HTTP, no re-import. Incremental calendarList refresh is owned by
+/// the fallback cron ([`run_fallback_cron`]) and preserves a deliberate
+/// `sync_enabled = false`. An empty store runs the same first-contact
+/// `calendarList` import `list_events` performs, then re-reads.
+/// Event sync and watch channels are never touched here (first contact has
+/// no channels to stop).
 ///
 /// Rows are mapped to [`CalendarView`] (repo order: `is_primary DESC,
 /// summary ASC`). Import failures propagate as [`CalendarError`] — nothing
@@ -914,7 +916,8 @@ pub async fn list_calendars(
     let mut rows = calendars.list_by_user_id(user_id).await?;
     if rows.is_empty() {
         // First contact with Google: import the calendar list, then re-read.
-        refresh_calendar_list(http, calendars, access, user_id, now_rfc3339).await?;
+        // No watches yet — pass None so we do not require a WatchChannelRepo.
+        refresh_calendar_list(http, calendars, None, access, user_id, now_rfc3339).await?;
         rows = calendars.list_by_user_id(user_id).await?;
     }
     Ok(CalendarsResponse {
@@ -1251,6 +1254,8 @@ pub enum SyncCalendarOutcome {
 /// Whether a sync-enabled calendar should start a replica walk this tick.
 ///
 /// Due when **all** of:
+/// - `access_role != "freeBusyReader"` (replica `singleEvents=false` strips
+///   details on freeBusyReader calendars — keep events, never walk)
 /// - `sync_status != "authorization_required"` (do not hot-loop Google; keep events)
 /// - `next_retry_at` is missing/unparseable **or** `<= now_unix` (honor V1 backoff)
 ///
@@ -1265,6 +1270,9 @@ pub enum SyncCalendarOutcome {
 ///
 /// Freshness uses `last_success_at`, not `last_synced_at` (ADR 0005).
 pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
+    if cal.access_role == "freeBusyReader" {
+        return false;
+    }
     if cal.sync_status == "authorization_required" {
         return false;
     }
@@ -1296,36 +1304,42 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
     dirty || success_stale || cal.full_sync_requested || retry_due
 }
 
-/// The fallback cron (ADR 0001 § Fallback cron): for every sync-enabled,
-/// non-deleted calendar, publish a replica when [`replica_due`] (dirty
-/// generation, 15-minute `last_success_at` backstop, full-sync flag, or
-/// expired backoff), then renew its watch channel when none covers
-/// [`WATCH_RENEW_HORIZON_SECS`]. Successful publishes land in
+/// The fallback cron (ADR 0001 § Fallback cron): per user, incrementally
+/// refresh `calendarList`, then for every sync-enabled non-deleted calendar
+/// publish a replica when [`replica_due`] (dirty generation, 15-minute
+/// `last_success_at` backstop, full-sync flag, or expired backoff), then
+/// renew its watch channel when none covers [`WATCH_RENEW_HORIZON_SECS`].
+/// Successful publishes and **newly imported** calendar ids land in
 /// [`CronReport::published`] so the Worker can notify open browsers after D1
 /// is updated.
 ///
 /// Orchestration lives here (pure, unit-tested) so the Worker's
-/// `#[event(scheduled)]` handler is a thin shell. Per-calendar failures are
-/// collected in [`CronReport::errors`] and never abort the rest of the job.
-/// OAuth refresh is cached per `user_id` so two calendars of the same user
-/// share one access token in a tick.
+/// `#[event(scheduled)]` handler is a thin shell. Per-calendar / per-user
+/// failures are collected in [`CronReport::errors`] and never abort the rest
+/// of the job. OAuth refresh is cached per `user_id` so two calendars of the
+/// same user share one access token in a tick.
 ///
-/// Per calendar, in order:
+/// Per user, in order:
 /// 1. `refresh_if_needed` for the owner's Google token (cached per user).
 ///    - Revoked refresh (`invalid_grant` / token-endpoint 400/401): stamp
-///      `auth_revoked` / `authorization_required`, keep events, skip Google.
+///      `auth_revoked` / `authorization_required` on the user's living
+///      sync-enabled calendars, keep events, skip Google for that user.
 ///    - `NoToken` / `NoRefreshToken`: skip + error string only (do not flip
 ///      healthy calendars to `authorization_required`).
-/// 2. When [`replica_due`] and under [`CRON_MAX_REPLICA_CALENDARS`]:
-///    `sync_calendar`.
-///    - [`SyncCalendarOutcome::Published`] → `synced` + `published`.
-///    - [`SyncCalendarOutcome::LeaseBusy`] → quiet skip (not synced).
-///    - `events.list` 404 disables sync, stops channels, skips renew.
-///    - Other sync errors are logged; dirty stays requested > applied; renew
-///      still runs when the calendar is still enabled.
-/// 3. When `watch_callback_url` is a public HTTPS URL, the calendar is still
-///    enabled, and `sync_status != "authorization_required"`:
-///    `renew_watch_if_needed`. A watch 404 disables sync and stops channels.
+/// 2. [`refresh_calendar_list`] (incremental when a list cursor exists).
+///    List errors are logged; existing sync-enabled calendars still get
+///    replica/renew work. New local calendar ids are pushed to `published`.
+/// 3. For each living sync-enabled calendar of the user:
+///    - When [`replica_due`] and under [`CRON_MAX_REPLICA_CALENDARS`]:
+///      `sync_calendar`.
+///      - [`SyncCalendarOutcome::Published`] → `synced` + `published`.
+///      - [`SyncCalendarOutcome::LeaseBusy`] → quiet skip (not synced).
+///      - `events.list` 404 disables sync, stops channels, skips renew.
+///      - Other sync errors are logged; dirty stays requested > applied; renew
+///        still runs when the calendar is still enabled.
+///    - When `watch_callback_url` is a public HTTPS URL, the calendar is still
+///      enabled, and `sync_status != "authorization_required"`:
+///      `renew_watch_if_needed`. A watch 404 disables sync and stops channels.
 pub async fn run_fallback_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1342,13 +1356,44 @@ pub async fn run_fallback_cron(
     // deliver push notifications, so all watch I/O is skipped (local dev).
     let callback = watch_callback_url.filter(|url| is_public_https_callback(url));
 
-    let cals = match calendars.list_sync_enabled().await {
-        Ok(cals) => cals,
+    // Prefer every owner of a living calendar (including sync-disabled) so a
+    // user who disabled everything still gets list refresh and can pick up
+    // newly added Google calendars. Fall back to unique owners of the
+    // sync-enabled work list when that query is empty.
+    let user_ids = match calendars.list_user_ids_with_calendars().await {
+        Ok(ids) if !ids.is_empty() => ids,
+        Ok(_) => match calendars.list_sync_enabled().await {
+            Ok(cals) => {
+                let mut ids: Vec<String> = cals.into_iter().map(|c| c.user_id).collect();
+                ids.sort();
+                ids.dedup();
+                ids
+            }
+            Err(err) => {
+                report
+                    .errors
+                    .push(format!("list_sync_enabled failed: {err}"));
+                return report;
+            }
+        },
         Err(err) => {
             report
                 .errors
-                .push(format!("list_sync_enabled failed: {err}"));
-            return report;
+                .push(format!("list_user_ids_with_calendars failed: {err}"));
+            match calendars.list_sync_enabled().await {
+                Ok(cals) => {
+                    let mut ids: Vec<String> = cals.into_iter().map(|c| c.user_id).collect();
+                    ids.sort();
+                    ids.dedup();
+                    ids
+                }
+                Err(err2) => {
+                    report
+                        .errors
+                        .push(format!("list_sync_enabled failed: {err2}"));
+                    return report;
+                }
+            }
         }
     };
 
@@ -1357,13 +1402,12 @@ pub async fn run_fallback_cron(
     let mut access_by_user: HashMap<String, Result<GoogleAccess, TokenError>> = HashMap::new();
     let mut replica_attempts: usize = 0;
 
-    for cal in &cals {
-        let access_result = match access_by_user.get(&cal.user_id) {
+    for user_id in &user_ids {
+        let access_result = match access_by_user.get(user_id) {
             Some(cached) => cached.clone(),
             None => {
-                let result =
-                    refresh_if_needed(http, tokens, oauth, &cal.user_id, now_unix).await;
-                access_by_user.insert(cal.user_id.clone(), result.clone());
+                let result = refresh_if_needed(http, tokens, oauth, user_id, now_unix).await;
+                access_by_user.insert(user_id.clone(), result.clone());
                 result
             }
         };
@@ -1372,117 +1416,169 @@ pub async fn run_fallback_cron(
             Ok(access) => access,
             Err(err) => {
                 report.errors.push(format!(
-                    "token refresh failed for user {} (calendar {}): {err}",
-                    cal.user_id, cal.id
+                    "token refresh failed for user {user_id}: {err}"
                 ));
                 if is_refresh_auth_revoked(&err) {
-                    // Keep events; stop Google for this calendar this tick.
-                    if let Err(persist_err) = persist_sync_failure(
-                        calendars,
-                        cal,
-                        SyncErrorCode::AuthRevoked,
-                        now_unix,
-                        &now_rfc3339,
-                    )
-                    .await
-                    {
-                        report.errors.push(format!(
-                            "failed to stamp auth_revoked for calendar {}: {persist_err}",
-                            cal.id
-                        ));
+                    // Keep events; stop Google for this user's calendars this tick.
+                    match calendars.list_by_user_id(user_id).await {
+                        Ok(user_cals) => {
+                            for cal in user_cals.iter().filter(|c| c.sync_enabled) {
+                                if let Err(persist_err) = persist_sync_failure(
+                                    calendars,
+                                    cal,
+                                    SyncErrorCode::AuthRevoked,
+                                    now_unix,
+                                    &now_rfc3339,
+                                )
+                                .await
+                                {
+                                    report.errors.push(format!(
+                                        "failed to stamp auth_revoked for calendar {}: {persist_err}",
+                                        cal.id
+                                    ));
+                                }
+                            }
+                        }
+                        Err(list_err) => report.errors.push(format!(
+                            "failed to list calendars for auth_revoked stamp (user {user_id}): {list_err}"
+                        )),
                     }
                 }
                 continue;
             }
         };
 
-        // Re-read may be needed if a prior auth stamp mutated status, but we
-        // work from the list snapshot + in-loop knowledge. Skip renew when
-        // this calendar was just stamped authorization_required above — that
-        // path `continue`s. For already-authorization_required rows, skip
-        // replica + renew below.
-        let due = replica_due(cal, now_unix);
-        if due && replica_attempts < CRON_MAX_REPLICA_CALENDARS {
-            replica_attempts += 1;
-            match sync_calendar(http, calendars, events, &access, cal, &now_rfc3339).await {
-                Ok(SyncCalendarOutcome::Published) => {
-                    report.synced += 1;
-                    report
-                        .published
-                        .push((cal.user_id.clone(), cal.id.clone()));
+        // Incremental (or full) calendarList refresh before replica work so
+        // newly added calendars can be published this tick and removed ones
+        // stop being watched.
+        match refresh_calendar_list(
+            http,
+            calendars,
+            Some(watches),
+            &access,
+            user_id,
+            &now_rfc3339,
+        )
+        .await
+        {
+            Ok(new_ids) => {
+                for id in new_ids {
+                    report.published.push((user_id.clone(), id));
                 }
-                Ok(SyncCalendarOutcome::LeaseBusy) => {
-                    // Quiet skip — not a failure, not a publish.
-                }
-                Err(CalendarError::GoogleNotFound) => {
-                    report.errors.push(format!(
-                        "calendar {} ({}) returned 404 — disabling sync",
-                        cal.id, cal.google_calendar_id
-                    ));
-                    if let Err(err) =
-                        calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await
-                    {
-                        report.errors.push(format!(
-                            "failed to disable sync for calendar {}: {err}",
-                            cal.id
-                        ));
-                    }
-                    // The calendar is gone from Google's side: stop its
-                    // channels so stale subscriptions do not push at it.
-                    if let Err(err) =
-                        stop_watches_for_calendar(http, watches, &access, &cal.id).await
-                    {
-                        report.errors.push(format!(
-                            "failed to stop watch channels for calendar {}: {err}",
-                            cal.id
-                        ));
-                    }
-                    // Do not renew a calendar whose sync was just disabled.
-                    continue;
-                }
-                Err(err) => report.errors.push(format!(
-                    "sync failed for calendar {} ({}): {err}",
-                    cal.id, cal.google_calendar_id
-                )),
+            }
+            Err(err) => {
+                // Prefer: log list error, still process existing sync-enabled calendars.
+                report.errors.push(format!(
+                    "calendarList refresh failed for user {user_id}: {err}"
+                ));
             }
         }
 
-        // Do not hammer Google watch endpoints for revoked calendars.
-        if cal.sync_status == "authorization_required" {
-            continue;
-        }
+        let user_cals = match calendars.list_by_user_id(user_id).await {
+            Ok(cals) => cals
+                .into_iter()
+                .filter(|c| c.sync_enabled)
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                report.errors.push(format!(
+                    "list_by_user_id failed for user {user_id}: {err}"
+                ));
+                continue;
+            }
+        };
 
-        if let Some(callback_url) = callback {
-            match renew_watch_if_needed(http, watches, &access, cal, callback_url, now_unix).await
-            {
-                Ok(true) => report.renewed += 1,
-                Ok(false) => {}
-                Err(CalendarError::GoogleNotFound) => {
-                    report.errors.push(format!(
-                        "calendar {} ({}) returned 404 for events.watch — disabling sync",
+        for cal in &user_cals {
+            let due = replica_due(cal, now_unix);
+            if due && replica_attempts < CRON_MAX_REPLICA_CALENDARS {
+                replica_attempts += 1;
+                match sync_calendar(http, calendars, events, &access, cal, &now_rfc3339).await {
+                    Ok(SyncCalendarOutcome::Published) => {
+                        report.synced += 1;
+                        report
+                            .published
+                            .push((cal.user_id.clone(), cal.id.clone()));
+                    }
+                    Ok(SyncCalendarOutcome::LeaseBusy) => {
+                        // Quiet skip — not a failure, not a publish.
+                    }
+                    Err(CalendarError::GoogleNotFound) => {
+                        report.errors.push(format!(
+                            "calendar {} ({}) returned 404 — disabling sync",
+                            cal.id, cal.google_calendar_id
+                        ));
+                        if let Err(err) =
+                            calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await
+                        {
+                            report.errors.push(format!(
+                                "failed to disable sync for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                        // The calendar is gone from Google's side: stop its
+                        // channels so stale subscriptions do not push at it.
+                        if let Err(err) =
+                            stop_watches_for_calendar(http, watches, &access, &cal.id).await
+                        {
+                            report.errors.push(format!(
+                                "failed to stop watch channels for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                        // Do not renew a calendar whose sync was just disabled.
+                        continue;
+                    }
+                    Err(err) => report.errors.push(format!(
+                        "sync failed for calendar {} ({}): {err}",
                         cal.id, cal.google_calendar_id
-                    ));
-                    if let Err(err) =
-                        calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await
-                    {
-                        report.errors.push(format!(
-                            "failed to disable sync for calendar {}: {err}",
-                            cal.id
-                        ));
-                    }
-                    if let Err(err) =
-                        stop_watches_for_calendar(http, watches, &access, &cal.id).await
-                    {
-                        report.errors.push(format!(
-                            "failed to stop watch channels for calendar {}: {err}",
-                            cal.id
-                        ));
-                    }
+                    )),
                 }
-                Err(err) => report.errors.push(format!(
-                    "watch renew failed for calendar {} ({}): {err}",
-                    cal.id, cal.google_calendar_id
-                )),
+            }
+
+            // Do not hammer Google watch endpoints for revoked calendars.
+            if cal.sync_status == "authorization_required" {
+                continue;
+            }
+
+            if let Some(callback_url) = callback {
+                match renew_watch_if_needed(
+                    http,
+                    watches,
+                    &access,
+                    cal,
+                    callback_url,
+                    now_unix,
+                )
+                .await
+                {
+                    Ok(true) => report.renewed += 1,
+                    Ok(false) => {}
+                    Err(CalendarError::GoogleNotFound) => {
+                        report.errors.push(format!(
+                            "calendar {} ({}) returned 404 for events.watch — disabling sync",
+                            cal.id, cal.google_calendar_id
+                        ));
+                        if let Err(err) =
+                            calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await
+                        {
+                            report.errors.push(format!(
+                                "failed to disable sync for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                        if let Err(err) =
+                            stop_watches_for_calendar(http, watches, &access, &cal.id).await
+                        {
+                            report.errors.push(format!(
+                                "failed to stop watch channels for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                    }
+                    Err(err) => report.errors.push(format!(
+                        "watch renew failed for calendar {} ({}): {err}",
+                        cal.id, cal.google_calendar_id
+                    )),
+                }
             }
         }
     }
@@ -1744,47 +1840,181 @@ async fn ensure_event_labels(
     Ok(())
 }
 
-/// Imports `/users/me/calendarList` and upserts each entry (all imported
-/// calendars default to `sync_enabled = true`). After the upsert, re-reads the
-/// user's rows and backfills the event-label cache for any row that has none
-/// (first import, or the deploy backfill on next sync).
+/// Walks `/users/me/calendarList` (full or incremental) and merges into the
+/// local calendar store.
+///
+/// - **Full** (no stored cursor, or merge-full after 410): pages without
+///   `syncToken`. Living calendars absent from the union of all pages are
+///   orphaned (disable + soft-delete + stop watches). Does **not** truncate
+///   mid-failure.
+/// - **Incremental** (stored non-empty sync token): `syncToken` +
+///   `showDeleted=true`. `deleted: true` items disable + soft-delete + stop
+///   watches. Absence is a no-op (do not orphan).
+/// - Never advances the stored list cursor past uncommitted upserts/deletes.
+/// - Never clobbers a living row's deliberate `sync_enabled = false` (SQL +
+///   fake upsert contract).
+/// - Returns local ids of calendars that were **not** living before this walk
+///   (newly inserted or resurrected). Metadata-only updates do not count.
+///
+/// `watches` is `None` on first-contact import paths that have no channels
+/// (`list_calendars`); cron and `list_events` pass `Some`.
 async fn refresh_calendar_list(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
+    watches: Option<&dyn WatchChannelRepo>,
     access: &GoogleAccess,
     user_id: &str,
     now_rfc3339: &str,
-) -> Result<(), CalendarError> {
-    let (status, body) = http
-        .get_bearer_raw(GOOGLE_CALENDAR_LIST_URL, &access.access_token)
-        .await?;
-    if !(200..300).contains(&status) {
-        return Err(CalendarError::GoogleApi(format!(
-            "calendarList fetch: google returned {status}"
-        )));
-    }
-    let list: CalendarListResponse = serde_json::from_slice(&body)
-        .map_err(|err| CalendarError::InvalidResponse(format!("calendarList body: {err}")))?;
+) -> Result<Vec<String>, CalendarError> {
+    let stored = calendars.get_calendar_list_sync_token(user_id).await?;
+    let mut list_token: Option<String> = stored.filter(|t| !t.is_empty());
+    let mut is_full = list_token.is_none();
+    let mut page_token: Option<String> = None;
+    let mut retried_410 = false;
+    let mut seen_google_ids: HashSet<String> = HashSet::new();
+    let mut new_local_ids: Vec<String> = Vec::new();
 
-    let rows: Vec<NewCalendar> = list
-        .items
+    // Snapshot living google ids before the walk so "new" is well-defined
+    // even when upsert_batch updates in place.
+    let living_before: HashSet<String> = calendars
+        .list_by_user_id(user_id)
+        .await?
         .into_iter()
-        .map(|item| NewCalendar {
-            user_id: user_id.to_string(),
-            google_calendar_id: item.id,
-            summary: item.summary.unwrap_or_default(),
-            time_zone: item.time_zone.unwrap_or_default(),
-            is_primary: item.primary,
-            access_role: item.access_role.unwrap_or_default(),
-            sync_enabled: true,
-            sync_token: String::new(),
-            last_synced_at: None,
-        })
+        .map(|c| c.google_calendar_id)
         .collect();
-    if !rows.is_empty() {
-        calendars.upsert_batch(rows).await?;
+
+    loop {
+        let url = calendar_list_url(list_token.as_deref(), page_token.as_deref());
+        let (status, body) = http
+            .get_bearer_raw(&url, &access.access_token)
+            .await?;
+
+        if status == 410 {
+            if retried_410 {
+                return Err(CalendarError::GoogleApi(
+                    "calendarList returned 410 twice".into(),
+                ));
+            }
+            // Merge-full: drop cursor, keep living calendars, restart once.
+            // Persist "" so a crash mid-restart retries as full (never leave
+            // a fabricated success token).
+            retried_410 = true;
+            list_token = None;
+            page_token = None;
+            is_full = true;
+            seen_google_ids.clear();
+            calendars
+                .set_calendar_list_sync_token(user_id, "", now_rfc3339)
+                .await?;
+            continue;
+        }
+
+        if !(200..300).contains(&status) {
+            return Err(CalendarError::GoogleApi(format!(
+                "calendarList fetch: google returned {status}"
+            )));
+        }
+
+        let list: CalendarListResponse = serde_json::from_slice(&body).map_err(|err| {
+            CalendarError::InvalidResponse(format!("calendarList body: {err}"))
+        })?;
+
+        // Apply this page before fetching the next (fence: never advance the
+        // list cursor past uncommitted upserts).
+        for item in list.items {
+            if item.deleted {
+                if let Some(cal) = calendars
+                    .get_by_google_cal_id(user_id, &item.id)
+                    .await?
+                {
+                    calendars
+                        .set_sync_enabled(&cal.id, false, now_rfc3339)
+                        .await?;
+                    calendars.delete(&cal.id, now_rfc3339).await?;
+                    if let Some(w) = watches {
+                        // Best-effort stop: calendar is already disabled. A
+                        // failed stop leaves channel rows for slice-4 retry.
+                        let _ = stop_watches_for_calendar(http, w, access, &cal.id).await;
+                    }
+                }
+                seen_google_ids.insert(item.id);
+                continue;
+            }
+
+            let google_id = item.id;
+            let was_new = !living_before.contains(&google_id);
+            let access_role = item.access_role.unwrap_or_default();
+            calendars
+                .upsert_batch(vec![NewCalendar {
+                    user_id: user_id.to_string(),
+                    google_calendar_id: google_id.clone(),
+                    summary: item.summary.unwrap_or_default(),
+                    time_zone: item.time_zone.unwrap_or_default(),
+                    is_primary: item.primary,
+                    access_role: access_role.clone(),
+                    sync_enabled: true,
+                    sync_token: String::new(),
+                    last_synced_at: None,
+                }])
+                .await?;
+            seen_google_ids.insert(google_id.clone());
+
+            if let Some(cal) = calendars
+                .get_by_google_cal_id(user_id, &google_id)
+                .await?
+            {
+                if was_new && !new_local_ids.iter().any(|id| id == &cal.id) {
+                    new_local_ids.push(cal.id.clone());
+                }
+                if access_role == "freeBusyReader" {
+                    let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
+                    // Stamp health only — do not request full_sync or start a
+                    // replica walk (`replica_due` skips freeBusyReader).
+                    persist_sync_failure(
+                        calendars,
+                        &cal,
+                        SyncErrorCode::InsufficientAccess,
+                        now_unix,
+                        now_rfc3339,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if let Some(next) = list.next_page_token.filter(|t| !t.is_empty()) {
+            page_token = Some(next);
+            continue;
+        }
+
+        // Terminal page: orphan only after a successful full / merge-full walk.
+        if is_full {
+            let living = calendars.list_by_user_id(user_id).await?;
+            for cal in living {
+                if !seen_google_ids.contains(&cal.google_calendar_id) {
+                    calendars
+                        .set_sync_enabled(&cal.id, false, now_rfc3339)
+                        .await?;
+                    calendars.delete(&cal.id, now_rfc3339).await?;
+                    if let Some(w) = watches {
+                        let _ = stop_watches_for_calendar(http, w, access, &cal.id).await;
+                    }
+                }
+            }
+        }
+
+        // Commit nextSyncToken only after every page's upserts/deletes/orphans.
+        if let Some(next_sync) = list.next_sync_token.filter(|t| !t.is_empty()) {
+            calendars
+                .set_calendar_list_sync_token(user_id, &next_sync, now_rfc3339)
+                .await?;
+        }
+        // Missing terminal nextSyncToken: leave the stored cursor alone (or
+        // "" after a 410 clear) so the next tick retries full/incremental.
+        break;
     }
-    // Backfill the event-label cache: every imported row starts with an empty
+
+    // Backfill the event-label cache: newly imported rows start with an empty
     // `event_labels` (cache miss), so fetch + persist it right away.
     let imported = calendars.list_by_user_id(user_id).await?;
     for cal in &imported {
@@ -1792,7 +2022,26 @@ async fn refresh_calendar_list(
             ensure_event_labels(http, calendars, access, cal, now_rfc3339).await?;
         }
     }
-    Ok(())
+    Ok(new_local_ids)
+}
+
+/// Builds a `calendarList.list` URL.
+///
+/// Full (no token): bare list URL, optional `pageToken`.
+/// Incremental: `syncToken` + `showDeleted=true`, optional `pageToken`.
+/// Never pairs a stale syncToken with a full-list pageToken after a 410 —
+/// the caller drops `list_token` before restarting.
+fn calendar_list_url(sync_token: Option<&str>, page_token: Option<&str>) -> String {
+    let mut url = Url::parse(GOOGLE_CALENDAR_LIST_URL).expect("static calendarList URL is valid");
+    if let Some(token) = sync_token {
+        url.query_pairs_mut()
+            .append_pair("syncToken", token)
+            .append_pair("showDeleted", "true");
+    }
+    if let Some(token) = page_token {
+        url.query_pairs_mut().append_pair("pageToken", token);
+    }
+    url.to_string()
 }
 
 /// Full or incremental sync of one calendar via the fenced replica walk
@@ -1950,12 +2199,20 @@ struct CalendarListEntry {
     primary: bool,
     #[serde(default, rename = "accessRole")]
     access_role: Option<String>,
+    /// Present on incremental (`showDeleted=true`) responses when the user
+    /// removed the calendar from their list.
+    #[serde(default)]
+    deleted: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct CalendarListResponse {
     #[serde(default)]
     items: Vec<CalendarListEntry>,
+    #[serde(default, rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    #[serde(default, rename = "nextSyncToken")]
+    next_sync_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -2011,6 +2268,13 @@ mod tests {
             {
                 return (200, br#"{"labelProperties":{"eventLabels":[]}}"#.to_vec());
             }
+            // Default for unscripted incremental calendarList ticks (cron):
+            // empty delta, no nextSyncToken — no-op merge. Full-list URLs
+            // (no syncToken) still panic so first-import tests keep their
+            // explicit route.
+            if url.contains("calendarList") && url.contains("syncToken=") {
+                return (200, br#"{"items":[]}"#.to_vec());
+            }
             panic!("no route for {url}");
         }
     }
@@ -2061,10 +2325,10 @@ mod tests {
         }
     }
 
-    /// In-memory calendar repo: `upsert_batch` materializes rows (like D1), so
-    /// the service's re-read after a calendarList import sees the new rows.
-    /// Lease methods mirror the V1 SQL semantics so replica tests exercise
-    /// real fencing.
+    /// In-memory calendar repo: `upsert_batch` upserts by natural key
+    /// `(user_id, google_calendar_id)` (like D1), so incremental calendarList
+    /// tests do not invent duplicate rows. Lease methods mirror the V1 SQL
+    /// semantics so replica tests exercise real fencing.
     struct FakeCalendarRepo {
         stored: Mutex<Vec<GoogleCalendar>>,
         upserted: Mutex<Vec<NewCalendar>>,
@@ -2072,6 +2336,8 @@ mod tests {
         disabled: Mutex<Vec<(String, bool)>>,
         label_updates: Mutex<Vec<(String, String)>>,
         next_id: Mutex<u64>,
+        /// Per-user calendarList.list sync tokens.
+        calendar_list_tokens: Mutex<HashMap<String, String>>,
         /// Count of `get_by_id` calls (for mid-walk lease-steal hooks).
         get_by_id_count: Mutex<usize>,
         /// After this many `get_by_id` calls, force `lease_owner` to `"thief"`
@@ -2090,13 +2356,29 @@ mod tests {
 
     impl FakeCalendarRepo {
         fn with(calendars: Vec<GoogleCalendar>) -> Self {
+            // Seed a non-empty list token for every distinct user so existing
+            // cron tests take the incremental-empty path (FakeHttp default)
+            // and do not orphan calendars on an unscripted full list.
+            // `with(vec![])` seeds nothing → first-import tests stay full-list.
+            let mut tokens = HashMap::new();
+            let mut max_numeric_id = 0u64;
+            for cal in &calendars {
+                tokens
+                    .entry(cal.user_id.clone())
+                    .or_insert_with(|| "test-list-token".to_string());
+                if let Some(n) = cal.id.strip_prefix("cal-").and_then(|s| s.parse().ok()) {
+                    max_numeric_id = max_numeric_id.max(n);
+                }
+            }
             Self {
                 stored: Mutex::new(calendars),
                 upserted: Mutex::new(Vec::new()),
                 sync_states: Mutex::new(Vec::new()),
                 disabled: Mutex::new(Vec::new()),
                 label_updates: Mutex::new(Vec::new()),
-                next_id: Mutex::new(1),
+                // Avoid colliding with fixture ids like `cal-1`.
+                next_id: Mutex::new(max_numeric_id.saturating_add(1).max(1)),
+                calendar_list_tokens: Mutex::new(tokens),
                 get_by_id_count: Mutex::new(0),
                 steal_lease_after_get_by_id: Mutex::new(None),
                 fail_bump_dirty: Mutex::new(false),
@@ -2148,8 +2430,15 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl CalendarRepo for FakeCalendarRepo {
-        async fn list_by_user_id(&self, _user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
-            Ok(self.stored.lock().unwrap().clone())
+        async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|cal| cal.user_id == user_id && cal.deleted_at.is_none())
+                .cloned()
+                .collect())
         }
 
         async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError> {
@@ -2172,7 +2461,11 @@ mod tests {
             let mut stored = self.stored.lock().unwrap();
             // Snapshot first so the Nth call still sees our lease / dirty gen;
             // subsequent reads observe the post-hook mutation.
-            let result = stored.iter().find(|cal| cal.id == id).cloned();
+            // Match D1: only living rows.
+            let result = stored
+                .iter()
+                .find(|cal| cal.id == id && cal.deleted_at.is_none())
+                .cloned();
             if let Some(threshold) = *self.steal_lease_after_get_by_id.lock().unwrap() {
                 if n == threshold {
                     if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
@@ -2194,7 +2487,7 @@ mod tests {
 
         async fn get_by_google_cal_id(
             &self,
-            _user_id: &str,
+            user_id: &str,
             google_cal_id: &str,
         ) -> Result<Option<GoogleCalendar>, RepoError> {
             Ok(self
@@ -2202,7 +2495,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|cal| cal.google_calendar_id == google_cal_id)
+                .find(|cal| {
+                    cal.user_id == user_id
+                        && cal.google_calendar_id == google_cal_id
+                        && cal.deleted_at.is_none()
+                })
                 .cloned())
         }
 
@@ -2212,44 +2509,70 @@ mod tests {
 
         async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError> {
             for cal in calendars {
-                let mut next = self.next_id.lock().unwrap();
-                let row = GoogleCalendar {
-                    id: format!("cal-{next}"),
-                    user_id: cal.user_id.clone(),
-                    google_calendar_id: cal.google_calendar_id.clone(),
-                    summary: cal.summary.clone(),
-                    time_zone: cal.time_zone.clone(),
-                    is_primary: cal.is_primary,
-                    access_role: cal.access_role.clone(),
-                    sync_enabled: cal.sync_enabled,
-                    sync_token: cal.sync_token.clone(),
-                    last_synced_at: cal.last_synced_at.clone(),
-                    // Freshly imported rows start with an empty label cache
-                    // (cache miss) — `refresh_calendar_list` backfills it.
-                    event_labels: String::new(),
-                    // Health defaults: calendarList upsert must never write these.
-                    sync_query_fingerprint: String::new(),
-                    sync_status: String::new(),
-                    initial_sync_complete: false,
-                    last_attempt_at: None,
-                    last_success_at: None,
-                    last_error_code: String::new(),
-                    failure_streak: 0,
-                    next_retry_at: None,
-                    dirty_requested_generation: 0,
-                    dirty_applied_generation: 0,
-                    full_sync_requested: false,
-                    lease_owner: String::new(),
-                    lease_expires_at: None,
-                    cache_revision: 0,
-                    projection: "timed_masters_and_exceptions".to_string(),
-                    created_at: "2026-08-17T00:00:00Z".to_string(),
-                    updated_at: "2026-08-17T00:00:00Z".to_string(),
-                    deleted_at: None,
-                };
-                *next += 1;
-                self.upserted.lock().unwrap().push(cal);
-                self.stored.lock().unwrap().push(row);
+                self.upserted.lock().unwrap().push(cal.clone());
+                let mut stored = self.stored.lock().unwrap();
+                if let Some(existing) = stored.iter_mut().find(|row| {
+                    row.user_id == cal.user_id && row.google_calendar_id == cal.google_calendar_id
+                }) {
+                    let resurrecting = existing.deleted_at.is_some();
+                    existing.summary = cal.summary.clone();
+                    existing.time_zone = cal.time_zone.clone();
+                    existing.is_primary = cal.is_primary;
+                    existing.access_role = cal.access_role.clone();
+                    existing.updated_at = "2026-08-17T00:00:00Z".to_string();
+                    existing.deleted_at = None;
+                    if resurrecting {
+                        // Returned calendar is a new appearance.
+                        existing.sync_enabled = cal.sync_enabled;
+                    }
+                    // Living: keep sync_enabled, health, dirty gens, event_labels, id.
+                    // Empty incoming sync_token / last_synced_at preserve stored
+                    // (COALESCE), matching CALENDAR_UPSERT_SQL.
+                    if !cal.sync_token.is_empty() {
+                        existing.sync_token = cal.sync_token.clone();
+                    }
+                    if cal.last_synced_at.is_some() {
+                        existing.last_synced_at = cal.last_synced_at.clone();
+                    }
+                } else {
+                    let mut next = self.next_id.lock().unwrap();
+                    let row = GoogleCalendar {
+                        id: format!("cal-{next}"),
+                        user_id: cal.user_id.clone(),
+                        google_calendar_id: cal.google_calendar_id.clone(),
+                        summary: cal.summary.clone(),
+                        time_zone: cal.time_zone.clone(),
+                        is_primary: cal.is_primary,
+                        access_role: cal.access_role.clone(),
+                        sync_enabled: cal.sync_enabled,
+                        sync_token: cal.sync_token.clone(),
+                        last_synced_at: cal.last_synced_at.clone(),
+                        // Freshly imported rows start with an empty label cache
+                        // (cache miss) — `refresh_calendar_list` backfills it.
+                        event_labels: String::new(),
+                        // Health defaults: calendarList upsert must never write these.
+                        sync_query_fingerprint: String::new(),
+                        sync_status: String::new(),
+                        initial_sync_complete: false,
+                        last_attempt_at: None,
+                        last_success_at: None,
+                        last_error_code: String::new(),
+                        failure_streak: 0,
+                        next_retry_at: None,
+                        dirty_requested_generation: 0,
+                        dirty_applied_generation: 0,
+                        full_sync_requested: false,
+                        lease_owner: String::new(),
+                        lease_expires_at: None,
+                        cache_revision: 0,
+                        projection: "timed_masters_and_exceptions".to_string(),
+                        created_at: "2026-08-17T00:00:00Z".to_string(),
+                        updated_at: "2026-08-17T00:00:00Z".to_string(),
+                        deleted_at: None,
+                    };
+                    *next += 1;
+                    stored.push(row);
+                }
             }
             Ok(())
         }
@@ -2486,8 +2809,52 @@ mod tests {
             Ok(())
         }
 
-        async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+        async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.deleted_at = Some(now_rfc3339.to_string());
+                cal.updated_at = now_rfc3339.to_string();
+            }
             Ok(())
+        }
+
+        async fn get_calendar_list_sync_token(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<String>, RepoError> {
+            Ok(self
+                .calendar_list_tokens
+                .lock()
+                .unwrap()
+                .get(user_id)
+                .cloned())
+        }
+
+        async fn set_calendar_list_sync_token(
+            &self,
+            user_id: &str,
+            token: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            self.calendar_list_tokens
+                .lock()
+                .unwrap()
+                .insert(user_id.to_string(), token.to_string());
+            Ok(())
+        }
+
+        async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
+            let mut ids: Vec<String> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|cal| cal.deleted_at.is_none())
+                .map(|cal| cal.user_id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
         }
     }
 
@@ -5148,8 +5515,15 @@ mod tests {
             vec![("u-1".to_string(), "cal-a".to_string())]
         );
         let gets = http.gets.lock().unwrap();
-        assert_eq!(gets.len(), 1, "fresh calendar must not hit events.list");
-        assert!(gets[0].contains("primary%40example.com/events"), "{:?}", gets);
+        let event_gets: Vec<_> = gets.iter().filter(|u| u.contains("/events")).collect();
+        let list_gets: Vec<_> = gets.iter().filter(|u| u.contains("calendarList")).collect();
+        assert_eq!(event_gets.len(), 1, "fresh calendar must not hit events.list: {gets:?}");
+        assert!(
+            event_gets[0].contains("primary%40example.com/events"),
+            "{:?}",
+            gets
+        );
+        assert_eq!(list_gets.len(), 1, "one incremental calendarList GET: {gets:?}");
         let states = calendars.sync_states.lock().unwrap();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].0, "cal-a");
@@ -5172,7 +5546,17 @@ mod tests {
         assert_eq!(report.synced, 1);
         assert_eq!(report.renewed, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert_eq!(http.gets.lock().unwrap().len(), 1);
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(
+            gets.iter().filter(|u| u.contains("/events")).count(),
+            1,
+            "{gets:?}"
+        );
+        assert_eq!(
+            gets.iter().filter(|u| u.contains("calendarList")).count(),
+            1,
+            "{gets:?}"
+        );
         assert_eq!(calendars.sync_states.lock().unwrap().len(), 1);
     }
 
@@ -5202,9 +5586,15 @@ mod tests {
             *calendars.disabled.lock().unwrap(),
             vec![("cal-1".to_string(), false)]
         );
+        let gets = http.gets.lock().unwrap();
         assert!(
-            http.gets.lock().unwrap().is_empty(),
-            "fresh calendar was not synced"
+            gets.iter().all(|u| !u.contains("/events")),
+            "fresh calendar was not synced: {gets:?}"
+        );
+        assert_eq!(
+            gets.iter().filter(|u| u.contains("calendarList")).count(),
+            1,
+            "incremental list still runs: {gets:?}"
         );
     }
 
@@ -5266,8 +5656,19 @@ mod tests {
         let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
         assert_ne!(a.sync_status, "authorization_required");
         let gets = http.gets.lock().unwrap();
-        assert_eq!(gets.len(), 1);
-        assert!(gets[0].contains("secondary%40example.com"), "{:?}", gets);
+        let event_gets: Vec<_> = gets.iter().filter(|u| u.contains("/events")).collect();
+        assert_eq!(event_gets.len(), 1, "{gets:?}");
+        assert!(
+            event_gets[0].contains("secondary%40example.com"),
+            "{:?}",
+            gets
+        );
+        // Only u-b got a token → only u-b runs calendarList.
+        assert_eq!(
+            gets.iter().filter(|u| u.contains("calendarList")).count(),
+            1,
+            "{gets:?}"
+        );
     }
 
     // ──────────────────────────────────────────
@@ -5314,7 +5715,7 @@ mod tests {
         cal.sync_status = String::new();
         cal.dirty_requested_generation = 0;
         cal.dirty_applied_generation = 0;
-        cal.last_success_at = Some(twenty_min_ago);
+        cal.last_success_at = Some(twenty_min_ago.clone());
         cal.next_retry_at = Some(future_retry);
         assert!(!replica_due(&cal, now), "future backoff blocks even stale");
 
@@ -5328,6 +5729,18 @@ mod tests {
         cal.full_sync_requested = true;
         cal.last_success_at = Some(one_min_ago);
         assert!(replica_due(&cal, now), "full_sync_requested forces due");
+
+        // freeBusyReader + dirty + last_success 20m ago → not due
+        cal.full_sync_requested = false;
+        cal.access_role = "freeBusyReader".to_string();
+        cal.dirty_requested_generation = 3;
+        cal.dirty_applied_generation = 0;
+        cal.last_success_at = Some(twenty_min_ago);
+        cal.next_retry_at = None;
+        assert!(
+            !replica_due(&cal, now),
+            "freeBusyReader must never start a replica walk"
+        );
     }
 
     #[test]
@@ -5360,8 +5773,18 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let gets = http.gets.lock().unwrap();
-        assert_eq!(gets.len(), 1);
-        assert!(gets[0].contains("primary%40example.com/events"), "{:?}", gets);
+        let event_gets: Vec<_> = gets.iter().filter(|u| u.contains("/events")).collect();
+        assert_eq!(event_gets.len(), 1, "{gets:?}");
+        assert!(
+            event_gets[0].contains("primary%40example.com/events"),
+            "{:?}",
+            gets
+        );
+        assert_eq!(
+            gets.iter().filter(|u| u.contains("calendarList")).count(),
+            1,
+            "{gets:?}"
+        );
         let stored = calendars.stored.lock().unwrap();
         let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
         assert_eq!(a.dirty_applied_generation, 1);
@@ -5468,6 +5891,345 @@ mod tests {
             "LeaseBusy must not fetch: {:?}",
             gets
         );
+    }
+
+    // ──────────────────────────────────────────
+    // refresh_calendar_list (incremental)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn calendar_list_incremental_new_calendar_appears() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let body = r#"{
+            "items": [
+                {"id": "new@example.com", "summary": "New", "timeZone": "UTC", "accessRole": "owner"}
+            ],
+            "nextSyncToken": "tok-2"
+        }"#;
+        let http = FakeHttp::new(vec![("calendarList", 200, body)]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        // with() seeds "test-list-token"; set the token the fixture expects.
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "tok-1", &now)).unwrap();
+        let watches = FakeWatchChannelRepo::new();
+
+        let new_ids = pollster::block_on(refresh_calendar_list(
+            &http,
+            &calendars,
+            Some(&watches),
+            &access(),
+            "u-1",
+            &now,
+        ))
+        .unwrap();
+
+        assert_eq!(new_ids.len(), 1, "one newly inserted local id");
+        let stored = calendars.stored.lock().unwrap();
+        let primary = stored
+            .iter()
+            .find(|c| c.google_calendar_id == "primary@example.com")
+            .unwrap();
+        assert!(primary.sync_enabled);
+        assert!(primary.deleted_at.is_none());
+        let newbie = stored
+            .iter()
+            .find(|c| c.google_calendar_id == "new@example.com")
+            .unwrap();
+        assert!(newbie.sync_enabled);
+        assert!(newbie.deleted_at.is_none());
+        assert_eq!(newbie.id, new_ids[0]);
+        drop(stored);
+        let token = pollster::block_on(calendars.get_calendar_list_sync_token("u-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(token, "tok-2");
+        let gets = http.gets.lock().unwrap();
+        assert!(gets[0].contains("syncToken=tok-1"), "{gets:?}");
+        assert!(gets[0].contains("showDeleted=true"), "{gets:?}");
+    }
+
+    #[test]
+    fn calendar_list_incremental_deleted_disables_and_stops_watches() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let body = r#"{
+            "items": [
+                {"id": "primary@example.com", "deleted": true}
+            ],
+            "nextSyncToken": "tok-del"
+        }"#;
+        let http = FakeHttp::new(vec![
+            ("calendarList", 200, body),
+            ("/channels/stop", 200, "{}"),
+        ]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "tok-1", &now)).unwrap();
+        // Preload an event so soft-delete of the calendar does not wipe events.
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(seeded_event("ev-1", "cal-1", "g-1", ""));
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-21T22:13:20Z")]);
+
+        let dirty_before = calendars.stored.lock().unwrap()[0].dirty_requested_generation;
+
+        pollster::block_on(refresh_calendar_list(
+            &http,
+            &calendars,
+            Some(&watches),
+            &access(),
+            "u-1",
+            &now,
+        ))
+        .unwrap();
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_enabled, false);
+        assert!(stored[0].deleted_at.is_some());
+        assert_eq!(
+            stored[0].dirty_requested_generation, dirty_before,
+            "deleted list entry must not bump dirty"
+        );
+        drop(stored);
+        assert_eq!(
+            *watches.deleted_by_calendar_id.lock().unwrap(),
+            vec!["cal-1".to_string()]
+        );
+        let posts = http.posts.lock().unwrap();
+        assert!(
+            posts.iter().any(|(u, _)| u.contains("/channels/stop")),
+            "watch stop POST expected: {posts:?}"
+        );
+        // Events repo not wiped.
+        let evs = events.stored.lock().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].deleted_at.is_none());
+    }
+
+    #[test]
+    fn calendar_list_incremental_absence_does_not_delete() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let body = r#"{"items":[],"nextSyncToken":"tok-empty"}"#;
+        let http = FakeHttp::new(vec![("calendarList", 200, body)]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "tok-1", &now)).unwrap();
+        let watches = FakeWatchChannelRepo::new();
+
+        pollster::block_on(refresh_calendar_list(
+            &http,
+            &calendars,
+            Some(&watches),
+            &access(),
+            "u-1",
+            &now,
+        ))
+        .unwrap();
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].sync_enabled);
+        assert!(stored[0].deleted_at.is_none());
+        drop(stored);
+        let token = pollster::block_on(calendars.get_calendar_list_sync_token("u-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(token, "tok-empty");
+    }
+
+    #[test]
+    fn calendar_list_full_absence_orphans() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let body = r#"{
+            "items": [
+                {"id": "b@example.com", "summary": "B", "accessRole": "owner"}
+            ],
+            "nextSyncToken": "tok-full"
+        }"#;
+        let http = FakeHttp::new(vec![
+            ("calendarList", 200, body),
+            ("/channels/stop", 200, "{}"),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![
+            calendar("cal-a", "a@example.com", true),
+            calendar("cal-b", "b@example.com", true),
+        ]);
+        // Clear the seeded list token so this walk is full (orphan path).
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "", &now)).unwrap();
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-a", "2023-11-21T22:13:20Z")]);
+
+        pollster::block_on(refresh_calendar_list(
+            &http,
+            &calendars,
+            Some(&watches),
+            &access(),
+            "u-1",
+            &now,
+        ))
+        .unwrap();
+
+        let stored = calendars.stored.lock().unwrap();
+        let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+        assert!(!a.sync_enabled);
+        assert!(a.deleted_at.is_some());
+        let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
+        assert!(b.sync_enabled);
+        assert!(b.deleted_at.is_none());
+        drop(stored);
+        assert_eq!(
+            *watches.deleted_by_calendar_id.lock().unwrap(),
+            vec!["cal-a".to_string()]
+        );
+        let token = pollster::block_on(calendars.get_calendar_list_sync_token("u-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(token, "tok-full");
+        // Full list URL must not carry syncToken.
+        let gets = http.gets.lock().unwrap();
+        assert!(
+            gets.iter().any(|u| u.contains("calendarList") && !u.contains("syncToken=")),
+            "{gets:?}"
+        );
+    }
+
+    #[test]
+    fn calendar_list_410_merge_full_does_not_wipe_on_mid_failure() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        // First GET is incremental (has syncToken) → 410.
+        // Second GET is full (no syncToken) → 500.
+        let http = FakeHttp::new(vec![
+            ("syncToken=", 410, r#"{"error":"gone"}"#),
+            ("calendarList", 500, r#"{"error":"boom"}"#),
+        ]);
+        let calendars =
+            FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "old", &now)).unwrap();
+        let watches = FakeWatchChannelRepo::new();
+
+        let err = pollster::block_on(refresh_calendar_list(
+            &http,
+            &calendars,
+            Some(&watches),
+            &access(),
+            "u-1",
+            &now,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("500") || err.to_string().contains("calendarList"), "{err}");
+
+        let stored = calendars.stored.lock().unwrap();
+        assert!(stored[0].sync_enabled);
+        assert!(stored[0].deleted_at.is_none());
+        drop(stored);
+        // Cursor cleared on 410 start — never a fabricated new success token.
+        let token = pollster::block_on(calendars.get_calendar_list_sync_token("u-1"))
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(token, "", "must not persist a new success token after failed walk");
+    }
+
+    #[test]
+    fn calendar_list_metadata_upsert_does_not_re_enable_disabled() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let body = r#"{
+            "items": [
+                {"id": "primary@example.com", "summary": "Renamed", "accessRole": "writer", "timeZone": "Asia/Colombo"}
+            ],
+            "nextSyncToken": "tok-meta"
+        }"#;
+        let http = FakeHttp::new(vec![("calendarList", 200, body)]);
+        let mut cal = calendar("cal-1", "primary@example.com", false);
+        cal.summary = "Old".to_string();
+        cal.access_role = "owner".to_string();
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        // Full walk also exercises the same upsert contract.
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "", &now)).unwrap();
+        let watches = FakeWatchChannelRepo::new();
+
+        pollster::block_on(refresh_calendar_list(
+            &http,
+            &calendars,
+            Some(&watches),
+            &access(),
+            "u-1",
+            &now,
+        ))
+        .unwrap();
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            !stored[0].sync_enabled,
+            "deliberate disable must survive metadata upsert"
+        );
+        assert_eq!(stored[0].summary, "Renamed");
+        assert_eq!(stored[0].access_role, "writer");
+        assert_eq!(stored[0].time_zone, "Asia/Colombo");
+        assert!(stored[0].deleted_at.is_none());
+    }
+
+    #[test]
+    fn cron_publishes_newly_appeared_calendar_from_list_refresh() {
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let list_body = r#"{
+            "items": [
+                {"id": "new@example.com", "summary": "New", "accessRole": "owner"}
+            ],
+            "nextSyncToken": "tok-cron"
+        }"#;
+        // New calendar is never_initialized → replica_due; script events.list.
+        let http = FakeHttp::new(vec![
+            ("calendarList", 200, list_body),
+            ("/events", 200, EVENTS_JSON),
+        ]);
+        let mut existing = calendar("cal-1", "primary@example.com", true);
+        // Fresh so only the new calendar is replica-due (never synced).
+        existing.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        existing.last_synced_at = existing.last_success_at.clone();
+        let calendars = FakeCalendarRepo::with(vec![existing]);
+        pollster::block_on(calendars.set_calendar_list_sync_token("u-1", "tok-1", &now)).unwrap();
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        // published includes the new calendar id from list refresh, plus the
+        // replica publish for that new calendar (never-synced → due).
+        assert!(
+            report
+                .published
+                .iter()
+                .any(|(u, _)| u == "u-1"),
+            "{:?}",
+            report.published
+        );
+        let new_rows: Vec<_> = calendars
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.google_calendar_id == "new@example.com")
+            .cloned()
+            .collect();
+        assert_eq!(new_rows.len(), 1);
+        assert!(new_rows[0].sync_enabled);
+        assert!(
+            report
+                .published
+                .iter()
+                .any(|(_, id)| id == &new_rows[0].id),
+            "new calendar id must be in published: {:?}",
+            report.published
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     // ──────────────────────────────────────────

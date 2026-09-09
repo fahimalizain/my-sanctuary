@@ -4504,6 +4504,26 @@ mod tests {
         async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
             Ok(())
         }
+
+        async fn get_calendar_list_sync_token(
+            &self,
+            _user_id: &str,
+        ) -> Result<Option<String>, RepoError> {
+            Ok(None)
+        }
+
+        async fn set_calendar_list_sync_token(
+            &self,
+            _user_id: &str,
+            _token: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
+            Ok(Vec::new())
+        }
     }
 
     /// In-memory event repo: upserts materialize `CalendarEvent` rows (so the

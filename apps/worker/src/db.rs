@@ -31,7 +31,9 @@ use api_core::repo::{
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL,
     CALENDAR_MARK_DIRTY_APPLIED_SQL,
     CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
-    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
+    CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_LIST_USER_IDS_SQL,
     CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
     CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
@@ -676,6 +678,55 @@ impl CalendarRepo for D1CalendarRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    async fn get_calendar_list_sync_token(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<String>, RepoError> {
+        #[derive(Deserialize)]
+        struct Row {
+            sync_token: String,
+        }
+        let stmt = self
+            .db
+            .prepare(CALENDAR_LIST_STATE_GET_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<Row>(None).await.map_err(backend)?;
+        Ok(row.map(|r| r.sync_token))
+    }
+
+    async fn set_calendar_list_sync_token(
+        &self,
+        user_id: &str,
+        token: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_LIST_STATE_UPSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(token),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
+        #[derive(Deserialize)]
+        struct Row {
+            user_id: String,
+        }
+        let stmt = self
+            .db
+            .prepare(CALENDAR_LIST_USER_IDS_SQL)
+            .bind(&[])
+            .map_err(backend)?;
+        let rows: Vec<Row> = query_vec(stmt).await?;
+        Ok(rows.into_iter().map(|r| r.user_id).collect())
     }
 }
 
