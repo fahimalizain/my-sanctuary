@@ -68,6 +68,7 @@ pub mod replica;
 pub mod sync;
 pub mod window;
 pub(crate) mod google;
+pub(crate) mod journal;
 pub(crate) mod list;
 pub(crate) mod write;
 pub(crate) mod watch;
@@ -78,6 +79,10 @@ pub(crate) mod labels;
 
 #[cfg(test)]
 mod tests;
+
+/// In-memory operation journal for unit tests (tasks/agenda call sites).
+#[cfg(test)]
+pub(crate) use tests::support::FakeOperationRepo;
 
 use thiserror::Error;
 

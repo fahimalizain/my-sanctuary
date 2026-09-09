@@ -229,9 +229,10 @@ pub async fn list_calendars(
 
 /// `POST /api/calendar/events` → 200 `{"event":{...},"source":"google"}`.
 ///
-/// Body: `{calendar_id, summary, description?, start, end}`. Creates the
-/// event on Google, then upserts the returned row into the cache (a cache
-/// failure is logged, never fatal).
+/// Body: `{calendar_id, summary, description?, start, end}`. Journals the
+/// outbound insert, creates the event on Google, then upserts the returned
+/// row into the cache. A cache failure after Google commit is 500
+/// (`CalendarError::Repo`) — never 200 with a phantom local id.
 pub async fn create_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -259,10 +260,12 @@ pub async fn create_event(
 
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
     match api_core::create_event(
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &access,
         &input,
         now_unix,
@@ -270,9 +273,7 @@ pub async fn create_event(
     .await
     {
         Ok(output) => {
-            if let Some(error) = &output.cache_error {
-                console_log!("calendar: cache upsert failed for created event: {error}");
-            }
+            // create_event never returns Ok with cache_error set (issue #50).
             let event = paint_single_event(&ctx, &user_id, output.event).await?;
             let _ = crate::user_hub::notify_user(
                 &ctx.env,
@@ -294,6 +295,8 @@ pub async fn create_event(
             json_error(&ctx, 502, "google returned 404 for events.list")
         }
         Err(err) => {
+            // Includes cache-after-Google Repo failures (journal left
+            // google_committed for repair).
             console_log!("calendar: create_event failed: {err}");
             json_error(&ctx, 500, "failed to create event")
         }

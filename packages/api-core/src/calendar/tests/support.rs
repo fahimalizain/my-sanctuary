@@ -86,7 +86,10 @@ impl HttpClient for FakeHttp {
         _token: &str,
     ) -> Result<(u16, Vec<u8>), HttpError> {
         self.gets.lock().unwrap().push(url.to_string());
-        Ok(self.route(url))
+        let (status, response) = self.route(url);
+        // events.get by id: echo the path id into the JSON body (mirrors
+        // Google returning the client-supplied id after a 409 insert).
+        Ok((status, echo_get_event_id(url, response)))
     }
 
     async fn post_json(
@@ -99,7 +102,10 @@ impl HttpClient for FakeHttp {
             .lock()
             .unwrap()
             .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
-        Ok(self.route(url))
+        let (status, response) = self.route(url);
+        // Google echoes a client-supplied event id on insert. Rewrite the
+        // scripted response id so journaled mint and cache key stay aligned.
+        Ok((status, echo_insert_event_id(url, body, response)))
     }
 
     async fn patch_json(
@@ -114,6 +120,56 @@ impl HttpClient for FakeHttp {
             .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
         Ok(self.route(url))
     }
+}
+
+/// `events.insert` URL (collection), not `events/{id}` or `events/watch`.
+fn is_events_insert_url(url: &str) -> bool {
+    let Some(idx) = url.find("/events") else {
+        return false;
+    };
+    let rest = &url[idx + "/events".len()..];
+    rest.is_empty() || rest.starts_with('?')
+}
+
+/// When the request body has a string `id` and the routed response is JSON
+/// with an `id`, rewrite the response id to the request id (insert only).
+fn echo_insert_event_id(url: &str, request_body: &[u8], response: Vec<u8>) -> Vec<u8> {
+    if !is_events_insert_url(url) {
+        return response;
+    }
+    let Ok(req) = serde_json::from_slice::<serde_json::Value>(request_body) else {
+        return response;
+    };
+    let Some(req_id) = req.get("id").and_then(|v| v.as_str()) else {
+        return response;
+    };
+    rewrite_json_id(response, req_id)
+}
+
+/// `.../events/{id}` GET: rewrite response `id` to the path segment.
+fn echo_get_event_id(url: &str, response: Vec<u8>) -> Vec<u8> {
+    // Path form: .../events/{id} optionally followed by ?query
+    let Some(idx) = url.find("/events/") else {
+        return response;
+    };
+    let rest = &url[idx + "/events/".len()..];
+    let id = rest.split('?').next().unwrap_or(rest);
+    if id.is_empty() || id.contains('/') {
+        return response;
+    }
+    // Percent-decode is unnecessary for our minted ids (hex).
+    rewrite_json_id(response, id)
+}
+
+fn rewrite_json_id(response: Vec<u8>, id: &str) -> Vec<u8> {
+    let Ok(mut resp) = serde_json::from_slice::<serde_json::Value>(&response) else {
+        return response;
+    };
+    if resp.get("id").is_none() {
+        return response;
+    }
+    resp["id"] = serde_json::json!(id);
+    serde_json::to_vec(&resp).unwrap_or(response)
 }
 
 /// In-memory calendar repo: `upsert_batch` upserts by natural key

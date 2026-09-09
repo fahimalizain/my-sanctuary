@@ -263,6 +263,10 @@ pub struct GoogleEventExtendedProperties {
 /// on serialize, so the wire shape never carries `"0"`/empty placeholders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GoogleEventSharedProperties {
+    /// Client-supplied Google event id, stamped on every insert (issue #50).
+    /// Stable across retry; useful for restore. Always set on create.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_event_id")]
+    pub sanctuary_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_task_id")]
     pub sanctuary_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_focus")]

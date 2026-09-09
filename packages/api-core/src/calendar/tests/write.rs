@@ -4,45 +4,62 @@ use crate::calendar::{
     create_event, delete_event, delete_event_for_user, patch_event, patch_event_fields,
     update_event_for_user, CalendarError,
 };
-use crate::models::{GoogleCalendar, PatchEventFields};
+use crate::models::{
+    GoogleCalendar, PatchEventFields, OP_STATUS_CACHE_APPLIED, OP_STATUS_FAILED,
+    OP_STATUS_GOOGLE_COMMITTED, OP_VERB_INSERT,
+};
+
+const MINTED_ID: &str = "sanc0123456789abcdef0123456789ab";
 
 // ──────────────────────────────────────────
 // build_shared_properties
 // ──────────────────────────────────────────
 
 #[test]
-fn shared_properties_without_task_id_are_none() {
+fn shared_properties_without_task_id_are_event_id_only() {
     let mut input = input();
     input.priority = Some("high".to_string());
     input.difficulty = Some("hard".to_string());
-    assert!(
-        build_shared_properties(&input).is_none(),
-        "no carrier → no extendedProperties at all"
-    );
+    let shared = build_shared_properties(&input, MINTED_ID);
+    let value = serde_json::to_value(&shared).unwrap();
+    let map = value.as_object().unwrap();
+    assert_eq!(map.len(), 1, "hand-created: only sanctuary_event_id: {value}");
+    assert_eq!(map["sanctuary_event_id"], MINTED_ID);
+    assert_eq!(shared.sanctuary_task_id, None);
+    assert_eq!(shared.sanctuary_priority, None);
+    assert_eq!(shared.sanctuary_difficulty, None);
 }
 
 #[test]
-fn shared_properties_with_whitespace_only_task_id_are_none() {
+fn shared_properties_with_whitespace_only_task_id_are_event_id_only() {
     for blank in ["", "   ", "\t"] {
         let mut input = input();
         input.task_id = Some(blank.to_string());
-        assert!(
-            build_shared_properties(&input).is_none(),
-            "whitespace-only task id {blank:?} is no carrier"
+        let shared = build_shared_properties(&input, MINTED_ID);
+        let value = serde_json::to_value(&shared).unwrap();
+        let map = value.as_object().unwrap();
+        assert_eq!(
+            map.len(),
+            1,
+            "whitespace-only task id {blank:?} is no carrier: {value}"
         );
+        assert_eq!(map["sanctuary_event_id"], MINTED_ID);
+        assert_eq!(shared.sanctuary_task_id, None);
     }
 }
 
 #[test]
-fn shared_properties_task_id_only_serializes_the_carrier_alone() {
+fn shared_properties_task_id_only_serializes_event_id_and_carrier() {
     let mut input = input();
     input.task_id = Some("task-1".to_string());
-    let shared = build_shared_properties(&input).expect("carrier present");
+    let shared = build_shared_properties(&input, MINTED_ID);
     assert_eq!(shared.sanctuary_task_id.as_deref(), Some("task-1"));
+    assert_eq!(shared.sanctuary_event_id.as_deref(), Some(MINTED_ID));
     let value = serde_json::to_value(&shared).unwrap();
     let map = value.as_object().unwrap();
-    assert_eq!(map.len(), 1, "only the carrier key: {value}");
+    assert_eq!(map.len(), 2, "event id + carrier: {value}");
     assert_eq!(map["sanctuary_task_id"], "task-1");
+    assert_eq!(map["sanctuary_event_id"], MINTED_ID);
     assert!(
         !matches!(map.get("sanctuary_focus"), Some(v) if v == "0"),
         "focus never serializes as \"0\""
@@ -57,7 +74,7 @@ fn shared_properties_focused_sets_sanctuary_focus_to_one() {
     let mut input = input();
     input.task_id = Some("task-1".to_string());
     input.sanctuary_focus = true;
-    let shared = build_shared_properties(&input).unwrap();
+    let shared = build_shared_properties(&input, MINTED_ID);
     assert_eq!(shared.sanctuary_focus.as_deref(), Some("1"));
 }
 
@@ -66,7 +83,7 @@ fn shared_properties_unfocused_omits_the_focus_key_on_serialize() {
     let mut input = input();
     input.task_id = Some("task-1".to_string());
     input.sanctuary_focus = false;
-    let shared = build_shared_properties(&input).unwrap();
+    let shared = build_shared_properties(&input, MINTED_ID);
     assert_eq!(shared.sanctuary_focus, None);
     let value = serde_json::to_value(&shared).unwrap();
     assert!(
@@ -81,7 +98,7 @@ fn shared_properties_carry_priority_and_difficulty_snapshots() {
     input.task_id = Some("task-1".to_string());
     input.priority = Some("high".to_string());
     input.difficulty = Some("hard".to_string());
-    let shared = build_shared_properties(&input).unwrap();
+    let shared = build_shared_properties(&input, MINTED_ID);
     assert_eq!(shared.sanctuary_priority.as_deref(), Some("high"));
     assert_eq!(shared.sanctuary_difficulty.as_deref(), Some("hard"));
     let value = serde_json::to_value(&shared).unwrap();
@@ -95,7 +112,7 @@ fn shared_properties_blank_snapshots_are_dropped() {
     input.task_id = Some("task-1".to_string());
     input.priority = Some("  ".to_string());
     input.difficulty = Some("\t".to_string());
-    let shared = build_shared_properties(&input).unwrap();
+    let shared = build_shared_properties(&input, MINTED_ID);
     assert_eq!(shared.sanctuary_priority, None);
     assert_eq!(shared.sanctuary_difficulty, None);
     let value = serde_json::to_value(&shared).unwrap();
@@ -104,14 +121,21 @@ fn shared_properties_blank_snapshots_are_dropped() {
 }
 
 #[test]
-fn shared_properties_focus_without_a_task_id_is_none() {
+fn shared_properties_focus_without_a_task_id_omits_focus_and_snapshots() {
     let mut input = input();
     input.sanctuary_focus = true;
     input.priority = Some("high".to_string());
-    assert!(
-        build_shared_properties(&input).is_none(),
-        "focus and snapshots never travel without the carrier"
+    let shared = build_shared_properties(&input, MINTED_ID);
+    let value = serde_json::to_value(&shared).unwrap();
+    let map = value.as_object().unwrap();
+    assert_eq!(
+        map.len(),
+        1,
+        "focus and snapshots never travel without the task carrier: {value}"
     );
+    assert_eq!(map["sanctuary_event_id"], MINTED_ID);
+    assert_eq!(shared.sanctuary_focus, None);
+    assert_eq!(shared.sanctuary_priority, None);
 }
 
 #[test]
@@ -123,22 +147,28 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
     ))
     .unwrap();
 
     assert_eq!(output.source, "google");
     assert!(output.cache_error.is_none());
-    assert!(!output.event.id.is_empty(), "persisted id from upsert");
-    assert_eq!(output.event.google_event_id, "google-evt-created");
+    assert_eq!(output.event.id, "evt-1", "persisted id from FakeEventRepo upsert");
+    assert!(!output.event.google_event_id.is_empty());
+    assert!(
+        output.event.google_event_id.starts_with("sanc"),
+        "minted client id: {}",
+        output.event.google_event_id
+    );
     assert_eq!(output.event.calendar_id, "cal-1");
     assert_eq!(output.event.title, "New meeting");
     assert_eq!(output.event.start_time, "2026-08-19T09:00:00Z");
     assert_eq!(output.event.last_synced_at, "2023-11-14T22:13:20Z");
 
-    // POST body carries the calendar contract.
+    // POST body carries the calendar contract + client id.
     let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
     assert!(url.contains("primary%40example.com"), "{url}");
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -146,6 +176,11 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
     assert_eq!(body["description"], "About things");
     assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
     assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z");
+    assert_eq!(body["id"], output.event.google_event_id);
+    assert_eq!(
+        body["extendedProperties"]["shared"]["sanctuary_event_id"],
+        output.event.google_event_id
+    );
     assert!(body.get("colorId").is_none(), "hand-created events carry no colorId");
     assert!(
         body.get("eventLabelId").is_none(),
@@ -155,11 +190,25 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
         !url.contains("eventLabelVersion"),
         "hand-created events do not require eventLabelVersion: {url}"
     );
+    assert_eq!(http.posts.lock().unwrap().len(), 1);
 
-    // Cache upsert happened with the mapped row.
+    // Cache upsert happened with the mapped row (echoed mint id).
     let (google_id, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
-    assert_eq!(google_id, "google-evt-created");
+    assert_eq!(google_id, output.event.google_event_id);
     assert_eq!(upserted.calendar_id, "cal-1");
+
+    // Journal: pending → google_committed → cache_applied.
+    let stored = ops.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    let op = &stored[0];
+    assert_eq!(op.verb, OP_VERB_INSERT);
+    assert_eq!(op.status, OP_STATUS_CACHE_APPLIED);
+    assert_eq!(op.google_event_id, output.event.google_event_id);
+    assert_eq!(op.local_event_id, "evt-1");
+    assert_eq!(op.user_id, "u-1");
+    assert_eq!(op.calendar_id, "cal-1");
+    assert!(!op.payload_fingerprint.is_empty());
+    assert_eq!(op.google_etag, "e1");
 }
 
 #[test]
@@ -176,16 +225,20 @@ fn create_with_color_hex_sends_event_label_id() {
         ..calendar("cal-1", "primary@example.com", true)
     }]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
     let mut input = input();
     input.color_hex = Some("#535050".to_string());
 
-    pollster::block_on(create_event(&http, &calendars, &events, &access(), &input, NOW_UNIX))
-        .unwrap();
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+    ))
+    .unwrap();
 
     let (url, body) = http.posts.lock().unwrap().first().unwrap().clone();
     assert!(url.contains("eventLabelVersion=1"), "{url}");
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["eventLabelId"], "label-graphite");
+    assert!(body.get("id").and_then(|v| v.as_str()).is_some(), "client id in body: {body}");
     assert!(
         body.get("colorId").is_none(),
         "create_event never sends colorId: {body}"
@@ -196,6 +249,7 @@ fn create_with_color_hex_sends_event_label_id() {
 fn create_with_blank_color_hex_omits_color_keys() {
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
     for blank in ["", "   ", "\t"] {
         let http = FakeHttp::new(vec![(
             "/calendars/primary%40example.com/events",
@@ -206,7 +260,7 @@ fn create_with_blank_color_hex_omits_color_keys() {
         input.color_hex = Some(blank.to_string());
 
         pollster::block_on(create_event(
-            &http, &calendars, &events, &access(), &input, NOW_UNIX,
+            &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
         ))
         .unwrap();
 
@@ -226,18 +280,19 @@ fn create_with_blank_color_hex_omits_color_keys() {
 #[test]
 fn create_with_color_hex_and_empty_label_cache_is_invalid() {
     // Empty string = cache miss. The start must fail with a 400-shaped
-    // Invalid — no `calendars.get`, no POST.
+    // Invalid — no `calendars.get`, no POST, no journal.
     let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
         event_labels: String::new(),
         ..calendar("cal-1", "primary@example.com", true)
     }]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
     let http = FakeHttp::new(vec![]);
     let mut input = input();
     input.color_hex = Some("#4285f4".to_string());
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
     ))
     .unwrap_err();
     assert!(
@@ -245,6 +300,7 @@ fn create_with_color_hex_and_empty_label_cache_is_invalid() {
         "got {err:?}"
     );
     assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal row");
 }
 
 #[test]
@@ -252,12 +308,13 @@ fn create_with_color_hex_and_no_matching_label_is_invalid() {
     // Fetched-but-empty cache (`"[]"` = no labels on the calendar).
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
     let http = FakeHttp::new(vec![]);
     let mut cobalt_input = input();
     cobalt_input.color_hex = Some("#4285f4".to_string());
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &cobalt_input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &cobalt_input, NOW_UNIX,
     ))
     .unwrap_err();
     assert!(
@@ -272,12 +329,13 @@ fn create_with_color_hex_and_no_matching_label_is_invalid() {
         ..calendar("cal-1", "primary@example.com", true)
     }]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
     let http = FakeHttp::new(vec![]);
     let mut banana_input = input();
     banana_input.color_hex = Some("#4285f4".to_string());
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &banana_input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &banana_input, NOW_UNIX,
     ))
     .unwrap_err();
     assert!(
@@ -292,13 +350,15 @@ fn create_missing_calendar_is_not_found() {
     let http = FakeHttp::new(vec![]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-other", "other", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
     assert!(http.posts.lock().unwrap().is_empty(), "no Google call");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal row");
 }
 
 #[test]
@@ -306,17 +366,22 @@ fn create_google_non_2xx_is_an_api_error() {
     let http = FakeHttp::new(vec![("/events", 400, r#"{"error":"invalid"}"#)]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
     assert!(events.upserted_single.lock().unwrap().is_none(), "no cache write on failure");
+    let stored = ops.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].status, OP_STATUS_FAILED);
+    assert!(stored[0].last_error.contains("400"), "{}", stored[0].last_error);
 }
 
 #[test]
-fn create_cache_failure_is_logged_not_fatal() {
+fn create_cache_failure_after_google_is_repo_error() {
     let http = FakeHttp::new(vec![(
         "/calendars/primary%40example.com/events",
         200,
@@ -324,20 +389,101 @@ fn create_cache_failure_is_logged_not_fatal() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
     *events.fail_upsert.lock().unwrap() = true;
 
+    let err = pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+    ))
+    .unwrap_err();
+
+    assert!(matches!(err, CalendarError::Repo(_)), "got {err:?}");
+    assert_eq!(http.posts.lock().unwrap().len(), 1, "exactly one POST");
+    let stored = ops.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].status, OP_STATUS_GOOGLE_COMMITTED,
+        "cache fail leaves journal google_committed"
+    );
+    assert!(stored[0].local_event_id.is_empty());
+    assert!(!stored[0].google_event_id.is_empty());
+}
+
+#[test]
+fn create_409_duplicate_gets_existing_and_applies_cache() {
+    // GET route first — FakeHttp matches first substring; POST path
+    // `.../events` would otherwise steal a GET to `.../events/sanc...`.
+    let http = FakeHttp::new(vec![
+        (
+            "/events/sanc",
+            200,
+            r#"{
+                "id": "placeholder", "etag": "etag-from-get",
+                "updated": "2026-08-17T12:00:00.000Z",
+                "summary": "New meeting", "description": "About things",
+                "start": {"dateTime": "2026-08-19T09:00:00Z"},
+                "end": {"dateTime": "2026-08-19T10:00:00Z"}
+            }"#,
+        ),
+        (
+            "/calendars/primary%40example.com/events",
+            409,
+            r#"{"error":{"code":409,"message":"already exists"}}"#,
+        ),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
     ))
     .unwrap();
 
-    assert_eq!(output.source, "google");
-    assert_eq!(output.event.google_event_id, "google-evt-created");
+    assert_eq!(output.event.id, "evt-1");
+    assert_eq!(http.posts.lock().unwrap().len(), 1, "no second POST");
+    let gets = http.gets.lock().unwrap().clone();
+    assert_eq!(gets.len(), 1);
     assert!(
-        matches!(output.cache_error.as_deref(), Some(message) if message.contains("cache write failed")),
-        "{:?}",
-        output.cache_error
+        gets[0].contains(&output.event.google_event_id),
+        "GET uses minted id: {} vs {}",
+        gets[0],
+        output.event.google_event_id
     );
+
+    let stored = ops.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].status, OP_STATUS_CACHE_APPLIED);
+    assert_eq!(stored[0].google_etag, "etag-from-get");
+    assert_eq!(stored[0].local_event_id, "evt-1");
+    assert_eq!(stored[0].google_event_id, output.event.google_event_id);
+
+    let rows = events.stored.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].google_event_id, output.event.google_event_id);
+}
+
+#[test]
+fn create_journal_insert_failure_skips_google() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    *ops.fail_insert.lock().unwrap() = true;
+
+    let err = pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+    ))
+    .unwrap_err();
+
+    assert!(matches!(err, CalendarError::Repo(_)), "got {err:?}");
+    assert!(http.posts.lock().unwrap().is_empty(), "no Google POST");
+    assert!(ops.stored.lock().unwrap().is_empty());
+    assert!(events.upserted_single.lock().unwrap().is_none());
 }
 
 #[test]
@@ -349,11 +495,12 @@ fn create_with_task_id_sends_extended_properties_and_maps_it_back() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let mut input = input();
     input.task_id = Some("task-1".to_string());
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
     ))
     .unwrap();
 
@@ -365,6 +512,10 @@ fn create_with_task_id_sends_extended_properties_and_maps_it_back() {
     assert_eq!(
         body["extendedProperties"]["shared"]["sanctuary_task_id"],
         "task-1"
+    );
+    assert_eq!(
+        body["extendedProperties"]["shared"]["sanctuary_event_id"],
+        output.event.google_event_id
     );
     let shared = body["extendedProperties"]["shared"].as_object().unwrap();
     for key in ["sanctuary_focus", "sanctuary_priority", "sanctuary_difficulty"] {
@@ -379,7 +530,7 @@ fn create_with_task_id_sends_extended_properties_and_maps_it_back() {
 }
 
 #[test]
-fn create_without_task_id_sends_no_extended_properties() {
+fn create_without_task_id_sends_only_sanctuary_event_id() {
     let http = FakeHttp::new(vec![(
         "/calendars/primary%40example.com/events",
         200,
@@ -387,16 +538,29 @@ fn create_without_task_id_sends_no_extended_properties() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
     ))
     .unwrap();
 
     let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(body.get("extendedProperties").is_none(), "{body}");
-    assert_eq!(output.event.task_id, "", "no property → no task link");
+    let shared = body["extendedProperties"]["shared"].as_object().unwrap();
+    assert_eq!(shared.len(), 1, "hand-created: only sanctuary_event_id: {body}");
+    assert_eq!(shared["sanctuary_event_id"], output.event.google_event_id);
+    for key in [
+        "sanctuary_task_id",
+        "sanctuary_focus",
+        "sanctuary_priority",
+        "sanctuary_difficulty",
+        "sanctuary_routine_id",
+        "sanctuary_occurrence_id",
+    ] {
+        assert!(!shared.contains_key(key), "{key} must be absent: {body}");
+    }
+    assert_eq!(output.event.task_id, "", "no task carrier → no task link");
 }
 
 #[test]
@@ -408,17 +572,18 @@ fn create_with_task_and_focus_sends_both_shared_keys() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let mut input = input();
     input.task_id = Some("task-1".to_string());
     input.sanctuary_focus = true;
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
     ))
     .unwrap();
 
-    // Both keys travel together — never a partial shared map, never
-    // `sanctuary_focus` inside a `private` map.
+    // Task + focus + event id travel together — never a partial shared map,
+    // never `sanctuary_focus` inside a `private` map.
     let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
@@ -426,6 +591,10 @@ fn create_with_task_and_focus_sends_both_shared_keys() {
         "task-1"
     );
     assert_eq!(body["extendedProperties"]["shared"]["sanctuary_focus"], "1");
+    assert_eq!(
+        body["extendedProperties"]["shared"]["sanctuary_event_id"],
+        output.event.google_event_id
+    );
     // No snapshots were set on the input, so P/D stay absent.
     let shared = body["extendedProperties"]["shared"].as_object().unwrap();
     for key in ["sanctuary_priority", "sanctuary_difficulty"] {
@@ -441,8 +610,8 @@ fn create_with_task_and_focus_sends_both_shared_keys() {
 
 #[test]
 fn create_with_task_but_no_focus_omits_the_focus_key() {
-    // Unfocused creates (e.g. `start_task`) send the carrier alone — the
-    // `sanctuary_focus` key must not appear, and never as `"0"`.
+    // Unfocused creates (e.g. `start_task`) send the carrier + event id —
+    // the `sanctuary_focus` key must not appear, and never as `"0"`.
     let http = FakeHttp::new(vec![(
         "/calendars/primary%40example.com/events",
         200,
@@ -450,12 +619,15 @@ fn create_with_task_but_no_focus_omits_the_focus_key() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let mut input = input();
     input.task_id = Some("task-1".to_string());
     input.sanctuary_focus = false;
-    pollster::block_on(create_event(&http, &calendars, &events, &access(), &input, NOW_UNIX))
-        .unwrap();
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+    ))
+    .unwrap();
 
     let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -478,6 +650,7 @@ fn create_with_task_priority_and_difficulty_snapshots_both_keys() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let mut input = input();
     input.task_id = Some("task-1".to_string());
@@ -485,7 +658,7 @@ fn create_with_task_priority_and_difficulty_snapshots_both_keys() {
     input.difficulty = Some("hard".to_string());
     input.sanctuary_focus = false;
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
     ))
     .unwrap();
 

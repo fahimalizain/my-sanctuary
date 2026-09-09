@@ -1,11 +1,9 @@
 use super::apply::{map_google_event, row_from_new_event, GoogleEvent, GoogleEventSharedProperties};
 use super::google::encode_path_segment;
-use super::labels::CachedEventLabel;
 use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
-use crate::google_color::snap_to_event_label_hex;
 use crate::models::{CalendarEvent, GoogleCalendar, NewEventInput, PatchEventFields};
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
 use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
@@ -14,21 +12,27 @@ use crate::token::GoogleAccess;
 pub struct CreateEventOutput {
     pub event: CalendarEvent,
     pub source: String,
-    /// Set when the local cache upsert failed (logged, never fatal).
+    /// Set when the local cache upsert failed on **patch** (logged, never
+    /// fatal). [`create_event`] never returns `Ok` with this set — a cache
+    /// miss after Google commit is [`CalendarError::Repo`].
     pub cache_error: Option<String>,
 }
 
 /// Builds `extendedProperties.shared` for an `events.insert`.
 ///
-/// Returns `None` when there is no carrier — hand-created events send no
-/// extendedProperties at all. A **task** carrier (`task_id`) is always
-/// `sanctuary_task_id` (plus `sanctuary_focus` `"1"` only if focused, never
-/// `"0"`, and the priority/difficulty snapshots only when non-empty). An
-/// **occurrence** carrier (both `routine_id` and `occurrence_id` present)
-/// sends exactly `sanctuary_routine_id` + `sanctuary_occurrence_id` — no
-/// task_id, no focus/priority/difficulty (focus stays task-only). Never a
-/// partial map without a carrier, and never both carriers at once.
-pub(crate) fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEventSharedProperties> {
+/// Always includes `sanctuary_event_id` (the client-supplied Google event id).
+/// A **task** carrier (`task_id`) adds `sanctuary_task_id` (plus
+/// `sanctuary_focus` `"1"` only if focused, never `"0"`, and the
+/// priority/difficulty snapshots only when non-empty). An **occurrence**
+/// carrier (both `routine_id` and `occurrence_id` present) adds
+/// `sanctuary_routine_id` + `sanctuary_occurrence_id` — no task_id, no
+/// focus/priority/difficulty (focus stays task-only). Hand-created events
+/// (no carrier) send **only** `sanctuary_event_id`. Never both carriers at
+/// once; never a partial occurrence pair.
+pub(crate) fn build_shared_properties(
+    input: &NewEventInput,
+    sanctuary_event_id: &str,
+) -> GoogleEventSharedProperties {
     let trim_opt = |value: &Option<String>| {
         value
             .as_deref()
@@ -36,15 +40,20 @@ pub(crate) fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEve
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    let base = GoogleEventSharedProperties {
+        sanctuary_event_id: Some(sanctuary_event_id.to_string()),
+        ..Default::default()
+    };
     if let Some(task_id) = input.task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(GoogleEventSharedProperties {
+        return GoogleEventSharedProperties {
+            sanctuary_event_id: base.sanctuary_event_id,
             sanctuary_task_id: Some(task_id.to_string()),
             sanctuary_focus: input.sanctuary_focus.then(|| "1".to_string()),
             sanctuary_priority: trim_opt(&input.priority),
             sanctuary_difficulty: trim_opt(&input.difficulty),
             sanctuary_routine_id: None,
             sanctuary_occurrence_id: None,
-        });
+        };
     }
     // Occurrence carrier: BOTH ids must be present (a partial pair is a
     // caller bug — never emit a partial map).
@@ -55,21 +64,28 @@ pub(crate) fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEve
         .map(str::trim)
         .filter(|s| !s.is_empty());
     match (routine_id, occurrence_id) {
-        (Some(routine_id), Some(occurrence_id)) => Some(GoogleEventSharedProperties {
+        (Some(routine_id), Some(occurrence_id)) => GoogleEventSharedProperties {
+            sanctuary_event_id: base.sanctuary_event_id,
             sanctuary_task_id: None,
             sanctuary_focus: None,
             sanctuary_priority: None,
             sanctuary_difficulty: None,
             sanctuary_routine_id: Some(routine_id.to_string()),
             sanctuary_occurrence_id: Some(occurrence_id.to_string()),
-        }),
-        _ => None,
+        },
+        _ => base,
     }
 }
 
-/// Creates an event on Google (`events.insert`) and upserts the returned row
-/// into the local cache. A cache failure is logged (returned in
-/// [`CreateEventOutput::cache_error`]), never fatal.
+/// Creates an event on Google (`events.insert`) via the outbound operation
+/// journal (issue #50 / Vertical 4).
+///
+/// Journals a `pending` row **before** the Google call, mints a
+/// client-supplied event id once (reused on 409 → GET), stamps
+/// `sanctuary_event_id` on every insert, and returns the V2 persisted local
+/// id after cache apply. A cache failure after Google commit is
+/// [`CalendarError::Repo`] (status stays `google_committed`); create never
+/// returns `Ok` with [`CreateEventOutput::cache_error`] set.
 ///
 /// When `input.task_id` is set, the payload carries
 /// `extendedProperties.shared.sanctuary_task_id` — the task timer's carrier
@@ -84,100 +100,29 @@ pub(crate) fn build_shared_properties(input: &NewEventInput) -> Option<GoogleEve
 /// snapshots) alone.
 ///
 /// When instead `routine_id` AND `occurrence_id` are both set (slice 6 — a
-/// started occurrence's one-shot log), the shared map carries exactly
-/// `sanctuary_routine_id` + `sanctuary_occurrence_id`; `calendar_events.task_id`
-/// stays empty (occurrence events are resolved through the occurrence row,
-/// never through the task column). `task_id` and the occurrence pair are
-/// mutually exclusive at the call sites.
+/// started occurrence's one-shot log), the shared map carries
+/// `sanctuary_routine_id` + `sanctuary_occurrence_id` (plus
+/// `sanctuary_event_id`); `calendar_events.task_id` stays empty. `task_id`
+/// and the occurrence pair are mutually exclusive at the call sites.
 pub async fn create_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     input: &NewEventInput,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
-    let Some(cal) = calendars.get_by_id(&input.calendar_id).await? else {
-        return Err(CalendarError::NotFound);
-    };
-
-    let url = format!(
-        "{GOOGLE_EVENTS_BASE_URL}/{}/events",
-        encode_path_segment(&cal.google_calendar_id)
-    );
-    let mut payload = serde_json::json!({
-        "summary": input.summary,
-        "description": input.description,
-        "start": { "dateTime": input.start },
-        "end": { "dateTime": input.end },
-    });
-    if let Some(shared) = build_shared_properties(input) {
-        payload["extendedProperties"] = serde_json::json!({ "shared": shared });
-    }
-    // Category color → Google event label: snap the caller's hex onto the 24
-    // event-label palette (chroma-first, persisted nowhere), then resolve the
-    // label's id against the calendar's CACHED `event_labels`. A cache miss
-    // or a missing match fails the start (400) — never a `calendars.get` and
-    // never a label write. `colorId` is never sent. Hand-created events
-    // (`None` / blank after trim) stay uncolored: no `eventLabelId`, and the
-    // POST URL stays without `eventLabelVersion`.
-    let url = match input.color_hex.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(color_hex) => {
-            let snapped = snap_to_event_label_hex(color_hex)
-                .map_err(|err| CalendarError::Invalid(err.to_string()))?;
-            if cal.event_labels.is_empty() {
-                return Err(CalendarError::Invalid(
-                    "calendar event-label cache is empty".to_string(),
-                ));
-            }
-            let labels: Vec<CachedEventLabel> = serde_json::from_str(&cal.event_labels)
-                .map_err(|err| {
-                    CalendarError::Invalid(format!("invalid calendar event-label cache: {err}"))
-                })?;
-            let label_id = labels
-                .iter()
-                .find(|label| label.background_color.eq_ignore_ascii_case(&snapped))
-                .map(|label| label.id.clone())
-                .ok_or_else(|| {
-                    CalendarError::Invalid("no event label matches category color".to_string())
-                })?;
-            payload["eventLabelId"] = serde_json::json!(label_id);
-            format!(
-                "{GOOGLE_EVENTS_BASE_URL}/{}/events?eventLabelVersion=1",
-                encode_path_segment(&cal.google_calendar_id)
-            )
-        }
-        None => url,
-    };
-    let body =
-        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
-    let (status, response) = http.post_json(&url, &access.access_token, &body).await?;
-    if !(200..300).contains(&status) {
-        return Err(CalendarError::GoogleApi(format!(
-            "google events.insert returned {status}"
-        )));
-    }
-    let created: GoogleEvent = serde_json::from_slice(&response)
-        .map_err(|err| CalendarError::InvalidResponse(format!("events.insert body: {err}")))?;
-
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let new_event = map_google_event(&created, &cal.id, &now_rfc3339);
-    let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
-        Ok(id) => id,
-        Err(err) => {
-            return Ok(CreateEventOutput {
-                event: row_from_new_event(new_event, "".to_string(), &now_rfc3339),
-                source: "google".to_string(),
-                cache_error: Some(err.to_string()),
-            });
-        }
-    };
-
-    Ok(CreateEventOutput {
-        event: row_from_new_event(new_event, id, &now_rfc3339),
-        source: "google".to_string(),
-        cache_error: None,
-    })
+    super::journal::create_event_with_journal(
+        http,
+        calendars,
+        events,
+        operations,
+        access,
+        input,
+        now_unix,
+    )
+    .await
 }
 
 /// Patches selected fields on Google (`events.patch`) and upserts the

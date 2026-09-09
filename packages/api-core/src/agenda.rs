@@ -112,8 +112,8 @@ use crate::models::{
 };
 use crate::oauth::HttpClient;
 use crate::repo::{
-    AgendaItemRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError, RoutineRepo,
-    TaskCategoryRepo, TaskListRepo, TaskRepo, TokenRepo,
+    AgendaItemRepo, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo,
+    RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskRepo, TokenRepo,
 };
 use crate::routines::occurrence_dates;
 use crate::tasks::{ElongateReport, START_EVENT_MINUTES, TaskCategorySummary, TaskView};
@@ -1034,6 +1034,7 @@ pub async fn start_occurrence(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     routine_repo: &dyn RoutineRepo,
@@ -1099,6 +1100,7 @@ pub async fn start_occurrence(
         http,
         calendars,
         events,
+        operations,
         access,
         &NewEventInput {
             calendar_id: target.calendar_id.clone(),
@@ -3620,6 +3622,12 @@ mod tests {
         }
     }
 
+
+    fn ops() -> crate::calendar::FakeOperationRepo {
+        crate::calendar::FakeOperationRepo::new()
+    }
+
+
     /// All 24 event-label hexes as a cached `event_labels` JSON array with
     /// stable fake ids (`label-0` … `label-23`) — the fixture's default
     /// cache, so colored starts resolve their label id locally (create_event
@@ -3794,7 +3802,7 @@ mod tests {
         pollster::block_on(start_occurrence(
             &http,
             &calendars,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -5145,7 +5153,7 @@ mod tests {
         let response = pollster::block_on(start_occurrence(
             &http,
             &calendars,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -5189,6 +5197,10 @@ mod tests {
         assert_eq!(shared["sanctuary_routine_id"], "rt-1");
         assert_eq!(shared["sanctuary_occurrence_id"], "occ-1");
         assert!(
+            shared.get("sanctuary_event_id").and_then(|v| v.as_str()).is_some(),
+            "client-supplied event id stamped on every insert: {body}"
+        );
+        assert!(
             shared.get("sanctuary_task_id").is_none(),
             "task carrier never set: {body}"
         );
@@ -5202,8 +5214,8 @@ mod tests {
         );
         assert_eq!(
             shared.as_object().unwrap().len(),
-            2,
-            "exactly the two carriers: {body}"
+            3,
+            "event id + the two occurrence carriers: {body}"
         );
 
         // The cached event row carries NO task link — the two worlds stay apart.
@@ -5227,7 +5239,7 @@ mod tests {
         let response = pollster::block_on(start_occurrence(
             &http,
             &calendars,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -5291,7 +5303,7 @@ mod tests {
         let err = pollster::block_on(start_occurrence(
             &http,
             &kolkata,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -5316,7 +5328,7 @@ mod tests {
         let response = pollster::block_on(start_occurrence(
             &http,
             &ny,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -5462,7 +5474,7 @@ mod tests {
         let response = pollster::block_on(start_occurrence(
             &http,
             &calendars,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -5493,7 +5505,7 @@ mod tests {
         let err = pollster::block_on(start_occurrence(
             &http,
             &calendars,
-            &events,
+            &events, &ops(),
             &repos.lists,
             &repos.categories,
             &repos.routines,

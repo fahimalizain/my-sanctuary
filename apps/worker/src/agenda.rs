@@ -133,6 +133,15 @@ fn events_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::
     Ok(crate::db::D1CalendarEventRepo::new(db))
 }
 
+fn operations_d1(
+    ctx: &RouteContext<Option<api_core::Config>>,
+) -> Result<crate::db::D1CalendarEventOperationRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1CalendarEventOperationRepo::new(db))
+}
+
 fn tokens_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TokenRepo> {
     let db = ctx
         .d1("DB")
@@ -491,10 +500,12 @@ pub async fn start_occurrence(
 
     let calendars = calendars_d1(&ctx)?;
     let events = events_d1(&ctx)?;
+    let operations = operations_d1(&ctx)?;
     let result = api_core::start_occurrence(
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &lists_d1(&ctx)?,
         &categories_d1(&ctx)?,
         &routines_d1(&ctx)?,
