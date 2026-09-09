@@ -231,35 +231,60 @@ pub(crate) async fn delete_event_with_journal(
 
     let url = event_url(&cal.google_calendar_id, google_event_id);
 
+    // Empty stored etag (pre-V1 rows): bootstrap via GET. 404/410 means
+    // Google already dropped the event — same as PATCH 404/410: skip cancel
+    // and still local-delete. Other GET failures stay failed + GoogleApi.
+    let mut google_already_gone = false;
     if etag.is_empty() {
-        match fetch_etag(http, access, &url, "events.get before delete").await {
-            Ok(fresh) => etag = fresh,
+        let (status, body_bytes) = match http
+            .get_bearer_raw(&url, &access.access_token)
+            .await
+        {
+            Ok(pair) => pair,
             Err(err) => {
-                // GET failure before delete: still try cancel without etag?
-                // Spec: If GET fails, GoogleApi + mark failed.
+                let err = CalendarError::from(err);
                 mark_failed(operations, &op_id, &err, &now_rfc3339).await;
                 return Err(err);
+            }
+        };
+        if status == 404 || status == 410 {
+            google_already_gone = true;
+        } else if !(200..300).contains(&status) {
+            let err = CalendarError::GoogleApi(format!(
+                "google events.get before delete returned {status}"
+            ));
+            mark_failed(operations, &op_id, &err, &now_rfc3339).await;
+            return Err(err);
+        } else {
+            match parse_google_event(&body_bytes, "events.get before delete") {
+                Ok(ev) => etag = ev.etag.unwrap_or_default(),
+                Err(err) => {
+                    mark_failed(operations, &op_id, &err, &now_rfc3339).await;
+                    return Err(err);
+                }
             }
         }
     }
 
-    match patch_with_if_match(
-        http,
-        access,
-        operations,
-        &op_id,
-        google_event_id,
-        &local_event_id,
-        &url,
-        &body,
-        &mut etag,
-        true, // delete: 404/410 = already gone
-        &now_rfc3339,
-    )
-    .await
-    {
-        Ok(_) => {}
-        Err(err) => return Err(err),
+    if !google_already_gone {
+        match patch_with_if_match(
+            http,
+            access,
+            operations,
+            &op_id,
+            google_event_id,
+            &local_event_id,
+            &url,
+            &body,
+            &mut etag,
+            true, // delete: 404/410 = already gone
+            &now_rfc3339,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(err) => return Err(err),
+        }
     }
 
     operations

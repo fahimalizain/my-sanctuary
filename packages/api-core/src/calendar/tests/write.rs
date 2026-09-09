@@ -1130,6 +1130,49 @@ fn delete_event_google_404_still_soft_deletes_locally() {
 }
 
 #[test]
+fn delete_event_empty_etag_get_404_still_soft_deletes_locally() {
+    // Pre-V1 / empty-etag row: bootstrap GET 404 must still local-delete
+    // (same contract as PATCH 404/410), without a cancel PATCH.
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/g-evt-1",
+        404,
+        r#"{"error":"notFound"}"#,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let mut row = living_event("local-1", "cal-1", "g-evt-1");
+    row.google_etag = String::new();
+    events.stored.lock().unwrap().push(row);
+    let ops = FakeOperationRepo::new();
+
+    pollster::block_on(delete_event(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "cal-1",
+        "g-evt-1",
+        "local-1",
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let deleted = events.deleted.lock().unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].0, "local-1");
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_CACHE_APPLIED);
+    assert!(
+        http.patches.lock().unwrap().is_empty(),
+        "no cancel PATCH after GET 404"
+    );
+    assert!(
+        !http.gets.lock().unwrap().is_empty(),
+        "bootstrap GET must run when etag empty"
+    );
+}
+
+#[test]
 fn update_event_for_user_wrong_owner_is_not_found() {
     let http = FakeHttp::new(vec![]);
     let calendars =
