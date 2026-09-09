@@ -56,9 +56,10 @@
 //!   then stops and hard-deletes only the old rows (overlap is allowed).
 //! - Webhook: [`decide_webhook`] verifies push notifications
 //!   (`X-Goog-Channel-ID`/`-Token`/`-Resource-State`) against the stored
-//!   channel and calendar rows — pure and unit-tested; the Worker handler
-//!   wires D1 lookups and `ctx.wait_until(sync_calendar)` (ADR 0001 §
-//!   Webhook).
+//!   channel and calendar rows — pure and unit-tested. The Worker persists
+//!   the decision via [`persist_webhook_decision`] (dirty bump or disable)
+//!   **before** HTTP 200; an optional `ctx.wait_until` replica attempt is
+//!   only an optimization after durable dirty is written.
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
@@ -1369,16 +1370,43 @@ pub async fn run_fallback_cron(
 
 /// Outcome of verifying a Google push notification (`X-Goog-*` headers)
 /// against the stored watch channel.
+///
+/// Watches are **hints**. The caller MUST persist durable D1 work (via
+/// [`persist_webhook_decision`]) before treating a non-[`Ignore`] decision
+/// as accepted — HTTP 200 is only valid after that write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebhookDecision {
-    /// HTTP 200, no sync: unknown channel, bad or missing token, missing or
-    /// disabled calendar, the `sync` handshake, or any non-`exists` state.
+    /// 200, no durable work: unknown channel, bad/missing token, missing or
+    /// disabled calendar, `sync` handshake, or any other non-actionable state.
     /// Verification failures never surface as 4xx/5xx (no existence leak,
     /// no Google retry hammer).
     Ignore,
-    /// HTTP 200, then `ctx.wait_until(sync_calendar)` for this local
-    /// calendar id.
-    Sync { calendar_id: String },
+    /// Verified `exists` on a living sync_enabled calendar. Caller MUST persist
+    /// dirty before treating this as accepted work.
+    EnqueueDirty { calendar_id: String },
+    /// Verified `not_exists`: the calendar resource is gone. Caller MUST persist
+    /// disable/tombstone before 200. Do not full-sync.
+    CalendarGone { calendar_id: String },
+}
+
+/// Result of applying a [`WebhookDecision`] to D1 (dirty bump or disable).
+///
+/// Only [`DirtyAccepted`] and [`GoneDisabled`] mean durable work landed.
+/// Persist failures must **not** be described as accepted work — cron recovers
+/// lost `wait_until`, not a failed dirty write that never happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookPersistResult {
+    /// Decision was [`WebhookDecision::Ignore`]; no repo writes.
+    Ignored,
+    /// Dirty generation was written. This is the only "accepted work" outcome
+    /// for `exists`.
+    DirtyAccepted { calendar_id: String },
+    /// Tried to persist dirty and failed. MUST NOT be described as accepted work.
+    DirtyPersistFailed { calendar_id: String },
+    /// Disable was written for a gone calendar.
+    GoneDisabled { calendar_id: String },
+    /// Tried to disable a gone calendar and failed.
+    GonePersistFailed { calendar_id: String },
 }
 
 /// Constant-time token comparison.
@@ -1404,21 +1432,26 @@ pub fn tokens_match(stored: &str, presented: &str) -> bool {
 /// (via `X-Goog-Channel-ID`) and `calendar` (via `stored.calendar_id`)
 /// first.
 ///
-/// Rules (ADR 0001 § Webhook), in order:
+/// Rules, in order:
 /// 1. `stored` is `None` → [`WebhookDecision::Ignore`] (unknown channel).
 /// 2. `presented_token` is `None` or `!tokens_match(stored.token, …)` →
 ///    [`WebhookDecision::Ignore`].
 /// 3. `calendar` is `None` (missing or soft-deleted — `get_by_id` already
 ///    filters `deleted_at IS NULL`) or `!calendar.sync_enabled` →
 ///    [`WebhookDecision::Ignore`].
-/// 4. `resource_state` == `"exists"` → [`WebhookDecision::Sync`] for
-///    `stored.calendar_id`.
-/// 5. `"sync"` (the channel handshake) or anything else →
+/// 4. `resource_state` == `"exists"` → [`WebhookDecision::EnqueueDirty`] for
+///    `stored.calendar_id` (never `X-Goog-Resource-Id`).
+/// 5. `resource_state` == `"not_exists"` → [`WebhookDecision::CalendarGone`]
+///    for `stored.calendar_id` (verified channel + living enabled calendar).
+/// 6. `"sync"` (the channel handshake) or anything else →
 ///    [`WebhookDecision::Ignore`].
 ///
 /// The state comparison is case-sensitive and exact: Google sends bare
-/// values like `exists`/`sync`, so a whitespace-wrapped `exists` is treated
-/// as an unknown state and ignored.
+/// values like `exists`/`sync`/`not_exists`, so a whitespace-wrapped `exists`
+/// is treated as an unknown state and ignored.
+///
+/// The caller must run [`persist_webhook_decision`] before HTTP 200 for any
+/// non-[`Ignore`] outcome.
 pub fn decide_webhook(
     resource_state: &str,
     stored: Option<&WatchChannel>,
@@ -1440,12 +1473,57 @@ pub fn decide_webhook(
     if !calendar.sync_enabled {
         return WebhookDecision::Ignore;
     }
-    if resource_state == "exists" {
-        return WebhookDecision::Sync {
+    match resource_state {
+        "exists" => WebhookDecision::EnqueueDirty {
             calendar_id: stored.calendar_id.clone(),
-        };
+        },
+        "not_exists" => WebhookDecision::CalendarGone {
+            calendar_id: stored.calendar_id.clone(),
+        },
+        _ => WebhookDecision::Ignore,
     }
-    WebhookDecision::Ignore
+}
+
+/// Persists a verified webhook decision to D1 before the Worker returns 200.
+///
+/// - [`WebhookDecision::Ignore`] → no writes, [`WebhookPersistResult::Ignored`].
+/// - [`WebhookDecision::EnqueueDirty`] → [`CalendarRepo::bump_dirty_requested`];
+///   does **not** call Google or `sync_calendar`.
+/// - [`WebhookDecision::CalendarGone`] → [`CalendarRepo::set_sync_enabled`]
+///   `(false)`; does **not** bump dirty, delete events, or call Google.
+///
+/// `now_rfc3339` is supplied by the caller (never `SystemTime` in api-core).
+pub async fn persist_webhook_decision(
+    calendars: &dyn CalendarRepo,
+    decision: &WebhookDecision,
+    now_rfc3339: &str,
+) -> WebhookPersistResult {
+    match decision {
+        WebhookDecision::Ignore => WebhookPersistResult::Ignored,
+        WebhookDecision::EnqueueDirty { calendar_id } => {
+            match calendars.bump_dirty_requested(calendar_id, now_rfc3339).await {
+                Ok(()) => WebhookPersistResult::DirtyAccepted {
+                    calendar_id: calendar_id.clone(),
+                },
+                Err(_) => WebhookPersistResult::DirtyPersistFailed {
+                    calendar_id: calendar_id.clone(),
+                },
+            }
+        }
+        WebhookDecision::CalendarGone { calendar_id } => {
+            match calendars
+                .set_sync_enabled(calendar_id, false, now_rfc3339)
+                .await
+            {
+                Ok(()) => WebhookPersistResult::GoneDisabled {
+                    calendar_id: calendar_id.clone(),
+                },
+                Err(_) => WebhookPersistResult::GonePersistFailed {
+                    calendar_id: calendar_id.clone(),
+                },
+            }
+        }
+    }
 }
 
 /// Subset of the `calendars.get` response: the label properties carrying the
@@ -1856,6 +1934,10 @@ mod tests {
         /// After this many `get_by_id` calls, force `lease_owner` to `"thief"`
         /// on the matched row (None = disabled).
         steal_lease_after_get_by_id: Mutex<Option<usize>>,
+        /// When true, `bump_dirty_requested` returns `RepoError::Backend`.
+        fail_bump_dirty: Mutex<bool>,
+        /// When true, `set_sync_enabled` returns `RepoError::Backend`.
+        fail_set_sync_enabled: Mutex<bool>,
     }
 
     impl FakeCalendarRepo {
@@ -1869,6 +1951,8 @@ mod tests {
                 next_id: Mutex::new(1),
                 get_by_id_count: Mutex::new(0),
                 steal_lease_after_get_by_id: Mutex::new(None),
+                fail_bump_dirty: Mutex::new(false),
+                fail_set_sync_enabled: Mutex::new(false),
             }
         }
 
@@ -2179,6 +2263,9 @@ mod tests {
             id: &str,
             now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            if *self.fail_bump_dirty.lock().unwrap() {
+                return Err(RepoError::Backend("bump dirty failed".into()));
+            }
             let mut stored = self.stored.lock().unwrap();
             if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                 if cal.deleted_at.is_none() {
@@ -2196,6 +2283,9 @@ mod tests {
             enabled: bool,
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            if *self.fail_set_sync_enabled.lock().unwrap() {
+                return Err(RepoError::Backend("set_sync_enabled failed".into()));
+            }
             self.disabled.lock().unwrap().push((id.to_string(), enabled));
             // Mutate stored so a re-read after 404-disable shows `disabled`
             // in the health envelope.
@@ -5118,7 +5208,7 @@ mod tests {
     }
 
     #[test]
-    fn exists_state_syncs_the_channel_calendar() {
+    fn exists_state_enqueues_dirty_for_the_channel_calendar() {
         let channel = webhook_channel("cal-1");
         assert_eq!(
             decide_webhook(
@@ -5127,10 +5217,159 @@ mod tests {
                 Some("tok-1"),
                 Some(&calendar("cal-1", "primary@example.com", true)),
             ),
-            WebhookDecision::Sync {
+            WebhookDecision::EnqueueDirty {
                 calendar_id: "cal-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn not_exists_state_marks_calendar_gone() {
+        let channel = webhook_channel("cal-1");
+        assert_eq!(
+            decide_webhook(
+                "not_exists",
+                Some(&channel),
+                Some("tok-1"),
+                Some(&calendar("cal-1", "primary@example.com", true)),
+            ),
+            WebhookDecision::CalendarGone {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn exists_persist_bumps_dirty_and_returns_dirty_accepted() {
+        let cal = calendar("cal-1", "primary@example.com", true);
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let channel = webhook_channel("cal-1");
+        let decision = decide_webhook(
+            "exists",
+            Some(&channel),
+            Some("tok-1"),
+            Some(&calendars.stored.lock().unwrap()[0].clone()),
+        );
+        assert_eq!(
+            decision,
+            WebhookDecision::EnqueueDirty {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let result = pollster::block_on(persist_webhook_decision(
+            &calendars,
+            &decision,
+            &now,
+        ));
+        assert_eq!(
+            result,
+            WebhookPersistResult::DirtyAccepted {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].dirty_requested_generation, 1);
+        assert!(stored[0].sync_enabled);
+    }
+
+    #[test]
+    fn missing_dirty_write_is_not_accepted_work() {
+        let cal = calendar("cal-1", "primary@example.com", true);
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        *calendars.fail_bump_dirty.lock().unwrap() = true;
+        let decision = WebhookDecision::EnqueueDirty {
+            calendar_id: "cal-1".to_string(),
+        };
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let result = pollster::block_on(persist_webhook_decision(
+            &calendars,
+            &decision,
+            &now,
+        ));
+        assert_eq!(
+            result,
+            WebhookPersistResult::DirtyPersistFailed {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+        assert!(!matches!(result, WebhookPersistResult::DirtyAccepted { .. }));
+        assert_eq!(
+            calendars.stored.lock().unwrap()[0].dirty_requested_generation,
+            0
+        );
+    }
+
+    #[test]
+    fn non_actionable_webhook_states_do_not_bump_dirty() {
+        let channel = webhook_channel("cal-1");
+        let enabled = calendar("cal-1", "primary@example.com", true);
+        let disabled = calendar("cal-1", "primary@example.com", false);
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+
+        let cases: Vec<(&str, Option<&WatchChannel>, Option<&str>, Option<&GoogleCalendar>)> = vec![
+            ("sync", Some(&channel), Some("tok-1"), Some(&enabled)),
+            ("exists", Some(&channel), Some("tok-2"), Some(&enabled)),
+            ("exists", None, Some("tok-1"), Some(&enabled)),
+            ("exists", Some(&channel), Some("tok-1"), Some(&disabled)),
+        ];
+
+        for (state, stored_ch, token, cal) in cases {
+            let calendars = FakeCalendarRepo::with(vec![enabled.clone()]);
+            let decision = decide_webhook(state, stored_ch, token, cal);
+            assert_eq!(
+                decision,
+                WebhookDecision::Ignore,
+                "state={state:?} token={token:?} should Ignore"
+            );
+            let result = pollster::block_on(persist_webhook_decision(
+                &calendars,
+                &decision,
+                &now,
+            ));
+            assert_eq!(result, WebhookPersistResult::Ignored);
+            assert_eq!(
+                calendars.stored.lock().unwrap()[0].dirty_requested_generation,
+                0,
+                "state={state:?} must not bump dirty"
+            );
+        }
+    }
+
+    #[test]
+    fn not_exists_persist_disables_without_dirty_bump() {
+        let cal = calendar("cal-1", "primary@example.com", true);
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let channel = webhook_channel("cal-1");
+        let decision = decide_webhook(
+            "not_exists",
+            Some(&channel),
+            Some("tok-1"),
+            Some(&calendars.stored.lock().unwrap()[0].clone()),
+        );
+        assert_eq!(
+            decision,
+            WebhookDecision::CalendarGone {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+
+        let now = unix_secs_to_rfc3339(NOW_UNIX);
+        let result = pollster::block_on(persist_webhook_decision(
+            &calendars,
+            &decision,
+            &now,
+        ));
+        assert_eq!(
+            result,
+            WebhookPersistResult::GoneDisabled {
+                calendar_id: "cal-1".to_string(),
+            }
+        );
+        let stored = calendars.stored.lock().unwrap();
+        assert!(!stored[0].sync_enabled);
+        assert_eq!(stored[0].dirty_requested_generation, 0);
     }
 
     #[test]
