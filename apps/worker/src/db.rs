@@ -31,6 +31,7 @@ use api_core::repo::{
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL,
     CALENDAR_MARK_DIRTY_APPLIED_SQL,
     CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
+    CALENDAR_GET_BY_ID_UNFILTERED_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
     CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL,
@@ -68,7 +69,8 @@ use api_core::repo::{
     TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
     USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
     WATCH_CHANNEL_DELETE_BY_ID_SQL,
-    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
+    WATCH_CHANNEL_LIST_ALL_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
     WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use serde::Deserialize;
@@ -367,6 +369,15 @@ impl CalendarRepo for D1CalendarRepo {
         let stmt = self
             .db
             .prepare(CALENDAR_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<GoogleCalendar>(None).await.map_err(backend)
+    }
+
+    async fn get_by_id_unfiltered(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_GET_BY_ID_UNFILTERED_SQL)
             .bind_refs(&[D1Type::Text(id)])
             .map_err(backend)?;
         stmt.first::<GoogleCalendar>(None).await.map_err(backend)
@@ -2101,6 +2112,15 @@ impl WatchChannelRepo for D1WatchChannelRepo {
             .db
             .prepare(WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL)
             .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_all(&self) -> Result<Vec<WatchChannel>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_LIST_ALL_SQL)
+            .bind(&[])
             .map_err(backend)?;
         query_vec(stmt).await
     }

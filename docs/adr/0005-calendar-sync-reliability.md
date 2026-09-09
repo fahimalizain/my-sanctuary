@@ -111,10 +111,26 @@ permanent.
 - GET envelope `source` is `cache` | `window` | `mixed`
 - Projection still `timed_masters_and_exceptions`; all-day stored as Z-midnight
 
+**V3 (shipped)** — 2026-09-10
+
+- Watches are **hints**; webhook `exists` persists `dirty_requested_generation`
+  then HTTP 200; optional `wait_until` replica is an optimization only
+- `not_exists` persists disable then 200; stop is best-effort
+- Cron consumes dirty (`requested > applied`) **and** the 15-minute
+  `last_success_at` backstop **and** `full_sync_requested` **and** due
+  `next_retry_at`; honors backoff and `authorization_required`
+- Successful publish sets `dirty_applied_generation` to the
+  **generation-at-start**
+- Worker `notify_user` after successful cron publish (`CronReport.published`);
+  broadcast to 0 sockets is logged
+- calendarList incremental with per-user cursor; 410 merge-full; incremental
+  `deleted=true` disables+stops; incremental absence does not delete; full
+  absence orphans
+- Metadata upsert does not re-enable a living user-disabled calendar
+- Leftover watch channels on disable/soft-delete are retried by cron
+
 **Later**
 
-- **V3:** dirty generations consumed by cron `notify_user` + watch as hint only;
-  durable dirty enqueue; calendarList incremental
 - **V4:** If-Match / operation journal / writes
 - **V5:** web health chrome
 - **Not planned:** Cloudflare Queues (ADR 0001)
@@ -132,9 +148,9 @@ permanent.
   token and stamp success.”
 - Tokens, OAuth credentials, lease secrets, event bodies, and `raw_json` never
   appear in the envelope or in `last_error_code`.
-- Cron continues to key off `last_synced_at`; `record_sync_success` writes it,
-  so the 15-minute backstop keeps working. Window bumps dirty as a V3 hint
-  without setting `full_sync_requested`.
+- Cron keys off dirty generation + `last_success_at` (15-minute backstop) +
+  `full_sync_requested` + due `next_retry_at`. Window bumps dirty as a hint
+  without setting `full_sync_requested`. Watches never disable the poll.
 
 ## Residual risk
 
@@ -147,5 +163,5 @@ permanent.
   under the natural key.
 - All-day Z-midnight storage: non-UTC civil dates have residual lexicographic
   overlap risk on GET.
-- V3 still owns durable dirty enqueue consumption, calendarList incremental,
-  and cron `notify_user`.
+- Channel rows whose parent calendar row is hard-missing (no `user_id`) cannot
+  be stopped automatically; they surface once per tick as a cron error string.

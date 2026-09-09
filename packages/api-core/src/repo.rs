@@ -86,6 +86,10 @@ pub trait CalendarRepo: Send + Sync {
     async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError>;
     /// Returns the calendar with local `id`, or `None` when absent/soft-deleted.
     async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError>;
+    /// Like [`CalendarRepo::get_by_id`] but does **not** filter `deleted_at`.
+    /// Used to retry leftover watch stops after a calendar is soft-deleted
+    /// (channel rows survive; living-only reads cannot recover `user_id`).
+    async fn get_by_id_unfiltered(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError>;
     /// Returns the calendar with `google_calendar_id`, or `None`.
     async fn get_by_google_cal_id(
         &self,
@@ -677,6 +681,10 @@ pub trait WatchChannelRepo: Send + Sync {
     /// All channels for `calendar_id`. Many rows per calendar are expected:
     /// renewal overlaps two channels briefly (ADR 0001).
     async fn list_by_calendar_id(&self, calendar_id: &str) -> Result<Vec<WatchChannel>, RepoError>;
+    /// Every watch channel row (all calendars). Small table; personal app.
+    /// Cron uses this to find leftover channels on disabled/soft-deleted
+    /// calendars after a best-effort `channels.stop` failed.
+    async fn list_all(&self) -> Result<Vec<WatchChannel>, RepoError>;
     /// Channels for `calendar_id` whose `expiration` is still in the future.
     /// RFC 3339 UTC strings compare lexicographically, so `expiration > ?`
     /// is correct.
@@ -763,6 +771,10 @@ pub const CALENDAR_LIST_SYNC_ENABLED_SQL: &str =
 
 pub const CALENDAR_GET_BY_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE id = ? AND deleted_at IS NULL";
+
+/// Unfiltered by `deleted_at` — leftover watch-stop retry after soft-delete.
+pub const CALENDAR_GET_BY_ID_UNFILTERED_SQL: &str =
+    "SELECT * FROM google_calendars WHERE id = ?";
 
 pub const CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE user_id = ? AND google_calendar_id = ? AND deleted_at IS NULL";
@@ -1381,6 +1393,10 @@ pub const WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL: &str =
 pub const WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL: &str =
     "SELECT * FROM google_calendars_watch_channels WHERE calendar_id = ? ORDER BY created_at ASC";
 
+/// Every channel row. Small personal-app table; cron leftover-stop pass.
+pub const WATCH_CHANNEL_LIST_ALL_SQL: &str =
+    "SELECT * FROM google_calendars_watch_channels";
+
 /// RFC 3339 UTC strings compare correctly as text, so `expiration > ?` finds
 /// channels that are still valid.
 pub const WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL: &str = "
@@ -1732,6 +1748,27 @@ mod tests {
         assert!(CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL.contains("deleted_at IS NULL"));
         assert!(EVENT_GET_BY_ID_SQL.contains("deleted_at IS NULL"));
         assert!(EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL.contains("deleted_at IS NULL"));
+    }
+
+    #[test]
+    fn calendar_get_by_id_unfiltered_has_no_deleted_at_filter() {
+        let sql = CALENDAR_GET_BY_ID_UNFILTERED_SQL;
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(
+            !sql.contains("deleted_at"),
+            "unfiltered read must see soft-deleted rows: {sql}"
+        );
+    }
+
+    #[test]
+    fn watch_channel_list_all_has_no_filter() {
+        let sql = WATCH_CHANNEL_LIST_ALL_SQL;
+        assert!(
+            sql.contains("FROM google_calendars_watch_channels"),
+            "{sql}"
+        );
+        assert!(!sql.contains("WHERE"), "{sql}");
+        assert!(!sql.contains("deleted_at"), "{sql}");
     }
 
     #[test]
@@ -2460,6 +2497,7 @@ mod tests {
         for sql in [
             WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
             WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
+            WATCH_CHANNEL_LIST_ALL_SQL,
             WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
         ] {
             assert!(!sql.contains("deleted_at"), "{sql}");

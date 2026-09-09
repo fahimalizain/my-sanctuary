@@ -1190,6 +1190,9 @@ pub async fn stop_watches_for_calendar(
 /// Renews a calendar's watch channel when none covers `WATCH_RENEW_HORIZON_SECS`
 /// from `now_unix` (ADR 0001 § Fallback cron).
 ///
+/// Horizon is 24h (`WATCH_RENEW_HORIZON_SECS`); cron already renews before
+/// coverage goes thin — no separate health-column alert for under-coverage.
+///
 /// `ensure_watch` only checks that some channel is unexpired (`expiration >
 /// now`) — a channel with 23 hours left would skip it. Renewal instead mints
 /// a new channel whenever no stored channel expires later than `now_unix +
@@ -1304,11 +1307,14 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
     dirty || success_stale || cal.full_sync_requested || retry_due
 }
 
-/// The fallback cron (ADR 0001 § Fallback cron): per user, incrementally
-/// refresh `calendarList`, then for every sync-enabled non-deleted calendar
-/// publish a replica when [`replica_due`] (dirty generation, 15-minute
-/// `last_success_at` backstop, full-sync flag, or expired backoff), then
-/// renew its watch channel when none covers [`WATCH_RENEW_HORIZON_SECS`].
+/// The fallback cron (ADR 0001 § Fallback cron + ADR 0005 V3): per user,
+/// incrementally refresh `calendarList`, then for every sync-enabled
+/// non-deleted calendar publish a replica when [`replica_due`] (dirty
+/// generation, 15-minute `last_success_at` backstop, full-sync flag, or
+/// expired backoff), then renew its watch channel when none covers
+/// [`WATCH_RENEW_HORIZON_SECS`]. After the per-user loop, a **leftover-stop
+/// pass** retries `channels.stop` for watch rows whose calendar is disabled
+/// or soft-deleted (best-effort stop failures leave rows for the next tick).
 /// Successful publishes and **newly imported** calendar ids land in
 /// [`CronReport::published`] so the Worker can notify open browsers after D1
 /// is updated.
@@ -1340,6 +1346,11 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///    - When `watch_callback_url` is a public HTTPS URL, the calendar is still
 ///      enabled, and `sync_status != "authorization_required"`:
 ///      `renew_watch_if_needed`. A watch 404 disables sync and stops channels.
+/// 4. Leftover-stop tail: [`WatchChannelRepo::list_all`], resolve each calendar
+///    via [`CalendarRepo::get_by_id_unfiltered`], stop channels when the
+///    calendar is missing-from-living-path (soft-deleted) or `!sync_enabled`.
+///    Does **not** require a public HTTPS callback (stop needs no webhook URL).
+///    Does **not** abort prior replica work. Failed stops leave rows + error.
 pub async fn run_fallback_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1582,7 +1593,125 @@ pub async fn run_fallback_cron(
             }
         }
     }
+
+    // Leftover-stop pass: channel rows that survived a failed best-effort stop
+    // after disable/soft-delete. Soft-deleted calendars are invisible to
+    // get_by_id / list_user_ids_with_calendars, so this pass uses unfiltered
+    // reads. Stop does not need the webhook callback URL.
+    stop_leftover_watch_channels(
+        http,
+        calendars,
+        watches,
+        tokens,
+        oauth,
+        &mut access_by_user,
+        &mut report,
+        now_unix,
+    )
+    .await;
+
     report
+}
+
+/// Retry `channels.stop` for watch rows whose calendar is disabled or
+/// soft-deleted. Living + `sync_enabled` channels are the real subscription
+/// (including renewal overlap) and are left alone.
+///
+/// On stop failure the channel rows remain for the next tick. Missing calendar
+/// rows (hard-deleted or orphaned FK) cannot recover `user_id` — those are
+/// skipped once per channel calendar id with an error string (no tokens).
+async fn stop_leftover_watch_channels(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    watches: &dyn WatchChannelRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    access_by_user: &mut HashMap<String, Result<GoogleAccess, TokenError>>,
+    report: &mut CronReport,
+    now_unix: i64,
+) {
+    let all_channels = match watches.list_all().await {
+        Ok(rows) => rows,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("list_all watch channels failed: {err}"));
+            return;
+        }
+    };
+    if all_channels.is_empty() {
+        return;
+    }
+
+    // calendar_id → user_id for leftover calendars only.
+    let mut leftover_by_user: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen_calendar: HashSet<String> = HashSet::new();
+    let mut missing_logged: HashSet<String> = HashSet::new();
+
+    for channel in &all_channels {
+        if !seen_calendar.insert(channel.calendar_id.clone()) {
+            continue;
+        }
+        let cal = match calendars.get_by_id_unfiltered(&channel.calendar_id).await {
+            Ok(row) => row,
+            Err(err) => {
+                report.errors.push(format!(
+                    "get_by_id_unfiltered failed for calendar {}: {err}",
+                    channel.calendar_id
+                ));
+                continue;
+            }
+        };
+        let Some(cal) = cal else {
+            // No user_id → cannot stop. Log once per calendar id.
+            if missing_logged.insert(channel.calendar_id.clone()) {
+                report.errors.push(format!(
+                    "leftover watch channel for missing calendar {} — cannot stop (no user_id)",
+                    channel.calendar_id
+                ));
+            }
+            continue;
+        };
+        let is_leftover = cal.deleted_at.is_some() || !cal.sync_enabled;
+        if !is_leftover {
+            // Living + sync_enabled: real subscription (renewal overlap ok).
+            continue;
+        }
+        leftover_by_user
+            .entry(cal.user_id.clone())
+            .or_default()
+            .push(cal.id.clone());
+    }
+
+    for (user_id, calendar_ids) in leftover_by_user {
+        let access_result = match access_by_user.get(&user_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let result = refresh_if_needed(http, tokens, oauth, &user_id, now_unix).await;
+                access_by_user.insert(user_id.clone(), result.clone());
+                result
+            }
+        };
+        let access = match access_result {
+            Ok(access) => access,
+            Err(err) => {
+                // Do not hammer revoked grants; skip this user's leftover stops.
+                report.errors.push(format!(
+                    "token refresh failed for leftover-stop user {user_id}: {err}"
+                ));
+                continue;
+            }
+        };
+        for calendar_id in calendar_ids {
+            if let Err(err) =
+                stop_watches_for_calendar(http, watches, &access, &calendar_id).await
+            {
+                report.errors.push(format!(
+                    "failed to stop leftover watch channels for calendar {calendar_id}: {err}"
+                ));
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────
@@ -2485,6 +2614,19 @@ mod tests {
             Ok(result)
         }
 
+        async fn get_by_id_unfiltered(
+            &self,
+            id: &str,
+        ) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|cal| cal.id == id)
+                .cloned())
+        }
+
         async fn get_by_google_cal_id(
             &self,
             user_id: &str,
@@ -3173,6 +3315,10 @@ mod tests {
                 .filter(|channel| channel.calendar_id == calendar_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn list_all(&self) -> Result<Vec<WatchChannel>, RepoError> {
+            Ok(self.stored.lock().unwrap().clone())
         }
 
         async fn list_unexpired_by_calendar_id(
@@ -5485,6 +5631,174 @@ mod tests {
         let stored = watches.stored.lock().unwrap();
         assert_eq!(stored.len(), 1, "new row only");
         assert_eq!(stored[0].channel_id, inserted[0].channel_id);
+    }
+
+    // ──────────────────────────────────────────
+    // Leftover watch-channel stop (cron tail)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn cron_stops_leftover_channels_on_disabled_living_calendar() {
+        // Disabled living calendar, fresh last_success → not replica-due.
+        // Leftover channel must still be stopped (callback None is fine).
+        let http = FakeHttp::new(vec![("/channels/stop", 200, "{}")]);
+        let mut cal = calendar("cal-1", "primary@example.com", false);
+        cal.last_synced_at = Some("2023-11-14T22:12:20Z".to_string());
+        cal.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-20T00:00:00Z")]);
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.synced, 0);
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "one channels.stop: {posts:?}");
+        assert!(posts[0].0.contains("/channels/stop"), "{}", posts[0].0);
+        let body: serde_json::Value = serde_json::from_str(&posts[0].1).unwrap();
+        assert_eq!(body["id"], "minted-id");
+        assert_eq!(body["resourceId"], "resource-1");
+        assert_eq!(
+            *watches.deleted_by_calendar_id.lock().unwrap(),
+            vec!["cal-1".to_string()]
+        );
+        assert!(watches.stored.lock().unwrap().is_empty(), "row hard-deleted");
+        let gets = http.gets.lock().unwrap();
+        assert!(
+            gets.iter().all(|u| !u.contains("/events")),
+            "disabled calendar must not hit events.list: {gets:?}"
+        );
+    }
+
+    #[test]
+    fn cron_stops_leftover_channels_on_soft_deleted_calendar() {
+        // Soft-deleted calendars are invisible to get_by_id / list_user_ids —
+        // leftover stop needs get_by_id_unfiltered to recover user_id.
+        let http = FakeHttp::new(vec![("/channels/stop", 200, "{}")]);
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.deleted_at = Some("2023-11-14T20:00:00Z".to_string());
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        // Sanity: living-only read hides the row.
+        assert!(
+            pollster::block_on(calendars.get_by_id("cal-1"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pollster::block_on(calendars.get_by_id_unfiltered("cal-1"))
+                .unwrap()
+                .is_some()
+        );
+        let events = FakeEventRepo::new();
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-20T00:00:00Z")]);
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "one channels.stop: {posts:?}");
+        assert!(posts[0].0.contains("/channels/stop"), "{}", posts[0].0);
+        assert!(watches.stored.lock().unwrap().is_empty(), "row hard-deleted");
+        assert_eq!(
+            *watches.deleted_by_calendar_id.lock().unwrap(),
+            vec!["cal-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn cron_failed_leftover_stop_leaves_row_for_next_tick() {
+        // Disabled leftover fails stop → row remains; sibling still progresses.
+        let http = FakeHttp::new(vec![
+            ("/channels/stop", 500, r#"{"error":"boom"}"#),
+            ("/events", 200, EVENTS_JSON),
+        ]);
+        let mut disabled = calendar("cal-disabled", "disabled@example.com", false);
+        disabled.last_synced_at = Some("2023-11-14T22:12:20Z".to_string());
+        disabled.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        // Stale living calendar must still sync despite leftover stop failure.
+        let mut living = calendar("cal-live", "primary@example.com", true);
+        living.last_synced_at = Some("2023-11-14T21:53:20Z".to_string());
+        living.last_success_at = Some("2023-11-14T21:53:20Z".to_string());
+        let calendars = FakeCalendarRepo::with(vec![disabled, living]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::with(vec![watch_channel(
+            "cal-disabled",
+            "2023-11-20T00:00:00Z",
+        )]);
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1, "living calendar still synced");
+        assert_eq!(
+            report.published,
+            vec![("u-1".to_string(), "cal-live".to_string())]
+        );
+        assert!(
+            report.errors.iter().any(|e| e.contains("cal-disabled")),
+            "error mentions leftover calendar: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            watches.stored.lock().unwrap().len(),
+            1,
+            "channel row left for retry"
+        );
+        assert!(watches.deleted_by_calendar_id.lock().unwrap().is_empty());
+        let posts = http.posts.lock().unwrap();
+        assert!(
+            posts.iter().any(|(u, _)| u.contains("/channels/stop")),
+            "stop was attempted: {posts:?}"
+        );
+    }
+
+    #[test]
+    fn cron_does_not_stop_channels_on_living_sync_enabled_calendar() {
+        // Enabled + fresh + covered horizon → no leftover stop, no renew.
+        let http = FakeHttp::new(vec![]);
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.last_synced_at = Some("2023-11-14T22:12:20Z".to_string());
+        cal.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+        // Far future: spans renew horizon (now + 24h).
+        let watches =
+            FakeWatchChannelRepo::with(vec![watch_channel("cal-1", "2023-11-20T00:00:00Z")]);
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http,
+            &calendars,
+            &events,
+            &watches,
+            &tokens,
+            &oauth,
+            Some(CALLBACK_URL),
+            NOW_UNIX,
+        ));
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.renewed, 0);
+        assert!(http.posts.lock().unwrap().is_empty(), "no stop/watch POST");
+        assert_eq!(watches.stored.lock().unwrap().len(), 1, "channel untouched");
+        assert!(watches.deleted_by_calendar_id.lock().unwrap().is_empty());
+        assert!(watches.deleted_by_id.lock().unwrap().is_empty());
     }
 
     #[test]

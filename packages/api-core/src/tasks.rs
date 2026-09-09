@@ -4360,6 +4360,13 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_by_id_unfiltered(
+            &self,
+            _id: &str,
+        ) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(None)
+        }
+
         async fn get_by_google_cal_id(
             &self,
             _user_id: &str,
