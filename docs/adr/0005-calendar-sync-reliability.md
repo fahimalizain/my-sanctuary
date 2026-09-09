@@ -165,3 +165,19 @@ permanent.
   overlap risk on GET.
 - Channel rows whose parent calendar row is hard-missing (no `user_id`) cannot
   be stopped automatically; they surface once per tick as a cron error string.
+
+## Module map (2026-09-10)
+
+Calendar code is split by boundary so a newcomer does not scroll a single novel:
+
+- **Service** (`packages/api-core/src/calendar/`): `list` / `write` / `watch` /
+  `webhook` / `catalog` / `cron` / `labels` / `apply` / `replica` / `window` /
+  `sync` (health). Shared URL encoding lives in `google.rs`. Public names are
+  re-exported from `calendar/mod.rs` and `lib.rs`.
+- **Persistence**: `models/calendar.rs` (row types), `repo/calendar.rs`
+  (traits + SQL), `apps/worker/src/db/calendar.rs` (D1 impls).
+- **Worker HTTP**: `apps/worker/src/calendar/http.rs` (REST) and
+  `calendar/webhook.rs` (push notifications). Route wiring stays in
+  `apps/worker/src/lib.rs`.
+
+V4 writes land in `calendar/write.rs`.

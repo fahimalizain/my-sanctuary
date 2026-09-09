@@ -1,7 +1,7 @@
 //! Repository traits, errors, and the D1 SQL statements.
 //!
 //! The traits live in api-core (pure Rust, unit-testable with fakes); the D1
-//! implementations live in `apps/worker/src/db.rs`. SQL is a single source of
+//! implementations live in `apps/worker/src/db/`. SQL is a single source of
 //! truth here so it can be reviewed and asserted in tests.
 //!
 //! Soft-delete rules:
