@@ -12,82 +12,54 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    AgendaItem, CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewAgendaItem, NewCalendar,
-    NewCalendarEvent, NewRoutine, NewRoutineOccurrence, NewTask, NewTaskCategory,
-    NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, NewWatchChannel, Routine,
-    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog,
-    UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList, User, WatchChannel,
+    AgendaItem, GoogleOAuthToken, NewAgendaItem, NewRoutine, NewRoutineOccurrence, NewTask,
+    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Routine,
+    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine,
+    UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
 };
 use api_core::repo::{
-    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_event_upsert_sql,
-    build_occurrence_insert_sql, build_occurrence_list_by_ids_sql, AgendaItemRepo,
-    CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError, RoutineRepo, TaskCategoryRepo,
-    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
+    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_occurrence_insert_sql,
+    build_occurrence_list_by_ids_sql, AgendaItemRepo, OccurrenceRepo, RepoError, RoutineRepo,
+    TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
     AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
     AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,
     AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
-    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL,
-    AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
-    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL,
-    CALENDAR_MARK_DIRTY_APPLIED_SQL,
-    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
-    CALENDAR_GET_BY_ID_UNFILTERED_SQL,
-    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
-    CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
-    CALENDAR_LIST_USER_IDS_SQL,
-    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
-    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
-    CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
-    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
-    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
-    EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
-    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
-    EVENT_GET_ID_BY_NATURAL_KEY_SQL,
-    EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
-    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
-    OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
-    OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
+    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
+    AGENDA_ITEM_SHIFT_SORT_ORDER_SQL, OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL,
+    OCCURRENCE_INSERT_SQL, OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
     OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
     OCCURRENCE_CLEAR_EVENT_IDS_SQL, OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
-    OCCURRENCE_UPDATE_TITLE_SQL,
-    ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL, ROUTINE_LIST_BY_USER_ID_SQL,
-    ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL, TASK_CATEGORY_COUNT_BY_USER_ID_SQL,
-    TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL,
-    TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,
-    TASK_CATEGORY_PATTERNS_DELETE_SQL, TASK_CATEGORY_PATTERNS_INSERT_SQL,
-    TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_LIST_SQL,
-    TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL,
-    TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
-    TASK_LIST_COUNT_BY_USER_ID_SQL,
-    TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
-    TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
-    TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
-    TASK_SHIFT_SORT_ORDER_SQL,
-    TASK_UPDATE_SQL, TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL,
-    TASK_SET_STATUS_SQL,
-    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL,
-    TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL,
-    USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
-    WATCH_CHANNEL_DELETE_BY_ID_SQL,
-    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
-    WATCH_CHANNEL_LIST_ALL_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
-    WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
+    OCCURRENCE_UPDATE_TITLE_SQL, ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
+    ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
+    TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL,
+    TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL,
+    TASK_CATEGORY_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_DELETE_SQL,
+    TASK_CATEGORY_PATTERNS_INSERT_SQL, TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL,
+    TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL, TASK_GET_BY_ID_SQL,
+    TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LIST_COUNT_BY_USER_ID_SQL, TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL,
+    TASK_LIST_GET_BY_ID_SQL, TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL,
+    TASK_LIST_UPDATE_SQL, TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL,
+    TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL,
+    TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, TASK_SET_STATUS_SQL,
+    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL,
+    USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, D1Type};
 
 /// Current time as an RFC 3339 UTC string, from the JS clock.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     api_core::unix_secs_to_rfc3339(now_unix)
 }
 
-fn backend(err: worker::Error) -> RepoError {
+pub(crate) fn backend(err: worker::Error) -> RepoError {
     RepoError::Backend(err.to_string())
 }
 
 /// Runs a statement, surfacing D1's `success`/`error` metadata.
-async fn run_stmt(stmt: D1PreparedStatement) -> Result<(), RepoError> {
+pub(crate) async fn run_stmt(stmt: D1PreparedStatement) -> Result<(), RepoError> {
     let result = stmt.run().await.map_err(backend)?;
     if !result.success() {
         return Err(RepoError::Backend(result.error().unwrap_or_default()));
@@ -97,7 +69,7 @@ async fn run_stmt(stmt: D1PreparedStatement) -> Result<(), RepoError> {
 
 /// Runs a statement and returns D1 `changes` (rows matched/updated), or 0 when
 /// meta is missing. Used by fenced lease / success writes.
-async fn run_stmt_changes(stmt: D1PreparedStatement) -> Result<usize, RepoError> {
+pub(crate) async fn run_stmt_changes(stmt: D1PreparedStatement) -> Result<usize, RepoError> {
     let result = stmt.run().await.map_err(backend)?;
     if !result.success() {
         return Err(RepoError::Backend(result.error().unwrap_or_default()));
@@ -111,7 +83,7 @@ async fn run_stmt_changes(stmt: D1PreparedStatement) -> Result<usize, RepoError>
 }
 
 /// Executes a select and maps every row through serde (`D1Result::results`).
-async fn query_vec<T>(stmt: D1PreparedStatement) -> Result<Vec<T>, RepoError>
+pub(crate) async fn query_vec<T>(stmt: D1PreparedStatement) -> Result<Vec<T>, RepoError>
 where
     T: for<'a> serde::Deserialize<'a>,
 {
@@ -124,9 +96,12 @@ where
 /// `build_occurrence_list_by_ids_sql`, `build_agenda_item_list_by_refs_sql`)
 /// return string args; INTEGER columns coerce the text via their affinity
 /// (same pattern as `D1CalendarEventRepo::run_upsert`).
-fn bind_text(args: &[String]) -> Vec<D1Type> {
+pub(crate) fn bind_text(args: &[String]) -> Vec<D1Type> {
     args.iter().map(|arg| D1Type::Text(arg)).collect()
 }
+
+pub mod calendar;
+pub use calendar::*;
 
 /// `users` table persistence.
 pub struct D1UserRepo {
@@ -145,39 +120,6 @@ pub struct D1TokenRepo {
 }
 
 impl D1TokenRepo {
-    pub fn new(db: D1Database) -> Self {
-        Self { db }
-    }
-}
-
-/// `google_calendars` table persistence.
-pub struct D1CalendarRepo {
-    db: D1Database,
-}
-
-impl D1CalendarRepo {
-    pub fn new(db: D1Database) -> Self {
-        Self { db }
-    }
-}
-
-/// `calendar_events` table persistence.
-pub struct D1CalendarEventRepo {
-    db: D1Database,
-}
-
-impl D1CalendarEventRepo {
-    pub fn new(db: D1Database) -> Self {
-        Self { db }
-    }
-}
-
-/// `google_calendars_watch_channels` table persistence.
-pub struct D1WatchChannelRepo {
-    db: D1Database,
-}
-
-impl D1WatchChannelRepo {
     pub fn new(db: D1Database) -> Self {
         Self { db }
     }
@@ -342,585 +284,6 @@ impl TokenRepo for D1TokenRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl CalendarRepo for D1CalendarRepo {
-    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_LIST_BY_USER_ID_SQL)
-            .bind_refs(&[D1Type::Text(user_id)])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn list_sync_enabled(&self) -> Result<Vec<GoogleCalendar>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_LIST_SYNC_ENABLED_SQL)
-            .bind(&[])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_GET_BY_ID_SQL)
-            .bind_refs(&[D1Type::Text(id)])
-            .map_err(backend)?;
-        stmt.first::<GoogleCalendar>(None).await.map_err(backend)
-    }
-
-    async fn get_by_id_unfiltered(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_GET_BY_ID_UNFILTERED_SQL)
-            .bind_refs(&[D1Type::Text(id)])
-            .map_err(backend)?;
-        stmt.first::<GoogleCalendar>(None).await.map_err(backend)
-    }
-
-    async fn get_by_google_cal_id(
-        &self,
-        user_id: &str,
-        google_cal_id: &str,
-    ) -> Result<Option<GoogleCalendar>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL)
-            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(google_cal_id)])
-            .map_err(backend)?;
-        stmt.first::<GoogleCalendar>(None).await.map_err(backend)
-    }
-
-    async fn upsert(&self, calendar: NewCalendar) -> Result<(), RepoError> {
-        self.upsert_batch(vec![calendar]).await
-    }
-
-    async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError> {
-        for calendar in calendars {
-            let id = uuid::Uuid::new_v4().to_string();
-            let now = now_rfc3339();
-            // `is_primary`/`sync_enabled` are INTEGER 0/1 columns in D1.
-            let last_synced_at = match calendar.last_synced_at.as_deref() {
-                Some(value) => D1Type::Text(value),
-                // NULL flows through COALESCE(NULLIF(..., ''), …) and keeps any
-                // previously stored value.
-                None => D1Type::Null,
-            };
-            let stmt = self
-                .db
-                .prepare(CALENDAR_UPSERT_SQL)
-                .bind_refs(&[
-                    D1Type::Text(&id),
-                    D1Type::Text(&calendar.user_id),
-                    D1Type::Text(&calendar.google_calendar_id),
-                    D1Type::Text(&calendar.summary),
-                    D1Type::Text(&calendar.time_zone),
-                    D1Type::Integer(i32::from(calendar.is_primary)),
-                    D1Type::Text(&calendar.access_role),
-                    D1Type::Integer(i32::from(calendar.sync_enabled)),
-                    D1Type::Text(&calendar.sync_token),
-                    last_synced_at,
-                    D1Type::Text(&now),
-                    D1Type::Text(&now),
-                ])
-                .map_err(backend)?;
-            run_stmt(stmt).await?;
-        }
-        Ok(())
-    }
-
-    async fn update_sync_state(
-        &self,
-        id: &str,
-        sync_token: &str,
-        last_synced_at_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let now = now_rfc3339();
-        let stmt = self
-            .db
-            .prepare(CALENDAR_UPDATE_SYNC_STATE_SQL)
-            .bind_refs(&[
-                D1Type::Text(sync_token),
-                D1Type::Text(last_synced_at_rfc3339),
-                D1Type::Text(&now),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn record_sync_attempt(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_RECORD_SYNC_ATTEMPT_SQL)
-            .bind_refs(&[
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn record_sync_success(
-        &self,
-        id: &str,
-        sync_token: &str,
-        query_fingerprint: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        // Binds: token, last_synced_at, last_success_at, last_attempt_at,
-        // fingerprint, updated_at, id — both success timestamps share `now`.
-        let stmt = self
-            .db
-            .prepare(CALENDAR_RECORD_SYNC_SUCCESS_SQL)
-            .bind_refs(&[
-                D1Type::Text(sync_token),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(query_fingerprint),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn record_sync_success_if_owner(
-        &self,
-        id: &str,
-        sync_token: &str,
-        query_fingerprint: &str,
-        lease_owner: &str,
-        now_rfc3339: &str,
-    ) -> Result<bool, RepoError> {
-        // Binds: token, last_synced_at, last_success_at, last_attempt_at,
-        // fingerprint, updated_at, id, lease_owner, now (lease check).
-        let stmt = self
-            .db
-            .prepare(CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL)
-            .bind_refs(&[
-                D1Type::Text(sync_token),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(query_fingerprint),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-                D1Type::Text(lease_owner),
-                D1Type::Text(now_rfc3339),
-            ])
-            .map_err(backend)?;
-        let changes = run_stmt_changes(stmt).await?;
-        Ok(changes > 0)
-    }
-
-    async fn record_sync_failure(
-        &self,
-        id: &str,
-        error_code: &str,
-        sync_status: &str,
-        next_retry_rfc3339: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_RECORD_SYNC_FAILURE_SQL)
-            .bind_refs(&[
-                D1Type::Text(error_code),
-                D1Type::Text(sync_status),
-                D1Type::Text(next_retry_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn try_acquire_lease(
-        &self,
-        id: &str,
-        owner: &str,
-        now_rfc3339: &str,
-        expires_rfc3339: &str,
-    ) -> Result<bool, RepoError> {
-        // Binds: owner, expires, now, id, owner, now.
-        let stmt = self
-            .db
-            .prepare(CALENDAR_TRY_ACQUIRE_LEASE_SQL)
-            .bind_refs(&[
-                D1Type::Text(owner),
-                D1Type::Text(expires_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-                D1Type::Text(owner),
-                D1Type::Text(now_rfc3339),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await?;
-        // Verify ownership (another writer may have raced; changes alone is not
-        // enough if the WHERE matched a different concurrent steal).
-        match self.get_by_id(id).await? {
-            Some(cal) => Ok(cal.lease_owner == owner),
-            None => Ok(false),
-        }
-    }
-
-    async fn release_lease(
-        &self,
-        id: &str,
-        owner: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_RELEASE_LEASE_SQL)
-            .bind_refs(&[
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-                D1Type::Text(owner),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn renew_lease(
-        &self,
-        id: &str,
-        owner: &str,
-        expires_rfc3339: &str,
-        now_rfc3339: &str,
-    ) -> Result<bool, RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_RENEW_LEASE_SQL)
-            .bind_refs(&[
-                D1Type::Text(expires_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-                D1Type::Text(owner),
-            ])
-            .map_err(backend)?;
-        let changes = run_stmt_changes(stmt).await?;
-        Ok(changes > 0)
-    }
-
-    async fn bump_dirty_requested(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_BUMP_DIRTY_REQUESTED_SQL)
-            .bind_refs(&[D1Type::Text(now_rfc3339), D1Type::Text(id)])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn mark_dirty_applied(
-        &self,
-        id: &str,
-        generation: i64,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        // D1 Integer is i32; dirty generations are monotonic counters well
-        // within that range for practical workloads.
-        let gen = generation as i32;
-        let stmt = self
-            .db
-            .prepare(CALENDAR_MARK_DIRTY_APPLIED_SQL)
-            .bind_refs(&[
-                D1Type::Integer(gen),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-                D1Type::Integer(gen),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn set_sync_enabled(
-        &self,
-        id: &str,
-        enabled: bool,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_SET_SYNC_ENABLED_SQL)
-            .bind_refs(&[
-                D1Type::Integer(i32::from(enabled)),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn set_event_labels(
-        &self,
-        id: &str,
-        event_labels_json: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_SET_EVENT_LABELS_SQL)
-            .bind_refs(&[
-                D1Type::Text(event_labels_json),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_DELETE_SQL)
-            .bind_refs(&[
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn get_calendar_list_sync_token(
-        &self,
-        user_id: &str,
-    ) -> Result<Option<String>, RepoError> {
-        #[derive(Deserialize)]
-        struct Row {
-            sync_token: String,
-        }
-        let stmt = self
-            .db
-            .prepare(CALENDAR_LIST_STATE_GET_SQL)
-            .bind_refs(&[D1Type::Text(user_id)])
-            .map_err(backend)?;
-        let row = stmt.first::<Row>(None).await.map_err(backend)?;
-        Ok(row.map(|r| r.sync_token))
-    }
-
-    async fn set_calendar_list_sync_token(
-        &self,
-        user_id: &str,
-        token: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(CALENDAR_LIST_STATE_UPSERT_SQL)
-            .bind_refs(&[
-                D1Type::Text(user_id),
-                D1Type::Text(token),
-                D1Type::Text(now_rfc3339),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
-        #[derive(Deserialize)]
-        struct Row {
-            user_id: String,
-        }
-        let stmt = self
-            .db
-            .prepare(CALENDAR_LIST_USER_IDS_SQL)
-            .bind(&[])
-            .map_err(backend)?;
-        let rows: Vec<Row> = query_vec(stmt).await?;
-        Ok(rows.into_iter().map(|r| r.user_id).collect())
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl CalendarEventRepo for D1CalendarEventRepo {
-    async fn upsert(&self, event: NewCalendarEvent, now_rfc3339: &str) -> Result<String, RepoError> {
-        // Reuse the persisted natural-key id (including soft-deleted) so ON
-        // CONFLICT updates the living/deleted row and we return that id —
-        // never a discarded candidate UUID after conflict.
-        let id = match self
-            .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
-            .await?
-        {
-            Some(existing) => existing,
-            None => uuid::Uuid::new_v4().to_string(),
-        };
-        let (sql, args) = build_event_upsert_sql(&[event], now_rfc3339, vec![id.clone()]);
-        self.run_upsert(&sql, &args).await?;
-        Ok(id)
-    }
-
-    async fn upsert_batch(
-        &self,
-        events: Vec<NewCalendarEvent>,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        // Chunk to stay under D1's 100 bound-parameter limit (4 rows of 23
-        // columns per statement); each chunk is one D1 subrequest. Look up
-        // each natural key first so ON CONFLICT hits the living/deleted row
-        // instead of inserting a colliding id that gets thrown away.
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match self
-                    .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
-                    .await?
-                {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
-            let (sql, args) = build_event_upsert_sql(chunk, now_rfc3339, ids);
-            self.run_upsert(&sql, &args).await?;
-        }
-        Ok(())
-    }
-
-    async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_GET_BY_ID_SQL)
-            .bind_refs(&[D1Type::Text(id)])
-            .map_err(backend)?;
-        stmt.first::<CalendarEvent>(None).await.map_err(backend)
-    }
-
-    async fn get_by_calendar_and_google_id(
-        &self,
-        calendar_id: &str,
-        google_event_id: &str,
-    ) -> Result<Option<CalendarEvent>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL)
-            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(google_event_id)])
-            .map_err(backend)?;
-        stmt.first::<CalendarEvent>(None).await.map_err(backend)
-    }
-
-    async fn list_by_user_id_and_time_range(
-        &self,
-        user_id: &str,
-        start_rfc3339: &str,
-        end_rfc3339: &str,
-    ) -> Result<Vec<CalendarEvent>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL)
-            .bind_refs(&[
-                D1Type::Text(user_id),
-                D1Type::Text(end_rfc3339),
-                D1Type::Text(start_rfc3339),
-            ])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn list_running_by_user_id(
-        &self,
-        user_id: &str,
-        now_rfc3339: &str,
-    ) -> Result<Vec<CalendarEvent>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_LIST_RUNNING_BY_USER_ID_SQL)
-            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(now_rfc3339), D1Type::Text(now_rfc3339)])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_DELETE_SQL)
-            .bind_refs(&[
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn delete_by_google_event_id(
-        &self,
-        calendar_id: &str,
-        google_event_id: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL)
-            .bind_refs(&[
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(calendar_id),
-                D1Type::Text(google_event_id),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn delete_stale(
-        &self,
-        calendar_id: &str,
-        older_than_rfc3339: &str,
-        now_rfc3339: &str,
-    ) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_DELETE_STALE_SQL)
-            .bind_refs(&[
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(calendar_id),
-                D1Type::Text(older_than_rfc3339),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-}
-
-/// Row projection for `SELECT id …` natural-key lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct EventIdRow {
-    id: String,
-}
-
-impl D1CalendarEventRepo {
-    /// Binds all-string args as `D1Type::Text` and runs the statement.
-    async fn run_upsert(&self, sql: &str, args: &[String]) -> Result<(), RepoError> {
-        let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
-        let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    /// Id for `(calendar_id, google_event_id)`, including soft-deleted rows.
-    async fn lookup_id_by_natural_key(
-        &self,
-        calendar_id: &str,
-        google_event_id: &str,
-    ) -> Result<Option<String>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(EVENT_GET_ID_BY_NATURAL_KEY_SQL)
-            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(google_event_id)])
-            .map_err(backend)?;
-        Ok(stmt
-            .first::<EventIdRow>(None)
-            .await
-            .map_err(backend)?
-            .map(|row| row.id))
     }
 }
 
@@ -2072,87 +1435,3 @@ impl TaskLogRepo for D1TaskLogRepo {
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl WatchChannelRepo for D1WatchChannelRepo {
-    async fn insert(
-        &self,
-        channel: NewWatchChannel,
-        now_rfc3339: &str,
-    ) -> Result<String, RepoError> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_INSERT_SQL)
-            .bind_refs(&[
-                D1Type::Text(&id),
-                D1Type::Text(&channel.calendar_id),
-                D1Type::Text(&channel.channel_id),
-                D1Type::Text(&channel.resource_id),
-                D1Type::Text(&channel.token),
-                D1Type::Text(&channel.expiration),
-                D1Type::Text(now_rfc3339),
-                D1Type::Text(now_rfc3339),
-            ])
-            .map_err(backend)?;
-        run_stmt(stmt).await?;
-        Ok(id)
-    }
-
-    async fn get_by_channel_id(&self, channel_id: &str) -> Result<Option<WatchChannel>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL)
-            .bind_refs(&[D1Type::Text(channel_id)])
-            .map_err(backend)?;
-        stmt.first::<WatchChannel>(None).await.map_err(backend)
-    }
-
-    async fn list_by_calendar_id(&self, calendar_id: &str) -> Result<Vec<WatchChannel>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL)
-            .bind_refs(&[D1Type::Text(calendar_id)])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn list_all(&self) -> Result<Vec<WatchChannel>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_LIST_ALL_SQL)
-            .bind(&[])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn list_unexpired_by_calendar_id(
-        &self,
-        calendar_id: &str,
-        now_rfc3339: &str,
-    ) -> Result<Vec<WatchChannel>, RepoError> {
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL)
-            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(now_rfc3339)])
-            .map_err(backend)?;
-        query_vec(stmt).await
-    }
-
-    async fn delete_by_id(&self, id: &str) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_DELETE_BY_ID_SQL)
-            .bind_refs(&[D1Type::Text(id)])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-
-    async fn delete_by_calendar_id(&self, calendar_id: &str) -> Result<(), RepoError> {
-        let stmt = self
-            .db
-            .prepare(WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL)
-            .bind_refs(&[D1Type::Text(calendar_id)])
-            .map_err(backend)?;
-        run_stmt(stmt).await
-    }
-}
