@@ -790,10 +790,17 @@ pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
 /// Overlap semantics: an event intersects `[start, end)` when it begins before
 /// the window ends AND ends after it begins — multi-day and overnight events
 /// are not clipped at window edges.
+///
+/// Projection `timed_masters_and_exceptions`: exclude all-day rows and
+/// cancelled exceptions (stored living for series correctness) from GET.
 pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
-    WHERE c.user_id = ? AND e.deleted_at IS NULL AND e.start_time < ? AND e.end_time > ?
+    WHERE c.user_id = ?
+      AND e.deleted_at IS NULL
+      AND e.is_all_day = 0
+      AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
+      AND e.start_time < ? AND e.end_time > ?
     ORDER BY e.start_time ASC
 ";
 
@@ -803,15 +810,26 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
 /// empty-string test is required, not cosmetic. RFC 3339 UTC strings of this
 /// shape (`…Z`, zero-padded, no fractions) compare lexicographically, so the
 /// range test needs no timestamp function.
+///
+/// Same projection filters as the range query: a running task chip must not be
+/// an all-day or cancelled row.
 pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
       AND e.deleted_at IS NULL
+      AND e.is_all_day = 0
+      AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
       AND e.task_id IS NOT NULL AND e.task_id != ''
       AND e.start_time <= ? AND e.end_time > ?
     ORDER BY e.start_time ASC
 ";
+
+/// Natural-key id lookup **including soft-deleted rows**. Used before upsert so
+/// ON CONFLICT updates the living/deleted row and the caller returns the
+/// persisted id (never a discarded candidate UUID).
+pub const EVENT_GET_ID_BY_NATURAL_KEY_SQL: &str =
+    "SELECT id FROM calendar_events WHERE calendar_id = ? AND google_event_id = ?";
 
 /// SOFT delete by local id.
 pub const EVENT_DELETE_SQL: &str =
@@ -850,7 +868,8 @@ const EVENT_UPSERT_ON_CONFLICT: &str = "
         end_time_zone = excluded.end_time_zone,
         is_all_day = excluded.is_all_day,
         raw_json = excluded.raw_json,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        deleted_at = NULL
 ";
 
 /// Builds a multi-row `INSERT … ON CONFLICT` statement for one chunk of
@@ -1667,6 +1686,47 @@ mod tests {
         assert!(sql.contains("e.end_time > ?"), "{sql}");
         assert!(sql.contains("c.user_id = ?"), "{sql}");
         assert!(sql.contains("ORDER BY e.start_time ASC"), "{sql}");
+        // timed_masters_and_exceptions projection
+        assert!(sql.contains("e.is_all_day = 0"), "{sql}");
+        assert!(
+            sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn event_range_and_running_queries_exclude_all_day_and_cancelled() {
+        for sql in [
+            EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
+            EVENT_LIST_RUNNING_BY_USER_ID_SQL,
+        ] {
+            assert!(sql.contains("e.is_all_day = 0"), "{sql}");
+            assert!(
+                sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
+                "{sql}"
+            );
+            assert!(sql.contains("e.deleted_at IS NULL"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn event_upsert_on_conflict_clears_deleted_at() {
+        assert!(
+            EVENT_UPSERT_ON_CONFLICT.contains("deleted_at = NULL"),
+            "{EVENT_UPSERT_ON_CONFLICT}"
+        );
+    }
+
+    #[test]
+    fn event_get_id_by_natural_key_includes_soft_deleted() {
+        let sql = EVENT_GET_ID_BY_NATURAL_KEY_SQL;
+        assert!(sql.contains("SELECT id FROM calendar_events"), "{sql}");
+        assert!(sql.contains("calendar_id = ?"), "{sql}");
+        assert!(sql.contains("google_event_id = ?"), "{sql}");
+        assert!(
+            !sql.contains("deleted_at"),
+            "must include soft-deleted rows: {sql}"
+        );
     }
 
     #[test]
@@ -2249,6 +2309,11 @@ mod tests {
         let sql = EVENT_LIST_RUNNING_BY_USER_ID_SQL;
         assert!(sql.contains("c.user_id = ?"), "{sql}");
         assert!(sql.contains("e.deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("e.is_all_day = 0"), "{sql}");
+        assert!(
+            sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
+            "{sql}"
+        );
         assert!(sql.contains("e.task_id IS NOT NULL AND e.task_id != ''"), "{sql}");
         assert!(sql.contains("e.start_time <= ? AND e.end_time > ?"), "{sql}");
         assert!(sql.contains("JOIN google_calendars c ON c.id = e.calendar_id"), "{sql}");

@@ -35,6 +35,7 @@ use api_core::repo::{
     CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
+    EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
@@ -534,7 +535,16 @@ impl CalendarRepo for D1CalendarRepo {
 #[async_trait::async_trait(?Send)]
 impl CalendarEventRepo for D1CalendarEventRepo {
     async fn upsert(&self, event: NewCalendarEvent, now_rfc3339: &str) -> Result<String, RepoError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        // Reuse the persisted natural-key id (including soft-deleted) so ON
+        // CONFLICT updates the living/deleted row and we return that id —
+        // never a discarded candidate UUID after conflict.
+        let id = match self
+            .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
+            .await?
+        {
+            Some(existing) => existing,
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         let (sql, args) = build_event_upsert_sql(&[event], now_rfc3339, vec![id.clone()]);
         self.run_upsert(&sql, &args).await?;
         Ok(id)
@@ -546,9 +556,21 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
         // Chunk to stay under D1's 100 bound-parameter limit (4 rows of 23
-        // columns per statement); each chunk is one D1 subrequest.
+        // columns per statement); each chunk is one D1 subrequest. Look up
+        // each natural key first so ON CONFLICT hits the living/deleted row
+        // instead of inserting a colliding id that gets thrown away.
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
-            let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            let mut ids = Vec::with_capacity(chunk.len());
+            for event in chunk {
+                let id = match self
+                    .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
+                    .await?
+                {
+                    Some(existing) => existing,
+                    None => uuid::Uuid::new_v4().to_string(),
+                };
+                ids.push(id);
+            }
             let (sql, args) = build_event_upsert_sql(chunk, now_rfc3339, ids);
             self.run_upsert(&sql, &args).await?;
         }
@@ -660,12 +682,36 @@ impl CalendarEventRepo for D1CalendarEventRepo {
     }
 }
 
+/// Row projection for `SELECT id …` natural-key lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct EventIdRow {
+    id: String,
+}
+
 impl D1CalendarEventRepo {
     /// Binds all-string args as `D1Type::Text` and runs the statement.
     async fn run_upsert(&self, sql: &str, args: &[String]) -> Result<(), RepoError> {
         let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
         let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    /// Id for `(calendar_id, google_event_id)`, including soft-deleted rows.
+    async fn lookup_id_by_natural_key(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+    ) -> Result<Option<String>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_GET_ID_BY_NATURAL_KEY_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id), D1Type::Text(google_event_id)])
+            .map_err(backend)?;
+        Ok(stmt
+            .first::<EventIdRow>(None)
+            .await
+            .map_err(backend)?
+            .map(|row| row.id))
     }
 }
 

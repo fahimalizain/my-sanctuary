@@ -27,11 +27,11 @@
 //!   resync). HTTP 404 (e.g. holidays/birthdays calendars that don't support
 //!   `events.list`) disables sync for that calendar. Other errors are logged
 //!   (returned in `sync_errors`) and do not fail the whole listing.
-//! - Incremental cancelled events (`status == "cancelled"`) are soft-deleted
-//!   via `delete_by_google_event_id` (missing rows no-op) instead of being
-//!   skipped. Events without a `start.dateTime`/`end.dateTime` (all-day
-//!   events) are skipped — the old Go parser stored zero times for those,
-//!   which is worse than skipping.
+//! - Replica apply is classified in [`crate::calendar_apply`]: ordinary
+//!   cancelled events (`status == "cancelled"`, no `recurringEventId`) are
+//!   soft-deleted; cancelled exceptions are upserted as sparse living rows;
+//!   all-day and no-time events are upserted (stored out of the GET
+//!   projection `timed_masters_and_exceptions`).
 //! - Watch: every `sync_enabled` calendar is ensure-watched (`events.watch`)
 //!   before its first-paint sync, but only when `WATCH_CALLBACK_URL` is set
 //!   and is a public HTTPS URL ([`is_public_https_callback`]). Watch 404
@@ -55,6 +55,10 @@ use std::fmt;
 use thiserror::Error;
 use url::Url;
 
+use crate::calendar_apply::{
+    classify_replica_item, map_google_event, row_from_new_event, EventsPage, GoogleEvent,
+    GoogleEventSharedProperties, ReplicaApplyAction,
+};
 use crate::calendar_sync::{
     classify_sync_error, events_sync_envelope, next_retry_rfc3339, replica_query_fingerprint,
     replica_state_for_error, EventsSyncEnvelope, SyncErrorCode,
@@ -1596,22 +1600,21 @@ async fn sync_calendar_body(
         }
     }
 
+    // Apply in page order. Ordinary cancels soft-delete immediately (failure
+    // must not advance the token). Cancelled exceptions and living items
+    // (including all-day) go to the upsert batch.
     let mut to_upsert: Vec<NewCalendarEvent> = Vec::new();
     for item in &all_items {
-        if item.status.as_deref() == Some("cancelled") {
-            // Incremental cancelled event: soft-delete the cached row (a no-op
-            // when the row was never cached, e.g. an all-day event). A delete
-            // failure propagates so the sync token is not advanced after a
-            // partial apply.
-            events
-                .delete_by_google_event_id(&cal.id, &item.id, now_rfc3339)
-                .await?;
-            continue;
+        match classify_replica_item(item, &cal.id, now_rfc3339) {
+            ReplicaApplyAction::SoftDelete { google_event_id } => {
+                events
+                    .delete_by_google_event_id(&cal.id, &google_event_id, now_rfc3339)
+                    .await?;
+            }
+            ReplicaApplyAction::Upsert(row) => {
+                to_upsert.push(row);
+            }
         }
-        if is_skipped(item) {
-            continue;
-        }
-        to_upsert.push(map_google_event(item, &cal.id, now_rfc3339));
     }
     if !to_upsert.is_empty() {
         events.upsert_batch(to_upsert, now_rfc3339).await?;
@@ -1704,99 +1707,6 @@ fn encode_path_segment(segment: &str) -> String {
     out
 }
 
-/// Whether a Google event should be skipped during sync: events without
-/// `start.dateTime`/`end.dateTime` (e.g. all-day events, which use
-/// `start.date` instead). The old Go parser stored zero times for those —
-/// skipping is cleaner. Cancelled events are NOT skipped here; they are
-/// soft-deleted first in [`sync_calendar`].
-fn is_skipped(event: &GoogleEvent) -> bool {
-    let has_date_time =
-        |time: &Option<GoogleEventTime>| matches!(time, Some(t) if !t.date_time.as_deref().unwrap_or("").is_empty());
-    !(has_date_time(&event.start) && has_date_time(&event.end))
-}
-
-/// Converts a Google event API response into the local cache model.
-///
-/// `task_id` is copied from `extendedProperties.shared.sanctuary_task_id`
-/// (the task timer's carrier); events without the property map to `""` and
-/// the upsert's `COALESCE` leaves any stored value untouched.
-// `sanctuary_focus` / `sanctuary_priority` / `sanctuary_difficulty` are
-// create-time snapshots on Google and are not cached.
-fn map_google_event(event: &GoogleEvent, calendar_id: &str, now_rfc3339: &str) -> NewCalendarEvent {
-    // Identity columns stay empty/0 until a later slice populates them from
-    // the Google payload; the apply algorithm is unchanged this slice.
-    NewCalendarEvent {
-        calendar_id: calendar_id.to_string(),
-        google_event_id: event.id.clone(),
-        google_etag: event.etag.clone().unwrap_or_default(),
-        google_updated_at: event.updated.clone().unwrap_or_default(),
-        last_synced_at: now_rfc3339.to_string(),
-        title: event.summary.clone().unwrap_or_default(),
-        description: event.description.clone().unwrap_or_default(),
-        start_time: event
-            .start
-            .as_ref()
-            .and_then(|time| time.date_time.clone())
-            .unwrap_or_default(),
-        end_time: event
-            .end
-            .as_ref()
-            .and_then(|time| time.date_time.clone())
-            .unwrap_or_default(),
-        recurrence: event
-            .recurrence
-            .as_ref()
-            .map(|rules| serde_json::to_string(rules).unwrap_or_default())
-            .unwrap_or_default(),
-        task_id: event
-            .extended_properties
-            .as_ref()
-            .and_then(|props| props.shared.as_ref())
-            .and_then(|shared| shared.sanctuary_task_id.clone())
-            .unwrap_or_default(),
-        ical_uid: String::new(),
-        sequence: 0,
-        status: String::new(),
-        recurring_event_id: String::new(),
-        original_start: String::new(),
-        start_time_zone: String::new(),
-        end_time_zone: String::new(),
-        is_all_day: false,
-        raw_json: String::new(),
-    }
-}
-
-/// Builds the full DB-shaped [`CalendarEvent`] (for API responses) from the
-/// upsert input plus the generated id.
-fn row_from_new_event(event: NewCalendarEvent, id: String, now_rfc3339: &str) -> CalendarEvent {
-    CalendarEvent {
-        id,
-        calendar_id: event.calendar_id,
-        google_event_id: event.google_event_id,
-        google_etag: event.google_etag,
-        google_updated_at: event.google_updated_at,
-        last_synced_at: event.last_synced_at,
-        title: event.title,
-        description: event.description,
-        start_time: event.start_time,
-        end_time: event.end_time,
-        recurrence: event.recurrence,
-        task_id: event.task_id,
-        ical_uid: event.ical_uid,
-        sequence: event.sequence,
-        status: event.status,
-        recurring_event_id: event.recurring_event_id,
-        original_start: event.original_start,
-        start_time_zone: event.start_time_zone,
-        end_time_zone: event.end_time_zone,
-        is_all_day: event.is_all_day,
-        raw_json: event.raw_json,
-        created_at: now_rfc3339.to_string(),
-        updated_at: now_rfc3339.to_string(),
-        deleted_at: None,
-    }
-}
-
 /// One entry from `/users/me/calendarList`.
 #[derive(Debug, Deserialize)]
 struct CalendarListEntry {
@@ -1815,81 +1725,6 @@ struct CalendarListEntry {
 struct CalendarListResponse {
     #[serde(default)]
     items: Vec<CalendarListEntry>,
-}
-
-/// A Google Calendar event as returned by `events.list` / `events.insert` /
-/// `events.patch`.
-#[derive(Debug, Deserialize)]
-struct GoogleEvent {
-    id: String,
-    #[serde(default)]
-    etag: Option<String>,
-    #[serde(default)]
-    updated: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    recurrence: Option<Vec<String>>,
-    #[serde(default)]
-    start: Option<GoogleEventTime>,
-    #[serde(default)]
-    end: Option<GoogleEventTime>,
-    #[serde(default, rename = "extendedProperties")]
-    extended_properties: Option<GoogleEventExtendedProperties>,
-}
-
-/// `extendedProperties` of a Google event. Only the shared map is modelled —
-/// the task timer's `sanctuary_task_id` lives under `shared`.
-#[derive(Debug, Deserialize)]
-struct GoogleEventExtendedProperties {
-    #[serde(default)]
-    shared: Option<GoogleEventSharedProperties>,
-}
-
-/// `extendedProperties.shared` of a Google event. Every key we write is
-/// modelled here: `sanctuary_task_id` (the task timer's carrier),
-/// `sanctuary_focus` (focused-segment flag), the create-time snapshots
-/// `sanctuary_priority` / `sanctuary_difficulty`, and the occurrence
-/// carriers `sanctuary_routine_id` / `sanctuary_occurrence_id` (slice 6 —
-/// a started occurrence's one-shot log; never sent next to the task
-/// carrier). Absent keys deserialize to `None`; `None` values are skipped
-/// on serialize, so the wire shape never carries `"0"`/empty placeholders.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-struct GoogleEventSharedProperties {
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_task_id")]
-    sanctuary_task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_focus")]
-    sanctuary_focus: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_priority")]
-    sanctuary_priority: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_difficulty")]
-    sanctuary_difficulty: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_routine_id")]
-    sanctuary_routine_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "sanctuary_occurrence_id")]
-    sanctuary_occurrence_id: Option<String>,
-}
-
-/// `start`/`end` of a Google event; all-day events carry `date` instead of
-/// `dateTime` and are skipped by the sync.
-#[derive(Debug, Deserialize)]
-struct GoogleEventTime {
-    #[serde(default, rename = "dateTime")]
-    date_time: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EventsPage {
-    #[serde(default)]
-    items: Option<Vec<GoogleEvent>>,
-    #[serde(default, rename = "nextSyncToken")]
-    next_sync_token: Option<String>,
-    #[serde(default, rename = "nextPageToken")]
-    next_page_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -2256,6 +2091,57 @@ mod tests {
                 next_id: Mutex::new(1),
             }
         }
+
+        /// Natural-key upsert including soft-deleted rows: on hit, update
+        /// fields, clear `deleted_at`, return the existing id; on miss, insert
+        /// and return a new id. Mirrors D1 + `EVENT_UPSERT_ON_CONFLICT`.
+        fn apply_upsert(&self, event: NewCalendarEvent, now_rfc3339: &str) -> String {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(existing) = stored.iter_mut().find(|row| {
+                row.calendar_id == event.calendar_id && row.google_event_id == event.google_event_id
+            }) {
+                let id = existing.id.clone();
+                // Preserve task_id when incoming is empty (SQL COALESCE).
+                let task_id = if event.task_id.is_empty() {
+                    existing.task_id.clone()
+                } else {
+                    event.task_id.clone()
+                };
+                existing.google_etag = event.google_etag;
+                existing.google_updated_at = event.google_updated_at;
+                existing.last_synced_at = event.last_synced_at;
+                existing.title = event.title;
+                existing.description = event.description;
+                existing.start_time = event.start_time;
+                existing.end_time = event.end_time;
+                existing.recurrence = event.recurrence;
+                existing.task_id = task_id;
+                existing.ical_uid = event.ical_uid;
+                existing.sequence = event.sequence;
+                existing.status = event.status;
+                existing.recurring_event_id = event.recurring_event_id;
+                existing.original_start = event.original_start;
+                existing.start_time_zone = event.start_time_zone;
+                existing.end_time_zone = event.end_time_zone;
+                existing.is_all_day = event.is_all_day;
+                existing.raw_json = event.raw_json;
+                existing.updated_at = now_rfc3339.to_string();
+                existing.deleted_at = None;
+                return id;
+            }
+            let mut next = self.next_id.lock().unwrap();
+            let id = format!("evt-{next}");
+            *next += 1;
+            stored.push(row_from_new_event(event, id.clone(), now_rfc3339));
+            id
+        }
+
+        /// Mirrors GET projection filters (`timed_masters_and_exceptions`).
+        fn in_projection(event: &CalendarEvent) -> bool {
+            event.deleted_at.is_none()
+                && !event.is_all_day
+                && (event.status.is_empty() || event.status != "cancelled")
+        }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -2268,14 +2154,9 @@ mod tests {
             if *self.fail_upsert.lock().unwrap() {
                 return Err(RepoError::Backend("cache write failed".into()));
             }
-            *self.upserted_single.lock().unwrap() = Some((event.google_event_id.clone(), event.clone()));
-            let id = "created-id".to_string();
-            self.stored.lock().unwrap().push(row_from_new_event(
-                event,
-                id.clone(),
-                now_rfc3339,
-            ));
-            Ok(id)
+            *self.upserted_single.lock().unwrap() =
+                Some((event.google_event_id.clone(), event.clone()));
+            Ok(self.apply_upsert(event, now_rfc3339))
         }
 
         async fn upsert_batch(
@@ -2287,14 +2168,8 @@ mod tests {
                 return Err(RepoError::Backend("cache write failed".into()));
             }
             self.upserted_batch.lock().unwrap().extend(events.clone());
-            let mut next = self.next_id.lock().unwrap();
             for event in events {
-                self.stored.lock().unwrap().push(row_from_new_event(
-                    event,
-                    format!("evt-{next}"),
-                    now_rfc3339,
-                ));
-                *next += 1;
+                self.apply_upsert(event, now_rfc3339);
             }
             Ok(())
         }
@@ -2333,11 +2208,25 @@ mod tests {
             start_rfc3339: &str,
             end_rfc3339: &str,
         ) -> Result<Vec<CalendarEvent>, RepoError> {
-            self.ranged
+            self.ranged.lock().unwrap().push((
+                user_id.to_string(),
+                start_rfc3339.to_string(),
+                end_rfc3339.to_string(),
+            ));
+            // Mirrors EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL projection +
+            // overlap (start < window_end AND end > window_start).
+            Ok(self
+                .stored
                 .lock()
                 .unwrap()
-                .push((user_id.to_string(), start_rfc3339.to_string(), end_rfc3339.to_string()));
-            Ok(self.stored.lock().unwrap().clone())
+                .iter()
+                .filter(|event| {
+                    Self::in_projection(event)
+                        && event.start_time.as_str() < end_rfc3339
+                        && event.end_time.as_str() > start_rfc3339
+                })
+                .cloned()
+                .collect())
         }
 
         async fn list_running_by_user_id(
@@ -2345,15 +2234,15 @@ mod tests {
             _user_id: &str,
             now_rfc3339: &str,
         ) -> Result<Vec<CalendarEvent>, RepoError> {
-            // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: task-tagged, living,
-            // `start_time <= now < end_time` (lexicographic RFC 3339).
+            // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: projection +
+            // task-tagged + `start_time <= now < end_time`.
             Ok(self
                 .stored
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|event| {
-                    event.deleted_at.is_none()
+                    Self::in_projection(event)
                         && !event.task_id.is_empty()
                         && event.start_time.as_str() <= now_rfc3339
                         && event.end_time.as_str() > now_rfc3339
@@ -2381,7 +2270,7 @@ mod tests {
             &self,
             calendar_id: &str,
             google_event_id: &str,
-            _now_rfc3339: &str,
+            now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             self.deleted_by_google_event_id
                 .lock()
@@ -2389,6 +2278,12 @@ mod tests {
                 .push((calendar_id.to_string(), google_event_id.to_string()));
             if *self.fail_delete.lock().unwrap() {
                 return Err(RepoError::Backend("cache delete failed".into()));
+            }
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(event) = stored.iter_mut().find(|event| {
+                event.calendar_id == calendar_id && event.google_event_id == google_event_id
+            }) {
+                event.deleted_at = Some(now_rfc3339.to_string());
             }
             Ok(())
         }
@@ -3461,9 +3356,10 @@ mod tests {
     }
 
     #[test]
-    fn all_day_and_no_time_events_are_skipped() {
+    fn all_day_and_no_time_events_are_upserted_out_of_projection() {
         let body = r#"{"items":[
-            {"id": "all-day", "start": {"date": "2026-08-01"}, "end": {"date": "2026-08-02"}},
+            {"id": "all-day", "summary": "Holiday",
+             "start": {"date": "2026-08-01"}, "end": {"date": "2026-08-02"}},
             {"id": "no-time", "summary": "No times at all"},
             {"id": "real", "summary": "Real",
              "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
@@ -3480,14 +3376,21 @@ mod tests {
         .unwrap();
 
         let upserted = events.upserted_batch.lock().unwrap();
-        assert_eq!(upserted.len(), 1, "only the timed event");
-        assert_eq!(upserted[0].google_event_id, "real");
+        assert_eq!(upserted.len(), 3, "all-day, no-time, and timed are upserted");
+        let all_day = upserted.iter().find(|e| e.google_event_id == "all-day").unwrap();
+        assert!(all_day.is_all_day);
+        assert_eq!(all_day.start_time, "2026-08-01T00:00:00Z");
+        assert_eq!(all_day.end_time, "2026-08-02T00:00:00Z");
+        let no_time = upserted.iter().find(|e| e.google_event_id == "no-time").unwrap();
+        assert!(!no_time.is_all_day);
+        assert!(no_time.start_time.is_empty());
         assert!(
             events.deleted_by_google_event_id.lock().unwrap().is_empty(),
-            "skipped events are not deleted"
+            "all-day/no-time are not deleted"
         );
+        // GET projection only surfaces the timed living event.
         assert_eq!(output.events.len(), 1);
-        // Sync state still advances even when everything was skipped.
+        assert_eq!(output.events[0].google_event_id, "real");
         assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
     }
 
@@ -3510,7 +3413,7 @@ mod tests {
         ))
         .unwrap();
 
-        // Cancelled events are soft-deleted by google id, not skipped.
+        // Ordinary cancelled events (no recurringEventId) are soft-deleted.
         assert_eq!(
             *events.deleted_by_google_event_id.lock().unwrap(),
             vec![("cal-1".to_string(), "cancelled".to_string())]
@@ -3521,6 +3424,119 @@ mod tests {
         assert_eq!(output.events.len(), 1);
         // Sync state still advances.
         assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+    }
+
+    #[test]
+    fn cancelled_exception_is_upserted_not_deleted_and_out_of_projection() {
+        let body = r#"{"items":[
+            {"id": "exc-1", "status": "cancelled", "recurringEventId": "master-1",
+             "originalStartTime": {"dateTime": "2026-08-20T15:00:00Z"}},
+            {"id": "real", "summary": "Real",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ], "nextSyncToken": "st-exc"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert!(
+            events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+            "cancelled exceptions must not be soft-deleted"
+        );
+        let upserted = events.upserted_batch.lock().unwrap();
+        assert_eq!(upserted.len(), 2);
+        let exc = upserted.iter().find(|e| e.google_event_id == "exc-1").unwrap();
+        assert_eq!(exc.status, "cancelled");
+        assert_eq!(exc.recurring_event_id, "master-1");
+        assert_eq!(exc.start_time, "2026-08-20T15:00:00Z");
+        // Projection: only the living timed event.
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].google_event_id, "real");
+        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-exc");
+    }
+
+    #[test]
+    fn natural_key_upsert_returns_persisted_id() {
+        let events = FakeEventRepo::new();
+        let mut row = NewCalendarEvent {
+            calendar_id: "cal-1".into(),
+            google_event_id: "g-1".into(),
+            google_etag: "e1".into(),
+            google_updated_at: "2026-08-17T10:00:00Z".into(),
+            last_synced_at: "2026-08-17T12:00:00Z".into(),
+            title: "First".into(),
+            description: String::new(),
+            start_time: "2026-08-18T09:00:00Z".into(),
+            end_time: "2026-08-18T09:30:00Z".into(),
+            recurrence: String::new(),
+            task_id: String::new(),
+            ical_uid: "uid".into(),
+            sequence: 0,
+            status: "confirmed".into(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            is_all_day: false,
+            raw_json: "{}".into(),
+        };
+        let id1 = pollster::block_on(events.upsert(row.clone(), "2026-08-17T12:00:00Z")).unwrap();
+        row.title = "Second".into();
+        row.sequence = 1;
+        let id2 = pollster::block_on(events.upsert(row, "2026-08-17T13:00:00Z")).unwrap();
+        assert_eq!(id1, id2, "second upsert must return the persisted id");
+        let stored = events.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, id1);
+        assert_eq!(stored[0].title, "Second");
+        assert_eq!(stored[0].sequence, 1);
+        assert!(stored[0].deleted_at.is_none());
+    }
+
+    #[test]
+    fn upsert_after_delete_clears_deleted_at() {
+        let events = FakeEventRepo::new();
+        let row = NewCalendarEvent {
+            calendar_id: "cal-1".into(),
+            google_event_id: "g-1".into(),
+            google_etag: "e1".into(),
+            google_updated_at: "2026-08-17T10:00:00Z".into(),
+            last_synced_at: "2026-08-17T12:00:00Z".into(),
+            title: "Live".into(),
+            description: String::new(),
+            start_time: "2026-08-18T09:00:00Z".into(),
+            end_time: "2026-08-18T09:30:00Z".into(),
+            recurrence: String::new(),
+            task_id: String::new(),
+            ical_uid: String::new(),
+            sequence: 0,
+            status: "confirmed".into(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            is_all_day: false,
+            raw_json: String::new(),
+        };
+        let id = pollster::block_on(events.upsert(row.clone(), "2026-08-17T12:00:00Z")).unwrap();
+        pollster::block_on(events.delete_by_google_event_id("cal-1", "g-1", "2026-08-17T12:30:00Z"))
+            .unwrap();
+        assert!(
+            events.stored.lock().unwrap()[0].deleted_at.is_some(),
+            "soft-deleted"
+        );
+        let id2 = pollster::block_on(events.upsert(row, "2026-08-17T13:00:00Z")).unwrap();
+        assert_eq!(id, id2);
+        let stored = events.stored.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].deleted_at.is_none(), "upsert restores deleted_at");
+        assert_eq!(stored[0].title, "Live");
     }
 
     #[test]
@@ -4583,7 +4599,7 @@ mod tests {
 
         assert_eq!(output.source, "google");
         assert!(output.cache_error.is_none());
-        assert_eq!(output.event.id, "created-id");
+        assert!(!output.event.id.is_empty(), "persisted id from upsert");
         assert_eq!(output.event.google_event_id, "google-evt-created");
         assert_eq!(output.event.calendar_id, "cal-1");
         assert_eq!(output.event.title, "New meeting");
