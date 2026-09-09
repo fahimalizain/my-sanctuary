@@ -926,6 +926,7 @@ pub async fn patch_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
     events: Option<&dyn CalendarEventRepo>,
+    operations: Option<&dyn CalendarEventOperationRepo>,
     access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -976,13 +977,14 @@ pub async fn patch_occurrence(
         && updated.google_event_id.is_some()
         && updated.calendar_id.is_some()
     {
-        if let (Some(http), Some(calendars), Some(events), Some(access)) =
-            (http, calendars, events, access)
+        if let (Some(http), Some(calendars), Some(events), Some(operations), Some(access)) =
+            (http, calendars, events, operations, access)
         {
             let output = patch_event_summary(
                 http,
                 calendars,
                 events,
+                operations,
                 access,
                 updated.calendar_id.as_deref().expect("checked above"),
                 updated.google_event_id.as_deref().expect("checked above"),
@@ -1154,6 +1156,7 @@ pub async fn complete_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
     events: Option<&dyn CalendarEventRepo>,
+    operations: Option<&dyn CalendarEventOperationRepo>,
     access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -1164,7 +1167,7 @@ pub async fn complete_occurrence(
     now_unix: i64,
 ) -> Result<OccurrenceResponse, AgendaError> {
     exit_occurrence(
-        http, calendars, events, access, list_repo, category_repo, routine_repo,
+        http, calendars, events, operations, access, list_repo, category_repo, routine_repo,
         occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_DONE,
     )
     .await
@@ -1182,6 +1185,7 @@ pub async fn skip_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
     events: Option<&dyn CalendarEventRepo>,
+    operations: Option<&dyn CalendarEventOperationRepo>,
     access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -1192,7 +1196,7 @@ pub async fn skip_occurrence(
     now_unix: i64,
 ) -> Result<OccurrenceResponse, AgendaError> {
     exit_occurrence(
-        http, calendars, events, access, list_repo, category_repo, routine_repo,
+        http, calendars, events, operations, access, list_repo, category_repo, routine_repo,
         occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_SKIPPED,
     )
     .await
@@ -1211,6 +1215,7 @@ pub async fn pause_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
     events: Option<&dyn CalendarEventRepo>,
+    operations: Option<&dyn CalendarEventOperationRepo>,
     access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -1228,13 +1233,14 @@ pub async fn pause_occurrence(
         }
         OCCURRENCE_STATUS_IN_PROGRESS => {
             if occurrence.calendar_id.is_some() && occurrence.google_event_id.is_some() {
-                if let (Some(http), Some(calendars), Some(events), Some(access)) =
-                    (http, calendars, events, access)
+                if let (Some(http), Some(calendars), Some(events), Some(operations), Some(access)) =
+                    (http, calendars, events, operations, access)
                 {
                     close_occurrence_event(
                         http,
                         calendars,
                         events,
+                        operations,
                         access,
                         occurrence.calendar_id.as_deref().expect("checked above"),
                         occurrence.google_event_id.as_deref().expect("checked above"),
@@ -1311,6 +1317,7 @@ async fn exit_occurrence(
     http: Option<&dyn HttpClient>,
     calendars: Option<&dyn CalendarRepo>,
     events: Option<&dyn CalendarEventRepo>,
+    operations: Option<&dyn CalendarEventOperationRepo>,
     access: Option<&GoogleAccess>,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -1335,13 +1342,14 @@ async fn exit_occurrence(
         && occurrence.calendar_id.is_some()
         && occurrence.google_event_id.is_some()
     {
-        if let (Some(http), Some(calendars), Some(events), Some(access)) =
-            (http, calendars, events, access)
+        if let (Some(http), Some(calendars), Some(events), Some(operations), Some(access)) =
+            (http, calendars, events, operations, access)
         {
             close_occurrence_event(
                 http,
                 calendars,
                 events,
+                operations,
                 access,
                 occurrence.calendar_id.as_deref().expect("checked above"),
                 occurrence.google_event_id.as_deref().expect("checked above"),
@@ -1365,6 +1373,7 @@ async fn close_occurrence_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     calendar_id: &str,
     google_event_id: &str,
@@ -1390,6 +1399,7 @@ async fn close_occurrence_event(
         http,
         calendars,
         events,
+        operations,
         access,
         calendar_id,
         google_event_id,
@@ -1618,6 +1628,7 @@ pub async fn run_elongate_occurrences(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     occurrences: &dyn OccurrenceRepo,
     tokens: &dyn TokenRepo,
     oauth: &OAuthConfig,
@@ -1700,6 +1711,7 @@ pub async fn run_elongate_occurrences(
             http,
             calendars,
             events,
+            operations,
             &access,
             &event.calendar_id,
             &event.google_event_id,
@@ -2978,10 +2990,15 @@ mod tests {
 
         async fn get_bearer_raw(
             &self,
-            _url: &str,
+            url: &str,
             _token: &str,
         ) -> Result<(u16, Vec<u8>), HttpError> {
-            Ok((200, Vec::new()))
+            for (substr, status, body) in &self.routes {
+                if url.contains(substr.as_str()) {
+                    return Ok((*status, body.clone().into_bytes()));
+                }
+            }
+            Ok((200, br#"{"id":"unknown","etag":"e1"}"#.to_vec()))
         }
 
         async fn post_json(
@@ -3538,7 +3555,7 @@ mod tests {
 
     fn complete(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(complete_occurrence(
-            None, None, None, None,
+            None, None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -3551,7 +3568,7 @@ mod tests {
 
     fn skip(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(skip_occurrence(
-            None, None, None, None,
+            None, None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -3575,7 +3592,7 @@ mod tests {
 
     fn pause(repos: &Repos, user_id: &str, id: &str) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(pause_occurrence(
-            None, None, None, None,
+            None, None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -3593,7 +3610,7 @@ mod tests {
         updates: &UpdateOccurrence,
     ) -> Result<OccurrenceResponse, AgendaError> {
         pollster::block_on(patch_occurrence(
-            None, None, None, None,
+            None, None, None, None, None,
             &repos.lists,
             &repos.categories,
             &repos.routines,
@@ -3713,7 +3730,7 @@ mod tests {
             id: "evt-1".to_string(),
             calendar_id: calendar_id.to_string(),
             google_event_id: google_id.to_string(),
-            google_etag: String::new(),
+            google_etag: "e1".to_string(),
             google_updated_at: String::new(),
             last_synced_at: "2026-08-23T00:00:00Z".to_string(),
             title: "Fajr".to_string(),
@@ -5561,7 +5578,7 @@ mod tests {
             NewCalendarEvent {
                 calendar_id: "cal-primary@example.com".to_string(),
                 google_event_id: "g-1".to_string(),
-                google_etag: String::new(),
+                google_etag: "e1".to_string(),
                 google_updated_at: String::new(),
                 last_synced_at: "2026-08-23T00:00:00Z".to_string(),
                 title: "Fajr".to_string(),
@@ -5588,6 +5605,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5628,7 +5646,7 @@ mod tests {
             NewCalendarEvent {
                 calendar_id: "cal-primary@example.com".to_string(),
                 google_event_id: "g-1".to_string(),
-                google_etag: String::new(),
+                google_etag: "e1".to_string(),
                 google_updated_at: String::new(),
                 last_synced_at: "2026-08-23T00:00:00Z".to_string(),
                 title: "Fajr".to_string(),
@@ -5655,6 +5673,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5692,7 +5711,7 @@ mod tests {
             NewCalendarEvent {
                 calendar_id: "cal-primary@example.com".to_string(),
                 google_event_id: "g-1".to_string(),
-                google_etag: String::new(),
+                google_etag: "e1".to_string(),
                 google_updated_at: String::new(),
                 last_synced_at: "2026-08-23T00:00:00Z".to_string(),
                 title: "Fajr".to_string(),
@@ -5719,6 +5738,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5780,6 +5800,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5814,6 +5835,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5851,6 +5873,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5884,6 +5907,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5921,6 +5945,7 @@ mod tests {
             Some(&http),
             Some(&calendars),
             Some(&events),
+            Some(&ops()),
             Some(&access()),
             &repos.lists,
             &repos.categories,
@@ -5960,6 +5985,7 @@ mod tests {
             http,
             calendars,
             events,
+            &ops(),
             occurrences,
             &FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]),
             &oauth_config(),
@@ -5982,7 +6008,7 @@ mod tests {
             NewCalendarEvent {
                 calendar_id: "cal-primary@example.com".to_string(),
                 google_event_id: "g-1".to_string(),
-                google_etag: String::new(),
+                google_etag: "e1".to_string(),
                 google_updated_at: String::new(),
                 last_synced_at: "2026-08-23T00:00:00Z".to_string(),
                 title: "Fajr".to_string(),
@@ -6035,7 +6061,7 @@ mod tests {
             NewCalendarEvent {
                 calendar_id: "cal-primary@example.com".to_string(),
                 google_event_id: "g-1".to_string(),
-                google_etag: String::new(),
+                google_etag: "e1".to_string(),
                 google_updated_at: String::new(),
                 last_synced_at: "2026-08-23T00:00:00Z".to_string(),
                 title: "Fajr".to_string(),

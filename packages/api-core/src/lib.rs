@@ -93,7 +93,8 @@ pub use routines::{
 pub use repo::{
     build_event_upsert_sql, build_occurrence_insert_sql, build_occurrence_list_by_ids_sql,
     build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, AgendaItemRepo,
-    CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError, RoutineRepo, TaskCategoryRepo,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError,
+    RoutineRepo, TaskCategoryRepo,
     TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
     AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
     AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,

@@ -71,6 +71,7 @@ pub(crate) mod google;
 pub(crate) mod journal;
 pub(crate) mod list;
 pub(crate) mod write;
+pub(crate) mod write_journal;
 pub(crate) mod watch;
 pub(crate) mod webhook;
 pub(crate) mod catalog;
@@ -144,6 +145,9 @@ pub enum CalendarError {
     GoogleNotFound,
     #[error("google api error: {0}")]
     GoogleApi(String),
+    /// If-Match retries exhausted for this event/operation. The calendar is not disabled.
+    #[error("calendar event write conflict")]
+    Conflict,
     #[error("invalid google response: {0}")]
     InvalidResponse(String),
     #[error("http request failed: {0}")]

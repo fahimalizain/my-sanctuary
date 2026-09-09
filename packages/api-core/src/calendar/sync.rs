@@ -194,7 +194,8 @@ pub fn classify_sync_error(err: &CalendarError) -> SyncErrorCode {
         CalendarError::GoogleApi(msg) => classify_google_api_message(msg),
         CalendarError::InvalidRange(_)
         | CalendarError::Invalid(_)
-        | CalendarError::NotFound => SyncErrorCode::Unknown,
+        | CalendarError::NotFound
+        | CalendarError::Conflict => SyncErrorCode::Unknown,
     }
 }
 

@@ -1,10 +1,7 @@
-use super::apply::{map_google_event, row_from_new_event, GoogleEvent, GoogleEventSharedProperties};
-use super::google::encode_path_segment;
-use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
+use super::CalendarError;
 use crate::models::{CalendarEvent, GoogleCalendar, NewEventInput, PatchEventFields};
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
-use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
 /// Result of [`create_event`]: the created event plus the response source.
@@ -12,9 +9,10 @@ use crate::token::GoogleAccess;
 pub struct CreateEventOutput {
     pub event: CalendarEvent,
     pub source: String,
-    /// Set when the local cache upsert failed on **patch** (logged, never
-    /// fatal). [`create_event`] never returns `Ok` with this set — a cache
-    /// miss after Google commit is [`CalendarError::Repo`].
+    /// Set when the local cache upsert failed on **patch** historically
+    /// (logged, never fatal). Journaled create/patch/delete never return
+    /// `Ok` with this set — a cache miss after Google commit is
+    /// [`CalendarError::Repo`].
     pub cache_error: Option<String>,
 }
 
@@ -32,7 +30,8 @@ pub struct CreateEventOutput {
 pub(crate) fn build_shared_properties(
     input: &NewEventInput,
     sanctuary_event_id: &str,
-) -> GoogleEventSharedProperties {
+) -> super::apply::GoogleEventSharedProperties {
+    use super::apply::GoogleEventSharedProperties;
     let trim_opt = |value: &Option<String>| {
         value
             .as_deref()
@@ -125,79 +124,45 @@ pub async fn create_event(
     .await
 }
 
-/// Patches selected fields on Google (`events.patch`) and upserts the
-/// returned row into the local cache. Builds a minimal JSON body from
-/// whichever of `start` / `end` / `summary` are `Some`. Empty (all `None`)
-/// → [`CalendarError::Invalid`]. Cache failures are logged
-/// ([`CreateEventOutput::cache_error`]), never fatal.
+/// Patches selected fields on Google (`events.patch`) via the outbound
+/// operation journal (issue #50 / Vertical 4).
+///
+/// **Minimal body only:** `start.dateTime` / `end.dateTime` / `summary` —
+/// whichever of `fields` are `Some`. This is **not** `events.update` (full
+/// replace). Arrays replace on patch, so we deliberately never send
+/// attendees, conferenceData, extendedProperties, or recurrence — those
+/// stay on Google untouched. Empty (all `None`) → [`CalendarError::Invalid`]
+/// before any journal row.
+///
+/// Journals `pending` before Google, sends `If-Match` with the stored
+/// `google_etag` (or GETs one first when empty), retries 412 up to three
+/// PATCH attempts with the **same** minimal payload + fresh etag, then
+/// marks the operation `conflict` ([`CalendarError::Conflict`]) without
+/// disabling the calendar. Cache failure after Google 2xx is
+/// [`CalendarError::Repo`] (status stays `google_committed`).
 pub async fn patch_event_fields(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     calendar_id: &str,
     google_event_id: &str,
     fields: &PatchEventFields,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
-    let mut payload = serde_json::Map::new();
-    if let Some(start) = fields.start.as_ref() {
-        payload.insert(
-            "start".to_string(),
-            serde_json::json!({ "dateTime": start }),
-        );
-    }
-    if let Some(end) = fields.end.as_ref() {
-        payload.insert(
-            "end".to_string(),
-            serde_json::json!({ "dateTime": end }),
-        );
-    }
-    if let Some(summary) = fields.summary.as_ref() {
-        payload.insert("summary".to_string(), serde_json::json!(summary));
-    }
-    if payload.is_empty() {
-        return Err(CalendarError::Invalid("empty patch".to_string()));
-    }
-
-    let Some(cal) = calendars.get_by_id(calendar_id).await? else {
-        return Err(CalendarError::NotFound);
-    };
-
-    let url = format!(
-        "{GOOGLE_EVENTS_BASE_URL}/{}/events/{}",
-        encode_path_segment(&cal.google_calendar_id),
-        encode_path_segment(google_event_id)
-    );
-    let body = serde_json::to_vec(&serde_json::Value::Object(payload))
-        .map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
-    let (status, response) = http.patch_json(&url, &access.access_token, &body).await?;
-    if !(200..300).contains(&status) {
-        return Err(CalendarError::GoogleApi(format!(
-            "google events.patch returned {status}"
-        )));
-    }
-    let patched: GoogleEvent = serde_json::from_slice(&response)
-        .map_err(|err| CalendarError::InvalidResponse(format!("events.patch body: {err}")))?;
-
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let new_event = map_google_event(&patched, &cal.id, &now_rfc3339);
-    let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
-        Ok(id) => id,
-        Err(err) => {
-            return Ok(CreateEventOutput {
-                event: row_from_new_event(new_event, "".to_string(), &now_rfc3339),
-                source: "google".to_string(),
-                cache_error: Some(err.to_string()),
-            });
-        }
-    };
-
-    Ok(CreateEventOutput {
-        event: row_from_new_event(new_event, id, &now_rfc3339),
-        source: "google".to_string(),
-        cache_error: None,
-    })
+    super::write_journal::patch_event_fields_with_journal(
+        http,
+        calendars,
+        events,
+        operations,
+        access,
+        calendar_id,
+        google_event_id,
+        fields,
+        now_unix,
+    )
+    .await
 }
 
 /// Patches an event's `end` on Google — the task timer's stop/pause path.
@@ -206,6 +171,7 @@ pub async fn patch_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     calendar_id: &str,
     google_event_id: &str,
@@ -216,6 +182,7 @@ pub async fn patch_event(
         http,
         calendars,
         events,
+        operations,
         access,
         calendar_id,
         google_event_id,
@@ -235,6 +202,7 @@ pub async fn patch_event_summary(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     calendar_id: &str,
     google_event_id: &str,
@@ -245,6 +213,7 @@ pub async fn patch_event_summary(
         http,
         calendars,
         events,
+        operations,
         access,
         calendar_id,
         google_event_id,
@@ -260,11 +229,12 @@ pub async fn patch_event_summary(
 
 /// Looks up a local event by id, verifies the owning calendar belongs to
 /// `user_id`, then patches via [`patch_event_fields`]. Wrong owner / missing
-/// → [`CalendarError::NotFound`] (no Google call).
+/// → [`CalendarError::NotFound`] (no Google call, no journal).
 pub async fn update_event_for_user(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     user_id: &str,
     event_id: &str,
@@ -276,6 +246,7 @@ pub async fn update_event_for_user(
         http,
         calendars,
         events,
+        operations,
         access,
         &cal.id,
         &event.google_event_id,
@@ -286,42 +257,34 @@ pub async fn update_event_for_user(
 }
 
 /// Cancels an event on Google (`events.patch` with `status: "cancelled"`)
-/// and soft-deletes the local cache row. Google 404/410 still soft-deletes
-/// locally (already gone). Does **not** use HTTP DELETE — reuses
-/// [`HttpClient::patch_json`] so fakes across tasks/agenda stay unchanged.
+/// via the outbound journal and soft-deletes the local cache row.
+///
+/// Sends `If-Match` when an etag is known (same 412 retry cap as patch).
+/// Google 404/410 still soft-deletes locally (already gone) and marks the
+/// operation `cache_applied`. Does **not** use HTTP DELETE.
 pub async fn delete_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     calendar_id: &str,
     google_event_id: &str,
     local_id: &str,
     now_unix: i64,
 ) -> Result<(), CalendarError> {
-    let Some(cal) = calendars.get_by_id(calendar_id).await? else {
-        return Err(CalendarError::NotFound);
-    };
-
-    let url = format!(
-        "{GOOGLE_EVENTS_BASE_URL}/{}/events/{}",
-        encode_path_segment(&cal.google_calendar_id),
-        encode_path_segment(google_event_id)
-    );
-    let payload = serde_json::json!({ "status": "cancelled" });
-    let body =
-        serde_json::to_vec(&payload).map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
-    let (status, _response) = http.patch_json(&url, &access.access_token, &body).await?;
-    // 404/410 = already gone on Google; still soft-delete locally.
-    if status != 404 && status != 410 && !(200..300).contains(&status) {
-        return Err(CalendarError::GoogleApi(format!(
-            "google events.patch (cancel) returned {status}"
-        )));
-    }
-
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    events.delete(local_id, &now_rfc3339).await?;
-    Ok(())
+    super::write_journal::delete_event_with_journal(
+        http,
+        calendars,
+        events,
+        operations,
+        access,
+        calendar_id,
+        google_event_id,
+        local_id,
+        now_unix,
+    )
+    .await
 }
 
 /// Looks up a local event by id, verifies ownership, then cancels via
@@ -330,6 +293,7 @@ pub async fn delete_event_for_user(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     user_id: &str,
     event_id: &str,
@@ -340,6 +304,7 @@ pub async fn delete_event_for_user(
         http,
         calendars,
         events,
+        operations,
         access,
         &cal.id,
         &event.google_event_id,

@@ -5,6 +5,8 @@
 //! `pending` → Google POST → `google_committed` (or 409+GET) → cache upsert
 //! → `cache_applied`. Cache failure after Google commit is a hard
 //! [`CalendarError::Repo`] (never a 200 with a phantom local id).
+//!
+//! Patch/delete live in [`super::write_journal`].
 
 use sha2::{Digest, Sha256};
 
@@ -22,6 +24,7 @@ use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
 use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
+
 
 /// Google client-supplied event id: `sanc` + 32 lowercase hex chars.
 ///
@@ -229,10 +232,11 @@ pub(crate) async fn create_event_with_journal(
     })
 }
 
-fn parse_google_event(bytes: &[u8], context: &str) -> Result<GoogleEvent, CalendarError> {
+pub(crate) fn parse_google_event(bytes: &[u8], context: &str) -> Result<GoogleEvent, CalendarError> {
     serde_json::from_slice(bytes)
         .map_err(|err| CalendarError::InvalidResponse(format!("{context} body: {err}")))
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -83,6 +83,13 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             return;
         }
     };
+    let operations = match env.d1("DB") {
+        Ok(db) => crate::db::D1CalendarEventOperationRepo::new(db),
+        Err(err) => {
+            console_log!("cron: DB binding missing: {err} — skipping cron");
+            return;
+        }
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
@@ -93,6 +100,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &logs,
         &tasks,
         &tokens,
@@ -107,6 +115,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &occurrences,
         &tokens,
         &oauth,

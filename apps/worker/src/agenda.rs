@@ -51,6 +51,9 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: AgendaError) -> 
         AgendaError::Invalid(message) => json_error(ctx, 400, &message),
         AgendaError::NotFound => json_error(ctx, 404, "not found"),
         AgendaError::GoogleApi(message) => json_error(ctx, 502, &message),
+        AgendaError::Calendar(api_core::CalendarError::Conflict) => {
+            json_error(ctx, 409, "event write conflict")
+        }
         AgendaError::Calendar(err) => {
             console_log!("agenda: calendar error: {err}");
             json_error(ctx, 500, "failed to update occurrence")
@@ -448,10 +451,12 @@ pub async fn patch_occurrence(
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let calendars = calendars_d1(&ctx)?;
     let events = events_d1(&ctx)?;
+    let operations = operations_d1(&ctx)?;
     let result = api_core::patch_occurrence(
         http,
         needs_google.then(|| &calendars as &dyn api_core::CalendarRepo),
         needs_google.then(|| &events as &dyn api_core::CalendarEventRepo),
+        needs_google.then(|| &operations as &dyn api_core::CalendarEventOperationRepo),
         access.as_ref(),
         &lists_d1(&ctx)?,
         &categories_d1(&ctx)?,
@@ -580,10 +585,12 @@ macro_rules! occurrence_exit {
             let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
             let calendars = calendars_d1(&ctx)?;
             let events = events_d1(&ctx)?;
+            let operations = operations_d1(&ctx)?;
             let result = $service(
                 http,
                 needs_google.then(|| &calendars as &dyn api_core::CalendarRepo),
                 needs_google.then(|| &events as &dyn api_core::CalendarEventRepo),
+                needs_google.then(|| &operations as &dyn api_core::CalendarEventOperationRepo),
                 access.as_ref(),
                 &lists_d1(&ctx)?,
                 &categories_d1(&ctx)?,

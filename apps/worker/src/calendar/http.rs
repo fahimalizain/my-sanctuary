@@ -337,10 +337,12 @@ pub async fn update_event(
 
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
     match api_core::update_event_for_user(
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &access,
         &user_id,
         &id,
@@ -350,9 +352,7 @@ pub async fn update_event(
     .await
     {
         Ok(output) => {
-            if let Some(error) = &output.cache_error {
-                console_log!("calendar: cache upsert failed for patched event: {error}");
-            }
+            // Journaled patch never returns Ok with cache_error set (issue #50).
             let event = paint_single_event(&ctx, &user_id, output.event).await?;
             let _ = crate::user_hub::notify_user(
                 &ctx.env,
@@ -369,6 +369,7 @@ pub async fn update_event(
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
         Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(CalendarError::Conflict) => json_error(&ctx, 409, "event write conflict"),
         Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
         Err(CalendarError::GoogleNotFound) => {
             json_error(&ctx, 502, "google returned 404 for events.patch")
@@ -409,10 +410,12 @@ pub async fn delete_event(
 
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
     match api_core::delete_event_for_user(
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &access,
         &user_id,
         &id,
@@ -428,6 +431,7 @@ pub async fn delete_event(
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
         Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(CalendarError::Conflict) => json_error(&ctx, 409, "event write conflict"),
         Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
         Err(CalendarError::GoogleNotFound) => {
             json_error(&ctx, 502, "google returned 404 for events.patch")

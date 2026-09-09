@@ -5,8 +5,8 @@ use crate::calendar::{
     update_event_for_user, CalendarError,
 };
 use crate::models::{
-    GoogleCalendar, PatchEventFields, OP_STATUS_CACHE_APPLIED, OP_STATUS_FAILED,
-    OP_STATUS_GOOGLE_COMMITTED, OP_VERB_INSERT,
+    GoogleCalendar, PatchEventFields, OP_STATUS_CACHE_APPLIED, OP_STATUS_CONFLICT,
+    OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED, OP_VERB_DELETE, OP_VERB_INSERT, OP_VERB_PATCH,
 };
 
 const MINTED_ID: &str = "sanc0123456789abcdef0123456789ab";
@@ -690,6 +690,15 @@ fn create_with_task_priority_and_difficulty_snapshots_both_keys() {
     assert_eq!(output.event.task_id, "task-1");
 }
 
+/// Seed a living cache row so patch/delete send If-Match without a GET.
+fn seed_living(events: &FakeEventRepo, id: &str, cal: &str, google_id: &str) {
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(living_event(id, cal, google_id));
+}
+
 #[test]
 fn patch_posts_end_and_upserts_the_echoed_event() {
     let http = FakeHttp::new(vec![(
@@ -699,9 +708,11 @@ fn patch_posts_end_and_upserts_the_echoed_event() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(patch_event(
-        &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
     ))
     .unwrap();
@@ -710,18 +721,32 @@ fn patch_posts_end_and_upserts_the_echoed_event() {
     assert_eq!(output.event.end_time, "2026-08-19T11:00:00Z");
     assert_eq!(output.event.calendar_id, "cal-1");
 
-    // PATCH body: `end.dateTime` only.
+    // PATCH body: `end.dateTime` only + If-Match from stored etag.
     let patches = http.patches.lock().unwrap();
     assert_eq!(patches.len(), 1);
     let (url, body) = patches.first().unwrap().clone();
     assert!(url.contains("primary%40example.com/events/google-evt-created"), "{url}");
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["end"]["dateTime"], "2026-08-19T11:00:00Z");
+    let headers = http.patch_headers.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert!(
+        headers[0].iter().any(|(k, v)| k == "If-Match" && v == "e1"),
+        "If-Match e1: {:?}",
+        headers[0]
+    );
 
     // The echoed (patched) event replaced the cached row.
     let (google_id, upserted) = events.upserted_single.lock().unwrap().clone().unwrap();
     assert_eq!(google_id, "google-evt-created");
     assert_eq!(upserted.end_time, "2026-08-19T11:00:00Z");
+    assert_eq!(upserted.google_etag, "e2");
+
+    let stored = ops.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].verb, OP_VERB_PATCH);
+    assert_eq!(stored[0].status, OP_STATUS_CACHE_APPLIED);
+    assert_eq!(stored[0].google_etag, "e2");
 }
 
 #[test]
@@ -733,9 +758,11 @@ fn patch_preserves_task_link_when_google_echoes_it() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(patch_event(
-        &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
     ))
     .unwrap();
@@ -750,14 +777,16 @@ fn patch_missing_calendar_is_not_found() {
     let http = FakeHttp::new(vec![]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-other", "other", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(patch_event(
-        &http, &calendars, &events, &access(), "cal-1", "g-1",
+        &http, &calendars, &events, &ops, &access(), "cal-1", "g-1",
         "2026-08-19T11:00:00Z", NOW_UNIX,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
     assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal");
 }
 
 #[test]
@@ -765,18 +794,21 @@ fn patch_google_non_2xx_is_an_api_error() {
     let http = FakeHttp::new(vec![("/events/google-evt-created", 400, r#"{"error":"invalid"}"#)]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(patch_event(
-        &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
     assert!(events.upserted_single.lock().unwrap().is_none(), "no cache write on failure");
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_FAILED);
 }
 
 #[test]
-fn patch_cache_failure_is_logged_not_fatal() {
+fn patch_cache_failure_is_repo_after_google_commit() {
     let http = FakeHttp::new(vec![(
         "/events/google-evt-created",
         200,
@@ -784,20 +816,17 @@ fn patch_cache_failure_is_logged_not_fatal() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
     *events.fail_upsert.lock().unwrap() = true;
 
-    let output = pollster::block_on(patch_event(
-        &http, &calendars, &events, &access(), "cal-1", "google-evt-created",
+    let err = pollster::block_on(patch_event(
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
     ))
-    .unwrap();
-
-    assert_eq!(output.event.end_time, "2026-08-19T11:00:00Z");
-    assert!(
-        matches!(output.cache_error.as_deref(), Some(message) if message.contains("cache write failed")),
-        "{:?}",
-        output.cache_error
-    );
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::Repo(_)), "got {err:?}");
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_GOOGLE_COMMITTED);
 }
 
 
@@ -814,11 +843,14 @@ fn patch_fields_start_only_payload() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
 
     pollster::block_on(patch_event_fields(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "cal-1",
         "google-evt-created",
@@ -848,11 +880,14 @@ fn patch_fields_start_end_summary_payload() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
 
     pollster::block_on(patch_event_fields(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "cal-1",
         "google-evt-created",
@@ -878,11 +913,13 @@ fn patch_fields_all_none_is_invalid() {
     let http = FakeHttp::new(vec![]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(patch_event_fields(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "cal-1",
         "google-evt-created",
@@ -895,6 +932,128 @@ fn patch_fields_all_none_is_invalid() {
         "got {err:?}"
     );
     assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal on empty patch");
+}
+
+#[test]
+fn patch_sends_if_match_and_stores_new_etag() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/google-evt-created",
+        200,
+        PATCHED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
+
+    let output = pollster::block_on(patch_event(
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
+        "2026-08-19T11:00:00Z", NOW_UNIX,
+    ))
+    .unwrap();
+
+    assert_eq!(output.event.google_etag, "e2");
+    let headers = &http.patch_headers.lock().unwrap()[0];
+    assert!(headers.iter().any(|(k, v)| k == "If-Match" && v == "e1"), "{headers:?}");
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_CACHE_APPLIED);
+    assert_eq!(ops.stored.lock().unwrap()[0].google_etag, "e2");
+    assert!(http.gets.lock().unwrap().is_empty(), "no GET when etag known");
+}
+
+#[test]
+fn patch_412_then_success_retries_with_fresh_etag() {
+    let get_body = r#"{
+        "id": "google-evt-created", "etag": "e2",
+        "summary": "New meeting",
+        "start": {"dateTime": "2026-08-19T09:00:00Z"},
+        "end": {"dateTime": "2026-08-19T10:00:00Z"}
+    }"#;
+    let http = FakeHttp::new(vec![]).with_one_shots(vec![
+        ("/events/google-evt-created", 412, r#"{"error":{"code":412}}"#),
+        ("/events/google-evt-created", 200, get_body),
+        ("/events/google-evt-created", 200, PATCHED_JSON),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
+
+    let output = pollster::block_on(patch_event(
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
+        "2026-08-19T11:00:00Z", NOW_UNIX,
+    ))
+    .unwrap();
+
+    assert_eq!(output.event.end_time, "2026-08-19T11:00:00Z");
+    assert_eq!(http.patches.lock().unwrap().len(), 2);
+    assert_eq!(http.gets.lock().unwrap().len(), 1);
+    let headers = http.patch_headers.lock().unwrap();
+    assert!(
+        headers[0].iter().any(|(k, v)| k == "If-Match" && v == "e1"),
+        "first If-Match e1: {:?}",
+        headers[0]
+    );
+    assert!(
+        headers[1].iter().any(|(k, v)| k == "If-Match" && v == "e2"),
+        "second If-Match e2: {:?}",
+        headers[1]
+    );
+    // Same minimal payload both times.
+    let patches = http.patches.lock().unwrap();
+    assert_eq!(patches[0].1, patches[1].1);
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_CACHE_APPLIED);
+    assert!(ops.stored.lock().unwrap()[0].attempt_count >= 1);
+}
+
+#[test]
+fn patch_three_412s_is_conflict_without_disabling_calendar() {
+    let get_body = r#"{"id":"google-evt-created","etag":"eX"}"#;
+    let http = FakeHttp::new(vec![]).with_one_shots(vec![
+        ("/events/google-evt-created", 412, r#"{"error":{"code":412}}"#),
+        ("/events/google-evt-created", 200, get_body),
+        ("/events/google-evt-created", 412, r#"{"error":{"code":412}}"#),
+        ("/events/google-evt-created", 200, get_body),
+        ("/events/google-evt-created", 412, r#"{"error":{"code":412}}"#),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(patch_event(
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
+        "2026-08-19T11:00:00Z", NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::Conflict), "got {err:?}");
+    assert_eq!(http.patches.lock().unwrap().len(), 3, "exactly 3 PATCH attempts");
+    let op = &ops.stored.lock().unwrap()[0];
+    assert_eq!(op.status, OP_STATUS_CONFLICT);
+    assert!(op.attempt_count >= 3, "attempt_count={}", op.attempt_count);
+    // Calendar still listed / sync not disabled.
+    let cal = calendars.stored.lock().unwrap();
+    assert!(cal[0].sync_enabled, "calendar must stay sync_enabled");
+    assert!(calendars.disabled.lock().unwrap().is_empty());
+}
+
+#[test]
+fn patch_403_forbidden_for_non_organizer_does_not_retry() {
+    let body = r#"{"error":{"errors":[{"reason":"forbiddenForNonOrganizer"}]}}"#;
+    let http = FakeHttp::new(vec![("/events/google-evt-created", 403, body)]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(patch_event(
+        &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
+        "2026-08-19T11:00:00Z", NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
+    assert_eq!(http.patches.lock().unwrap().len(), 1, "exactly one PATCH");
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_FAILED);
 }
 
 #[test]
@@ -902,20 +1061,18 @@ fn delete_event_sends_cancelled_and_soft_deletes_cache() {
     let http = FakeHttp::new(vec![(
         "/calendars/primary%40example.com/events/g-evt-1",
         200,
-        r#"{"id":"g-evt-1","status":"cancelled"}"#,
+        r#"{"id":"g-evt-1","status":"cancelled","etag":"e-del"}"#,
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
-    events
-        .stored
-        .lock()
-        .unwrap()
-        .push(living_event("local-1", "cal-1", "g-evt-1"));
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
 
     pollster::block_on(delete_event(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "cal-1",
         "g-evt-1",
@@ -929,10 +1086,18 @@ fn delete_event_sends_cancelled_and_soft_deletes_cache() {
     let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
     assert_eq!(body["status"], "cancelled");
     assert!(body.get("end").is_none());
+    let headers = &http.patch_headers.lock().unwrap()[0];
+    assert!(
+        headers.iter().any(|(k, v)| k == "If-Match" && v == "e1"),
+        "If-Match on delete: {headers:?}"
+    );
 
     let deleted = events.deleted.lock().unwrap();
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].0, "local-1");
+    let op = &ops.stored.lock().unwrap()[0];
+    assert_eq!(op.verb, OP_VERB_DELETE);
+    assert_eq!(op.status, OP_STATUS_CACHE_APPLIED);
 }
 
 #[test]
@@ -944,11 +1109,14 @@ fn delete_event_google_404_still_soft_deletes_locally() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
 
     pollster::block_on(delete_event(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "cal-1",
         "g-evt-1",
@@ -958,6 +1126,7 @@ fn delete_event_google_404_still_soft_deletes_locally() {
     .unwrap();
 
     assert_eq!(events.deleted.lock().unwrap().len(), 1);
+    assert_eq!(ops.stored.lock().unwrap()[0].status, OP_STATUS_CACHE_APPLIED);
 }
 
 #[test]
@@ -966,16 +1135,14 @@ fn update_event_for_user_wrong_owner_is_not_found() {
     let calendars =
         FakeCalendarRepo::with(vec![calendar_for_user("other-user", "cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
-    events
-        .stored
-        .lock()
-        .unwrap()
-        .push(living_event("local-1", "cal-1", "g-evt-1"));
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(update_event_for_user(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "u-1",
         "local-1",
@@ -989,6 +1156,7 @@ fn update_event_for_user_wrong_owner_is_not_found() {
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
     assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal");
 }
 
 #[test]
@@ -997,16 +1165,14 @@ fn delete_event_for_user_wrong_owner_is_not_found() {
     let calendars =
         FakeCalendarRepo::with(vec![calendar_for_user("other-user", "cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
-    events
-        .stored
-        .lock()
-        .unwrap()
-        .push(living_event("local-1", "cal-1", "g-evt-1"));
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(delete_event_for_user(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "u-1",
         "local-1",
@@ -1016,6 +1182,7 @@ fn delete_event_for_user_wrong_owner_is_not_found() {
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
     assert!(http.patches.lock().unwrap().is_empty(), "no Google call");
     assert!(events.deleted.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal");
 }
 
 #[test]
@@ -1027,16 +1194,14 @@ fn update_event_for_user_patches_owned_event() {
     )]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
     let events = FakeEventRepo::new();
-    events
-        .stored
-        .lock()
-        .unwrap()
-        .push(living_event("local-1", "cal-1", "g-evt-1"));
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(update_event_for_user(
         &http,
         &calendars,
         &events,
+        &ops,
         &access(),
         "u-1",
         "local-1",
@@ -1053,4 +1218,9 @@ fn update_event_for_user_patches_owned_event() {
     let body: serde_json::Value =
         serde_json::from_str(&http.patches.lock().unwrap()[0].1).unwrap();
     assert_eq!(body["summary"], "Renamed");
+    assert!(
+        http.patch_headers.lock().unwrap()[0]
+            .iter()
+            .any(|(k, v)| k == "If-Match" && v == "e1")
+    );
 }

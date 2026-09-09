@@ -20,12 +20,19 @@ use crate::token::GoogleAccess;
 // ──────────────────────────────────────────
 
 /// Scripted HTTP fake: `routes` are `(url-substring, status, body)` in
-/// match order; every call is recorded for assertions.
+/// match order (permanent — not consumed; replica/window pagination reuses
+/// them). `one_shots` are checked first and **removed** on match (412
+/// sequences). Every call is recorded for assertions.
 pub(crate) struct FakeHttp {
     pub(crate) routes: Vec<(String, u16, String)>,
+    /// Consumed on first substring match (FIFO among matches).
+    pub(crate) one_shots: Mutex<Vec<(String, u16, String)>>,
     pub(crate) gets: Mutex<Vec<String>>,
     pub(crate) posts: Mutex<Vec<(String, String)>>,
     pub(crate) patches: Mutex<Vec<(String, String)>>,
+    /// Extra headers passed to each `patch_json_with_headers` (parallel to
+    /// `patches`).
+    pub(crate) patch_headers: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl FakeHttp {
@@ -37,13 +44,35 @@ impl FakeHttp {
                     (substr.to_string(), status, body.to_string())
                 })
                 .collect(),
+            one_shots: Mutex::new(Vec::new()),
             gets: Mutex::new(Vec::new()),
             posts: Mutex::new(Vec::new()),
             patches: Mutex::new(Vec::new()),
+            patch_headers: Mutex::new(Vec::new()),
         }
     }
 
+    /// Attach one-shot routes (consumed on match) for 412/retry sequences.
+    pub(crate) fn with_one_shots(self, shots: Vec<(&str, u16, &str)>) -> Self {
+        *self.one_shots.lock().unwrap() = shots
+            .into_iter()
+            .map(|(substr, status, body)| {
+                (substr.to_string(), status, body.to_string())
+            })
+            .collect();
+        self
+    }
+
     pub(crate) fn route(&self, url: &str) -> (u16, Vec<u8>) {
+        // One-shots first: first substring match is removed and returned.
+        {
+            let mut shots = self.one_shots.lock().unwrap();
+            if let Some(idx) = shots.iter().position(|(substr, _, _)| url.contains(substr.as_str()))
+            {
+                let (_substr, status, body) = shots.remove(idx);
+                return (status, body.into_bytes());
+            }
+        }
         for (substr, status, body) in &self.routes {
             if url.contains(substr) {
                 return (*status, body.clone().into_bytes());
@@ -111,13 +140,29 @@ impl HttpClient for FakeHttp {
     async fn patch_json(
         &self,
         url: &str,
+        token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), HttpError> {
+        self.patch_json_with_headers(url, token, body, &[]).await
+    }
+
+    async fn patch_json_with_headers(
+        &self,
+        url: &str,
         _token: &str,
         body: &[u8],
+        extra_headers: &[(&str, &str)],
     ) -> Result<(u16, Vec<u8>), HttpError> {
         self.patches
             .lock()
             .unwrap()
             .push((url.to_string(), String::from_utf8_lossy(body).to_string()));
+        self.patch_headers.lock().unwrap().push(
+            extra_headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        );
         Ok(self.route(url))
     }
 }

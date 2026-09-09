@@ -61,6 +61,9 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: TasksError) -> R
         TasksError::Calendar(api_core::CalendarError::GoogleApi(message)) => {
             json_error(ctx, 502, &message)
         }
+        TasksError::Calendar(api_core::CalendarError::Conflict) => {
+            json_error(ctx, 409, "event write conflict")
+        }
         TasksError::Calendar(err) => {
             console_log!("tasks: calendar error: {err}");
             json_error(ctx, 500, "failed to update task")
@@ -313,6 +316,7 @@ pub async fn delete_task(
         http,
         &repos.calendars,
         &repos.events,
+        &repos.operations,
         &repos.logs,
         &users,
         access.as_ref(),
@@ -447,6 +451,7 @@ macro_rules! timer_action {
                 &crate::http::WorkerHttp,
                 &repos.calendars,
                 &repos.events,
+                &repos.operations,
                 &repos.categories,
                 &repos.tasks,
                 &repos.logs,
