@@ -347,9 +347,17 @@ export function EventInspector({
           onOpenAutoFocus={(e) => {
             if (!focusTitle) e.preventDefault();
           }}
-          onInteractOutside={() => {
-            // Let chip / calendar pointer handlers run (select other event,
-            // empty-click discard). Still close via onOpenChange(false).
+          onInteractOutside={(e) => {
+            const target = e.target;
+            if (!(target instanceof Element)) return;
+            // Chip pointerdown is select / move / resize — keep the popover mounted.
+            if (
+              target.closest(
+                '[data-event-chip], [data-allday-chip], [data-event-id]',
+              )
+            ) {
+              e.preventDefault();
+            }
           }}
           data-event-inspector
         >
