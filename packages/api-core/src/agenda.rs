@@ -3149,6 +3149,14 @@ mod tests {
             Ok(true)
         }
 
+        async fn bump_dirty_requested(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn set_sync_enabled(
             &self,
             _id: &str,

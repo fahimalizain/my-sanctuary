@@ -6,38 +6,45 @@
 //! from the caller — never `SystemTime`. The Worker layers session checks and
 //! token refresh on top (`apps/worker/src/calendar.rs`).
 //!
-//! Sync rules (ADR 0001 + ADR 0005 health):
-//! - `list_events` awaits a sync only when `initial_sync_complete` is false
-//!   **and** `last_synced_at` is missing or unparseable — i.e. the calendar
-//!   has never synced (first paint after calendar import). Once either gate
-//!   is set, `list_events` is cache-only: no stale pull on the request path,
-//!   whatever the age. The fallback cron ([`run_fallback_cron`]) reintroduces
-//!   a time-based threshold (`CRON_SYNC_STALE_SECS`).
+//! Sync rules (ADR 0001 + ADR 0005 two-path + health):
+//! - `list_events` is **cache-only** once `initial_sync_complete` is true **or**
+//!   `last_synced_at` is parseable. Never-initialized calendars take Path A:
+//!   a bounded **window** fetch (`singleEvents=true` + `timeMin`/`timeMax`),
+//!   write-through display rows, throw away any `nextSyncToken`, bump dirty,
+//!   and do **not** call [`sync_calendar`] / [`crate::calendar_replica`].
+//!   The fallback cron ([`run_fallback_cron`]) and webhooks still own Path B
+//!   (replica) and reintroduce a time-based threshold (`CRON_SYNC_STALE_SECS`).
 //! - Parseable `last_synced_at` remains the request-path gate (ADR 0001). It
 //!   is **not** the health signal: health is the sanitized `sync` envelope
 //!   built from persisted replica columns (`last_success_at`, `sync_status`,
 //!   …) via [`crate::calendar_sync`] (ADR 0005).
 //! - [`sync_calendar`] records `record_sync_attempt` before any Google fetch,
-//!   acquires a V1 lease, applies the replica walk page-by-page, and publishes
+//!   acquires a lease, applies the replica walk page-by-page, and publishes
 //!   via fenced `record_sync_success_if_owner` only when apply finished **and**
 //!   a terminal `nextSyncToken` is present. `record_sync_failure` on every
 //!   other path (including missing terminal token). Attempt ≠ success. A busy
 //!   lease is a quiet skip (not a failure).
 //! - Replica `events.list` uses `singleEvents=false&maxResults=250`, optionally
 //!   with the stored `syncToken` (incremental), and follows `nextPageToken`
-//!   (see [`crate::calendar_replica`]).
-//! - HTTP 410 (stale sync token) is merge-full once in-invocation: drop the
-//!   cursor and re-list without truncating applied rows. HTTP 404 (e.g.
-//!   holidays/birthdays calendars that don't support `events.list`) disables
-//!   sync for that calendar. Other errors are logged (returned in
-//!   `sync_errors`) and do not fail the whole listing.
-//! - Replica apply is classified in [`crate::calendar_apply`]: ordinary
-//!   cancelled events (`status == "cancelled"`, no `recurringEventId`) are
-//!   soft-deleted; cancelled exceptions are upserted as sparse living rows;
-//!   all-day and no-time events are upserted (stored out of the GET
-//!   projection `timed_masters_and_exceptions`).
+//!   (see [`crate::calendar_replica`]). **Only the replica walk owns
+//!   `sync_token`.**
+//! - Window `events.list` uses `singleEvents=true&orderBy=startTime` plus the
+//!   request time bounds (see [`crate::calendar_window`]). Never sends
+//!   `syncToken`; never calls `record_sync_success`.
+//! - HTTP 410 on the **replica** is merge-full once in-invocation: drop the
+//!   cursor and re-list without truncating applied rows. Window 410 is a plain
+//!   error (no merge-full — no token was sent). HTTP 404 (e.g. holidays/
+//!   birthdays calendars that don't support `events.list`) disables sync for
+//!   that calendar. Other errors are logged (returned in `sync_errors`) and
+//!   do not fail the whole listing.
+//! - Apply is classified in [`crate::calendar_apply`]: ordinary cancelled
+//!   events (`status == "cancelled"`, no `recurringEventId`) are soft-deleted;
+//!   cancelled exceptions are upserted as sparse living rows; all-day and
+//!   no-time events are upserted (stored out of the GET projection
+//!   `timed_masters_and_exceptions`). Window write-through reuses the same
+//!   classifier.
 //! - Watch: every `sync_enabled` calendar is ensure-watched (`events.watch`)
-//!   before its first-paint sync, but only when `WATCH_CALLBACK_URL` is set
+//!   before its first-paint window, but only when `WATCH_CALLBACK_URL` is set
 //!   and is a public HTTPS URL ([`is_public_https_callback`]). Watch 404
 //!   disables sync (and stops any prior channels); other watch errors are
 //!   logged and leave sync enabled. When sync is disabled for a calendar
@@ -67,6 +74,7 @@ use crate::calendar_sync::{
     classify_sync_error, events_sync_envelope, next_retry_rfc3339, replica_state_for_error,
     EventsSyncEnvelope, SyncErrorCode,
 };
+use crate::calendar_window::fetch_and_apply_window;
 use crate::config::OAuthConfig;
 use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
@@ -133,9 +141,9 @@ pub enum CalendarError {
     Repo(#[from] RepoError),
 }
 
-/// Result of [`list_events`]: the cached events, per-calendar sync errors
-/// for the caller to log (sync failures never fail the whole listing), and
-/// the sanitized replica-health envelope for the HTTP response.
+/// Result of [`list_events`]: the cached (and/or window) events, per-calendar
+/// sync errors for the caller to log (failures never fail the whole listing),
+/// the sanitized replica-health envelope, and the response `source`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalendarListOutput {
     pub events: Vec<CalendarEvent>,
@@ -144,6 +152,9 @@ pub struct CalendarListOutput {
     pub sync_errors: Vec<String>,
     /// Sanitized per-calendar replica health (no tokens / credentials).
     pub sync: EventsSyncEnvelope,
+    /// `"cache"` | `"window"` | `"mixed"` — how the event set was produced.
+    /// See [`list_events`] for the rules.
+    pub source: String,
 }
 
 /// Result of [`create_event`]: the created event plus the response source.
@@ -249,13 +260,21 @@ pub fn parse_event_time_range(
     ))
 }
 
-/// Lists the user's cached events, syncing each stale calendar from Google
-/// first (see module docs for the sync rules).
+/// Lists the user's cached events. Never-initialized calendars take a
+/// bounded window fetch first (see module docs); initialized calendars are
+/// cache-only. Does **not** call [`sync_calendar`] / the replica walk.
 ///
 /// When `watch_callback_url` is a public HTTPS URL ([`is_public_https_callback`]),
-/// each `sync_enabled` calendar is ensure-watched before its first-paint sync;
+/// each `sync_enabled` calendar is ensure-watched before its first-paint window;
 /// a watch 404 disables sync and stops any prior channels (ADR 0001).
 /// `None` or a non-public URL skips all watch I/O (local dev).
+///
+/// `source` rules:
+/// - `"cache"` — no window fetch ran
+/// - `"window"` — at least one window fetch ran and no initialized calendar
+///   contributed cache-only rows
+/// - `"mixed"` — at least one window fetch and at least one initialized
+///   cache-only calendar
 pub async fn list_events(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -277,12 +296,15 @@ pub async fn list_events(
     }
 
     let mut sync_errors: Vec<String> = Vec::new();
+    let mut window_fetched = false;
+    let mut cache_only_initialized = false;
+    let mut ephemeral: Vec<CalendarEvent> = Vec::new();
     let watch_callback_url = watch_callback_url.filter(|url| is_public_https_callback(url));
     for cal in &cals {
         if !cal.sync_enabled {
             continue;
         }
-        // Ensure-watch before the first-paint sync (ADR 0001): a sync-enabled
+        // Ensure-watch before the first-paint window (ADR 0001): a sync-enabled
         // calendar with no unexpired channel gets `events.watch`. Skipped
         // entirely when WATCH_CALLBACK_URL is unset or not public HTTPS.
         if let Some(callback_url) = watch_callback_url {
@@ -321,11 +343,9 @@ pub async fn list_events(
                 }
             }
         }
-        // Cache-only after first paint (ADR 0001): `initial_sync_complete` or
-        // a set, parseable `last_synced_at` means the sync cursor exists, so
-        // never pull on the request path — regardless of age or envelope
-        // staleness. Missing both means the calendar has never synced: await
-        // the first sync.
+        // Cache-only after first publication (ADR 0001 / 0005): either gate
+        // means the replica cursor exists — never pull on the request path.
+        // Missing both → never-initialized: Path A window fetch (not Path B).
         let previously_synced = cal.initial_sync_complete
             || cal
                 .last_synced_at
@@ -333,10 +353,34 @@ pub async fn list_events(
                 .and_then(rfc3339_to_unix_secs)
                 .is_some();
         if previously_synced {
+            cache_only_initialized = true;
             continue;
         }
-        match sync_calendar(http, calendars, events, access, cal, &now_rfc3339).await {
-            Ok(()) => {}
+
+        // Hint cron/webhook Path B; do not await the replica on first paint.
+        if let Err(err) = calendars.bump_dirty_requested(&cal.id, &now_rfc3339).await {
+            sync_errors.push(format!(
+                "failed to bump dirty for calendar {} ({}): {err}",
+                cal.id, cal.google_calendar_id
+            ));
+        }
+
+        window_fetched = true;
+        match fetch_and_apply_window(
+            http,
+            calendars,
+            events,
+            access,
+            cal,
+            start_rfc3339,
+            end_rfc3339,
+            &now_rfc3339,
+        )
+        .await
+        {
+            Ok(rows) => {
+                ephemeral.extend(rows);
+            }
             Err(CalendarError::GoogleNotFound) => {
                 sync_errors.push(format!(
                     "calendar {} ({}) returned 404 — disabling sync",
@@ -360,30 +404,76 @@ pub async fn list_events(
                 }
             }
             Err(err) => sync_errors.push(format!(
-                "sync failed for calendar {} ({}): {err}",
+                "window fetch failed for calendar {} ({}): {err}",
                 cal.id, cal.google_calendar_id
             )),
         }
     }
 
-    let cached = events
+    let mut cached = events
         .list_by_user_id_and_time_range(user_id, start_rfc3339, end_rfc3339)
         .await?;
 
-    // Re-read calendars so the health envelope reflects any `record_sync_*`
-    // writes from this request. On re-read failure, fall back to the
-    // in-memory snapshot from the start of the request.
+    // Lease-miss path: merge ephemeral window rows the D1 write-through skipped.
+    merge_ephemeral_window_events(&mut cached, ephemeral, start_rfc3339, end_rfc3339);
+
+    // Re-read calendars so the health envelope reflects dirty bumps / disables
+    // from this request. On re-read failure, fall back to the in-memory
+    // snapshot from the start of the request. Window path must not flip
+    // ready / initial_sync_complete / sync_token.
     let fresh = match calendars.list_by_user_id(user_id).await {
         Ok(rows) => rows,
         Err(_) => cals,
     };
     let sync = events_sync_envelope(&fresh, now_unix);
 
+    let source = match (window_fetched, cache_only_initialized) {
+        (false, _) => "cache",
+        (true, false) => "window",
+        (true, true) => "mixed",
+    }
+    .to_string();
+
     Ok(CalendarListOutput {
         events: cached,
         sync_errors,
         sync,
+        source,
     })
+}
+
+/// Merge lease-miss ephemeral window rows into the D1 cache query result.
+///
+/// Applies the same GET projection filters as the list SQL
+/// (`timed_masters_and_exceptions` + overlap). Prefers existing D1 rows on
+/// natural-key collision.
+fn merge_ephemeral_window_events(
+    cached: &mut Vec<CalendarEvent>,
+    ephemeral: Vec<CalendarEvent>,
+    start_rfc3339: &str,
+    end_rfc3339: &str,
+) {
+    for event in ephemeral {
+        if event.is_all_day {
+            continue;
+        }
+        if event.status == "cancelled" {
+            continue;
+        }
+        if event.deleted_at.is_some() {
+            continue;
+        }
+        if !(event.start_time.as_str() < end_rfc3339 && event.end_time.as_str() > start_rfc3339)
+        {
+            continue;
+        }
+        let already = cached.iter().any(|row| {
+            row.calendar_id == event.calendar_id && row.google_event_id == event.google_event_id
+        });
+        if !already {
+            cached.push(event);
+        }
+    }
 }
 
 /// Builds `extendedProperties.shared` for an `events.insert`.
@@ -1514,8 +1604,9 @@ async fn refresh_calendar_list(
 /// - The lease is always released on the way out (success, skip-after-acquire,
 ///   or error).
 ///
-/// `pub` for the webhook handler and the fallback cron; the request path
-/// reaches it via [`list_events`].
+/// `pub` for the webhook handler and the fallback cron. The request path
+/// ([`list_events`]) never calls this — never-initialized calendars use the
+/// window path instead.
 pub async fn sync_calendar(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -2081,6 +2172,22 @@ mod tests {
             cal.lease_expires_at = Some(expires_rfc3339.to_string());
             cal.updated_at = now_rfc3339.to_string();
             Ok(true)
+        }
+
+        async fn bump_dirty_requested(
+            &self,
+            id: &str,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                if cal.deleted_at.is_none() {
+                    cal.dirty_requested_generation =
+                        cal.dirty_requested_generation.saturating_add(1);
+                    cal.updated_at = now_rfc3339.to_string();
+                }
+            }
+            Ok(())
         }
 
         async fn set_sync_enabled(
@@ -2747,14 +2854,21 @@ mod tests {
         assert!(upserted.iter().any(|cal| cal.is_primary));
         assert_eq!(upserted[1].google_calendar_id, "en.usa#holiday@group.v.calendar.google.com");
 
-        // Freshly imported calendars have never synced (stale), so the same
-        // request also syncs them (Go behavior: refreshCalendarList then the
-        // staleness loop). The encoded `#`/`@` show in the events.list URLs.
+        // Freshly imported calendars are never-initialized: Path A window
+        // fetch (not replica). Encoded `#`/`@` show in the events.list URLs.
         assert!(gets[3].contains("primary%40example.com/events"), "{gets:?}");
+        assert!(gets[3].contains("singleEvents=true"), "{gets:?}");
+        assert!(!gets[3].contains("syncToken"), "{gets:?}");
         assert!(gets[4].contains("en.usa%23holiday%40group.v.calendar.google.com/events"), "{gets:?}");
-        let states = calendars.sync_states.lock().unwrap();
-        assert_eq!(states.len(), 2, "both imported calendars synced");
-        assert!(states.iter().all(|(_, token, _)| token == "st-1"));
+        assert!(gets[4].contains("singleEvents=true"), "{gets:?}");
+        // Window discards nextSyncToken — no record_sync_success.
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|c| c.sync_token.is_empty()));
+        assert!(stored.iter().all(|c| !c.initial_sync_complete));
+        assert!(stored.iter().all(|c| c.dirty_requested_generation == 1));
+        assert_eq!(output.source, "window");
     }
 
     #[test]
@@ -2872,9 +2986,9 @@ mod tests {
     }
 
     #[test]
-    fn never_synced_calendar_is_synced_before_the_cache_query() {
-        // `calendar()` defaults to `last_synced_at: None` — first paint, so
-        // the sync is awaited before the cache query.
+    fn never_synced_calendar_window_fetch_before_cache_query() {
+        // `calendar()` defaults to `last_synced_at: None` — first paint uses
+        // Path A (window), not Path B (replica).
         let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
@@ -2886,14 +3000,18 @@ mod tests {
         ))
         .unwrap();
 
-        // Sync fetched events, then the time-range query returned them.
         let gets = http.gets.lock().unwrap();
         assert_eq!(gets.len(), 1);
         assert!(gets[0].contains("/calendars/primary%40example.com/events"), "{gets:?}");
-        assert!(gets[0].contains("singleEvents=false"), "{gets:?}");
+        assert!(gets[0].contains("singleEvents=true"), "{gets:?}");
+        assert!(gets[0].contains("orderBy=startTime"), "{gets:?}");
         assert!(gets[0].contains("maxResults=250"), "{gets:?}");
+        assert!(gets[0].contains("timeMin="), "{gets:?}");
+        assert!(gets[0].contains("timeMax="), "{gets:?}");
+        assert!(!gets[0].contains("syncToken"), "{gets:?}");
+        assert!(!gets[0].contains("singleEvents=false"), "{gets:?}");
 
-        // Both items upserted with the sync timestamp and this calendar.
+        // Write-through under lease: both items upserted.
         let upserted = events.upserted_batch.lock().unwrap();
         assert_eq!(upserted.len(), 2);
         assert!(upserted.iter().all(|event| event.calendar_id == "cal-1"));
@@ -2902,60 +3020,54 @@ mod tests {
         assert_eq!(upserted[0].start_time, "2026-08-18T09:00:00Z");
         assert_eq!(upserted[0].recurrence, r#"["RRULE:FREQ=DAILY"]"#);
 
-        // Sync state advanced with Google's nextSyncToken via record_sync_success.
-        let states = calendars.sync_states.lock().unwrap();
-        assert_eq!(*states, vec![("cal-1".to_string(), "st-9".to_string(), "2023-11-14T22:13:20Z".to_string())]);
+        // Window must not publish nextSyncToken / record_sync_success.
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
 
-        // Overlap query used the parsed window.
         let ranged = events.ranged.lock().unwrap();
         assert_eq!(*ranged, vec![("u-1".to_string(), "2026-08-01T00:00:00Z".to_string(), "2026-09-01T00:00:00Z".to_string())]);
 
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty());
+        assert_eq!(output.source, "window");
 
-        // After record_sync_success, re-read shows ready / not stale.
+        // Health still never_initialized — window does not flip ready.
         assert_eq!(output.sync.calendars.len(), 1);
         let health = &output.sync.calendars[0];
         assert_eq!(health.calendar_id, "cal-1");
-        assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
-        assert!(health.initial_sync_complete);
-        assert!(!health.stale, "fresh last_success_at must not be stale");
         assert_eq!(
-            health.last_success_at.as_deref(),
-            Some("2023-11-14T22:13:20Z")
+            health.state,
+            crate::calendar_sync::CalendarReplicaState::NeverInitialized
         );
-        assert_eq!(
-            health.last_attempt_at.as_deref(),
-            Some("2023-11-14T22:13:20Z")
-        );
+        assert!(!health.initial_sync_complete);
         assert!(health.error_code.is_none());
-        assert_eq!(output.sync.status, crate::calendar_sync::SyncAggregateStatus::Ready);
+        assert_eq!(
+            output.sync.status,
+            crate::calendar_sync::SyncAggregateStatus::Degraded
+        );
 
         let stored = calendars.stored.lock().unwrap();
-        assert_eq!(stored[0].sync_token, "st-9");
-        assert_eq!(stored[0].failure_streak, 0);
-        assert_eq!(stored[0].sync_status, "ready");
-        assert!(stored[0].initial_sync_complete);
-        assert_eq!(stored[0].cache_revision, 1);
+        assert!(stored[0].sync_token.is_empty(), "window discards nextSyncToken");
+        assert!(!stored[0].initial_sync_complete);
+        assert_eq!(stored[0].cache_revision, 0);
+        assert_eq!(stored[0].dirty_requested_generation, 1);
         assert!(stored[0].last_error_code.is_empty());
+        assert!(stored[0].last_success_at.is_none());
+        assert!(stored[0].last_attempt_at.is_none());
     }
 
     #[test]
-    fn empty_items_with_next_sync_token_is_success() {
-        // Completed empty incremental: items=[] + nextSyncToken is publication.
+    fn empty_items_with_next_sync_token_is_replica_success() {
+        // Completed empty incremental: items=[] + nextSyncToken is publication
+        // on the replica path only.
         let http = FakeHttp::new(vec![("/events", 200, r#"{"items":[],"nextSyncToken":"st-empty"}"#)]);
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
-        let watches = FakeWatchChannelRepo::new();
+        let cal = calendars.stored.lock().unwrap()[0].clone();
 
-        let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &watches, &access(), "u-1",
-            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
         ))
         .unwrap();
-
-        assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
-        assert!(output.events.is_empty());
 
         let stored = calendars.stored.lock().unwrap();
         assert_eq!(stored[0].sync_token, "st-empty");
@@ -2972,15 +3084,35 @@ mod tests {
         assert!(stored[0].initial_sync_complete);
         assert_eq!(stored[0].cache_revision, 1);
         assert!(stored[0].last_error_code.is_empty());
+    }
 
+    #[test]
+    fn window_empty_page_with_next_sync_token_does_not_publish() {
+        // Google may return nextSyncToken on a window query; Path A throws it away.
+        let http = FakeHttp::new(vec![("/events", 200, r#"{"items":[],"nextSyncToken":"st-window"}"#)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
+        assert!(output.events.is_empty());
+        assert_eq!(output.source, "window");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+
+        let stored = calendars.stored.lock().unwrap();
+        assert!(stored[0].sync_token.is_empty());
+        assert!(!stored[0].initial_sync_complete);
+        assert_eq!(stored[0].dirty_requested_generation, 1);
         assert_eq!(
-            output.sync.status,
-            crate::calendar_sync::SyncAggregateStatus::Ready
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::NeverInitialized
         );
-        let health = &output.sync.calendars[0];
-        assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
-        assert!(!health.stale);
-        assert!(health.error_code.is_none());
     }
 
     #[test]
@@ -3172,6 +3304,12 @@ mod tests {
         assert!(events.upserted_batch.lock().unwrap().is_empty());
         assert!(calendars.sync_states.lock().unwrap().is_empty(), "sync state untouched");
         assert!(output.sync_errors.is_empty());
+        assert_eq!(output.source, "cache");
+        assert_eq!(
+            calendars.stored.lock().unwrap()[0].dirty_requested_generation,
+            0,
+            "cache-only must not bump dirty"
+        );
 
         // Health envelope: old last_synced_at → degraded + stale, but compat
         // state is still ready / initial_sync_complete.
@@ -3185,6 +3323,49 @@ mod tests {
         assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
         assert!(health.initial_sync_complete);
         assert!(health.error_code.is_none());
+    }
+
+    #[test]
+    fn mixed_initialized_and_never_init_source_is_mixed() {
+        let mut ready = calendar("cal-ready", "ready@example.com", true);
+        ready.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        ready.initial_sync_complete = true;
+        ready.sync_token = "tok-ready".to_string();
+        let never = calendar("cal-new", "new@example.com", true);
+        let http = FakeHttp::new(vec![
+            (
+                "new%40example.com/events",
+                200,
+                r#"{"items":[{"id":"n1","summary":"New","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextSyncToken":"st-discard"}"#,
+            ),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![ready, never]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert_eq!(output.source, "mixed");
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1, "window only for never-init: {gets:?}");
+        assert!(gets[0].contains("new%40example.com"), "{gets:?}");
+        assert!(gets[0].contains("singleEvents=true"), "{gets:?}");
+        assert!(!gets[0].contains("syncToken"), "{gets:?}");
+
+        let stored = calendars.stored.lock().unwrap();
+        let ready_row = stored.iter().find(|c| c.id == "cal-ready").unwrap();
+        let new_row = stored.iter().find(|c| c.id == "cal-new").unwrap();
+        assert_eq!(ready_row.sync_token, "tok-ready");
+        assert_eq!(ready_row.dirty_requested_generation, 0);
+        assert!(new_row.sync_token.is_empty());
+        assert_eq!(new_row.dirty_requested_generation, 1);
+        assert!(!new_row.initial_sync_complete);
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].google_event_id, "n1");
     }
 
     #[test]
@@ -3205,6 +3386,7 @@ mod tests {
 
         assert!(output.events.is_empty());
         assert!(http.gets.lock().unwrap().is_empty());
+        assert_eq!(output.source, "cache");
         assert_eq!(output.sync.calendars.len(), 1);
         assert_eq!(output.sync.calendars[0].calendar_id, "cal-1");
         assert_eq!(
@@ -3294,15 +3476,14 @@ mod tests {
         assert_eq!(output.sync_errors.len(), 1);
         assert!(output.sync_errors[0].contains("404"), "{}", output.sync_errors[0]);
         assert!(output.events.is_empty(), "cache still served");
+        // Window path still ran (and failed) → source is window; dirty was bumped.
+        assert_eq!(output.source, "window");
 
-        // Failure recorded, then sync disabled — envelope shows disabled.
         let stored = calendars.stored.lock().unwrap();
         assert!(!stored[0].sync_enabled);
-        assert_eq!(stored[0].last_error_code, "not_found");
-        assert_eq!(
-            stored[0].last_attempt_at.as_deref(),
-            Some("2023-11-14T22:13:20Z")
-        );
+        // Window path does not record_sync_failure — disable alone drives health.
+        assert!(stored[0].sync_token.is_empty());
+        assert_eq!(stored[0].dirty_requested_generation, 1);
         drop(stored);
         assert_eq!(
             output.sync.calendars[0].state,
@@ -3341,37 +3522,8 @@ mod tests {
     }
 
     #[test]
-    fn events_list_410_retries_without_sync_token() {
-        let http = FakeHttp::new(vec![
-            ("syncToken=stale-token", 410, ""),
-            ("/events", 200, EVENTS_JSON),
-        ]);
-        let mut cal = calendar("cal-1", "primary@example.com", true);
-        cal.sync_token = "stale-token".to_string();
-        let calendars = FakeCalendarRepo::with(vec![cal]);
-        let events = FakeEventRepo::new();
-
-        let watches = FakeWatchChannelRepo::new();
-        let output = pollster::block_on(list_events(
-            &http, &calendars, &events, &watches, &access(), "u-1",
-            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
-        ))
-        .unwrap();
-
-        let gets = http.gets.lock().unwrap();
-        assert_eq!(gets.len(), 2, "410 then full resync");
-        assert!(gets[0].contains("syncToken=stale-token"), "{gets:?}");
-        assert!(!gets[1].contains("syncToken"), "{gets:?}");
-        assert_eq!(output.events.len(), 2, "resync populated the cache");
-        assert!(output.sync_errors.is_empty());
-
-        // New sync token stored after the resync.
-        let states = calendars.sync_states.lock().unwrap();
-        assert_eq!(states[0].1, "st-9");
-    }
-
-    #[test]
-    fn events_list_410_without_sync_token_is_an_error_not_an_infinite_loop() {
+    fn window_410_is_error_without_merge_full_or_token_write() {
+        // Window never sends syncToken; 410 is a plain error (no merge-full loop).
         let http = FakeHttp::new(vec![("/events", 410, "")]);
         let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
         let events = FakeEventRepo::new();
@@ -3383,16 +3535,21 @@ mod tests {
         ))
         .unwrap();
 
-        // One 410 triggers the single retry; the second 410 errors out.
-        assert_eq!(http.gets.lock().unwrap().len(), 2);
+        assert_eq!(http.gets.lock().unwrap().len(), 1, "no 410 retry on window");
         assert_eq!(output.sync_errors.len(), 1);
         assert!(output.sync_errors[0].contains("410"), "{}", output.sync_errors[0]);
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert_eq!(
+            calendars.stored.lock().unwrap()[0].dirty_requested_generation,
+            1
+        );
+        assert_eq!(output.source, "window");
     }
 
     #[test]
-    fn events_list_follows_next_page_token() {
+    fn window_follows_next_page_token_without_publishing_sync_token() {
         let page_one = r#"{"items":[{"id":"p1","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
-        // Terminal page must carry nextSyncToken for publication success.
         let page_two = r#"{"items":[{"id":"p2","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-page"}"#;
         let http = FakeHttp::new(vec![
             ("pageToken=tok-2", 200, page_two),
@@ -3410,15 +3567,19 @@ mod tests {
 
         let gets = http.gets.lock().unwrap();
         assert_eq!(gets.len(), 2);
+        assert!(gets[0].contains("singleEvents=true"), "{gets:?}");
         assert!(gets[1].contains("pageToken=tok-2"), "{gets:?}");
+        assert!(gets.iter().all(|u| !u.contains("syncToken")), "{gets:?}");
         assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
-        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-page");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
         assert_eq!(
             output.sync.calendars[0].state,
-            crate::calendar_sync::CalendarReplicaState::Ready
+            crate::calendar_sync::CalendarReplicaState::NeverInitialized
         );
+        assert_eq!(output.source, "window");
     }
 
     fn seeded_event(
@@ -3672,7 +3833,9 @@ mod tests {
     }
 
     #[test]
-    fn replica_poison_on_one_calendar_does_not_block_sibling() {
+    fn window_poison_on_one_calendar_does_not_block_sibling() {
+        // list_events Path A: invalid JSON on A must not block B's window.
+        // Neither calendar publishes a replica token / becomes ready.
         let cal_a = calendar("cal-a", "a@example.com", true);
         let cal_b = calendar("cal-b", "b@example.com", true);
         let http = FakeHttp::new(vec![
@@ -3680,7 +3843,7 @@ mod tests {
             (
                 "b%40example.com/events",
                 200,
-                r#"{"items":[],"nextSyncToken":"st-b"}"#,
+                r#"{"items":[{"id":"b1","summary":"B","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextSyncToken":"st-b"}"#,
             ),
         ]);
         let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b]);
@@ -3701,15 +3864,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.sync_errors.len(), 1, "{:?}", output.sync_errors);
+        assert!(
+            output.sync_errors[0].contains("cal-a") || output.sync_errors[0].contains("a@"),
+            "{:?}",
+            output.sync_errors
+        );
+        assert_eq!(output.events.len(), 1);
+        assert_eq!(output.events[0].google_event_id, "b1");
+        assert_eq!(output.source, "window");
+
         let stored = calendars.stored.lock().unwrap();
         let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
         let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
-        assert_eq!(a.last_error_code, "mapping_poison");
-        assert_eq!(a.sync_status, "retrying");
+        // Window path does not record_sync_failure — health stays never_init.
         assert!(a.sync_token.is_empty());
-        assert_eq!(b.sync_token, "st-b");
-        assert_eq!(b.sync_status, "ready");
-        assert!(b.initial_sync_complete);
+        assert!(!a.initial_sync_complete);
+        assert_eq!(a.dirty_requested_generation, 1);
+        assert!(b.sync_token.is_empty(), "window nextSyncToken discarded");
+        assert!(!b.initial_sync_complete);
+        assert_eq!(b.dirty_requested_generation, 1);
+        assert_eq!(
+            output.sync.calendars.iter().find(|c| c.calendar_id == "cal-a").unwrap().state,
+            crate::calendar_sync::CalendarReplicaState::NeverInitialized
+        );
+        assert_eq!(
+            output.sync.calendars.iter().find(|c| c.calendar_id == "cal-b").unwrap().state,
+            crate::calendar_sync::CalendarReplicaState::NeverInitialized
+        );
+    }
+
+    #[test]
+    fn replica_poison_on_one_calendar_records_mapping_poison() {
+        // Replica path (sync_calendar) still classifies invalid JSON as
+        // mapping_poison via record_sync_failure.
+        let cal = calendar("cal-a", "a@example.com", true);
+        let http = FakeHttp::new(vec![("a%40example.com/events", 200, "not-json{{{")]);
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+        let err = pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::InvalidResponse(_)), "{err:?}");
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].last_error_code, "mapping_poison");
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert!(stored[0].sync_token.is_empty());
     }
 
     #[test]
@@ -3842,6 +4042,7 @@ mod tests {
 
     #[test]
     fn all_day_and_no_time_events_are_upserted_out_of_projection() {
+        // Window write-through reuses classify_replica_item; token not advanced.
         let body = r#"{"items":[
             {"id": "all-day", "summary": "Holiday",
              "start": {"date": "2026-08-01"}, "end": {"date": "2026-08-02"}},
@@ -3876,7 +4077,9 @@ mod tests {
         // GET projection only surfaces the timed living event.
         assert_eq!(output.events.len(), 1);
         assert_eq!(output.events[0].google_event_id, "real");
-        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
@@ -3907,8 +4110,10 @@ mod tests {
         assert_eq!(upserted.len(), 1, "only the timed, non-cancelled event");
         assert_eq!(upserted[0].google_event_id, "real");
         assert_eq!(output.events.len(), 1);
-        // Sync state still advances.
-        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-9");
+        // Window does not advance the replica token.
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
@@ -3943,7 +4148,9 @@ mod tests {
         // Projection: only the living timed event.
         assert_eq!(output.events.len(), 1);
         assert_eq!(output.events[0].google_event_id, "real");
-        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-exc");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
@@ -4025,7 +4232,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_event_delete_failure_does_not_advance_sync_token() {
+    fn window_cancelled_event_delete_failure_does_not_advance_sync_token() {
         let body = r#"{"items":[
             {"id": "cancelled", "status": "cancelled",
              "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}},
@@ -4048,13 +4255,10 @@ mod tests {
             *events.deleted_by_google_event_id.lock().unwrap(),
             vec![("cal-1".to_string(), "cancelled".to_string())]
         );
-        // A delete failure fails the sync: no partial apply, no upsert, and
-        // the sync token must not advance.
+        // Delete failure aborts the window apply: no upsert of the living
+        // sibling, token must not advance (window never publishes anyway).
         assert!(events.upserted_batch.lock().unwrap().is_empty());
-        assert!(
-            calendars.sync_states.lock().unwrap().is_empty(),
-            "sync token must not advance after a delete failure"
-        );
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
         assert_eq!(output.sync_errors.len(), 1);
         assert!(
             output.sync_errors[0].contains("cache delete failed"),
@@ -4062,24 +4266,47 @@ mod tests {
             output.sync_errors[0]
         );
 
-        // Health: attempt set, storage_transient, streak++, no success stamp.
         let stored = calendars.stored.lock().unwrap();
         assert!(stored[0].sync_token.is_empty(), "token never advanced");
-        assert!(stored[0].last_success_at.is_none());
+        assert!(!stored[0].initial_sync_complete);
+        assert_eq!(stored[0].dirty_requested_generation, 1);
+        // Window path does not record_sync_failure.
+        assert!(stored[0].last_error_code.is_empty());
         assert_eq!(
-            stored[0].last_attempt_at.as_deref(),
-            Some("2023-11-14T22:13:20Z")
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::NeverInitialized
         );
+        assert_eq!(output.source, "window");
+    }
+
+    #[test]
+    fn replica_cancelled_event_delete_failure_records_storage_transient() {
+        let body = r#"{"items":[
+            {"id": "cancelled", "status": "cancelled",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}},
+            {"id": "real", "summary": "Real",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ], "nextSyncToken": "st-9"}"#;
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        *events.fail_delete.lock().unwrap() = true;
+        let cal = calendars.stored.lock().unwrap()[0].clone();
+
+        let err = pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::Repo(_)), "{err:?}");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        let stored = calendars.stored.lock().unwrap();
+        assert!(stored[0].sync_token.is_empty());
         assert_eq!(stored[0].last_error_code, "storage_transient");
         assert_eq!(stored[0].failure_streak, 1);
         assert_eq!(stored[0].sync_status, "retrying");
         assert_eq!(
-            output.sync.calendars[0].error_code.as_deref(),
-            Some("storage_transient")
-        );
-        assert_eq!(
-            output.sync.calendars[0].state,
-            crate::calendar_sync::CalendarReplicaState::Retrying
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
         );
     }
 
@@ -4100,6 +4327,11 @@ mod tests {
         assert!(output.sync_errors[0].contains("500"), "{}", output.sync_errors[0]);
         assert!(output.events.is_empty());
         assert!(calendars.disabled.lock().unwrap().is_empty(), "500 is not a 404");
+        assert_eq!(output.source, "window");
+        assert_eq!(
+            calendars.stored.lock().unwrap()[0].dirty_requested_generation,
+            1
+        );
     }
 
     // ──────────────────────────────────────────
@@ -4345,10 +4577,13 @@ mod tests {
 
         assert!(http.posts.lock().unwrap().is_empty(), "no watch POST without a callback");
         assert!(watches.inserted.lock().unwrap().is_empty());
-        // The first-paint sync still runs with no callback configured.
-        assert_eq!(http.gets.lock().unwrap().len(), 1);
+        // The first-paint window still runs with no callback configured.
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1);
+        assert!(gets[0].contains("singleEvents=true"), "{gets:?}");
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
@@ -4367,12 +4602,13 @@ mod tests {
 
         assert!(http.posts.lock().unwrap().is_empty(), "no watch POST for a localhost callback");
         assert!(watches.inserted.lock().unwrap().is_empty());
-        assert_eq!(output.events.len(), 2, "first-paint sync unaffected");
+        assert_eq!(output.events.len(), 2, "first-paint window unaffected");
         assert!(output.sync_errors.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
-    fn never_synced_calendar_is_watched_then_synced() {
+    fn never_synced_calendar_is_watched_then_window_fetched() {
         // `/events/watch` must precede `/events`: the substring matcher would
         // otherwise swallow the watch POST URL.
         let http = FakeHttp::new(vec![
@@ -4409,14 +4645,20 @@ mod tests {
         assert_eq!(inserted[0].resource_id, "resource-123");
         assert_eq!(inserted[0].expiration, "2024-03-09T16:00:00Z");
 
-        // First-paint sync still ran and populated the cache.
+        // First-paint window (not replica) populated the cache; token not published.
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1);
+        assert!(gets[0].contains("singleEvents=true"), "{gets:?}");
+        assert!(!gets[0].contains("syncToken"), "{gets:?}");
         assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
-    fn never_synced_calendar_is_watched_then_synced_with_string_expiration() {
+    fn never_synced_calendar_is_watched_then_window_fetched_with_string_expiration() {
         // Production shape: Google sends `expiration` as a JSON string
         // (discovery type string/int64). This is the path that used to fail
         // with "invalid type: string ..., expected i64" and orphan every
@@ -4445,10 +4687,12 @@ mod tests {
         assert_eq!(inserted[0].resource_id, "resource-123");
         assert_eq!(inserted[0].expiration, "2024-03-09T16:00:00Z");
 
-        // First-paint sync still ran and populated the cache.
+        // First-paint window still ran and populated the cache; token not published.
         assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty());
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]
@@ -4469,8 +4713,11 @@ mod tests {
 
         assert!(http.posts.lock().unwrap().is_empty(), "unexpired channel must not be rewatched");
         assert!(watches.inserted.lock().unwrap().is_empty());
-        assert_eq!(http.gets.lock().unwrap().len(), 1, "sync still runs");
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1, "window still runs");
+        assert!(gets[0].contains("singleEvents=true"), "{gets:?}");
         assert!(output.sync_errors.is_empty());
+        assert_eq!(output.source, "window");
     }
 
     #[test]

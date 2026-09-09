@@ -168,6 +168,9 @@ pub trait CalendarRepo: Send + Sync {
         expires_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<bool, RepoError>;
+    /// Bump `dirty_requested_generation` so cron/webhook replica work can catch
+    /// up (V3 dirty channel). Does **not** set `full_sync_requested`.
+    async fn bump_dirty_requested(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
     async fn set_sync_enabled(
         &self,
         id: &str,
@@ -850,6 +853,15 @@ pub const CALENDAR_RENEW_LEASE_SQL: &str = "
     UPDATE google_calendars
     SET lease_expires_at = ?, updated_at = ?
     WHERE id = ? AND lease_owner = ? AND deleted_at IS NULL
+";
+
+/// Bump dirty generation so Path B (replica) can catch up after a window
+/// first-paint. Binds: now, id. Does not touch `full_sync_requested`.
+pub const CALENDAR_BUMP_DIRTY_REQUESTED_SQL: &str = "
+    UPDATE google_calendars
+    SET dirty_requested_generation = dirty_requested_generation + 1,
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
 ";
 
 pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
@@ -2050,6 +2062,20 @@ mod tests {
         assert!(sql.contains("lease_expires_at = ?"), "{sql}");
         assert!(sql.contains("lease_owner = ?"), "{sql}");
         assert!(!sql.contains("sync_token"), "{sql}");
+    }
+
+    #[test]
+    fn bump_dirty_requested_sql_increments_generation_only() {
+        let sql = CALENDAR_BUMP_DIRTY_REQUESTED_SQL;
+        assert!(
+            sql.contains("dirty_requested_generation = dirty_requested_generation + 1"),
+            "{sql}"
+        );
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("full_sync_requested"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("last_synced_at"), "{sql}");
     }
 
     #[test]

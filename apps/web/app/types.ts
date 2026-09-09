@@ -80,7 +80,7 @@ export interface CalendarEventsSync {
 // The envelope returned by GET /api/calendar/events
 export interface CalendarEventsResponse {
   events: CalendarEvent[];
-  source: 'cache' | string;
+  source: 'cache' | 'window' | 'mixed' | string;
   sync: CalendarEventsSync;
 }
 

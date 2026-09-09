@@ -34,29 +34,32 @@ request-path gate and an implied health signal.** Those must diverge.
 
 ### Destination (two paths)
 
-V2 implements two distinct Google read shapes. They must not be collapsed:
+Two distinct Google read shapes. They must not be collapsed:
 
-- **Window fetch:** `timeMin` + `timeMax`, `singleEvents=true`, first paint /
-  visible range. Any `nextSyncToken` from this query is **thrown away**.
-- **Replica walk:** `singleEvents=false`, optional `timeMin ≈ now − 12 months`,
-  no `timeMax`. **Only this walk owns `sync_token`.** Persist the token only
-  after the last page is durably committed.
-
-V1 still uses the single existing replica-shaped `events.list`
-(`singleEvents=false`, no time bounds) on first paint only. The two-path split
-is locked here so later verticals do not invent a third shape.
+- **Window fetch (Path A):** `timeMin` + `timeMax`, `singleEvents=true`,
+  `orderBy=startTime`, first paint / visible range. Any `nextSyncToken` from
+  this query is **thrown away**. Does **not** call `record_sync_success`.
+  Bumps `dirty_requested_generation` so Path B can catch up.
+- **Replica walk (Path B):** `singleEvents=false`, **no** `timeMin` / `timeMax`
+  / `updatedMin` (unbounded list). Optional `syncToken` / `pageToken`.
+  **Only this walk owns `sync_token`.** Persist the token only after the last
+  page is durably committed under a still-held lease.
 
 ### Invariants
 
 1. Never advance `syncToken` past work that is not durably committed.
 2. Upsert by `(calendar_id, google_event_id)` — never a global unique on
-   `google_event_id`.
-3. One fenced owner per calendar (lease columns exist; fencing logic is later).
+   `google_event_id`. Never use `iCalUID` as PK. Window `singleEvents=true`
+   instance ids are distinct from masters — upsert under the instance id.
+3. One fenced owner per calendar (lease acquire / renew / fenced success /
+   release on both paths that write).
 4. Watches are hints; the periodic incremental is the contract.
-5. 410 is merge-full, not truncate (V2 implements merge-full; V1 keeps the
-   in-invocation single retry and does not wipe rows).
-6. Cancelled exceptions are kept rows (V2; columns exist). Ordinary cancelled
-   events stay soft-deletes.
+5. 410 on the **replica** is merge-full, not truncate (drop in-memory cursor,
+   re-list once, keep already-applied rows). Window 410 is a plain error (no
+   token was sent).
+6. Cancelled exceptions are kept rows. Ordinary cancelled events stay
+   soft-deletes. Same `classify_replica_item` on window write-through and
+   replica apply.
 7. App-owned fields (`task_id`, future notes) stay off the Google-overwrite set.
    `task_id` COALESCE is permanent.
 8. A recent attempt is not success. A healthy watch is not a healthy replica.
@@ -70,13 +73,16 @@ is locked here so later verticals do not invent a third shape.
 
 ### Projection / app-owned
 
-Product projection declared: `timed_masters_and_exceptions` (all-day still
-out). `task_id` (and future notes) must not live in columns a Google merge
-blindly overwrites — keep COALESCE / app-owned semantics permanent.
+Product projection: `timed_masters_and_exceptions` (all-day **stored**,
+**excluded** from GET list SQL). All-day civil dates are stored as RFC 3339
+Z-midnight (`YYYY-MM-DDT00:00:00Z`); lexicographic overlap has residual risk
+for non-UTC civil days. `task_id` (and future notes) must not live in columns
+a Google merge blindly overwrites — keep COALESCE / app-owned semantics
+permanent.
 
-### What V1 shipped vs later
+### What shipped vs later
 
-**V1 (this vertical)**
+**V1**
 
 - Health columns on `google_calendars` + event identity columns on
   `calendar_events` (nullable / defaulted)
@@ -84,15 +90,31 @@ blindly overwrites — keep COALESCE / app-owned semantics permanent.
 - Sanitized `sync` envelope on `GET /api/calendar/events`
 - Existing sync path records attempt vs success; missing terminal
   `nextSyncToken` is **not** publication success
-- Request path still cache-only after first publication; stale is visible in
-  the envelope, not a blocking resync
+- Request path cache-only after first publication; stale is visible in the
+  envelope, not a blocking resync
 - Projection declared: `timed_masters_and_exceptions`
+
+**V2 (shipped)**
+
+- Two-path reads: never-initialized calendars first-paint via a bounded
+  `singleEvents=true` **window**; initialized calendars stay cache-only
+- Window throws away `nextSyncToken`; does not call `record_sync_success`;
+  bumps `dirty_requested_generation`
+- Replica walk is unbounded (`singleEvents=false`, no `timeMin`) so production
+  tokens are not invalidated / 410-stormed by a fingerprint change that adds
+  time bounds
+- Identity columns / `raw_json` populated on apply; cancelled exceptions kept;
+  upsert restores `deleted_at` and returns the persisted id
+- 410 merge-full (no truncate); page-by-page apply under a lease; fenced
+  `record_sync_success_if_owner`
+- First paint is **window**, not replica-await
+- GET envelope `source` is `cache` | `window` | `mixed`
+- Projection still `timed_masters_and_exceptions`; all-day stored as Z-midnight
 
 **Later**
 
-- **V2:** two-path reads (live window vs replica apply), populate identity /
-  `raw_json`, 410 merge-full, cancelled-exception retention
-- **V3:** dirty generations + cron `notify_user` + watch as hint only
+- **V3:** dirty generations consumed by cron `notify_user` + watch as hint only;
+  durable dirty enqueue; calendarList incremental
 - **V4:** If-Match / operation journal / writes
 - **V5:** web health chrome
 - **Not planned:** Cloudflare Queues (ADR 0001)
@@ -104,23 +126,26 @@ blindly overwrites — keep COALESCE / app-owned semantics permanent.
   (`last_success_at`, `sync_status`, `stale`, `error_code`, …).
 - A failed incremental leaves the previous cursor and success stamp intact;
   the next run can replay (upsert-by-id). Empty `items` + `nextSyncToken`
-  still counts as success.
-- Missing terminal `nextSyncToken` is classified as `missing_sync_token` and
-  stored as `retrying` — never as a silent “keep old token and stamp success.”
+  still counts as success **on the replica path**.
+- Missing terminal `nextSyncToken` on the replica is classified as
+  `missing_sync_token` and stored as `retrying` — never as a silent “keep old
+  token and stamp success.”
 - Tokens, OAuth credentials, lease secrets, event bodies, and `raw_json` never
   appear in the envelope or in `last_error_code`.
 - Cron continues to key off `last_synced_at`; `record_sync_success` writes it,
-  so the 15-minute backstop keeps working without a separate dirty channel
-  (until V3).
+  so the 15-minute backstop keeps working. Window bumps dirty as a V3 hint
+  without setting `full_sync_requested`.
 
 ## Residual risk
 
-- V1 still has one replica-shaped fetch on first paint only; a long-stale
-  cache is visible (`stale` / `degraded`) but not force-refetched on the
-  request path until cron/webhook run.
-- 410 is still an in-invocation single retry, not merge-full — residual
-  truncate risk if a future change wipes rows on 410 before V2.
-- No auto-reset after N failures: a permanently bad cursor stays until an
-  operator or V2 merge-full path clears it.
-- Identity columns and `raw_json` stay empty until V2; app-owned COALESCE is
-  ready but unexercised by the replica apply path.
+- Merge-full ghosts remain until a later incremental cancel (or operator
+  action); there is no mark-and-sweep.
+- Lease renew uses the caller’s fixed `now`, so a walk longer than the 90s TTL
+  can be stolen mid-flight.
+- Window instances (`singleEvents=true` ids) and replica masters share
+  `calendar_events` but different `google_event_id`s — both are valid rows
+  under the natural key.
+- All-day Z-midnight storage: non-UTC civil dates have residual lexicographic
+  overlap risk on GET.
+- V3 still owns durable dirty enqueue consumption, calendarList incremental,
+  and cron `notify_user`.
