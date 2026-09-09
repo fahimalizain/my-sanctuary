@@ -41,6 +41,11 @@ export function movedEnough(dx: number, dy: number): boolean {
   return Math.hypot(dx, dy) >= DRAG_THRESHOLD_PX;
 }
 
+/** Touch tap on empty grid still creates. Mouse/pen click does not. */
+export function isTapCreatePointer(pointerType: string): boolean {
+  return pointerType === 'touch';
+}
+
 /**
  * Which resize edge (if any) is under the pointer inside a chip.
  * `localY` is Y relative to the chip top; `chipHeight` is the chip's height.

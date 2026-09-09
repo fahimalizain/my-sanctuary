@@ -12,6 +12,7 @@ import {
   type DragKind,
   type DragSlot,
   type TimedRange,
+  isTapCreatePointer,
   movedEnough,
   movedRange,
   rangeFromSlots,
@@ -245,14 +246,19 @@ export function useCalendarDrag(
       // Commit before clearing so callbacks see a consistent session.
       if (s.kind === 'create') {
         if (!dragged) {
-          clickCreate(s.originSlot);
+          // Touch tap still creates; mouse/pen click on empty cell is a no-op.
+          if (isTapCreatePointer(e.pointerType)) {
+            clickCreate(s.originSlot);
+          }
         } else if (preview) {
           suppressClickRef.current = true;
           dragCreate(preview);
         }
       } else if (s.kind === 'allday-create') {
         if (!dragged) {
-          allDayCreate(rangeFromSlots(s.originSlot, s.originSlot, 'allday'));
+          if (isTapCreatePointer(e.pointerType)) {
+            allDayCreate(rangeFromSlots(s.originSlot, s.originSlot, 'allday'));
+          }
         } else if (preview) {
           suppressClickRef.current = true;
           allDayCreate(preview);

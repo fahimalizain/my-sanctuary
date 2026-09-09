@@ -6,6 +6,7 @@ import {
   DRAG_THRESHOLD_PX,
   RESIZE_HANDLE_PX,
   allDayPreviewIndices,
+  isTapCreatePointer,
   movedEnough,
   movedRange,
   rangeFromSlots,
@@ -37,6 +38,24 @@ test('movedEnough: at threshold is true', () => {
   assert.equal(movedEnough(DRAG_THRESHOLD_PX, 0), true);
   assert.equal(movedEnough(0, DRAG_THRESHOLD_PX), true);
   assert.equal(movedEnough(4, 0), true);
+});
+
+// ── isTapCreatePointer ──────────────────────────────────────────────────
+
+test('isTapCreatePointer: touch → true', () => {
+  assert.equal(isTapCreatePointer('touch'), true);
+});
+
+test('isTapCreatePointer: mouse → false', () => {
+  assert.equal(isTapCreatePointer('mouse'), false);
+});
+
+test('isTapCreatePointer: pen → false', () => {
+  assert.equal(isTapCreatePointer('pen'), false);
+});
+
+test('isTapCreatePointer: empty → false', () => {
+  assert.equal(isTapCreatePointer(''), false);
 });
 
 // ── resizeEdgeAt ────────────────────────────────────────────────────────
