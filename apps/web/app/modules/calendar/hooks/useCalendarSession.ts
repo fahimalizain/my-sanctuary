@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import {
@@ -26,6 +27,7 @@ import {
   clickCreateTimesFromSlot,
   eventChipColor,
 } from '../lib/calendar-model';
+import { isPersistableDraftTitle } from '../lib/event-draft';
 import {
   isTempEventId,
   newTempEventId,
@@ -100,6 +102,18 @@ export function useCalendarSession({
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   // Focus title only right after click-to-create, not on every chip select.
   const [focusTitleOnOpen, setFocusTitleOnOpen] = useState(false);
+  // Local-only draft (overlay upsert, no POST yet). Ref is the source of
+  // truth inside stable callbacks; state mirrors it for React identity.
+  const [unpersistedDraftId, setUnpersistedDraftId] = useState<string | null>(
+    null,
+  );
+  const unpersistedDraftIdRef = useRef<string | null>(null);
+  const setDraftId = useCallback((id: string | null) => {
+    unpersistedDraftIdRef.current = id;
+    setUnpersistedDraftId(id);
+  }, []);
+  // Prevent a second title-blur from firing another POST for the same draft.
+  const draftPersistStartedRef = useRef<Set<string>>(new Set());
 
   const createEvent = useCreateCalendarEvent();
   const updateEvent = useUpdateCalendarEvent();
@@ -145,15 +159,201 @@ export function useCalendarSession({
     return calendars.find((c) => c.id === selectedEvent.calendar_id);
   }, [calendars, selectedEvent]);
 
+  const discardUnpersistedDraft = useCallback(() => {
+    const id = unpersistedDraftIdRef.current;
+    if (!id) return;
+    // clear (not remove): never on the server; if POST is in flight, empty
+    // overlay makes create onSuccess DELETE the just-created server row.
+    queue.clear(id);
+    setDraftId(null);
+  }, [queue, setDraftId]);
+
   const closeInspector = useCallback(() => {
+    discardUnpersistedDraft();
     setSelectedEventId(null);
     setFocusTitleOnOpen(false);
-  }, []);
+  }, [discardUnpersistedDraft]);
 
-  const selectEvent = useCallback((eventId: string) => {
-    setSelectedEventId(eventId);
-    setFocusTitleOnOpen(false);
-  }, []);
+  const selectEvent = useCallback(
+    (eventId: string) => {
+      const draftId = unpersistedDraftIdRef.current;
+      if (draftId && draftId !== eventId) {
+        discardUnpersistedDraft();
+      }
+      setSelectedEventId(eventId);
+      setFocusTitleOnOpen(false);
+    },
+    [discardUnpersistedDraft],
+  );
+
+  const beginDraft = useCallback(
+    (range: TimedRange) => {
+      if (!writableCalendar) {
+        closeInspector();
+        return;
+      }
+
+      // Replace any previous local draft (no POST was made for it).
+      const prevDraftId = unpersistedDraftIdRef.current;
+      if (prevDraftId) {
+        queue.clear(prevDraftId);
+        setDraftId(null);
+      }
+
+      const tempId = newTempEventId();
+      const startIso = range.start.toISOString();
+      const endIso = range.end.toISOString();
+
+      const optimistic: CalendarEvent = {
+        id: tempId,
+        calendar_id: writableCalendar.id,
+        google_event_id: '',
+        title: '',
+        description: '',
+        start_time: startIso,
+        end_time: endIso,
+        last_synced_at: new Date().toISOString(),
+        color: colorForCalendar(writableCalendar.id),
+      };
+
+      // Paint chip + open inspector — no network until title blur.
+      queue.upsert(optimistic);
+      setDraftId(tempId);
+      setSelectedEventId(tempId);
+      setFocusTitleOnOpen(true);
+    },
+    [writableCalendar, closeInspector, queue, setDraftId],
+  );
+
+  const persistDraft = useCallback(() => {
+    const tempId = unpersistedDraftIdRef.current;
+    if (!tempId) return;
+
+    const latest = queue.getOverlay(tempId);
+    if (!latest || latest.op !== 'upsert') return;
+    if (!isPersistableDraftTitle(latest.event.title)) return;
+    if (draftPersistStartedRef.current.has(tempId)) return;
+
+    const event = latest.event;
+    const postedSummary = event.title.trim();
+    const startIso = event.start_time;
+    const endIso = event.end_time;
+
+    draftPersistStartedRef.current.add(tempId);
+
+    createEvent.mutate(
+      {
+        calendar_id: event.calendar_id,
+        summary: postedSummary,
+        start: startIso,
+        end: endIso,
+      },
+      {
+        onSuccess: (result) => {
+          draftPersistStartedRef.current.delete(tempId);
+          const after = queue.getOverlay(tempId);
+
+          // User deleted / discarded while create was in flight — do not
+          // cache-write; DELETE the just-created server event so Google has
+          // no ghost.
+          if (!after || after.op === 'delete') {
+            queue.clear(tempId);
+            if (unpersistedDraftIdRef.current === tempId) {
+              setDraftId(null);
+            }
+            void deleteEvent.mutateAsync(result.event.id).then(() => {
+              removeCalendarEventFromCache(result.event.id);
+            });
+            return;
+          }
+
+          // Remap selection before clear/cache so selectedEvent never
+          // resolves null for the old temp id (effect would close inspector).
+          setSelectedEventId((prev) =>
+            prev === tempId ? result.event.id : prev,
+          );
+          if (unpersistedDraftIdRef.current === tempId) {
+            setDraftId(null);
+          }
+          queue.clear(tempId);
+          upsertCalendarEventInCache(result.event);
+
+          // If the user renamed / moved the temp event before POST returned,
+          // keep those fields under the server id and flush a PATCH.
+          if (after.op === 'upsert') {
+            const local = after.event;
+            const titleDiffers = local.title !== postedSummary;
+            const startDiffers = local.start_time !== startIso;
+            const endDiffers = local.end_time !== endIso;
+
+            if (titleDiffers || startDiffers || endDiffers) {
+              const merged: CalendarEvent = {
+                ...result.event,
+                title: local.title,
+                start_time: local.start_time,
+                end_time: local.end_time,
+              };
+              queue.upsert(merged);
+
+              const input: {
+                summary?: string;
+                start?: string;
+                end?: string;
+              } = {};
+              if (titleDiffers) input.summary = local.title;
+              if (startDiffers) input.start = local.start_time;
+              if (endDiffers) input.end = local.end_time;
+
+              const serverId = result.event.id;
+              void updateEvent
+                .mutateAsync({ id: serverId, input })
+                .then((patchResult) => {
+                  upsertCalendarEventInCache(patchResult.event);
+                  const patchAfter = queue.getOverlay(serverId);
+                  if (
+                    !patchAfter ||
+                    (patchAfter.op === 'upsert' &&
+                      patchAfter.event.title === patchResult.event.title &&
+                      patchAfter.event.start_time ===
+                        patchResult.event.start_time &&
+                      patchAfter.event.end_time ===
+                        patchResult.event.end_time)
+                  ) {
+                    queue.clear(serverId);
+                  }
+                })
+                .catch(() => {
+                  // Revert only if overlay still matches what we tried to flush.
+                  const patchAfter = queue.getOverlay(serverId);
+                  if (
+                    patchAfter?.op === 'upsert' &&
+                    patchAfter.event.title === local.title &&
+                    patchAfter.event.start_time === local.start_time &&
+                    patchAfter.event.end_time === local.end_time
+                  ) {
+                    queue.clear(serverId);
+                  }
+                });
+            }
+          }
+        },
+        onError: () => {
+          draftPersistStartedRef.current.delete(tempId);
+          queue.clear(tempId);
+          if (unpersistedDraftIdRef.current === tempId) {
+            setDraftId(null);
+          }
+          setSelectedEventId((prev) => {
+            if (prev === tempId) {
+              setFocusTitleOnOpen(false);
+              return null;
+            }
+            return prev;
+          });
+        },
+      },
+    );
+  }, [createEvent, deleteEvent, queue, updateEvent, setDraftId]);
 
   const handleSaveTitle = useCallback(
     async (summary: string) => {
@@ -164,7 +364,16 @@ export function useCalendarSession({
       // Paint immediately.
       queue.upsert({ ...current, title: summary });
 
-      // Temp ids have no server row yet — create onSuccess will flush the title.
+      // Unpersisted draft: title blur is the sole persist trigger.
+      if (
+        selectedEventId === unpersistedDraftIdRef.current ||
+        selectedEventId === unpersistedDraftId
+      ) {
+        persistDraft();
+        return;
+      }
+
+      // Temp id with POST in flight — create onSuccess will flush the title.
       if (isTempEventId(selectedEventId)) return;
 
       try {
@@ -191,19 +400,43 @@ export function useCalendarSession({
         }
       }
     },
-    [selectedEventId, overlaidEvents, queue, updateEvent],
+    [
+      selectedEventId,
+      unpersistedDraftId,
+      overlaidEvents,
+      queue,
+      updateEvent,
+      persistDraft,
+    ],
   );
 
   const handleDeleteEvent = useCallback(async () => {
     if (!selectedEventId) return;
     const id = selectedEventId;
 
+    // Draft or in-flight create: drop overlay only — never DELETE a missing
+    // server row. If POST is in flight, clear makes onSuccess DELETE it.
+    if (
+      isTempEventId(id) ||
+      id === unpersistedDraftIdRef.current ||
+      id === unpersistedDraftId
+    ) {
+      queue.clear(id);
+      if (
+        unpersistedDraftIdRef.current === id ||
+        unpersistedDraftId === id
+      ) {
+        setDraftId(null);
+      }
+      setSelectedEventId(null);
+      setFocusTitleOnOpen(false);
+      return;
+    }
+
     // Chip gone now; close inspector immediately.
     queue.remove(id);
-    closeInspector();
-
-    // Temp ids were never on the server — abandon in-flight create.
-    if (isTempEventId(id)) return;
+    setSelectedEventId(null);
+    setFocusTitleOnOpen(false);
 
     try {
       await deleteEvent.mutateAsync(id);
@@ -213,7 +446,7 @@ export function useCalendarSession({
       // Clear delete overlay so the event reappears from the server list.
       queue.clear(id);
     }
-  }, [selectedEventId, queue, closeInspector, deleteEvent]);
+  }, [selectedEventId, unpersistedDraftId, queue, deleteEvent, setDraftId]);
 
   const knownCalendarIds = useMemo(
     () => new Set(calendars.map((c) => c.id)),
@@ -280,145 +513,6 @@ export function useCalendarSession({
   );
   const totalHoursH = hourH * 24;
 
-  const commitCreate = useCallback(
-    (range: TimedRange) => {
-      if (!writableCalendar) {
-        closeInspector();
-        return;
-      }
-
-      const tempId = newTempEventId();
-      const startIso = range.start.toISOString();
-      const endIso = range.end.toISOString();
-      const postedSummary = 'New event';
-
-      const optimistic: CalendarEvent = {
-        id: tempId,
-        calendar_id: writableCalendar.id,
-        google_event_id: '',
-        title: postedSummary,
-        description: '',
-        start_time: startIso,
-        end_time: endIso,
-        last_synced_at: new Date().toISOString(),
-        color: colorForCalendar(writableCalendar.id),
-      };
-
-      // Paint chip + open inspector immediately under the temp id.
-      queue.upsert(optimistic);
-      setSelectedEventId(tempId);
-      setFocusTitleOnOpen(true);
-
-      createEvent.mutate(
-        {
-          calendar_id: writableCalendar.id,
-          summary: postedSummary,
-          start: startIso,
-          end: endIso,
-        },
-        {
-          onSuccess: (result) => {
-            const latest = queue.getOverlay(tempId);
-
-            // User deleted while create was in flight — do not cache-write;
-            // DELETE the just-created server event so Google has no ghost.
-            if (!latest || latest.op === 'delete') {
-              queue.clear(tempId);
-              void deleteEvent.mutateAsync(result.event.id).then(() => {
-                removeCalendarEventFromCache(result.event.id);
-              });
-              return;
-            }
-
-            // Remap selection before clear/cache so selectedEvent never
-            // resolves null for the old temp id (effect would close inspector).
-            setSelectedEventId((prev) =>
-              prev === tempId ? result.event.id : prev,
-            );
-            queue.clear(tempId);
-            upsertCalendarEventInCache(result.event);
-
-            // If the user renamed / moved the temp event before POST returned,
-            // keep those fields under the server id and flush a PATCH.
-            if (latest.op === 'upsert') {
-              const local = latest.event;
-              const titleDiffers = local.title !== postedSummary;
-              const startDiffers = local.start_time !== startIso;
-              const endDiffers = local.end_time !== endIso;
-
-              if (titleDiffers || startDiffers || endDiffers) {
-                const merged: CalendarEvent = {
-                  ...result.event,
-                  title: local.title,
-                  start_time: local.start_time,
-                  end_time: local.end_time,
-                };
-                queue.upsert(merged);
-
-                const input: {
-                  summary?: string;
-                  start?: string;
-                  end?: string;
-                } = {};
-                if (titleDiffers) input.summary = local.title;
-                if (startDiffers) input.start = local.start_time;
-                if (endDiffers) input.end = local.end_time;
-
-                const serverId = result.event.id;
-                void updateEvent
-                  .mutateAsync({ id: serverId, input })
-                  .then((patchResult) => {
-                    upsertCalendarEventInCache(patchResult.event);
-                    const after = queue.getOverlay(serverId);
-                    if (
-                      !after ||
-                      (after.op === 'upsert' &&
-                        after.event.title === patchResult.event.title &&
-                        after.event.start_time ===
-                          patchResult.event.start_time &&
-                        after.event.end_time === patchResult.event.end_time)
-                    ) {
-                      queue.clear(serverId);
-                    }
-                  })
-                  .catch(() => {
-                    // Revert only if overlay still matches what we tried to flush.
-                    const after = queue.getOverlay(serverId);
-                    if (
-                      after?.op === 'upsert' &&
-                      after.event.title === local.title &&
-                      after.event.start_time === local.start_time &&
-                      after.event.end_time === local.end_time
-                    ) {
-                      queue.clear(serverId);
-                    }
-                  });
-              }
-            }
-          },
-          onError: () => {
-            queue.clear(tempId);
-            setSelectedEventId((prev) => {
-              if (prev === tempId) {
-                setFocusTitleOnOpen(false);
-                return null;
-              }
-              return prev;
-            });
-          },
-        },
-      );
-    },
-    [
-      writableCalendar,
-      createEvent,
-      closeInspector,
-      queue,
-      deleteEvent,
-      updateEvent,
-    ],
-  );
-
   const handleMoveOrResize = useCallback(
     (eventId: string, range: TimedRange) => {
       const current =
@@ -471,15 +565,27 @@ export function useCalendarSession({
     [overlaidEvents, events, queue, updateEvent],
   );
 
+  const handleEmptyClick = useCallback(() => {
+    // Desktop empty-cell click: discard an open draft only. Leave a real
+    // selected event (and its inspector) alone.
+    const hadDraft = unpersistedDraftIdRef.current !== null;
+    discardUnpersistedDraft();
+    if (hadDraft) {
+      setSelectedEventId(null);
+      setFocusTitleOnOpen(false);
+    }
+  }, [discardUnpersistedDraft]);
+
   const drag = useCalendarDrag({
     hourH,
     setStripLocked,
-    onClickCreate: (slot) => commitCreate(clickCreateTimesFromSlot(slot)),
-    onDragCreate: commitCreate,
+    onClickCreate: (slot) => beginDraft(clickCreateTimesFromSlot(slot)),
+    onDragCreate: beginDraft,
     onMove: handleMoveOrResize,
     onResize: handleMoveOrResize,
-    onAllDayCreate: commitCreate,
+    onAllDayCreate: beginDraft,
     onChipTap: selectEvent,
+    onEmptyClick: handleEmptyClick,
   });
 
   // Stable across pointermove — only flips at drag start/end (not every move).
@@ -517,7 +623,7 @@ export function useCalendarSession({
     : writableCalendar
       ? colorForCalendar(writableCalendar.id)
       : colorForCalendar('preview');
-  const previewTitle = activeDragEvent?.title ?? 'New event';
+  const previewTitle = activeDragEvent?.title ?? '';
 
   // Tick "now" so the now-line creeps forward while the page is open.
   const [now, setNow] = useState(() => new Date());

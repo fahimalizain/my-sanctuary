@@ -224,9 +224,7 @@ export function AllDayRow({
                     backgroundColor: hexToRgba(color, PREVIEW_FILL_ALPHA),
                   }}
                 >
-                  <div className="truncate text-[11px] font-medium leading-[17px]">
-                    New event
-                  </div>
+                  <div className="truncate text-[11px] font-medium leading-[17px]" />
                 </div>
               </div>
             );

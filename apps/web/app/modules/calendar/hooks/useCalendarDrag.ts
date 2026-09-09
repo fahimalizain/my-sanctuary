@@ -37,6 +37,11 @@ export interface UseCalendarDragOptions {
   onAllDayCreate: (range: TimedRange) => void;
   /** Chip tap without drag — open inspector. */
   onChipTap: (eventId: string) => void;
+  /**
+   * Desktop mouse/pen empty-cell click (no drag). Used to discard an
+   * unpersisted draft without deselecting a real event.
+   */
+  onEmptyClick?: () => void;
 }
 
 export interface CalendarDragApi {
@@ -241,14 +246,18 @@ export function useCalendarDrag(
         onResize: resizeCb,
         onAllDayCreate: allDayCreate,
         onChipTap: chipTap,
+        onEmptyClick: emptyClick,
       } = optsRef.current;
 
       // Commit before clearing so callbacks see a consistent session.
       if (s.kind === 'create') {
         if (!dragged) {
-          // Touch tap still creates; mouse/pen click on empty cell is a no-op.
+          // Touch tap still creates; mouse/pen click on empty cell is a no-op
+          // (except discarding an unpersisted draft via onEmptyClick).
           if (isTapCreatePointer(e.pointerType)) {
             clickCreate(s.originSlot);
+          } else {
+            emptyClick?.();
           }
         } else if (preview) {
           suppressClickRef.current = true;
@@ -258,6 +267,8 @@ export function useCalendarDrag(
         if (!dragged) {
           if (isTapCreatePointer(e.pointerType)) {
             allDayCreate(rangeFromSlots(s.originSlot, s.originSlot, 'allday'));
+          } else {
+            emptyClick?.();
           }
         } else if (preview) {
           suppressClickRef.current = true;
