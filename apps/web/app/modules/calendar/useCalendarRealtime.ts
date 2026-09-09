@@ -1,16 +1,33 @@
 import { useEffect } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useAuth } from '@/lib/auth';
-import { queryKeys } from '@/app/queries/keys';
-import { parseRealtimeMessage } from './lib/realtime';
+import {
+  calendarCatchupQueryKeys,
+  parseRealtimeMessage,
+  shouldInvalidateCalendarOnMessage,
+  shouldInvalidateCalendarOnOpen,
+} from './lib/realtime';
 
 const PING_INTERVAL_MS = 25_000;
 const BACKOFF_INITIAL_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 
+// Cancel-then-invalidate so the latest same-key GET wins over an in-flight older one.
+export async function catchUpCalendarQueries(
+  queryClient: QueryClient,
+): Promise<void> {
+  const { events, calendars } = calendarCatchupQueryKeys();
+  await queryClient.cancelQueries({ queryKey: events });
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: events }),
+    queryClient.invalidateQueries({ queryKey: calendars }),
+  ]);
+}
+
 /**
  * Same-origin WebSocket to `/api/realtime` while the user is logged in.
- * On `calendar.changed`, invalidates calendar events queries only.
+ * On open/reconnect and on `calendar.changed`, catch up calendar queries
+ * (cancel in-flight events GETs, then invalidate events + calendars).
  * Optimistic overlays in CalendarEventsProvider still win for in-flight edits.
  */
 export function useCalendarRealtime(): void {
@@ -74,16 +91,17 @@ export function useCalendarRealtime(): void {
             ws.send('ping');
           }
         }, PING_INTERVAL_MS);
+        if (shouldInvalidateCalendarOnOpen()) {
+          void catchUpCalendarQueries(queryClient);
+        }
       };
 
       ws.onmessage = (event: MessageEvent) => {
         if (typeof event.data !== 'string') return;
         // Server auto-replies "pong" to "ping"; ignore non-JSON frames.
         const msg = parseRealtimeMessage(event.data);
-        if (msg?.type === 'calendar.changed') {
-          void queryClient.invalidateQueries({
-            queryKey: [...queryKeys.calendar.all, 'events'],
-          });
+        if (shouldInvalidateCalendarOnMessage(msg)) {
+          void catchUpCalendarQueries(queryClient);
         }
       };
 
