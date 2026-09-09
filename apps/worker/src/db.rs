@@ -31,8 +31,10 @@ use api_core::repo::{
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
-    CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
-    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
+    CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
+    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
+    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
     EVENT_GET_ID_BY_NATURAL_KEY_SQL,
@@ -85,6 +87,21 @@ async fn run_stmt(stmt: D1PreparedStatement) -> Result<(), RepoError> {
         return Err(RepoError::Backend(result.error().unwrap_or_default()));
     }
     Ok(())
+}
+
+/// Runs a statement and returns D1 `changes` (rows matched/updated), or 0 when
+/// meta is missing. Used by fenced lease / success writes.
+async fn run_stmt_changes(stmt: D1PreparedStatement) -> Result<usize, RepoError> {
+    let result = stmt.run().await.map_err(backend)?;
+    if !result.success() {
+        return Err(RepoError::Backend(result.error().unwrap_or_default()));
+    }
+    let changes = result
+        .meta()
+        .map_err(|err| RepoError::Backend(err.to_string()))?
+        .and_then(|meta| meta.changes.or(meta.rows_written))
+        .unwrap_or(0);
+    Ok(changes)
 }
 
 /// Executes a select and maps every row through serde (`D1Result::results`).
@@ -460,6 +477,35 @@ impl CalendarRepo for D1CalendarRepo {
         run_stmt(stmt).await
     }
 
+    async fn record_sync_success_if_owner(
+        &self,
+        id: &str,
+        sync_token: &str,
+        query_fingerprint: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        // Binds: token, last_synced_at, last_success_at, last_attempt_at,
+        // fingerprint, updated_at, id, lease_owner, now (lease check).
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL)
+            .bind_refs(&[
+                D1Type::Text(sync_token),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(query_fingerprint),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+                D1Type::Text(lease_owner),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        let changes = run_stmt_changes(stmt).await?;
+        Ok(changes > 0)
+    }
+
     async fn record_sync_failure(
         &self,
         id: &str,
@@ -480,6 +526,74 @@ impl CalendarRepo for D1CalendarRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    async fn try_acquire_lease(
+        &self,
+        id: &str,
+        owner: &str,
+        now_rfc3339: &str,
+        expires_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        // Binds: owner, expires, now, id, owner, now.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_TRY_ACQUIRE_LEASE_SQL)
+            .bind_refs(&[
+                D1Type::Text(owner),
+                D1Type::Text(expires_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+                D1Type::Text(owner),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        // Verify ownership (another writer may have raced; changes alone is not
+        // enough if the WHERE matched a different concurrent steal).
+        match self.get_by_id(id).await? {
+            Some(cal) => Ok(cal.lease_owner == owner),
+            None => Ok(false),
+        }
+    }
+
+    async fn release_lease(
+        &self,
+        id: &str,
+        owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RELEASE_LEASE_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+                D1Type::Text(owner),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn renew_lease(
+        &self,
+        id: &str,
+        owner: &str,
+        expires_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RENEW_LEASE_SQL)
+            .bind_refs(&[
+                D1Type::Text(expires_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+                D1Type::Text(owner),
+            ])
+            .map_err(backend)?;
+        let changes = run_stmt_changes(stmt).await?;
+        Ok(changes > 0)
     }
 
     async fn set_sync_enabled(

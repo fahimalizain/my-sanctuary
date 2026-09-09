@@ -110,6 +110,9 @@ pub trait CalendarRepo: Send + Sync {
     /// Records a successful apply: writes token + `last_synced_at` /
     /// `last_success_at`, clears error/streak, marks ready, bumps
     /// `cache_revision`.
+    ///
+    /// Unfenced compat path. Prefer [`CalendarRepo::record_sync_success_if_owner`]
+    /// for the replica walk so a lost lease cannot publish a cursor.
     async fn record_sync_success(
         &self,
         id: &str,
@@ -117,6 +120,17 @@ pub trait CalendarRepo: Send + Sync {
         query_fingerprint: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Fenced success: same writes as [`CalendarRepo::record_sync_success`] but
+    /// only when `lease_owner` still matches and the lease is unexpired.
+    /// Returns `false` when zero rows updated (token / health unchanged).
+    async fn record_sync_success_if_owner(
+        &self,
+        id: &str,
+        sync_token: &str,
+        query_fingerprint: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError>;
     /// Records a failed attempt: sets error code, increments streak, updates
     /// status and next retry. Does **not** touch token, `last_success_at`,
     /// `last_synced_at`, or `last_attempt_at` (attempt is recorded at start).
@@ -128,6 +142,32 @@ pub trait CalendarRepo: Send + Sync {
         next_retry_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Try to become the sole replica owner for `id`. Succeeds when the lease
+    /// is empty, already ours, or expired. Returns `true` only when this
+    /// `owner` holds the lease after the update.
+    async fn try_acquire_lease(
+        &self,
+        id: &str,
+        owner: &str,
+        now_rfc3339: &str,
+        expires_rfc3339: &str,
+    ) -> Result<bool, RepoError>;
+    /// Clear the lease only if `owner` still holds it.
+    async fn release_lease(
+        &self,
+        id: &str,
+        owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// Extend `lease_expires_at` only if `owner` still holds the lease.
+    /// Returns `true` when the row was updated.
+    async fn renew_lease(
+        &self,
+        id: &str,
+        owner: &str,
+        expires_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError>;
     async fn set_sync_enabled(
         &self,
         id: &str,
@@ -748,6 +788,29 @@ pub const CALENDAR_RECORD_SYNC_SUCCESS_SQL: &str = "
     WHERE id = ? AND deleted_at IS NULL
 ";
 
+/// Fenced success: same SET as [`CALENDAR_RECORD_SYNC_SUCCESS_SQL`] plus a
+/// lease-owner guard so a stolen/expired owner cannot publish the cursor.
+/// Binds: token, now, now, now, fingerprint, now, id, lease_owner, now.
+pub const CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL: &str = "
+    UPDATE google_calendars SET
+      sync_token = ?,
+      last_synced_at = ?,
+      last_success_at = ?,
+      last_attempt_at = ?,
+      last_error_code = '',
+      failure_streak = 0,
+      next_retry_at = NULL,
+      initial_sync_complete = 1,
+      sync_status = 'ready',
+      sync_query_fingerprint = ?,
+      cache_revision = cache_revision + 1,
+      full_sync_requested = 0,
+      updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+      AND lease_owner = ?
+      AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
+";
+
 /// Failed attempt: error code, streak++, status, next retry. Does not write
 /// `sync_token`, `last_success_at`, `last_synced_at`, or `last_attempt_at`.
 pub const CALENDAR_RECORD_SYNC_FAILURE_SQL: &str = "
@@ -758,6 +821,35 @@ pub const CALENDAR_RECORD_SYNC_FAILURE_SQL: &str = "
       next_retry_at = ?,
       updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Steal or re-acquire the replica lease when empty, same owner, or expired.
+/// Binds: owner, expires, now, id, owner, now.
+pub const CALENDAR_TRY_ACQUIRE_LEASE_SQL: &str = "
+    UPDATE google_calendars
+    SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+      AND (
+        lease_owner = ''
+        OR lease_owner = ?
+        OR lease_expires_at IS NULL
+        OR lease_expires_at < ?
+      )
+";
+
+/// Release only if still owned by `owner`. Does not touch `sync_token`.
+/// Binds: now, id, owner.
+pub const CALENDAR_RELEASE_LEASE_SQL: &str = "
+    UPDATE google_calendars
+    SET lease_owner = '', lease_expires_at = NULL, updated_at = ?
+    WHERE id = ? AND lease_owner = ? AND deleted_at IS NULL
+";
+
+/// Renew expiry only if still owned by `owner`. Binds: expires, now, id, owner.
+pub const CALENDAR_RENEW_LEASE_SQL: &str = "
+    UPDATE google_calendars
+    SET lease_expires_at = ?, updated_at = ?
+    WHERE id = ? AND lease_owner = ? AND deleted_at IS NULL
 ";
 
 pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
@@ -1912,6 +2004,52 @@ mod tests {
         assert!(sql.contains("full_sync_requested = 0"), "{sql}");
         assert!(sql.contains("next_retry_at = NULL"), "{sql}");
         assert!(sql.contains("last_error_code = ''"), "{sql}");
+    }
+
+    #[test]
+    fn record_sync_success_if_owner_sql_fences_on_lease_and_writes_token() {
+        let sql = CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL;
+        assert!(sql.contains("sync_token = ?"), "{sql}");
+        assert!(sql.contains("last_success_at = ?"), "{sql}");
+        assert!(sql.contains("last_synced_at = ?"), "{sql}");
+        assert!(sql.contains("sync_query_fingerprint = ?"), "{sql}");
+        assert!(sql.contains("cache_revision = cache_revision + 1"), "{sql}");
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(
+            sql.contains("lease_expires_at IS NULL OR lease_expires_at >= ?"),
+            "{sql}"
+        );
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn try_acquire_lease_sql_allows_empty_same_or_expired() {
+        let sql = CALENDAR_TRY_ACQUIRE_LEASE_SQL;
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(sql.contains("lease_expires_at = ?"), "{sql}");
+        assert!(sql.contains("lease_owner = ''"), "{sql}");
+        assert!(sql.contains("OR lease_owner = ?"), "{sql}");
+        assert!(sql.contains("OR lease_expires_at IS NULL"), "{sql}");
+        assert!(sql.contains("OR lease_expires_at < ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn release_lease_sql_does_not_touch_sync_token() {
+        let sql = CALENDAR_RELEASE_LEASE_SQL;
+        assert!(sql.contains("lease_owner = ''"), "{sql}");
+        assert!(sql.contains("lease_expires_at = NULL"), "{sql}");
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("last_success_at"), "{sql}");
+    }
+
+    #[test]
+    fn renew_lease_sql_only_owner() {
+        let sql = CALENDAR_RENEW_LEASE_SQL;
+        assert!(sql.contains("lease_expires_at = ?"), "{sql}");
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
     }
 
     #[test]

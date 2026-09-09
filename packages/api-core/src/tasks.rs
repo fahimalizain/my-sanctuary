@@ -4409,6 +4409,17 @@ mod tests {
             Ok(())
         }
 
+        async fn record_sync_success_if_owner(
+            &self,
+            _id: &str,
+            _sync_token: &str,
+            _query_fingerprint: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
         async fn record_sync_failure(
             &self,
             _id: &str,
@@ -4418,6 +4429,35 @@ mod tests {
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             Ok(())
+        }
+
+        async fn try_acquire_lease(
+            &self,
+            _id: &str,
+            _owner: &str,
+            _now_rfc3339: &str,
+            _expires_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
+        async fn release_lease(
+            &self,
+            _id: &str,
+            _owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn renew_lease(
+            &self,
+            _id: &str,
+            _owner: &str,
+            _expires_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
         }
 
         async fn set_sync_enabled(

@@ -18,15 +18,19 @@
 //!   built from persisted replica columns (`last_success_at`, `sync_status`,
 //!   …) via [`crate::calendar_sync`] (ADR 0005).
 //! - [`sync_calendar`] records `record_sync_attempt` before any Google fetch,
-//!   `record_sync_success` only when apply finished **and** a terminal
-//!   `nextSyncToken` is present, and `record_sync_failure` on every other
-//!   path (including missing terminal token). Attempt ≠ success.
-//! - `events.list` uses `singleEvents=false&maxResults=250`, optionally with
-//!   the stored `syncToken` (incremental), and follows `nextPageToken`.
-//! - HTTP 410 (stale sync token) retries once with an empty token (full
-//!   resync). HTTP 404 (e.g. holidays/birthdays calendars that don't support
-//!   `events.list`) disables sync for that calendar. Other errors are logged
-//!   (returned in `sync_errors`) and do not fail the whole listing.
+//!   acquires a V1 lease, applies the replica walk page-by-page, and publishes
+//!   via fenced `record_sync_success_if_owner` only when apply finished **and**
+//!   a terminal `nextSyncToken` is present. `record_sync_failure` on every
+//!   other path (including missing terminal token). Attempt ≠ success. A busy
+//!   lease is a quiet skip (not a failure).
+//! - Replica `events.list` uses `singleEvents=false&maxResults=250`, optionally
+//!   with the stored `syncToken` (incremental), and follows `nextPageToken`
+//!   (see [`crate::calendar_replica`]).
+//! - HTTP 410 (stale sync token) is merge-full once in-invocation: drop the
+//!   cursor and re-list without truncating applied rows. HTTP 404 (e.g.
+//!   holidays/birthdays calendars that don't support `events.list`) disables
+//!   sync for that calendar. Other errors are logged (returned in
+//!   `sync_errors`) and do not fail the whole listing.
 //! - Replica apply is classified in [`crate::calendar_apply`]: ordinary
 //!   cancelled events (`status == "cancelled"`, no `recurringEventId`) are
 //!   soft-deleted; cancelled exceptions are upserted as sparse living rows;
@@ -56,18 +60,18 @@ use thiserror::Error;
 use url::Url;
 
 use crate::calendar_apply::{
-    classify_replica_item, map_google_event, row_from_new_event, EventsPage, GoogleEvent,
-    GoogleEventSharedProperties, ReplicaApplyAction,
+    map_google_event, row_from_new_event, GoogleEvent, GoogleEventSharedProperties,
 };
+use crate::calendar_replica::{lease_expires_at, mint_lease_owner, sync_replica};
 use crate::calendar_sync::{
-    classify_sync_error, events_sync_envelope, next_retry_rfc3339, replica_query_fingerprint,
-    replica_state_for_error, EventsSyncEnvelope, SyncErrorCode,
+    classify_sync_error, events_sync_envelope, next_retry_rfc3339, replica_state_for_error,
+    EventsSyncEnvelope, SyncErrorCode,
 };
 use crate::config::OAuthConfig;
 use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
-    CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewEventInput, NewWatchChannel,
-    PatchEventFields, WatchChannel,
+    CalendarEvent, GoogleCalendar, NewCalendar, NewEventInput, NewWatchChannel, PatchEventFields,
+    WatchChannel,
 };
 use crate::oauth::{HttpClient, HttpError};
 use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, WatchChannelRepo};
@@ -1498,14 +1502,17 @@ async fn refresh_calendar_list(
     Ok(())
 }
 
-/// Full or incremental sync of one calendar: fetch events (following
-/// `nextPageToken`, retrying once on 410), upsert them, and persist health
-/// independently of the cursor (ADR 0005).
+/// Full or incremental sync of one calendar via the fenced replica walk
+/// ([`crate::calendar_replica::sync_replica`], ADR 0005).
 ///
-/// - Attempt is stamped **before** any Google fetch.
+/// - Attempt is stamped **before** lease acquire / any Google fetch.
+/// - A busy (unexpired foreign) lease is a quiet `Ok(())` skip — not a failure.
 /// - Success requires apply finished **and** a non-empty terminal
-///   `nextSyncToken` (empty `items` + token still counts).
+///   `nextSyncToken` published under the still-held lease (empty `items` +
+///   token still counts).
 /// - Every other path records failure without advancing the token.
+/// - The lease is always released on the way out (success, skip-after-acquire,
+///   or error).
 ///
 /// `pub` for the webhook handler and the fallback cron; the request path
 /// reaches it via [`list_events`].
@@ -1522,7 +1529,43 @@ pub async fn sync_calendar(
         .await?;
     let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
 
-    match sync_calendar_body(http, calendars, events, access, cal, now_rfc3339).await {
+    let owner = mint_lease_owner();
+    let expires = lease_expires_at(now_rfc3339);
+    let acquired = calendars
+        .try_acquire_lease(&cal.id, &owner, now_rfc3339, &expires)
+        .await?;
+    if !acquired {
+        // Another owner is working this calendar — not a failure.
+        return Ok(());
+    }
+
+    // Re-read cursor/fingerprint under the lease (not the stale snapshot).
+    let body_result = async {
+        let fresh = calendars
+            .get_by_id(&cal.id)
+            .await?
+            .ok_or_else(|| CalendarError::Invalid("calendar missing after lease acquire".into()))?;
+        // Deploy backfill: empty event-label cache before the first fetch.
+        ensure_event_labels(http, calendars, access, &fresh, now_rfc3339).await?;
+        sync_replica(
+            http,
+            calendars,
+            events,
+            access,
+            &fresh,
+            &owner,
+            now_rfc3339,
+        )
+        .await
+    }
+    .await;
+
+    // Always release, even when the body failed.
+    let _ = calendars
+        .release_lease(&cal.id, &owner, now_rfc3339)
+        .await;
+
+    match body_result {
         Ok(()) => Ok(()),
         Err(err) => {
             let code = match &err {
@@ -1539,104 +1582,6 @@ pub async fn sync_calendar(
             }
         }
     }
-}
-
-/// Fetch + apply + success stamp. Callers must have already recorded attempt;
-/// on `Err` the caller records failure (including missing terminal token).
-async fn sync_calendar_body(
-    http: &dyn HttpClient,
-    calendars: &dyn CalendarRepo,
-    events: &dyn CalendarEventRepo,
-    access: &GoogleAccess,
-    cal: &GoogleCalendar,
-    now_rfc3339: &str,
-) -> Result<(), CalendarError> {
-    // Deploy backfill: existing rows have an empty event-label cache; fill it
-    // before the first (and every cache-miss) sync.
-    ensure_event_labels(http, calendars, access, cal, now_rfc3339).await?;
-
-    let mut all_items: Vec<GoogleEvent> = Vec::new();
-    let mut next_sync_token: Option<String> = None;
-    let mut sync_token = if cal.sync_token.is_empty() {
-        None
-    } else {
-        Some(cal.sync_token.as_str())
-    };
-    let mut page_token: Option<String> = None;
-    let mut retried_resync = false;
-
-    loop {
-        let url = google_events_url(&cal.google_calendar_id, sync_token, page_token.as_deref());
-        let (status, body) = http.get_bearer_raw(&url, &access.access_token).await?;
-        if status == 410 && !retried_resync {
-            // Stale sync token: drop it and the paging cursor, restart with a
-            // full resync (same as Go's recursive fetchGoogleEvents retry).
-            // Do not record failure on the first 410 — we are about to retry.
-            retried_resync = true;
-            sync_token = None;
-            page_token = None;
-            all_items.clear();
-            continue;
-        }
-        if status == 404 {
-            return Err(CalendarError::GoogleNotFound);
-        }
-        if !(200..300).contains(&status) {
-            return Err(CalendarError::GoogleApi(format!(
-                "google events.list returned {status}"
-            )));
-        }
-        let page: EventsPage = serde_json::from_slice(&body)
-            .map_err(|err| CalendarError::InvalidResponse(format!("events.list body: {err}")))?;
-        if let Some(items) = page.items {
-            all_items.extend(items);
-        }
-        if let Some(token) = page.next_sync_token {
-            next_sync_token = Some(token);
-        }
-        page_token = page.next_page_token;
-        if page_token.is_none() {
-            break;
-        }
-    }
-
-    // Apply in page order. Ordinary cancels soft-delete immediately (failure
-    // must not advance the token). Cancelled exceptions and living items
-    // (including all-day) go to the upsert batch.
-    let mut to_upsert: Vec<NewCalendarEvent> = Vec::new();
-    for item in &all_items {
-        match classify_replica_item(item, &cal.id, now_rfc3339) {
-            ReplicaApplyAction::SoftDelete { google_event_id } => {
-                events
-                    .delete_by_google_event_id(&cal.id, &google_event_id, now_rfc3339)
-                    .await?;
-            }
-            ReplicaApplyAction::Upsert(row) => {
-                to_upsert.push(row);
-            }
-        }
-    }
-    if !to_upsert.is_empty() {
-        events.upsert_batch(to_upsert, now_rfc3339).await?;
-    }
-
-    // Publication success requires a terminal nextSyncToken. Missing or empty
-    // token after a successful apply is still not success — leave the old
-    // cursor so the next run can replay (upsert-by-id).
-    let Some(next_token) = next_sync_token.filter(|t| !t.is_empty()) else {
-        return Err(CalendarError::InvalidResponse(
-            "missing nextSyncToken on terminal page".into(),
-        ));
-    };
-    calendars
-        .record_sync_success(
-            &cal.id,
-            &next_token,
-            &replica_query_fingerprint(),
-            now_rfc3339,
-        )
-        .await?;
-    Ok(())
 }
 
 /// Persist a classified failure without advancing the sync cursor.
@@ -1664,32 +1609,6 @@ async fn persist_sync_failure(
         )
         .await?;
     Ok(())
-}
-
-/// Builds the `events.list` URL for a calendar, percent-encoding the Google
-/// calendar id (ids like `en.usa#holiday@group.v.calendar.google.com` contain
-/// `#`). Query params are appended via `url::Url` so sync tokens (which often
-/// contain `=`) are properly encoded.
-fn google_events_url(
-    google_cal_id: &str,
-    sync_token: Option<&str>,
-    page_token: Option<&str>,
-) -> String {
-    let mut url = Url::parse(&format!(
-        "{GOOGLE_EVENTS_BASE_URL}/{}/events",
-        encode_path_segment(google_cal_id)
-    ))
-    .expect("static events URL is valid");
-    url.query_pairs_mut()
-        .append_pair("singleEvents", "false")
-        .append_pair("maxResults", "250");
-    if let Some(token) = sync_token {
-        url.query_pairs_mut().append_pair("syncToken", token);
-    }
-    if let Some(token) = page_token {
-        url.query_pairs_mut().append_pair("pageToken", token);
-    }
-    url.to_string()
 }
 
 /// RFC 3986 percent-encoding for a URL path segment (calendar ids may contain
@@ -1732,7 +1651,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::models::{GoogleCalendar, GoogleOAuthToken, NewCalendar, NewToken, WatchChannel};
+    use crate::models::{
+        GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewToken, WatchChannel,
+    };
 
     // ──────────────────────────────────────────
     // Fakes
@@ -1830,6 +1751,8 @@ mod tests {
 
     /// In-memory calendar repo: `upsert_batch` materializes rows (like D1), so
     /// the service's re-read after a calendarList import sees the new rows.
+    /// Lease methods mirror the V1 SQL semantics so replica tests exercise
+    /// real fencing.
     struct FakeCalendarRepo {
         stored: Mutex<Vec<GoogleCalendar>>,
         upserted: Mutex<Vec<NewCalendar>>,
@@ -1837,6 +1760,11 @@ mod tests {
         disabled: Mutex<Vec<(String, bool)>>,
         label_updates: Mutex<Vec<(String, String)>>,
         next_id: Mutex<u64>,
+        /// Count of `get_by_id` calls (for mid-walk lease-steal hooks).
+        get_by_id_count: Mutex<usize>,
+        /// After this many `get_by_id` calls, force `lease_owner` to `"thief"`
+        /// on the matched row (None = disabled).
+        steal_lease_after_get_by_id: Mutex<Option<usize>>,
     }
 
     impl FakeCalendarRepo {
@@ -1848,6 +1776,48 @@ mod tests {
                 disabled: Mutex::new(Vec::new()),
                 label_updates: Mutex::new(Vec::new()),
                 next_id: Mutex::new(1),
+                get_by_id_count: Mutex::new(0),
+                steal_lease_after_get_by_id: Mutex::new(None),
+            }
+        }
+
+        /// Test helper: plant a foreign or same-owner lease on a stored row.
+        fn force_lease(&self, id: &str, owner: &str, expires_rfc3339: Option<&str>) {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.lease_owner = owner.to_string();
+                cal.lease_expires_at = expires_rfc3339.map(str::to_string);
+            }
+        }
+
+        fn apply_success_fields(
+            cal: &mut GoogleCalendar,
+            sync_token: &str,
+            query_fingerprint: &str,
+            now_rfc3339: &str,
+        ) {
+            cal.sync_token = sync_token.to_string();
+            cal.last_synced_at = Some(now_rfc3339.to_string());
+            cal.last_success_at = Some(now_rfc3339.to_string());
+            cal.last_attempt_at = Some(now_rfc3339.to_string());
+            cal.last_error_code = String::new();
+            cal.failure_streak = 0;
+            cal.next_retry_at = None;
+            cal.initial_sync_complete = true;
+            cal.sync_status = "ready".to_string();
+            cal.sync_query_fingerprint = query_fingerprint.to_string();
+            cal.cache_revision += 1;
+            cal.full_sync_requested = false;
+            cal.updated_at = now_rfc3339.to_string();
+        }
+
+        fn lease_held(cal: &GoogleCalendar, owner: &str, now_rfc3339: &str) -> bool {
+            if cal.lease_owner != owner {
+                return false;
+            }
+            match cal.lease_expires_at.as_deref() {
+                None => true,
+                Some(exp) => exp >= now_rfc3339,
             }
         }
     }
@@ -1870,13 +1840,24 @@ mod tests {
         }
 
         async fn get_by_id(&self, id: &str) -> Result<Option<GoogleCalendar>, RepoError> {
-            Ok(self
-                .stored
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|cal| cal.id == id)
-                .cloned())
+            let mut count = self.get_by_id_count.lock().unwrap();
+            *count += 1;
+            let n = *count;
+            drop(count);
+
+            let mut stored = self.stored.lock().unwrap();
+            // Snapshot first so the Nth call still sees our lease; subsequent
+            // reads (and renew / fenced success) observe the thief.
+            let result = stored.iter().find(|cal| cal.id == id).cloned();
+            if let Some(threshold) = *self.steal_lease_after_get_by_id.lock().unwrap() {
+                if n == threshold {
+                    if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                        cal.lease_owner = "thief".to_string();
+                        cal.lease_expires_at = Some("2099-01-01T00:00:00Z".to_string());
+                    }
+                }
+            }
+            Ok(result)
         }
 
         async fn get_by_google_cal_id(
@@ -1988,21 +1969,35 @@ mod tests {
             ));
             let mut stored = self.stored.lock().unwrap();
             if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
-                cal.sync_token = sync_token.to_string();
-                cal.last_synced_at = Some(now_rfc3339.to_string());
-                cal.last_success_at = Some(now_rfc3339.to_string());
-                cal.last_attempt_at = Some(now_rfc3339.to_string());
-                cal.last_error_code = String::new();
-                cal.failure_streak = 0;
-                cal.next_retry_at = None;
-                cal.initial_sync_complete = true;
-                cal.sync_status = "ready".to_string();
-                cal.sync_query_fingerprint = query_fingerprint.to_string();
-                cal.cache_revision += 1;
-                cal.full_sync_requested = false;
-                cal.updated_at = now_rfc3339.to_string();
+                Self::apply_success_fields(cal, sync_token, query_fingerprint, now_rfc3339);
             }
             Ok(())
+        }
+
+        async fn record_sync_success_if_owner(
+            &self,
+            id: &str,
+            sync_token: &str,
+            query_fingerprint: &str,
+            lease_owner: &str,
+            now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) else {
+                return Ok(false);
+            };
+            if !Self::lease_held(cal, lease_owner, now_rfc3339) {
+                // Token must remain unchanged.
+                return Ok(false);
+            }
+            Self::apply_success_fields(cal, sync_token, query_fingerprint, now_rfc3339);
+            drop(stored);
+            self.sync_states.lock().unwrap().push((
+                id.to_string(),
+                sync_token.to_string(),
+                now_rfc3339.to_string(),
+            ));
+            Ok(true)
         }
 
         async fn record_sync_failure(
@@ -2023,6 +2018,69 @@ mod tests {
                 cal.updated_at = now_rfc3339.to_string();
             }
             Ok(())
+        }
+
+        async fn try_acquire_lease(
+            &self,
+            id: &str,
+            owner: &str,
+            now_rfc3339: &str,
+            expires_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) else {
+                return Ok(false);
+            };
+            let can_take = cal.lease_owner.is_empty()
+                || cal.lease_owner == owner
+                || cal.lease_expires_at.is_none()
+                || cal
+                    .lease_expires_at
+                    .as_deref()
+                    .is_some_and(|exp| exp < now_rfc3339);
+            if !can_take {
+                return Ok(false);
+            }
+            cal.lease_owner = owner.to_string();
+            cal.lease_expires_at = Some(expires_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+            Ok(true)
+        }
+
+        async fn release_lease(
+            &self,
+            id: &str,
+            owner: &str,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                if cal.lease_owner == owner {
+                    cal.lease_owner = String::new();
+                    cal.lease_expires_at = None;
+                    cal.updated_at = now_rfc3339.to_string();
+                }
+            }
+            Ok(())
+        }
+
+        async fn renew_lease(
+            &self,
+            id: &str,
+            owner: &str,
+            expires_rfc3339: &str,
+            now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) else {
+                return Ok(false);
+            };
+            if cal.lease_owner != owner {
+                return Ok(false);
+            }
+            cal.lease_expires_at = Some(expires_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+            Ok(true)
         }
 
         async fn set_sync_enabled(
@@ -2072,6 +2130,8 @@ mod tests {
         ranged: Mutex<Vec<(String, String, String)>>,
         deleted: Mutex<Vec<(String, String)>>,
         deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
+        /// `(calendar_id, older_than, now)` — replica walk must never push.
+        deleted_stale: Mutex<Vec<(String, String, String)>>,
         fail_upsert: Mutex<bool>,
         fail_delete: Mutex<bool>,
         next_id: Mutex<u64>,
@@ -2086,6 +2146,7 @@ mod tests {
                 ranged: Mutex::new(Vec::new()),
                 deleted: Mutex::new(Vec::new()),
                 deleted_by_google_event_id: Mutex::new(Vec::new()),
+                deleted_stale: Mutex::new(Vec::new()),
                 fail_upsert: Mutex::new(false),
                 fail_delete: Mutex::new(false),
                 next_id: Mutex::new(1),
@@ -2290,10 +2351,15 @@ mod tests {
 
         async fn delete_stale(
             &self,
-            _calendar_id: &str,
-            _older_than_rfc3339: &str,
-            _now_rfc3339: &str,
+            calendar_id: &str,
+            older_than_rfc3339: &str,
+            now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            self.deleted_stale.lock().unwrap().push((
+                calendar_id.to_string(),
+                older_than_rfc3339.to_string(),
+                now_rfc3339.to_string(),
+            ));
             Ok(())
         }
     }
@@ -3353,6 +3419,425 @@ mod tests {
             output.sync.calendars[0].state,
             crate::calendar_sync::CalendarReplicaState::Ready
         );
+    }
+
+    fn seeded_event(
+        id: &str,
+        calendar_id: &str,
+        google_event_id: &str,
+        task_id: &str,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            id: id.to_string(),
+            calendar_id: calendar_id.to_string(),
+            google_event_id: google_event_id.to_string(),
+            google_etag: String::new(),
+            google_updated_at: String::new(),
+            last_synced_at: "2023-11-14T21:00:00Z".to_string(),
+            title: google_event_id.to_string(),
+            description: String::new(),
+            start_time: "2026-08-18T09:00:00Z".to_string(),
+            end_time: "2026-08-18T09:30:00Z".to_string(),
+            recurrence: String::new(),
+            task_id: task_id.to_string(),
+            ical_uid: String::new(),
+            sequence: 0,
+            status: "confirmed".to_string(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            is_all_day: false,
+            raw_json: String::new(),
+            created_at: "2023-11-14T21:00:00Z".to_string(),
+            updated_at: "2023-11-14T21:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn replica_paginated_apply_publishes_token_only_after_last_page() {
+        let page_one = r#"{"items":[{"id":"p1","summary":"A","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+        let page_two = r#"{"items":[{"id":"p2","summary":"B","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-final"}"#;
+        let now = "2023-11-14T22:13:20Z";
+
+        // Phase 1: page 2 fails — page 1 applied, token stays old.
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+        let http_fail = FakeHttp::new(vec![
+            ("pageToken=tok-2", 500, ""),
+            ("/events", 200, page_one),
+        ]);
+        let err = pollster::block_on(sync_calendar(
+            &http_fail, &calendars, &events, &access(), &cal, now,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")), "{err:?}");
+        assert_eq!(events.upserted_batch.lock().unwrap().len(), 1);
+        assert_eq!(events.upserted_batch.lock().unwrap()[0].google_event_id, "p1");
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        assert!(events.deleted_stale.lock().unwrap().is_empty());
+
+        // Phase 2: both pages succeed — terminal token published + fingerprint.
+        let http_ok = FakeHttp::new(vec![
+            ("pageToken=tok-2", 200, page_two),
+            ("/events", 200, page_one),
+        ]);
+        pollster::block_on(sync_calendar(
+            &http_ok, &calendars, &events, &access(), &cal, now,
+        ))
+        .unwrap();
+        let upserted = events.upserted_batch.lock().unwrap();
+        assert!(upserted.iter().any(|e| e.google_event_id == "p1"));
+        assert!(upserted.iter().any(|e| e.google_event_id == "p2"));
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "st-final");
+        assert_eq!(
+            stored[0].sync_query_fingerprint,
+            crate::calendar_sync::replica_query_fingerprint()
+        );
+        assert!(events.deleted_stale.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replica_410_first_page_merge_full_preserves_task_id_and_ghosts() {
+        let merge = r#"{"items":[
+            {"id":"keep","summary":"Keep","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}
+        ],"nextSyncToken":"st-merge"}"#;
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "stale-token".to_string();
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+        events.stored.lock().unwrap().extend([
+            seeded_event("e-keep", "cal-1", "keep", "keep-me"),
+            seeded_event("e-ghost", "cal-1", "ghost", ""),
+        ]);
+        let http = FakeHttp::new(vec![
+            ("syncToken=stale-token", 410, ""),
+            ("/events", 200, merge),
+        ]);
+        pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap();
+
+        let stored_ev = events.stored.lock().unwrap();
+        let keep = stored_ev.iter().find(|e| e.google_event_id == "keep").unwrap();
+        assert_eq!(keep.task_id, "keep-me", "COALESCE must preserve task_id");
+        let ghost = stored_ev.iter().find(|e| e.google_event_id == "ghost").unwrap();
+        assert!(ghost.deleted_at.is_none(), "ghost must not be truncated");
+        assert!(events.deleted_stale.lock().unwrap().is_empty());
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-merge");
+    }
+
+    #[test]
+    fn replica_410_later_page_merge_full_keeps_partial_apply() {
+        let page_one = r#"{"items":[{"id":"a","summary":"A","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+        let merge = r#"{"items":[
+            {"id":"a","summary":"A2","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+            {"id":"keep","summary":"Keep","start":{"dateTime":"2026-08-18T11:00:00Z"},"end":{"dateTime":"2026-08-18T11:30:00Z"}}
+        ],"nextSyncToken":"st-mf"}"#;
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old".to_string();
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(seeded_event("e-keep", "cal-1", "keep", "keep-me"));
+        let http = FakeHttp::new(vec![
+            ("pageToken=tok-2", 410, ""),
+            ("syncToken=old", 200, page_one),
+            ("/events", 200, merge),
+        ]);
+        pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap();
+
+        assert!(events.deleted_stale.lock().unwrap().is_empty());
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-mf");
+        let keep = events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.google_event_id == "keep")
+            .unwrap()
+            .clone();
+        assert_eq!(keep.task_id, "keep-me");
+        // Partial apply of A from page1 is OK (also in merge-full).
+        assert!(events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "a"));
+    }
+
+    #[test]
+    fn replica_failure_after_page1_delete_replays_idempotently() {
+        let page_one = r#"{"items":[
+            {"id":"gone","status":"cancelled"},
+            {"id":"live","summary":"Live","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}
+        ],"nextPageToken":"tok-2"}"#;
+        let page_two = r#"{"items":[{"id":"p2","summary":"P2","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-done"}"#;
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .push(seeded_event("e-gone", "cal-1", "gone", ""));
+
+        let http_fail = FakeHttp::new(vec![
+            ("pageToken=tok-2", 500, ""),
+            ("/events", 200, page_one),
+        ]);
+        let err = pollster::block_on(sync_calendar(
+            &http_fail,
+            &calendars,
+            &events,
+            &access(),
+            &cal,
+            "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::GoogleApi(_)), "{err:?}");
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+        assert!(events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.google_event_id == "gone")
+            .unwrap()
+            .deleted_at
+            .is_some());
+
+        let http_ok = FakeHttp::new(vec![
+            ("pageToken=tok-2", 200, page_two),
+            ("/events", 200, page_one),
+        ]);
+        pollster::block_on(sync_calendar(
+            &http_ok,
+            &calendars,
+            &events,
+            &access(),
+            &cal,
+            "2023-11-14T22:13:20Z",
+        ))
+        .unwrap();
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-done");
+        // Idempotent: still soft-deleted once, live + p2 present.
+        assert!(events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.google_event_id == "gone")
+            .unwrap()
+            .deleted_at
+            .is_some());
+        assert!(events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "live" && e.deleted_at.is_none()));
+        assert!(events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "p2"));
+    }
+
+    #[test]
+    fn replica_poison_on_one_calendar_does_not_block_sibling() {
+        let cal_a = calendar("cal-a", "a@example.com", true);
+        let cal_b = calendar("cal-b", "b@example.com", true);
+        let http = FakeHttp::new(vec![
+            ("a%40example.com/events", 200, "not-json{{{"),
+            (
+                "b%40example.com/events",
+                200,
+                r#"{"items":[],"nextSyncToken":"st-b"}"#,
+            ),
+        ]);
+        let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http,
+            &calendars,
+            &events,
+            &watches,
+            &access(),
+            "u-1",
+            "2026-08-01T00:00:00Z",
+            "2026-09-01T00:00:00Z",
+            NOW_UNIX,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(output.sync_errors.len(), 1, "{:?}", output.sync_errors);
+        let stored = calendars.stored.lock().unwrap();
+        let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+        let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
+        assert_eq!(a.last_error_code, "mapping_poison");
+        assert_eq!(a.sync_status, "retrying");
+        assert!(a.sync_token.is_empty());
+        assert_eq!(b.sync_token, "st-b");
+        assert_eq!(b.sync_status, "ready");
+        assert!(b.initial_sync_complete);
+    }
+
+    #[test]
+    fn replica_unexpired_foreign_lease_skips_without_failure() {
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        calendars.force_lease("cal-1", "other-owner", Some("2099-01-01T00:00:00Z"));
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+
+        pollster::block_on(sync_calendar(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            &cal,
+            "2023-11-14T22:13:20Z",
+        ))
+        .unwrap();
+
+        assert!(
+            http.gets.lock().unwrap().is_empty(),
+            "must not fetch when lease is held"
+        );
+        assert!(events.upserted_batch.lock().unwrap().is_empty());
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "old-tok");
+        assert_eq!(stored[0].failure_streak, 0);
+        assert_eq!(stored[0].lease_owner, "other-owner");
+        // Attempt was stamped; no failure.
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert!(stored[0].last_error_code.is_empty());
+    }
+
+    #[test]
+    fn replica_expired_foreign_lease_is_stolen_and_walk_succeeds() {
+        let cal = calendar("cal-1", "primary@example.com", true);
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        calendars.force_lease("cal-1", "stale-owner", Some("2020-01-01T00:00:00Z"));
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+
+        pollster::block_on(sync_calendar(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            &cal,
+            "2023-11-14T22:13:20Z",
+        ))
+        .unwrap();
+
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-9");
+        assert!(calendars.stored.lock().unwrap()[0].lease_owner.is_empty());
+        assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn record_sync_success_if_owner_rejects_wrong_owner() {
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        calendars.force_lease("cal-1", "owner-a", Some("2099-01-01T00:00:00Z"));
+        let ok = pollster::block_on(calendars.record_sync_success_if_owner(
+            "cal-1",
+            "new-tok",
+            "fp",
+            "owner-b",
+            "2023-11-14T22:13:20Z",
+        ))
+        .unwrap();
+        assert!(!ok);
+        assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replica_mid_walk_lease_loss_does_not_publish_token() {
+        let page_one = r#"{"items":[{"id":"p1","summary":"A","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+        let page_two = r#"{"items":[{"id":"p2","summary":"B","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-stolen"}"#;
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        // After re-read (#1) + page1 fence (#2), steal before renew.
+        *calendars.steal_lease_after_get_by_id.lock().unwrap() = Some(2);
+        let events = FakeEventRepo::new();
+        let http = FakeHttp::new(vec![
+            ("pageToken=tok-2", 200, page_two),
+            ("/events", 200, page_one),
+        ]);
+
+        let err = pollster::block_on(sync_calendar(
+            &http,
+            &calendars,
+            &events,
+            &access(),
+            &cal,
+            "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CalendarError::Invalid(ref m) if m.contains("lost replica lease")),
+            "{err:?}"
+        );
+        // Page 1 may have applied.
+        assert!(events
+            .upserted_batch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "p1"));
+        assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        // Must not have applied page 2 / published st-stolen.
+        assert!(!events
+            .upserted_batch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "p2"));
     }
 
     #[test]
