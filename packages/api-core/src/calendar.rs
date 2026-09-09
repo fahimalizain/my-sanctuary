@@ -1614,6 +1614,8 @@ fn is_skipped(event: &GoogleEvent) -> bool {
 // `sanctuary_focus` / `sanctuary_priority` / `sanctuary_difficulty` are
 // create-time snapshots on Google and are not cached.
 fn map_google_event(event: &GoogleEvent, calendar_id: &str, now_rfc3339: &str) -> NewCalendarEvent {
+    // Identity columns stay empty/0 until a later slice populates them from
+    // the Google payload; the apply algorithm is unchanged this slice.
     NewCalendarEvent {
         calendar_id: calendar_id.to_string(),
         google_event_id: event.id.clone(),
@@ -1643,6 +1645,15 @@ fn map_google_event(event: &GoogleEvent, calendar_id: &str, now_rfc3339: &str) -
             .and_then(|props| props.shared.as_ref())
             .and_then(|shared| shared.sanctuary_task_id.clone())
             .unwrap_or_default(),
+        ical_uid: String::new(),
+        sequence: 0,
+        status: String::new(),
+        recurring_event_id: String::new(),
+        original_start: String::new(),
+        start_time_zone: String::new(),
+        end_time_zone: String::new(),
+        is_all_day: false,
+        raw_json: String::new(),
     }
 }
 
@@ -1662,6 +1673,15 @@ fn row_from_new_event(event: NewCalendarEvent, id: String, now_rfc3339: &str) ->
         end_time: event.end_time,
         recurrence: event.recurrence,
         task_id: event.task_id,
+        ical_uid: event.ical_uid,
+        sequence: event.sequence,
+        status: event.status,
+        recurring_event_id: event.recurring_event_id,
+        original_start: event.original_start,
+        start_time_zone: event.start_time_zone,
+        end_time_zone: event.end_time_zone,
+        is_all_day: event.is_all_day,
+        raw_json: event.raw_json,
         created_at: now_rfc3339.to_string(),
         updated_at: now_rfc3339.to_string(),
         deleted_at: None,
@@ -1950,6 +1970,22 @@ mod tests {
                     // Freshly imported rows start with an empty label cache
                     // (cache miss) — `refresh_calendar_list` backfills it.
                     event_labels: String::new(),
+                    // Health defaults: calendarList upsert must never write these.
+                    sync_query_fingerprint: String::new(),
+                    sync_status: String::new(),
+                    initial_sync_complete: false,
+                    last_attempt_at: None,
+                    last_success_at: None,
+                    last_error_code: String::new(),
+                    failure_streak: 0,
+                    next_retry_at: None,
+                    dirty_requested_generation: 0,
+                    dirty_applied_generation: 0,
+                    full_sync_requested: false,
+                    lease_owner: String::new(),
+                    lease_expires_at: None,
+                    cache_revision: 0,
+                    projection: "timed_masters_and_exceptions".to_string(),
                     created_at: "2026-08-17T00:00:00Z".to_string(),
                     updated_at: "2026-08-17T00:00:00Z".to_string(),
                     deleted_at: None,
@@ -1972,6 +2008,61 @@ mod tests {
                 sync_token.to_string(),
                 last_synced_at_rfc3339.to_string(),
             ));
+            Ok(())
+        }
+
+        async fn record_sync_attempt(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.last_attempt_at = Some(now_rfc3339.to_string());
+                cal.updated_at = now_rfc3339.to_string();
+            }
+            Ok(())
+        }
+
+        async fn record_sync_success(
+            &self,
+            id: &str,
+            sync_token: &str,
+            query_fingerprint: &str,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.sync_token = sync_token.to_string();
+                cal.last_synced_at = Some(now_rfc3339.to_string());
+                cal.last_success_at = Some(now_rfc3339.to_string());
+                cal.last_attempt_at = Some(now_rfc3339.to_string());
+                cal.last_error_code = String::new();
+                cal.failure_streak = 0;
+                cal.next_retry_at = None;
+                cal.initial_sync_complete = true;
+                cal.sync_status = "ready".to_string();
+                cal.sync_query_fingerprint = query_fingerprint.to_string();
+                cal.cache_revision += 1;
+                cal.full_sync_requested = false;
+                cal.updated_at = now_rfc3339.to_string();
+            }
+            Ok(())
+        }
+
+        async fn record_sync_failure(
+            &self,
+            id: &str,
+            error_code: &str,
+            sync_status: &str,
+            next_retry_rfc3339: &str,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                // Do not touch sync_token / last_success_at / last_synced_at.
+                cal.last_error_code = error_code.to_string();
+                cal.failure_streak += 1;
+                cal.sync_status = sync_status.to_string();
+                cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+                cal.updated_at = now_rfc3339.to_string();
+            }
             Ok(())
         }
 
@@ -2330,6 +2421,23 @@ mod tests {
             // tests skip the `calendars.get` backfill. Tests exercising the
             // cache-miss path construct rows with an empty string explicitly.
             event_labels: "[]".to_string(),
+            sync_query_fingerprint: String::new(),
+            // Empty string matches serde default for missing columns; production
+            // backfill uses `never_initialized` / `ready` / `disabled`.
+            sync_status: String::new(),
+            initial_sync_complete: false,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: String::new(),
+            failure_streak: 0,
+            next_retry_at: None,
+            dirty_requested_generation: 0,
+            dirty_applied_generation: 0,
+            full_sync_requested: false,
+            lease_owner: String::new(),
+            lease_expires_at: None,
+            cache_revision: 0,
+            projection: "timed_masters_and_exceptions".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4610,6 +4718,15 @@ mod tests {
             end_time: "2026-08-19T10:00:00Z".to_string(),
             recurrence: String::new(),
             task_id: String::new(),
+            ical_uid: String::new(),
+            sequence: 0,
+            status: String::new(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            is_all_day: false,
+            raw_json: String::new(),
             created_at: "2026-08-17T12:00:00Z".to_string(),
             updated_at: "2026-08-17T12:00:00Z".to_string(),
             deleted_at: None,

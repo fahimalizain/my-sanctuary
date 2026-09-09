@@ -3080,6 +3080,35 @@ mod tests {
             Ok(())
         }
 
+        async fn record_sync_attempt(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn record_sync_success(
+            &self,
+            _id: &str,
+            _sync_token: &str,
+            _query_fingerprint: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn record_sync_failure(
+            &self,
+            _id: &str,
+            _error_code: &str,
+            _sync_status: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn set_sync_enabled(
             &self,
             _id: &str,
@@ -3157,6 +3186,15 @@ mod tests {
                 end_time: event.end_time.clone(),
                 recurrence: event.recurrence.clone(),
                 task_id: event.task_id.clone(),
+                ical_uid: event.ical_uid.clone(),
+                sequence: event.sequence,
+                status: event.status.clone(),
+                recurring_event_id: event.recurring_event_id.clone(),
+                original_start: event.original_start.clone(),
+                start_time_zone: event.start_time_zone.clone(),
+                end_time_zone: event.end_time_zone.clone(),
+                is_all_day: event.is_all_day,
+                raw_json: event.raw_json.clone(),
                 created_at: now_rfc3339.to_string(),
                 updated_at: now_rfc3339.to_string(),
                 deleted_at: None,
@@ -3534,6 +3572,21 @@ mod tests {
             // The 24 seeded labels with stable fake ids — agenda never syncs,
             // so this is the cache `create_event` resolves colors against.
             event_labels: event_labels_json(),
+            sync_query_fingerprint: String::new(),
+            sync_status: String::new(),
+            initial_sync_complete: false,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: String::new(),
+            failure_streak: 0,
+            next_retry_at: None,
+            dirty_requested_generation: 0,
+            dirty_applied_generation: 0,
+            full_sync_requested: false,
+            lease_owner: String::new(),
+            lease_expires_at: None,
+            cache_revision: 0,
+            projection: "timed_masters_and_exceptions".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -3579,6 +3632,15 @@ mod tests {
             // Occurrence events NEVER carry a task link — the two worlds stay
             // apart (the cache maps only sanctuary_task_id onto this column).
             task_id: String::new(),
+            ical_uid: String::new(),
+            sequence: 0,
+            status: String::new(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            is_all_day: false,
+            raw_json: String::new(),
             created_at: "2026-08-23T00:00:00Z".to_string(),
             updated_at: "2026-08-23T00:00:00Z".to_string(),
             deleted_at: None,
@@ -5412,6 +5474,15 @@ mod tests {
                 end_time: "2026-08-23T10:15:00Z".to_string(),
                 recurrence: String::new(),
                 task_id: String::new(),
+                ical_uid: String::new(),
+                sequence: 0,
+                status: String::new(),
+                recurring_event_id: String::new(),
+                original_start: String::new(),
+                start_time_zone: String::new(),
+                end_time_zone: String::new(),
+                is_all_day: false,
+                raw_json: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -5470,6 +5541,15 @@ mod tests {
                 end_time: "2026-08-23T10:15:00Z".to_string(),
                 recurrence: String::new(),
                 task_id: String::new(),
+                ical_uid: String::new(),
+                sequence: 0,
+                status: String::new(),
+                recurring_event_id: String::new(),
+                original_start: String::new(),
+                start_time_zone: String::new(),
+                end_time_zone: String::new(),
+                is_all_day: false,
+                raw_json: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -5525,6 +5605,15 @@ mod tests {
                 end_time: "2026-08-23T10:15:00Z".to_string(),
                 recurrence: String::new(),
                 task_id: String::new(),
+                ical_uid: String::new(),
+                sequence: 0,
+                status: String::new(),
+                recurring_event_id: String::new(),
+                original_start: String::new(),
+                start_time_zone: String::new(),
+                end_time_zone: String::new(),
+                is_all_day: false,
+                raw_json: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -5807,6 +5896,15 @@ mod tests {
                 end_time: "2026-08-23T10:15:00Z".to_string(),
                 recurrence: String::new(),
                 task_id: String::new(),
+                ical_uid: String::new(),
+                sequence: 0,
+                status: String::new(),
+                recurring_event_id: String::new(),
+                original_start: String::new(),
+                start_time_zone: String::new(),
+                end_time_zone: String::new(),
+                is_all_day: false,
+                raw_json: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -5850,6 +5948,15 @@ mod tests {
                 end_time: "2026-08-23T10:30:00Z".to_string(),
                 recurrence: String::new(),
                 task_id: String::new(),
+                ical_uid: String::new(),
+                sequence: 0,
+                status: String::new(),
+                recurring_event_id: String::new(),
+                original_start: String::new(),
+                start_time_zone: String::new(),
+                end_time_zone: String::new(),
+                is_all_day: false,
+                raw_json: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))

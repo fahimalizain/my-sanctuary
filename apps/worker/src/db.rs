@@ -30,8 +30,9 @@ use api_core::repo::{
     AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
-    CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL,
-    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
+    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
@@ -420,6 +421,66 @@ impl CalendarRepo for D1CalendarRepo {
         run_stmt(stmt).await
     }
 
+    async fn record_sync_attempt(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RECORD_SYNC_ATTEMPT_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn record_sync_success(
+        &self,
+        id: &str,
+        sync_token: &str,
+        query_fingerprint: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Binds: token, last_synced_at, last_success_at, last_attempt_at,
+        // fingerprint, updated_at, id — both success timestamps share `now`.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RECORD_SYNC_SUCCESS_SQL)
+            .bind_refs(&[
+                D1Type::Text(sync_token),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(query_fingerprint),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn record_sync_failure(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RECORD_SYNC_FAILURE_SQL)
+            .bind_refs(&[
+                D1Type::Text(error_code),
+                D1Type::Text(sync_status),
+                D1Type::Text(next_retry_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
     async fn set_sync_enabled(
         &self,
         id: &str,
@@ -484,7 +545,7 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        // Chunk to stay under D1's 100 bound-parameter limit (7 rows of 14
+        // Chunk to stay under D1's 100 bound-parameter limit (4 rows of 23
         // columns per statement); each chunk is one D1 subrequest.
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
             let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();

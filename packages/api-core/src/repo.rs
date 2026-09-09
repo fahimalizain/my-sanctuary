@@ -95,11 +95,38 @@ pub trait CalendarRepo: Send + Sync {
     async fn upsert(&self, calendar: NewCalendar) -> Result<(), RepoError>;
     async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError>;
     /// Stores the incremental sync cursor and the sync timestamp.
+    ///
+    /// Compat path kept for existing call sites. Prefer
+    /// [`CalendarRepo::record_sync_success`] which also writes health columns.
     async fn update_sync_state(
         &self,
         id: &str,
         sync_token: &str,
         last_synced_at_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// Records that a sync attempt started (`last_attempt_at = now`). Does not
+    /// touch token, success, or failure columns.
+    async fn record_sync_attempt(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Records a successful apply: writes token + `last_synced_at` /
+    /// `last_success_at`, clears error/streak, marks ready, bumps
+    /// `cache_revision`.
+    async fn record_sync_success(
+        &self,
+        id: &str,
+        sync_token: &str,
+        query_fingerprint: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// Records a failed attempt: sets error code, increments streak, updates
+    /// status and next retry. Does **not** touch token, `last_success_at`,
+    /// `last_synced_at`, or `last_attempt_at` (attempt is recorded at start).
+    async fn record_sync_failure(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
     ) -> Result<(), RepoError>;
     async fn set_sync_enabled(
         &self,
@@ -693,6 +720,46 @@ pub const CALENDAR_UPSERT_SQL: &str = "
 pub const CALENDAR_UPDATE_SYNC_STATE_SQL: &str =
     "UPDATE google_calendars SET sync_token = ?, last_synced_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
+/// Marks a sync attempt start. Does not touch token, success, or failure fields.
+pub const CALENDAR_RECORD_SYNC_ATTEMPT_SQL: &str = "
+    UPDATE google_calendars
+    SET last_attempt_at = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Successful apply: token + both success timestamps, clear error/streak,
+/// ready status, bump cache_revision. Binds: token, now, now, now, fingerprint,
+/// now, id (`last_synced_at` and `last_success_at` share the same instant).
+pub const CALENDAR_RECORD_SYNC_SUCCESS_SQL: &str = "
+    UPDATE google_calendars SET
+      sync_token = ?,
+      last_synced_at = ?,
+      last_success_at = ?,
+      last_attempt_at = ?,
+      last_error_code = '',
+      failure_streak = 0,
+      next_retry_at = NULL,
+      initial_sync_complete = 1,
+      sync_status = 'ready',
+      sync_query_fingerprint = ?,
+      cache_revision = cache_revision + 1,
+      full_sync_requested = 0,
+      updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Failed attempt: error code, streak++, status, next retry. Does not write
+/// `sync_token`, `last_success_at`, `last_synced_at`, or `last_attempt_at`.
+pub const CALENDAR_RECORD_SYNC_FAILURE_SQL: &str = "
+    UPDATE google_calendars SET
+      last_error_code = ?,
+      failure_streak = failure_streak + 1,
+      sync_status = ?,
+      next_retry_at = ?,
+      updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
 pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
     "UPDATE google_calendars SET sync_enabled = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
@@ -759,9 +826,9 @@ pub const EVENT_DELETE_STALE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND last_synced_at < ? AND deleted_at IS NULL";
 
 /// D1 allows at most 100 bound parameters per SQL statement.
-/// `calendar_events` upsert binds 14 columns per row → max 7 rows per statement.
-pub const EVENT_UPSERT_COL_COUNT: usize = 14;
-pub const EVENT_UPSERT_CHUNK_SIZE: usize = 100 / EVENT_UPSERT_COL_COUNT; // 7
+/// `calendar_events` upsert binds 23 columns per row → max 4 rows per statement.
+pub const EVENT_UPSERT_COL_COUNT: usize = 23;
+pub const EVENT_UPSERT_CHUNK_SIZE: usize = 100 / EVENT_UPSERT_COL_COUNT; // 4
 
 const EVENT_UPSERT_ON_CONFLICT: &str = "
     ON CONFLICT(calendar_id, google_event_id) DO UPDATE SET
@@ -774,6 +841,15 @@ const EVENT_UPSERT_ON_CONFLICT: &str = "
         end_time = excluded.end_time,
         recurrence = excluded.recurrence,
         task_id = COALESCE(NULLIF(excluded.task_id, ''), calendar_events.task_id),
+        ical_uid = excluded.ical_uid,
+        sequence = excluded.sequence,
+        status = excluded.status,
+        recurring_event_id = excluded.recurring_event_id,
+        original_start = excluded.original_start,
+        start_time_zone = excluded.start_time_zone,
+        end_time_zone = excluded.end_time_zone,
+        is_all_day = excluded.is_all_day,
+        raw_json = excluded.raw_json,
         updated_at = excluded.updated_at
 ";
 
@@ -783,9 +859,10 @@ const EVENT_UPSERT_ON_CONFLICT: &str = "
 /// generates them (api-core stays free of a UUID dependency).
 ///
 /// Returns `(sql, args)` where every arg is a string; the D1 implementation
-/// binds them as `D1Type::Text`. Mirrors the old Go `buildEventUpsertSQL`
-/// (14 columns; COALESCE-free apart from the `task_id` guard — a Google event
-/// without the `sanctuary_task_id` property must not wipe a stored link).
+/// binds them as `D1Type::Text`. 23 columns; COALESCE-free apart from the
+/// `task_id` guard — a Google event without the `sanctuary_task_id` property
+/// must not wipe a stored link. New identity columns are Google-owned and
+/// overwrite from `excluded.*` (no COALESCE).
 pub fn build_event_upsert_sql(
     events: &[NewCalendarEvent],
     now_rfc3339: &str,
@@ -800,7 +877,7 @@ pub fn build_event_upsert_sql(
 
     let mut sql = String::from(
         "INSERT INTO calendar_events
-        (id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, task_id, created_at, updated_at)
+        (id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, task_id, ical_uid, sequence, status, recurring_event_id, original_start, start_time_zone, end_time_zone, is_all_day, raw_json, created_at, updated_at)
         VALUES ",
     );
     let mut args: Vec<String> = Vec::with_capacity(events.len() * EVENT_UPSERT_COL_COUNT);
@@ -808,7 +885,7 @@ pub fn build_event_upsert_sql(
         if index > 0 {
             sql.push(',');
         }
-        sql.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        sql.push_str("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         args.extend([
             id,
             event.calendar_id.clone(),
@@ -822,6 +899,19 @@ pub fn build_event_upsert_sql(
             event.end_time.clone(),
             event.recurrence.clone(),
             event.task_id.clone(),
+            event.ical_uid.clone(),
+            event.sequence.to_string(),
+            event.status.clone(),
+            event.recurring_event_id.clone(),
+            event.original_start.clone(),
+            event.start_time_zone.clone(),
+            event.end_time_zone.clone(),
+            if event.is_all_day {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+            event.raw_json.clone(),
             now_rfc3339.to_string(),
             now_rfc3339.to_string(),
         ]);
@@ -1581,14 +1671,13 @@ mod tests {
 
     #[test]
     fn event_upsert_chunk_size_respects_d1_100_param_limit() {
-        assert_eq!(EVENT_UPSERT_COL_COUNT, 14);
-        assert_eq!(EVENT_UPSERT_CHUNK_SIZE, 7);
+        assert_eq!(EVENT_UPSERT_COL_COUNT, 23);
+        assert_eq!(EVENT_UPSERT_CHUNK_SIZE, 4);
         assert!(EVENT_UPSERT_CHUNK_SIZE * EVENT_UPSERT_COL_COUNT <= 100);
     }
 
-    #[test]
-    fn event_upsert_sql_has_14_placeholders_per_row_and_on_conflict() {
-        let event = NewCalendarEvent {
+    fn sample_new_event() -> NewCalendarEvent {
+        NewCalendarEvent {
             calendar_id: "cal-1".to_string(),
             google_event_id: "g-1".to_string(),
             google_etag: "etag".to_string(),
@@ -1600,7 +1689,21 @@ mod tests {
             end_time: "2026-08-18T09:30:00Z".to_string(),
             recurrence: String::new(),
             task_id: "task-1".to_string(),
-        };
+            ical_uid: "uid-1".to_string(),
+            sequence: 3,
+            status: "confirmed".to_string(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: "UTC".to_string(),
+            end_time_zone: "UTC".to_string(),
+            is_all_day: false,
+            raw_json: r#"{"id":"g-1"}"#.to_string(),
+        }
+    }
+
+    #[test]
+    fn event_upsert_sql_has_23_placeholders_per_row_and_on_conflict() {
+        let event = sample_new_event();
         let (sql, args) = build_event_upsert_sql(
             &[event.clone()],
             "2026-08-17T12:00:00Z",
@@ -1609,47 +1712,64 @@ mod tests {
 
         assert!(sql.starts_with("INSERT INTO calendar_events"), "{sql}");
         assert!(sql.contains("ON CONFLICT(calendar_id, google_event_id)"), "{sql}");
+        assert!(
+            !sql.contains("ON CONFLICT(google_event_id)"),
+            "must not use a global unique on google_event_id: {sql}"
+        );
         assert!(sql.contains("google_etag = excluded.google_etag"), "{sql}");
         assert!(sql.contains("updated_at = excluded.updated_at"), "{sql}");
+        assert!(sql.contains("ical_uid = excluded.ical_uid"), "{sql}");
+        assert!(sql.contains("sequence = excluded.sequence"), "{sql}");
+        assert!(sql.contains("status = excluded.status"), "{sql}");
+        assert!(sql.contains("recurring_event_id = excluded.recurring_event_id"), "{sql}");
+        assert!(sql.contains("original_start = excluded.original_start"), "{sql}");
+        assert!(sql.contains("start_time_zone = excluded.start_time_zone"), "{sql}");
+        assert!(sql.contains("end_time_zone = excluded.end_time_zone"), "{sql}");
+        assert!(sql.contains("is_all_day = excluded.is_all_day"), "{sql}");
+        assert!(sql.contains("raw_json = excluded.raw_json"), "{sql}");
 
-        assert_eq!(args.len(), 14);
+        assert_eq!(args.len(), 23);
         assert_eq!(args[0], "evt-1");
         assert_eq!(args[1], "cal-1");
         assert_eq!(args[5], "2026-08-17T12:00:00Z", "last_synced_at bound");
         assert_eq!(args[11], "task-1", "task_id bound");
-        assert_eq!(args[12], "2026-08-17T12:00:00Z", "created_at bound");
-        assert_eq!(args[13], "2026-08-17T12:00:00Z", "updated_at bound");
+        assert_eq!(args[12], "uid-1", "ical_uid bound");
+        assert_eq!(args[13], "3", "sequence bound as decimal string");
+        assert_eq!(args[14], "confirmed", "status bound");
+        assert_eq!(args[19], "0", "is_all_day bound as 0/1");
+        assert_eq!(args[20], r#"{"id":"g-1"}"#, "raw_json bound");
+        assert_eq!(args[21], "2026-08-17T12:00:00Z", "created_at bound");
+        assert_eq!(args[22], "2026-08-17T12:00:00Z", "updated_at bound");
 
-        // Exactly 14 placeholders for the single row (no trailing/extra commas).
-        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 1);
-        assert!(!sql.contains("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"), "no 15th placeholder");
+        // Exactly 23 placeholders for the single row (no trailing/extra commas).
+        assert_eq!(
+            sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .count(),
+            1
+        );
+        assert!(
+            !sql.contains("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"),
+            "no 24th placeholder"
+        );
     }
 
     #[test]
-    fn event_upsert_sql_chunks_7_rows_with_98_placeholders() {
-        let event = NewCalendarEvent {
-            calendar_id: "cal-1".to_string(),
-            google_event_id: "g".to_string(),
-            google_etag: String::new(),
-            google_updated_at: String::new(),
-            last_synced_at: "2026-08-17T12:00:00Z".to_string(),
-            title: "T".to_string(),
-            description: String::new(),
-            start_time: "2026-08-18T09:00:00Z".to_string(),
-            end_time: "2026-08-18T09:30:00Z".to_string(),
-            recurrence: String::new(),
-            task_id: "task-1".to_string(),
-        };
-        let events: Vec<NewCalendarEvent> = (0..7).map(|_| event.clone()).collect();
-        let ids: Vec<String> = (0..7).map(|i| format!("evt-{i}")).collect();
+    fn event_upsert_sql_chunks_4_rows_with_92_placeholders() {
+        let event = sample_new_event();
+        let events: Vec<NewCalendarEvent> = (0..4).map(|_| event.clone()).collect();
+        let ids: Vec<String> = (0..4).map(|i| format!("evt-{i}")).collect();
         let (sql, args) = build_event_upsert_sql(&events, "2026-08-17T12:00:00Z", ids);
 
-        assert_eq!(args.len(), 7 * 14);
-        assert_eq!(sql.matches('?').count(), 7 * 14);
-        assert_eq!(sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").count(), 7);
+        assert_eq!(args.len(), 4 * 23);
+        assert_eq!(sql.matches('?').count(), 4 * 23);
+        assert_eq!(
+            sql.matches("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .count(),
+            4
+        );
         assert_eq!(args[0], "evt-0");
-        assert_eq!(args[14], "evt-1");
-        assert_eq!(args[14 * 6], "evt-6");
+        assert_eq!(args[23], "evt-1");
+        assert_eq!(args[23 * 3], "evt-3");
     }
 
     #[test]
@@ -1661,6 +1781,148 @@ mod tests {
                 "task_id = COALESCE(NULLIF(excluded.task_id, ''), calendar_events.task_id)"
             ),
             "{EVENT_UPSERT_ON_CONFLICT}"
+        );
+    }
+
+    #[test]
+    fn event_upsert_overwrites_google_owned_identity_columns() {
+        // Identity columns are Google-owned: merge assigns from excluded.*,
+        // no COALESCE protection (unlike task_id).
+        for col in [
+            "ical_uid = excluded.ical_uid",
+            "sequence = excluded.sequence",
+            "status = excluded.status",
+            "recurring_event_id = excluded.recurring_event_id",
+            "original_start = excluded.original_start",
+            "start_time_zone = excluded.start_time_zone",
+            "end_time_zone = excluded.end_time_zone",
+            "is_all_day = excluded.is_all_day",
+            "raw_json = excluded.raw_json",
+        ] {
+            assert!(
+                EVENT_UPSERT_ON_CONFLICT.contains(col),
+                "missing overwrite for {col}: {EVENT_UPSERT_ON_CONFLICT}"
+            );
+        }
+        assert!(
+            !EVENT_UPSERT_ON_CONFLICT.contains("COALESCE(NULLIF(excluded.ical_uid"),
+            "ical_uid must not be COALESCE-protected: {EVENT_UPSERT_ON_CONFLICT}"
+        );
+    }
+
+    #[test]
+    fn calendar_upsert_does_not_clobber_sync_health() {
+        // Health columns live on google_calendars but calendarList upsert must
+        // never write them (same invariant as event_labels).
+        for col in [
+            "sync_status",
+            "last_success_at",
+            "last_attempt_at",
+            "last_error_code",
+            "failure_streak",
+            "next_retry_at",
+            "sync_query_fingerprint",
+            "initial_sync_complete",
+            "cache_revision",
+            "dirty_requested_generation",
+            "dirty_applied_generation",
+            "full_sync_requested",
+            "lease_owner",
+            "lease_expires_at",
+            "projection",
+        ] {
+            assert!(
+                !CALENDAR_UPSERT_SQL.contains(col),
+                "upsert must not touch health column {col}: {CALENDAR_UPSERT_SQL}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_sync_success_sql_writes_token_and_success_not_just_attempt() {
+        let sql = CALENDAR_RECORD_SYNC_SUCCESS_SQL;
+        assert!(sql.contains("sync_token = ?"), "{sql}");
+        assert!(sql.contains("last_success_at = ?"), "{sql}");
+        assert!(sql.contains("last_synced_at = ?"), "{sql}");
+        assert!(sql.contains("failure_streak = 0"), "{sql}");
+        assert!(sql.contains("cache_revision = cache_revision + 1"), "{sql}");
+        assert!(sql.contains("sync_status = 'ready'"), "{sql}");
+        assert!(sql.contains("initial_sync_complete = 1"), "{sql}");
+        assert!(sql.contains("sync_query_fingerprint = ?"), "{sql}");
+        assert!(sql.contains("full_sync_requested = 0"), "{sql}");
+        assert!(sql.contains("next_retry_at = NULL"), "{sql}");
+        assert!(sql.contains("last_error_code = ''"), "{sql}");
+    }
+
+    #[test]
+    fn record_sync_failure_sql_does_not_touch_token_or_success() {
+        let sql = CALENDAR_RECORD_SYNC_FAILURE_SQL;
+        assert!(sql.contains("last_error_code = ?"), "{sql}");
+        assert!(sql.contains("failure_streak = failure_streak + 1"), "{sql}");
+        assert!(sql.contains("sync_status = ?"), "{sql}");
+        assert!(sql.contains("next_retry_at = ?"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("last_success_at"), "{sql}");
+        assert!(!sql.contains("last_synced_at"), "{sql}");
+        assert!(!sql.contains("last_attempt_at"), "{sql}");
+    }
+
+    #[test]
+    fn migration_0010_adds_sync_health_and_event_identity_columns() {
+        // Path from packages/api-core → apps/worker/migrations.
+        let migration = include_str!("../../../apps/worker/migrations/0010_calendar_sync_health.sql");
+        for col in [
+            "sync_query_fingerprint",
+            "sync_status",
+            "initial_sync_complete",
+            "last_attempt_at",
+            "last_success_at",
+            "last_error_code",
+            "failure_streak",
+            "next_retry_at",
+            "dirty_requested_generation",
+            "dirty_applied_generation",
+            "full_sync_requested",
+            "lease_owner",
+            "lease_expires_at",
+            "cache_revision",
+            "projection",
+            "ical_uid",
+            "sequence",
+            "status",
+            "recurring_event_id",
+            "original_start",
+            "start_time_zone",
+            "end_time_zone",
+            "is_all_day",
+            "raw_json",
+        ] {
+            assert!(
+                migration.contains(col),
+                "migration missing column {col}"
+            );
+        }
+        assert!(
+            migration.contains("UPDATE google_calendars"),
+            "migration must backfill living rows from last_synced_at"
+        );
+        assert!(
+            migration.contains("last_success_at = last_synced_at"),
+            "backfill must copy last_synced_at → last_success_at"
+        );
+        assert!(
+            migration.contains("never add a global")
+                || migration.contains("UNIQUE (calendar_id, google_event_id)"),
+            "migration must document UNIQUE (calendar_id, google_event_id) invariant"
+        );
+        assert!(
+            migration.contains("calendarList")
+                && migration.contains("must never touch these health columns"),
+            "migration must document calendarList upsert health invariant"
+        );
+        assert!(
+            migration.contains("task_id"),
+            "migration must document task_id COALESCE protection"
         );
     }
 
