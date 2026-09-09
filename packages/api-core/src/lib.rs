@@ -6,11 +6,11 @@
 
 pub mod agenda;
 pub mod calendar;
-pub mod calendar_apply;
 pub mod calendar_color;
-pub mod calendar_replica;
-pub mod calendar_sync;
-pub mod calendar_window;
+pub use calendar::apply as calendar_apply;
+pub use calendar::replica as calendar_replica;
+pub use calendar::sync as calendar_sync;
+pub use calendar::window as calendar_window;
 pub mod categories;
 pub mod google_color;
 pub mod lists;

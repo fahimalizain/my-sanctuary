@@ -62,6 +62,12 @@
 //!   **before** HTTP 200; an optional `ctx.wait_until` replica attempt is
 //!   only an optimization after durable dirty is written.
 
+pub mod apply;
+pub mod replica;
+pub mod sync;
+pub mod window;
+pub(crate) mod google;
+
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -69,15 +75,16 @@ use std::fmt;
 use thiserror::Error;
 use url::Url;
 
-use crate::calendar_apply::{
+use crate::calendar::apply::{
     map_google_event, row_from_new_event, GoogleEvent, GoogleEventSharedProperties,
 };
-use crate::calendar_replica::{lease_expires_at, mint_lease_owner, sync_replica};
-use crate::calendar_sync::{
+use crate::calendar::replica::{lease_expires_at, mint_lease_owner, sync_replica};
+use crate::calendar::sync::{
     classify_sync_error, events_sync_envelope, next_retry_rfc3339, replica_state_for_error,
     EventsSyncEnvelope, SyncErrorCode,
 };
-use crate::calendar_window::fetch_and_apply_window;
+use crate::calendar::window::fetch_and_apply_window;
+use crate::calendar::google::encode_path_segment;
 use crate::config::OAuthConfig;
 use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
@@ -2299,21 +2306,6 @@ async fn persist_sync_failure(
         )
         .await?;
     Ok(())
-}
-
-/// RFC 3986 percent-encoding for a URL path segment (calendar ids may contain
-/// `#` and other reserved characters).
-fn encode_path_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// One entry from `/users/me/calendarList`.

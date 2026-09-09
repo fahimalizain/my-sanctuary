@@ -32,11 +32,12 @@
 
 use url::Url;
 
-use crate::calendar::{CalendarError, GOOGLE_EVENTS_BASE_URL};
-use crate::calendar_apply::{
+use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
+use super::apply::{
     classify_replica_item, EventsPage, ReplicaApplyAction,
 };
-use crate::calendar_sync::replica_query_fingerprint;
+use super::google::encode_path_segment;
+use super::sync::replica_query_fingerprint;
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventRepo, CalendarRepo};
@@ -229,21 +230,6 @@ pub(crate) fn google_events_url(
         url.query_pairs_mut().append_pair("pageToken", token);
     }
     url.to_string()
-}
-
-/// RFC 3986 percent-encoding for a URL path segment (calendar ids may contain
-/// `#` and other reserved characters).
-fn encode_path_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]

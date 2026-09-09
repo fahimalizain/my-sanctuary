@@ -12,7 +12,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::calendar::CalendarError;
+use super::CalendarError;
 use crate::models::GoogleCalendar;
 use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 

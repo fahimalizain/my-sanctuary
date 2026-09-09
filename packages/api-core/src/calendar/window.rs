@@ -13,11 +13,12 @@
 
 use url::Url;
 
-use crate::calendar::{CalendarError, GOOGLE_EVENTS_BASE_URL};
-use crate::calendar_apply::{
+use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
+use super::apply::{
     classify_replica_item, row_from_new_event, EventsPage, ReplicaApplyAction,
 };
-use crate::calendar_replica::{lease_expires_at, mint_lease_owner};
+use super::google::encode_path_segment;
+use super::replica::{lease_expires_at, mint_lease_owner};
 use crate::models::{CalendarEvent, GoogleCalendar};
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventRepo, CalendarRepo};
@@ -198,19 +199,6 @@ pub fn google_window_events_url(
         url.query_pairs_mut().append_pair("pageToken", token);
     }
     url.to_string()
-}
-
-fn encode_path_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
