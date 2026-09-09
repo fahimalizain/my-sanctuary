@@ -17,7 +17,10 @@
 use worker::*;
 
 use api_core::repo::{CalendarRepo, WatchChannelRepo};
-use api_core::{models::NewEventInput, CalendarError, OAuthConfig};
+use api_core::{
+    models::NewEventInput, models::PatchEventFields, paint_events_default, paint_events_for_user,
+    CalendarError, CalendarEventView, OAuthConfig,
+};
 
 /// 401 body for missing/invalid sessions and failed token refreshes.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -52,6 +55,58 @@ fn session_and_oauth<'a>(
         return Ok(None);
     };
     Ok(Some((user.id, oauth)))
+}
+
+/// Paint cached events with category colors. Taxonomy failures are logged and
+/// every event falls back to [`api_core::DEFAULT_EVENT_LABEL_COLOR`] — listing
+/// must never 500 because paint failed.
+async fn paint_listed_events(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user_id: &str,
+    events: Vec<api_core::models::CalendarEvent>,
+) -> Result<Vec<CalendarEventView>> {
+    paint_events_with_fallback(ctx, user_id, events).await
+}
+
+async fn paint_single_event(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user_id: &str,
+    event: api_core::models::CalendarEvent,
+) -> Result<CalendarEventView> {
+    let mut views = paint_events_with_fallback(ctx, user_id, vec![event]).await?;
+    Ok(views
+        .pop()
+        .expect("paint_events_with_fallback preserves one event"))
+}
+
+async fn paint_events_with_fallback(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user_id: &str,
+    events: Vec<api_core::models::CalendarEvent>,
+) -> Result<Vec<CalendarEventView>> {
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
+    let list_repo = crate::db::D1TaskListRepo::new(d1()?);
+    let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let cals = match calendars.list_by_user_id(user_id).await {
+        Ok(cals) => cals,
+        Err(err) => {
+            console_log!("calendar: paint calendars load failed: {err}");
+            return Ok(paint_events_default(events));
+        }
+    };
+    // Clone so taxonomy failure can still return a default-colored response.
+    let fallback = events.clone();
+    match paint_events_for_user(&list_repo, &category_repo, &cals, events, user_id).await {
+        Ok(views) => Ok(views),
+        Err(err) => {
+            console_log!("calendar: paint events failed: {err}");
+            Ok(paint_events_default(fallback))
+        }
+    }
 }
 
 /// `GET /api/calendar/events` → 200 `{"events":[...],"source":"cache"}`.
@@ -122,8 +177,10 @@ pub async fn list_events(
         console_log!("calendar sync: {error}");
     }
 
+    let events = paint_listed_events(&ctx, &user_id, output.events).await?;
+
     let response = Response::from_json(&api_core::CalendarEventsResponse {
-        events: output.events,
+        events,
         source: "cache".to_string(),
     })?;
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
@@ -226,8 +283,15 @@ pub async fn create_event(
             if let Some(error) = &output.cache_error {
                 console_log!("calendar: cache upsert failed for created event: {error}");
             }
+            let event = paint_single_event(&ctx, &user_id, output.event).await?;
+            let _ = crate::user_hub::notify_user(
+                &ctx.env,
+                &user_id,
+                Some(&event.event.calendar_id),
+            )
+            .await;
             let response = Response::from_json(&api_core::CreateEventResponse {
-                event: output.event,
+                event,
                 source: output.source,
             })?;
             Ok(response
@@ -242,6 +306,142 @@ pub async fn create_event(
         Err(err) => {
             console_log!("calendar: create_event failed: {err}");
             json_error(&ctx, 500, "failed to create event")
+        }
+    }
+}
+
+/// `PATCH /api/calendar/events/:id` → 200 `{"event":{...},"source":"google"}`.
+///
+/// Body: `{start?, end?, summary?}` — at least one field required. Looks up
+/// the local event, verifies calendar ownership, then patches Google.
+pub async fn update_event(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
+        return json_error(&ctx, 404, "event not found");
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let tokens = crate::db::D1TokenRepo::new(d1()?);
+
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+        Ok(access) => access,
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            return unauthorized(&ctx);
+        }
+    };
+
+    let fields: PatchEventFields = match req.json().await {
+        Ok(fields) => fields,
+        Err(_) => return json_error(&ctx, 400, "invalid body"),
+    };
+
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    match api_core::update_event_for_user(
+        &crate::http::WorkerHttp,
+        &calendars,
+        &events,
+        &access,
+        &user_id,
+        &id,
+        &fields,
+        now_unix,
+    )
+    .await
+    {
+        Ok(output) => {
+            if let Some(error) = &output.cache_error {
+                console_log!("calendar: cache upsert failed for patched event: {error}");
+            }
+            let event = paint_single_event(&ctx, &user_id, output.event).await?;
+            let _ = crate::user_hub::notify_user(
+                &ctx.env,
+                &user_id,
+                Some(&event.event.calendar_id),
+            )
+            .await;
+            let response = Response::from_json(&api_core::CreateEventResponse {
+                event,
+                source: output.source,
+            })?;
+            Ok(response
+                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
+        Err(CalendarError::GoogleNotFound) => {
+            json_error(&ctx, 502, "google returned 404 for events.patch")
+        }
+        Err(err) => {
+            console_log!("calendar: update_event failed: {err}");
+            json_error(&ctx, 500, "failed to update event")
+        }
+    }
+}
+
+/// `DELETE /api/calendar/events/:id` → 200 `{"success":true}`.
+///
+/// Cancels the event on Google (`status: cancelled`) and soft-deletes the
+/// local cache row. Ownership is checked via the parent calendar.
+pub async fn delete_event(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
+        return json_error(&ctx, 404, "event not found");
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let tokens = crate::db::D1TokenRepo::new(d1()?);
+
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+        Ok(access) => access,
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            return unauthorized(&ctx);
+        }
+    };
+
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let events = crate::db::D1CalendarEventRepo::new(d1()?);
+    match api_core::delete_event_for_user(
+        &crate::http::WorkerHttp,
+        &calendars,
+        &events,
+        &access,
+        &user_id,
+        &id,
+        now_unix,
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = crate::user_hub::notify_user(&ctx.env, &user_id, None).await;
+            let response = Response::from_json(&api_core::DeleteEventResponse { success: true })?;
+            Ok(response
+                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(CalendarError::GoogleApi(message)) => json_error(&ctx, 502, &message),
+        Err(CalendarError::GoogleNotFound) => {
+            json_error(&ctx, 502, "google returned 404 for events.patch")
+        }
+        Err(err) => {
+            console_log!("calendar: delete_event failed: {err}");
+            json_error(&ctx, 500, "failed to delete event")
         }
     }
 }
@@ -388,7 +588,7 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                     return;
                 }
             };
-            if let Err(err) = api_core::sync_calendar(
+            match api_core::sync_calendar(
                 &crate::http::WorkerHttp,
                 &calendars,
                 &events,
@@ -398,7 +598,15 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
             )
             .await
             {
-                console_log!("calendar webhook: background sync for {} failed: {err}", calendar.id);
+                Ok(()) => {
+                    crate::user_hub::notify_user(&env, &calendar.user_id, Some(&calendar.id)).await;
+                }
+                Err(err) => {
+                    console_log!(
+                        "calendar webhook: background sync for {} failed: {err}",
+                        calendar.id
+                    );
+                }
             }
         });
     } else {

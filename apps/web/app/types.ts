@@ -42,12 +42,44 @@ export interface CalendarEvent {
   start_time: string; // ISO 8601
   end_time: string; // ISO 8601
   last_synced_at: string;
+  /** Matched category color from the API (`#rrggbb`). May be absent from older workers. */
+  color?: string;
 }
 
 // The envelope returned by GET /api/calendar/events
 export interface CalendarEventsResponse {
   events: CalendarEvent[];
   source: 'cache' | string;
+}
+
+// Request body for POST /api/calendar/events
+export interface NewCalendarEventInput {
+  /** Local `GoogleCalendar.id` (not the Google calendar id). */
+  calendar_id: string;
+  summary: string;
+  description?: string;
+  /** RFC 3339 dateTime. */
+  start: string;
+  /** RFC 3339 dateTime. */
+  end: string;
+}
+
+// Envelope for POST /api/calendar/events and PATCH /api/calendar/events/:id
+export interface CreateEventResponse {
+  event: CalendarEvent;
+  source: string;
+}
+
+// Request body for PATCH /api/calendar/events/:id — at least one field required
+export interface PatchCalendarEventInput {
+  start?: string;
+  end?: string;
+  summary?: string;
+}
+
+// Envelope for DELETE /api/calendar/events/:id
+export interface DeleteCalendarEventResponse {
+  success: boolean;
 }
 
 // A calendar from GET /api/calendar/calendars (picker-safe view).

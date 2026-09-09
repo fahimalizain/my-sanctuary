@@ -6,12 +6,14 @@
 
 pub mod agenda;
 pub mod calendar;
+pub mod calendar_color;
 pub mod categories;
 pub mod google_color;
 pub mod lists;
 pub mod models;
 pub mod oauth;
 pub mod pattern_gen;
+pub mod realtime;
 pub mod repo;
 pub mod routines;
 pub mod tasks;
@@ -32,13 +34,18 @@ pub use agenda::{
     OCCURRENCE_STATUS_IN_PROGRESS, OCCURRENCE_STATUS_PENDING, OCCURRENCE_STATUS_SKIPPED,
 };
 pub use calendar::{
-    create_event, decide_webhook, ensure_watch, is_public_https_callback, list_calendars,
-    list_events, parse_event_time_range, patch_event, renew_watch_if_needed, run_fallback_cron,
-    stop_watches_for_calendar, sync_calendar, tokens_match, CalendarError, CalendarEventsResponse,
-    CalendarView, CalendarsResponse, CreateEventOutput, CreateEventResponse, CalendarListOutput,
-    CronReport, WebhookDecision, CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL,
+    create_event, decide_webhook, delete_event, delete_event_for_user, ensure_watch,
+    is_public_https_callback, list_calendars, list_events, parse_event_time_range, patch_event,
+    patch_event_fields, renew_watch_if_needed, run_fallback_cron, stop_watches_for_calendar,
+    sync_calendar, tokens_match, update_event_for_user, CalendarError, CalendarEventsResponse,
+    CalendarListOutput, CalendarView, CalendarsResponse, CreateEventOutput, CreateEventResponse,
+    CronReport, DeleteEventResponse, WebhookDecision, CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL,
     GOOGLE_CHANNELS_STOP_URL, GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS,
     WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
+};
+pub use calendar_color::{
+    calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
+    paint_events_for_user, CalendarEventView,
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
@@ -65,6 +72,7 @@ pub use oauth::{
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
+pub use realtime::{RealtimeKind, RealtimeMessage};
 pub use routines::{
     create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
     validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,

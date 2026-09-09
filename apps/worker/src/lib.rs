@@ -8,6 +8,7 @@ mod http;
 mod lists;
 mod routines;
 mod tasks;
+mod user_hub;
 
 use worker::*;
 
@@ -64,6 +65,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         return calendar::notifications(req, env, ctx).await;
     }
 
+    // WebSocket upgrade must bypass Router — upgrade through Router is flaky.
+    // `/api/*` is already `run_worker_first`, so this path always hits the Worker.
+    if req.path() == "/api/realtime" {
+        return user_hub::connect(req, env, config.as_ref()).await;
+    }
+
     Router::with_data(config)
         .get("/health", health)
         .get("/version", version)
@@ -77,7 +84,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/auth/google/callback", auth::options)
         .get_async("/api/calendar/events", calendar::list_events)
         .post_async("/api/calendar/events", calendar::create_event)
+        .patch_async("/api/calendar/events/:id", calendar::update_event)
+        .delete_async("/api/calendar/events/:id", calendar::delete_event)
         .options("/api/calendar/events", auth::options)
+        .options("/api/calendar/events/:id", auth::options)
         .get_async("/api/calendar/calendars", calendar::list_calendars)
         .options("/api/calendar/calendars", auth::options)
         .get_async("/api/lists", lists::list_lists)
