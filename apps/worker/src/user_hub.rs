@@ -93,8 +93,13 @@ pub async fn notify_user(env: &Env, user_id: &str, calendar_id: Option<&str>) {
         }
     };
 
-    if let Err(err) = stub.fetch_with_request(req).await {
-        console_log!("user_hub: notify fetch failed for {user_id}: {err}");
+    match stub.fetch_with_request(req).await {
+        Ok(_) => {
+            console_log!("user_hub: notify fetch ok for {user_id}");
+        }
+        Err(err) => {
+            console_log!("user_hub: notify fetch failed for {user_id}: {err}");
+        }
     }
 }
 
@@ -126,7 +131,9 @@ impl DurableObject for UserHub {
         if req.method() == Method::Post {
             // Internal notify from `notify_user` — broadcast body to all sockets.
             let body = req.text().await.unwrap_or_default();
-            for ws in self.state.get_websockets() {
+            let sockets = self.state.get_websockets();
+            console_log!("user_hub: notify broadcast sockets={}", sockets.len());
+            for ws in sockets {
                 let _ = ws.send_with_str(&body);
             }
             return Response::ok("ok");

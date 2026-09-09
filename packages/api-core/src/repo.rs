@@ -171,6 +171,16 @@ pub trait CalendarRepo: Send + Sync {
     /// Bump `dirty_requested_generation` so cron/webhook replica work can catch
     /// up (V3 dirty channel). Does **not** set `full_sync_requested`.
     async fn bump_dirty_requested(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Set `dirty_applied_generation` to `generation` when that is strictly
+    /// greater than the stored applied value. Never writes `dirty_requested_generation`
+    /// or `sync_token`. Used after a successful replica publication with the
+    /// generation snapshotted at the start of the run.
+    async fn mark_dirty_applied(
+        &self,
+        id: &str,
+        generation: i64,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     async fn set_sync_enabled(
         &self,
         id: &str,
@@ -862,6 +872,18 @@ pub const CALENDAR_BUMP_DIRTY_REQUESTED_SQL: &str = "
     SET dirty_requested_generation = dirty_requested_generation + 1,
         updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Advance `dirty_applied_generation` to the generation snapshotted at the
+/// start of a successful replica publish. Binds: generation, now, id, generation.
+/// The `<` guard never moves applied backwards. Does not touch
+/// `dirty_requested_generation`, `sync_token`, or `full_sync_requested`.
+pub const CALENDAR_MARK_DIRTY_APPLIED_SQL: &str = "
+    UPDATE google_calendars
+    SET dirty_applied_generation = ?,
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+      AND dirty_applied_generation < ?
 ";
 
 pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
@@ -2076,6 +2098,21 @@ mod tests {
         assert!(!sql.contains("full_sync_requested"), "{sql}");
         assert!(!sql.contains("sync_token"), "{sql}");
         assert!(!sql.contains("last_synced_at"), "{sql}");
+    }
+
+    #[test]
+    fn mark_dirty_applied_sql_advances_applied_with_guard_only() {
+        let sql = CALENDAR_MARK_DIRTY_APPLIED_SQL;
+        assert!(sql.contains("dirty_applied_generation = ?"), "{sql}");
+        assert!(sql.contains("dirty_applied_generation < ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("full_sync_requested"), "{sql}");
+        assert!(
+            !sql.contains("dirty_requested_generation ="),
+            "must not write dirty_requested_generation: {sql}"
+        );
     }
 
     #[test]

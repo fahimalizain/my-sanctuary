@@ -40,10 +40,11 @@ pub use agenda::{
 pub use calendar::{
     create_event, decide_webhook, delete_event, delete_event_for_user, ensure_watch,
     is_public_https_callback, list_calendars, list_events, parse_event_time_range, patch_event,
-    patch_event_fields, persist_webhook_decision, renew_watch_if_needed, run_fallback_cron,
-    stop_watches_for_calendar, sync_calendar, tokens_match, update_event_for_user, CalendarError,
-    CalendarEventsResponse, CalendarListOutput, CalendarView, CalendarsResponse, CreateEventOutput,
-    CreateEventResponse, CronReport, DeleteEventResponse, WebhookDecision, WebhookPersistResult,
+    patch_event_fields, persist_webhook_decision, renew_watch_if_needed, replica_due,
+    run_fallback_cron, stop_watches_for_calendar, sync_calendar, tokens_match,
+    update_event_for_user, CalendarError, CalendarEventsResponse, CalendarListOutput, CalendarView,
+    CalendarsResponse, CreateEventOutput, CreateEventResponse, CronReport, DeleteEventResponse,
+    SyncCalendarOutcome, WebhookDecision, WebhookPersistResult, CRON_MAX_REPLICA_CALENDARS,
     CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL, GOOGLE_CHANNELS_STOP_URL,
     GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS, WATCH_DEFAULT_TTL_SECS,
     WATCH_RENEW_HORIZON_SECS,
@@ -101,6 +102,7 @@ pub use repo::{
     AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_MARK_DIRTY_APPLIED_SQL,
     CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
     CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
@@ -146,4 +148,6 @@ pub use time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, parse_iana_tz,
     rfc3339_to_unix_secs, unix_secs_to_rfc3339,
 };
-pub use token::{refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS};
+pub use token::{
+    is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS,
+};

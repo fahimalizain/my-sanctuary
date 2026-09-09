@@ -4468,6 +4468,15 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_dirty_applied(
+            &self,
+            _id: &str,
+            _generation: i64,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn set_sync_enabled(
             &self,
             _id: &str,

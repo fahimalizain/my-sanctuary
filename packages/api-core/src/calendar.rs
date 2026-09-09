@@ -21,9 +21,10 @@
 //! - [`sync_calendar`] records `record_sync_attempt` before any Google fetch,
 //!   acquires a lease, applies the replica walk page-by-page, and publishes
 //!   via fenced `record_sync_success_if_owner` only when apply finished **and**
-//!   a terminal `nextSyncToken` is present. `record_sync_failure` on every
+//!   a terminal `nextSyncToken` is present, then marks `dirty_applied_generation`
+//!   to the generation snapshotted at start. `record_sync_failure` on every
 //!   other path (including missing terminal token). Attempt ≠ success. A busy
-//!   lease is a quiet skip (not a failure).
+//!   lease is [`SyncCalendarOutcome::LeaseBusy`] (not a failure, not a publish).
 //! - Replica `events.list` uses `singleEvents=false&maxResults=250`, optionally
 //!   with the stored `syncToken` (incremental), and follows `nextPageToken`
 //!   (see [`crate::calendar_replica`]). **Only the replica walk owns
@@ -63,6 +64,7 @@
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
 use url::Url;
@@ -85,7 +87,7 @@ use crate::models::{
 use crate::oauth::{HttpClient, HttpError};
 use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, WatchChannelRepo};
 use crate::time::{add_months_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
-use crate::token::{refresh_if_needed, GoogleAccess};
+use crate::token::{is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError};
 
 /// A calendar is stale (needs a sync) when it has not synced in this many
 /// seconds (5 minutes, same as Go's `syncStaleThreshold`).
@@ -96,9 +98,15 @@ use crate::token::{refresh_if_needed, GoogleAccess};
 pub const SYNC_STALE_THRESHOLD_SECS: i64 = 5 * 60;
 
 /// A sync-enabled calendar is stale (needs a cron sync) when it has not
-/// synced in this many seconds (15 minutes — the fallback cron's cadence,
-/// ADR 0001 § Fallback cron).
+/// had a successful replica publish in this many seconds (15 minutes — the
+/// fallback cron's cadence, ADR 0001 § Fallback cron). Freshness is
+/// [`GoogleCalendar::last_success_at`], not `last_synced_at` (ADR 0005).
 pub const CRON_SYNC_STALE_SECS: i64 = 15 * 60;
+
+/// Cap on how many calendars may start a replica walk (`sync_calendar`) in
+/// one fallback-cron tick. Remaining due calendars stay dirty for the next
+/// tick. Counts Published, LeaseBusy, and Err attempts alike.
+pub const CRON_MAX_REPLICA_CALENDARS: usize = 25;
 
 /// Watch channels must still be valid at least this far in the future
 /// (`now_unix + WATCH_RENEW_HORIZON_SECS`) for the cron to consider the
@@ -1218,35 +1226,106 @@ pub async fn renew_watch_if_needed(
 /// a failure for one calendar never fails the whole job.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CronReport {
-    /// Calendars synced in this run.
+    /// Calendars that successfully published a replica in this run.
     pub synced: usize,
     /// Watch channels minted (renewals) in this run.
     pub renewed: usize,
     /// Human-readable failures; empty when everything worked.
+    /// Never contains tokens or event bodies.
     pub errors: Vec<String>,
+    /// `(user_id, calendar_id)` that actually published this run.
+    /// Never includes failures or [`SyncCalendarOutcome::LeaseBusy`]. Worker
+    /// notifies from this list **after** D1 is updated.
+    pub published: Vec<(String, String)>,
+}
+
+/// Outcome of a successful [`sync_calendar`] call (errors use [`CalendarError`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncCalendarOutcome {
+    /// Fenced replica publish succeeded (terminal nextSyncToken committed).
+    Published,
+    /// Foreign unexpired lease; quiet skip, not a failure, not a publish.
+    LeaseBusy,
+}
+
+/// Whether a sync-enabled calendar should start a replica walk this tick.
+///
+/// Due when **all** of:
+/// - `sync_status != "authorization_required"` (do not hot-loop Google; keep events)
+/// - `next_retry_at` is missing/unparseable **or** `<= now_unix` (honor V1 backoff)
+///
+/// AND **any** of:
+/// - `dirty_requested_generation > dirty_applied_generation`
+/// - `last_success_at` missing/unparseable
+/// - `last_success_at` older than [`CRON_SYNC_STALE_SECS`] (15m backstop; watches
+///   do not disable the poll)
+/// - `full_sync_requested`
+/// - `next_retry_at` is due (`Some` and `<= now`) — a failed run with a still-fresh
+///   `last_success_at` still retries when backoff expires
+///
+/// Freshness uses `last_success_at`, not `last_synced_at` (ADR 0005).
+pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
+    if cal.sync_status == "authorization_required" {
+        return false;
+    }
+
+    let retry_unix = cal
+        .next_retry_at
+        .as_deref()
+        .and_then(rfc3339_to_unix_secs);
+    // Missing/unparseable next_retry_at → no backoff gate.
+    // Future next_retry_at → not due (backoff wins even if otherwise stale).
+    if let Some(retry) = retry_unix {
+        if retry > now_unix {
+            return false;
+        }
+    }
+
+    let dirty = cal.dirty_requested_generation > cal.dirty_applied_generation;
+    let success_unix = cal
+        .last_success_at
+        .as_deref()
+        .and_then(rfc3339_to_unix_secs);
+    // Missing/unparseable/future last_success → treat as stale (due).
+    let success_stale = match success_unix {
+        None => true,
+        Some(last) => now_unix - last >= CRON_SYNC_STALE_SECS || last > now_unix,
+    };
+    let retry_due = retry_unix.is_some_and(|retry| retry <= now_unix);
+
+    dirty || success_stale || cal.full_sync_requested || retry_due
 }
 
 /// The fallback cron (ADR 0001 § Fallback cron): for every sync-enabled,
-/// non-deleted calendar, sync it when `last_synced_at` is missing/unparseable
-/// or older than [`CRON_SYNC_STALE_SECS`], then renew its watch channel when
-/// none covers [`WATCH_RENEW_HORIZON_SECS`].
+/// non-deleted calendar, publish a replica when [`replica_due`] (dirty
+/// generation, 15-minute `last_success_at` backstop, full-sync flag, or
+/// expired backoff), then renew its watch channel when none covers
+/// [`WATCH_RENEW_HORIZON_SECS`]. Successful publishes land in
+/// [`CronReport::published`] so the Worker can notify open browsers after D1
+/// is updated.
 ///
 /// Orchestration lives here (pure, unit-tested) so the Worker's
 /// `#[event(scheduled)]` handler is a thin shell. Per-calendar failures are
 /// collected in [`CronReport::errors`] and never abort the rest of the job.
+/// OAuth refresh is cached per `user_id` so two calendars of the same user
+/// share one access token in a tick.
 ///
 /// Per calendar, in order:
-/// 1. `refresh_if_needed` for the owner's Google token. On failure the
-///    calendar is skipped entirely (no sync, no renew).
-/// 2. Stale check (`last_synced_at` missing/unparseable, or
-///    `now - last_sync >= CRON_SYNC_STALE_SECS`) → `sync_calendar`.
-///    - `events.list` 404 disables sync, stops any prior channels, and skips
-///      the renew step (a disabled calendar is not renewed).
-///    - Other sync errors are logged but renewal still runs (the calendar is
-///      still enabled).
-/// 3. When `watch_callback_url` is a public HTTPS URL and the calendar is
-///    still enabled: `renew_watch_if_needed`. A watch 404 disables sync and
-///    stops any prior channels; other errors are logged.
+/// 1. `refresh_if_needed` for the owner's Google token (cached per user).
+///    - Revoked refresh (`invalid_grant` / token-endpoint 400/401): stamp
+///      `auth_revoked` / `authorization_required`, keep events, skip Google.
+///    - `NoToken` / `NoRefreshToken`: skip + error string only (do not flip
+///      healthy calendars to `authorization_required`).
+/// 2. When [`replica_due`] and under [`CRON_MAX_REPLICA_CALENDARS`]:
+///    `sync_calendar`.
+///    - [`SyncCalendarOutcome::Published`] → `synced` + `published`.
+///    - [`SyncCalendarOutcome::LeaseBusy`] → quiet skip (not synced).
+///    - `events.list` 404 disables sync, stops channels, skips renew.
+///    - Other sync errors are logged; dirty stays requested > applied; renew
+///      still runs when the calendar is still enabled.
+/// 3. When `watch_callback_url` is a public HTTPS URL, the calendar is still
+///    enabled, and `sync_status != "authorization_required"`:
+///    `renew_watch_if_needed`. A watch 404 disables sync and stops channels.
 pub async fn run_fallback_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1272,28 +1351,69 @@ pub async fn run_fallback_cron(
             return report;
         }
     };
+
+    // One refresh per user per tick — two concurrent refreshes of the same
+    // grant can invalidate each other.
+    let mut access_by_user: HashMap<String, Result<GoogleAccess, TokenError>> = HashMap::new();
+    let mut replica_attempts: usize = 0;
+
     for cal in &cals {
-        let access = match refresh_if_needed(http, tokens, oauth, &cal.user_id, now_unix).await {
+        let access_result = match access_by_user.get(&cal.user_id) {
+            Some(cached) => cached.clone(),
+            None => {
+                let result =
+                    refresh_if_needed(http, tokens, oauth, &cal.user_id, now_unix).await;
+                access_by_user.insert(cal.user_id.clone(), result.clone());
+                result
+            }
+        };
+
+        let access = match access_result {
             Ok(access) => access,
             Err(err) => {
                 report.errors.push(format!(
                     "token refresh failed for user {} (calendar {}): {err}",
                     cal.user_id, cal.id
                 ));
+                if is_refresh_auth_revoked(&err) {
+                    // Keep events; stop Google for this calendar this tick.
+                    if let Err(persist_err) = persist_sync_failure(
+                        calendars,
+                        cal,
+                        SyncErrorCode::AuthRevoked,
+                        now_unix,
+                        &now_rfc3339,
+                    )
+                    .await
+                    {
+                        report.errors.push(format!(
+                            "failed to stamp auth_revoked for calendar {}: {persist_err}",
+                            cal.id
+                        ));
+                    }
+                }
                 continue;
             }
         };
 
-        // Stale: never synced, unparseable timestamp, or last sync older than
-        // the cron's 15-minute threshold.
-        let stale = cal
-            .last_synced_at
-            .as_deref()
-            .and_then(rfc3339_to_unix_secs)
-            .is_none_or(|last_unix| now_unix - last_unix >= CRON_SYNC_STALE_SECS);
-        if stale {
+        // Re-read may be needed if a prior auth stamp mutated status, but we
+        // work from the list snapshot + in-loop knowledge. Skip renew when
+        // this calendar was just stamped authorization_required above — that
+        // path `continue`s. For already-authorization_required rows, skip
+        // replica + renew below.
+        let due = replica_due(cal, now_unix);
+        if due && replica_attempts < CRON_MAX_REPLICA_CALENDARS {
+            replica_attempts += 1;
             match sync_calendar(http, calendars, events, &access, cal, &now_rfc3339).await {
-                Ok(()) => report.synced += 1,
+                Ok(SyncCalendarOutcome::Published) => {
+                    report.synced += 1;
+                    report
+                        .published
+                        .push((cal.user_id.clone(), cal.id.clone()));
+                }
+                Ok(SyncCalendarOutcome::LeaseBusy) => {
+                    // Quiet skip — not a failure, not a publish.
+                }
                 Err(CalendarError::GoogleNotFound) => {
                     report.errors.push(format!(
                         "calendar {} ({}) returned 404 — disabling sync",
@@ -1325,6 +1445,11 @@ pub async fn run_fallback_cron(
                     cal.id, cal.google_calendar_id
                 )),
             }
+        }
+
+        // Do not hammer Google watch endpoints for revoked calendars.
+        if cal.sync_status == "authorization_required" {
+            continue;
         }
 
         if let Some(callback_url) = callback {
@@ -1674,11 +1799,18 @@ async fn refresh_calendar_list(
 /// ([`crate::calendar_replica::sync_replica`], ADR 0005).
 ///
 /// - Attempt is stamped **before** lease acquire / any Google fetch.
-/// - A busy (unexpired foreign) lease is a quiet `Ok(())` skip — not a failure.
+/// - A busy (unexpired foreign) lease is a quiet
+///   [`SyncCalendarOutcome::LeaseBusy`] — not a failure, does not mark dirty
+///   applied.
+/// - After acquire, re-reads the calendar and **snapshots**
+///   `dirty_requested_generation`. On successful publish, marks applied to
+///   that snapshot (not the live requested value, so dirty bumps mid-run
+///   remain dirty).
 /// - Success requires apply finished **and** a non-empty terminal
 ///   `nextSyncToken` published under the still-held lease (empty `items` +
-///   token still counts).
-/// - Every other path records failure without advancing the token.
+///   token still counts) → [`SyncCalendarOutcome::Published`].
+/// - Every other path records failure without advancing the token or applied
+///   generation.
 /// - The lease is always released on the way out (success, skip-after-acquire,
 ///   or error).
 ///
@@ -1692,7 +1824,7 @@ pub async fn sync_calendar(
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     now_rfc3339: &str,
-) -> Result<(), CalendarError> {
+) -> Result<SyncCalendarOutcome, CalendarError> {
     calendars
         .record_sync_attempt(&cal.id, now_rfc3339)
         .await?;
@@ -1705,15 +1837,17 @@ pub async fn sync_calendar(
         .await?;
     if !acquired {
         // Another owner is working this calendar — not a failure.
-        return Ok(());
+        return Ok(SyncCalendarOutcome::LeaseBusy);
     }
 
     // Re-read cursor/fingerprint under the lease (not the stale snapshot).
+    // Snapshot dirty generation at start so mid-run bumps stay dirty.
     let body_result = async {
         let fresh = calendars
             .get_by_id(&cal.id)
             .await?
             .ok_or_else(|| CalendarError::Invalid("calendar missing after lease acquire".into()))?;
+        let dirty_snapshot = fresh.dirty_requested_generation;
         // Deploy backfill: empty event-label cache before the first fetch.
         ensure_event_labels(http, calendars, access, &fresh, now_rfc3339).await?;
         sync_replica(
@@ -1725,7 +1859,8 @@ pub async fn sync_calendar(
             &owner,
             now_rfc3339,
         )
-        .await
+        .await?;
+        Ok::<i64, CalendarError>(dirty_snapshot)
     }
     .await;
 
@@ -1735,7 +1870,15 @@ pub async fn sync_calendar(
         .await;
 
     match body_result {
-        Ok(()) => Ok(()),
+        Ok(dirty_snapshot) => {
+            // After a successful publish: advance applied to the generation-at-start.
+            // If this write fails, surface the error (replica is idempotent; cron
+            // retries). Do not pretend applied advanced.
+            calendars
+                .mark_dirty_applied(&cal.id, dirty_snapshot, now_rfc3339)
+                .await?;
+            Ok(SyncCalendarOutcome::Published)
+        }
         Err(err) => {
             let code = match &err {
                 CalendarError::InvalidResponse(msg)
@@ -1938,6 +2081,11 @@ mod tests {
         fail_bump_dirty: Mutex<bool>,
         /// When true, `set_sync_enabled` returns `RepoError::Backend`.
         fail_set_sync_enabled: Mutex<bool>,
+        /// After this many `get_by_id` calls, increment
+        /// `dirty_requested_generation` on the matched row (None = disabled).
+        /// Snapshot is taken before the bump so the caller still sees the
+        /// pre-bump generation (mirrors mid-run dirty enqueue).
+        bump_dirty_after_get_by_id: Mutex<Option<usize>>,
     }
 
     impl FakeCalendarRepo {
@@ -1953,6 +2101,7 @@ mod tests {
                 steal_lease_after_get_by_id: Mutex::new(None),
                 fail_bump_dirty: Mutex::new(false),
                 fail_set_sync_enabled: Mutex::new(false),
+                bump_dirty_after_get_by_id: Mutex::new(None),
             }
         }
 
@@ -2021,14 +2170,22 @@ mod tests {
             drop(count);
 
             let mut stored = self.stored.lock().unwrap();
-            // Snapshot first so the Nth call still sees our lease; subsequent
-            // reads (and renew / fenced success) observe the thief.
+            // Snapshot first so the Nth call still sees our lease / dirty gen;
+            // subsequent reads observe the post-hook mutation.
             let result = stored.iter().find(|cal| cal.id == id).cloned();
             if let Some(threshold) = *self.steal_lease_after_get_by_id.lock().unwrap() {
                 if n == threshold {
                     if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                         cal.lease_owner = "thief".to_string();
                         cal.lease_expires_at = Some("2099-01-01T00:00:00Z".to_string());
+                    }
+                }
+            }
+            if let Some(threshold) = *self.bump_dirty_after_get_by_id.lock().unwrap() {
+                if n == threshold {
+                    if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                        cal.dirty_requested_generation =
+                            cal.dirty_requested_generation.saturating_add(1);
                     }
                 }
             }
@@ -2271,6 +2428,22 @@ mod tests {
                 if cal.deleted_at.is_none() {
                     cal.dirty_requested_generation =
                         cal.dirty_requested_generation.saturating_add(1);
+                    cal.updated_at = now_rfc3339.to_string();
+                }
+            }
+            Ok(())
+        }
+
+        async fn mark_dirty_applied(
+            &self,
+            id: &str,
+            generation: i64,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                if cal.deleted_at.is_none() && cal.dirty_applied_generation < generation {
+                    cal.dirty_applied_generation = generation;
                     cal.updated_at = now_rfc3339.to_string();
                 }
             }
@@ -4951,9 +5124,12 @@ mod tests {
     fn cron_syncs_stale_and_skips_fresh() {
         let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
         let mut stale = calendar("cal-a", "primary@example.com", true);
+        // Freshness is last_success_at (ADR 0005), not last_synced_at.
         stale.last_synced_at = Some("2023-11-14T21:53:20Z".to_string()); // 20 min ago
+        stale.last_success_at = Some("2023-11-14T21:53:20Z".to_string());
         let mut fresh = calendar("cal-b", "secondary@example.com", true);
         fresh.last_synced_at = Some("2023-11-14T22:12:20Z".to_string()); // 1 min ago
+        fresh.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
         let calendars = FakeCalendarRepo::with(vec![stale, fresh]);
         let events = FakeEventRepo::new();
         let watches = FakeWatchChannelRepo::new();
@@ -4967,6 +5143,10 @@ mod tests {
         assert_eq!(report.synced, 1, "only the stale calendar synced");
         assert_eq!(report.renewed, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.published,
+            vec![("u-1".to_string(), "cal-a".to_string())]
+        );
         let gets = http.gets.lock().unwrap();
         assert_eq!(gets.len(), 1, "fresh calendar must not hit events.list");
         assert!(gets[0].contains("primary%40example.com/events"), "{:?}", gets);
@@ -5000,7 +5180,9 @@ mod tests {
     fn cron_watch_404_disables() {
         let http = FakeHttp::new(vec![("/events/watch", 404, r#"{"error":"not found"}"#)]);
         let mut cal = calendar("cal-1", "primary@example.com", true);
-        cal.last_synced_at = Some("2023-11-14T22:12:20Z".to_string()); // fresh → no sync
+        // Fresh last_success → not replica-due; only renews (and 404-disables).
+        cal.last_synced_at = Some("2023-11-14T22:12:20Z".to_string());
+        cal.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
         let calendars = FakeCalendarRepo::with(vec![cal]);
         let events = FakeEventRepo::new();
         let watches = FakeWatchChannelRepo::new();
@@ -5013,6 +5195,7 @@ mod tests {
 
         assert_eq!(report.synced, 0);
         assert_eq!(report.renewed, 0);
+        assert!(report.published.is_empty());
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("404"), "{}", report.errors[0]);
         assert_eq!(
@@ -5056,8 +5239,10 @@ mod tests {
         // User u-a has NO stored token → refresh fails; u-b has one → proceeds.
         let mut cal_a = calendar_for_user("u-a", "cal-a", "primary@example.com", true);
         cal_a.last_synced_at = Some("2023-11-14T21:53:20Z".to_string()); // stale
+        cal_a.last_success_at = Some("2023-11-14T21:53:20Z".to_string());
         let mut cal_b = calendar_for_user("u-b", "cal-b", "secondary@example.com", true);
         cal_b.last_synced_at = Some("2023-11-14T21:53:20Z".to_string()); // stale
+        cal_b.last_success_at = Some("2023-11-14T21:53:20Z".to_string());
         let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b]);
         let events = FakeEventRepo::new();
         let watches = FakeWatchChannelRepo::new();
@@ -5070,11 +5255,219 @@ mod tests {
 
         assert_eq!(report.synced, 1, "u-b's calendar synced despite u-a's failure");
         assert_eq!(report.renewed, 0);
+        assert_eq!(
+            report.published,
+            vec![("u-b".to_string(), "cal-b".to_string())]
+        );
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].contains("u-a"), "{}", report.errors[0]);
+        // NoToken must not flip healthy calendars to authorization_required.
+        let stored = calendars.stored.lock().unwrap();
+        let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+        assert_ne!(a.sync_status, "authorization_required");
         let gets = http.gets.lock().unwrap();
         assert_eq!(gets.len(), 1);
         assert!(gets[0].contains("secondary%40example.com"), "{:?}", gets);
+    }
+
+    // ──────────────────────────────────────────
+    // replica_due / dirty-generation cron
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn replica_due_matrix() {
+        let now = NOW_UNIX;
+        let one_min_ago = unix_secs_to_rfc3339(now - 60);
+        let twenty_min_ago = unix_secs_to_rfc3339(now - 20 * 60);
+        let future_retry = unix_secs_to_rfc3339(now + 600);
+        let past_retry = unix_secs_to_rfc3339(now - 60);
+
+        // dirty + last_success 1 minute ago → due
+        let mut cal = calendar("c", "primary@example.com", true);
+        cal.dirty_requested_generation = 1;
+        cal.dirty_applied_generation = 0;
+        cal.last_success_at = Some(one_min_ago.clone());
+        assert!(replica_due(&cal, now), "dirty should be due");
+
+        // clean + last_success 1 minute ago → not due
+        cal.dirty_requested_generation = 0;
+        cal.dirty_applied_generation = 0;
+        cal.last_success_at = Some(one_min_ago.clone());
+        assert!(!replica_due(&cal, now), "fresh clean should not be due");
+
+        // clean + last_success 20 minutes ago → due
+        cal.last_success_at = Some(twenty_min_ago.clone());
+        assert!(replica_due(&cal, now), "15m backstop");
+
+        // clean + last_success missing → due
+        cal.last_success_at = None;
+        assert!(replica_due(&cal, now), "never-succeeded is due");
+
+        // authorization_required + dirty → not due
+        cal.dirty_requested_generation = 5;
+        cal.dirty_applied_generation = 0;
+        cal.last_success_at = Some(twenty_min_ago.clone());
+        cal.sync_status = "authorization_required".to_string();
+        assert!(!replica_due(&cal, now), "auth_required must not hot-loop");
+
+        // next_retry_at in the future + last_success 20m ago → not due (backoff wins)
+        cal.sync_status = String::new();
+        cal.dirty_requested_generation = 0;
+        cal.dirty_applied_generation = 0;
+        cal.last_success_at = Some(twenty_min_ago);
+        cal.next_retry_at = Some(future_retry);
+        assert!(!replica_due(&cal, now), "future backoff blocks even stale");
+
+        // next_retry_at in the past + last_success 1m ago + not dirty → due
+        cal.next_retry_at = Some(past_retry);
+        cal.last_success_at = Some(one_min_ago.clone());
+        assert!(replica_due(&cal, now), "expired backoff retries");
+
+        // full_sync_requested + last_success 1m ago + not dirty → due
+        cal.next_retry_at = None;
+        cal.full_sync_requested = true;
+        cal.last_success_at = Some(one_min_ago);
+        assert!(replica_due(&cal, now), "full_sync_requested forces due");
+    }
+
+    #[test]
+    fn cron_picks_dirty_even_when_last_success_is_fresh() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let mut dirty = calendar("cal-a", "primary@example.com", true);
+        dirty.last_success_at = Some("2023-11-14T22:12:20Z".to_string()); // 1 min ago
+        dirty.last_synced_at = dirty.last_success_at.clone();
+        dirty.dirty_requested_generation = 1;
+        dirty.dirty_applied_generation = 0;
+        let mut clean = calendar("cal-b", "secondary@example.com", true);
+        clean.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        clean.last_synced_at = clean.last_success_at.clone();
+        clean.dirty_requested_generation = 0;
+        clean.dirty_applied_generation = 0;
+        let calendars = FakeCalendarRepo::with(vec![dirty, clean]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1);
+        assert_eq!(
+            report.published,
+            vec![("u-1".to_string(), "cal-a".to_string())]
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let gets = http.gets.lock().unwrap();
+        assert_eq!(gets.len(), 1);
+        assert!(gets[0].contains("primary%40example.com/events"), "{:?}", gets);
+        let stored = calendars.stored.lock().unwrap();
+        let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+        assert_eq!(a.dirty_applied_generation, 1);
+        let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
+        assert_eq!(b.dirty_applied_generation, 0);
+    }
+
+    #[test]
+    fn cron_success_sets_applied_to_generation_at_start_mid_run_dirty_remains() {
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.last_success_at = Some("2023-11-14T22:12:20Z".to_string()); // fresh
+        cal.last_synced_at = cal.last_success_at.clone();
+        cal.dirty_requested_generation = 5;
+        cal.dirty_applied_generation = 1;
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        // After the under-lease snapshot get_by_id (#1), bump requested 5 → 6.
+        *calendars.bump_dirty_after_get_by_id.lock().unwrap() = Some(1);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1);
+        assert_eq!(
+            report.published,
+            vec![("u-1".to_string(), "cal-1".to_string())]
+        );
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].dirty_applied_generation, 5, "snapshot at start");
+        assert_eq!(
+            stored[0].dirty_requested_generation, 6,
+            "mid-run bump preserved"
+        );
+        assert!(
+            replica_due(&stored[0], NOW_UNIX),
+            "still dirty after mid-run bump"
+        );
+    }
+
+    #[test]
+    fn cron_failure_leaves_dirty_other_calendars_progress_and_lease_busy_not_published() {
+        // cal-a: dirty, events.list 500 → failure, applied stays 0
+        // cal-b: dirty, events.list 200 → published
+        // cal-c: dirty, foreign unexpired lease → LeaseBusy, not published
+        let http = FakeHttp::new(vec![
+            ("primary%40example.com/events", 500, r#"{"error":"boom"}"#),
+            ("secondary%40example.com/events", 200, EVENTS_JSON),
+            // tertiary would 200 if reached — lease busy must not fetch.
+            ("tertiary%40example.com/events", 200, EVENTS_JSON),
+        ]);
+        let mut cal_a = calendar("cal-a", "primary@example.com", true);
+        cal_a.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        cal_a.dirty_requested_generation = 2;
+        cal_a.dirty_applied_generation = 0;
+        let mut cal_b = calendar("cal-b", "secondary@example.com", true);
+        cal_b.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        cal_b.dirty_requested_generation = 1;
+        cal_b.dirty_applied_generation = 0;
+        let mut cal_c = calendar("cal-c", "tertiary@example.com", true);
+        cal_c.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+        cal_c.dirty_requested_generation = 3;
+        cal_c.dirty_applied_generation = 0;
+        let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b, cal_c]);
+        calendars.force_lease("cal-c", "other-owner", Some("2099-01-01T00:00:00Z"));
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+        let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+        let oauth = oauth_config();
+
+        let report = pollster::block_on(run_fallback_cron(
+            &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        ));
+
+        assert_eq!(report.synced, 1);
+        assert_eq!(
+            report.published,
+            vec![("u-1".to_string(), "cal-b".to_string())]
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert!(
+            report.errors[0].contains("cal-a"),
+            "{:?}",
+            report.errors
+        );
+
+        let stored = calendars.stored.lock().unwrap();
+        let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+        assert_eq!(a.dirty_applied_generation, 0);
+        assert_eq!(a.dirty_requested_generation, 2);
+        let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
+        assert_eq!(b.dirty_applied_generation, 1);
+        let c = stored.iter().find(|c| c.id == "cal-c").unwrap();
+        assert_eq!(c.dirty_applied_generation, 0);
+        assert_eq!(c.dirty_requested_generation, 3);
+
+        let gets = http.gets.lock().unwrap();
+        assert!(
+            !gets.iter().any(|u| u.contains("tertiary")),
+            "LeaseBusy must not fetch: {:?}",
+            gets
+        );
     }
 
     // ──────────────────────────────────────────

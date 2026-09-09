@@ -125,6 +125,28 @@ pub async fn refresh_if_needed(
     })
 }
 
+/// True when a token refresh failed because Google rejected the refresh grant
+/// (revoked / expired refresh token, or HTTP 400/401 from the token endpoint).
+///
+/// Used by the fallback cron to stamp `authorization_required` and stop
+/// hammering Google. Does **not** treat [`TokenError::NoToken`] /
+/// [`TokenError::NoRefreshToken`] as revoked — a missing row this tick must
+/// not flip healthy calendars.
+pub fn is_refresh_auth_revoked(err: &TokenError) -> bool {
+    match err {
+        TokenError::Http(HttpError::Message(msg)) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("invalid_grant")
+                || lower.contains("returned 400")
+                || lower.contains("returned 401")
+        }
+        TokenError::InvalidResponse(msg) | TokenError::InvalidStored(msg) => {
+            msg.to_ascii_lowercase().contains("invalid_grant")
+        }
+        TokenError::NoToken | TokenError::NoRefreshToken | TokenError::Repo(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -385,5 +407,29 @@ mod tests {
         ))
         .unwrap_err();
         assert!(matches!(err, TokenError::Repo(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn is_refresh_auth_revoked_detects_token_endpoint_rejections() {
+        assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+            "POST https://oauth2.googleapis.com/token returned 400".into()
+        ))));
+        assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+            "POST https://oauth2.googleapis.com/token returned 401".into()
+        ))));
+        assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+            "invalid_grant".into()
+        ))));
+        assert!(is_refresh_auth_revoked(&TokenError::InvalidResponse(
+            "body has invalid_grant".into()
+        )));
+        assert!(!is_refresh_auth_revoked(&TokenError::NoToken));
+        assert!(!is_refresh_auth_revoked(&TokenError::NoRefreshToken));
+        assert!(!is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+            "POST https://oauth2.googleapis.com/token returned 500".into()
+        ))));
+        assert!(!is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+            "connection refused".into()
+        ))));
     }
 }

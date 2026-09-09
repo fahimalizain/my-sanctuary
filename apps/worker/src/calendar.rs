@@ -621,13 +621,19 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(api_core::SyncCalendarOutcome::Published) => {
                             crate::user_hub::notify_user(
                                 &env,
                                 &calendar.user_id,
                                 Some(&calendar.id),
                             )
                             .await;
+                        }
+                        Ok(api_core::SyncCalendarOutcome::LeaseBusy) => {
+                            console_log!(
+                                "calendar webhook: background sync for {} skipped (lease busy)",
+                                calendar.id
+                            );
                         }
                         Err(err) => {
                             console_log!(

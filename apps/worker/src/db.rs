@@ -29,6 +29,7 @@ use api_core::repo::{
     AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL,
     AGENDA_ITEM_SET_SORT_ORDER_SQL, AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL,
+    CALENDAR_MARK_DIRTY_APPLIED_SQL,
     CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
@@ -602,6 +603,28 @@ impl CalendarRepo for D1CalendarRepo {
             .db
             .prepare(CALENDAR_BUMP_DIRTY_REQUESTED_SQL)
             .bind_refs(&[D1Type::Text(now_rfc3339), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn mark_dirty_applied(
+        &self,
+        id: &str,
+        generation: i64,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // D1 Integer is i32; dirty generations are monotonic counters well
+        // within that range for practical workloads.
+        let gen = generation as i32;
+        let stmt = self
+            .db
+            .prepare(CALENDAR_MARK_DIRTY_APPLIED_SQL)
+            .bind_refs(&[
+                D1Type::Integer(gen),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+                D1Type::Integer(gen),
+            ])
             .map_err(backend)?;
         run_stmt(stmt).await
     }
