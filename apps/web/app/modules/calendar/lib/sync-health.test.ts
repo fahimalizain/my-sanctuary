@@ -28,7 +28,9 @@ function sync(...calendars: CalendarSyncHealth[]): CalendarEventsSync {
   const hasAuth = calendars.some((c) => c.state === 'authorization_required');
   const hasDegraded = calendars.some(
     (c) =>
-      c.state === 'retrying' || c.state === 'rebuilding' || c.stale === true,
+      c.state === 'retrying' ||
+      c.state === 'rebuilding' ||
+      (c.stale === true && c.state !== 'never_initialized'),
   );
   return {
     status: hasAuth
@@ -96,6 +98,41 @@ test('never_initialized → quiet syncing copy', () => {
   assert.equal(banner.showRetry, false);
   assert.equal(banner.showReconnect, false);
   assert.equal(banner.calendarName, 'Personal Goals');
+});
+
+test('never_initialized + stale → still quiet syncing (not out of date)', () => {
+  const banner = selectSyncHealthBanner({
+    ...base,
+    sync: sync(
+      health({
+        calendar_id: 'cal-personal',
+        state: 'never_initialized',
+        stale: true,
+      }),
+    ),
+  });
+  assert.equal(banner.kind, 'never_initialized');
+  assert.equal(banner.message, 'Syncing earlier events…');
+  assert.equal(banner.showRetry, false);
+  assert.equal(banner.showReconnect, false);
+});
+
+test('empty window + never_initialized + stale → quiet syncing (not no events)', () => {
+  const banner = selectSyncHealthBanner({
+    ...base,
+    eventsEmpty: true,
+    sync: sync(
+      health({
+        calendar_id: 'cal-personal',
+        state: 'never_initialized',
+        stale: true,
+      }),
+    ),
+  });
+  assert.equal(banner.kind, 'never_initialized');
+  assert.equal(banner.message, 'Syncing earlier events…');
+  assert.equal(banner.showRetry, false);
+  assert.equal(banner.showReconnect, false);
 });
 
 test('authorization_required → reconnect, strongest vs stale sibling', () => {

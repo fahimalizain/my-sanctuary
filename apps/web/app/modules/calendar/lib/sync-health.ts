@@ -51,7 +51,7 @@ function isDegraded(health: CalendarSyncHealth): boolean {
   return (
     health.state === 'retrying' ||
     health.state === 'rebuilding' ||
-    health.stale === true
+    (health.stale === true && health.state !== 'never_initialized')
   );
 }
 
