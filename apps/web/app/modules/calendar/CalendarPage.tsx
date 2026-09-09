@@ -75,6 +75,19 @@ export function CalendarPage() {
         isRefreshing={session.isRefreshing}
       />
 
+      {session.writeError && (
+        <div className="shrink-0 flex items-center justify-between gap-3 border-b border-border px-4 py-1.5 text-xs">
+          <p className="text-muted-foreground truncate">{session.writeError}</p>
+          <button
+            type="button"
+            onClick={session.clearWriteError}
+            className="shrink-0 text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Body: sidebar + grid + inspector */}
       <div className="flex-1 min-h-0 flex relative">
         <CalendarSidebar

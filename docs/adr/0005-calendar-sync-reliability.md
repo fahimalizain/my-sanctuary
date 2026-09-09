@@ -141,9 +141,23 @@ permanent.
 - GET projection hides unmodified instances when a living master exists
 - PATCH set remains minimal (start/end/summary / status cancelled) — attendees/conferenceData not sent
 
+**V5 (shipped)** — 2026-09-10
+
+- Browser reads sanitized `sync` on GET events; one compact chrome banner
+- `authorization_required` / degraded / never_initialized visible without
+  clearing the grid
+- `never_initialized` (including API `stale=true`) uses quiet “Syncing earlier
+  events…” not an out-of-date warning
+- WS open/reconnect cancel-then-invalidates events + calendars so a missed cron
+  `notify_user` converges
+- `calendar.changed` uses the same catch-up runner (cron already notifies; no
+  second push channel)
+- Overlay map resets on logout / account change
+- Failed writes surface a small error; no offline queue; no user-facing Full
+  Refresh
+
 **Later**
 
-- **V5:** web health chrome
 - **Not planned:** Cloudflare Queues (ADR 0001)
 
 ## Consequences

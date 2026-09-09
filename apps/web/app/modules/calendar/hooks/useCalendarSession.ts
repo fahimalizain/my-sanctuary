@@ -125,6 +125,18 @@ export function useCalendarSession({
   const updateEvent = useUpdateCalendarEvent();
   const deleteEvent = useDeleteCalendarEvent();
 
+  // Quiet notice for failed writes (distinct from sync health banner).
+  const [writeError, setWriteError] = useState<string | null>(null);
+  const clearWriteError = useCallback(() => setWriteError(null), []);
+
+  const reportWriteError = useCallback((base: string, err: unknown) => {
+    if (err instanceof Error && err.message.trim()) {
+      setWriteError(`${base}: ${err.message}`);
+      return;
+    }
+    setWriteError(base);
+  }, []);
+
   const writableCalendar = useMemo(
     () => defaultWritableCalendar(calendars),
     [calendars],
@@ -239,6 +251,7 @@ export function useCalendarSession({
     const endIso = event.end_time;
 
     draftPersistStartedRef.current.add(tempId);
+    clearWriteError();
 
     createEvent.mutate(
       {
@@ -320,7 +333,7 @@ export function useCalendarSession({
                     queue.clear(serverId);
                   }
                 })
-                .catch(() => {
+                .catch((err: unknown) => {
                   // Revert only if overlay still matches what we tried to flush.
                   const patchAfter = queue.getOverlay(serverId);
                   if (
@@ -331,11 +344,12 @@ export function useCalendarSession({
                   ) {
                     queue.clear(serverId);
                   }
+                  reportWriteError("Couldn't save event", err);
                 });
             }
           }
         },
-        onError: () => {
+        onError: (err) => {
           draftPersistStartedRef.current.delete(tempId);
           queue.clear(tempId);
           if (unpersistedDraftIdRef.current === tempId) {
@@ -348,16 +362,27 @@ export function useCalendarSession({
             }
             return prev;
           });
+          reportWriteError("Couldn't create event", err);
         },
       },
     );
-  }, [createEvent, deleteEvent, queue, updateEvent, setDraftId]);
+  }, [
+    clearWriteError,
+    createEvent,
+    deleteEvent,
+    queue,
+    reportWriteError,
+    updateEvent,
+    setDraftId,
+  ]);
 
   const handleSaveTitle = useCallback(
     async (summary: string) => {
       if (!selectedEventId) return;
       const current = overlaidEvents.find((e) => e.id === selectedEventId);
       if (!current) return;
+
+      clearWriteError();
 
       // Paint immediately.
       queue.upsert({ ...current, title: summary });
@@ -390,12 +415,13 @@ export function useCalendarSession({
         ) {
           queue.clear(selectedEventId);
         }
-      } catch {
+      } catch (err) {
         // Revert only if overlay was not superseded by a newer edit.
         const latest = queue.getOverlay(selectedEventId);
         if (latest?.op === 'upsert' && latest.event.title === summary) {
           queue.clear(selectedEventId);
         }
+        reportWriteError("Couldn't save event", err);
       }
     },
     [
@@ -405,12 +431,16 @@ export function useCalendarSession({
       queue,
       updateEvent,
       persistDraft,
+      clearWriteError,
+      reportWriteError,
     ],
   );
 
   const handleDeleteEvent = useCallback(async () => {
     if (!selectedEventId) return;
     const id = selectedEventId;
+
+    clearWriteError();
 
     // Draft or in-flight create: drop overlay only — never DELETE a missing
     // server row. If POST is in flight, clear makes onSuccess DELETE it.
@@ -437,11 +467,20 @@ export function useCalendarSession({
       await deleteEvent.mutateAsync(id);
       removeCalendarEventFromCache(id);
       queue.clear(id);
-    } catch {
+    } catch (err) {
       // Clear delete overlay so the event reappears from the server list.
       queue.clear(id);
+      reportWriteError("Couldn't delete event", err);
     }
-  }, [selectedEventId, unpersistedDraftId, queue, deleteEvent, setDraftId]);
+  }, [
+    selectedEventId,
+    unpersistedDraftId,
+    queue,
+    deleteEvent,
+    setDraftId,
+    clearWriteError,
+    reportWriteError,
+  ]);
 
   const knownCalendarIds = useMemo(
     () => new Set(calendars.map((c) => c.id)),
@@ -514,6 +553,7 @@ export function useCalendarSession({
         start_time: range.start.toISOString(),
         end_time: range.end.toISOString(),
       };
+      clearWriteError();
       // Paint immediately; PATCH follows (unless still a temp id).
       queue.upsert(next);
 
@@ -540,7 +580,7 @@ export function useCalendarSession({
             queue.clear(eventId);
           }
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           // Revert only if overlay was not superseded by a newer drag.
           const latest = queue.getOverlay(eventId);
           if (
@@ -550,9 +590,17 @@ export function useCalendarSession({
           ) {
             queue.clear(eventId);
           }
+          reportWriteError("Couldn't save event", err);
         });
     },
-    [overlaidEvents, events, queue, updateEvent],
+    [
+      overlaidEvents,
+      events,
+      queue,
+      updateEvent,
+      clearWriteError,
+      reportWriteError,
+    ],
   );
 
   const handleEmptyClick = useCallback(() => {
@@ -647,6 +695,8 @@ export function useCalendarSession({
     eventsEmpty,
     sync,
     healthBanner,
+    writeError,
+    clearWriteError,
 
     // Sidebar
     calendars,

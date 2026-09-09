@@ -58,3 +58,8 @@ export function applyEventOverlays(
 
   return result;
 }
+
+/** Drop all pending overlays (logout / account switch). */
+export function resetEventOverlays(map: Map<string, EventOverlay>): void {
+  map.clear();
+}

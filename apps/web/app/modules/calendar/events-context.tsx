@@ -2,12 +2,18 @@ import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
 } from 'react';
 import type { CalendarEvent } from '@/app/types';
-import { applyEventOverlays, type EventOverlay } from './lib/event-overlays';
+import { useAuth } from '@/lib/auth';
+import {
+  applyEventOverlays,
+  resetEventOverlays,
+  type EventOverlay,
+} from './lib/event-overlays';
 import { useCalendarRealtime } from './useCalendarRealtime';
 
 export interface CalendarEventsQueue {
@@ -19,6 +25,8 @@ export interface CalendarEventsQueue {
   remove(id: string): void;
   /** Drop overlay after reconcile / error (server data takes over). */
   clear(id: string): void;
+  /** Drop every overlay (logout / account switch). */
+  reset(): void;
   /** Current overlay for id, if any. Always reads the live map. */
   getOverlay(id: string): EventOverlay | undefined;
   /** Apply current overlays to a server list. */
@@ -30,6 +38,7 @@ const CalendarEventsContext = createContext<CalendarEventsQueue>({
   upsert: () => {},
   remove: () => {},
   clear: () => {},
+  reset: () => {},
   getOverlay: () => undefined,
   apply: (server) => server,
 });
@@ -46,6 +55,9 @@ export function CalendarEventsProvider({
 }) {
   // One app-wide UserHub socket; invalidates events queries on remote changes.
   useCalendarRealtime();
+
+  const { user } = useAuth();
+  const accountId = user?.id ?? null;
 
   // Map is the physical store (last write per id). version forces re-renders
   // so consumers re-run apply() after mutations; getOverlay always reads ref.
@@ -81,6 +93,18 @@ export function CalendarEventsProvider({
     [bump],
   );
 
+  const reset = useCallback(() => {
+    if (mapRef.current.size === 0) return;
+    resetEventOverlays(mapRef.current);
+    bump();
+  }, [bump]);
+
+  // Provider survives logout; clear overlays on identity change so they
+  // never leak across accounts (queryClient.clear does not touch this map).
+  useEffect(() => {
+    reset();
+  }, [accountId, reset]);
+
   // Stable: always reads the live map so async reconcile sees latest write.
   const getOverlay = useCallback(
     (id: string): EventOverlay | undefined => mapRef.current.get(id),
@@ -100,10 +124,11 @@ export function CalendarEventsProvider({
       upsert,
       remove,
       clear,
+      reset,
       getOverlay,
       apply,
     }),
-    [version, upsert, remove, clear, getOverlay, apply],
+    [version, upsert, remove, clear, reset, getOverlay, apply],
   );
 
   return (
