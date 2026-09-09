@@ -1,9 +1,24 @@
-import { useEffect, useRef, useState } from 'react';
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type RefObject,
+} from 'react';
+import { createPortal } from 'react-dom';
 import { Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import {
+  Popover,
+  PopoverAnchor,
+  PopoverContent,
+} from '@/components/ui/popover';
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
+import { eventChipSelector } from '../lib/inspector-anchor';
 import { formatEventTimeRange } from '../lib/week-layout';
+
+const DESKTOP_MQ = '(min-width: 768px)';
 
 export interface EventInspectorProps {
   event: CalendarEvent;
@@ -15,65 +30,121 @@ export interface EventInspectorProps {
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
+  /**
+   * While a drag is in progress, hide the inspector visually without
+   * unmounting (unmount would call onClose and discard a draft).
+   */
+  isDragging?: boolean;
 }
 
-/**
- * Side panel for inspecting / renaming / deleting a calendar event.
- * Desktop: 320px right column. Mobile: overlay drawer over the grid.
- */
-export function EventInspector({
+type ChipRect = {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+};
+
+function useIsDesktop(): boolean {
+  const [isDesktop, setIsDesktop] = useState(
+    () => window.matchMedia(DESKTOP_MQ).matches,
+  );
+
+  useEffect(() => {
+    const mql = window.matchMedia(DESKTOP_MQ);
+    const onChange = () => setIsDesktop(mql.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, []);
+
+  return isDesktop;
+}
+
+function useChipRect(eventId: string): ChipRect | null {
+  const [rect, setRect] = useState<ChipRect | null>(null);
+
+  useLayoutEffect(() => {
+    let ro: ResizeObserver | null = null;
+    let observed: Element | null = null;
+    let raf = 0;
+    let scroller: Element | null = null;
+
+    const measure = (): Element | null => {
+      const el = document.querySelector(eventChipSelector(eventId));
+      if (!el) {
+        setRect(null);
+        return null;
+      }
+      const r = el.getBoundingClientRect();
+      setRect({
+        top: r.top,
+        left: r.left,
+        width: r.width,
+        height: r.height,
+      });
+      return el;
+    };
+
+    const attachObserver = (el: Element) => {
+      if (observed === el && ro) return;
+      ro?.disconnect();
+      ro = new ResizeObserver(() => {
+        measure();
+      });
+      ro.observe(el);
+      observed = el;
+    };
+
+    const sync = () => {
+      const el = measure();
+      if (el) attachObserver(el);
+    };
+
+    sync();
+    if (!observed) {
+      // Draft chip may not be painted yet — retry next frame.
+      raf = requestAnimationFrame(sync);
+    }
+
+    scroller = document.querySelector('[data-calendar-scroller]');
+    scroller?.addEventListener('scroll', sync, { passive: true });
+    window.addEventListener('resize', sync);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      ro?.disconnect();
+      scroller?.removeEventListener('scroll', sync);
+      window.removeEventListener('resize', sync);
+    };
+  }, [eventId]);
+
+  return rect;
+}
+
+interface InspectorFormProps {
+  event: CalendarEvent;
+  calendar?: GoogleCalendar;
+  title: string;
+  setTitle: (v: string) => void;
+  titleRef: RefObject<HTMLInputElement | null>;
+  commitTitle: () => void;
+  onClose: () => void;
+  onDelete: () => void | Promise<void>;
+  isSaving: boolean;
+  isDeleting: boolean;
+}
+
+function InspectorForm({
   event,
   calendar,
-  focusTitle = false,
+  title,
+  setTitle,
+  titleRef,
+  commitTitle,
   onClose,
-  onSaveTitle,
   onDelete,
-  isSaving = false,
-  isDeleting = false,
-}: EventInspectorProps) {
-  const [title, setTitle] = useState(event.title);
-  const titleRef = useRef<HTMLInputElement>(null);
-  // Track the last-saved title so blur after an unchanged edit is a no-op.
-  const savedTitleRef = useRef(event.title);
-
-  // Sync local title when the selected event changes — but keep a dirty
-  // (unblurred) edit across temp→server id remap so typed text is not lost.
-  useEffect(() => {
-    const dirty = title !== savedTitleRef.current;
-    if (dirty) return;
-    setTitle(event.title);
-    savedTitleRef.current = event.title;
-  }, [event.id, event.title]);
-
-  useEffect(() => {
-    if (focusTitle) {
-      titleRef.current?.focus();
-      titleRef.current?.select();
-    }
-  }, [focusTitle, event.id]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  const commitTitle = () => {
-    const next = title.trim();
-    if (!next || next === savedTitleRef.current) {
-      // Restore if blanked out.
-      if (!next) setTitle(savedTitleRef.current);
-      return;
-    }
-    savedTitleRef.current = next;
-    void onSaveTitle(next);
-  };
-
+  isSaving,
+  isDeleting,
+}: InspectorFormProps) {
   const start = new Date(event.start_time);
   const end = new Date(event.end_time);
   const timeLabel = formatEventTimeRange(start, end);
@@ -81,15 +152,7 @@ export function EventInspector({
   const description = event.description?.trim() ?? '';
 
   return (
-    <aside
-      className={cn(
-        // Mobile: overlay drawer. Desktop (md+): in-flow right column.
-        'absolute inset-y-0 right-0 z-40 flex w-[min(320px,100%)] flex-col border-l border-border bg-cream',
-        'md:static md:z-auto md:w-80 md:shrink-0',
-      )}
-      data-event-inspector
-      aria-label="Event details"
-    >
+    <>
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border/60 px-3">
         <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
           Event
@@ -170,6 +233,154 @@ export function EventInspector({
           {isDeleting ? 'Deleting…' : 'Delete event'}
         </Button>
       </div>
-    </aside>
+    </>
+  );
+}
+
+/**
+ * Floating inspector for a selected calendar event.
+ * Desktop (md+): popover anchored to the event chip.
+ * Mobile: bottom drawer over the grid.
+ */
+export function EventInspector({
+  event,
+  calendar,
+  focusTitle = false,
+  onClose,
+  onSaveTitle,
+  onDelete,
+  isSaving = false,
+  isDeleting = false,
+  isDragging = false,
+}: EventInspectorProps) {
+  const [title, setTitle] = useState(event.title);
+  const titleRef = useRef<HTMLInputElement>(null);
+  // Track the last-saved title so blur after an unchanged edit is a no-op.
+  const savedTitleRef = useRef(event.title);
+  const isDesktop = useIsDesktop();
+  const rect = useChipRect(event.id);
+  const hidden = isDragging;
+
+  // Sync local title when the selected event changes — but keep a dirty
+  // (unblurred) edit across temp→server id remap so typed text is not lost.
+  useEffect(() => {
+    const dirty = title !== savedTitleRef.current;
+    if (dirty) return;
+    setTitle(event.title);
+    savedTitleRef.current = event.title;
+  }, [event.id, event.title]);
+
+  useEffect(() => {
+    if (focusTitle) {
+      titleRef.current?.focus();
+      titleRef.current?.select();
+    }
+  }, [focusTitle, event.id]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const commitTitle = () => {
+    const next = title.trim();
+    if (!next || next === savedTitleRef.current) {
+      // Restore if blanked out.
+      if (!next) setTitle(savedTitleRef.current);
+      return;
+    }
+    savedTitleRef.current = next;
+    void onSaveTitle(next);
+  };
+
+  const form = (
+    <InspectorForm
+      event={event}
+      calendar={calendar}
+      title={title}
+      setTitle={setTitle}
+      titleRef={titleRef}
+      commitTitle={commitTitle}
+      onClose={onClose}
+      onDelete={onDelete}
+      isSaving={isSaving}
+      isDeleting={isDeleting}
+    />
+  );
+
+  if (isDesktop) {
+    return (
+      <Popover
+        open
+        onOpenChange={(open) => {
+          if (!open) onClose();
+        }}
+        modal={false}
+      >
+        <PopoverAnchor asChild>
+          <span
+            aria-hidden
+            className="fixed pointer-events-none"
+            style={{
+              top: rect?.top ?? 0,
+              left: rect?.left ?? 0,
+              width: rect?.width ?? 0,
+              height: rect?.height ?? 0,
+            }}
+          />
+        </PopoverAnchor>
+        <PopoverContent
+          side="right"
+          align="start"
+          sideOffset={8}
+          collisionPadding={12}
+          className={cn(
+            'z-[60] w-80 p-0 bg-cream flex flex-col max-h-[min(80dvh,560px)]',
+            hidden && 'invisible pointer-events-none',
+          )}
+          onOpenAutoFocus={(e) => {
+            if (!focusTitle) e.preventDefault();
+          }}
+          onInteractOutside={() => {
+            // Let chip / calendar pointer handlers run (select other event,
+            // empty-click discard). Still close via onOpenChange(false).
+          }}
+          data-event-inspector
+        >
+          {form}
+        </PopoverContent>
+      </Popover>
+    );
+  }
+
+  return createPortal(
+    <div
+      className={cn(
+        'fixed inset-0 z-[60]',
+        hidden && 'invisible pointer-events-none',
+      )}
+      data-event-inspector
+    >
+      <button
+        type="button"
+        className="absolute inset-0 bg-black/40"
+        aria-label="Close event details"
+        onClick={onClose}
+      />
+      <div
+        role="dialog"
+        aria-label="Event details"
+        className="absolute inset-x-0 bottom-0 max-h-[85dvh] rounded-t-2xl border-t border-border bg-cream shadow-lg flex flex-col"
+      >
+        {form}
+      </div>
+    </div>,
+    document.body,
   );
 }

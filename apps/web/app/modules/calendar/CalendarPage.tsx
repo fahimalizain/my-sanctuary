@@ -64,7 +64,7 @@ export function CalendarPage() {
   ]);
 
   return (
-    <div className="h-[100dvh] bg-cream flex flex-col pb-20">
+    <div className="h-[100dvh] bg-cream flex flex-col">
       <CalendarHeader
         rangeTitle={strip.rangeTitle}
         isRefreshing={session.isRefreshing}
@@ -148,6 +148,7 @@ export function CalendarPage() {
             onDelete={session.handleDeleteEvent}
             isSaving={session.isSaving}
             isDeleting={session.isDeleting}
+            isDragging={session.isDragging}
           />
         )}
       </div>
