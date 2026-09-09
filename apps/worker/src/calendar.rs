@@ -109,11 +109,15 @@ async fn paint_events_with_fallback(
     }
 }
 
-/// `GET /api/calendar/events` → 200 `{"events":[...],"source":"cache"}`.
+/// `GET /api/calendar/events` → 200
+/// `{"events":[...],"source":"cache","sync":{...}}`.
 ///
-/// Session-gated; refreshes the Google token when stale; syncs each stale
-/// sync-enabled calendar (awaited, never fire-and-forget); then serves the
-/// overlap window from the D1 cache.
+/// Session-gated; refreshes the Google token when stale; syncs each
+/// never-initialized sync-enabled calendar (awaited, never fire-and-forget);
+/// then serves the overlap window from the D1 cache plus a sanitized
+/// replica-health `sync` envelope. Google auth failures on this path are
+/// logged in `sync_errors` — they are **not** mapped to HTTP 401 (401 stays
+/// session-only).
 pub async fn list_events(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -182,6 +186,7 @@ pub async fn list_events(
     let response = Response::from_json(&api_core::CalendarEventsResponse {
         events,
         source: "cache".to_string(),
+        sync: output.sync,
     })?;
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
 }

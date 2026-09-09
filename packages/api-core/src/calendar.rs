@@ -6,13 +6,17 @@
 //! from the caller — never `SystemTime`. The Worker layers session checks and
 //! token refresh on top (`apps/worker/src/calendar.rs`).
 //!
-//! Sync rules (ADR 0001):
-//! - `list_events` awaits a sync only when `last_synced_at` is missing or
-//!   unparseable — i.e. the calendar has never synced (first paint after
-//!   calendar import). Once `last_synced_at` is set, `list_events` is
-//!   cache-only: no stale pull on the request path, whatever the age. The
-//!   fallback cron ([`run_fallback_cron`]) reintroduces a time-based
-//!   threshold (`CRON_SYNC_STALE_SECS`).
+//! Sync rules (ADR 0001 + health envelope):
+//! - `list_events` awaits a sync only when `initial_sync_complete` is false
+//!   **and** `last_synced_at` is missing or unparseable — i.e. the calendar
+//!   has never synced (first paint after calendar import). Once either gate
+//!   is set, `list_events` is cache-only: no stale pull on the request path,
+//!   whatever the age. The fallback cron ([`run_fallback_cron`]) reintroduces
+//!   a time-based threshold (`CRON_SYNC_STALE_SECS`).
+//! - Parseable `last_synced_at` remains the request-path gate (ADR 0001). It
+//!   is **no longer** the health signal: health is the sanitized `sync`
+//!   envelope built from persisted replica columns (`last_success_at`,
+//!   `sync_status`, …) via [`crate::calendar_sync`] (ADR 0005 forthcoming).
 //! - `events.list` uses `singleEvents=false&maxResults=250`, optionally with
 //!   the stored `syncToken` (incremental), and follows `nextPageToken`.
 //! - HTTP 410 (stale sync token) retries once with an empty token (full
@@ -47,6 +51,7 @@ use std::fmt;
 use thiserror::Error;
 use url::Url;
 
+use crate::calendar_sync::{events_sync_envelope, EventsSyncEnvelope};
 use crate::config::OAuthConfig;
 use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
@@ -113,13 +118,17 @@ pub enum CalendarError {
     Repo(#[from] RepoError),
 }
 
-/// Result of [`list_events`]: the cached events plus per-calendar sync errors
-/// for the caller to log (sync failures never fail the whole listing).
+/// Result of [`list_events`]: the cached events, per-calendar sync errors
+/// for the caller to log (sync failures never fail the whole listing), and
+/// the sanitized replica-health envelope for the HTTP response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalendarListOutput {
     pub events: Vec<CalendarEvent>,
     /// Human-readable sync failures; empty when every calendar synced fine.
+    /// Worker console logs only — never placed on the HTTP envelope.
     pub sync_errors: Vec<String>,
+    /// Sanitized per-calendar replica health (no tokens / credentials).
+    pub sync: EventsSyncEnvelope,
 }
 
 /// Result of [`create_event`]: the created event plus the response source.
@@ -135,10 +144,12 @@ pub struct CreateEventOutput {
 ///
 /// Events are painted with the matched category color via
 /// [`crate::calendar_color::paint_events_for_user`] before serialization.
+/// `sync` is the sanitized replica-health envelope (never contains tokens).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CalendarEventsResponse {
     pub events: Vec<crate::calendar_color::CalendarEventView>,
     pub source: String,
+    pub sync: EventsSyncEnvelope,
 }
 
 /// Response envelope for `POST /api/calendar/events` and
@@ -295,15 +306,17 @@ pub async fn list_events(
                 }
             }
         }
-        // Cache-only after first paint (ADR 0001): a set, parseable
-        // `last_synced_at` means the sync cursor exists, so never pull on the
-        // request path — regardless of age. Missing or unparseable means the
-        // calendar has never synced: await the first sync.
-        let previously_synced = cal
-            .last_synced_at
-            .as_deref()
-            .and_then(rfc3339_to_unix_secs)
-            .is_some();
+        // Cache-only after first paint (ADR 0001): `initial_sync_complete` or
+        // a set, parseable `last_synced_at` means the sync cursor exists, so
+        // never pull on the request path — regardless of age or envelope
+        // staleness. Missing both means the calendar has never synced: await
+        // the first sync.
+        let previously_synced = cal.initial_sync_complete
+            || cal
+                .last_synced_at
+                .as_deref()
+                .and_then(rfc3339_to_unix_secs)
+                .is_some();
         if previously_synced {
             continue;
         }
@@ -341,9 +354,20 @@ pub async fn list_events(
     let cached = events
         .list_by_user_id_and_time_range(user_id, start_rfc3339, end_rfc3339)
         .await?;
+
+    // Re-read calendars so the health envelope reflects any `update_sync_state`
+    // (or future `record_sync_*`) writes from this request. On re-read failure,
+    // fall back to the in-memory snapshot from the start of the request.
+    let fresh = match calendars.list_by_user_id(user_id).await {
+        Ok(rows) => rows,
+        Err(_) => cals,
+    };
+    let sync = events_sync_envelope(&fresh, now_unix);
+
     Ok(CalendarListOutput {
         events: cached,
         sync_errors,
+        sync,
     })
 }
 
@@ -2008,6 +2032,14 @@ mod tests {
                 sync_token.to_string(),
                 last_synced_at_rfc3339.to_string(),
             ));
+            // Match D1 `CALENDAR_UPDATE_SYNC_STATE_SQL`: persist token +
+            // last_synced_at onto the stored row so a re-read after
+            // `sync_calendar` sees compat success.
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.sync_token = sync_token.to_string();
+                cal.last_synced_at = Some(last_synced_at_rfc3339.to_string());
+            }
             Ok(())
         }
 
@@ -2816,6 +2848,20 @@ mod tests {
 
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty());
+
+        // After fake `update_sync_state` persistence, re-read shows compat
+        // ready / not stale (last_synced_at == now).
+        assert_eq!(output.sync.calendars.len(), 1);
+        let health = &output.sync.calendars[0];
+        assert_eq!(health.calendar_id, "cal-1");
+        assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
+        assert!(health.initial_sync_complete);
+        assert!(!health.stale, "fresh last_synced_at must not be stale");
+        assert_eq!(
+            health.last_success_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(output.sync.status, crate::calendar_sync::SyncAggregateStatus::Ready);
     }
 
     #[test]
@@ -2839,6 +2885,88 @@ mod tests {
         assert!(events.upserted_batch.lock().unwrap().is_empty());
         assert!(calendars.sync_states.lock().unwrap().is_empty(), "sync state untouched");
         assert!(output.sync_errors.is_empty());
+
+        // Health envelope: old last_synced_at → degraded + stale, but compat
+        // state is still ready / initial_sync_complete.
+        assert_eq!(
+            output.sync.status,
+            crate::calendar_sync::SyncAggregateStatus::Degraded
+        );
+        assert_eq!(output.sync.calendars.len(), 1);
+        let health = &output.sync.calendars[0];
+        assert!(health.stale);
+        assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
+        assert!(health.initial_sync_complete);
+        assert!(health.error_code.is_none());
+    }
+
+    #[test]
+    fn list_events_returns_sync_envelope_when_event_window_is_empty() {
+        // Already synced, recent last_synced_at, zero events in the window.
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.last_synced_at = Some("2023-11-14T22:00:00Z".to_string());
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert!(output.events.is_empty());
+        assert!(http.gets.lock().unwrap().is_empty());
+        assert_eq!(output.sync.calendars.len(), 1);
+        assert_eq!(output.sync.calendars[0].calendar_id, "cal-1");
+        assert_eq!(
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::Ready
+        );
+        assert!(!output.sync.calendars[0].stale);
+        assert_eq!(
+            output.sync.status,
+            crate::calendar_sync::SyncAggregateStatus::Ready
+        );
+    }
+
+    #[test]
+    fn list_events_sync_envelope_never_leaks_sync_token() {
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "secret-sync-token-xyz".to_string();
+        cal.last_error_code = "storage_transient".to_string();
+        cal.sync_status = "retrying".to_string();
+        cal.last_success_at = Some("2023-11-10T00:00:00Z".to_string());
+        cal.last_synced_at = Some("2023-11-10T00:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        cal.lease_owner = "lease-secret-should-not-leak".to_string();
+
+        let http = FakeHttp::new(vec![]);
+        let calendars = FakeCalendarRepo::with(vec![cal]);
+        let events = FakeEventRepo::new();
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            output.sync.calendars[0].error_code.as_deref(),
+            Some("storage_transient")
+        );
+        assert_eq!(
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::Retrying
+        );
+
+        let json = serde_json::to_string(&output.sync).unwrap();
+        assert!(json.contains("storage_transient"), "{json}");
+        assert!(!json.contains("secret-sync-token-xyz"), "{json}");
+        assert!(!json.contains("sync_token"), "{json}");
+        assert!(!json.contains("lease-secret-should-not-leak"), "{json}");
     }
 
     #[test]

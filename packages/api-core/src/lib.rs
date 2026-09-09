@@ -7,6 +7,7 @@
 pub mod agenda;
 pub mod calendar;
 pub mod calendar_color;
+pub mod calendar_sync;
 pub mod categories;
 pub mod google_color;
 pub mod lists;
@@ -42,6 +43,12 @@ pub use calendar::{
     CronReport, DeleteEventResponse, WebhookDecision, CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL,
     GOOGLE_CHANNELS_STOP_URL, GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS,
     WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
+};
+pub use calendar_sync::{
+    aggregate_sync_status, calendar_sync_view, classify_sync_error, events_sync_envelope,
+    next_retry_rfc3339, next_retry_unix, replica_query_fingerprint, replica_state_for_error,
+    CalendarReplicaState, CalendarSyncView, EventsSyncEnvelope, SyncAggregateStatus, SyncErrorCode,
+    REPLICA_PROJECTION, SYNC_HEALTH_STALE_SECS,
 };
 pub use calendar_color::{
     calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
