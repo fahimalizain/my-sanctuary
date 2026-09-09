@@ -3,6 +3,12 @@
 Status: Accepted
 Date: 2026-08-18
 
+> Amendment (2026-09-10): **Health signal superseded by ADR 0005.** Parseable
+> `last_synced_at` remains the request-path cache-only *gate* after first
+> paint; it is no longer treated as freshness/health. Replica health lives in
+> dedicated columns and the sanitized `sync` envelope (ADR 0005). Watch
+> channels, 15-minute cron, no Queue, and 404-disable behaviour are unchanged.
+
 ## Context
 
 Calendar sync is pull-only today: `GET /api/calendar/events` syncs on the request path, so changes from Google appear only when the user opens the app. We want Google to push changes to us instead. This ADR is slice 1 of N: it locks the design for `events.watch` push channels. Nothing is implemented yet; later slices implement against this document.

@@ -6,7 +6,7 @@
 //! from the caller — never `SystemTime`. The Worker layers session checks and
 //! token refresh on top (`apps/worker/src/calendar.rs`).
 //!
-//! Sync rules (ADR 0001 + health envelope):
+//! Sync rules (ADR 0001 + ADR 0005 health):
 //! - `list_events` awaits a sync only when `initial_sync_complete` is false
 //!   **and** `last_synced_at` is missing or unparseable — i.e. the calendar
 //!   has never synced (first paint after calendar import). Once either gate
@@ -14,9 +14,13 @@
 //!   whatever the age. The fallback cron ([`run_fallback_cron`]) reintroduces
 //!   a time-based threshold (`CRON_SYNC_STALE_SECS`).
 //! - Parseable `last_synced_at` remains the request-path gate (ADR 0001). It
-//!   is **no longer** the health signal: health is the sanitized `sync`
-//!   envelope built from persisted replica columns (`last_success_at`,
-//!   `sync_status`, …) via [`crate::calendar_sync`] (ADR 0005 forthcoming).
+//!   is **not** the health signal: health is the sanitized `sync` envelope
+//!   built from persisted replica columns (`last_success_at`, `sync_status`,
+//!   …) via [`crate::calendar_sync`] (ADR 0005).
+//! - [`sync_calendar`] records `record_sync_attempt` before any Google fetch,
+//!   `record_sync_success` only when apply finished **and** a terminal
+//!   `nextSyncToken` is present, and `record_sync_failure` on every other
+//!   path (including missing terminal token). Attempt ≠ success.
 //! - `events.list` uses `singleEvents=false&maxResults=250`, optionally with
 //!   the stored `syncToken` (incremental), and follows `nextPageToken`.
 //! - HTTP 410 (stale sync token) retries once with an empty token (full
@@ -51,7 +55,10 @@ use std::fmt;
 use thiserror::Error;
 use url::Url;
 
-use crate::calendar_sync::{events_sync_envelope, EventsSyncEnvelope};
+use crate::calendar_sync::{
+    classify_sync_error, events_sync_envelope, next_retry_rfc3339, replica_query_fingerprint,
+    replica_state_for_error, EventsSyncEnvelope, SyncErrorCode,
+};
 use crate::config::OAuthConfig;
 use crate::google_color::{canonicalize_hex, snap_to_event_label_hex};
 use crate::models::{
@@ -355,9 +362,9 @@ pub async fn list_events(
         .list_by_user_id_and_time_range(user_id, start_rfc3339, end_rfc3339)
         .await?;
 
-    // Re-read calendars so the health envelope reflects any `update_sync_state`
-    // (or future `record_sync_*`) writes from this request. On re-read failure,
-    // fall back to the in-memory snapshot from the start of the request.
+    // Re-read calendars so the health envelope reflects any `record_sync_*`
+    // writes from this request. On re-read failure, fall back to the
+    // in-memory snapshot from the start of the request.
     let fresh = match calendars.list_by_user_id(user_id).await {
         Ok(rows) => rows,
         Err(_) => cals,
@@ -1488,12 +1495,51 @@ async fn refresh_calendar_list(
 }
 
 /// Full or incremental sync of one calendar: fetch events (following
-/// `nextPageToken`, retrying once on 410), upsert them, and store the new
-/// sync cursor.
+/// `nextPageToken`, retrying once on 410), upsert them, and persist health
+/// independently of the cursor (ADR 0005).
 ///
-/// `pub` for the webhook handler and the fallback cron (later slices); the
-/// request path reaches it via [`list_events`].
+/// - Attempt is stamped **before** any Google fetch.
+/// - Success requires apply finished **and** a non-empty terminal
+///   `nextSyncToken` (empty `items` + token still counts).
+/// - Every other path records failure without advancing the token.
+///
+/// `pub` for the webhook handler and the fallback cron; the request path
+/// reaches it via [`list_events`].
 pub async fn sync_calendar(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    now_rfc3339: &str,
+) -> Result<(), CalendarError> {
+    calendars
+        .record_sync_attempt(&cal.id, now_rfc3339)
+        .await?;
+    let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
+
+    match sync_calendar_body(http, calendars, events, access, cal, now_rfc3339).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let code = match &err {
+                CalendarError::InvalidResponse(msg)
+                    if msg.contains("missing nextSyncToken") =>
+                {
+                    SyncErrorCode::MissingSyncToken
+                }
+                _ => classify_sync_error(&err),
+            };
+            match persist_sync_failure(calendars, cal, code, now_unix, now_rfc3339).await {
+                Ok(()) => Err(err),
+                Err(persist_err) => Err(persist_err),
+            }
+        }
+    }
+}
+
+/// Fetch + apply + success stamp. Callers must have already recorded attempt;
+/// on `Err` the caller records failure (including missing terminal token).
+async fn sync_calendar_body(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
@@ -1521,6 +1567,7 @@ pub async fn sync_calendar(
         if status == 410 && !retried_resync {
             // Stale sync token: drop it and the paging cursor, restart with a
             // full resync (same as Go's recursive fetchGoogleEvents retry).
+            // Do not record failure on the first 410 — we are about to retry.
             retried_resync = true;
             sync_token = None;
             page_token = None;
@@ -1570,10 +1617,48 @@ pub async fn sync_calendar(
         events.upsert_batch(to_upsert, now_rfc3339).await?;
     }
 
-    // Keep the previous sync token when Google omitted nextSyncToken.
-    let next_token = next_sync_token.unwrap_or_else(|| cal.sync_token.clone());
+    // Publication success requires a terminal nextSyncToken. Missing or empty
+    // token after a successful apply is still not success — leave the old
+    // cursor so the next run can replay (upsert-by-id).
+    let Some(next_token) = next_sync_token.filter(|t| !t.is_empty()) else {
+        return Err(CalendarError::InvalidResponse(
+            "missing nextSyncToken on terminal page".into(),
+        ));
+    };
     calendars
-        .update_sync_state(&cal.id, &next_token, now_rfc3339)
+        .record_sync_success(
+            &cal.id,
+            &next_token,
+            &replica_query_fingerprint(),
+            now_rfc3339,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Persist a classified failure without advancing the sync cursor.
+///
+/// Uses `cal.failure_streak + 1` for backoff (the in-memory snapshot at
+/// invocation — attempt does not bump streak). Returns a repo error if the
+/// health write itself fails so callers never drop health silently.
+async fn persist_sync_failure(
+    calendars: &dyn CalendarRepo,
+    cal: &GoogleCalendar,
+    code: SyncErrorCode,
+    now_unix: i64,
+    now_rfc3339: &str,
+) -> Result<(), CalendarError> {
+    let state = replica_state_for_error(code);
+    let streak_for_backoff = cal.failure_streak.saturating_add(1);
+    let retry = next_retry_rfc3339(now_unix, streak_for_backoff);
+    calendars
+        .record_sync_failure(
+            &cal.id,
+            code.as_str(),
+            state.as_str(),
+            &retry,
+            now_rfc3339,
+        )
         .await?;
     Ok(())
 }
@@ -2059,6 +2144,13 @@ mod tests {
             query_fingerprint: &str,
             now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            // Keep `sync_states` meaningful for tests that assert cursor
+            // advancement (mirrors legacy `update_sync_state` recording).
+            self.sync_states.lock().unwrap().push((
+                id.to_string(),
+                sync_token.to_string(),
+                now_rfc3339.to_string(),
+            ));
             let mut stored = self.stored.lock().unwrap();
             if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                 cal.sync_token = sync_token.to_string();
@@ -2105,6 +2197,12 @@ mod tests {
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             self.disabled.lock().unwrap().push((id.to_string(), enabled));
+            // Mutate stored so a re-read after 404-disable shows `disabled`
+            // in the health envelope.
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+                cal.sync_enabled = enabled;
+            }
             Ok(())
         }
 
@@ -2185,6 +2283,9 @@ mod tests {
             events: Vec<NewCalendarEvent>,
             now_rfc3339: &str,
         ) -> Result<(), RepoError> {
+            if *self.fail_upsert.lock().unwrap() {
+                return Err(RepoError::Backend("cache write failed".into()));
+            }
             self.upserted_batch.lock().unwrap().extend(events.clone());
             let mut next = self.next_id.lock().unwrap();
             for event in events {
@@ -2744,14 +2845,16 @@ mod tests {
     fn calendar_get_without_label_properties_stores_empty_array() {
         // Holiday-style `calendars.get` body: no `labelProperties` at all.
         // The cache must read `"[]"` (fetched, no labels) — never stay empty.
+        // `/events` must be listed before `/calendars/` so events.list URLs
+        // (which contain both substrings) do not match the calendars.get body.
         let http = FakeHttp::new(vec![
             ("calendarList", 200, CALENDAR_LIST_JSON),
+            ("/events", 200, r#"{"items":[],"nextSyncToken":"st-1"}"#),
             (
                 "/calendars/",
                 200,
                 r#"{"id":"en.usa#holiday@group.v.calendar.google.com","summary":"Holidays","timeZone":"UTC"}"#,
             ),
-            ("/events", 200, r#"{"items":[],"nextSyncToken":"st-1"}"#),
         ]);
         let calendars = FakeCalendarRepo::with(vec![]);
         let events = FakeEventRepo::new();
@@ -2838,7 +2941,7 @@ mod tests {
         assert_eq!(upserted[0].start_time, "2026-08-18T09:00:00Z");
         assert_eq!(upserted[0].recurrence, r#"["RRULE:FREQ=DAILY"]"#);
 
-        // Sync state advanced with Google's nextSyncToken.
+        // Sync state advanced with Google's nextSyncToken via record_sync_success.
         let states = calendars.sync_states.lock().unwrap();
         assert_eq!(*states, vec![("cal-1".to_string(), "st-9".to_string(), "2023-11-14T22:13:20Z".to_string())]);
 
@@ -2849,19 +2952,242 @@ mod tests {
         assert_eq!(output.events.len(), 2);
         assert!(output.sync_errors.is_empty());
 
-        // After fake `update_sync_state` persistence, re-read shows compat
-        // ready / not stale (last_synced_at == now).
+        // After record_sync_success, re-read shows ready / not stale.
         assert_eq!(output.sync.calendars.len(), 1);
         let health = &output.sync.calendars[0];
         assert_eq!(health.calendar_id, "cal-1");
         assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
         assert!(health.initial_sync_complete);
-        assert!(!health.stale, "fresh last_synced_at must not be stale");
+        assert!(!health.stale, "fresh last_success_at must not be stale");
         assert_eq!(
             health.last_success_at.as_deref(),
             Some("2023-11-14T22:13:20Z")
         );
+        assert_eq!(
+            health.last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert!(health.error_code.is_none());
         assert_eq!(output.sync.status, crate::calendar_sync::SyncAggregateStatus::Ready);
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "st-9");
+        assert_eq!(stored[0].failure_streak, 0);
+        assert_eq!(stored[0].sync_status, "ready");
+        assert!(stored[0].initial_sync_complete);
+        assert_eq!(stored[0].cache_revision, 1);
+        assert!(stored[0].last_error_code.is_empty());
+    }
+
+    #[test]
+    fn empty_items_with_next_sync_token_is_success() {
+        // Completed empty incremental: items=[] + nextSyncToken is publication.
+        let http = FakeHttp::new(vec![("/events", 200, r#"{"items":[],"nextSyncToken":"st-empty"}"#)]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let watches = FakeWatchChannelRepo::new();
+
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
+        assert!(output.events.is_empty());
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "st-empty");
+        assert_eq!(
+            stored[0].last_success_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(stored[0].failure_streak, 0);
+        assert_eq!(stored[0].sync_status, "ready");
+        assert!(stored[0].initial_sync_complete);
+        assert_eq!(stored[0].cache_revision, 1);
+        assert!(stored[0].last_error_code.is_empty());
+
+        assert_eq!(
+            output.sync.status,
+            crate::calendar_sync::SyncAggregateStatus::Ready
+        );
+        let health = &output.sync.calendars[0];
+        assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Ready);
+        assert!(!health.stale);
+        assert!(health.error_code.is_none());
+    }
+
+    #[test]
+    fn google_list_failure_records_attempt_not_success() {
+        // Seed a previously healthy calendar; call sync_calendar directly
+        // (list_events would be cache-only), then list_events for the envelope.
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        cal.failure_streak = 0;
+        cal.sync_status = "ready".to_string();
+
+        let http = FakeHttp::new(vec![("/events", 500, "")]);
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")),
+            "{err:?}"
+        );
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(
+            stored[0].last_success_at.as_deref(),
+            Some("2023-11-14T21:00:00Z"),
+            "success timestamp must not move on failure"
+        );
+        assert_eq!(stored[0].sync_token, "old-tok");
+        assert_eq!(stored[0].failure_streak, 1);
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert_eq!(stored[0].last_error_code, "google_transient");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        drop(stored);
+
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+
+        // Cache-only: no additional Google calls beyond the failed sync.
+        assert_eq!(http.gets.lock().unwrap().len(), 1);
+        assert_eq!(
+            output.sync.status,
+            crate::calendar_sync::SyncAggregateStatus::Degraded
+        );
+        let health = &output.sync.calendars[0];
+        assert_eq!(health.state, crate::calendar_sync::CalendarReplicaState::Retrying);
+        assert_eq!(health.error_code.as_deref(), Some("google_transient"));
+
+        let json = serde_json::to_string(&output.sync).unwrap();
+        assert!(!json.contains("old-tok"), "{json}");
+    }
+
+    #[test]
+    fn upsert_failure_records_storage_transient_without_advancing_token() {
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        cal.sync_status = "ready".to_string();
+
+        let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+        *events.fail_upsert.lock().unwrap() = true;
+
+        let err = pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, CalendarError::Repo(_)), "{err:?}");
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "old-tok");
+        assert_eq!(
+            stored[0].last_success_at.as_deref(),
+            Some("2023-11-14T21:00:00Z")
+        );
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(stored[0].failure_streak, 1);
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert_eq!(stored[0].last_error_code, "storage_transient");
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_terminal_next_sync_token_is_not_success() {
+        // Single page 200 with items but no nextSyncToken / nextPageToken.
+        let body = r#"{"items":[
+            {"id": "evt-1", "summary": "Standup",
+             "start": {"dateTime": "2026-08-18T09:00:00Z"},
+             "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+        ]}"#;
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "old-tok".to_string();
+        cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+        cal.initial_sync_complete = true;
+        cal.sync_status = "ready".to_string();
+
+        let http = FakeHttp::new(vec![("/events", 200, body)]);
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CalendarError::InvalidResponse(ref m) if m.contains("missing nextSyncToken")),
+            "{err:?}"
+        );
+
+        // Apply may have happened; publication did not.
+        assert_eq!(events.upserted_batch.lock().unwrap().len(), 1);
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "old-tok");
+        assert_eq!(
+            stored[0].last_success_at.as_deref(),
+            Some("2023-11-14T21:00:00Z")
+        );
+        assert_eq!(
+            stored[0].last_synced_at.as_deref(),
+            Some("2023-11-14T21:00:00Z")
+        );
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(stored[0].last_error_code, "missing_sync_token");
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert_eq!(stored[0].failure_streak, 1);
+        assert!(calendars.sync_states.lock().unwrap().is_empty());
+        drop(stored);
+
+        // list_events is cache-only and surfaces the persisted health +
+        // does not re-sync; first-paint path would also surface sync_errors.
+        let watches = FakeWatchChannelRepo::new();
+        let output = pollster::block_on(list_events(
+            &http, &calendars, &events, &watches, &access(), "u-1",
+            "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+        ))
+        .unwrap();
+        assert_eq!(
+            output.sync.calendars[0].error_code.as_deref(),
+            Some("missing_sync_token")
+        );
+        assert_eq!(
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::Retrying
+        );
     }
 
     #[test]
@@ -3007,6 +3333,50 @@ mod tests {
         assert_eq!(output.sync_errors.len(), 1);
         assert!(output.sync_errors[0].contains("404"), "{}", output.sync_errors[0]);
         assert!(output.events.is_empty(), "cache still served");
+
+        // Failure recorded, then sync disabled — envelope shows disabled.
+        let stored = calendars.stored.lock().unwrap();
+        assert!(!stored[0].sync_enabled);
+        assert_eq!(stored[0].last_error_code, "not_found");
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        drop(stored);
+        assert_eq!(
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::Disabled
+        );
+    }
+
+    #[test]
+    fn events_list_410_after_retry_records_gone() {
+        // First 410 retries in-invocation; second 410 is gone (not success).
+        let http = FakeHttp::new(vec![("/events", 410, "")]);
+        let mut cal = calendar("cal-1", "primary@example.com", true);
+        cal.sync_token = "stale-token".to_string();
+        let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+        let events = FakeEventRepo::new();
+
+        let err = pollster::block_on(sync_calendar(
+            &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, CalendarError::GoogleApi(ref m) if m.contains("410")),
+            "{err:?}"
+        );
+
+        let stored = calendars.stored.lock().unwrap();
+        assert_eq!(stored[0].sync_token, "stale-token", "token not cleared on gone");
+        assert_eq!(stored[0].last_error_code, "gone");
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert_eq!(stored[0].failure_streak, 1);
+        assert!(stored[0].last_success_at.is_none());
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
     }
 
     #[test]
@@ -3061,7 +3431,8 @@ mod tests {
     #[test]
     fn events_list_follows_next_page_token() {
         let page_one = r#"{"items":[{"id":"p1","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
-        let page_two = r#"{"items":[{"id":"p2","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}]}"#;
+        // Terminal page must carry nextSyncToken for publication success.
+        let page_two = r#"{"items":[{"id":"p2","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-page"}"#;
         let http = FakeHttp::new(vec![
             ("pageToken=tok-2", 200, page_two),
             ("/events", 200, page_one),
@@ -3081,6 +3452,12 @@ mod tests {
         assert!(gets[1].contains("pageToken=tok-2"), "{gets:?}");
         assert_eq!(events.upserted_batch.lock().unwrap().len(), 2);
         assert_eq!(output.events.len(), 2);
+        assert!(output.sync_errors.is_empty(), "{:?}", output.sync_errors);
+        assert_eq!(calendars.sync_states.lock().unwrap()[0].1, "st-page");
+        assert_eq!(
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::Ready
+        );
     }
 
     #[test]
@@ -3182,6 +3559,26 @@ mod tests {
             output.sync_errors[0].contains("cache delete failed"),
             "{}",
             output.sync_errors[0]
+        );
+
+        // Health: attempt set, storage_transient, streak++, no success stamp.
+        let stored = calendars.stored.lock().unwrap();
+        assert!(stored[0].sync_token.is_empty(), "token never advanced");
+        assert!(stored[0].last_success_at.is_none());
+        assert_eq!(
+            stored[0].last_attempt_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(stored[0].last_error_code, "storage_transient");
+        assert_eq!(stored[0].failure_streak, 1);
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert_eq!(
+            output.sync.calendars[0].error_code.as_deref(),
+            Some("storage_transient")
+        );
+        assert_eq!(
+            output.sync.calendars[0].state,
+            crate::calendar_sync::CalendarReplicaState::Retrying
         );
     }
 

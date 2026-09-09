@@ -4,8 +4,8 @@
 //! health columns. Never exposes `sync_token`, OAuth credentials, lease
 //! secrets, event bodies, or `raw_json`.
 //!
-//! Classification and backoff helpers are used by the write path (slice 3);
-//! this module only *reads* health for the request envelope today.
+//! Classification and backoff helpers are used by `sync_calendar` (ADR 0005);
+//! this module also *reads* health for the request envelope.
 
 use std::fmt;
 
