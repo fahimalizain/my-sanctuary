@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   removeCalendarEventFromCache,
   upsertCalendarEventInCache,
@@ -28,10 +22,7 @@ import {
   eventChipColor,
 } from '../lib/calendar-model';
 import { isPersistableDraftTitle } from '../lib/event-draft';
-import {
-  isTempEventId,
-  newTempEventId,
-} from '../lib/event-overlays';
+import { isTempEventId, newTempEventId } from '../lib/event-overlays';
 import { useCalendarDrag } from './useCalendarDrag';
 import {
   COL_HEADER_H,
@@ -132,10 +123,7 @@ export function useCalendarSession({
   }, [calendars, selectionReady]);
 
   // Overlay first so inspector shows optimistic create/move/resize.
-  const overlaidEvents = useMemo(
-    () => queue.apply(events),
-    [queue, events],
-  );
+  const overlaidEvents = useMemo(() => queue.apply(events), [queue, events]);
 
   const selectedEvent = useMemo(() => {
     if (!selectedEventId) return null;
@@ -144,11 +132,7 @@ export function useCalendarSession({
 
   // Drop selection if the event disappeared (deleted / filtered out of cache).
   useEffect(() => {
-    if (
-      selectedEventId &&
-      !selectedEvent &&
-      !eventsQuery.isFetching
-    ) {
+    if (selectedEventId && !selectedEvent && !eventsQuery.isFetching) {
       setSelectedEventId(null);
       setFocusTitleOnOpen(false);
     }
@@ -316,8 +300,7 @@ export function useCalendarSession({
                       patchAfter.event.title === patchResult.event.title &&
                       patchAfter.event.start_time ===
                         patchResult.event.start_time &&
-                      patchAfter.event.end_time ===
-                        patchResult.event.end_time)
+                      patchAfter.event.end_time === patchResult.event.end_time)
                   ) {
                     queue.clear(serverId);
                   }
@@ -422,10 +405,7 @@ export function useCalendarSession({
       id === unpersistedDraftId
     ) {
       queue.clear(id);
-      if (
-        unpersistedDraftIdRef.current === id ||
-        unpersistedDraftId === id
-      ) {
+      if (unpersistedDraftIdRef.current === id || unpersistedDraftId === id) {
         setDraftId(null);
       }
       setSelectedEventId(null);
@@ -473,12 +453,7 @@ export function useCalendarSession({
       if (!knownCalendarIds.has(e.calendar_id)) return true;
       return false;
     });
-  }, [
-    overlaidEvents,
-    selectedCalendarIds,
-    knownCalendarIds,
-    selectionReady,
-  ]);
+  }, [overlaidEvents, selectedCalendarIds, knownCalendarIds, selectionReady]);
 
   const { timedEvents, allDayEvents } = useMemo(() => {
     const timed: CalendarEvent[] = [];
@@ -601,8 +576,7 @@ export function useCalendarSession({
   );
 
   const timedPreviewByDay = useMemo(
-    () =>
-      timedPreviewSegments(drag.preview, drag.previewKind, days, hourH),
+    () => timedPreviewSegments(drag.preview, drag.previewKind, days, hourH),
     [drag.preview, drag.previewKind, days, hourH],
   );
 
@@ -645,10 +619,7 @@ export function useCalendarSession({
     return idx >= 0 ? idx : null;
   }, [days]);
 
-  const hourLabels = useMemo(
-    () => Array.from({ length: 24 }, (_, h) => h),
-    [],
-  );
+  const hourLabels = useMemo(() => Array.from({ length: 24 }, (_, h) => h), []);
 
   const hourGridBg = useMemo(() => hourGridBackground(hourH), [hourH]);
 

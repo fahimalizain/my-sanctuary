@@ -91,9 +91,7 @@ export function buildAllDayChips(
     const first = startOfDay(start);
     const last = lastOccupiedCivilDate(start, end);
 
-    let startDay = Math.round(
-      (first.getTime() - origin.getTime()) / msPerDay,
-    );
+    let startDay = Math.round((first.getTime() - origin.getTime()) / msPerDay);
     let endDay = Math.round((last.getTime() - origin.getTime()) / msPerDay);
 
     // No overlap with rendered window [0, dayCount).

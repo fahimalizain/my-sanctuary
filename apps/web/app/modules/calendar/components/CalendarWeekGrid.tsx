@@ -1,7 +1,4 @@
-import type {
-  PointerEvent as ReactPointerEvent,
-  RefObject,
-} from 'react';
+import type { PointerEvent as ReactPointerEvent, RefObject } from 'react';
 import { Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { CalendarEvent } from '@/app/types';
@@ -42,20 +39,14 @@ export interface CalendarWeekGridProps {
   eventsByDay: Map<string, PositionedEvent[]>;
   selectedEventId: string | null;
   draggingEventId: string | null;
-  onColumnPointerDown: (
-    e: ReactPointerEvent<HTMLElement>,
-    day: Date,
-  ) => void;
+  onColumnPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   onChipPointerDown: (
     e: ReactPointerEvent<HTMLElement>,
     event: CalendarEvent,
     chipEl: HTMLElement,
   ) => void;
   onSelectChip: (eventId: string) => void;
-  onAllDayPointerDown: (
-    e: ReactPointerEvent<HTMLElement>,
-    day: Date,
-  ) => void;
+  onAllDayPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   onChipSelect: (eventId: string) => void;
   isDragging: boolean;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
@@ -160,10 +151,7 @@ export function CalendarWeekGrid({
           </div>
 
           {/* All-day band — sticky under headers */}
-          <div
-            className="sticky z-20 bg-cream"
-            style={{ top: COL_HEADER_H }}
-          >
+          <div className="sticky z-20 bg-cream" style={{ top: COL_HEADER_H }}>
             <AllDayRow
               days={days}
               colWidth={colW}
@@ -180,10 +168,7 @@ export function CalendarWeekGrid({
 
           {/* Hours: sticky left gutter + day columns */}
           <div
-            className={cn(
-              'relative flex',
-              isDragging && 'select-none',
-            )}
+            className={cn('relative flex', isDragging && 'select-none')}
             style={{ height: totalHoursH, width: contentWidth }}
           >
             {/* Time gutter */}
@@ -210,8 +195,7 @@ export function CalendarWeekGrid({
             {days.map((day) => {
               const isTodayCol = isSameDay(day, today);
               const dayKey = day.toDateString();
-              const dayEvents =
-                eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
+              const dayEvents = eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
 
               return (
                 <DayColumn

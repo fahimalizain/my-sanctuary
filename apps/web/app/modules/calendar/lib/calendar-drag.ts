@@ -55,7 +55,11 @@ export function resizeEdgeAt(
   localY: number,
   chipHeight: number,
 ): 'start' | 'end' | null {
-  if (!Number.isFinite(localY) || !Number.isFinite(chipHeight) || chipHeight <= 0) {
+  if (
+    !Number.isFinite(localY) ||
+    !Number.isFinite(chipHeight) ||
+    chipHeight <= 0
+  ) {
     return null;
   }
   const handle = RESIZE_HANDLE_PX;
@@ -206,4 +210,3 @@ export function allDayPreviewIndices(
   if (endDay < startDay) return null;
   return { startDay, endDay };
 }
-

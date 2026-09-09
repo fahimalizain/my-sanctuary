@@ -19,11 +19,7 @@ import {
   resizeEdgeAt,
   resizedRange,
 } from '../lib/calendar-drag';
-import {
-  minutesFromY,
-  snapMinutes,
-  startOfDay,
-} from '../lib/week-layout';
+import { minutesFromY, snapMinutes, startOfDay } from '../lib/week-layout';
 import type { CalendarEvent } from '@/app/types';
 
 export interface UseCalendarDragOptions {
@@ -45,19 +41,13 @@ export interface UseCalendarDragOptions {
 }
 
 export interface CalendarDragApi {
-  onColumnPointerDown: (
-    e: ReactPointerEvent<HTMLElement>,
-    day: Date,
-  ) => void;
+  onColumnPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   onChipPointerDown: (
     e: ReactPointerEvent<HTMLElement>,
     event: CalendarEvent,
     chipEl: HTMLElement,
   ) => void;
-  onAllDayPointerDown: (
-    e: ReactPointerEvent<HTMLElement>,
-    day: Date,
-  ) => void;
+  onAllDayPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   preview: TimedRange | null;
   previewKind: DragKind | null;
   /** Event being moved/resized (null for create gestures). */
@@ -100,7 +90,11 @@ function slotFromColumn(
   return { day: startOfDay(day), minutes };
 }
 
-function hitTestTimed(clientX: number, clientY: number, hourH: number): DragSlot | null {
+function hitTestTimed(
+  clientX: number,
+  clientY: number,
+  hourH: number,
+): DragSlot | null {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return null;
   const col = el.closest('[data-day-col]') as HTMLElement | null;
@@ -170,11 +164,7 @@ export function useCalendarDrag(
   const [didDrag, setDidDrag] = useState(false);
 
   const beginSession = useCallback(
-    (
-      next: Session,
-      target: HTMLElement,
-      e: ReactPointerEvent<HTMLElement>,
-    ) => {
+    (next: Session, target: HTMLElement, e: ReactPointerEvent<HTMLElement>) => {
       sessionRef.current = next;
       didDragRef.current = false;
       setSession(next);

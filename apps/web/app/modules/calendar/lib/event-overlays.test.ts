@@ -82,9 +82,10 @@ test('applyEventOverlays: upsert replaces matching id in place', () => {
     start_time: '2026-09-08T15:00:00.000Z',
     end_time: '2026-09-08T16:00:00.000Z',
   });
-  const result = applyEventOverlays([e1, e2, e3], [
-    { op: 'upsert', event: moved },
-  ]);
+  const result = applyEventOverlays(
+    [e1, e2, e3],
+    [{ op: 'upsert', event: moved }],
+  );
   assert.equal(result.length, 3);
   assert.equal(result[0], moved);
   assert.equal(result[1], e2);
@@ -110,9 +111,10 @@ test('applyEventOverlays: delete drops matching id', () => {
 });
 
 test('applyEventOverlays: delete of unknown id is no-op', () => {
-  const result = applyEventOverlays([e1, e2], [
-    { op: 'delete', id: 'missing' },
-  ]);
+  const result = applyEventOverlays(
+    [e1, e2],
+    [{ op: 'delete', id: 'missing' }],
+  );
   assert.deepEqual(
     result.map((e) => e.id),
     ['e1', 'e2'],
@@ -163,10 +165,13 @@ test('applyEventOverlays: two upserts same id → last wins', () => {
     start_time: '2026-09-08T14:00:00.000Z',
     end_time: '2026-09-08T15:00:00.000Z',
   });
-  const result = applyEventOverlays([e1], [
-    { op: 'upsert', event: first },
-    { op: 'upsert', event: second },
-  ]);
+  const result = applyEventOverlays(
+    [e1],
+    [
+      { op: 'upsert', event: first },
+      { op: 'upsert', event: second },
+    ],
+  );
   assert.equal(result.length, 1);
   assert.equal(result[0], second);
   assert.equal(result[0].title, 'Second');
@@ -179,9 +184,10 @@ test('applyEventOverlays: preserves relative order of server rows', () => {
     start_time: '2026-09-08T18:00:00.000Z',
     end_time: '2026-09-08T19:00:00.000Z',
   });
-  const result = applyEventOverlays([e1, e2, e3], [
-    { op: 'upsert', event: moved2 },
-  ]);
+  const result = applyEventOverlays(
+    [e1, e2, e3],
+    [{ op: 'upsert', event: moved2 }],
+  );
   assert.deepEqual(
     result.map((e) => e.id),
     ['e1', 'e2', 'e3'],
@@ -195,10 +201,13 @@ test('applyEventOverlays: multiple overlays on different ids', () => {
     start_time: '2026-09-08T07:00:00.000Z',
     end_time: '2026-09-08T08:00:00.000Z',
   });
-  const result = applyEventOverlays([e1, e2, e3], [
-    { op: 'upsert', event: moved1 },
-    { op: 'delete', id: 'e3' },
-  ]);
+  const result = applyEventOverlays(
+    [e1, e2, e3],
+    [
+      { op: 'upsert', event: moved1 },
+      { op: 'delete', id: 'e3' },
+    ],
+  );
   assert.deepEqual(
     result.map((e) => e.id),
     ['e1', 'e2'],

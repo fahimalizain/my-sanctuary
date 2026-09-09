@@ -7,10 +7,7 @@ import React, {
   useState,
 } from 'react';
 import type { CalendarEvent } from '@/app/types';
-import {
-  applyEventOverlays,
-  type EventOverlay,
-} from './lib/event-overlays';
+import { applyEventOverlays, type EventOverlay } from './lib/event-overlays';
 import { useCalendarRealtime } from './useCalendarRealtime';
 
 export interface CalendarEventsQueue {

@@ -15,7 +15,9 @@ test('parseRealtimeMessage: valid calendar.changed with calendar_id', () => {
 });
 
 test('parseRealtimeMessage: valid calendar.changed without calendar_id', () => {
-  const msg = parseRealtimeMessage(JSON.stringify({ type: 'calendar.changed' }));
+  const msg = parseRealtimeMessage(
+    JSON.stringify({ type: 'calendar.changed' }),
+  );
   assert.deepEqual(msg, { type: 'calendar.changed' });
 });
 

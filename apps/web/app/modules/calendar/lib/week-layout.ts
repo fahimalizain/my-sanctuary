@@ -542,11 +542,7 @@ export const ALLDAY_MAX = 137.5;
  * containing `viewDate`.
  */
 export function monthGridStart(viewDate: Date): Date {
-  const firstOfMonth = new Date(
-    viewDate.getFullYear(),
-    viewDate.getMonth(),
-    1,
-  );
+  const firstOfMonth = new Date(viewDate.getFullYear(), viewDate.getMonth(), 1);
   return startOfWeek(firstOfMonth);
 }
 
@@ -615,12 +611,7 @@ export function packAllDayLanes(items: AllDayPackInput[]): AllDayPackResult[] {
       const occupied = laneRanges[lane] ?? [];
       const free = occupied.every(
         (r) =>
-          !dayRangesOverlap(
-            item.startDay,
-            item.endDay,
-            r.startDay,
-            r.endDay,
-          ),
+          !dayRangesOverlap(item.startDay, item.endDay, r.startDay, r.endDay),
       );
       if (free) {
         if (!laneRanges[lane]) laneRanges[lane] = [];
@@ -645,10 +636,7 @@ export function packAllDayLanes(items: AllDayPackInput[]): AllDayPackResult[] {
  */
 export function allDaySectionHeight(maxLaneIndex: number | null): number {
   if (maxLaneIndex === null || maxLaneIndex < 0) return ALLDAY_MIN;
-  const raw =
-    ALLDAY_PAD +
-    (ALLDAY_CHIP + ALLDAY_GAP) * (maxLaneIndex + 1) +
-    1;
+  const raw = ALLDAY_PAD + (ALLDAY_CHIP + ALLDAY_GAP) * (maxLaneIndex + 1) + 1;
   return clamp(Math.max(ALLDAY_MIN, raw), ALLDAY_MIN, ALLDAY_MAX);
 }
 

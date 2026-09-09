@@ -18,13 +18,13 @@ in `App-B44a-2uY.js`. Minified names are not used below.
 Pack **one civil day at a time**. Caller clamps each event to that day
 (`clampMinutesToDay`) before packing.
 
-| Option | Sanctuary default | Notes |
-| --- | --- | --- |
-| `shouldDisplayItemAsRibbon` | always `false` | Notion: `!!event.holdGroup` only |
-| `mergeDisabled` | `true` | No multi-calendar merge |
-| `isItemAlwaysOnTop` | always `false` | Notion: drag clones |
-| `hiddenDays` | none | Out of scope |
-| Month-view snapping | off | Out of scope |
+| Option                      | Sanctuary default | Notes                            |
+| --------------------------- | ----------------- | -------------------------------- |
+| `shouldDisplayItemAsRibbon` | always `false`    | Notion: `!!event.holdGroup` only |
+| `mergeDisabled`             | `true`            | No multi-calendar merge          |
+| `isItemAlwaysOnTop`         | always `false`    | Notion: drag clones              |
+| `hiddenDays`                | none              | Out of scope                     |
+| Month-view snapping         | off               | Out of scope                     |
 
 ### Input shape (timed)
 
@@ -32,7 +32,7 @@ Pack **one civil day at a time**. Caller clamps each event to that day
 type TimedPackInput = {
   id: string;
   startMin: number; // minutes since local midnight
-  endMin: number;   // minutes since local midnight
+  endMin: number; // minutes since local midnight
 };
 ```
 
@@ -41,10 +41,10 @@ type TimedPackInput = {
 ```ts
 type TimedPackResult = {
   id: string;
-  leftPercent: number;  // 0..1 fraction of day column
+  leftPercent: number; // 0..1 fraction of day column
   widthPercent: number; // 0..1 fraction of day column (may exceed remaining space via peek/steal)
-  layerIndex: number;   // 1-based; later columns paint on top
-  leftPixels: number;   // ribbon inset; 0 when no ribbons
+  layerIndex: number; // 1-based; later columns paint on top
+  leftPixels: number; // ribbon inset; 0 when no ribbons
 };
 ```
 
@@ -171,7 +171,7 @@ for each event e in reverse(flatMap(columns, c => c.items)):
 ```
 
 An event may occupy a **contiguous run** of columns. Self is not yet in later
-columns during this pass, so the overlap check is against *other* events.
+columns during this pass, so the overlap check is against _other_ events.
 
 ### 9. Percents (cascade — not a partition)
 
@@ -261,10 +261,10 @@ z-index: <selected || manipulating
            : calc(var(--z-index-grid-foreground) + layerIndex)>;
 ```
 
-| Token | Value |
-| --- | --- |
-| `--chip-margin-right` / `CHIP_MARGIN_RIGHT` | `13px` |
-| `--chip-margin-bottom` / `CHIP_MARGIN_BOTTOM` | `3px` |
+| Token                                         | Value  |
+| --------------------------------------------- | ------ |
+| `--chip-margin-right` / `CHIP_MARGIN_RIGHT`   | `13px` |
+| `--chip-margin-bottom` / `CHIP_MARGIN_BOTTOM` | `3px`  |
 
 `left` + `margin-left` is intentional: pixel ribbon inset plus percent cascade
 within the remaining day column.
@@ -282,29 +282,29 @@ Events: `A 9:00–10:00`, `B 11:00–12:00`, `C 14:00–15:00`
 
 Three separate clusters. Each:
 
-| id | leftPercent | widthPercent | layerIndex |
-| --- | ---: | ---: | ---: |
-| A | 0 | 1 | 1 |
-| B | 0 | 1 | 1 |
-| C | 0 | 1 | 1 |
+| id  | leftPercent | widthPercent | layerIndex |
+| --- | ----------: | -----------: | ---------: |
+| A   |           0 |            1 |          1 |
+| B   |           0 |            1 |          1 |
+| C   |           0 |            1 |          1 |
 
 ### 2. Two overlap
 
 Events: `A 9:00–11:00`, `B 10:00–12:00` → `nCols = 2`, `f = 0.5`
 
-| step | A | B |
-| --- | --- | --- |
-| seed / columns | col 0 | col 1 |
-| left-compact | stays 0 | stays 1 (overlaps A) |
-| right-expand | blocked by B | (last col) |
-| base percents | L=0, W=0.5, layer=1 | L=0.5, W=0.5, layer=2 |
-| right peek | other B, Δstart=60>30 → W+=f → **1** | none |
-| left steal | — | other A, Δstart=60>30 → steal=f−0.05=0.45 → L=0.05, W=0.95 |
+| step           | A                                    | B                                                          |
+| -------------- | ------------------------------------ | ---------------------------------------------------------- |
+| seed / columns | col 0                                | col 1                                                      |
+| left-compact   | stays 0                              | stays 1 (overlaps A)                                       |
+| right-expand   | blocked by B                         | (last col)                                                 |
+| base percents  | L=0, W=0.5, layer=1                  | L=0.5, W=0.5, layer=2                                      |
+| right peek     | other B, Δstart=60>30 → W+=f → **1** | none                                                       |
+| left steal     | —                                    | other A, Δstart=60>30 → steal=f−0.05=0.45 → L=0.05, W=0.95 |
 
-| id | leftPercent | widthPercent | layerIndex |
-| --- | ---: | ---: | ---: |
-| A | 0 | 1 | 1 |
-| B | 0.05 | 0.95 | 2 |
+| id  | leftPercent | widthPercent | layerIndex |
+| --- | ----------: | -----------: | ---------: |
+| A   |           0 |            1 |          1 |
+| B   |        0.05 |         0.95 |          2 |
 
 ### 3. Same start, longer first
 
@@ -312,10 +312,10 @@ Events: `Long 9:00–12:00`, `Short 9:00–10:00` → `nCols = 2`, `f = 0.5`
 
 Seed order: Long then Short (longer first).
 
-| id | leftPercent | widthPercent | layerIndex | notes |
-| --- | ---: | ---: | ---: | --- |
-| Long | 0 | 0.75 | 1 | base W=0.5; half-peek into Short (Δstart=0≤30) → +0.25 |
-| Short | 0.5 | 0.5 | 2 | no steal (starts with Long, Δ=0≤30; Long ∉ stolen) |
+| id    | leftPercent | widthPercent | layerIndex | notes                                                  |
+| ----- | ----------: | -----------: | ---------: | ------------------------------------------------------ |
+| Long  |           0 |         0.75 |          1 | base W=0.5; half-peek into Short (Δstart=0≤30) → +0.25 |
+| Short |         0.5 |          0.5 |          2 | no steal (starts with Long, Δ=0≤30; Long ∉ stolen)     |
 
 ### 4. Chain
 
@@ -325,11 +325,11 @@ Columns after compact/expand: A∈{0}, B∈{1}, C∈{2} (all pairwise overlap A�
 
 Layout order A, B, C. `stolen` grows as B then C steal.
 
-| id | leftPercent | widthPercent | layerIndex | derivation |
-| --- | ---: | ---: | ---: | --- |
-| A | 0 | 1 | 1 | base 1/3; full peek B (Δ=60>30) +1/3; full peek C (Δ=90>30) +1/3 |
-| B | 0.05 | 0.5 + 1/3 − 0.05 ≈ **0.7833…** | 2 | base 1/3; half-peek C (Δ=30≤30) +1/6; steal from A (Δ=60>30): steal=1/3−0.05; L=1/3−steal=0.05; W=1/3+1/6+steal |
-| C | 1/3 + 0.05 ≈ **0.3833…** | 2/3 − 0.05 ≈ **0.6166…** | 3 | base 1/3; left of col2 is B only; Δ(C,B)=30≤30 but **B ∈ stolen** → steal; L=2/3−(1/3−0.05); W=1/3+(1/3−0.05); stop (do not inspect A) |
+| id  |              leftPercent |                   widthPercent | layerIndex | derivation                                                                                                                             |
+| --- | -----------------------: | -----------------------------: | ---------: | -------------------------------------------------------------------------------------------------------------------------------------- |
+| A   |                        0 |                              1 |          1 | base 1/3; full peek B (Δ=60>30) +1/3; full peek C (Δ=90>30) +1/3                                                                       |
+| B   |                     0.05 | 0.5 + 1/3 − 0.05 ≈ **0.7833…** |          2 | base 1/3; half-peek C (Δ=30≤30) +1/6; steal from A (Δ=60>30): steal=1/3−0.05; L=1/3−steal=0.05; W=1/3+1/6+steal                        |
+| C   | 1/3 + 0.05 ≈ **0.3833…** |       2/3 − 0.05 ≈ **0.6166…** |          3 | base 1/3; left of col2 is B only; Δ(C,B)=30≤30 but **B ∈ stolen** → steal; L=2/3−(1/3−0.05); W=1/3+(1/3−0.05); stop (do not inspect A) |
 
 Exact:
 
@@ -345,11 +345,11 @@ Initial columns: A@0, B@1, C@2.
 Left-compact: C does not overlap B → **moves into B’s column**. Drop empty col 2.
 `nCols = 2`. Columns: `{0: [A], 1: [B, C]}`.
 
-| id | leftPercent | widthPercent | layerIndex | notes |
-| --- | ---: | ---: | ---: | --- |
-| A | 0 | 0.75 | 1 | base 0.5; half-peek into col1 (other B, Δstart=0≤30) → +0.25. (C also overlaps A but `find` hits B first.) |
-| B | 0.5 | 0.5 | 2 | no steal — starts with A (Δ=0≤30), A ∉ stolen |
-| C | 0.05 | 0.95 | 2 | left-steal from A: Δstart=120>30; steal=0.5−0.05=0.45; L=0.5−0.45; W=0.5+0.45 |
+| id  | leftPercent | widthPercent | layerIndex | notes                                                                                                      |
+| --- | ----------: | -----------: | ---------: | ---------------------------------------------------------------------------------------------------------- |
+| A   |           0 |         0.75 |          1 | base 0.5; half-peek into col1 (other B, Δstart=0≤30) → +0.25. (C also overlaps A but `find` hits B first.) |
+| B   |         0.5 |          0.5 |          2 | no steal — starts with A (Δ=0≤30), A ∉ stolen                                                              |
+| C   |        0.05 |         0.95 |          2 | left-steal from A: Δstart=120>30; steal=0.5−0.05=0.45; L=0.5−0.45; W=0.5+0.45                              |
 
 ### 6. Touching endpoints
 
@@ -357,10 +357,10 @@ Events: `A 9:00–10:00`, `B 10:00–11:00`
 
 Half-open → no overlap → two clusters → both full width:
 
-| id | leftPercent | widthPercent | layerIndex |
-| --- | ---: | ---: | ---: |
-| A | 0 | 1 | 1 |
-| B | 0 | 1 | 1 |
+| id  | leftPercent | widthPercent | layerIndex |
+| --- | ----------: | -----------: | ---------: |
+| A   |           0 |            1 |          1 |
+| B   |           0 |            1 |          1 |
 
 ---
 

@@ -7,12 +7,7 @@ import { CalendarWeekGrid } from './components/CalendarWeekGrid';
 import { EventInspector } from './components/EventInspector';
 import { useCalendarSession } from './hooks/useCalendarSession';
 import { useCalendarStrip } from './hooks/useCalendarStrip';
-import {
-  COL_HEADER_H,
-  addDays,
-  isSameDay,
-  nowLineY,
-} from './lib/week-layout';
+import { COL_HEADER_H, addDays, isSameDay, nowLineY } from './lib/week-layout';
 
 export function CalendarPage() {
   const strip = useCalendarStrip();

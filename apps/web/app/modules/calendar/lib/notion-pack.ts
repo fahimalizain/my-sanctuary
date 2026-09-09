@@ -78,15 +78,24 @@ function findColumnIndex(columns: Column[], event: PackInput): number {
 }
 
 function columnHasOverlap(col: Column, event: PackInput): boolean {
-  return col.items.some((other) => other !== event && eventsOverlap(event, other));
+  return col.items.some(
+    (other) => other !== event && eventsOverlap(event, other),
+  );
 }
 
-function firstOverlapping(col: Column, event: PackInput): PackInput | undefined {
-  return col.items.find((other) => other !== event && eventsOverlap(event, other));
+function firstOverlapping(
+  col: Column,
+  event: PackInput,
+): PackInput | undefined {
+  return col.items.find(
+    (other) => other !== event && eventsOverlap(event, other),
+  );
 }
 
 function overlappingInColumn(col: Column, event: PackInput): PackInput[] {
-  return col.items.filter((other) => other !== event && eventsOverlap(event, other));
+  return col.items.filter(
+    (other) => other !== event && eventsOverlap(event, other),
+  );
 }
 
 function packCluster(cluster: PackInput[]): PackResult[] {

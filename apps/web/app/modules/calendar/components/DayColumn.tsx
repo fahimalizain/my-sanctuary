@@ -1,7 +1,4 @@
-import {
-  memo,
-  type PointerEvent as ReactPointerEvent,
-} from 'react';
+import { memo, type PointerEvent as ReactPointerEvent } from 'react';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
@@ -24,10 +21,7 @@ export interface DayColumnProps {
   showNow: boolean;
   /** Only needed when showNow; omit otherwise so memo stays stable. */
   now?: Date;
-  onColumnPointerDown: (
-    e: ReactPointerEvent<HTMLElement>,
-    day: Date,
-  ) => void;
+  onColumnPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   onChipPointerDown: (
     e: ReactPointerEvent<HTMLElement>,
     event: CalendarEvent,

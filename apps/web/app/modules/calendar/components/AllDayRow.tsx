@@ -58,10 +58,7 @@ export interface AllDayRowProps {
   /** Highlight today's column index into `days`, or null. */
   todayIndex?: number | null;
   /** Empty-cell pointerdown for all-day create / drag-create. */
-  onDayPointerDown?: (
-    e: ReactPointerEvent<HTMLElement>,
-    day: Date,
-  ) => void;
+  onDayPointerDown?: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   /** Chip click/tap selects the event. */
   onChipSelect?: (eventId: string) => void;
   selectedEventId?: string | null;
@@ -112,9 +109,7 @@ export function AllDayRow({
                 className={cn(
                   'shrink-0 border-r last:border-r-0',
                   weekend ? 'border-border/60' : 'border-border/40',
-                  isToday
-                    ? 'bg-primary/[0.03]'
-                    : weekend && 'bg-muted/40',
+                  isToday ? 'bg-primary/[0.03]' : weekend && 'bg-muted/40',
                 )}
                 style={{ width: colWidth }}
               />
@@ -139,8 +134,7 @@ export function AllDayRow({
           const daySpan = chip.endDay - chip.startDay + 1;
           const left = chip.startDay * colWidth;
           const width = daySpan * colWidth - 2;
-          const top =
-            (ALLDAY_CHIP + ALLDAY_GAP) * chip.lane + ALLDAY_PAD;
+          const top = (ALLDAY_CHIP + ALLDAY_GAP) * chip.lane + ALLDAY_PAD;
           const selected = chip.id === selectedEventId;
 
           return (

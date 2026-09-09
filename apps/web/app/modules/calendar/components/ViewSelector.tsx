@@ -14,13 +14,13 @@ const GROUP_1: { n: number; label: string; shortcut: string }[] = [
   { n: 7, label: 'Week', shortcut: 'W' },
 ];
 
-const GROUP_2: { n: number; label: string; shortcut: string }[] = [2, 3, 4, 5, 6].map(
-  (n) => ({
-    n,
-    label: periodLabel(n),
-    shortcut: String(n),
-  }),
-);
+const GROUP_2: { n: number; label: string; shortcut: string }[] = [
+  2, 3, 4, 5, 6,
+].map((n) => ({
+  n,
+  label: periodLabel(n),
+  shortcut: String(n),
+}));
 
 export function ViewSelector({
   periodLength,
@@ -85,11 +85,11 @@ function MenuGroup({
             role="menuitemradio"
           >
             <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center">
-              {selected ? (
-                <Check className="h-3.5 w-3.5" aria-hidden />
-              ) : null}
+              {selected ? <Check className="h-3.5 w-3.5" aria-hidden /> : null}
             </span>
-            <span className="flex-1 min-w-0 text-left truncate">{item.label}</span>
+            <span className="flex-1 min-w-0 text-left truncate">
+              {item.label}
+            </span>
             <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
               {item.shortcut}
             </span>

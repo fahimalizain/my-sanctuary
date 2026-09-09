@@ -115,10 +115,7 @@ test('formatWeekTitle: same-month range', () => {
 
 test('formatWeekTitle: cross-month range', () => {
   // Mon Sep 28 – Sun Oct 4, 2026
-  assert.equal(
-    formatWeekTitle(new Date(2026, 8, 28)),
-    'Sep 28 – Oct 4, 2026',
-  );
+  assert.equal(formatWeekTitle(new Date(2026, 8, 28)), 'Sep 28 – Oct 4, 2026');
 });
 
 test('formatDayRangeTitle: Wed–Tue cross-month', () => {
@@ -377,8 +374,18 @@ test('eventHeightPx: 15 min gets CHIP_MIN_H', () => {
 const PACK_EPS = 1e-9;
 
 function assertPackClose(
-  actual: { leftPercent: number; widthPercent: number; layerIndex: number; leftPixels: number },
-  expected: { leftPercent: number; widthPercent: number; layerIndex: number; leftPixels?: number },
+  actual: {
+    leftPercent: number;
+    widthPercent: number;
+    layerIndex: number;
+    leftPixels: number;
+  },
+  expected: {
+    leftPercent: number;
+    widthPercent: number;
+    layerIndex: number;
+    leftPixels?: number;
+  },
   label: string,
 ) {
   assert.ok(
@@ -406,7 +413,11 @@ test('packDayEvents: example 1 — no overlap → full width each cluster', () =
   ]);
   assert.equal(packed.length, 3);
   for (const p of packed) {
-    assertPackClose(p, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, p.id);
+    assertPackClose(
+      p,
+      { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
+      p.id,
+    );
   }
 });
 
@@ -417,8 +428,16 @@ test('packDayEvents: example 2 — two overlap → peek + steal', () => {
     { id: 'b', startMin: 10 * 60, endMin: 12 * 60 },
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
-  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'a');
-  assertPackClose(byId.b, { leftPercent: 0.05, widthPercent: 0.95, layerIndex: 2 }, 'b');
+  assertPackClose(
+    byId.a,
+    { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
+    'a',
+  );
+  assertPackClose(
+    byId.b,
+    { leftPercent: 0.05, widthPercent: 0.95, layerIndex: 2 },
+    'b',
+  );
 });
 
 // Spec § Worked example 3 — Same start, longer first
@@ -449,7 +468,11 @@ test('packDayEvents: example 4 — chain A/B/C with stolen cascade', () => {
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
   // A: base 1/3; full peek B +1/3; full peek C +1/3 → 1
-  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'a');
+  assertPackClose(
+    byId.a,
+    { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
+    'a',
+  );
   // B: left = 0.05; width = 0.5 + 1/3 - 0.05 = 5/6 - 0.05
   assertPackClose(
     byId.b,
@@ -472,9 +495,21 @@ test('packDayEvents: example 5 — B and C share column after left-compact', () 
     { id: 'c', startMin: 11 * 60, endMin: 12 * 60 },
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
-  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 0.75, layerIndex: 1 }, 'a');
-  assertPackClose(byId.b, { leftPercent: 0.5, widthPercent: 0.5, layerIndex: 2 }, 'b');
-  assertPackClose(byId.c, { leftPercent: 0.05, widthPercent: 0.95, layerIndex: 2 }, 'c');
+  assertPackClose(
+    byId.a,
+    { leftPercent: 0, widthPercent: 0.75, layerIndex: 1 },
+    'a',
+  );
+  assertPackClose(
+    byId.b,
+    { leftPercent: 0.5, widthPercent: 0.5, layerIndex: 2 },
+    'b',
+  );
+  assertPackClose(
+    byId.c,
+    { leftPercent: 0.05, widthPercent: 0.95, layerIndex: 2 },
+    'c',
+  );
 });
 
 // Spec § Worked example 6 — Touching endpoints (half-open)
@@ -484,8 +519,16 @@ test('packDayEvents: example 6 — touching endpoints → separate full-width cl
     { id: 'b', startMin: 10 * 60, endMin: 11 * 60 },
   ]);
   const byId = Object.fromEntries(packed.map((p) => [p.id, p]));
-  assertPackClose(byId.a, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'a');
-  assertPackClose(byId.b, { leftPercent: 0, widthPercent: 1, layerIndex: 1 }, 'b');
+  assertPackClose(
+    byId.a,
+    { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
+    'a',
+  );
+  assertPackClose(
+    byId.b,
+    { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
+    'b',
+  );
 });
 
 // ── nowLineY ────────────────────────────────────────────────────────────

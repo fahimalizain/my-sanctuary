@@ -80,9 +80,7 @@ export function CalendarSidebar({
   // Highlight the consecutive visible days (free-scroll; not Mon-locked).
   const visibleWeekDays = useMemo(() => {
     const origin = startOfDay(weekStart);
-    return Array.from({ length: daysInPeriod }, (_, i) =>
-      addDays(origin, i),
-    );
+    return Array.from({ length: daysInPeriod }, (_, i) => addDays(origin, i));
   }, [weekStart, daysInPeriod]);
   const gridDays = useMemo(() => monthGridDays(viewMonth), [viewMonth]);
 
@@ -96,9 +94,7 @@ export function CalendarSidebar({
       origin.getTime() <= gridEnd.getTime() &&
       weekEnd.getTime() >= gridStart.getTime();
     if (!overlaps) {
-      setViewMonth(
-        new Date(weekStart.getFullYear(), weekStart.getMonth(), 1),
-      );
+      setViewMonth(new Date(weekStart.getFullYear(), weekStart.getMonth(), 1));
     }
   }, [weekStart, viewMonth, daysInPeriod]);
 
@@ -106,10 +102,7 @@ export function CalendarSidebar({
   const viewMonthIndex = viewMonth.getMonth();
   const viewYear = viewMonth.getFullYear();
 
-  const sortedCalendars = useMemo(
-    () => sortCalendars(calendars),
-    [calendars],
-  );
+  const sortedCalendars = useMemo(() => sortCalendars(calendars), [calendars]);
 
   const shiftMonth = (delta: number) => {
     setViewMonth(
@@ -172,9 +165,7 @@ export function CalendarSidebar({
               day.getMonth() === viewMonthIndex &&
               day.getFullYear() === viewYear;
             const isToday = isSameDay(day, today);
-            const inViewedWeek = visibleWeekDays.some((d) =>
-              isSameDay(d, day),
-            );
+            const inViewedWeek = visibleWeekDays.some((d) => isSameDay(d, day));
 
             return (
               <button
@@ -207,31 +198,37 @@ export function CalendarSidebar({
         </h3>
 
         {calendarsLoading && sortedCalendars.length === 0 && (
-          <div className="space-y-2" aria-busy="true" aria-label="Loading calendars">
+          <div
+            className="space-y-2"
+            aria-busy="true"
+            aria-label="Loading calendars"
+          >
             <div className="h-7 rounded-md bg-muted/60 animate-pulse" />
             <div className="h-7 rounded-md bg-muted/60 animate-pulse" />
             <div className="h-7 rounded-md bg-muted/40 animate-pulse w-4/5" />
           </div>
         )}
 
-        {calendarsError && sortedCalendars.length === 0 && !calendarsLoading && (
-          <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">
-              Couldn&apos;t load calendars
-            </p>
-            {onRetryCalendars && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 text-xs"
-                onClick={onRetryCalendars}
-              >
-                <RefreshCw className="h-3 w-3 mr-1.5" />
-                Retry
-              </Button>
-            )}
-          </div>
-        )}
+        {calendarsError &&
+          sortedCalendars.length === 0 &&
+          !calendarsLoading && (
+            <div className="space-y-2">
+              <p className="text-xs text-muted-foreground">
+                Couldn&apos;t load calendars
+              </p>
+              {onRetryCalendars && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={onRetryCalendars}
+                >
+                  <RefreshCw className="h-3 w-3 mr-1.5" />
+                  Retry
+                </Button>
+              )}
+            </div>
+          )}
 
         <ul className="space-y-0.5">
           {sortedCalendars.map((cal) => {

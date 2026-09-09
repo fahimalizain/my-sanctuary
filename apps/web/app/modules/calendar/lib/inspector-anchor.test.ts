@@ -5,10 +5,7 @@ import assert from 'node:assert/strict';
 import { escapeAttrValue, eventChipSelector } from './inspector-anchor';
 
 test('eventChipSelector: normal id', () => {
-  assert.equal(
-    eventChipSelector('abc-123'),
-    '[data-event-id="abc-123"]',
-  );
+  assert.equal(eventChipSelector('abc-123'), '[data-event-id="abc-123"]');
 });
 
 test('eventChipSelector: temp uuid id', () => {
@@ -17,24 +14,15 @@ test('eventChipSelector: temp uuid id', () => {
 });
 
 test('eventChipSelector: id containing double quote', () => {
-  assert.equal(
-    eventChipSelector('foo"bar'),
-    '[data-event-id="foo\\"bar"]',
-  );
+  assert.equal(eventChipSelector('foo"bar'), '[data-event-id="foo\\"bar"]');
 });
 
 test('eventChipSelector: id containing backslash', () => {
-  assert.equal(
-    eventChipSelector('foo\\bar'),
-    '[data-event-id="foo\\\\bar"]',
-  );
+  assert.equal(eventChipSelector('foo\\bar'), '[data-event-id="foo\\\\bar"]');
 });
 
 test('eventChipSelector: id containing ] is fine inside quotes', () => {
-  assert.equal(
-    eventChipSelector('foo]bar'),
-    '[data-event-id="foo]bar"]',
-  );
+  assert.equal(eventChipSelector('foo]bar'), '[data-event-id="foo]bar"]');
 });
 
 test('escapeAttrValue: empty string', () => {
