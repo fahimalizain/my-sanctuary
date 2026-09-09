@@ -1,8 +1,7 @@
 import { useLayoutEffect } from 'react';
-import { RefreshCw } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import { CalendarHeader } from './components/CalendarHeader';
 import { CalendarSidebar } from './components/CalendarSidebar';
+import { CalendarSyncBanner } from './components/CalendarSyncBanner';
 import { CalendarWeekGrid } from './components/CalendarWeekGrid';
 import { EventInspector } from './components/EventInspector';
 import { useCalendarSession } from './hooks/useCalendarSession';
@@ -70,17 +69,11 @@ export function CalendarPage() {
         onNextPeriod={() => strip.shiftPeriod(1)}
       />
 
-      {session.error && !session.eventsEmpty && (
-        <div className="shrink-0 flex items-center justify-between gap-3 border-b border-border bg-muted/50 px-4 py-2 text-sm">
-          <p className="text-muted-foreground truncate">
-            Couldn&apos;t refresh events: {session.error}
-          </p>
-          <Button variant="outline" size="sm" onClick={session.retry}>
-            <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
-            Retry
-          </Button>
-        </div>
-      )}
+      <CalendarSyncBanner
+        banner={session.healthBanner}
+        onRetry={session.retry}
+        isRefreshing={session.isRefreshing}
+      />
 
       {/* Body: sidebar + grid + inspector */}
       <div className="flex-1 min-h-0 flex relative">

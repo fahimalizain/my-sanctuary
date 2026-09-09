@@ -23,6 +23,7 @@ import {
 } from '../lib/calendar-model';
 import { isPersistableDraftTitle } from '../lib/event-draft';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
+import { selectSyncHealthBanner } from '../lib/sync-health';
 import { useCalendarDrag } from './useCalendarDrag';
 import {
   COL_HEADER_H,
@@ -57,6 +58,7 @@ export function useCalendarSession({
 }: CalendarSessionInput) {
   const eventsQuery = useCalendarEventsQuery(timeMin, timeMax);
   const events = eventsQuery.data?.events ?? [];
+  const sync = eventsQuery.data?.sync;
   const isLoading = eventsQuery.isLoading;
   const isRefreshing = eventsQuery.isFetching && !eventsQuery.isLoading;
   const error =
@@ -68,6 +70,7 @@ export function useCalendarSession({
   const retry = () => {
     void eventsQuery.refetch();
   };
+  const eventsEmpty = events.length === 0;
 
   // Optimistic create/move/resize/delete overlay (read-time; not setQueryData).
   const queue = useCalendarEventsQueue();
@@ -81,6 +84,18 @@ export function useCalendarSession({
       : calendarsQuery.error
         ? 'Failed to load calendars'
         : null;
+
+  const healthBanner = useMemo(
+    () =>
+      selectSyncHealthBanner({
+        sync,
+        calendars,
+        fetchError: error,
+        eventsEmpty,
+        isLoading,
+      }),
+    [sync, calendars, error, eventsEmpty, isLoading],
+  );
 
   const [selectedCalendarIds, setSelectedCalendarIds] = useState<Set<string>>(
     () => new Set(),
@@ -629,7 +644,9 @@ export function useCalendarSession({
     isLoading,
     error,
     retry,
-    eventsEmpty: events.length === 0,
+    eventsEmpty,
+    sync,
+    healthBanner,
 
     // Sidebar
     calendars,
