@@ -6,4 +6,5 @@ mod webhook;
 mod catalog;
 mod cron;
 mod replica;
+mod repair;
 mod apply;

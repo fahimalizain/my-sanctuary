@@ -40,9 +40,10 @@ use super::google::encode_path_segment;
 use super::sync::replica_query_fingerprint;
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
 use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 use crate::token::GoogleAccess;
+use std::collections::HashSet;
 
 /// Replica lease lifetime (seconds). Renewed after each applied page.
 pub const REPLICA_LEASE_TTL_SECS: i64 = 90;
@@ -59,6 +60,7 @@ pub async fn sync_replica(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     lease_owner: &str,
@@ -78,6 +80,15 @@ pub async fn sync_replica(
 
     let mut page_token: Option<String> = None;
     let mut retried_410 = false;
+
+    // Snapshot once per walk: user writes in flight must not be clobbered by
+    // a replica page that still carries the pre-write Google shape.
+    let inflight: HashSet<String> = operations
+        .list_inflight_google_ids(&cal.id)
+        .await?
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .collect();
 
     loop {
         let url = google_events_url(
@@ -119,6 +130,10 @@ pub async fn sync_replica(
         let items = page.items.unwrap_or_default();
         let mut to_upsert = Vec::new();
         for item in &items {
+            if inflight.contains(&item.id) {
+                // Skip upsert and soft-delete for in-flight google ids.
+                continue;
+            }
             match classify_replica_item(item, &cal.id, now_rfc3339) {
                 ReplicaApplyAction::SoftDelete { google_event_id } => {
                     events

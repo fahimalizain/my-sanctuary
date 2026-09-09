@@ -1,5 +1,6 @@
 use super::catalog::refresh_calendar_list;
 use super::labels::ensure_event_labels;
+use super::repair::repair_inflight_operations;
 use super::replica::{lease_expires_at, mint_lease_owner, sync_replica};
 use super::sync::{
     classify_sync_error, next_retry_rfc3339, replica_state_for_error, SyncErrorCode,
@@ -13,7 +14,9 @@ use super::{
 use crate::config::OAuthConfig;
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventRepo, CalendarRepo, TokenRepo, WatchChannelRepo};
+use crate::repo::{
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TokenRepo, WatchChannelRepo,
+};
 use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 use crate::token::{is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError};
 use std::collections::{HashMap, HashSet};
@@ -122,10 +125,12 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///      sync-enabled calendars, keep events, skip Google for that user.
 ///    - `NoToken` / `NoRefreshToken`: skip + error string only (do not flip
 ///      healthy calendars to `authorization_required`).
-/// 2. [`refresh_calendar_list`] (incremental when a list cursor exists).
+/// 2. GET-only [`repair_inflight_operations`] for stuck journal rows. Repair
+///    errors append to the report; they never abort replica/renew work.
+/// 3. [`refresh_calendar_list`] (incremental when a list cursor exists).
 ///    List errors are logged; existing sync-enabled calendars still get
 ///    replica/renew work. New local calendar ids are pushed to `published`.
-/// 3. For each living sync-enabled calendar of the user:
+/// 4. For each living sync-enabled calendar of the user:
 ///    - When [`replica_due`] and under [`CRON_MAX_REPLICA_CALENDARS`]:
 ///      `sync_calendar`.
 ///      - [`SyncCalendarOutcome::Published`] → `synced` + `published`.
@@ -136,7 +141,7 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///    - When `watch_callback_url` is a public HTTPS URL, the calendar is still
 ///      enabled, and `sync_status != "authorization_required"`:
 ///      `renew_watch_if_needed`. A watch 404 disables sync and stops channels.
-/// 4. Leftover-stop tail: [`WatchChannelRepo::list_all`], resolve each calendar
+/// 5. Leftover-stop tail: [`WatchChannelRepo::list_all`], resolve each calendar
 ///    via [`CalendarRepo::get_by_id_unfiltered`], stop channels when the
 ///    calendar is missing-from-living-path (soft-deleted) or `!sync_enabled`.
 ///    Does **not** require a public HTTPS callback (stop needs no webhook URL).
@@ -145,6 +150,7 @@ pub async fn run_fallback_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     watches: &dyn WatchChannelRepo,
     tokens: &dyn TokenRepo,
     oauth: &OAuthConfig,
@@ -249,6 +255,20 @@ pub async fn run_fallback_cron(
             }
         };
 
+        // GET-only journal repair before replica so stuck writes finish and
+        // inflight skip set shrinks. Failures never abort the rest of the tick.
+        let repair_errors = repair_inflight_operations(
+            http,
+            calendars,
+            events,
+            operations,
+            &access,
+            user_id,
+            now_unix,
+        )
+        .await;
+        report.errors.extend(repair_errors);
+
         // Incremental (or full) calendarList refresh before replica work so
         // newly added calendars can be published this tick and removed ones
         // stop being watched.
@@ -292,7 +312,17 @@ pub async fn run_fallback_cron(
             let due = replica_due(cal, now_unix);
             if due && replica_attempts < CRON_MAX_REPLICA_CALENDARS {
                 replica_attempts += 1;
-                match sync_calendar(http, calendars, events, &access, cal, &now_rfc3339).await {
+                match sync_calendar(
+                    http,
+                    calendars,
+                    events,
+                    operations,
+                    &access,
+                    cal,
+                    &now_rfc3339,
+                )
+                .await
+                {
                     Ok(SyncCalendarOutcome::Published) => {
                         report.synced += 1;
                         report
@@ -531,6 +561,7 @@ pub async fn sync_calendar(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     now_rfc3339: &str,
@@ -564,6 +595,7 @@ pub async fn sync_calendar(
             http,
             calendars,
             events,
+            operations,
             access,
             &fresh,
             &owner,

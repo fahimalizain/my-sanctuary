@@ -140,6 +140,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             &crate::http::WorkerHttp,
             &calendars,
             &events,
+            &operations,
             &watches,
             &tokens,
             &oauth,

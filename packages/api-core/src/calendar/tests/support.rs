@@ -839,11 +839,36 @@ impl FakeEventRepo {
         id
     }
 
-    /// Mirrors GET projection filters (`timed_masters_and_exceptions`).
-    pub(crate) fn in_projection(event: &CalendarEvent) -> bool {
-        event.deleted_at.is_none()
-            && !event.is_all_day
-            && (event.status.is_empty() || event.status != "cancelled")
+    /// Mirrors GET projection filters (`timed_masters_and_exceptions`),
+    /// including the master/instance dedupe rule on
+    /// [`crate::repo::EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`].
+    ///
+    /// `all` is the full stored set so sibling masters can be found.
+    pub(crate) fn in_projection(event: &CalendarEvent, all: &[CalendarEvent]) -> bool {
+        if event.deleted_at.is_some() || event.is_all_day {
+            return false;
+        }
+        if !event.status.is_empty() && event.status == "cancelled" {
+            return false;
+        }
+        // Hide unmodified window instance when a living master exists.
+        if !event.recurring_event_id.is_empty() {
+            let unmodified = event.original_start.is_empty()
+                || event.original_start == event.start_time;
+            if unmodified {
+                let has_master = all.iter().any(|m| {
+                    m.deleted_at.is_none()
+                        && m.calendar_id == event.calendar_id
+                        && m.google_event_id == event.recurring_event_id
+                        && !m.recurrence.is_empty()
+                        && m.title == event.title
+                });
+                if has_master {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -918,13 +943,11 @@ impl CalendarEventRepo for FakeEventRepo {
         ));
         // Mirrors EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL projection +
         // overlap (start < window_end AND end > window_start).
-        Ok(self
-            .stored
-            .lock()
-            .unwrap()
+        let stored = self.stored.lock().unwrap();
+        Ok(stored
             .iter()
             .filter(|event| {
-                Self::in_projection(event)
+                Self::in_projection(event, &stored)
                     && event.start_time.as_str() < end_rfc3339
                     && event.end_time.as_str() > start_rfc3339
             })
@@ -939,13 +962,11 @@ impl CalendarEventRepo for FakeEventRepo {
     ) -> Result<Vec<CalendarEvent>, RepoError> {
         // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: projection +
         // task-tagged + `start_time <= now < end_time`.
-        Ok(self
-            .stored
-            .lock()
-            .unwrap()
+        let stored = self.stored.lock().unwrap();
+        Ok(stored
             .iter()
             .filter(|event| {
-                Self::in_projection(event)
+                Self::in_projection(event, &stored)
                     && !event.task_id.is_empty()
                     && event.start_time.as_str() <= now_rfc3339
                     && event.end_time.as_str() > now_rfc3339

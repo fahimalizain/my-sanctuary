@@ -218,7 +218,7 @@ fn sync_skips_calendars_get_when_label_cache_is_filled() {
     let rows = calendars.stored.lock().unwrap().clone();
     for cal in &rows {
         pollster::block_on(sync_calendar(
-            &http, &calendars, &events, &access(), cal, "2023-11-14T22:13:20Z",
+            &http, &calendars, &events, &FakeOperationRepo::new(), &access(), cal, "2023-11-14T22:13:20Z",
         ))
         .unwrap();
     }

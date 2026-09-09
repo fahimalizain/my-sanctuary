@@ -129,9 +129,20 @@ permanent.
 - Metadata upsert does not re-enable a living user-disabled calendar
 - Leftover watch channels on disable/soft-delete are retried by cron
 
+**V4 (shipped)** — 2026-09-10
+
+- Outbound `calendar_event_operations` journal before Google insert/patch/delete
+- Client-supplied insert ids; 409 → GET; no phantom local id
+- If-Match on patch/delete; 412 GET+retry cap 3 → operation `conflict` (calendar not disabled)
+- `403 forbiddenForNonOrganizer` not retried
+- Delete 404/410 (including empty-etag GET 404) still local-delete
+- Cron GET-only repair of pending/google_committed
+- Replica skips in-flight google ids
+- GET projection hides unmodified instances when a living master exists
+- PATCH set remains minimal (start/end/summary / status cancelled) — attendees/conferenceData not sent
+
 **Later**
 
-- **V4:** If-Match / operation journal / writes
 - **V5:** web health chrome
 - **Not planned:** Cloudflare Queues (ADR 0001)
 
@@ -160,7 +171,10 @@ permanent.
   can be stolen mid-flight.
 - Window instances (`singleEvents=true` ids) and replica masters share
   `calendar_events` but different `google_event_id`s — both are valid rows
-  under the natural key.
+  under the natural key. Unmodified expansions are hidden from GET when a
+  living master exists; modified exceptions are kept.
+- GET-only repair never re-POSTs; a pending insert that 404s is marked failed
+  (user retries, new client id).
 - All-day Z-midnight storage: non-UTC civil dates have residual lexicographic
   overlap risk on GET.
 - Channel rows whose parent calendar row is hard-missing (no `user_id`) cannot
@@ -170,14 +184,16 @@ permanent.
 
 Calendar code is split by boundary so a newcomer does not scroll a single novel:
 
-- **Service** (`packages/api-core/src/calendar/`): `list` / `write` / `watch` /
-  `webhook` / `catalog` / `cron` / `labels` / `apply` / `replica` / `window` /
-  `sync` (health). Shared URL encoding lives in `google.rs`. Public names are
-  re-exported from `calendar/mod.rs` and `lib.rs`.
+- **Service** (`packages/api-core/src/calendar/`): `list` / `write` /
+  `write_journal` / `journal` / `repair` / `watch` / `webhook` / `catalog` /
+  `cron` / `labels` / `apply` / `replica` / `window` / `sync` (health). Shared
+  URL encoding lives in `google.rs`. Public names are re-exported from
+  `calendar/mod.rs` and `lib.rs`.
 - **Persistence**: `models/calendar.rs` (row types), `repo/calendar.rs`
   (traits + SQL), `apps/worker/src/db/calendar.rs` (D1 impls).
 - **Worker HTTP**: `apps/worker/src/calendar/http.rs` (REST) and
   `calendar/webhook.rs` (push notifications). Route wiring stays in
   `apps/worker/src/lib.rs`.
 
-V4 writes land in `calendar/write.rs`.
+V4 writes land in `calendar/write.rs` (facade), `journal.rs` (insert),
+`write_journal.rs` (patch/delete), and `repair.rs` (GET-only recovery).

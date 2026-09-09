@@ -1,4 +1,5 @@
 use super::support::*;
+use crate::calendar::apply::{map_google_event, GoogleEvent, GoogleEventTime};
 use crate::calendar::write::build_shared_properties;
 use crate::calendar::{
     create_event, delete_event, delete_event_for_user, patch_event, patch_event_fields,
@@ -8,6 +9,7 @@ use crate::models::{
     GoogleCalendar, PatchEventFields, OP_STATUS_CACHE_APPLIED, OP_STATUS_CONFLICT,
     OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED, OP_VERB_DELETE, OP_VERB_INSERT, OP_VERB_PATCH,
 };
+use crate::repo::CalendarEventRepo;
 
 const MINTED_ID: &str = "sanc0123456789abcdef0123456789ab";
 
@@ -1266,4 +1268,60 @@ fn update_event_for_user_patches_owned_event() {
             .iter()
             .any(|(k, v)| k == "If-Match" && v == "e1")
     );
+}
+
+#[test]
+fn create_echo_upsert_same_google_id_keeps_one_local_row() {
+    // Journaled create → local id evt-1. A later replica echo with the same
+    // google id must natural-key upsert onto that row (no second local row).
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+
+    let output = pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+    ))
+    .unwrap();
+    let google_id = output.event.google_event_id.clone();
+    assert_eq!(output.event.id, "evt-1");
+    assert_eq!(events.stored.lock().unwrap().len(), 1);
+
+    let echo = GoogleEvent {
+        id: google_id.clone(),
+        etag: Some("e-echo".into()),
+        updated: Some("2026-08-19T12:00:00Z".into()),
+        status: Some("confirmed".into()),
+        summary: Some("New meeting".into()),
+        description: Some("About things".into()),
+        recurrence: None,
+        start: Some(GoogleEventTime {
+            date_time: Some("2026-08-19T09:00:00Z".into()),
+            date: None,
+            time_zone: None,
+        }),
+        end: Some(GoogleEventTime {
+            date_time: Some("2026-08-19T10:00:00Z".into()),
+            date: None,
+            time_zone: None,
+        }),
+        extended_properties: None,
+        ical_uid: None,
+        sequence: Some(0),
+        recurring_event_id: None,
+        original_start_time: None,
+    };
+    let row = map_google_event(&echo, "cal-1", "2023-11-14T22:13:20Z");
+    let echoed_id = pollster::block_on(events.upsert(row, "2023-11-14T22:13:20Z")).unwrap();
+
+    assert_eq!(echoed_id, "evt-1", "natural-key upsert returns same local id");
+    let stored = events.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1, "still one row: {stored:?}");
+    assert_eq!(stored[0].id, "evt-1");
+    assert_eq!(stored[0].google_event_id, google_id);
+    assert_eq!(stored[0].google_etag, "e-echo");
 }

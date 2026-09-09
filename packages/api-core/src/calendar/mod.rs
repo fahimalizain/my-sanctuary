@@ -65,6 +65,7 @@
 
 pub mod apply;
 pub mod replica;
+pub mod repair;
 pub mod sync;
 pub mod window;
 pub(crate) mod google;
@@ -234,3 +235,4 @@ pub use catalog::list_calendars;
 pub use cron::{
     replica_due, run_fallback_cron, sync_calendar, CronReport, SyncCalendarOutcome,
 };
+pub use repair::repair_inflight_operations;

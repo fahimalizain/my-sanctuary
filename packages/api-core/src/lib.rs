@@ -40,8 +40,8 @@ pub use agenda::{
 pub use calendar::{
     create_event, decide_webhook, delete_event, delete_event_for_user, ensure_watch,
     is_public_https_callback, list_calendars, list_events, parse_event_time_range, patch_event,
-    patch_event_fields, persist_webhook_decision, renew_watch_if_needed, replica_due,
-    run_fallback_cron, stop_watches_for_calendar, sync_calendar, tokens_match,
+    patch_event_fields, persist_webhook_decision, renew_watch_if_needed, repair_inflight_operations,
+    replica_due, run_fallback_cron, stop_watches_for_calendar, sync_calendar, tokens_match,
     update_event_for_user, CalendarError, CalendarEventsResponse, CalendarListOutput, CalendarView,
     CalendarsResponse, CreateEventOutput, CreateEventResponse, CronReport, DeleteEventResponse,
     SyncCalendarOutcome, WebhookDecision, WebhookPersistResult, CRON_MAX_REPLICA_CALENDARS,

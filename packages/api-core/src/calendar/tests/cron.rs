@@ -23,7 +23,7 @@ fn cron_stops_leftover_channels_on_disabled_living_calendar() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -72,7 +72,7 @@ fn cron_stops_leftover_channels_on_soft_deleted_calendar() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -110,7 +110,7 @@ fn cron_failed_leftover_stop_leaves_row_for_next_tick() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1, "living calendar still synced");
@@ -155,7 +155,7 @@ fn cron_does_not_stop_channels_on_living_sync_enabled_calendar() {
         &http,
         &calendars,
         &events,
-        &watches,
+        &FakeOperationRepo::new(), &watches,
         &tokens,
         &oauth,
         Some(CALLBACK_URL),
@@ -188,7 +188,7 @@ fn cron_syncs_stale_and_skips_fresh() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1, "only the stale calendar synced");
@@ -224,7 +224,7 @@ fn cron_syncs_never_synced() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1);
@@ -258,7 +258,7 @@ fn cron_watch_404_disables() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, Some(CALLBACK_URL), NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, Some(CALLBACK_URL), NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 0);
@@ -293,7 +293,7 @@ fn cron_skips_watch_when_callback_not_public() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth,
         Some("http://localhost:8787/api/calendar/notifications"),
         NOW_UNIX,
     ));
@@ -324,7 +324,7 @@ fn cron_token_refresh_failure_for_one_user_does_not_abort_the_rest() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1, "u-b's calendar synced despite u-a's failure");
@@ -448,7 +448,7 @@ fn cron_picks_dirty_even_when_last_success_is_fresh() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1);
@@ -494,7 +494,7 @@ fn cron_success_sets_applied_to_generation_at_start_mid_run_dirty_remains() {
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1);
@@ -545,7 +545,7 @@ fn cron_failure_leaves_dirty_other_calendars_progress_and_lease_busy_not_publish
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(
-        &http, &calendars, &events, &watches, &tokens, &oauth, None, NOW_UNIX,
+        &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
     ));
 
     assert_eq!(report.synced, 1);

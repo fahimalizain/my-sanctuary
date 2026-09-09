@@ -528,6 +528,13 @@ pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
 ///
 /// Projection `timed_masters_and_exceptions`: exclude all-day rows and
 /// cancelled exceptions (stored living for series correctness) from GET.
+///
+/// Also hide an unmodified window instance when a living **master** exists in
+/// the same calendar (`m.google_event_id = e.recurring_event_id`,
+/// `m.deleted_at IS NULL`, `m.recurrence != ''`) and the instance looks
+/// unmodified (`original_start` empty or equal to `start_time`, same title).
+/// Modified exceptions (moved start or different title) stay visible. When no
+/// master exists (window-only never-init), instances stay visible.
 pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
@@ -536,6 +543,18 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
       AND e.is_all_day = 0
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
       AND e.start_time < ? AND e.end_time > ?
+      AND NOT (
+        e.recurring_event_id IS NOT NULL AND e.recurring_event_id != ''
+        AND (e.original_start IS NULL OR e.original_start = '' OR e.original_start = e.start_time)
+        AND EXISTS (
+          SELECT 1 FROM calendar_events m
+          WHERE m.calendar_id = e.calendar_id
+            AND m.google_event_id = e.recurring_event_id
+            AND m.deleted_at IS NULL
+            AND m.recurrence IS NOT NULL AND m.recurrence != ''
+            AND e.title = m.title
+        )
+      )
     ORDER BY e.start_time ASC
 ";
 
@@ -547,7 +566,8 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
 /// range test needs no timestamp function.
 ///
 /// Same projection filters as the range query: a running task chip must not be
-/// an all-day or cancelled row.
+/// an all-day or cancelled row, and unmodified window instances are hidden
+/// when a living master exists (see [`EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`]).
 pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
@@ -557,6 +577,18 @@ pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
       AND e.task_id IS NOT NULL AND e.task_id != ''
       AND e.start_time <= ? AND e.end_time > ?
+      AND NOT (
+        e.recurring_event_id IS NOT NULL AND e.recurring_event_id != ''
+        AND (e.original_start IS NULL OR e.original_start = '' OR e.original_start = e.start_time)
+        AND EXISTS (
+          SELECT 1 FROM calendar_events m
+          WHERE m.calendar_id = e.calendar_id
+            AND m.google_event_id = e.recurring_event_id
+            AND m.deleted_at IS NULL
+            AND m.recurrence IS NOT NULL AND m.recurrence != ''
+            AND e.title = m.title
+        )
+      )
     ORDER BY e.start_time ASC
 ";
 
@@ -934,6 +966,20 @@ mod tests {
                 "{sql}"
             );
             assert!(sql.contains("e.deleted_at IS NULL"), "{sql}");
+            // Unmodified window instances hidden when a living master exists.
+            assert!(
+                sql.contains("m.google_event_id = e.recurring_event_id"),
+                "master join by recurring_event_id: {sql}"
+            );
+            assert!(
+                sql.contains("m.recurrence IS NOT NULL AND m.recurrence != ''"),
+                "master must be a series: {sql}"
+            );
+            assert!(
+                sql.contains("e.original_start = e.start_time"),
+                "unmodified expansion predicate: {sql}"
+            );
+            assert!(sql.contains("e.title = m.title"), "title match: {sql}");
         }
     }
 

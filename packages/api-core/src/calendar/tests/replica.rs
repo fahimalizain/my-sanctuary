@@ -12,7 +12,7 @@ fn empty_items_with_next_sync_token_is_replica_success() {
     let cal = calendars.stored.lock().unwrap()[0].clone();
 
     pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap();
 
@@ -50,7 +50,7 @@ fn google_list_failure_records_attempt_not_success() {
     let events = FakeEventRepo::new();
 
     let err = pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap_err();
     assert!(
@@ -111,7 +111,7 @@ fn upsert_failure_records_storage_transient_without_advancing_token() {
     *events.fail_upsert.lock().unwrap() = true;
 
     let err = pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::Repo(_)), "{err:?}");
@@ -152,7 +152,7 @@ fn missing_terminal_next_sync_token_is_not_success() {
     let events = FakeEventRepo::new();
 
     let err = pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap_err();
     assert!(
@@ -211,7 +211,7 @@ fn events_list_410_after_retry_records_gone() {
     let events = FakeEventRepo::new();
 
     let err = pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap_err();
     assert!(
@@ -250,7 +250,7 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
         ("/events", 200, page_one),
     ]);
     let err = pollster::block_on(sync_calendar(
-        &http_fail, &calendars, &events, &access(), &cal, now,
+        &http_fail, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, now,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")), "{err:?}");
@@ -266,7 +266,7 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
         ("/events", 200, page_one),
     ]);
     pollster::block_on(sync_calendar(
-        &http_ok, &calendars, &events, &access(), &cal, now,
+        &http_ok, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, now,
     ))
     .unwrap();
     let upserted = events.upserted_batch.lock().unwrap();
@@ -302,7 +302,7 @@ fn replica_410_first_page_merge_full_preserves_task_id_and_ghosts() {
         ("/events", 200, merge),
     ]);
     pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap();
 
@@ -340,7 +340,7 @@ fn replica_410_later_page_merge_full_keeps_partial_apply() {
         ("/events", 200, merge),
     ]);
     pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap();
 
@@ -392,7 +392,7 @@ fn replica_failure_after_page1_delete_replays_idempotently() {
         &http_fail,
         &calendars,
         &events,
-        &access(),
+        &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
     ))
@@ -417,7 +417,7 @@ fn replica_failure_after_page1_delete_replays_idempotently() {
         &http_ok,
         &calendars,
         &events,
-        &access(),
+        &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
     ))
@@ -456,7 +456,7 @@ fn replica_poison_on_one_calendar_records_mapping_poison() {
     let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
     let events = FakeEventRepo::new();
     let err = pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::InvalidResponse(_)), "{err:?}");
@@ -482,7 +482,7 @@ fn replica_unexpired_foreign_lease_skips_without_failure() {
         &http,
         &calendars,
         &events,
-        &access(),
+        &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
     ))
@@ -517,7 +517,7 @@ fn replica_expired_foreign_lease_is_stolen_and_walk_succeeds() {
         &http,
         &calendars,
         &events,
-        &access(),
+        &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
     ))
@@ -567,7 +567,7 @@ fn replica_mid_walk_lease_loss_does_not_publish_token() {
         &http,
         &calendars,
         &events,
-        &access(),
+        &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
     ))
@@ -609,7 +609,7 @@ fn replica_cancelled_event_delete_failure_records_storage_transient() {
     let cal = calendars.stored.lock().unwrap()[0].clone();
 
     let err = pollster::block_on(sync_calendar(
-        &http, &calendars, &events, &access(), &cal, "2023-11-14T22:13:20Z",
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::Repo(_)), "{err:?}");
@@ -648,4 +648,86 @@ fn sync_maps_sanctuary_task_id_onto_cached_events() {
     assert_eq!(upserted.len(), 1);
     assert_eq!(upserted[0].task_id, "task-1", "carrier copied from shared props");
     assert_eq!(output.events[0].task_id, "task-1");
+}
+
+#[test]
+fn replica_skips_inflight_google_event_ids() {
+    // In-flight journal row for g-inflight: replica page must not upsert or
+    // soft-delete that id (would clobber a concurrent user write).
+    use crate::models::{
+        CalendarEventOperation, OP_STATUS_PENDING, OP_VERB_PATCH,
+    };
+
+    let body = r#"{"items":[
+        {"id":"g-inflight","summary":"Stale title",
+         "start":{"dateTime":"2026-08-18T09:00:00Z"},
+         "end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"g-ok","summary":"Ok",
+         "start":{"dateTime":"2026-08-18T10:00:00Z"},
+         "end":{"dateTime":"2026-08-18T10:30:00Z"}},
+        {"id":"g-cancel","status":"cancelled"}
+    ],"nextSyncToken":"st-skip"}"#;
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    // Pre-seed the in-flight local row with the user's newer title.
+    let mut living = living_event("local-inflight", "cal-1", "g-inflight");
+    living.title = "User rewrite".to_string();
+    events.stored.lock().unwrap().push(living);
+
+    let ops = FakeOperationRepo::with(vec![CalendarEventOperation {
+        id: "op-1".to_string(),
+        user_id: "u-1".to_string(),
+        calendar_id: "cal-1".to_string(),
+        local_event_id: "local-inflight".to_string(),
+        google_event_id: "g-inflight".to_string(),
+        verb: OP_VERB_PATCH.to_string(),
+        payload_fingerprint: "fp".to_string(),
+        payload_json: "{}".to_string(),
+        status: OP_STATUS_PENDING.to_string(),
+        google_etag: "e1".to_string(),
+        attempt_count: 0,
+        last_error: String::new(),
+        created_at: "2023-11-14T22:00:00Z".to_string(),
+        updated_at: "2023-11-14T22:00:00Z".to_string(),
+    }]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+
+    let upserted = events.upserted_batch.lock().unwrap();
+    assert!(
+        upserted.iter().all(|e| e.google_event_id != "g-inflight"),
+        "inflight id must not be upserted: {upserted:?}"
+    );
+    assert!(
+        upserted.iter().any(|e| e.google_event_id == "g-ok"),
+        "non-inflight still applied: {upserted:?}"
+    );
+    let deleted = events.deleted_by_google_event_id.lock().unwrap();
+    assert!(
+        deleted.iter().all(|(_, id)| id != "g-inflight"),
+        "inflight must not soft-delete: {deleted:?}"
+    );
+    // Cancelled non-inflight still soft-deleted.
+    assert!(
+        deleted.iter().any(|(_, id)| id == "g-cancel"),
+        "cancelled non-inflight still deleted: {deleted:?}"
+    );
+    // User row title preserved.
+    let stored = events.stored.lock().unwrap();
+    let inflight = stored
+        .iter()
+        .find(|e| e.google_event_id == "g-inflight")
+        .unwrap();
+    assert_eq!(inflight.title, "User rewrite");
 }

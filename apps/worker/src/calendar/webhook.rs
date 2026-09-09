@@ -161,10 +161,21 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                             return;
                         }
                     };
+                    let operations = match env.d1("DB") {
+                        Ok(db) => crate::db::D1CalendarEventOperationRepo::new(db),
+                        Err(err) => {
+                            console_log!(
+                                "calendar webhook: background sync for {} skipped (DB binding missing): {err}",
+                                calendar.id
+                            );
+                            return;
+                        }
+                    };
                     match api_core::sync_calendar(
                         &crate::http::WorkerHttp,
                         &calendars,
                         &events,
+                        &operations,
                         &access,
                         &calendar,
                         &now_rfc3339,
