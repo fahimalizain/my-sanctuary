@@ -4,11 +4,15 @@ use std::sync::Mutex;
 use crate::calendar::apply::row_from_new_event;
 use crate::config::OAuthConfig;
 use crate::models::{
-    CalendarEvent, GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewEventInput,
-    NewToken, NewWatchChannel, WatchChannel,
+    CalendarEvent, CalendarEventOperation, GoogleCalendar, GoogleOAuthToken, NewCalendar,
+    NewCalendarEvent, NewCalendarEventOperation, NewEventInput, NewToken, NewWatchChannel,
+    OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING, WatchChannel,
 };
 use crate::oauth::{HttpClient, HttpError};
-use crate::repo::{CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, WatchChannelRepo};
+use crate::repo::{
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo,
+    WatchChannelRepo,
+};
 use crate::token::GoogleAccess;
 
 // ──────────────────────────────────────────
@@ -1014,6 +1018,178 @@ impl WatchChannelRepo for FakeWatchChannelRepo {
             .lock()
             .unwrap()
             .retain(|channel| channel.calendar_id != calendar_id);
+        Ok(())
+    }
+}
+
+/// In-memory outbound operation journal (issue #50 / Vertical 4).
+/// Records inserts so slice 2 write-path tests can assert journal-first
+/// behavior; `fail_insert` forces a backend error before any row is stored.
+pub(crate) struct FakeOperationRepo {
+    pub(crate) stored: Mutex<Vec<CalendarEventOperation>>,
+    pub(crate) inserted: Mutex<Vec<NewCalendarEventOperation>>,
+    pub(crate) fail_insert: Mutex<bool>,
+    pub(crate) next_id: Mutex<u64>,
+}
+
+impl FakeOperationRepo {
+    pub(crate) fn new() -> Self {
+        Self {
+            stored: Mutex::new(Vec::new()),
+            inserted: Mutex::new(Vec::new()),
+            fail_insert: Mutex::new(false),
+            next_id: Mutex::new(1),
+        }
+    }
+
+    pub(crate) fn with(ops: Vec<CalendarEventOperation>) -> Self {
+        let max_numeric = ops
+            .iter()
+            .filter_map(|op| op.id.strip_prefix("op-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        Self {
+            stored: Mutex::new(ops),
+            inserted: Mutex::new(Vec::new()),
+            fail_insert: Mutex::new(false),
+            next_id: Mutex::new(max_numeric.saturating_add(1).max(1)),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl CalendarEventOperationRepo for FakeOperationRepo {
+    async fn insert(
+        &self,
+        op: NewCalendarEventOperation,
+        now_rfc3339: &str,
+    ) -> Result<String, RepoError> {
+        self.inserted.lock().unwrap().push(op.clone());
+        if *self.fail_insert.lock().unwrap() {
+            return Err(RepoError::Backend("journal insert failed".into()));
+        }
+        let mut next = self.next_id.lock().unwrap();
+        let id = format!("op-{next}");
+        *next += 1;
+        self.stored.lock().unwrap().push(CalendarEventOperation {
+            id: id.clone(),
+            user_id: op.user_id,
+            calendar_id: op.calendar_id,
+            local_event_id: op.local_event_id,
+            google_event_id: op.google_event_id,
+            verb: op.verb,
+            payload_fingerprint: op.payload_fingerprint,
+            payload_json: op.payload_json,
+            status: op.status,
+            google_etag: op.google_etag,
+            attempt_count: 0,
+            last_error: String::new(),
+            created_at: now_rfc3339.to_string(),
+            updated_at: now_rfc3339.to_string(),
+        });
+        Ok(id)
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEventOperation>, RepoError> {
+        Ok(self
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|op| op.id == id)
+            .cloned())
+    }
+
+    async fn list_by_statuses(
+        &self,
+        statuses: &[&str],
+    ) -> Result<Vec<CalendarEventOperation>, RepoError> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows: Vec<CalendarEventOperation> = self
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| statuses.iter().any(|s| *s == op.status.as_str()))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        Ok(rows)
+    }
+
+    async fn list_inflight_google_ids(
+        &self,
+        calendar_id: &str,
+    ) -> Result<Vec<String>, RepoError> {
+        let mut rows: Vec<(String, String)> = self
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| {
+                op.calendar_id == calendar_id
+                    && (op.status == OP_STATUS_PENDING
+                        || op.status == OP_STATUS_GOOGLE_COMMITTED)
+            })
+            .map(|op| (op.updated_at.clone(), op.google_event_id.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(rows.into_iter().map(|(_, id)| id).collect())
+    }
+
+    async fn update_status(
+        &self,
+        id: &str,
+        status: &str,
+        last_error: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Unknown id is a successful no-op (D1 UPDATE 0 rows).
+        if let Some(op) = self
+            .stored
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|op| op.id == id)
+        {
+            op.status = status.to_string();
+            op.last_error = last_error.to_string();
+            op.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+
+    async fn update_progress(
+        &self,
+        id: &str,
+        status: &str,
+        google_event_id: &str,
+        local_event_id: &str,
+        google_etag: &str,
+        last_error: &str,
+        bump_attempt: bool,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Unknown id is a successful no-op (D1 UPDATE 0 rows).
+        if let Some(op) = self
+            .stored
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|op| op.id == id)
+        {
+            op.status = status.to_string();
+            op.google_event_id = google_event_id.to_string();
+            op.local_event_id = local_event_id.to_string();
+            op.google_etag = google_etag.to_string();
+            op.last_error = last_error.to_string();
+            if bump_attempt {
+                op.attempt_count += 1;
+            }
+            op.updated_at = now_rfc3339.to_string();
+        }
         Ok(())
     }
 }

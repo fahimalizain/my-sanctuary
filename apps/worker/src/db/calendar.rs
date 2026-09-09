@@ -1,25 +1,28 @@
 //! D1-backed calendar repository implementations.
 
 use api_core::models::{
-    CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewWatchChannel,
-    WatchChannel,
+    CalendarEvent, CalendarEventOperation, GoogleCalendar, NewCalendar, NewCalendarEvent,
+    NewCalendarEventOperation, NewWatchChannel, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, CalendarEventRepo, CalendarRepo, RepoError, WatchChannelRepo,
-    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL,
-    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL,
-    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL,
-    CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
+    build_event_upsert_sql, build_operation_list_by_statuses_sql, CalendarEventOperationRepo,
+    CalendarEventRepo, CalendarRepo, RepoError, WatchChannelRepo, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
+    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
+    CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
+    CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL,
+    CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
     CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
     CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
-    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE,
-    WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
-    WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_ALL_SQL,
-    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
+    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
+    OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
+    OPERATION_UPDATE_STATUS_SQL, WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_DELETE_BY_ID_SQL, WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL,
+    WATCH_CHANNEL_LIST_ALL_SQL, WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1Type};
@@ -54,6 +57,17 @@ pub struct D1WatchChannelRepo {
 }
 
 impl D1WatchChannelRepo {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+/// `calendar_event_operations` outbound write journal (issue #50 / Vertical 4).
+pub struct D1CalendarEventOperationRepo {
+    db: D1Database,
+}
+
+impl D1CalendarEventOperationRepo {
     pub fn new(db: D1Database) -> Self {
         Self { db }
     }
@@ -719,6 +733,129 @@ impl WatchChannelRepo for D1WatchChannelRepo {
             .db
             .prepare(WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL)
             .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+}
+
+/// Row projection for `SELECT google_event_id …` inflight listing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct OperationGoogleEventIdRow {
+    google_event_id: String,
+}
+
+#[async_trait::async_trait(?Send)]
+impl CalendarEventOperationRepo for D1CalendarEventOperationRepo {
+    async fn insert(
+        &self,
+        op: NewCalendarEventOperation,
+        now_rfc3339: &str,
+    ) -> Result<String, RepoError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let stmt = self
+            .db
+            .prepare(OPERATION_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&id),
+                D1Type::Text(&op.user_id),
+                D1Type::Text(&op.calendar_id),
+                D1Type::Text(&op.local_event_id),
+                D1Type::Text(&op.google_event_id),
+                D1Type::Text(&op.verb),
+                D1Type::Text(&op.payload_fingerprint),
+                D1Type::Text(&op.payload_json),
+                D1Type::Text(&op.status),
+                D1Type::Text(&op.google_etag),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+        Ok(id)
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEventOperation>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(OPERATION_GET_BY_ID_SQL)
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        stmt.first::<CalendarEventOperation>(None)
+            .await
+            .map_err(backend)
+    }
+
+    async fn list_by_statuses(
+        &self,
+        statuses: &[&str],
+    ) -> Result<Vec<CalendarEventOperation>, RepoError> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sql, args) = build_operation_list_by_statuses_sql(statuses);
+        let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
+        let stmt = self.db.prepare(&sql).bind_refs(&refs).map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_inflight_google_ids(
+        &self,
+        calendar_id: &str,
+    ) -> Result<Vec<String>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
+        let rows: Vec<OperationGoogleEventIdRow> = query_vec(stmt).await?;
+        Ok(rows.into_iter().map(|row| row.google_event_id).collect())
+    }
+
+    async fn update_status(
+        &self,
+        id: &str,
+        status: &str,
+        last_error: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(OPERATION_UPDATE_STATUS_SQL)
+            .bind_refs(&[
+                D1Type::Text(status),
+                D1Type::Text(last_error),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn update_progress(
+        &self,
+        id: &str,
+        status: &str,
+        google_event_id: &str,
+        local_event_id: &str,
+        google_etag: &str,
+        last_error: &str,
+        bump_attempt: bool,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let bump = if bump_attempt { "1" } else { "0" };
+        let stmt = self
+            .db
+            .prepare(OPERATION_UPDATE_PROGRESS_SQL)
+            .bind_refs(&[
+                D1Type::Text(status),
+                D1Type::Text(google_event_id),
+                D1Type::Text(local_event_id),
+                D1Type::Text(google_etag),
+                D1Type::Text(last_error),
+                D1Type::Text(bump),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
             .map_err(backend)?;
         run_stmt(stmt).await
     }

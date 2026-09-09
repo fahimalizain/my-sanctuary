@@ -4,8 +4,8 @@ use async_trait::async_trait;
 
 use super::RepoError;
 use crate::models::{
-    CalendarEvent, GoogleCalendar, NewCalendar, NewCalendarEvent, NewWatchChannel,
-    WatchChannel,
+    CalendarEvent, CalendarEventOperation, GoogleCalendar, NewCalendar, NewCalendarEvent,
+    NewCalendarEventOperation, NewWatchChannel, WatchChannel,
 };
 
 /// Google Calendar persistence (`google_calendars` rows).
@@ -254,6 +254,60 @@ pub trait WatchChannelRepo: Send + Sync {
     /// HARD delete of every channel row for `calendar_id` (used when a
     /// calendar is disabled or soft-deleted — see ADR 0001).
     async fn delete_by_calendar_id(&self, calendar_id: &str) -> Result<(), RepoError>;
+}
+
+/// Outbound calendar write journal (`calendar_event_operations` rows).
+///
+/// Issue #50 / Vertical 4. Separate table = separate trait (same pattern as
+/// [`WatchChannelRepo`]). No soft-delete — journal rows stay forever for a
+/// personal app. Status machine: `pending` → `google_committed` →
+/// `cache_applied`; or `pending` → `failed`; or
+/// `pending`/`google_committed` → `conflict` after a 412 retry cap.
+#[async_trait(?Send)]
+pub trait CalendarEventOperationRepo: Send + Sync {
+    /// Inserts a new journal row and returns the generated `id`.
+    /// `now_rfc3339` is stamped into `created_at`/`updated_at`. Callers pass
+    /// `status = "pending"`.
+    async fn insert(
+        &self,
+        op: NewCalendarEventOperation,
+        now_rfc3339: &str,
+    ) -> Result<String, RepoError>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEventOperation>, RepoError>;
+    /// Living journal rows in `statuses` (e.g. pending + google_committed)
+    /// for repair. Empty `statuses` returns `Ok(vec![])` without a query.
+    async fn list_by_statuses(
+        &self,
+        statuses: &[&str],
+    ) -> Result<Vec<CalendarEventOperation>, RepoError>;
+    /// In-flight (`pending` or `google_committed`) google event ids for one
+    /// calendar — replica skip of writes still in flight.
+    async fn list_inflight_google_ids(
+        &self,
+        calendar_id: &str,
+    ) -> Result<Vec<String>, RepoError>;
+    async fn update_status(
+        &self,
+        id: &str,
+        status: &str,
+        last_error: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// Patch mutable fields after Google/cache steps: status, etag,
+    /// local_event_id, google_event_id (if discovered), last_error;
+    /// increments `attempt_count` when `bump_attempt` is true.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_progress(
+        &self,
+        id: &str,
+        status: &str,
+        google_event_id: &str,
+        local_event_id: &str,
+        google_etag: &str,
+        last_error: &str,
+        bump_attempt: bool,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
 }
 
 
@@ -662,6 +716,92 @@ pub const WATCH_CHANNEL_DELETE_BY_ID_SQL: &str =
 /// before this; overlap rows are removed together (ADR 0001).
 pub const WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL: &str =
     "DELETE FROM google_calendars_watch_channels WHERE calendar_id = ?";
+
+// ──────────────────────────────────────────
+// Calendar event operation journal SQL (issue #50 / Vertical 4)
+// ──────────────────────────────────────────
+
+/// Cap on statuses passed to [`build_operation_list_by_statuses_sql`] —
+/// well under D1's 100-parameter limit; the full status set is five values.
+pub const OPERATION_LIST_BY_STATUSES_MAX: usize = 8;
+
+/// Plain INSERT, not an upsert. The D1 implementation supplies `id` (UUIDv4)
+/// and `created_at`/`updated_at` from the passed `now_rfc3339`.
+/// `attempt_count` uses the column default (0); callers pass status
+/// `"pending"`. Binds: id, user_id, calendar_id, local_event_id,
+/// google_event_id, verb, payload_fingerprint, payload_json, status,
+/// google_etag, created_at, updated_at.
+pub const OPERATION_INSERT_SQL: &str = "
+    INSERT INTO calendar_event_operations
+        (id, user_id, calendar_id, local_event_id, google_event_id, verb,
+         payload_fingerprint, payload_json, status, google_etag,
+         created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+";
+
+pub const OPERATION_GET_BY_ID_SQL: &str =
+    "SELECT * FROM calendar_event_operations WHERE id = ?";
+
+/// In-flight repair set: `pending` and `google_committed` only, oldest first.
+/// Cron repair walks these; terminal statuses (`cache_applied`, `failed`,
+/// `conflict`) are excluded.
+pub const OPERATION_LIST_INFLIGHT_SQL: &str = "
+    SELECT * FROM calendar_event_operations
+    WHERE status IN ('pending', 'google_committed')
+    ORDER BY updated_at ASC
+";
+
+/// In-flight google event ids for one calendar (replica skip). Same status
+/// filter as [`OPERATION_LIST_INFLIGHT_SQL`]. Binds: calendar_id.
+pub const OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL: &str = "
+    SELECT google_event_id FROM calendar_event_operations
+    WHERE calendar_id = ?
+      AND status IN ('pending', 'google_committed')
+    ORDER BY updated_at ASC
+";
+
+/// Status-only update. Does not touch payload, etag, event ids, or
+/// attempt_count. Binds: status, last_error, updated_at, id.
+pub const OPERATION_UPDATE_STATUS_SQL: &str = "
+    UPDATE calendar_event_operations
+    SET status = ?, last_error = ?, updated_at = ?
+    WHERE id = ?
+";
+
+/// Progress update after Google/cache steps. Binds: status, google_event_id,
+/// local_event_id, google_etag, last_error, bump (0|1), updated_at, id.
+/// `attempt_count = attempt_count + ?` so one statement covers both bump and
+/// no-bump paths.
+pub const OPERATION_UPDATE_PROGRESS_SQL: &str = "
+    UPDATE calendar_event_operations
+    SET status = ?,
+        google_event_id = ?,
+        local_event_id = ?,
+        google_etag = ?,
+        last_error = ?,
+        attempt_count = attempt_count + ?,
+        updated_at = ?
+    WHERE id = ?
+";
+
+/// Builds `SELECT * FROM calendar_event_operations WHERE status IN (…)` for a
+/// non-empty status list (≤ [`OPERATION_LIST_BY_STATUSES_MAX`]). Returns
+/// `(sql, args)` with every arg a string (bound as `D1Type::Text`). Empty
+/// input is handled by the trait impl (returns `Ok(vec![])` without a query).
+pub fn build_operation_list_by_statuses_sql(statuses: &[&str]) -> (String, Vec<String>) {
+    assert!(!statuses.is_empty(), "operation status list must not be empty");
+    assert!(
+        statuses.len() <= OPERATION_LIST_BY_STATUSES_MAX,
+        "operation status list exceeds {OPERATION_LIST_BY_STATUSES_MAX} statuses"
+    );
+    let placeholders: Vec<&str> = statuses.iter().map(|_| "?").collect();
+    let sql = format!(
+        "SELECT * FROM calendar_event_operations WHERE status IN ({}) ORDER BY updated_at ASC",
+        placeholders.join(", ")
+    );
+    let args = statuses.iter().map(|s| (*s).to_string()).collect();
+    (sql, args)
+}
 
 
 #[cfg(test)]
@@ -1274,6 +1414,216 @@ mod tests {
         assert!(sql.contains("calendar_id = ?"), "{sql}");
         assert!(sql.contains("google_event_id = ?"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+    }
+
+    // ── calendar_event_operations journal (issue #50 / Vertical 4) ──
+
+    #[test]
+    fn migration_0012_creates_calendar_event_operations_journal() {
+        // Path from packages/api-core → apps/worker/migrations.
+        let migration =
+            include_str!("../../../../apps/worker/migrations/0012_calendar_event_operations.sql");
+        assert!(
+            migration.contains("CREATE TABLE IF NOT EXISTS calendar_event_operations"),
+            "migration must create calendar_event_operations"
+        );
+        for col in [
+            "id",
+            "user_id",
+            "calendar_id",
+            "local_event_id",
+            "google_event_id",
+            "verb",
+            "payload_fingerprint",
+            "payload_json",
+            "status",
+            "google_etag",
+            "attempt_count",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(migration.contains(col), "migration missing column {col}");
+        }
+        // Status / verb machine documented in the migration comment.
+        for token in [
+            "pending",
+            "google_committed",
+            "cache_applied",
+            "failed",
+            "conflict",
+            "insert",
+            "patch",
+            "delete",
+        ] {
+            assert!(
+                migration.contains(token),
+                "migration must document status/verb {token}"
+            );
+        }
+        assert!(
+            migration.contains("issue #50") || migration.contains("Vertical 4"),
+            "migration must reference issue #50 / Vertical 4"
+        );
+        assert!(
+            !migration.contains("deleted_at"),
+            "journal has no soft-delete: {migration}"
+        );
+        assert!(
+            migration.contains("idx_calendar_event_operations_status_updated")
+                || migration.contains("(status, updated_at)"),
+            "migration must index (status, updated_at) for cron repair"
+        );
+        assert!(
+            migration.contains("(calendar_id, google_event_id)"),
+            "migration must index (calendar_id, google_event_id)"
+        );
+        assert!(
+            migration.contains("(user_id, calendar_id)"),
+            "migration must index (user_id, calendar_id)"
+        );
+    }
+
+    #[test]
+    fn operation_insert_is_insert_not_upsert_and_lists_columns() {
+        let sql = OPERATION_INSERT_SQL;
+        assert!(
+            sql.contains("INSERT INTO calendar_event_operations"),
+            "{sql}"
+        );
+        assert!(!sql.contains("ON CONFLICT"), "{sql}");
+        for column in [
+            "id",
+            "user_id",
+            "calendar_id",
+            "local_event_id",
+            "google_event_id",
+            "verb",
+            "payload_fingerprint",
+            "payload_json",
+            "status",
+            "google_etag",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(sql.contains(column), "missing {column} in {sql}");
+        }
+        // attempt_count uses the column default — not bound on insert.
+        assert!(
+            !sql.contains("attempt_count"),
+            "insert leaves attempt_count to DEFAULT 0: {sql}"
+        );
+        assert_eq!(
+            sql.matches('?').count(),
+            12,
+            "one placeholder per bound column: {sql}"
+        );
+        assert!(!sql.contains("deleted_at"), "{sql}");
+    }
+
+    #[test]
+    fn operation_list_inflight_filters_pending_and_google_committed_only() {
+        let sql = OPERATION_LIST_INFLIGHT_SQL;
+        assert!(sql.contains("FROM calendar_event_operations"), "{sql}");
+        assert!(sql.contains("'pending'"), "{sql}");
+        assert!(sql.contains("'google_committed'"), "{sql}");
+        assert!(!sql.contains("'failed'"), "{sql}");
+        assert!(!sql.contains("'conflict'"), "{sql}");
+        assert!(!sql.contains("'cache_applied'"), "{sql}");
+        assert!(sql.contains("ORDER BY updated_at ASC"), "{sql}");
+    }
+
+    #[test]
+    fn operation_list_inflight_google_ids_scoped_by_calendar() {
+        let sql = OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL;
+        assert!(sql.contains("SELECT google_event_id"), "{sql}");
+        assert!(sql.contains("FROM calendar_event_operations"), "{sql}");
+        assert!(sql.contains("calendar_id = ?"), "{sql}");
+        assert!(sql.contains("'pending'"), "{sql}");
+        assert!(sql.contains("'google_committed'"), "{sql}");
+        assert!(!sql.contains("'failed'"), "{sql}");
+        assert!(!sql.contains("'conflict'"), "{sql}");
+        assert!(!sql.contains("'cache_applied'"), "{sql}");
+    }
+
+    #[test]
+    fn operation_update_progress_can_bump_attempt_and_write_fields() {
+        let sql = OPERATION_UPDATE_PROGRESS_SQL;
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("google_event_id = ?"), "{sql}");
+        assert!(sql.contains("local_event_id = ?"), "{sql}");
+        assert!(sql.contains("google_etag = ?"), "{sql}");
+        assert!(sql.contains("last_error = ?"), "{sql}");
+        assert!(
+            sql.contains("attempt_count = attempt_count + ?"),
+            "must support bump via bound 0/1: {sql}"
+        );
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(!sql.contains("payload_json"), "{sql}");
+        assert!(!sql.contains("payload_fingerprint"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+    }
+
+    #[test]
+    fn operation_update_status_only_touches_status_error_and_updated_at() {
+        let sql = OPERATION_UPDATE_STATUS_SQL;
+        assert!(sql.contains("status = ?"), "{sql}");
+        assert!(sql.contains("last_error = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        // Must not touch payload bodies, etag, event ids, attempt_count, or
+        // unrelated calendar sync columns.
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("payload_json"), "{sql}");
+        assert!(!sql.contains("payload_fingerprint"), "{sql}");
+        assert!(!sql.contains("google_etag"), "{sql}");
+        assert!(!sql.contains("google_event_id"), "{sql}");
+        assert!(!sql.contains("local_event_id"), "{sql}");
+        assert!(!sql.contains("attempt_count"), "{sql}");
+    }
+
+    #[test]
+    fn operation_list_by_statuses_builder_orders_and_binds() {
+        let (sql, args) =
+            build_operation_list_by_statuses_sql(&["pending", "google_committed"]);
+        assert!(sql.contains("FROM calendar_event_operations"), "{sql}");
+        assert!(sql.contains("status IN (?, ?)"), "{sql}");
+        assert!(sql.contains("ORDER BY updated_at ASC"), "{sql}");
+        assert_eq!(args, vec!["pending".to_string(), "google_committed".to_string()]);
+    }
+
+    #[test]
+    fn calendar_event_operation_deserializes_d1_shaped_json() {
+        use crate::models::CalendarEventOperation;
+
+        let op: CalendarEventOperation = serde_json::from_str(
+            r#"{
+                "id": "op-1",
+                "user_id": "u-1",
+                "calendar_id": "cal-1",
+                "local_event_id": null,
+                "google_event_id": null,
+                "verb": "insert",
+                "payload_fingerprint": "abc",
+                "payload_json": "{}",
+                "status": "pending",
+                "google_etag": null,
+                "attempt_count": 0,
+                "last_error": null,
+                "created_at": "2026-09-10T00:00:00Z",
+                "updated_at": "2026-09-10T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(op.id, "op-1");
+        assert_eq!(op.local_event_id, "", "NULL TEXT maps to empty string");
+        assert_eq!(op.google_event_id, "");
+        assert_eq!(op.google_etag, "");
+        assert_eq!(op.last_error, "");
+        assert_eq!(op.attempt_count, 0);
+        assert_eq!(op.verb, "insert");
+        assert_eq!(op.status, "pending");
     }
 
 }

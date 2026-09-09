@@ -273,6 +273,78 @@ pub struct NewWatchChannel {
     pub expiration: String,
 }
 
+/// Verb constants for [`CalendarEventOperation::verb`].
+pub const OP_VERB_INSERT: &str = "insert";
+pub const OP_VERB_PATCH: &str = "patch";
+pub const OP_VERB_DELETE: &str = "delete";
+
+/// Status constants for [`CalendarEventOperation::status`].
+///
+/// Machine: `pending` → `google_committed` → `cache_applied`; or
+/// `pending` → `failed`; or `pending`/`google_committed` → `conflict`
+/// after a 412 retry cap (issue #50 / Vertical 4).
+pub const OP_STATUS_PENDING: &str = "pending";
+pub const OP_STATUS_GOOGLE_COMMITTED: &str = "google_committed";
+pub const OP_STATUS_CACHE_APPLIED: &str = "cache_applied";
+pub const OP_STATUS_FAILED: &str = "failed";
+pub const OP_STATUS_CONFLICT: &str = "conflict";
+
+/// A durable outbound calendar write journal row
+/// (`calendar_event_operations`). Issue #50 / Vertical 4.
+///
+/// Doubles as the D1 row projection: field names match the schema. TEXT
+/// defaults map to `""` via [`de_empty_string`]. No soft-delete — this is a
+/// journal, not a domain entity (same spirit as watch channels).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CalendarEventOperation {
+    pub id: String,
+    pub user_id: String,
+    pub calendar_id: String,
+    /// Known for patch/delete; filled after cache apply on insert.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub local_event_id: String,
+    /// Minted before insert HTTP; known for patch/delete.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub google_event_id: String,
+    /// `insert` | `patch` | `delete`.
+    pub verb: String,
+    /// Hex sha256 (or stable hex) of canonical payload JSON.
+    pub payload_fingerprint: String,
+    /// Intended Google JSON body (needed to replay/merge).
+    pub payload_json: String,
+    /// `pending` | `google_committed` | `cache_applied` | `failed` | `conflict`.
+    pub status: String,
+    /// Last known etag; empty until Google responds.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub google_etag: String,
+    /// 412 retries increment this. D1 INTEGER.
+    #[serde(default)]
+    pub attempt_count: i64,
+    /// Never store tokens / raw OAuth.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub last_error: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::CalendarEventOperationRepo::insert`].
+/// The D1 implementation generates the UUID `id` and stamps
+/// `created_at`/`updated_at`. Callers insert with
+/// [`OP_STATUS_PENDING`]. `attempt_count` starts at 0 in SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCalendarEventOperation {
+    pub user_id: String,
+    pub calendar_id: String,
+    pub local_event_id: String,
+    pub google_event_id: String,
+    pub verb: String,
+    pub payload_fingerprint: String,
+    pub payload_json: String,
+    /// Callers insert as [`OP_STATUS_PENDING`].
+    pub status: String,
+    pub google_etag: String,
+}
+
 /// Request body for `PATCH /api/calendar/events/:id`.
 /// At least one field must be `Some` (empty patch → 400).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
