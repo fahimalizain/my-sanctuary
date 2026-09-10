@@ -391,6 +391,54 @@ export function formatEventTimeRange(start: Date, end: Date): string {
 }
 
 /**
+ * Compact duration for the inspector when-block: "15min", "1h", "1h 30min".
+ * Whole minutes from end − start, rounded to nearest, clamped ≥ 0.
+ */
+export function formatEventDuration(start: Date, end: Date): string {
+  const totalMin = Math.max(
+    0,
+    Math.round((end.getTime() - start.getTime()) / 60_000),
+  );
+  const hours = Math.floor(totalMin / 60);
+  const minutes = totalMin % 60;
+  if (hours === 0) return `${minutes}min`;
+  if (minutes === 0) return `${hours}h`;
+  return `${hours}h ${minutes}min`;
+}
+
+/** Sun-first weekday labels for civil date lines (not WEEK_DAYS, which is Mon-first). */
+const WEEKDAY_SUN_FIRST = [
+  'Sun',
+  'Mon',
+  'Tue',
+  'Wed',
+  'Thu',
+  'Fri',
+  'Sat',
+] as const;
+
+function formatCivilDateLabel(date: Date): string {
+  const weekday = WEEKDAY_SUN_FIRST[date.getDay()];
+  return `${weekday} ${MONTH_SHORT[date.getMonth()]} ${date.getDate()}`;
+}
+
+/**
+ * Civil date line for the inspector when-block, browser local zone.
+ * Same day → "Sun Sep 13"; cross-day → "Sun Sep 13 → Mon Sep 14".
+ */
+export function formatEventDateLine(start: Date, end: Date): string {
+  const startLabel = formatCivilDateLabel(start);
+  if (
+    start.getFullYear() === end.getFullYear() &&
+    start.getMonth() === end.getMonth() &&
+    start.getDate() === end.getDate()
+  ) {
+    return startLabel;
+  }
+  return `${startLabel} → ${formatCivilDateLabel(end)}`;
+}
+
+/**
  * Hour row height for the current viewport hours area.
  * Short viewports stay at ≥48 and scroll; tall ones stretch up to 208.
  */
