@@ -80,7 +80,10 @@ export function useCalendarStrip(): CalendarStrip {
   // Initial: overscan before current period so it is centered in the buffer.
   // Uses stored period length so Day/short views do not Monday-snap on first paint.
   const [windowStart, setWindowStart] = useState(() =>
-    addDays(fitPeriodStart(new Date(), readStoredPeriodLength()), -STRIP_OVERSCAN),
+    addDays(
+      fitPeriodStart(new Date(), readStoredPeriodLength()),
+      -STRIP_OVERSCAN,
+    ),
   );
 
   // First visible day index into the rendered strip (0 … dayCount-periodLength).
