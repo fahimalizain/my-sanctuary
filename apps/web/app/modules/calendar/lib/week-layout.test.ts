@@ -17,6 +17,7 @@ import {
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
+  parseStoredPeriodLength,
   colWidth,
   dayIndexFromScroll,
   eventHeightPx,
@@ -164,6 +165,20 @@ test('clampPeriodLength: 0→1, 3→3, 9→7, NaN→7', () => {
   assert.equal(clampPeriodLength(9), 7);
   assert.equal(clampPeriodLength(NaN), 7);
   assert.equal(clampPeriodLength(Infinity), 7);
+});
+
+test('parseStoredPeriodLength: null / empty / non-numeric → null', () => {
+  assert.equal(parseStoredPeriodLength(null), null);
+  assert.equal(parseStoredPeriodLength(''), null);
+  assert.equal(parseStoredPeriodLength('nope'), null);
+});
+
+test('parseStoredPeriodLength: valid number is clamped', () => {
+  assert.equal(parseStoredPeriodLength('1'), 1);
+  assert.equal(parseStoredPeriodLength('3'), 3);
+  assert.equal(parseStoredPeriodLength('7'), 7);
+  assert.equal(parseStoredPeriodLength('0'), 1);
+  assert.equal(parseStoredPeriodLength('9'), 7);
 });
 
 test('periodLabel: 1 Day, 3 "3 days", 7 Week', () => {
