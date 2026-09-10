@@ -728,7 +728,9 @@ export function useCalendarSession({
 
   const hourLabels = useMemo(() => {
     const step = hourLabelStep(hourH);
-    return Array.from({ length: 24 }, (_, h) => h).filter((h) => h % step === 0);
+    return Array.from({ length: 24 }, (_, h) => h).filter(
+      (h) => h % step === 0,
+    );
   }, [hourH]);
 
   const hourGridBg = useMemo(() => hourGridBackground(hourH), [hourH]);

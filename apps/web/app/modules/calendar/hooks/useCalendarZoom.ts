@@ -1,9 +1,4 @@
-import {
-  useLayoutEffect,
-  useRef,
-  useState,
-  type RefObject,
-} from 'react';
+import { useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import {
   HOUR_H_STORAGE_KEY,
   hourHAfterZoom,
@@ -58,7 +53,11 @@ export function useCalendarZoom(options: {
     const el = scrollerRef.current;
     if (!el) return;
 
-    const applyZoom = (nextHourH: number, clientY: number, scroller: HTMLElement) => {
+    const applyZoom = (
+      nextHourH: number,
+      clientY: number,
+      scroller: HTMLElement,
+    ) => {
       const current = hourHRef.current;
       if (nextHourH === current) return;
 
