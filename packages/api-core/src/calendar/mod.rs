@@ -59,8 +59,7 @@
 //!   (`X-Goog-Channel-ID`/`-Token`/`-Resource-State`) against the stored
 //!   channel and calendar rows — pure and unit-tested. The Worker persists
 //!   the decision via [`persist_webhook_decision`] (dirty bump or disable)
-//!   **before** HTTP 200; an optional `ctx.wait_until` replica attempt is
-//!   only an optimization after durable dirty is written.
+//!   **before** HTTP 200. No `wait_until` replica — cron is the contract.
 
 
 pub mod apply;

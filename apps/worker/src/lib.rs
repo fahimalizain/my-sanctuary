@@ -57,9 +57,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let config = load_config(&env);
 
     // Google Calendar push webhooks (ADR 0001 § Webhook) are intercepted
-    // before the Router: `Router::run` never sees the fetch `Context`, and
-    // the background sync after a verified push must run via
-    // `ctx.wait_until`. Only a POST to the configured callback path (or the
+    // before the Router so they skip session/CORS middleware (Google is not
+    // a browser). Only a POST to the configured callback path (or the
     // documented default) is a webhook; everything else — including GETs to
     // that path — falls through to the Router.
     if is_webhook_request(&req, config.as_ref()) {
