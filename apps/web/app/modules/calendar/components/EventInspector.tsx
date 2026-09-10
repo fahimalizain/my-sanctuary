@@ -33,12 +33,16 @@ const DESKTOP_MQ = '(min-width: 768px)';
 export interface EventInspectorProps {
   event: CalendarEvent;
   calendar?: GoogleCalendar;
+  /** Writable calendars for the calendar select (local ids). */
+  calendars?: GoogleCalendar[];
   /** Focus the title input on mount (click-to-create path). */
   focusTitle?: boolean;
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
   onSaveDescription: (description: string) => void | Promise<void>;
   onSaveTimes: (startIso: string, endIso: string) => void | Promise<void>;
+  /** Move event to another calendar (local calendar id). */
+  onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -158,9 +162,14 @@ function hasRepeat(event: CalendarEvent): boolean {
   }
 }
 
+function isWritableCalendar(cal: GoogleCalendar): boolean {
+  return cal.access_role === 'owner' || cal.access_role === 'writer';
+}
+
 interface InspectorFormProps {
   event: CalendarEvent;
   calendar?: GoogleCalendar;
+  calendars: GoogleCalendar[];
   title: string;
   setTitle: (v: string) => void;
   titleRef: RefObject<HTMLInputElement | null>;
@@ -170,6 +179,7 @@ interface InspectorFormProps {
   commitDescription: () => void;
   commitTimes: (next: { start: Date; end: Date } | null) => void;
   onClose: () => void;
+  onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving: boolean;
   isDeleting: boolean;
@@ -184,6 +194,7 @@ const dateInputClassName =
 function InspectorForm({
   event,
   calendar,
+  calendars,
   title,
   setTitle,
   titleRef,
@@ -193,6 +204,7 @@ function InspectorForm({
   commitDescription,
   commitTimes,
   onClose,
+  onSaveCalendar,
   onDelete,
   isSaving,
   isDeleting,
@@ -220,6 +232,17 @@ function InspectorForm({
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
   const inputsDisabled = isSaving || isDeleting;
+
+  const writableCalendars = calendars.filter(isWritableCalendar);
+  const currentInWritable = writableCalendars.some(
+    (c) => c.id === event.calendar_id,
+  );
+  // Reader calendar not in writable list: keep a disabled option so value
+  // does not reset.
+  const calendarSelectOptions =
+    !currentInWritable && calendar
+      ? [calendar, ...writableCalendars]
+      : writableCalendars;
 
   return (
     <>
@@ -418,16 +441,47 @@ function InspectorForm({
           <p className="text-sm text-muted-foreground">Description</p>
         )}
 
-        {/* Calendar — swatch + summary */}
+        {/* Calendar — swatch + select (writable) or static summary */}
         <div className="flex min-w-0 items-center gap-2">
           <span
             className="h-2.5 w-2.5 shrink-0 rounded-full"
             style={{ backgroundColor: swatch }}
             aria-hidden
           />
-          <span className="truncate text-sm text-foreground">
-            {calendarLabel}
-          </span>
+          {writable ? (
+            <select
+              aria-label="Calendar"
+              value={event.calendar_id}
+              disabled={inputsDisabled}
+              onChange={(e) => {
+                const next = e.target.value;
+                if (next === event.calendar_id) return;
+                void onSaveCalendar(next);
+              }}
+              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-sm text-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+            >
+              {calendarSelectOptions.map((cal) => {
+                const label =
+                  cal.summary.trim().length > 0
+                    ? cal.summary
+                    : cal.google_calendar_id;
+                const disabledOption = !isWritableCalendar(cal);
+                return (
+                  <option
+                    key={cal.id}
+                    value={cal.id}
+                    disabled={disabledOption}
+                  >
+                    {label}
+                  </option>
+                );
+              })}
+            </select>
+          ) : (
+            <span className="truncate text-sm text-foreground">
+              {calendarLabel}
+            </span>
+          )}
         </div>
       </div>
     </>
@@ -442,11 +496,13 @@ function InspectorForm({
 export function EventInspector({
   event,
   calendar,
+  calendars = [],
   focusTitle = false,
   onClose,
   onSaveTitle,
   onSaveDescription,
   onSaveTimes,
+  onSaveCalendar,
   onDelete,
   isSaving = false,
   isDeleting = false,
@@ -551,6 +607,7 @@ export function EventInspector({
     <InspectorForm
       event={event}
       calendar={calendar}
+      calendars={calendars}
       title={title}
       setTitle={setTitle}
       titleRef={titleRef}
@@ -560,6 +617,7 @@ export function EventInspector({
       commitDescription={commitDescription}
       commitTimes={commitTimes}
       onClose={onClose}
+      onSaveCalendar={onSaveCalendar}
       onDelete={onDelete}
       isSaving={isSaving}
       isDeleting={isDeleting}

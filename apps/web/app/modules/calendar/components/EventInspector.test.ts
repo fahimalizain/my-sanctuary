@@ -12,11 +12,13 @@ installDom();
 type EventInspectorProps = {
   event: CalendarEvent;
   calendar?: GoogleCalendar;
+  calendars?: GoogleCalendar[];
   focusTitle?: boolean;
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
   onSaveDescription: (description: string) => void | Promise<void>;
   onSaveTimes: (startIso: string, endIso: string) => void | Promise<void>;
+  onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -84,11 +86,13 @@ type Spies = {
   onSaveTitle: (...args: unknown[]) => void;
   onSaveDescription: (...args: unknown[]) => void;
   onSaveTimes: (...args: unknown[]) => void;
+  onSaveCalendar: (...args: unknown[]) => void;
   onDelete: (...args: unknown[]) => void;
   closeCalls: unknown[][];
   saveCalls: unknown[][];
   saveDescriptionCalls: unknown[][];
   saveTimesCalls: unknown[][];
+  saveCalendarCalls: unknown[][];
   deleteCalls: unknown[][];
 };
 
@@ -97,12 +101,14 @@ function makeSpies(): Spies {
   const saveCalls: unknown[][] = [];
   const saveDescriptionCalls: unknown[][] = [];
   const saveTimesCalls: unknown[][] = [];
+  const saveCalendarCalls: unknown[][] = [];
   const deleteCalls: unknown[][] = [];
   return {
     closeCalls,
     saveCalls,
     saveDescriptionCalls,
     saveTimesCalls,
+    saveCalendarCalls,
     deleteCalls,
     onClose: (...args: unknown[]) => {
       closeCalls.push(args);
@@ -116,31 +122,58 @@ function makeSpies(): Spies {
     onSaveTimes: (...args: unknown[]) => {
       saveTimesCalls.push(args);
     },
+    onSaveCalendar: (...args: unknown[]) => {
+      saveCalendarCalls.push(args);
+    },
     onDelete: (...args: unknown[]) => {
       deleteCalls.push(args);
     },
   };
 }
 
+function defaultCalendars(): GoogleCalendar[] {
+  return [
+    makeCalendar({ id: 'cal-1', summary: 'Personal Goals' }),
+    makeCalendar({
+      id: 'cal-2',
+      google_calendar_id: 'work@example.com',
+      summary: 'Work',
+      is_primary: false,
+      access_role: 'writer',
+    }),
+    makeCalendar({
+      id: 'cal-reader',
+      google_calendar_id: 'shared@example.com',
+      summary: 'Shared (read)',
+      is_primary: false,
+      access_role: 'reader',
+    }),
+  ];
+}
+
 function mount(
   props: {
     event?: CalendarEvent;
     calendar?: GoogleCalendar | undefined;
+    calendars?: GoogleCalendar[];
     focusTitle?: boolean;
   } = {},
   spies = makeSpies(),
 ) {
   const event = props.event ?? makeEvent({ id: 'e1' });
   const calendar = 'calendar' in props ? props.calendar : makeCalendar();
+  const calendars = props.calendars ?? defaultCalendars();
   render(
     createElement(EventInspector, {
       event,
       calendar,
+      calendars,
       focusTitle: props.focusTitle,
       onClose: spies.onClose,
       onSaveTitle: spies.onSaveTitle,
       onSaveDescription: spies.onSaveDescription,
       onSaveTimes: spies.onSaveTimes,
+      onSaveCalendar: spies.onSaveCalendar,
       onDelete: spies.onDelete,
     }),
   );
@@ -369,8 +402,41 @@ test('description commit: trim on blur; unchanged no-op; clear commits empty', (
 
 // ── 4. Calendar row ─────────────────────────────────────────────────────
 
-test('calendar row shows calendar.summary', () => {
-  mount({ calendar: makeCalendar({ summary: 'Personal Goals' }) });
+test('writable calendar row is a select of writable calendars', () => {
+  const spies = makeSpies();
+  mount(
+    {
+      calendar: makeCalendar({ summary: 'Personal Goals' }),
+      calendars: defaultCalendars(),
+    },
+    spies,
+  );
+  const select = screen.getByLabelText('Calendar') as HTMLSelectElement;
+  assert.equal(select.value, 'cal-1');
+  const optionLabels = Array.from(select.options).map((o) => o.textContent);
+  assert.deepEqual(optionLabels, ['Personal Goals', 'Work']);
+  // Reader calendar is not an option.
+  assert.ok(!optionLabels.includes('Shared (read)'));
+
+  fireEvent.change(select, { target: { value: 'cal-2' } });
+  assert.equal(spies.saveCalendarCalls.length, 1);
+  assert.equal(spies.saveCalendarCalls[0][0], 'cal-2');
+});
+
+test('calendar select same value is a no-op', () => {
+  const spies = makeSpies();
+  mount({}, spies);
+  const select = screen.getByLabelText('Calendar') as HTMLSelectElement;
+  fireEvent.change(select, { target: { value: 'cal-1' } });
+  assert.equal(spies.saveCalendarCalls.length, 0);
+});
+
+test('read-only calendar row has no select; static summary remains', () => {
+  mount({
+    calendar: makeCalendar({ access_role: 'reader', summary: 'Personal Goals' }),
+    calendars: defaultCalendars(),
+  });
+  assert.equal(screen.queryByLabelText('Calendar'), null);
   assert.ok(screen.getByText('Personal Goals'));
 });
 

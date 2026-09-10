@@ -305,9 +305,11 @@ pub async fn create_event(
 
 /// `PATCH /api/calendar/events/:id` → 200 `{"event":{...},"source":"google"}`.
 ///
-/// Body: `{start?, end?, summary?, description?}` — at least one field
-/// required. Looks up the local event, verifies calendar ownership, then
-/// patches Google.
+/// Body: `{start?, end?, summary?, description?, calendar_id?}` — at least
+/// one field required. `calendar_id` is exclusive (local dest calendar id →
+/// Google `events.move`); cannot combine with start/end/summary/description.
+/// Looks up the local event, verifies calendar ownership, then patches or
+/// moves on Google.
 pub async fn update_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,

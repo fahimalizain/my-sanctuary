@@ -111,13 +111,17 @@ export interface CreateEventResponse {
   source: string;
 }
 
-// Request body for PATCH /api/calendar/events/:id — at least one field required
+// Request body for PATCH /api/calendar/events/:id — at least one field required.
+// `calendar_id` is exclusive (local dest id → Google events.move); cannot
+// combine with start/end/summary/description.
 export interface PatchCalendarEventInput {
   start?: string;
   end?: string;
   summary?: string;
   /** Event notes; empty string clears Google description. */
   description?: string;
+  /** Local destination calendar id — exclusive move field. */
+  calendar_id?: string;
 }
 
 // Envelope for DELETE /api/calendar/events/:id

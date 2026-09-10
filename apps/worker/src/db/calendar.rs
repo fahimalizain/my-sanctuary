@@ -14,8 +14,9 @@ use api_core::repo::{
     CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
-    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
+    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
+    EVENT_REASSIGN_CALENDAR_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
@@ -574,6 +575,24 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             .prepare(EVENT_DELETE_SQL)
             .bind_refs(&[
                 D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn reassign_calendar(
+        &self,
+        id: &str,
+        new_calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_REASSIGN_CALENDAR_SQL)
+            .bind_refs(&[
+                D1Type::Text(new_calendar_id),
                 D1Type::Text(now_rfc3339),
                 D1Type::Text(id),
             ])

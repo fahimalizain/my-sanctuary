@@ -306,7 +306,7 @@ export function useCalendarSession({
 
           // If the user renamed / moved / annotated the temp event before
           // POST returned, keep those fields under the server id and flush
-          // a PATCH.
+          // field PATCH first, then calendar MOVE (cannot combine).
           if (after.op === 'upsert') {
             const local = after.event;
             const titleDiffers = local.title !== postedSummary;
@@ -314,12 +314,15 @@ export function useCalendarSession({
               (local.description ?? '') !== postedDescription;
             const startDiffers = local.start_time !== startIso;
             const endDiffers = local.end_time !== endIso;
+            const calendarDiffers =
+              local.calendar_id !== result.event.calendar_id;
 
             if (
               titleDiffers ||
               descriptionDiffers ||
               startDiffers ||
-              endDiffers
+              endDiffers ||
+              calendarDiffers
             ) {
               const merged: CalendarEvent = {
                 ...result.event,
@@ -327,55 +330,126 @@ export function useCalendarSession({
                 description: local.description,
                 start_time: local.start_time,
                 end_time: local.end_time,
+                calendar_id: local.calendar_id,
+                color: local.color ?? colorForCalendar(local.calendar_id),
               };
               queue.upsert(merged);
 
-              const input: {
+              const fieldInput: {
                 summary?: string;
                 description?: string;
                 start?: string;
                 end?: string;
               } = {};
-              if (titleDiffers) input.summary = local.title;
+              if (titleDiffers) fieldInput.summary = local.title;
               if (descriptionDiffers) {
-                input.description = local.description ?? '';
+                fieldInput.description = local.description ?? '';
               }
-              if (startDiffers) input.start = local.start_time;
-              if (endDiffers) input.end = local.end_time;
+              if (startDiffers) fieldInput.start = local.start_time;
+              if (endDiffers) fieldInput.end = local.end_time;
 
               const serverId = result.event.id;
-              void updateEvent
-                .mutateAsync({ id: serverId, input })
-                .then((patchResult) => {
-                  upsertCalendarEventInCache(patchResult.event);
+              const hasFieldPatch = Object.keys(fieldInput).length > 0;
+
+              const flushMove = () => {
+                if (!calendarDiffers) {
                   const patchAfter = queue.getOverlay(serverId);
                   if (
                     !patchAfter ||
                     (patchAfter.op === 'upsert' &&
-                      patchAfter.event.title === patchResult.event.title &&
-                      patchAfter.event.description ===
-                        patchResult.event.description &&
-                      patchAfter.event.start_time ===
-                        patchResult.event.start_time &&
-                      patchAfter.event.end_time === patchResult.event.end_time)
+                      patchAfter.event.title === local.title &&
+                      patchAfter.event.description === local.description &&
+                      patchAfter.event.start_time === local.start_time &&
+                      patchAfter.event.end_time === local.end_time &&
+                      patchAfter.event.calendar_id === local.calendar_id)
                   ) {
-                    queue.clear(serverId);
+                    // Fields already match server after create; clear if no move.
+                    if (!hasFieldPatch) queue.clear(serverId);
                   }
-                })
-                .catch((err: unknown) => {
-                  // Revert only if overlay still matches what we tried to flush.
-                  const patchAfter = queue.getOverlay(serverId);
-                  if (
-                    patchAfter?.op === 'upsert' &&
-                    patchAfter.event.title === local.title &&
-                    patchAfter.event.description === local.description &&
-                    patchAfter.event.start_time === local.start_time &&
-                    patchAfter.event.end_time === local.end_time
-                  ) {
-                    queue.clear(serverId);
-                  }
-                  reportWriteError("Couldn't save event", err);
-                });
+                  return;
+                }
+                void updateEvent
+                  .mutateAsync({
+                    id: serverId,
+                    input: { calendar_id: local.calendar_id },
+                  })
+                  .then((moveResult) => {
+                    upsertCalendarEventInCache(moveResult.event);
+                    const patchAfter = queue.getOverlay(serverId);
+                    if (
+                      !patchAfter ||
+                      (patchAfter.op === 'upsert' &&
+                        patchAfter.event.title === moveResult.event.title &&
+                        patchAfter.event.description ===
+                          moveResult.event.description &&
+                        patchAfter.event.start_time ===
+                          moveResult.event.start_time &&
+                        patchAfter.event.end_time ===
+                          moveResult.event.end_time &&
+                        patchAfter.event.calendar_id ===
+                          moveResult.event.calendar_id)
+                    ) {
+                      queue.clear(serverId);
+                    }
+                  })
+                  .catch((err: unknown) => {
+                    const patchAfter = queue.getOverlay(serverId);
+                    if (
+                      patchAfter?.op === 'upsert' &&
+                      patchAfter.event.calendar_id === local.calendar_id &&
+                      patchAfter.event.title === local.title &&
+                      patchAfter.event.description === local.description &&
+                      patchAfter.event.start_time === local.start_time &&
+                      patchAfter.event.end_time === local.end_time
+                    ) {
+                      queue.clear(serverId);
+                    }
+                    reportWriteError("Couldn't save event", err);
+                  });
+              };
+
+              if (hasFieldPatch) {
+                void updateEvent
+                  .mutateAsync({ id: serverId, input: fieldInput })
+                  .then((patchResult) => {
+                    upsertCalendarEventInCache(patchResult.event);
+                    const patchAfter = queue.getOverlay(serverId);
+                    // Keep overlay if calendar still differs or newer edits.
+                    if (
+                      !calendarDiffers &&
+                      (!patchAfter ||
+                        (patchAfter.op === 'upsert' &&
+                          patchAfter.event.title === patchResult.event.title &&
+                          patchAfter.event.description ===
+                            patchResult.event.description &&
+                          patchAfter.event.start_time ===
+                            patchResult.event.start_time &&
+                          patchAfter.event.end_time ===
+                            patchResult.event.end_time &&
+                          patchAfter.event.calendar_id ===
+                            patchResult.event.calendar_id))
+                    ) {
+                      queue.clear(serverId);
+                    }
+                    flushMove();
+                  })
+                  .catch((err: unknown) => {
+                    const patchAfter = queue.getOverlay(serverId);
+                    if (
+                      patchAfter?.op === 'upsert' &&
+                      patchAfter.event.title === local.title &&
+                      patchAfter.event.description === local.description &&
+                      patchAfter.event.start_time === local.start_time &&
+                      patchAfter.event.end_time === local.end_time &&
+                      patchAfter.event.calendar_id === local.calendar_id
+                    ) {
+                      queue.clear(serverId);
+                    }
+                    reportWriteError("Couldn't save event", err);
+                  });
+              } else {
+                flushMove();
+              }
             }
           }
         },
@@ -442,7 +516,8 @@ export function useCalendarSession({
             latest.event.title === result.event.title &&
             latest.event.description === result.event.description &&
             latest.event.start_time === result.event.start_time &&
-            latest.event.end_time === result.event.end_time)
+            latest.event.end_time === result.event.end_time &&
+            latest.event.calendar_id === result.event.calendar_id)
         ) {
           queue.clear(selectedEventId);
         }
@@ -505,7 +580,8 @@ export function useCalendarSession({
             latest.event.title === result.event.title &&
             latest.event.description === result.event.description &&
             latest.event.start_time === result.event.start_time &&
-            latest.event.end_time === result.event.end_time)
+            latest.event.end_time === result.event.end_time &&
+            latest.event.calendar_id === result.event.calendar_id)
         ) {
           queue.clear(selectedEventId);
         }
@@ -528,6 +604,81 @@ export function useCalendarSession({
       queue,
       updateEvent,
       persistDraft,
+      clearWriteError,
+      reportWriteError,
+    ],
+  );
+
+  const handleSaveCalendar = useCallback(
+    async (calendarId: string) => {
+      if (!selectedEventId) return;
+      const current = overlaidEvents.find((e) => e.id === selectedEventId);
+      if (!current) return;
+      if (current.calendar_id === calendarId) return;
+
+      clearWriteError();
+
+      // Paint immediately (color follows destination calendar).
+      queue.upsert({
+        ...current,
+        calendar_id: calendarId,
+        color: colorForCalendar(calendarId),
+      });
+
+      // Ensure destination is visible so the chip does not vanish.
+      setSelectedCalendarIds((prev) => {
+        if (prev.has(calendarId)) return prev;
+        const next = new Set(prev);
+        next.add(calendarId);
+        return next;
+      });
+
+      // Unpersisted draft or temp id: overlay only; create POSTs calendar_id.
+      // In-flight create onSuccess flushes MOVE after any field PATCH.
+      if (
+        selectedEventId === unpersistedDraftIdRef.current ||
+        selectedEventId === unpersistedDraftId ||
+        isTempEventId(selectedEventId)
+      ) {
+        return;
+      }
+
+      try {
+        const result = await updateEvent.mutateAsync({
+          id: selectedEventId,
+          input: { calendar_id: calendarId },
+        });
+        upsertCalendarEventInCache(result.event);
+        const latest = queue.getOverlay(selectedEventId);
+        if (
+          !latest ||
+          (latest.op === 'upsert' &&
+            latest.event.title === result.event.title &&
+            latest.event.description === result.event.description &&
+            latest.event.start_time === result.event.start_time &&
+            latest.event.end_time === result.event.end_time &&
+            latest.event.calendar_id === result.event.calendar_id)
+        ) {
+          queue.clear(selectedEventId);
+        }
+      } catch (err) {
+        // Revert only if overlay still matches this move.
+        const latest = queue.getOverlay(selectedEventId);
+        if (
+          latest?.op === 'upsert' &&
+          latest.event.calendar_id === calendarId
+        ) {
+          queue.clear(selectedEventId);
+        }
+        reportWriteError("Couldn't save event", err);
+      }
+    },
+    [
+      selectedEventId,
+      unpersistedDraftId,
+      overlaidEvents,
+      queue,
+      updateEvent,
       clearWriteError,
       reportWriteError,
     ],
@@ -685,7 +836,8 @@ export function useCalendarSession({
               latest.event.start_time === result.event.start_time &&
               latest.event.end_time === result.event.end_time &&
               latest.event.title === result.event.title &&
-              latest.event.description === result.event.description)
+              latest.event.description === result.event.description &&
+              latest.event.calendar_id === result.event.calendar_id)
           ) {
             queue.clear(eventId);
           }
@@ -890,6 +1042,7 @@ export function useCalendarSession({
     handleSaveTitle,
     handleSaveDescription,
     handleSaveTimes,
+    handleSaveCalendar,
     handleDeleteEvent,
     isSaving: updateEvent.isPending,
     isDeleting: deleteEvent.isPending,

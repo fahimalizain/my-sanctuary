@@ -277,6 +277,7 @@ pub struct NewWatchChannel {
 pub const OP_VERB_INSERT: &str = "insert";
 pub const OP_VERB_PATCH: &str = "patch";
 pub const OP_VERB_DELETE: &str = "delete";
+pub const OP_VERB_MOVE: &str = "move";
 
 /// Status constants for [`CalendarEventOperation::status`].
 ///
@@ -306,7 +307,7 @@ pub struct CalendarEventOperation {
     /// Minted before insert HTTP; known for patch/delete.
     #[serde(default, deserialize_with = "de_empty_string")]
     pub google_event_id: String,
-    /// `insert` | `patch` | `delete`.
+    /// `insert` | `patch` | `delete` | `move`.
     pub verb: String,
     /// Hex sha256 (or stable hex) of canonical payload JSON.
     pub payload_fingerprint: String,
@@ -347,6 +348,10 @@ pub struct NewCalendarEventOperation {
 
 /// Request body for `PATCH /api/calendar/events/:id`.
 /// At least one field must be `Some` (empty patch → 400).
+///
+/// `calendar_id` is exclusive: when set, it must be the only field (local
+/// destination calendar id → Google `events.move`). Combining it with
+/// `start` / `end` / `summary` / `description` is rejected as invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct PatchEventFields {
     /// RFC 3339 dateTime passed through to Google `start.dateTime`.
@@ -362,6 +367,11 @@ pub struct PatchEventFields {
     /// `None` omits the field from the patch body.
     #[serde(default)]
     pub description: Option<String>,
+    /// Local destination calendar id (`google_calendars.id`). Exclusive —
+    /// cannot be combined with start/end/summary/description. Routes to
+    /// Google `events.move` (not `events.patch`).
+    #[serde(default)]
+    pub calendar_id: Option<String>,
 }
 
 /// Request body for `POST /api/calendar/events`.

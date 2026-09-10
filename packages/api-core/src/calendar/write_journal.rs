@@ -14,7 +14,7 @@ use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use crate::models::{
     GoogleCalendar, NewCalendarEventOperation, PatchEventFields, OP_STATUS_CACHE_APPLIED,
     OP_STATUS_CONFLICT, OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING,
-    OP_VERB_DELETE, OP_VERB_PATCH,
+    OP_VERB_DELETE, OP_VERB_MOVE, OP_VERB_PATCH,
 };
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
@@ -28,6 +28,9 @@ pub(crate) const IF_MATCH_MAX_ATTEMPTS: u32 = 3;
 /// Builds the minimal `events.patch` JSON object (only present fields).
 /// Empty map → caller returns [`CalendarError::Invalid`] before journal.
 /// `description: Some("")` is emitted as `""` so Google notes can be cleared.
+///
+/// `calendar_id` is intentionally omitted — calendar moves use Google
+/// `events.move` via [`move_event_with_journal`], not `events.patch`.
 pub(crate) fn build_patch_payload(fields: &PatchEventFields) -> serde_json::Map<String, serde_json::Value> {
     let mut payload = serde_json::Map::new();
     if let Some(start) = fields.start.as_ref() {
@@ -49,6 +52,166 @@ pub(crate) fn build_patch_payload(fields: &PatchEventFields) -> serde_json::Map<
         payload.insert("description".to_string(), serde_json::json!(description));
     }
     payload
+}
+
+fn is_writable_role(access_role: &str) -> bool {
+    access_role == "owner" || access_role == "writer"
+}
+
+/// Journaled Google `events.move` — reassigns the replica row in place
+/// (same local id, new `calendar_id`).
+///
+/// Journal `calendar_id` stays the **source** calendar. Payload is
+/// `{"destination":"<dest google_calendar_id>"}`.
+pub(crate) async fn move_event_with_journal(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
+    access: &GoogleAccess,
+    source: &GoogleCalendar,
+    event_local_id: &str,
+    google_event_id: &str,
+    dest_local_id: &str,
+    now_unix: i64,
+) -> Result<CreateEventOutput, CalendarError> {
+    if !is_writable_role(&source.access_role) {
+        return Err(CalendarError::Invalid(
+            "source calendar is not writable".to_string(),
+        ));
+    }
+
+    let Some(dest) = calendars.get_by_id(dest_local_id).await? else {
+        return Err(CalendarError::NotFound);
+    };
+    if dest.user_id != source.user_id {
+        return Err(CalendarError::NotFound);
+    }
+    if !is_writable_role(&dest.access_role) {
+        return Err(CalendarError::Invalid(
+            "destination calendar is not writable".to_string(),
+        ));
+    }
+
+    // Idempotent same-calendar move: return current row, no journal/HTTP.
+    if dest.id == source.id {
+        let Some(current) = events.get_by_id(event_local_id).await? else {
+            return Err(CalendarError::NotFound);
+        };
+        return Ok(CreateEventOutput {
+            event: current,
+            source: "cache".to_string(),
+            cache_error: None,
+        });
+    }
+
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let payload = serde_json::json!({ "destination": dest.google_calendar_id });
+    let body = serde_json::to_vec(&payload)
+        .map_err(|err| CalendarError::InvalidResponse(err.to_string()))?;
+
+    let op_id = insert_pending_op(
+        operations,
+        source,
+        event_local_id,
+        google_event_id,
+        OP_VERB_MOVE,
+        &body,
+        "",
+        &now_rfc3339,
+    )
+    .await?;
+
+    let url = format!(
+        "{GOOGLE_EVENTS_BASE_URL}/{}/events/{}/move?destination={}",
+        encode_path_segment(&source.google_calendar_id),
+        encode_path_segment(google_event_id),
+        encode_path_segment(&dest.google_calendar_id),
+    );
+
+    // Empty JSON body — destination is only in the query string.
+    let (status, response_bytes) = match http
+        .post_json(&url, &access.access_token, b"{}")
+        .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            let err = CalendarError::from(err);
+            mark_failed(operations, &op_id, &err, &now_rfc3339).await;
+            return Err(err);
+        }
+    };
+
+    if !(200..300).contains(&status) {
+        let err = if status == 404 || status == 410 {
+            CalendarError::GoogleNotFound
+        } else {
+            CalendarError::GoogleApi(format!("google events.move returned {status}"))
+        };
+        mark_failed(operations, &op_id, &err, &now_rfc3339).await;
+        return Err(err);
+    }
+
+    let moved = match parse_google_event(&response_bytes, "events.move") {
+        Ok(ev) => ev,
+        Err(err) => {
+            mark_failed(operations, &op_id, &err, &now_rfc3339).await;
+            return Err(err);
+        }
+    };
+    let moved_google_id = moved.id.clone();
+    let etag = moved.etag.clone().unwrap_or_default();
+
+    operations
+        .update_progress(
+            &op_id,
+            OP_STATUS_GOOGLE_COMMITTED,
+            &moved_google_id,
+            event_local_id,
+            &etag,
+            "",
+            false,
+            &now_rfc3339,
+        )
+        .await?;
+
+    if let Err(err) = events
+        .reassign_calendar(event_local_id, &dest.id, &now_rfc3339)
+        .await
+    {
+        return Err(CalendarError::Repo(err));
+    }
+
+    let new_event = map_google_event(&moved, &dest.id, &now_rfc3339);
+    let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
+        Ok(id) => id,
+        Err(err) => {
+            // Leave google_committed — repair will finish.
+            return Err(CalendarError::Repo(err));
+        }
+    };
+
+    operations
+        .update_progress(
+            &op_id,
+            OP_STATUS_CACHE_APPLIED,
+            &moved_google_id,
+            &id,
+            &etag,
+            "",
+            false,
+            &now_rfc3339,
+        )
+        .await?;
+
+    let _ = calendars.bump_dirty_requested(&source.id, &now_rfc3339).await;
+    let _ = calendars.bump_dirty_requested(&dest.id, &now_rfc3339).await;
+
+    Ok(CreateEventOutput {
+        event: row_from_new_event(new_event, id, &now_rfc3339),
+        source: "google".to_string(),
+        cache_error: None,
+    })
 }
 
 /// Journaled `events.patch` with If-Match / 412 retry (issue #50 / V4).

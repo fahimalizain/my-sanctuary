@@ -198,6 +198,15 @@ pub trait CalendarEventRepo: Send + Sync {
     ) -> Result<Vec<CalendarEvent>, RepoError>;
     /// SOFT delete by local id.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Reassign a living event's `calendar_id` in place (same local `id`).
+    /// Used after Google `events.move` so the natural key can flip without
+    /// inserting a second row.
+    async fn reassign_calendar(
+        &self,
+        id: &str,
+        new_calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// SOFT delete by `(calendar_id, google_event_id)` — used when incremental
     /// sync reports a cancelled event.
     async fn delete_by_google_event_id(
@@ -602,6 +611,10 @@ pub const EVENT_GET_ID_BY_NATURAL_KEY_SQL: &str =
 pub const EVENT_DELETE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
+/// Reassign living event to another calendar (keeps local id).
+pub const EVENT_REASSIGN_CALENDAR_SQL: &str =
+    "UPDATE calendar_events SET calendar_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
 /// SOFT delete by `(calendar_id, google_event_id)`.
 pub const EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND google_event_id = ? AND deleted_at IS NULL";
@@ -873,6 +886,16 @@ mod tests {
             assert!(sql.contains("SET deleted_at = ?"), "{sql}");
             assert!(!sql.contains("DELETE FROM"), "{sql}");
         }
+    }
+
+    #[test]
+    fn event_reassign_calendar_sql_updates_living_row() {
+        assert_eq!(
+            EVENT_REASSIGN_CALENDAR_SQL,
+            "UPDATE calendar_events SET calendar_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+        );
+        assert!(EVENT_REASSIGN_CALENDAR_SQL.starts_with("UPDATE"), "{EVENT_REASSIGN_CALENDAR_SQL}");
+        assert!(!EVENT_REASSIGN_CALENDAR_SQL.contains("DELETE FROM"), "{EVENT_REASSIGN_CALENDAR_SQL}");
     }
 
     #[test]

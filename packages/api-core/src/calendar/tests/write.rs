@@ -7,7 +7,8 @@ use crate::calendar::{
 };
 use crate::models::{
     GoogleCalendar, PatchEventFields, OP_STATUS_CACHE_APPLIED, OP_STATUS_CONFLICT,
-    OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED, OP_VERB_DELETE, OP_VERB_INSERT, OP_VERB_PATCH,
+    OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED, OP_VERB_DELETE, OP_VERB_INSERT, OP_VERB_MOVE,
+    OP_VERB_PATCH,
 };
 use crate::repo::CalendarEventRepo;
 
@@ -861,6 +862,7 @@ fn patch_fields_start_only_payload() {
             end: None,
             summary: None,
             description: None,
+            calendar_id: None,
         },
         NOW_UNIX,
     ))
@@ -873,6 +875,7 @@ fn patch_fields_start_only_payload() {
     assert!(body.get("end").is_none(), "{body}");
     assert!(body.get("summary").is_none(), "{body}");
     assert!(body.get("description").is_none(), "{body}");
+    assert!(body.get("calendar_id").is_none(), "{body}");
 }
 
 #[test]
@@ -900,6 +903,7 @@ fn patch_fields_start_end_summary_payload() {
             end: Some("2026-08-19T11:00:00Z".to_string()),
             summary: Some("Renamed".to_string()),
             description: None,
+            calendar_id: None,
         },
         NOW_UNIX,
     ))
@@ -912,6 +916,7 @@ fn patch_fields_start_end_summary_payload() {
     assert_eq!(body["end"]["dateTime"], "2026-08-19T11:00:00Z");
     assert_eq!(body["summary"], "Renamed");
     assert!(body.get("description").is_none(), "{body}");
+    assert!(body.get("calendar_id").is_none(), "{body}");
 }
 
 #[test]
@@ -939,6 +944,7 @@ fn patch_fields_description_only_payload() {
             end: None,
             summary: None,
             description: Some("Bring snacks".to_string()),
+            calendar_id: None,
         },
         NOW_UNIX,
     ))
@@ -951,6 +957,7 @@ fn patch_fields_description_only_payload() {
     assert!(body.get("start").is_none(), "{body}");
     assert!(body.get("end").is_none(), "{body}");
     assert!(body.get("summary").is_none(), "{body}");
+    assert!(body.get("calendar_id").is_none(), "{body}");
 }
 
 #[test]
@@ -978,6 +985,7 @@ fn patch_fields_description_empty_string_clears() {
             end: None,
             summary: None,
             description: Some(String::new()),
+            calendar_id: None,
         },
         NOW_UNIX,
     ))
@@ -990,6 +998,7 @@ fn patch_fields_description_empty_string_clears() {
     assert!(body.get("start").is_none(), "{body}");
     assert!(body.get("end").is_none(), "{body}");
     assert!(body.get("summary").is_none(), "{body}");
+    assert!(body.get("calendar_id").is_none(), "{body}");
 }
 
 #[test]
@@ -1278,6 +1287,7 @@ fn update_event_for_user_wrong_owner_is_not_found() {
             end: None,
             summary: Some("Nope".to_string()),
             description: None,
+            calendar_id: None,
         },
         NOW_UNIX,
     ))
@@ -1338,6 +1348,7 @@ fn update_event_for_user_patches_owned_event() {
             end: None,
             summary: Some("Renamed".to_string()),
             description: None,
+            calendar_id: None,
         },
         NOW_UNIX,
     ))
@@ -1352,6 +1363,341 @@ fn update_event_for_user_patches_owned_event() {
             .iter()
             .any(|(k, v)| k == "If-Match" && v == "e1")
     );
+}
+
+// ──────────────────────────────────────────
+// update_event_for_user — move
+// ──────────────────────────────────────────
+
+const MOVED_JSON: &str = r#"{
+    "id": "g-evt-1", "etag": "e-moved", "updated": "2026-08-17T12:30:00.000Z",
+    "summary": "Meeting",
+    "start": {"dateTime": "2026-08-19T09:00:00Z"},
+    "end": {"dateTime": "2026-08-19T10:00:00Z"}
+}"#;
+
+fn two_calendars() -> FakeCalendarRepo {
+    FakeCalendarRepo::with(vec![
+        calendar("cal-1", "primary@example.com", true),
+        calendar("cal-2", "work@example.com", true),
+    ])
+}
+
+#[test]
+fn update_event_for_user_moves_to_destination_calendar() {
+    let http = FakeHttp::new(vec![("/move", 200, MOVED_JSON)]);
+    let calendars = two_calendars();
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let output = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("cal-2".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    // Same local id, new calendar.
+    assert_eq!(output.event.id, "local-1");
+    assert_eq!(output.event.calendar_id, "cal-2");
+    assert_eq!(output.event.google_event_id, "g-evt-1");
+
+    // POST move, no PATCH.
+    let posts = http.posts.lock().unwrap();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    let (url, body) = &posts[0];
+    assert!(
+        url.contains("/calendars/primary%40example.com/events/g-evt-1/move"),
+        "{url}"
+    );
+    assert!(
+        url.contains("destination=work%40example.com"),
+        "{url}"
+    );
+    assert_eq!(body, "{}");
+    assert!(http.patches.lock().unwrap().is_empty(), "no events.patch");
+
+    // Replica reassigned in place.
+    let stored = events.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, "local-1");
+    assert_eq!(stored[0].calendar_id, "cal-2");
+    assert!(stored[0].deleted_at.is_none());
+
+    let op = &ops.stored.lock().unwrap()[0];
+    assert_eq!(op.verb, OP_VERB_MOVE);
+    assert_eq!(op.status, OP_STATUS_CACHE_APPLIED);
+    assert_eq!(op.calendar_id, "cal-1", "journal keeps source calendar");
+    let payload: serde_json::Value = serde_json::from_str(&op.payload_json).unwrap();
+    assert_eq!(payload["destination"], "work@example.com");
+
+    // Both source and dest dirty-bumped.
+    let cals = calendars.stored.lock().unwrap();
+    let src = cals.iter().find(|c| c.id == "cal-1").unwrap();
+    let dest = cals.iter().find(|c| c.id == "cal-2").unwrap();
+    assert_eq!(src.dirty_requested_generation, 1);
+    assert_eq!(dest.dirty_requested_generation, 1);
+}
+
+#[test]
+fn update_event_for_user_calendar_id_with_summary_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = two_calendars();
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: Some("Nope".to_string()),
+            description: None,
+            calendar_id: Some("cal-2".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("cannot be combined")),
+        "got {err:?}"
+    );
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(http.patches.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_same_calendar_is_noop() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = two_calendars();
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let output = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("cal-1".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    assert_eq!(output.event.id, "local-1");
+    assert_eq!(output.event.calendar_id, "cal-1");
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(http.patches.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_dest_missing_is_not_found() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("cal-missing".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_dest_other_user_is_not_found() {
+    let http = FakeHttp::new(vec![]);
+    let mut other = calendar("cal-2", "work@example.com", true);
+    other.user_id = "u-other".to_string();
+    let calendars = FakeCalendarRepo::with(vec![
+        calendar("cal-1", "primary@example.com", true),
+        other,
+    ]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("cal-2".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_dest_reader_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let mut dest = calendar("cal-2", "work@example.com", true);
+    dest.access_role = "reader".to_string();
+    let calendars = FakeCalendarRepo::with(vec![
+        calendar("cal-1", "primary@example.com", true),
+        dest,
+    ]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("cal-2".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("destination")),
+        "got {err:?}"
+    );
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_source_reader_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let mut src = calendar("cal-1", "primary@example.com", true);
+    src.access_role = "reader".to_string();
+    let calendars = FakeCalendarRepo::with(vec![
+        src,
+        calendar("cal-2", "work@example.com", true),
+    ]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("cal-2".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("source")),
+        "got {err:?}"
+    );
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_empty_calendar_id_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = two_calendars();
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            calendar_id: Some("  ".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("empty")),
+        "got {err:?}"
+    );
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
 }
 
 #[test]
