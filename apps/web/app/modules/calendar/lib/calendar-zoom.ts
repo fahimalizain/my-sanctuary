@@ -93,3 +93,41 @@ export function yInHoursArea(
 ): number {
   return clientY - scrollerRectTop + scrollTop - headerOffset;
 }
+
+/** Euclidean distance between two points. Non-finite coords → 0. */
+export function pinchDistance(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+): number {
+  if (
+    !Number.isFinite(a.x) ||
+    !Number.isFinite(a.y) ||
+    !Number.isFinite(b.x) ||
+    !Number.isFinite(b.y)
+  ) {
+    return 0;
+  }
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+/** Midpoint Y of two points. Non-finite → 0. */
+export function pinchMidpointY(a: { y: number }, b: { y: number }): number {
+  if (!Number.isFinite(a.y) || !Number.isFinite(b.y)) return 0;
+  return (a.y + b.y) / 2;
+}
+
+/**
+ * currentDist / originDist.
+ * Non-finite or originDist <= 0 or currentDist <= 0 → 1.
+ */
+export function pinchScale(originDist: number, currentDist: number): number {
+  if (
+    !Number.isFinite(originDist) ||
+    !Number.isFinite(currentDist) ||
+    originDist <= 0 ||
+    currentDist <= 0
+  ) {
+    return 1;
+  }
+  return currentDist / originDist;
+}

@@ -552,10 +552,17 @@ export function useCalendarSession({
     () => computeHourHeight(availableHoursPx),
     [availableHoursPx],
   );
+
+  // Pinch callbacks assigned after drag is created (drag needs hourH first).
+  const onPinchStartRef = useRef<(() => void) | null>(null);
+  const onPinchEndRef = useRef<(() => void) | null>(null);
+
   const { hourH } = useCalendarZoom({
     scrollerRef,
     autoHourH,
     headerOffset: COL_HEADER_H + allDayHeight,
+    onPinchStartRef,
+    onPinchEndRef,
   });
   const totalHoursH = hourH * 24;
 
@@ -642,6 +649,14 @@ export function useCalendarSession({
     onChipTap: selectEvent,
     onEmptyClick: handleEmptyClick,
   });
+
+  onPinchStartRef.current = () => {
+    drag.cancel();
+    setStripLocked(true);
+  };
+  onPinchEndRef.current = () => {
+    setStripLocked(false);
+  };
 
   // Stable across pointermove — only flips at drag start/end (not every move).
   const draggingEventId =

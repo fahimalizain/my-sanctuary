@@ -7,6 +7,9 @@ import {
   hourHAfterZoom,
   hourLabelStep,
   parseStoredHourH,
+  pinchDistance,
+  pinchMidpointY,
+  pinchScale,
   scrollDeltaForHourZoom,
   yInHoursArea,
   zoomFactorFromWheel,
@@ -138,4 +141,42 @@ test('parseStoredHourH: valid number is clamped', () => {
 test('yInHoursArea: clientY relative to scrolled hours area', () => {
   // clientY=200, rectTop=100, scrollTop=50, header=40 → 110
   assert.equal(yInHoursArea(200, 100, 50, 40), 110);
+});
+
+// ── pinchDistance ───────────────────────────────────────────────────────
+
+test('pinchDistance: 3-4-5 triangle', () => {
+  assert.equal(pinchDistance({ x: 0, y: 0 }, { x: 3, y: 4 }), 5);
+});
+
+test('pinchDistance: non-finite coords → 0', () => {
+  assert.equal(pinchDistance({ x: NaN, y: 0 }, { x: 3, y: 4 }), 0);
+  assert.equal(pinchDistance({ x: 0, y: 0 }, { x: Infinity, y: 4 }), 0);
+});
+
+// ── pinchMidpointY ──────────────────────────────────────────────────────
+
+test('pinchMidpointY: average of two Ys', () => {
+  assert.equal(pinchMidpointY({ y: 100 }, { y: 200 }), 150);
+});
+
+test('pinchMidpointY: non-finite → 0', () => {
+  assert.equal(pinchMidpointY({ y: NaN }, { y: 200 }), 0);
+  assert.equal(pinchMidpointY({ y: 100 }, { y: Infinity }), 0);
+});
+
+// ── pinchScale ──────────────────────────────────────────────────────────
+
+test('pinchScale: 100→200 = 2; 100→50 = 0.5', () => {
+  assert.equal(pinchScale(100, 200), 2);
+  assert.equal(pinchScale(100, 50), 0.5);
+});
+
+test('pinchScale: origin 0 / negative / NaN → 1', () => {
+  assert.equal(pinchScale(0, 100), 1);
+  assert.equal(pinchScale(-10, 100), 1);
+  assert.equal(pinchScale(NaN, 100), 1);
+  assert.equal(pinchScale(100, 0), 1);
+  assert.equal(pinchScale(100, -5), 1);
+  assert.equal(pinchScale(100, NaN), 1);
 });

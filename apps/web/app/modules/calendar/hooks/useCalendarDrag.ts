@@ -69,6 +69,8 @@ export interface CalendarDragApi {
   isDragging: boolean;
   /** True after a drag commit so a synthetic click can be ignored. */
   suppressNextClick: () => boolean;
+  /** Drop an in-progress gesture without committing create/move/resize. */
+  cancel: () => void;
 }
 
 interface Session {
@@ -656,6 +658,11 @@ export function useCalendarDrag(
     return true;
   }, []);
 
+  const cancel = useCallback(() => {
+    if (!sessionRef.current) return;
+    endSession();
+  }, [endSession]);
+
   // Ghost only after the pointer has moved past the threshold — click-without-
   // drag must not flash a preview.
   const preview = session && didDrag ? computePreview(session) : null;
@@ -671,5 +678,6 @@ export function useCalendarDrag(
     activeEventId: session?.eventId ?? null,
     isDragging: session !== null && didDrag,
     suppressNextClick,
+    cancel,
   };
 }

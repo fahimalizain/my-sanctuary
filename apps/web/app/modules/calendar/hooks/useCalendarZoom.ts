@@ -8,6 +8,9 @@ import {
   HOUR_H_STORAGE_KEY,
   hourHAfterZoom,
   parseStoredHourH,
+  pinchDistance,
+  pinchMidpointY,
+  pinchScale,
   scrollDeltaForHourZoom,
   yInHoursArea,
   zoomFactorFromWheel,
@@ -17,8 +20,18 @@ export function useCalendarZoom(options: {
   scrollerRef: RefObject<HTMLElement | null>;
   autoHourH: number;
   headerOffset: number;
+  /** Called when a 2-finger pinch begins. Use to cancel drag + lock strip. */
+  onPinchStartRef?: RefObject<(() => void) | null>;
+  /** Called when pinch ends (pointers < 2). Unlock strip. */
+  onPinchEndRef?: RefObject<(() => void) | null>;
 }): { hourH: number } {
-  const { scrollerRef, autoHourH, headerOffset } = options;
+  const {
+    scrollerRef,
+    autoHourH,
+    headerOffset,
+    onPinchStartRef,
+    onPinchEndRef,
+  } = options;
 
   const [userHourH, setUserHourH] = useState<number | null>(() => {
     if (typeof window === 'undefined') return null;
@@ -31,13 +44,11 @@ export function useCalendarZoom(options: {
 
   const hourH = userHourH ?? autoHourH;
 
-  // Latest values for a stable wheel listener (registered once per scroller el).
+  // Latest values for stable listeners (registered once per scroller el).
   const hourHRef = useRef(hourH);
   const headerOffsetRef = useRef(headerOffset);
-  const autoHourHRef = useRef(autoHourH);
   hourHRef.current = hourH;
   headerOffsetRef.current = headerOffset;
-  autoHourHRef.current = autoHourH;
 
   // Re-bind when the scroller element appears (may be null on first paint).
   // Parent re-renders after measure attach the ref; layout effect re-runs.
@@ -47,6 +58,33 @@ export function useCalendarZoom(options: {
     const el = scrollerRef.current;
     if (!el) return;
 
+    const applyZoom = (nextHourH: number, clientY: number, scroller: HTMLElement) => {
+      const current = hourHRef.current;
+      if (nextHourH === current) return;
+
+      const rect = scroller.getBoundingClientRect();
+      let y = yInHoursArea(
+        clientY,
+        rect.top,
+        scroller.scrollTop,
+        headerOffsetRef.current,
+      );
+      if (y < 0) y = 0;
+
+      const delta = scrollDeltaForHourZoom(current, nextHourH, y);
+      scroller.scrollTop += delta;
+
+      // Keep ref in sync before React re-renders so rapid pinch moves
+      // compute incremental scroll deltas from the true current hourH.
+      hourHRef.current = nextHourH;
+      setUserHourH(nextHourH);
+      try {
+        localStorage.setItem(HOUR_H_STORAGE_KEY, String(nextHourH));
+      } catch {
+        // private mode / quota — in-session zoom still applies
+      }
+    };
+
     const onWheel = (e: WheelEvent) => {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
@@ -54,33 +92,88 @@ export function useCalendarZoom(options: {
       const current = hourHRef.current;
       const factor = zoomFactorFromWheel(e.deltaY, e.deltaMode);
       const next = hourHAfterZoom(current, factor);
-      if (next === current) return;
+      applyZoom(next, e.clientY, el);
+    };
 
-      const rect = el.getBoundingClientRect();
-      let y = yInHoursArea(
-        e.clientY,
-        rect.top,
-        el.scrollTop,
-        headerOffsetRef.current,
-      );
-      if (y < 0) y = 0;
+    // ── Two-pointer pinch ───────────────────────────────────────────────
+    type Ptr = { x: number; y: number };
+    const pointers = new Map<number, Ptr>();
+    let pinchOrigin: { originHourH: number; originDist: number } | null = null;
+    let pinchActive = false;
 
-      const delta = scrollDeltaForHourZoom(current, next, y);
-      el.scrollTop += delta;
+    const endPinchIfNeeded = () => {
+      if (!pinchActive) return;
+      pinchActive = false;
+      pinchOrigin = null;
+      onPinchEndRef?.current?.();
+    };
 
-      setUserHourH(next);
-      try {
-        localStorage.setItem(HOUR_H_STORAGE_KEY, String(next));
-      } catch {
-        // private mode / quota — in-session zoom still applies
+    const onPointerDown = (e: PointerEvent) => {
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pointers.size === 2 && !pinchActive) {
+        const pts = [...pointers.values()];
+        const originDist = pinchDistance(pts[0], pts[1]);
+        pinchOrigin = {
+          originHourH: hourHRef.current,
+          originDist,
+        };
+        pinchActive = true;
+        onPinchStartRef?.current?.();
       }
     };
 
+    const onPointerMove = (e: PointerEvent) => {
+      if (!pointers.has(e.pointerId)) return;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pointers.size !== 2 || !pinchOrigin) return;
+
+      e.preventDefault();
+
+      const pts = [...pointers.values()];
+      const factor = pinchScale(
+        pinchOrigin.originDist,
+        pinchDistance(pts[0], pts[1]),
+      );
+      const next = hourHAfterZoom(pinchOrigin.originHourH, factor);
+      const midY = pinchMidpointY(pts[0], pts[1]);
+      applyZoom(next, midY, el);
+    };
+
+    const onPointerEnd = (e: PointerEvent) => {
+      if (!pointers.has(e.pointerId)) return;
+      pointers.delete(e.pointerId);
+      if (pointers.size < 2) {
+        endPinchIfNeeded();
+      }
+    };
+
+    // Safari page-zoom — block only; Mac trackpad already zooms via Ctrl+wheel.
+    const killGesture = (e: Event) => e.preventDefault();
+
     el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('pointerdown', onPointerDown, true);
+    el.addEventListener('pointermove', onPointerMove, {
+      capture: true,
+      passive: false,
+    });
+    el.addEventListener('pointerup', onPointerEnd, true);
+    el.addEventListener('pointercancel', onPointerEnd, true);
+    el.addEventListener('pointerleave', onPointerEnd, true);
+    el.addEventListener('gesturestart', killGesture, { passive: false });
+    el.addEventListener('gesturechange', killGesture, { passive: false });
+
     return () => {
       el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('pointerdown', onPointerDown, true);
+      el.removeEventListener('pointermove', onPointerMove, true);
+      el.removeEventListener('pointerup', onPointerEnd, true);
+      el.removeEventListener('pointercancel', onPointerEnd, true);
+      el.removeEventListener('pointerleave', onPointerEnd, true);
+      el.removeEventListener('gesturestart', killGesture);
+      el.removeEventListener('gesturechange', killGesture);
     };
-  }, [scrollerRef, scrollerEl]);
+  }, [scrollerRef, scrollerEl, onPinchStartRef, onPinchEndRef]);
 
   return { hourH };
 }
