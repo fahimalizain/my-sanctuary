@@ -535,8 +535,9 @@ pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
 /// the window ends AND ends after it begins — multi-day and overnight events
 /// are not clipped at window edges.
 ///
-/// Projection `timed_masters_and_exceptions`: exclude all-day rows and
-/// cancelled exceptions (stored living for series correctness) from GET.
+/// Projection name remains `timed_masters_and_exceptions` (health string), but
+/// GET range list **includes all-day rows** so the week grid can paint them.
+/// Cancelled exceptions (stored living for series correctness) stay excluded.
 ///
 /// Also hide an unmodified window instance when a living **master** exists in
 /// the same calendar (`m.google_event_id = e.recurring_event_id`,
@@ -549,7 +550,6 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
       AND e.deleted_at IS NULL
-      AND e.is_all_day = 0
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
       AND e.start_time < ? AND e.end_time > ?
       AND NOT (
@@ -574,9 +574,9 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
 /// shape (`…Z`, zero-padded, no fractions) compare lexicographically, so the
 /// range test needs no timestamp function.
 ///
-/// Same projection filters as the range query: a running task chip must not be
-/// an all-day or cancelled row, and unmodified window instances are hidden
-/// when a living master exists (see [`EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`]).
+/// Running task chips stay **timed only** (`is_all_day = 0`); cancelled rows
+/// and unmodified window instances are hidden when a living master exists
+/// (same instance dedupe as [`EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`]).
 pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
@@ -969,8 +969,11 @@ mod tests {
         assert!(sql.contains("e.end_time > ?"), "{sql}");
         assert!(sql.contains("c.user_id = ?"), "{sql}");
         assert!(sql.contains("ORDER BY e.start_time ASC"), "{sql}");
-        // timed_masters_and_exceptions projection
-        assert!(sql.contains("e.is_all_day = 0"), "{sql}");
+        // Range GET includes all-day rows (week grid); do not filter is_all_day.
+        assert!(
+            !sql.contains("e.is_all_day = 0"),
+            "range list must include all-day: {sql}"
+        );
         assert!(
             sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
             "{sql}"
@@ -978,12 +981,11 @@ mod tests {
     }
 
     #[test]
-    fn event_range_and_running_queries_exclude_all_day_and_cancelled() {
+    fn event_range_and_running_queries_share_cancelled_and_master_filters() {
         for sql in [
             EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
             EVENT_LIST_RUNNING_BY_USER_ID_SQL,
         ] {
-            assert!(sql.contains("e.is_all_day = 0"), "{sql}");
             assert!(
                 sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
                 "{sql}"

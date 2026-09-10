@@ -45,6 +45,25 @@ import {
   isSameDay,
 } from '../lib/week-layout';
 
+/** Overlay still matches server response for fields we paint optimistically. */
+function overlayMatchesServerEvent(
+  overlay: CalendarEvent,
+  server: CalendarEvent,
+): boolean {
+  return (
+    overlay.title === server.title &&
+    overlay.description === server.description &&
+    overlay.start_time === server.start_time &&
+    overlay.end_time === server.end_time &&
+    Boolean(overlay.is_all_day) === Boolean(server.is_all_day) &&
+    (overlay.start_time_zone?.trim() || '') ===
+      (server.start_time_zone?.trim() || '') &&
+    (overlay.end_time_zone?.trim() || '') ===
+      (server.end_time_zone?.trim() || '') &&
+    overlay.calendar_id === server.calendar_id
+  );
+}
+
 export interface CalendarSessionInput {
   timeMin: string;
   timeMax: string;
@@ -262,6 +281,9 @@ export function useCalendarSession({
     const postedDescription = event.description ?? '';
     const startIso = event.start_time;
     const endIso = event.end_time;
+    // Create API is timed dateTimes only; all-day / zone flush after create.
+    const postedAllDay = false;
+    const postedZone = '';
 
     draftPersistStartedRef.current.add(tempId);
     clearWriteError();
@@ -314,6 +336,10 @@ export function useCalendarSession({
               (local.description ?? '') !== postedDescription;
             const startDiffers = local.start_time !== startIso;
             const endDiffers = local.end_time !== endIso;
+            const allDayDiffers =
+              Boolean(local.is_all_day) !== postedAllDay;
+            const zoneDiffers =
+              (local.start_time_zone?.trim() || '') !== postedZone;
             const calendarDiffers =
               local.calendar_id !== result.event.calendar_id;
 
@@ -322,6 +348,8 @@ export function useCalendarSession({
               descriptionDiffers ||
               startDiffers ||
               endDiffers ||
+              allDayDiffers ||
+              zoneDiffers ||
               calendarDiffers
             ) {
               const merged: CalendarEvent = {
@@ -330,6 +358,9 @@ export function useCalendarSession({
                 description: local.description,
                 start_time: local.start_time,
                 end_time: local.end_time,
+                is_all_day: local.is_all_day,
+                start_time_zone: local.start_time_zone,
+                end_time_zone: local.end_time_zone,
                 calendar_id: local.calendar_id,
                 color: local.color ?? colorForCalendar(local.calendar_id),
               };
@@ -340,16 +371,48 @@ export function useCalendarSession({
                 description?: string;
                 start?: string;
                 end?: string;
+                is_all_day?: boolean;
+                start_time_zone?: string;
               } = {};
               if (titleDiffers) fieldInput.summary = local.title;
               if (descriptionDiffers) {
                 fieldInput.description = local.description ?? '';
               }
-              if (startDiffers) fieldInput.start = local.start_time;
-              if (endDiffers) fieldInput.end = local.end_time;
+              // All-day conversion always needs start/end + flag together.
+              if (allDayDiffers || startDiffers || endDiffers || zoneDiffers) {
+                fieldInput.start = local.start_time;
+                fieldInput.end = local.end_time;
+                if (allDayDiffers || local.is_all_day) {
+                  fieldInput.is_all_day = Boolean(local.is_all_day);
+                }
+                const zone = local.start_time_zone?.trim() || '';
+                if (zone && !local.is_all_day) {
+                  fieldInput.start_time_zone = zone;
+                }
+              }
 
               const serverId = result.event.id;
               const hasFieldPatch = Object.keys(fieldInput).length > 0;
+
+              const overlayMatchesLocal = (ev: CalendarEvent) =>
+                ev.title === local.title &&
+                ev.description === local.description &&
+                ev.start_time === local.start_time &&
+                ev.end_time === local.end_time &&
+                Boolean(ev.is_all_day) === Boolean(local.is_all_day) &&
+                (ev.start_time_zone?.trim() || '') ===
+                  (local.start_time_zone?.trim() || '') &&
+                ev.calendar_id === local.calendar_id;
+
+              const overlayMatchesServer = (ev: CalendarEvent, server: CalendarEvent) =>
+                ev.title === server.title &&
+                ev.description === server.description &&
+                ev.start_time === server.start_time &&
+                ev.end_time === server.end_time &&
+                Boolean(ev.is_all_day) === Boolean(server.is_all_day) &&
+                (ev.start_time_zone?.trim() || '') ===
+                  (server.start_time_zone?.trim() || '') &&
+                ev.calendar_id === server.calendar_id;
 
               const flushMove = () => {
                 if (!calendarDiffers) {
@@ -357,11 +420,7 @@ export function useCalendarSession({
                   if (
                     !patchAfter ||
                     (patchAfter.op === 'upsert' &&
-                      patchAfter.event.title === local.title &&
-                      patchAfter.event.description === local.description &&
-                      patchAfter.event.start_time === local.start_time &&
-                      patchAfter.event.end_time === local.end_time &&
-                      patchAfter.event.calendar_id === local.calendar_id)
+                      overlayMatchesLocal(patchAfter.event))
                   ) {
                     // Fields already match server after create; clear if no move.
                     if (!hasFieldPatch) queue.clear(serverId);
@@ -379,15 +438,7 @@ export function useCalendarSession({
                     if (
                       !patchAfter ||
                       (patchAfter.op === 'upsert' &&
-                        patchAfter.event.title === moveResult.event.title &&
-                        patchAfter.event.description ===
-                          moveResult.event.description &&
-                        patchAfter.event.start_time ===
-                          moveResult.event.start_time &&
-                        patchAfter.event.end_time ===
-                          moveResult.event.end_time &&
-                        patchAfter.event.calendar_id ===
-                          moveResult.event.calendar_id)
+                        overlayMatchesServer(patchAfter.event, moveResult.event))
                     ) {
                       queue.clear(serverId);
                     }
@@ -396,11 +447,7 @@ export function useCalendarSession({
                     const patchAfter = queue.getOverlay(serverId);
                     if (
                       patchAfter?.op === 'upsert' &&
-                      patchAfter.event.calendar_id === local.calendar_id &&
-                      patchAfter.event.title === local.title &&
-                      patchAfter.event.description === local.description &&
-                      patchAfter.event.start_time === local.start_time &&
-                      patchAfter.event.end_time === local.end_time
+                      overlayMatchesLocal(patchAfter.event)
                     ) {
                       queue.clear(serverId);
                     }
@@ -419,15 +466,10 @@ export function useCalendarSession({
                       !calendarDiffers &&
                       (!patchAfter ||
                         (patchAfter.op === 'upsert' &&
-                          patchAfter.event.title === patchResult.event.title &&
-                          patchAfter.event.description ===
-                            patchResult.event.description &&
-                          patchAfter.event.start_time ===
-                            patchResult.event.start_time &&
-                          patchAfter.event.end_time ===
-                            patchResult.event.end_time &&
-                          patchAfter.event.calendar_id ===
-                            patchResult.event.calendar_id))
+                          overlayMatchesServer(
+                            patchAfter.event,
+                            patchResult.event,
+                          )))
                     ) {
                       queue.clear(serverId);
                     }
@@ -437,11 +479,7 @@ export function useCalendarSession({
                     const patchAfter = queue.getOverlay(serverId);
                     if (
                       patchAfter?.op === 'upsert' &&
-                      patchAfter.event.title === local.title &&
-                      patchAfter.event.description === local.description &&
-                      patchAfter.event.start_time === local.start_time &&
-                      patchAfter.event.end_time === local.end_time &&
-                      patchAfter.event.calendar_id === local.calendar_id
+                      overlayMatchesLocal(patchAfter.event)
                     ) {
                       queue.clear(serverId);
                     }
@@ -513,11 +551,7 @@ export function useCalendarSession({
         if (
           !latest ||
           (latest.op === 'upsert' &&
-            latest.event.title === result.event.title &&
-            latest.event.description === result.event.description &&
-            latest.event.start_time === result.event.start_time &&
-            latest.event.end_time === result.event.end_time &&
-            latest.event.calendar_id === result.event.calendar_id)
+            overlayMatchesServerEvent(latest.event, result.event))
         ) {
           queue.clear(selectedEventId);
         }
@@ -577,11 +611,7 @@ export function useCalendarSession({
         if (
           !latest ||
           (latest.op === 'upsert' &&
-            latest.event.title === result.event.title &&
-            latest.event.description === result.event.description &&
-            latest.event.start_time === result.event.start_time &&
-            latest.event.end_time === result.event.end_time &&
-            latest.event.calendar_id === result.event.calendar_id)
+            overlayMatchesServerEvent(latest.event, result.event))
         ) {
           queue.clear(selectedEventId);
         }
@@ -653,11 +683,7 @@ export function useCalendarSession({
         if (
           !latest ||
           (latest.op === 'upsert' &&
-            latest.event.title === result.event.title &&
-            latest.event.description === result.event.description &&
-            latest.event.start_time === result.event.start_time &&
-            latest.event.end_time === result.event.end_time &&
-            latest.event.calendar_id === result.event.calendar_id)
+            overlayMatchesServerEvent(latest.event, result.event))
         ) {
           queue.clear(selectedEventId);
         }
@@ -761,6 +787,10 @@ export function useCalendarSession({
     const timed: CalendarEvent[] = [];
     const allDay: CalendarEvent[] = [];
     for (const e of visibleEvents) {
+      if (e.is_all_day) {
+        allDay.push(e);
+        continue;
+      }
       const start = new Date(e.start_time);
       const end = new Date(e.end_time);
       if (isMultiDay(start, end)) {
@@ -833,11 +863,7 @@ export function useCalendarSession({
           if (
             !latest ||
             (latest.op === 'upsert' &&
-              latest.event.start_time === result.event.start_time &&
-              latest.event.end_time === result.event.end_time &&
-              latest.event.title === result.event.title &&
-              latest.event.description === result.event.description &&
-              latest.event.calendar_id === result.event.calendar_id)
+              overlayMatchesServerEvent(latest.event, result.event))
           ) {
             queue.clear(eventId);
           }
@@ -875,6 +901,160 @@ export function useCalendarSession({
       handleMoveOrResize(selectedEventId, { start, end });
     },
     [selectedEventId, handleMoveOrResize],
+  );
+
+  /** Inspector all-day toggle / all-day date shift. */
+  const handleSaveAllDay = useCallback(
+    (next: { isAllDay: boolean; startIso: string; endIso: string }) => {
+      if (!selectedEventId) return;
+      const current = overlaidEvents.find((e) => e.id === selectedEventId);
+      if (!current) return;
+
+      clearWriteError();
+
+      const painted: CalendarEvent = {
+        ...current,
+        is_all_day: next.isAllDay,
+        start_time: next.startIso,
+        end_time: next.endIso,
+        // All-day is civil dates; clear zones on the overlay when switching on.
+        ...(next.isAllDay
+          ? { start_time_zone: '', end_time_zone: '' }
+          : {}),
+      };
+      queue.upsert(painted);
+
+      // Temp / draft: overlay only; create onSuccess flushes field PATCH.
+      if (
+        selectedEventId === unpersistedDraftIdRef.current ||
+        selectedEventId === unpersistedDraftId ||
+        isTempEventId(selectedEventId)
+      ) {
+        return;
+      }
+
+      void updateEvent
+        .mutateAsync({
+          id: selectedEventId,
+          input: {
+            is_all_day: next.isAllDay,
+            start: next.startIso,
+            end: next.endIso,
+          },
+        })
+        .then((result) => {
+          upsertCalendarEventInCache(result.event);
+          const latest = queue.getOverlay(selectedEventId);
+          if (
+            !latest ||
+            (latest.op === 'upsert' &&
+              overlayMatchesServerEvent(latest.event, result.event))
+          ) {
+            queue.clear(selectedEventId);
+          }
+        })
+        .catch((err: unknown) => {
+          const latest = queue.getOverlay(selectedEventId);
+          if (
+            latest?.op === 'upsert' &&
+            Boolean(latest.event.is_all_day) === next.isAllDay &&
+            latest.event.start_time === next.startIso &&
+            latest.event.end_time === next.endIso
+          ) {
+            queue.clear(selectedEventId);
+          }
+          reportWriteError("Couldn't save event", err);
+        });
+    },
+    [
+      selectedEventId,
+      unpersistedDraftId,
+      overlaidEvents,
+      queue,
+      updateEvent,
+      clearWriteError,
+      reportWriteError,
+    ],
+  );
+
+  /** Inspector time-zone change (timed events only). */
+  const handleSaveTimeZone = useCallback(
+    (timeZone: string, startIso: string, endIso: string) => {
+      if (!selectedEventId) return;
+      const current = overlaidEvents.find((e) => e.id === selectedEventId);
+      if (!current) return;
+
+      const zone = timeZone.trim();
+      clearWriteError();
+
+      const painted: CalendarEvent = {
+        ...current,
+        start_time: startIso,
+        end_time: endIso,
+        start_time_zone: zone,
+        end_time_zone: zone,
+      };
+      queue.upsert(painted);
+
+      if (
+        selectedEventId === unpersistedDraftIdRef.current ||
+        selectedEventId === unpersistedDraftId ||
+        isTempEventId(selectedEventId)
+      ) {
+        return;
+      }
+
+      const input: {
+        start: string;
+        end: string;
+        start_time_zone?: string;
+      } = {
+        start: startIso,
+        end: endIso,
+      };
+      // Empty zone = Local: send start+end only (omit timeZone on Google).
+      if (zone) {
+        input.start_time_zone = zone;
+      }
+
+      void updateEvent
+        .mutateAsync({
+          id: selectedEventId,
+          input,
+        })
+        .then((result) => {
+          upsertCalendarEventInCache(result.event);
+          const latest = queue.getOverlay(selectedEventId);
+          if (
+            !latest ||
+            (latest.op === 'upsert' &&
+              overlayMatchesServerEvent(latest.event, result.event))
+          ) {
+            queue.clear(selectedEventId);
+          }
+        })
+        .catch((err: unknown) => {
+          const latest = queue.getOverlay(selectedEventId);
+          if (
+            latest?.op === 'upsert' &&
+            (latest.event.start_time_zone?.trim() || '') === zone &&
+            latest.event.start_time === startIso &&
+            latest.event.end_time === endIso
+          ) {
+            queue.clear(selectedEventId);
+          }
+          reportWriteError("Couldn't save event", err);
+        });
+    },
+    [
+      selectedEventId,
+      unpersistedDraftId,
+      overlaidEvents,
+      queue,
+      updateEvent,
+      clearWriteError,
+      reportWriteError,
+    ],
   );
 
   const handleEmptyClick = useCallback(() => {
@@ -1042,6 +1222,8 @@ export function useCalendarSession({
     handleSaveTitle,
     handleSaveDescription,
     handleSaveTimes,
+    handleSaveAllDay,
+    handleSaveTimeZone,
     handleSaveCalendar,
     handleDeleteEvent,
     isSaving: updateEvent.isPending,

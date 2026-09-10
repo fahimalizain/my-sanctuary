@@ -25,26 +25,107 @@ use crate::token::GoogleAccess;
 /// many 412s the operation is marked `conflict` — no fourth PATCH.
 pub(crate) const IF_MATCH_MAX_ATTEMPTS: u32 = 3;
 
+/// Extract a civil `YYYY-MM-DD` from a patch start/end value.
+/// Accepts bare `YYYY-MM-DD` or RFC 3339 (leading date prefix before `T`).
+/// Invalid → None.
+fn civil_date_from_patch_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.len() < 10 {
+        return None;
+    }
+    let prefix = &trimmed[..10];
+    let bytes = prefix.as_bytes();
+    let is_ymd = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[5].is_ascii_digit()
+        && bytes[6].is_ascii_digit()
+        && bytes[8].is_ascii_digit()
+        && bytes[9].is_ascii_digit();
+    if !is_ymd {
+        return None;
+    }
+    // Bare civil date, or RFC 3339 / stored replica shape (`…T00:00:00Z`).
+    if trimmed.len() == 10 || trimmed.as_bytes().get(10) == Some(&b'T') {
+        return Some(prefix.to_string());
+    }
+    None
+}
+
 /// Builds the minimal `events.patch` JSON object (only present fields).
 /// Empty map → caller returns [`CalendarError::Invalid`] before journal.
 /// `description: Some("")` is emitted as `""` so Google notes can be cleared.
 ///
-/// `calendar_id` is intentionally omitted — calendar moves use Google
-/// `events.move` via [`move_event_with_journal`], not `events.patch`.
+/// All-day (`is_all_day: Some(true)`) emits `start.date` / `end.date` (civil
+/// `YYYY-MM-DD`); requires both start and end with extractable civil dates —
+/// otherwise the map stays empty for those keys (caller Invalid). Timed path
+/// emits `dateTime`; optional non-empty `start_time_zone` is added as
+/// `timeZone` on both start and end objects when those objects exist.
+///
+/// Never emits `recurrence`, attendees, conferenceData, extendedProperties,
+/// or `calendar_id`. Calendar moves use Google `events.move` via
+/// [`move_event_with_journal`], not `events.patch`.
 pub(crate) fn build_patch_payload(fields: &PatchEventFields) -> serde_json::Map<String, serde_json::Value> {
     let mut payload = serde_json::Map::new();
-    if let Some(start) = fields.start.as_ref() {
-        payload.insert(
-            "start".to_string(),
-            serde_json::json!({ "dateTime": start }),
-        );
+
+    if fields.is_all_day == Some(true) {
+        // All-day: both start and end required as civil dates. No timeZone.
+        match (fields.start.as_deref(), fields.end.as_deref()) {
+            (Some(start), Some(end)) => {
+                match (
+                    civil_date_from_patch_value(start),
+                    civil_date_from_patch_value(end),
+                ) {
+                    (Some(sd), Some(ed)) => {
+                        payload.insert(
+                            "start".to_string(),
+                            serde_json::json!({ "date": sd }),
+                        );
+                        payload.insert(
+                            "end".to_string(),
+                            serde_json::json!({ "date": ed }),
+                        );
+                    }
+                    _ => {
+                        // Invalid civil dates → leave start/end out (empty or
+                        // summary-only payload; caller rejects empty).
+                    }
+                }
+            }
+            _ => {
+                // Missing start/end → no date objects (caller Invalid).
+            }
+        }
+    } else {
+        // Timed (is_all_day false/None): dateTime + optional timeZone.
+        let tz = fields
+            .start_time_zone
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        if let Some(start) = fields.start.as_ref() {
+            let mut obj = serde_json::Map::new();
+            obj.insert("dateTime".to_string(), serde_json::json!(start));
+            if let Some(zone) = tz {
+                obj.insert("timeZone".to_string(), serde_json::json!(zone));
+            }
+            payload.insert("start".to_string(), serde_json::Value::Object(obj));
+        }
+        if let Some(end) = fields.end.as_ref() {
+            let mut obj = serde_json::Map::new();
+            obj.insert("dateTime".to_string(), serde_json::json!(end));
+            if let Some(zone) = tz {
+                obj.insert("timeZone".to_string(), serde_json::json!(zone));
+            }
+            payload.insert("end".to_string(), serde_json::Value::Object(obj));
+        }
     }
-    if let Some(end) = fields.end.as_ref() {
-        payload.insert(
-            "end".to_string(),
-            serde_json::json!({ "dateTime": end }),
-        );
-    }
+
     if let Some(summary) = fields.summary.as_ref() {
         payload.insert("summary".to_string(), serde_json::json!(summary));
     }

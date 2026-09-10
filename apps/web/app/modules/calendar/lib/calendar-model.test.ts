@@ -109,7 +109,7 @@ test('buildEventsByDay: 10:00–11:00 event under day key with height > 0', () =
 // ── buildAllDayChips ────────────────────────────────────────────────────
 
 test('buildAllDayChips: midnight→next-midnight one civil day → one chip', () => {
-  // All-day style: Tue Sep 8 00:00 → Wed Sep 9 00:00 local.
+  // All-day style: Tue Sep 8 00:00 → Wed Sep 9 00:00 local (timed multi-day path).
   const day = new Date(2026, 8, 8);
   const start = new Date(2026, 8, 8, 0, 0, 0, 0);
   const end = new Date(2026, 8, 9, 0, 0, 0, 0);
@@ -127,4 +127,21 @@ test('buildAllDayChips: midnight→next-midnight one civil day → one chip', ()
   assert.equal(allDayChips[0].endDay, 0);
   assert.equal(allDayChips[0].lane, 0);
   assert.ok(allDayHeight > 0);
+});
+
+test('buildAllDayChips: is_all_day uses ISO prefix (UTC midnight stays civil day)', () => {
+  // Replica stores all-day as YYYY-MM-DDT00:00:00Z. In UTC-4 that would be
+  // the previous evening via new Date(iso) — chips must still occupy the 13th.
+  const day = new Date(2026, 8, 13); // local Sep 13
+  const event = makeEvent({
+    id: 'allday-civil',
+    title: 'Holiday',
+    is_all_day: true,
+    start_time: '2026-09-13T00:00:00Z',
+    end_time: '2026-09-14T00:00:00Z',
+  });
+  const { allDayChips } = buildAllDayChips([day], [event], 1);
+  assert.equal(allDayChips.length, 1);
+  assert.equal(allDayChips[0].startDay, 0);
+  assert.equal(allDayChips[0].endDay, 0);
 });

@@ -44,7 +44,7 @@ export interface CalendarEvent {
   last_synced_at: string;
   /** Matched category color from the API (`#rrggbb`). May be absent from older workers. */
   color?: string;
-  /** Replica bool; missing/undefined means false. All-day is out of GET projection today. */
+  /** Replica bool; missing/undefined means false. Included in GET range list. */
   is_all_day?: boolean;
   /** IANA zone; empty / missing = unset. */
   start_time_zone?: string;
@@ -113,13 +113,17 @@ export interface CreateEventResponse {
 
 // Request body for PATCH /api/calendar/events/:id — at least one field required.
 // `calendar_id` is exclusive (local dest id → Google events.move); cannot
-// combine with start/end/summary/description.
+// combine with start/end/summary/description/is_all_day/start_time_zone.
 export interface PatchCalendarEventInput {
   start?: string;
   end?: string;
   summary?: string;
   /** Event notes; empty string clears Google description. */
   description?: string;
+  /** All-day flag; true requires start/end as civil dates (or RFC3339 prefixes). */
+  is_all_day?: boolean;
+  /** IANA zone on timed start/end; requires start and end. */
+  start_time_zone?: string;
   /** Local destination calendar id — exclusive move field. */
   calendar_id?: string;
 }

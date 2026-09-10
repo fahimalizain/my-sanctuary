@@ -191,6 +191,8 @@ pub async fn patch_event(
             end: Some(end_rfc3339.to_string()),
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         now_unix,
@@ -224,6 +226,8 @@ pub async fn patch_event_summary(
             end: None,
             summary: Some(summary.to_string()),
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         now_unix,
@@ -237,7 +241,8 @@ pub async fn patch_event_summary(
 /// - patches fields via [`patch_event_fields`].
 ///
 /// `calendar_id` is exclusive and must not be combined with start/end/summary/
-/// description. Wrong owner / missing → [`CalendarError::NotFound`] (no Google
+/// description/is_all_day/start_time_zone. `start_time_zone` requires start
+/// and end. Wrong owner / missing → [`CalendarError::NotFound`] (no Google
 /// call, no journal).
 pub async fn update_event_for_user(
     http: &dyn HttpClient,
@@ -253,7 +258,9 @@ pub async fn update_event_for_user(
     let has_other = fields.start.is_some()
         || fields.end.is_some()
         || fields.summary.is_some()
-        || fields.description.is_some();
+        || fields.description.is_some()
+        || fields.is_all_day.is_some()
+        || fields.start_time_zone.is_some();
 
     if let Some(dest_local_id) = fields.calendar_id.as_deref() {
         let dest_local_id = dest_local_id.trim();
@@ -264,7 +271,7 @@ pub async fn update_event_for_user(
         }
         if has_other {
             return Err(CalendarError::Invalid(
-                "calendar_id cannot be combined with start, end, summary, or description"
+                "calendar_id cannot be combined with start, end, summary, description, is_all_day, or start_time_zone"
                     .to_string(),
             ));
         }
@@ -282,6 +289,18 @@ pub async fn update_event_for_user(
             now_unix,
         )
         .await;
+    }
+
+    if fields.start_time_zone.is_some() && (fields.start.is_none() || fields.end.is_none()) {
+        return Err(CalendarError::Invalid(
+            "time zone requires start and end".to_string(),
+        ));
+    }
+
+    if fields.is_all_day == Some(true) && (fields.start.is_none() || fields.end.is_none()) {
+        return Err(CalendarError::Invalid(
+            "is_all_day requires start and end".to_string(),
+        ));
     }
 
     let (cal, event) = lookup_owned_event(calendars, events, user_id, event_id).await?;

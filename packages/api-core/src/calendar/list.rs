@@ -242,9 +242,9 @@ pub async fn list_events(
 
 /// Merge lease-miss ephemeral window rows into the D1 cache query result.
 ///
-/// Applies the same GET projection filters as the list SQL
-/// (`timed_masters_and_exceptions` + overlap). Prefers existing D1 rows on
-/// natural-key collision.
+/// Applies the same GET projection filters as the range list SQL (cancelled +
+/// overlap; all-day included). Prefers existing D1 rows on natural-key
+/// collision.
 fn merge_ephemeral_window_events(
     cached: &mut Vec<CalendarEvent>,
     ephemeral: Vec<CalendarEvent>,
@@ -252,9 +252,6 @@ fn merge_ephemeral_window_events(
     end_rfc3339: &str,
 ) {
     for event in ephemeral {
-        if event.is_all_day {
-            continue;
-        }
         if event.status == "cancelled" {
             continue;
         }

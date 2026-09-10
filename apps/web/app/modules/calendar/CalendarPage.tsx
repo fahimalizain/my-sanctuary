@@ -151,6 +151,8 @@ export function CalendarPage() {
             onSaveTitle={session.handleSaveTitle}
             onSaveDescription={session.handleSaveDescription}
             onSaveTimes={session.handleSaveTimes}
+            onSaveAllDay={session.handleSaveAllDay}
+            onSaveTimeZone={session.handleSaveTimeZone}
             onSaveCalendar={session.handleSaveCalendar}
             onDelete={session.handleDeleteEvent}
             isSaving={session.isSaving}

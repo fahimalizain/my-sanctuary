@@ -862,6 +862,8 @@ fn patch_fields_start_only_payload() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         NOW_UNIX,
@@ -903,6 +905,8 @@ fn patch_fields_start_end_summary_payload() {
             end: Some("2026-08-19T11:00:00Z".to_string()),
             summary: Some("Renamed".to_string()),
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         NOW_UNIX,
@@ -944,6 +948,8 @@ fn patch_fields_description_only_payload() {
             end: None,
             summary: None,
             description: Some("Bring snacks".to_string()),
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         NOW_UNIX,
@@ -985,6 +991,8 @@ fn patch_fields_description_empty_string_clears() {
             end: None,
             summary: None,
             description: Some(String::new()),
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         NOW_UNIX,
@@ -1287,6 +1295,8 @@ fn update_event_for_user_wrong_owner_is_not_found() {
             end: None,
             summary: Some("Nope".to_string()),
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         NOW_UNIX,
@@ -1348,6 +1358,8 @@ fn update_event_for_user_patches_owned_event() {
             end: None,
             summary: Some("Renamed".to_string()),
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: None,
         },
         NOW_UNIX,
@@ -1404,6 +1416,8 @@ fn update_event_for_user_moves_to_destination_calendar() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
@@ -1473,6 +1487,8 @@ fn update_event_for_user_calendar_id_with_summary_is_invalid() {
             end: None,
             summary: Some("Nope".to_string()),
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
@@ -1508,6 +1524,8 @@ fn update_event_for_user_same_calendar_is_noop() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-1".to_string()),
         },
         NOW_UNIX,
@@ -1542,6 +1560,8 @@ fn update_event_for_user_dest_missing_is_not_found() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-missing".to_string()),
         },
         NOW_UNIX,
@@ -1578,6 +1598,8 @@ fn update_event_for_user_dest_other_user_is_not_found() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
@@ -1614,6 +1636,8 @@ fn update_event_for_user_dest_reader_is_invalid() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
@@ -1653,6 +1677,8 @@ fn update_event_for_user_source_reader_is_invalid() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
@@ -1687,6 +1713,8 @@ fn update_event_for_user_empty_calendar_id_is_invalid() {
             end: None,
             summary: None,
             description: None,
+            is_all_day: None,
+            start_time_zone: None,
             calendar_id: Some("  ".to_string()),
         },
         NOW_UNIX,
@@ -1697,6 +1725,243 @@ fn update_event_for_user_empty_calendar_id_is_invalid() {
         "got {err:?}"
     );
     assert!(http.posts.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+// ──────────────────────────────────────────
+// update_event_for_user — all-day + time zone
+// ──────────────────────────────────────────
+
+#[test]
+fn update_event_for_user_all_day_emits_start_end_date() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/g-evt-1",
+        200,
+        PATCHED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: Some("2026-09-13".to_string()),
+            end: Some("2026-09-14".to_string()),
+            summary: None,
+            description: None,
+            is_all_day: Some(true),
+            start_time_zone: None,
+            calendar_id: None,
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let body: serde_json::Value =
+        serde_json::from_str(&http.patches.lock().unwrap()[0].1).unwrap();
+    assert_eq!(body["start"]["date"], "2026-09-13");
+    assert_eq!(body["end"]["date"], "2026-09-14");
+    assert!(body["start"].get("dateTime").is_none(), "{body}");
+    assert!(body["end"].get("dateTime").is_none(), "{body}");
+    assert!(body["start"].get("timeZone").is_none(), "{body}");
+    assert!(body.get("is_all_day").is_none(), "{body}");
+}
+
+#[test]
+fn update_event_for_user_all_day_accepts_rfc3339_prefix() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/g-evt-1",
+        200,
+        PATCHED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: Some("2026-09-13T00:00:00Z".to_string()),
+            end: Some("2026-09-14T00:00:00Z".to_string()),
+            summary: None,
+            description: None,
+            is_all_day: Some(true),
+            start_time_zone: None,
+            calendar_id: None,
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let body: serde_json::Value =
+        serde_json::from_str(&http.patches.lock().unwrap()[0].1).unwrap();
+    assert_eq!(body["start"]["date"], "2026-09-13");
+    assert_eq!(body["end"]["date"], "2026-09-14");
+}
+
+#[test]
+fn update_event_for_user_timed_with_timezone_on_start_and_end() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/g-evt-1",
+        200,
+        PATCHED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: Some("2026-08-19T09:00:00Z".to_string()),
+            end: Some("2026-08-19T10:00:00Z".to_string()),
+            summary: None,
+            description: None,
+            is_all_day: None,
+            start_time_zone: Some("America/New_York".to_string()),
+            calendar_id: None,
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let body: serde_json::Value =
+        serde_json::from_str(&http.patches.lock().unwrap()[0].1).unwrap();
+    assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
+    assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z");
+    assert_eq!(body["start"]["timeZone"], "America/New_York");
+    assert_eq!(body["end"]["timeZone"], "America/New_York");
+    assert!(body.get("start_time_zone").is_none(), "{body}");
+}
+
+#[test]
+fn update_event_for_user_all_day_without_start_end_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            is_all_day: Some(true),
+            start_time_zone: None,
+            calendar_id: None,
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("is_all_day")),
+        "got {err:?}"
+    );
+    assert!(http.patches.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_timezone_without_start_end_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            is_all_day: None,
+            start_time_zone: Some("America/New_York".to_string()),
+            calendar_id: None,
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("time zone")),
+        "got {err:?}"
+    );
+    assert!(http.patches.lock().unwrap().is_empty());
+    assert!(ops.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn update_event_for_user_calendar_id_with_is_all_day_is_invalid() {
+    let http = FakeHttp::new(vec![]);
+    let calendars = two_calendars();
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "g-evt-1");
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(update_event_for_user(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        "local-1",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: None,
+            is_all_day: Some(true),
+            start_time_zone: None,
+            calendar_id: Some("cal-2".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("cannot be combined")),
+        "got {err:?}"
+    );
+    assert!(http.posts.lock().unwrap().is_empty());
+    assert!(http.patches.lock().unwrap().is_empty());
     assert!(ops.stored.lock().unwrap().is_empty());
 }
 

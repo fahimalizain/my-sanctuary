@@ -18,17 +18,65 @@ import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
 import { eventChipSelector } from '../lib/inspector-anchor';
 import {
+  allDayRangeToTimed,
+  applyAllDayStartDate,
   applyStartDate,
   applyEndTime,
   applyStartTime,
+  civilDateFromAllDayIso,
   formatEventDateLine,
   formatEventDuration,
   formatEventTime,
+  timedRangeToAllDay,
   toDateInputValue,
   toTimeInputValue,
 } from '../lib/week-layout';
 
 const DESKTOP_MQ = '(min-width: 768px)';
+
+const FALLBACK_TIME_ZONES = [
+  'UTC',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'Europe/London',
+  'Europe/Paris',
+  'Asia/Riyadh',
+  'Asia/Dubai',
+  'Asia/Kolkata',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+] as const;
+
+function browserTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+function supportedTimeZones(): string[] {
+  try {
+    const intlWithZones = Intl as typeof Intl & {
+      supportedValuesOf?: (key: string) => string[];
+    };
+    const values = intlWithZones.supportedValuesOf?.('timeZone');
+    if (values && values.length > 0) return [...values];
+  } catch {
+    // fall through
+  }
+  return [...FALLBACK_TIME_ZONES];
+}
+
+function timeZoneOptions(current: string): string[] {
+  const set = new Set(supportedTimeZones());
+  const browser = browserTimeZone();
+  if (browser) set.add(browser);
+  if (current) set.add(current);
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
 
 export interface EventInspectorProps {
   event: CalendarEvent;
@@ -41,6 +89,18 @@ export interface EventInspectorProps {
   onSaveTitle: (summary: string) => void | Promise<void>;
   onSaveDescription: (description: string) => void | Promise<void>;
   onSaveTimes: (startIso: string, endIso: string) => void | Promise<void>;
+  /** Toggle all-day; start/end are overlay ISO (UTC midnight civil or timed). */
+  onSaveAllDay: (next: {
+    isAllDay: boolean;
+    startIso: string;
+    endIso: string;
+  }) => void | Promise<void>;
+  /** Change event time zone (empty = local / omit zone on PATCH). */
+  onSaveTimeZone: (
+    timeZone: string,
+    startIso: string,
+    endIso: string,
+  ) => void | Promise<void>;
   /** Move event to another calendar (local calendar id). */
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
@@ -178,6 +238,9 @@ interface InspectorFormProps {
   setDescription: (v: string) => void;
   commitDescription: () => void;
   commitTimes: (next: { start: Date; end: Date } | null) => void;
+  commitAllDayDate: (ymd: string) => void;
+  onToggleAllDay: () => void;
+  onChangeTimeZone: (zone: string) => void;
   onClose: () => void;
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
@@ -190,6 +253,10 @@ const timeInputClassName =
   'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
 const dateInputClassName =
   'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+const chipClassName =
+  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground';
+const chipToggleClassName =
+  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 aria-pressed:border-foreground/40 aria-pressed:bg-muted/40 aria-pressed:text-foreground disabled:opacity-50';
 
 function InspectorForm({
   event,
@@ -203,6 +270,9 @@ function InspectorForm({
   setDescription,
   commitDescription,
   commitTimes,
+  commitAllDayDate,
+  onToggleAllDay,
+  onChangeTimeZone,
   onClose,
   onSaveCalendar,
   onDelete,
@@ -212,21 +282,34 @@ function InspectorForm({
 }: InspectorFormProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
-  const start = new Date(event.start_time);
-  const end = new Date(event.end_time);
-  const durationLabel = formatEventDuration(start, end);
-  const whenRange = `${formatEventTime(start)} → ${formatEventTime(end)} ${durationLabel}`;
+  const isAllDay = event.is_all_day === true;
+  const start = isAllDay
+    ? (civilDateFromAllDayIso(event.start_time) ?? new Date(event.start_time))
+    : new Date(event.start_time);
+  const end = isAllDay
+    ? (civilDateFromAllDayIso(event.end_time) ?? new Date(event.end_time))
+    : new Date(event.end_time);
+  const durationLabel = formatEventDuration(
+    new Date(event.start_time),
+    new Date(event.end_time),
+  );
+  const whenRange = `${formatEventTime(new Date(event.start_time))} → ${formatEventTime(new Date(event.end_time))} ${durationLabel}`;
   const dateLine = formatEventDateLine(start, end);
-  const timesEditable = writable && event.is_all_day !== true;
+  const timesEditable = writable && !isAllDay;
+  const allDayDateEditable = writable && isAllDay;
   const crossDay =
     start.getFullYear() !== end.getFullYear() ||
     start.getMonth() !== end.getMonth() ||
     start.getDate() !== end.getDate();
 
   const timeZone = event.start_time_zone?.trim() || '';
-  const showAllDay = event.is_all_day === true;
   const showRepeat = hasRepeat(event);
-  const showChips = showAllDay || Boolean(timeZone) || showRepeat;
+  const browserZone = browserTimeZone();
+  const zoneOptions = timeZoneOptions(timeZone);
+  // Writable: always show All-day toggle; zone select when timed.
+  // Read-only: static chips only when set.
+  const showChipRow =
+    writable || isAllDay || Boolean(timeZone) || showRepeat;
 
   const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
@@ -243,6 +326,12 @@ function InspectorForm({
     !currentInWritable && calendar
       ? [calendar, ...writableCalendars]
       : writableCalendars;
+
+  const allDayDateValue = isAllDay
+    ? (civilDateFromAllDayIso(event.start_time)
+        ? toDateInputValue(civilDateFromAllDayIso(event.start_time)!)
+        : toDateInputValue(start))
+    : toDateInputValue(start);
 
   return (
     <>
@@ -384,6 +473,22 @@ function InspectorForm({
                   ) : null}
                 </div>
               </>
+            ) : allDayDateEditable ? (
+              <div className="flex flex-wrap items-baseline gap-x-1.5">
+                <input
+                  type="date"
+                  aria-label="Date"
+                  value={allDayDateValue}
+                  disabled={inputsDisabled}
+                  onChange={(e) => {
+                    commitAllDayDate(e.target.value);
+                  }}
+                  onBlur={(e) => {
+                    commitAllDayDate(e.target.value);
+                  }}
+                  className={dateInputClassName}
+                />
+              </div>
             ) : (
               <>
                 <p className="text-sm tabular-nums text-foreground">
@@ -392,22 +497,46 @@ function InspectorForm({
                 <p className="text-sm text-muted-foreground">{dateLine}</p>
               </>
             )}
-            {showChips ? (
-              <div className="flex flex-wrap gap-1.5 pt-1">
-                {showAllDay ? (
-                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
+            {showChipRow ? (
+              <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                {writable ? (
+                  <button
+                    type="button"
+                    aria-label="All-day"
+                    aria-pressed={isAllDay}
+                    disabled={inputsDisabled}
+                    onClick={onToggleAllDay}
+                    className={chipToggleClassName}
+                  >
                     All-day
-                  </span>
+                  </button>
+                ) : isAllDay ? (
+                  <span className={chipClassName}>All-day</span>
                 ) : null}
-                {timeZone ? (
-                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
-                    {timeZone}
-                  </span>
+                {writable && !isAllDay ? (
+                  <select
+                    aria-label="Time zone"
+                    value={timeZone}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      onChangeTimeZone(e.target.value);
+                    }}
+                    className="max-w-[12rem] truncate rounded-full border border-border/70 bg-transparent px-2 py-0.5 text-xs text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+                  >
+                    <option value="">
+                      {browserZone ? browserZone : 'Local'}
+                    </option>
+                    {zoneOptions.map((z) => (
+                      <option key={z} value={z}>
+                        {z}
+                      </option>
+                    ))}
+                  </select>
+                ) : !writable && timeZone ? (
+                  <span className={chipClassName}>{timeZone}</span>
                 ) : null}
                 {showRepeat ? (
-                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
-                    Repeat
-                  </span>
+                  <span className={chipClassName}>Repeat</span>
                 ) : null}
               </div>
             ) : null}
@@ -502,6 +631,8 @@ export function EventInspector({
   onSaveTitle,
   onSaveDescription,
   onSaveTimes,
+  onSaveAllDay,
+  onSaveTimeZone,
   onSaveCalendar,
   onDelete,
   isSaving = false,
@@ -603,6 +734,60 @@ export function EventInspector({
     void onSaveTimes(next.start.toISOString(), next.end.toISOString());
   };
 
+  const commitAllDayDate = (ymd: string) => {
+    if (!ymd.trim()) return;
+    const next = applyAllDayStartDate(event.start_time, event.end_time, ymd);
+    if (!next) return;
+    // Compare civil prefixes so replica `…Z` vs helper `…Z` stay no-ops.
+    const curS = civilDateFromAllDayIso(event.start_time);
+    const curE = civilDateFromAllDayIso(event.end_time);
+    const nextS = civilDateFromAllDayIso(next.startIso);
+    const nextE = civilDateFromAllDayIso(next.endIso);
+    if (
+      curS &&
+      curE &&
+      nextS &&
+      nextE &&
+      curS.getTime() === nextS.getTime() &&
+      curE.getTime() === nextE.getTime()
+    ) {
+      return;
+    }
+    void onSaveAllDay({
+      isAllDay: true,
+      startIso: next.startIso,
+      endIso: next.endIso,
+    });
+  };
+
+  const onToggleAllDay = () => {
+    if (event.is_all_day === true) {
+      const timed = allDayRangeToTimed(event.start_time, event.end_time);
+      if (!timed) return;
+      void onSaveAllDay({
+        isAllDay: false,
+        startIso: timed.start.toISOString(),
+        endIso: timed.end.toISOString(),
+      });
+      return;
+    }
+    const start = new Date(event.start_time);
+    const end = new Date(event.end_time);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return;
+    const allDay = timedRangeToAllDay(start, end);
+    void onSaveAllDay({
+      isAllDay: true,
+      startIso: allDay.startIso,
+      endIso: allDay.endIso,
+    });
+  };
+
+  const onChangeTimeZone = (zone: string) => {
+    const current = event.start_time_zone?.trim() || '';
+    if (zone === current) return;
+    void onSaveTimeZone(zone, event.start_time, event.end_time);
+  };
+
   const form = (
     <InspectorForm
       event={event}
@@ -616,6 +801,9 @@ export function EventInspector({
       setDescription={setDescription}
       commitDescription={commitDescription}
       commitTimes={commitTimes}
+      commitAllDayDate={commitAllDayDate}
+      onToggleAllDay={onToggleAllDay}
+      onChangeTimeZone={onChangeTimeZone}
       onClose={onClose}
       onSaveCalendar={onSaveCalendar}
       onDelete={onDelete}

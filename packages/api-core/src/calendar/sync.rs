@@ -21,7 +21,9 @@ use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 /// (parseable `last_synced_at` / `initial_sync_complete`).
 pub const SYNC_HEALTH_STALE_SECS: i64 = 60 * 60;
 
-/// Product projection currently materialised by the replica.
+/// Product projection name currently materialised by the replica.
+/// Health-string name is unchanged; GET range list now includes all-day rows
+/// (running-task list still filters `is_all_day = 0`).
 pub const REPLICA_PROJECTION: &str = "timed_masters_and_exceptions";
 
 /// Canonical replica query string hashed by [`replica_query_fingerprint`].

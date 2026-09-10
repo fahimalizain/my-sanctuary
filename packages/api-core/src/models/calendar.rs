@@ -351,13 +351,17 @@ pub struct NewCalendarEventOperation {
 ///
 /// `calendar_id` is exclusive: when set, it must be the only field (local
 /// destination calendar id → Google `events.move`). Combining it with
-/// `start` / `end` / `summary` / `description` is rejected as invalid.
+/// `start` / `end` / `summary` / `description` / `is_all_day` /
+/// `start_time_zone` is rejected as invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct PatchEventFields {
-    /// RFC 3339 dateTime passed through to Google `start.dateTime`.
+    /// RFC 3339 dateTime or civil `YYYY-MM-DD` (all-day). Timed patches emit
+    /// Google `start.dateTime`; all-day (`is_all_day: true`) emits `start.date`.
     #[serde(default)]
     pub start: Option<String>,
-    /// RFC 3339 dateTime passed through to Google `end.dateTime`.
+    /// RFC 3339 dateTime or civil `YYYY-MM-DD` (all-day). Timed patches emit
+    /// Google `end.dateTime`; all-day (`is_all_day: true`) emits `end.date`
+    /// (exclusive end date).
     #[serde(default)]
     pub end: Option<String>,
     /// Event title → Google `summary`.
@@ -367,9 +371,19 @@ pub struct PatchEventFields {
     /// `None` omits the field from the patch body.
     #[serde(default)]
     pub description: Option<String>,
+    /// When `Some(true)`, start/end are written as Google all-day `date`
+    /// fields (civil `YYYY-MM-DD`). Requires both start and end. When
+    /// `Some(false)` or omitted with start/end, timed `dateTime` path.
+    #[serde(default)]
+    pub is_all_day: Option<bool>,
+    /// IANA zone applied to both start and end `timeZone` on timed patches.
+    /// Requires start and end. Ignored / not emitted on all-day date objects.
+    /// Empty after trim is treated as omitted from the Google payload.
+    #[serde(default)]
+    pub start_time_zone: Option<String>,
     /// Local destination calendar id (`google_calendars.id`). Exclusive —
-    /// cannot be combined with start/end/summary/description. Routes to
-    /// Google `events.move` (not `events.patch`).
+    /// cannot be combined with start/end/summary/description/is_all_day/
+    /// start_time_zone. Routes to Google `events.move` (not `events.patch`).
     #[serde(default)]
     pub calendar_id: Option<String>,
 }
