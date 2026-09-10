@@ -592,21 +592,13 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
         // Chunk to stay under D1's 100 bound-parameter limit (4 rows of 23
-        // columns per statement); each chunk is one D1 subrequest. Look up
-        // each natural key first so ON CONFLICT hits the living/deleted row
-        // instead of inserting a colliding id that gets thrown away.
+        // columns per statement); each chunk is one D1 subrequest. Mint
+        // candidate UUIDs; ON CONFLICT(calendar_id, google_event_id) preserves
+        // existing id and sets deleted_at = NULL (no per-event SELECT).
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match self
-                    .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
-                    .await?
-                {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
+            let ids: Vec<String> = (0..chunk.len())
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect();
             let (sql, args) = build_event_upsert_sql(chunk, now_rfc3339, ids);
             self.run_upsert(&sql, &args).await?;
         }
@@ -622,21 +614,13 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         if events.is_empty() {
             return Ok(true);
         }
-        // Same natural-key lookup + chunking as upsert_batch; fence binds add
-        // only 3 params per statement so chunk size stays 4 (92 + 3 = 95).
+        // Same mint-UUID + chunking as upsert_batch; fence binds add only 3
+        // params per statement so chunk size stays 4 (92 + 3 = 95).
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
             let calendar_id = chunk[0].calendar_id.as_str();
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match self
-                    .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
-                    .await?
-                {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
+            let ids: Vec<String> = (0..chunk.len())
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect();
             let (sql, args) = build_event_upsert_if_owner_sql(
                 chunk,
                 now_rfc3339,

@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use api_core::models::{GoogleCalendar, WatchChannel};
+use api_core::models::{GoogleCalendar, NewCalendarEvent, WatchChannel};
 use api_core::oauth::{HttpClient, HttpError};
 use api_core::repo::{CalendarEventRepo, CalendarRepo};
 use api_core::time::unix_secs_to_rfc3339;
@@ -366,6 +366,119 @@ fn d1_cron_published_only_after_health_commit() {
         stored.last_success_at.as_deref(),
         Some("2023-11-14T22:13:20Z")
     );
+}
+
+fn sample_new_event(google_event_id: &str, title: &str) -> NewCalendarEvent {
+    NewCalendarEvent {
+        calendar_id: "cal-1".to_string(),
+        google_event_id: google_event_id.to_string(),
+        google_etag: "etag-1".to_string(),
+        google_updated_at: "2026-08-17T10:00:00Z".to_string(),
+        last_synced_at: NOW_RFC.to_string(),
+        title: title.to_string(),
+        description: String::new(),
+        start_time: "2026-08-18T09:00:00Z".to_string(),
+        end_time: "2026-08-18T09:30:00Z".to_string(),
+        recurrence: String::new(),
+        task_id: String::new(),
+        ical_uid: "uid-batch".to_string(),
+        sequence: 0,
+        status: "confirmed".to_string(),
+        recurring_event_id: String::new(),
+        original_start: String::new(),
+        start_time_zone: "UTC".to_string(),
+        end_time_zone: "UTC".to_string(),
+        is_all_day: false,
+        raw_json: r#"{"id":"g-batch"}"#.to_string(),
+    }
+}
+
+/// Batch upsert mints candidate UUIDs without per-event SELECT; ON CONFLICT
+/// keeps the original id, updates fields, and revives soft-deletes.
+#[test]
+fn d1_upsert_batch_preserves_id_and_revives_soft_delete() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+    }
+
+    let original_id = pollster::block_on(h.events.upsert(
+        sample_new_event("g-batch", "Original"),
+        NOW_RFC,
+    ))
+    .expect("single upsert");
+
+    // Re-batch same natural key with a different title; impl mints a fresh UUID
+    // that ON CONFLICT must discard so the original id is kept.
+    pollster::block_on(h.events.upsert_batch(
+        vec![sample_new_event("g-batch", "Updated title")],
+        NOW_RFC,
+    ))
+    .expect("upsert_batch");
+
+    let after_batch =
+        pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "g-batch"))
+            .expect("get")
+            .expect("row living");
+    assert_eq!(after_batch.id, original_id, "ON CONFLICT must preserve id");
+    assert_eq!(after_batch.title, "Updated title");
+    assert!(after_batch.deleted_at.is_none());
+
+    // Soft-delete, then batch-upsert again → revived with same id.
+    pollster::block_on(h.events.delete(&original_id, NOW_RFC)).expect("soft-delete");
+    {
+        let conn = h.db.lock().unwrap();
+        let deleted_at: Option<String> = conn
+            .query_row(
+                "SELECT deleted_at FROM calendar_events WHERE id = ?1",
+                rusqlite::params![original_id],
+                |r| r.get(0),
+            )
+            .expect("deleted row");
+        assert!(deleted_at.is_some(), "row must be soft-deleted");
+    }
+
+    pollster::block_on(h.events.upsert_batch(
+        vec![sample_new_event("g-batch", "Revived")],
+        NOW_RFC,
+    ))
+    .expect("upsert_batch revive");
+
+    let revived =
+        pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "g-batch"))
+            .expect("get revived")
+            .expect("row living again");
+    assert_eq!(revived.id, original_id, "revive must keep original id");
+    assert_eq!(revived.title, "Revived");
+    assert!(revived.deleted_at.is_none());
+
+    // Fenced batch path: live lease + upsert_batch_if_owner still preserves id.
+    {
+        let conn = h.db.lock().unwrap();
+        conn.execute(
+            "UPDATE google_calendars
+             SET lease_owner = ?1, lease_expires_at = ?2
+             WHERE id = 'cal-1'",
+            rusqlite::params!["owner-batch", "2099-01-01T00:00:00Z"],
+        )
+        .expect("set lease");
+    }
+    let ok = pollster::block_on(h.events.upsert_batch_if_owner(
+        vec![sample_new_event("g-batch", "Fenced title")],
+        "owner-batch",
+        NOW_RFC,
+    ))
+    .expect("if_owner");
+    assert!(ok, "live lease must succeed");
+
+    let fenced =
+        pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "g-batch"))
+            .expect("get fenced")
+            .expect("row living");
+    assert_eq!(fenced.id, original_id, "if_owner must preserve id");
+    assert_eq!(fenced.title, "Fenced title");
+    assert!(fenced.deleted_at.is_none());
 }
 
 fn seed_event(

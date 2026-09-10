@@ -543,20 +543,13 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
+        // Mint candidate UUIDs; ON CONFLICT(calendar_id, google_event_id)
+        // preserves existing id and sets deleted_at = NULL (no per-event SELECT).
         let conn = lock(&self.db)?;
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match Self::lookup_id_by_natural_key(
-                    &conn,
-                    &event.calendar_id,
-                    &event.google_event_id,
-                )? {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
+            let ids: Vec<String> = (0..chunk.len())
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect();
             let (sql, args) = build_event_upsert_sql(chunk, now_rfc3339, ids);
             Self::run_upsert(&conn, &sql, &args)?;
         }
@@ -572,21 +565,13 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
         if events.is_empty() {
             return Ok(true);
         }
+        // Same mint-UUID + chunking as upsert_batch; fence binds unchanged.
         let conn = lock(&self.db)?;
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
             let calendar_id = chunk[0].calendar_id.as_str();
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match Self::lookup_id_by_natural_key(
-                    &conn,
-                    &event.calendar_id,
-                    &event.google_event_id,
-                )? {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
+            let ids: Vec<String> = (0..chunk.len())
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect();
             let (sql, args) = build_event_upsert_if_owner_sql(
                 chunk,
                 now_rfc3339,

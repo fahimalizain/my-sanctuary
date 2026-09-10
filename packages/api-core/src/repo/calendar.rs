@@ -1590,6 +1590,18 @@ mod tests {
             EVENT_UPSERT_ON_CONFLICT.contains("deleted_at = NULL"),
             "{EVENT_UPSERT_ON_CONFLICT}"
         );
+        // DO UPDATE must not assign id — a fresh UUID on conflict is discarded
+        // and the existing row id is kept (batch upsert mints without SELECT).
+        // Match a bare column assignment (line-start / after comma), not
+        // suffixes like google_event_id / recurring_event_id.
+        let assigns_id = EVENT_UPSERT_ON_CONFLICT.lines().any(|line| {
+            let trimmed = line.trim().trim_start_matches(',').trim();
+            trimmed.starts_with("id =") || trimmed.starts_with("id=")
+        });
+        assert!(
+            !assigns_id,
+            "ON CONFLICT must not overwrite id: {EVENT_UPSERT_ON_CONFLICT}"
+        );
     }
 
     #[test]
