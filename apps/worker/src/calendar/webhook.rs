@@ -275,6 +275,32 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                             "calendar webhook: stop watches for {} failed (channel rows kept): {err}",
                             calendar.id
                         );
+                        return;
+                    }
+                    // Stamp sanitized coverage after stop (→ missing). Best-effort.
+                    let calendars = match env.d1("DB") {
+                        Ok(db) => crate::db::D1CalendarRepo::new(db),
+                        Err(err) => {
+                            console_log!(
+                                "calendar webhook: watch coverage refresh for {} skipped (DB binding missing): {err}",
+                                calendar.id
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(err) = api_core::refresh_watch_coverage(
+                        &calendars,
+                        &watches,
+                        &calendar.id,
+                        now_unix,
+                        &now_rfc3339,
+                    )
+                    .await
+                    {
+                        console_log!(
+                            "calendar webhook: watch coverage refresh for {} failed: {err}",
+                            calendar.id
+                        );
                     }
                 });
             }

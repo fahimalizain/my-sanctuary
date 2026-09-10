@@ -20,6 +20,7 @@ function health(
     retry_after_seconds: null,
     projection: 'timed_masters_and_exceptions',
     cache_revision: 0,
+    watch_coverage: 'missing',
     ...overrides,
   };
 }

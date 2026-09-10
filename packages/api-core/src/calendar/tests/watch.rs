@@ -1,8 +1,13 @@
 use super::support::*;
+use crate::calendar::sync::{refresh_watch_coverage, WatchCoverage};
 use crate::calendar::watch::WatchChannelResponse;
 use crate::calendar::{
-    is_public_https_callback, list_events, renew_watch_if_needed,
+    is_public_https_callback, list_events, renew_watch_if_needed, stop_watches_for_calendar,
 };
+use crate::models::WatchChannel;
+use crate::repo::CalendarRepo;
+use crate::time::unix_secs_to_rfc3339;
+use crate::WATCH_RENEW_HORIZON_SECS;
 
 // ──────────────────────────────────────────
 // is_public_https_callback
@@ -364,4 +369,240 @@ fn renew_creates_watch_and_stops_old_when_expiring_within_horizon() {
     let stored = watches.stored.lock().unwrap();
     assert_eq!(stored.len(), 1, "new row only");
     assert_eq!(stored[0].channel_id, inserted[0].channel_id);
+}
+
+// ──────────────────────────────────────────
+// watch_coverage persist (issue #55 slice 2)
+// ──────────────────────────────────────────
+
+#[test]
+fn list_events_stamps_covered_when_horizon_channel_present() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.initial_sync_complete = true;
+    cal.last_synced_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.sync_status = "ready".to_string();
+
+    let covered_exp = unix_secs_to_rfc3339(NOW_UNIX + WATCH_RENEW_HORIZON_SECS + 60);
+    let mut channel = watch_channel("cal-1", &covered_exp);
+    channel.token = "secret-channel-token".to_string();
+    channel.resource_id = "res-secret".to_string();
+
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::with(vec![channel]);
+
+    let output = pollster::block_on(list_events(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        None, // no watch I/O — coverage comes from stored channels
+    ))
+    .unwrap();
+
+    assert_eq!(output.sync.calendars.len(), 1);
+    assert_eq!(
+        output.sync.calendars[0].watch_coverage,
+        WatchCoverage::Covered
+    );
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].watch_coverage, "covered");
+
+    let json = serde_json::to_string(&output.sync).unwrap();
+    assert!(json.contains("\"watch_coverage\""), "{json}");
+    assert!(json.contains("covered"), "{json}");
+    assert!(!json.contains("secret-channel-token"), "{json}");
+    assert!(!json.contains("res-secret"), "{json}");
+    assert!(!json.contains("resource_id"), "{json}");
+    assert!(!json.contains("channel_id"), "{json}");
+}
+
+#[test]
+fn list_events_stamps_missing_when_no_channels() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.initial_sync_complete = true;
+    cal.last_synced_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.sync_status = "ready".to_string();
+
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::new();
+
+    let output = pollster::block_on(list_events(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        output.sync.calendars[0].watch_coverage,
+        WatchCoverage::Missing
+    );
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].watch_coverage,
+        "missing"
+    );
+    // Missing watches must not degrade a ready replica.
+    assert_eq!(
+        output.sync.status.as_str(),
+        "ready",
+        "aggregate must ignore watch_coverage"
+    );
+}
+
+#[test]
+fn renew_noop_persists_covered_via_refresh_helper() {
+    // renew returns Ok(false) when horizon already covered; cron still refreshes.
+    let http = FakeHttp::new(vec![]);
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let covered_exp = unix_secs_to_rfc3339(NOW_UNIX + WATCH_RENEW_HORIZON_SECS + 120);
+    let watches =
+        FakeWatchChannelRepo::with(vec![watch_channel("cal-1", &covered_exp)]);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+
+    let renewed = pollster::block_on(renew_watch_if_needed(
+        &http,
+        &watches,
+        &access(),
+        &cal,
+        CALLBACK_URL,
+        NOW_UNIX,
+    ))
+    .unwrap();
+    assert!(!renewed);
+
+    let coverage = pollster::block_on(refresh_watch_coverage(
+        &calendars,
+        &watches,
+        "cal-1",
+        NOW_UNIX,
+        &unix_secs_to_rfc3339(NOW_UNIX),
+    ))
+    .unwrap();
+    assert_eq!(coverage, WatchCoverage::Covered);
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].watch_coverage,
+        "covered"
+    );
+}
+
+#[test]
+fn stop_watches_then_refresh_persists_missing() {
+    let http = FakeHttp::new(vec![("/channels/stop", 200, "{}")]);
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let covered_exp = unix_secs_to_rfc3339(NOW_UNIX + WATCH_RENEW_HORIZON_SECS + 60);
+    let mut channel = watch_channel("cal-1", &covered_exp);
+    channel.token = "secret-channel-token".to_string();
+    channel.resource_id = "res-secret".to_string();
+    let watches = FakeWatchChannelRepo::with(vec![channel]);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+
+    // Pre-stamp covered so we can observe the flip to missing.
+    pollster::block_on(calendars.set_watch_coverage(
+        "cal-1",
+        "covered",
+        &unix_secs_to_rfc3339(NOW_UNIX),
+    ))
+    .unwrap();
+
+    pollster::block_on(stop_watches_for_calendar(
+        &http,
+        &watches,
+        &access(),
+        "cal-1",
+    ))
+    .unwrap();
+    assert!(watches.stored.lock().unwrap().is_empty());
+
+    let coverage = pollster::block_on(refresh_watch_coverage(
+        &calendars,
+        &watches,
+        "cal-1",
+        NOW_UNIX,
+        &unix_secs_to_rfc3339(NOW_UNIX),
+    ))
+    .unwrap();
+    assert_eq!(coverage, WatchCoverage::Missing);
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].watch_coverage,
+        "missing"
+    );
+}
+
+#[test]
+fn list_events_envelope_json_never_leaks_channel_secrets() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.initial_sync_complete = true;
+    cal.last_synced_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.sync_status = "ready".to_string();
+    cal.sync_token = "secret-sync-token".to_string();
+    cal.lease_owner = "lease-secret".to_string();
+
+    let covered_exp = unix_secs_to_rfc3339(NOW_UNIX + WATCH_RENEW_HORIZON_SECS + 60);
+    let channel = WatchChannel {
+        id: "wc-1".to_string(),
+        calendar_id: "cal-1".to_string(),
+        channel_id: "ch-secret-id".to_string(),
+        resource_id: "res-secret".to_string(),
+        token: "secret-channel-token".to_string(),
+        expiration: covered_exp,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::with(vec![channel]);
+
+    let output = pollster::block_on(list_events(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        None,
+    ))
+    .unwrap();
+
+    let json = serde_json::to_string(&output.sync).unwrap();
+    for secret in [
+        "secret-channel-token",
+        "res-secret",
+        "ch-secret-id",
+        "secret-sync-token",
+        "lease-secret",
+        "access_token",
+        "raw_json",
+    ] {
+        assert!(!json.contains(secret), "leaked {secret}: {json}");
+    }
+    assert!(!json.contains("\"token\""), "{json}");
+    assert!(!json.contains("resource_id"), "{json}");
+    assert!(!json.contains("channel_id"), "{json}");
+    assert!(!json.contains("sync_token"), "{json}");
+    assert!(!json.contains("lease_owner"), "{json}");
+    assert!(json.contains("\"watch_coverage\""), "{json}");
 }

@@ -1,6 +1,8 @@
 use super::catalog::refresh_calendar_list;
 use super::cron::stamp_auth_revoked_for_user;
-use super::sync::{events_sync_envelope, EventsSyncEnvelope};
+use super::sync::{
+    classify_watch_coverage, events_sync_envelope, refresh_watch_coverage, EventsSyncEnvelope,
+};
 use super::watch::{ensure_watch, is_public_https_callback, stop_watches_for_calendar};
 use super::window::fetch_and_apply_window;
 use super::CalendarError;
@@ -130,6 +132,21 @@ pub async fn list_events(
                             cal.id
                         ));
                     }
+                    // Best-effort: stamp missing / leftover coverage after stop.
+                    if let Err(err) = refresh_watch_coverage(
+                        calendars,
+                        watches,
+                        &cal.id,
+                        now_unix,
+                        &now_rfc3339,
+                    )
+                    .await
+                    {
+                        sync_errors.push(format!(
+                            "failed to refresh watch coverage for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
                     continue;
                 }
                 Err(err) => {
@@ -201,6 +218,20 @@ pub async fn list_events(
                         cal.id
                     ));
                 }
+                if let Err(err) = refresh_watch_coverage(
+                    calendars,
+                    watches,
+                    &cal.id,
+                    now_unix,
+                    &now_rfc3339,
+                )
+                .await
+                {
+                    sync_errors.push(format!(
+                        "failed to refresh watch coverage for calendar {}: {err}",
+                        cal.id
+                    ));
+                }
             }
             Err(err) => sync_errors.push(format!(
                 "window fetch failed for calendar {} ({}): {err}",
@@ -220,10 +251,36 @@ pub async fn list_events(
     // from this request. On re-read failure, fall back to the in-memory
     // snapshot from the start of the request. Window path must not flip
     // ready / initial_sync_complete / sync_token.
-    let fresh = match calendars.list_by_user_id(user_id).await {
+    let mut fresh = match calendars.list_by_user_id(user_id).await {
         Ok(rows) => rows,
         Err(_) => cals,
     };
+    // Stamp sanitized watch coverage from live channel rows so GET is accurate
+    // after deploy (column defaults to `missing`). Best-effort persist; always
+    // stamp the in-memory row so the envelope is correct even if D1 write fails.
+    for cal in &mut fresh {
+        let channels = match watches.list_by_calendar_id(&cal.id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                sync_errors.push(format!(
+                    "failed to list watch channels for calendar {}: {err}",
+                    cal.id
+                ));
+                continue;
+            }
+        };
+        let coverage = classify_watch_coverage(&channels, now_unix);
+        cal.watch_coverage = coverage.as_str().to_string();
+        if let Err(err) = calendars
+            .set_watch_coverage(&cal.id, coverage.as_str(), &now_rfc3339)
+            .await
+        {
+            sync_errors.push(format!(
+                "failed to persist watch coverage for calendar {}: {err}",
+                cal.id
+            ));
+        }
+    }
     let sync = events_sync_envelope(&fresh, now_unix);
 
     let source = match (window_fetched, cache_only_initialized) {

@@ -137,6 +137,14 @@ pub trait CalendarRepo: Send + Sync {
         event_labels_json: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Persist sanitized watch coverage (`missing` | `expiring` |
+    /// `no_successor` | `covered`). Never stores channel tokens / resource ids.
+    async fn set_watch_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
     /// Stored calendarList.list `nextSyncToken` for `user_id`, if any.
@@ -520,6 +528,15 @@ pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
 /// the cache or the stamp.
 pub const CALENDAR_SET_EVENT_LABELS_SQL: &str =
     "UPDATE google_calendars SET event_labels = ?, event_labels_updated_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// Persist sanitized watch coverage. Binds: coverage, now, id.
+/// Values: `missing` | `expiring` | `no_successor` | `covered`. Never stores
+/// channel tokens or resource ids (those live only on watch channel rows).
+pub const CALENDAR_SET_WATCH_COVERAGE_SQL: &str = "
+    UPDATE google_calendars
+    SET watch_coverage = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
 
 /// SOFT delete: stamps `deleted_at`, keeping the row's UNIQUE
 /// `(user_id, google_calendar_id)` slot.
@@ -946,6 +963,50 @@ mod tests {
     }
 
     #[test]
+    fn calendar_set_watch_coverage_writes_column_and_stamps_updated_at() {
+        let sql = CALENDAR_SET_WATCH_COVERAGE_SQL;
+        assert!(sql.contains("watch_coverage = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        // Never writes channel secrets.
+        assert!(!sql.contains("token"), "{sql}");
+        assert!(!sql.contains("resource_id"), "{sql}");
+        assert!(!sql.contains("channel_id"), "{sql}");
+    }
+
+    #[test]
+    fn migration_0014_adds_watch_coverage_without_secrets() {
+        let migration =
+            include_str!("../../../../apps/worker/migrations/0014_watch_coverage.sql");
+        assert!(
+            migration.contains("ALTER TABLE google_calendars ADD COLUMN watch_coverage"),
+            "migration must add watch_coverage column: {migration}"
+        );
+        assert!(
+            migration.contains("DEFAULT 'missing'"),
+            "default must be missing: {migration}"
+        );
+        assert!(
+            migration.contains("never stores channel tokens"),
+            "comment must note secrets are not stored: {migration}"
+        );
+        // Must not introduce secret-bearing columns.
+        assert!(
+            !migration.contains("resource_id"),
+            "must not add resource_id: {migration}"
+        );
+        assert!(
+            !migration.contains("channel_id"),
+            "must not add channel_id: {migration}"
+        );
+        assert!(
+            !migration.contains(" ADD COLUMN token"),
+            "must not add token column: {migration}"
+        );
+    }
+
+    #[test]
     fn calendar_list_orders_primary_first_then_summary() {
         let sql = CALENDAR_LIST_BY_USER_ID_SQL;
         let order_start = sql.find("ORDER BY").expect("has ORDER BY");
@@ -1206,6 +1267,7 @@ mod tests {
             "lease_owner",
             "lease_expires_at",
             "projection",
+            "watch_coverage",
         ] {
             assert!(
                 !CALENDAR_UPSERT_SQL.contains(col),

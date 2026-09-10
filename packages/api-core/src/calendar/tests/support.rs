@@ -472,6 +472,7 @@ impl CalendarRepo for FakeCalendarRepo {
                     lease_expires_at: None,
                     cache_revision: 0,
                     projection: "timed_masters_and_exceptions".to_string(),
+                    watch_coverage: String::new(),
                     created_at: "2026-08-17T00:00:00Z".to_string(),
                     updated_at: "2026-08-17T00:00:00Z".to_string(),
                     deleted_at: None,
@@ -728,6 +729,22 @@ impl CalendarRepo for FakeCalendarRepo {
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
             cal.event_labels = event_labels_json.to_string();
             cal.event_labels_updated_at = Some(now_rfc3339.to_string());
+        }
+        Ok(())
+    }
+
+    async fn set_watch_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            if cal.deleted_at.is_none() {
+                cal.watch_coverage = coverage.to_string();
+                cal.updated_at = now_rfc3339.to_string();
+            }
         }
         Ok(())
     }
@@ -1421,6 +1438,7 @@ pub(crate) fn calendar_for_user(
         lease_expires_at: None,
         cache_revision: 0,
         projection: "timed_masters_and_exceptions".to_string(),
+        watch_coverage: String::new(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         deleted_at: None,
