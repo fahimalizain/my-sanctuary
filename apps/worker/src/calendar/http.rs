@@ -215,8 +215,10 @@ pub async fn list_events(
 /// rows; an empty store runs the same first-contact `calendarList` import
 /// as `GET /api/calendar/events` (no event sync, no watch setup).
 ///
-/// Missing session or a failed token refresh → 401 `{"error":"unauthorized"}`;
-/// a `calendarList` import failure → 502 with Google's message; anything else
+/// Missing session → 401 `{"error":"unauthorized"}`.
+/// Google `refresh_if_needed` failure: revoked/missing grant → 200 cached
+/// calendars (stamp `authorization_required` on revoked); transient → 500.
+/// A `calendarList` import failure → 502 with Google's message; anything else
 /// → 500 `{"error":"failed to load calendars"}`.
 pub async fn list_calendars(
     req: Request,
@@ -231,31 +233,57 @@ pub async fn list_calendars(
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
-        Ok(access) => access,
-        Err(err) => {
-            console_log!("calendar: token refresh failed: {err}");
-            return unauthorized(&ctx);
-        }
-    };
-
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
-    let response = match api_core::list_calendars(
+
+    let response = match api_core::refresh_if_needed(
         &crate::http::WorkerHttp,
-        &calendars,
-        &access,
+        &tokens,
+        oauth,
         &user_id,
-        &now_rfc3339,
+        now_unix,
     )
     .await
     {
-            Ok(output) => Response::from_json(&output)?,
-            Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
-            Err(err) => {
-                console_log!("calendar: list_calendars failed: {err}");
+        Ok(access) => {
+            match api_core::list_calendars(
+                &crate::http::WorkerHttp,
+                &calendars,
+                &access,
+                &user_id,
+                &now_rfc3339,
+            )
+            .await
+            {
+                Ok(output) => Response::from_json(&output)?,
+                Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
+                Err(err) => {
+                    console_log!("calendar: list_calendars failed: {err}");
+                    return json_error(&ctx, 500, "failed to load calendars");
+                }
+            }
+        }
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient
+            {
                 return json_error(&ctx, 500, "failed to load calendars");
             }
-        };
+            match api_core::list_calendars_after_refresh_failure(
+                &calendars,
+                &user_id,
+                now_unix,
+                &err,
+            )
+            .await
+            {
+                Ok(output) => Response::from_json(&output)?,
+                Err(list_err) => {
+                    console_log!("calendar: list_calendars failed: {list_err}");
+                    return json_error(&ctx, 500, "failed to load calendars");
+                }
+            }
+        }
+    };
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
 }
 

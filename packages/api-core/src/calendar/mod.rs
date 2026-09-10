@@ -233,7 +233,7 @@ pub use watch::{
 pub use webhook::{
     decide_webhook, persist_webhook_decision, tokens_match, WebhookDecision, WebhookPersistResult,
 };
-pub use catalog::list_calendars;
+pub use catalog::{list_calendars, list_calendars_after_refresh_failure};
 pub use cron::{
     replica_due, run_fallback_cron, sync_calendar, CronReport, SyncCalendarOutcome,
 };

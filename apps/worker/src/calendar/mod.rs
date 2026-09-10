@@ -3,11 +3,14 @@
 //! `handlers/calendar.go`.
 //!
 //! The list/create endpoints are session-gated and refresh the Google access
-//! token when stale — a user whose token cannot be refreshed gets `401
-//! {"error":"unauthorized"}`, exactly like the Go handlers. The webhook is
-//! unauthenticated by design (ADR 0001 § Webhook): Google cannot send a
-//! session cookie, so verification is the `X-Goog-Channel-*` headers, and
-//! every failure is swallowed into a 200.
+//! token when stale. GET list endpoints (`events`, `calendars`): 401 is
+//! session-only; a Google grant refresh failure serves the D1 cache (events
+//! include an `authorization_required` envelope). Write verbs
+//! (create/patch/delete) still map refresh failure to 401
+//! `{"error":"unauthorized"}`. The webhook is unauthenticated by design
+//! (ADR 0001 § Webhook): Google cannot send a session cookie, so verification
+//! is the `X-Goog-Channel-*` headers, and every failure is swallowed into a
+//! 200.
 //!
 //! The sync/create/webhook orchestration lives in `api_core::calendar` (pure,
 //! unit-tested); this module only extracts the session user (or the webhook

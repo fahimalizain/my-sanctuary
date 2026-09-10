@@ -758,7 +758,7 @@ fn ready_synced_calendar(id: &str, google_cal_id: &str, sync_enabled: bool) -> c
 
 #[test]
 fn refresh_failure_revoked_grant_serves_cache_and_stamps_auth_required() {
-    let mut enabled = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let enabled = ready_synced_calendar("cal-1", "primary@example.com", true);
     let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
     let success_before = enabled.last_success_at.clone();
     let token_before = enabled.sync_token.clone();
