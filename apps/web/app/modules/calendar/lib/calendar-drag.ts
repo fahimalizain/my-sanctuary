@@ -46,6 +46,23 @@ export function isTapCreatePointer(pointerType: string): boolean {
   return pointerType === 'touch';
 }
 
+export type TouchGestureIntent = 'pending' | 'scroll' | 'drag';
+
+/**
+ * Classify a touch pan before claiming the gesture.
+ * Create: horizontal-dominant past threshold → scroll; else → drag.
+ * Chip: any movement past threshold → drag (cancel lets flicks scroll).
+ */
+export function classifyTouchGesture(
+  dx: number,
+  dy: number,
+  mode: 'create' | 'chip',
+): TouchGestureIntent {
+  if (!movedEnough(dx, dy)) return 'pending';
+  if (mode === 'create' && Math.abs(dx) > Math.abs(dy)) return 'scroll';
+  return 'drag';
+}
+
 /**
  * Which resize edge (if any) is under the pointer inside a chip.
  * `localY` is Y relative to the chip top; `chipHeight` is the chip's height.

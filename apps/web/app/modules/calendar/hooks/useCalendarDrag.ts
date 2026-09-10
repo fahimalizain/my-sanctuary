@@ -12,6 +12,7 @@ import {
   type DragKind,
   type DragSlot,
   type TimedRange,
+  classifyTouchGesture,
   isTapCreatePointer,
   movedEnough,
   movedRange,
@@ -69,6 +70,8 @@ interface Session {
   /** Minutes from painted chip start to pointer at pointerdown (move only). */
   grabOffsetMin?: number;
   pointerId: number;
+  /** touch waits for classify; mouse/pen is claimed immediately. */
+  pointerType: string;
 }
 
 function parseDayAttr(value: string | null | undefined): Date | null {
@@ -159,9 +162,27 @@ export function useCalendarDrag(
   const sessionRef = useRef<Session | null>(null);
   const didDragRef = useRef(false);
   const suppressClickRef = useRef(false);
+  /** Touch sessions start unclaimed so the scroller can pan. */
+  const claimedRef = useRef(false);
+  const captureTargetRef = useRef<HTMLElement | null>(null);
 
   const [session, setSession] = useState<Session | null>(null);
   const [didDrag, setDidDrag] = useState(false);
+
+  const claimGesture = useCallback((pointerId: number) => {
+    if (claimedRef.current) return;
+    claimedRef.current = true;
+    optsRef.current.setStripLocked(true);
+    document.body.style.userSelect = 'none';
+    const target = captureTargetRef.current;
+    if (target) {
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        // Capture can fail if the target is not active; window listeners still work.
+      }
+    }
+  }, []);
 
   const beginSession = useCallback(
     (next: Session, target: HTMLElement, e: ReactPointerEvent<HTMLElement>) => {
@@ -169,14 +190,22 @@ export function useCalendarDrag(
       didDragRef.current = false;
       setSession(next);
       setDidDrag(false);
-      optsRef.current.setStripLocked(true);
-      try {
-        target.setPointerCapture(e.pointerId);
-      } catch {
-        // Capture can fail if the target is not active; window listeners still work.
+      captureTargetRef.current = target;
+
+      const isTouch = e.pointerType === 'touch';
+      if (isTouch) {
+        // Leave unclaimed so native scroll on [data-calendar-scroller] works.
+        claimedRef.current = false;
+      } else {
+        claimedRef.current = true;
+        optsRef.current.setStripLocked(true);
+        try {
+          target.setPointerCapture(e.pointerId);
+        } catch {
+          // Capture can fail if the target is not active; window listeners still work.
+        }
+        document.body.style.userSelect = 'none';
       }
-      // Avoid text selection while the gesture is live.
-      document.body.style.userSelect = 'none';
     },
     [],
   );
@@ -186,6 +215,8 @@ export function useCalendarDrag(
     setSession(null);
     setDidDrag(false);
     didDragRef.current = false;
+    claimedRef.current = false;
+    captureTargetRef.current = null;
     optsRef.current.setStripLocked(false);
     document.body.style.userSelect = '';
   }, []);
@@ -197,9 +228,25 @@ export function useCalendarDrag(
     const onMoveWin = (e: PointerEvent) => {
       const s = sessionRef.current;
       if (!s) return;
+      if (e.pointerId !== s.pointerId) return;
 
       const dx = e.clientX - s.originX;
       const dy = e.clientY - s.originY;
+
+      // Unclaimed touch: classify before stealing the gesture.
+      if (!claimedRef.current && s.pointerType === 'touch') {
+        const mode =
+          s.kind === 'create' || s.kind === 'allday-create' ? 'create' : 'chip';
+        const intent = classifyTouchGesture(dx, dy, mode);
+        if (intent === 'pending') return;
+        if (intent === 'scroll') {
+          endSession();
+          return;
+        }
+        // 'drag' — claim now, then fall through into the move path.
+        claimGesture(e.pointerId);
+      }
+
       if (!didDragRef.current && movedEnough(dx, dy)) {
         didDragRef.current = true;
         setDidDrag(true);
@@ -283,15 +330,22 @@ export function useCalendarDrag(
       endSession();
     };
 
+    const onCancelWin = (e: PointerEvent) => {
+      const s = sessionRef.current;
+      if (!s) return;
+      if (e.pointerId !== s.pointerId) return;
+      endSession();
+    };
+
     window.addEventListener('pointermove', onMoveWin, { passive: false });
     window.addEventListener('pointerup', onUpWin);
-    window.addEventListener('pointercancel', onUpWin);
+    window.addEventListener('pointercancel', onCancelWin);
     return () => {
       window.removeEventListener('pointermove', onMoveWin);
       window.removeEventListener('pointerup', onUpWin);
-      window.removeEventListener('pointercancel', onUpWin);
+      window.removeEventListener('pointercancel', onCancelWin);
     };
-  }, [session, endSession]);
+  }, [session, endSession, claimGesture]);
 
   // Cleanup body style if unmounted mid-drag.
   useEffect(() => {
@@ -317,6 +371,7 @@ export function useCalendarDrag(
           originX: e.clientX,
           originY: e.clientY,
           pointerId: e.pointerId,
+          pointerType: e.pointerType,
         },
         col,
         e,
@@ -386,6 +441,7 @@ export function useCalendarDrag(
           originalEnd,
           grabOffsetMin: kind === 'move' ? grabOffsetMin : undefined,
           pointerId: e.pointerId,
+          pointerType: e.pointerType,
         },
         chipEl,
         e,
@@ -410,6 +466,7 @@ export function useCalendarDrag(
           originX: e.clientX,
           originY: e.clientY,
           pointerId: e.pointerId,
+          pointerType: e.pointerType,
         },
         e.currentTarget,
         e,

@@ -6,6 +6,7 @@ import {
   DRAG_THRESHOLD_PX,
   RESIZE_HANDLE_PX,
   allDayPreviewIndices,
+  classifyTouchGesture,
   isTapCreatePointer,
   movedEnough,
   movedRange,
@@ -56,6 +57,46 @@ test('isTapCreatePointer: pen → false', () => {
 
 test('isTapCreatePointer: empty → false', () => {
   assert.equal(isTapCreatePointer(''), false);
+});
+
+// ── classifyTouchGesture ────────────────────────────────────────────────
+
+test('classifyTouchGesture: under threshold → pending (create and chip)', () => {
+  assert.equal(classifyTouchGesture(2, 1, 'create'), 'pending');
+  assert.equal(classifyTouchGesture(1, 2, 'chip'), 'pending');
+  assert.equal(classifyTouchGesture(0, 0, 'create'), 'pending');
+});
+
+test('classifyTouchGesture: create + horizontal-dominant → scroll', () => {
+  assert.equal(classifyTouchGesture(10, 2, 'create'), 'scroll');
+});
+
+test('classifyTouchGesture: create + vertical-dominant → drag', () => {
+  assert.equal(classifyTouchGesture(2, 10, 'create'), 'drag');
+});
+
+test('classifyTouchGesture: create + 45° tie past threshold → drag', () => {
+  assert.equal(classifyTouchGesture(5, 5, 'create'), 'drag');
+});
+
+test('classifyTouchGesture: create + exactly threshold on X only → scroll', () => {
+  assert.equal(classifyTouchGesture(DRAG_THRESHOLD_PX, 0, 'create'), 'scroll');
+});
+
+test('classifyTouchGesture: create + exactly threshold on Y only → drag', () => {
+  assert.equal(classifyTouchGesture(0, DRAG_THRESHOLD_PX, 'create'), 'drag');
+});
+
+test('classifyTouchGesture: chip + horizontal-dominant → drag', () => {
+  assert.equal(classifyTouchGesture(10, 2, 'chip'), 'drag');
+});
+
+test('classifyTouchGesture: chip + vertical-dominant → drag', () => {
+  assert.equal(classifyTouchGesture(2, 10, 'chip'), 'drag');
+});
+
+test('classifyTouchGesture: chip under threshold → pending', () => {
+  assert.equal(classifyTouchGesture(3, 0, 'chip'), 'pending');
 });
 
 // ── resizeEdgeAt ────────────────────────────────────────────────────────
