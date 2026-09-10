@@ -16,6 +16,7 @@ type EventInspectorProps = {
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
   onSaveDescription: (description: string) => void | Promise<void>;
+  onSaveTimes: (startIso: string, endIso: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -82,10 +83,12 @@ type Spies = {
   onClose: (...args: unknown[]) => void;
   onSaveTitle: (...args: unknown[]) => void;
   onSaveDescription: (...args: unknown[]) => void;
+  onSaveTimes: (...args: unknown[]) => void;
   onDelete: (...args: unknown[]) => void;
   closeCalls: unknown[][];
   saveCalls: unknown[][];
   saveDescriptionCalls: unknown[][];
+  saveTimesCalls: unknown[][];
   deleteCalls: unknown[][];
 };
 
@@ -93,11 +96,13 @@ function makeSpies(): Spies {
   const closeCalls: unknown[][] = [];
   const saveCalls: unknown[][] = [];
   const saveDescriptionCalls: unknown[][] = [];
+  const saveTimesCalls: unknown[][] = [];
   const deleteCalls: unknown[][] = [];
   return {
     closeCalls,
     saveCalls,
     saveDescriptionCalls,
+    saveTimesCalls,
     deleteCalls,
     onClose: (...args: unknown[]) => {
       closeCalls.push(args);
@@ -107,6 +112,9 @@ function makeSpies(): Spies {
     },
     onSaveDescription: (...args: unknown[]) => {
       saveDescriptionCalls.push(args);
+    },
+    onSaveTimes: (...args: unknown[]) => {
+      saveTimesCalls.push(args);
     },
     onDelete: (...args: unknown[]) => {
       deleteCalls.push(args);
@@ -132,6 +140,7 @@ function mount(
       onClose: spies.onClose,
       onSaveTitle: spies.onSaveTitle,
       onSaveDescription: spies.onSaveDescription,
+      onSaveTimes: spies.onSaveTimes,
       onDelete: spies.onDelete,
     }),
   );
@@ -140,8 +149,118 @@ function mount(
 
 // ── 1. Timed event when-block ───────────────────────────────────────────
 
-test('timed event when-block shows Notion-style range and date line', () => {
+test('timed writable when-block shows time/date inputs and duration', () => {
   mount();
+  const startInput = screen.getByLabelText('Start time') as HTMLInputElement;
+  const endInput = screen.getByLabelText('End time') as HTMLInputElement;
+  const dateInput = screen.getByLabelText('Date') as HTMLInputElement;
+  assert.equal(startInput.type, 'time');
+  assert.equal(endInput.type, 'time');
+  assert.equal(dateInput.type, 'date');
+  assert.equal(startInput.value, '05:15');
+  assert.equal(endInput.value, '05:30');
+  assert.equal(dateInput.value, '2026-09-13');
+  assert.ok(screen.getByText('15min'));
+  // Static AM range text is replaced by inputs.
+  assert.equal(screen.queryByText('5:15 AM → 5:30 AM 15min'), null);
+});
+
+test('timed when-block: start time change preserves duration', () => {
+  const spies = makeSpies();
+  mount({}, spies);
+  const startInput = screen.getByLabelText('Start time') as HTMLInputElement;
+  fireEvent.change(startInput, { target: { value: '06:00' } });
+  assert.equal(spies.saveTimesCalls.length, 1);
+  const expectedStart = new Date(2026, 8, 13, 6, 0);
+  const expectedEnd = new Date(2026, 8, 13, 6, 15);
+  assert.equal(spies.saveTimesCalls[0][0], expectedStart.toISOString());
+  assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
+});
+
+test('timed when-block: end time change keeps start', () => {
+  const spies = makeSpies();
+  mount({}, spies);
+  const endInput = screen.getByLabelText('End time') as HTMLInputElement;
+  fireEvent.change(endInput, { target: { value: '07:00' } });
+  assert.equal(spies.saveTimesCalls.length, 1);
+  const expectedStart = new Date(2026, 8, 13, 5, 15);
+  const expectedEnd = new Date(2026, 8, 13, 7, 0);
+  assert.equal(spies.saveTimesCalls[0][0], expectedStart.toISOString());
+  assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
+});
+
+test('timed when-block: end before start clamps to start+15min', () => {
+  const spies = makeSpies();
+  // Longer initial end so clamp (start+15) is a real change vs current.
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 7, 0);
+  mount(
+    {
+      event: makeEvent({
+        id: 'e-clamp',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+      }),
+    },
+    spies,
+  );
+  const endInput = screen.getByLabelText('End time') as HTMLInputElement;
+  fireEvent.change(endInput, { target: { value: '04:00' } });
+  assert.equal(spies.saveTimesCalls.length, 1);
+  const expectedStart = new Date(2026, 8, 13, 5, 15);
+  const expectedEnd = new Date(2026, 8, 13, 5, 30);
+  assert.equal(spies.saveTimesCalls[0][0], expectedStart.toISOString());
+  assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
+});
+
+test('timed when-block: date change shifts both instants by one day', () => {
+  const spies = makeSpies();
+  mount({}, spies);
+  const dateInput = screen.getByLabelText('Date') as HTMLInputElement;
+  fireEvent.change(dateInput, { target: { value: '2026-09-14' } });
+  assert.equal(spies.saveTimesCalls.length, 1);
+  const expectedStart = new Date(2026, 8, 14, 5, 15);
+  const expectedEnd = new Date(2026, 8, 14, 5, 30);
+  assert.equal(spies.saveTimesCalls[0][0], expectedStart.toISOString());
+  assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
+});
+
+test('timed when-block: unchanged change/blur does not call onSaveTimes', () => {
+  const spies = makeSpies();
+  mount({}, spies);
+  const startInput = screen.getByLabelText('Start time') as HTMLInputElement;
+  const endInput = screen.getByLabelText('End time') as HTMLInputElement;
+  const dateInput = screen.getByLabelText('Date') as HTMLInputElement;
+
+  fireEvent.change(startInput, { target: { value: '05:15' } });
+  fireEvent.blur(startInput);
+  fireEvent.change(endInput, { target: { value: '05:30' } });
+  fireEvent.blur(endInput);
+  fireEvent.change(dateInput, { target: { value: '2026-09-13' } });
+  fireEvent.blur(dateInput);
+  assert.equal(spies.saveTimesCalls.length, 0);
+});
+
+test('timed when-block: empty/invalid values do not call onSaveTimes', () => {
+  const spies = makeSpies();
+  mount({}, spies);
+  const startInput = screen.getByLabelText('Start time') as HTMLInputElement;
+  const dateInput = screen.getByLabelText('Date') as HTMLInputElement;
+  fireEvent.change(startInput, { target: { value: '' } });
+  fireEvent.change(dateInput, { target: { value: '' } });
+  assert.equal(spies.saveTimesCalls.length, 0);
+});
+
+test('all-day writable: static when-block, no time/date inputs', () => {
+  mount({
+    event: makeEvent({
+      id: 'e-allday',
+      is_all_day: true,
+    }),
+  });
+  assert.equal(screen.queryByLabelText('Start time'), null);
+  assert.equal(screen.queryByLabelText('End time'), null);
+  assert.equal(screen.queryByLabelText('Date'), null);
   assert.ok(screen.getByText('5:15 AM → 5:30 AM 15min'));
   assert.ok(screen.getByText('Sun Sep 13'));
 });
@@ -300,7 +419,7 @@ test('overflow Delete calls onDelete; available for owner/writer/omitted', () =>
 
 // ── 8. Read-only ────────────────────────────────────────────────────────
 
-test('read-only reader and freeBusyReader: static title/description, no Delete', () => {
+test('read-only reader and freeBusyReader: static title/description/when, no Delete', () => {
   for (const role of ['reader', 'freeBusyReader'] as const) {
     cleanup();
     mount({
@@ -318,6 +437,12 @@ test('read-only reader and freeBusyReader: static title/description, no Delete',
     assert.ok(screen.getByText('Secret notes'));
     assert.equal(screen.queryByLabelText('Description'), null);
     assert.equal(document.querySelector('textarea'), null);
+    // When-block stays static — no time/date inputs.
+    assert.equal(screen.queryByLabelText('Start time'), null);
+    assert.equal(screen.queryByLabelText('End time'), null);
+    assert.equal(screen.queryByLabelText('Date'), null);
+    assert.ok(screen.getByText('5:15 AM → 5:30 AM 15min'));
+    assert.ok(screen.getByText('Sun Sep 13'));
     assert.equal(screen.queryByLabelText('More actions'), null);
     assert.equal(screen.queryByLabelText('Delete event'), null);
   }

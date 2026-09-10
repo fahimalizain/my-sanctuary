@@ -18,9 +18,14 @@ import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
 import { eventChipSelector } from '../lib/inspector-anchor';
 import {
+  applyStartDate,
+  applyEndTime,
+  applyStartTime,
   formatEventDateLine,
   formatEventDuration,
   formatEventTime,
+  toDateInputValue,
+  toTimeInputValue,
 } from '../lib/week-layout';
 
 const DESKTOP_MQ = '(min-width: 768px)';
@@ -33,6 +38,7 @@ export interface EventInspectorProps {
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
   onSaveDescription: (description: string) => void | Promise<void>;
+  onSaveTimes: (startIso: string, endIso: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -162,12 +168,18 @@ interface InspectorFormProps {
   description: string;
   setDescription: (v: string) => void;
   commitDescription: () => void;
+  commitTimes: (next: { start: Date; end: Date } | null) => void;
   onClose: () => void;
   onDelete: () => void | Promise<void>;
   isSaving: boolean;
   isDeleting: boolean;
   writable: boolean;
 }
+
+const timeInputClassName =
+  'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+const dateInputClassName =
+  'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
 
 function InspectorForm({
   event,
@@ -179,6 +191,7 @@ function InspectorForm({
   description,
   setDescription,
   commitDescription,
+  commitTimes,
   onClose,
   onDelete,
   isSaving,
@@ -189,8 +202,14 @@ function InspectorForm({
 
   const start = new Date(event.start_time);
   const end = new Date(event.end_time);
-  const whenRange = `${formatEventTime(start)} → ${formatEventTime(end)} ${formatEventDuration(start, end)}`;
+  const durationLabel = formatEventDuration(start, end);
+  const whenRange = `${formatEventTime(start)} → ${formatEventTime(end)} ${durationLabel}`;
   const dateLine = formatEventDateLine(start, end);
+  const timesEditable = writable && event.is_all_day !== true;
+  const crossDay =
+    start.getFullYear() !== end.getFullYear() ||
+    start.getMonth() !== end.getMonth() ||
+    start.getDate() !== end.getDate();
 
   const timeZone = event.start_time_zone?.trim() || '';
   const showAllDay = event.is_all_day === true;
@@ -200,6 +219,7 @@ function InspectorForm({
   const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
+  const inputsDisabled = isSaving || isDeleting;
 
   return (
     <>
@@ -277,15 +297,78 @@ function InspectorForm({
           <p className="text-lg font-semibold text-foreground">{title}</p>
         )}
 
-        {/* When — clock-led row */}
+        {/* When — clock-led row; timed+writable uses native time/date inputs */}
         <div className="flex gap-2.5">
           <Clock
             className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
             aria-hidden
           />
           <div className="min-w-0 space-y-0.5">
-            <p className="text-sm tabular-nums text-foreground">{whenRange}</p>
-            <p className="text-sm text-muted-foreground">{dateLine}</p>
+            {timesEditable ? (
+              <>
+                <div className="flex flex-wrap items-baseline gap-x-1 text-sm tabular-nums text-foreground">
+                  <input
+                    type="time"
+                    step={60}
+                    aria-label="Start time"
+                    value={toTimeInputValue(start)}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      commitTimes(applyStartTime(start, end, e.target.value));
+                    }}
+                    onBlur={(e) => {
+                      commitTimes(applyStartTime(start, end, e.target.value));
+                    }}
+                    className={timeInputClassName}
+                  />
+                  <span aria-hidden>→</span>
+                  <input
+                    type="time"
+                    step={60}
+                    aria-label="End time"
+                    value={toTimeInputValue(end)}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      commitTimes(applyEndTime(start, end, e.target.value));
+                    }}
+                    onBlur={(e) => {
+                      commitTimes(applyEndTime(start, end, e.target.value));
+                    }}
+                    className={timeInputClassName}
+                  />
+                  <span className="text-sm tabular-nums text-foreground">
+                    {durationLabel}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-baseline gap-x-1.5">
+                  <input
+                    type="date"
+                    aria-label="Date"
+                    value={toDateInputValue(start)}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      commitTimes(applyStartDate(start, end, e.target.value));
+                    }}
+                    onBlur={(e) => {
+                      commitTimes(applyStartDate(start, end, e.target.value));
+                    }}
+                    className={dateInputClassName}
+                  />
+                  {crossDay ? (
+                    <span className="text-sm text-muted-foreground">
+                      {dateLine}
+                    </span>
+                  ) : null}
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-sm tabular-nums text-foreground">
+                  {whenRange}
+                </p>
+                <p className="text-sm text-muted-foreground">{dateLine}</p>
+              </>
+            )}
             {showChips ? (
               <div className="flex flex-wrap gap-1.5 pt-1">
                 {showAllDay ? (
@@ -363,6 +446,7 @@ export function EventInspector({
   onClose,
   onSaveTitle,
   onSaveDescription,
+  onSaveTimes,
   onDelete,
   isSaving = false,
   isDeleting = false,
@@ -440,6 +524,16 @@ export function EventInspector({
     void onSaveDescription(next);
   };
 
+  // Times are derived from event props (no local dirty draft). Unchanged
+  // range is a no-op so change+blur double-fire does not double-PATCH.
+  const commitTimes = (next: { start: Date; end: Date } | null) => {
+    if (!next) return;
+    const startIso = next.start.toISOString();
+    const endIso = next.end.toISOString();
+    if (startIso === event.start_time && endIso === event.end_time) return;
+    void onSaveTimes(startIso, endIso);
+  };
+
   const form = (
     <InspectorForm
       event={event}
@@ -451,6 +545,7 @@ export function EventInspector({
       description={description}
       setDescription={setDescription}
       commitDescription={commitDescription}
+      commitTimes={commitTimes}
       onClose={onClose}
       onDelete={onDelete}
       isSaving={isSaving}
@@ -501,6 +596,11 @@ export function EventInspector({
                 '[data-event-chip], [data-allday-chip], [data-event-id]',
               )
             ) {
+              e.preventDefault();
+              return;
+            }
+            // Native time/date pickers often render outside the popover.
+            if (target.closest('input[type="time"], input[type="date"]')) {
               e.preventDefault();
             }
           }}

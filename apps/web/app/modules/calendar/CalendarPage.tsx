@@ -149,6 +149,7 @@ export function CalendarPage() {
             onClose={session.closeInspector}
             onSaveTitle={session.handleSaveTitle}
             onSaveDescription={session.handleSaveDescription}
+            onSaveTimes={session.handleSaveTimes}
             onDelete={session.handleDeleteEvent}
             isSaving={session.isSaving}
             isDeleting={session.isDeleting}

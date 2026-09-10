@@ -713,6 +713,18 @@ export function useCalendarSession({
     ],
   );
 
+  /** Inspector time/date edits — same overlay + PATCH path as drag/resize. */
+  const handleSaveTimes = useCallback(
+    (startIso: string, endIso: string) => {
+      if (!selectedEventId) return;
+      const start = new Date(startIso);
+      const end = new Date(endIso);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return;
+      handleMoveOrResize(selectedEventId, { start, end });
+    },
+    [selectedEventId, handleMoveOrResize],
+  );
+
   const handleEmptyClick = useCallback(() => {
     // Desktop empty-cell click: discard an open draft only. Leave a real
     // selected event (and its inspector) alone.
@@ -877,6 +889,7 @@ export function useCalendarSession({
     closeInspector,
     handleSaveTitle,
     handleSaveDescription,
+    handleSaveTimes,
     handleDeleteEvent,
     isSaving: updateEvent.isPending,
     isDeleting: deleteEvent.isPending,
