@@ -26,7 +26,7 @@ request-path gate and an implied health signal.** Those must diverge.
 - 15-minute fallback cron
 - No Cloudflare Queue
 - Request-path cache-only after first successful publication
-  (`initial_sync_complete` / parseable `last_synced_at` as the *gate*, not as
+  (`initial_sync_complete` / parseable `last_synced_at` as the _gate_, not as
   health)
 - Watch 404 / `events.list` 404 disable sync
 

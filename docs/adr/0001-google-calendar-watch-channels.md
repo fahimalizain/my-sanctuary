@@ -4,7 +4,7 @@ Status: Accepted
 Date: 2026-08-18
 
 > Amendment (2026-09-10): **Health signal superseded by ADR 0005.** Parseable
-> `last_synced_at` remains the request-path cache-only *gate* after first
+> `last_synced_at` remains the request-path cache-only _gate_ after first
 > paint; it is no longer treated as freshness/health. Replica health lives in
 > dedicated columns and the sanitized `sync` envelope (ADR 0005). Watch
 > channels, 15-minute cron, no Queue, and 404-disable behaviour are unchanged.
