@@ -6,7 +6,7 @@ import {
   type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { Trash2, X } from 'lucide-react';
+import { Clock, MoreHorizontal, Trash2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Popover,
@@ -15,8 +15,13 @@ import {
 } from '@/components/ui/popover';
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
+import { eventChipColor } from '../lib/calendar-model';
 import { eventChipSelector } from '../lib/inspector-anchor';
-import { formatEventTimeRange } from '../lib/week-layout';
+import {
+  formatEventDateLine,
+  formatEventDuration,
+  formatEventTime,
+} from '../lib/week-layout';
 
 const DESKTOP_MQ = '(min-width: 768px)';
 
@@ -120,6 +125,34 @@ function useChipRect(eventId: string): ChipRect | null {
   return rect;
 }
 
+/** Writable when calendar is omitted, or access_role is owner/writer. */
+function isCalendarWritable(calendar?: GoogleCalendar): boolean {
+  if (!calendar) return true;
+  return (
+    calendar.access_role === 'owner' || calendar.access_role === 'writer'
+  );
+}
+
+/**
+ * Whether the event should show a Repeat chip.
+ * Non-empty recurring_event_id, or recurrence JSON that parses to a non-empty
+ * array of non-blank strings. Invalid / empty / "[]" → false.
+ */
+function hasRepeat(event: CalendarEvent): boolean {
+  if (event.recurring_event_id?.trim()) return true;
+  const raw = event.recurrence?.trim();
+  if (!raw) return false;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return false;
+    return parsed.some(
+      (item) => typeof item === 'string' && item.trim().length > 0,
+    );
+  } catch {
+    return false;
+  }
+}
+
 interface InspectorFormProps {
   event: CalendarEvent;
   calendar?: GoogleCalendar;
@@ -131,6 +164,7 @@ interface InspectorFormProps {
   onDelete: () => void | Promise<void>;
   isSaving: boolean;
   isDeleting: boolean;
+  writable: boolean;
 }
 
 function InspectorForm({
@@ -144,19 +178,65 @@ function InspectorForm({
   onDelete,
   isSaving,
   isDeleting,
+  writable,
 }: InspectorFormProps) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
   const start = new Date(event.start_time);
   const end = new Date(event.end_time);
-  const timeLabel = formatEventTimeRange(start, end);
-  const calendarLabel = calendar?.summary || 'Calendar';
+  const whenRange = `${formatEventTime(start)} → ${formatEventTime(end)} ${formatEventDuration(start, end)}`;
+  const dateLine = formatEventDateLine(start, end);
+
+  const timeZone = event.start_time_zone?.trim() || '';
+  const showAllDay = event.is_all_day === true;
+  const showRepeat = hasRepeat(event);
+  const showChips = showAllDay || Boolean(timeZone) || showRepeat;
+
   const description = event.description?.trim() ?? '';
+  const calendarLabel = calendar?.summary || 'Calendar';
+  const swatch = eventChipColor(event);
 
   return (
     <>
-      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border/60 px-3">
-        <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
-          Event
-        </h2>
+      <div className="flex h-10 shrink-0 items-center justify-end gap-0.5 border-b border-border/60 px-2">
+        {writable ? (
+          <div className="relative">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              onClick={() => setMenuOpen((open) => !open)}
+              aria-label="More actions"
+              disabled={isDeleting || isSaving}
+            >
+              <MoreHorizontal className="h-4 w-4" />
+            </Button>
+            {menuOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-10"
+                  onClick={() => setMenuOpen(false)}
+                />
+                <div className="absolute right-0 top-9 z-20 w-36 rounded-lg border border-border bg-popover py-1 shadow-lg">
+                  <button
+                    type="button"
+                    aria-label="Delete event"
+                    disabled={isDeleting || isSaving}
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void onDelete();
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-sm text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    {isDeleting ? 'Deleting…' : 'Delete'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        ) : null}
         <Button
           type="button"
           variant="ghost"
@@ -169,17 +249,11 @@ function InspectorForm({
         </Button>
       </div>
 
-      <div className="flex-1 min-h-0 space-y-4 overflow-y-auto p-3">
-        <div>
-          <label
-            htmlFor="event-inspector-title"
-            className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted-foreground"
-          >
-            Title
-          </label>
+      <div className="flex-1 min-h-0 space-y-3 overflow-y-auto px-3 py-3">
+        {/* Title — large, unlabeled */}
+        {writable ? (
           <input
             ref={titleRef}
-            id="event-inspector-title"
             type="text"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
@@ -191,47 +265,64 @@ function InspectorForm({
               }
             }}
             disabled={isSaving || isDeleting}
-            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-50"
+            aria-label="Title"
+            className="w-full border-0 bg-transparent p-0 text-lg font-semibold text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
           />
-        </div>
+        ) : (
+          <p className="text-lg font-semibold text-foreground">{title}</p>
+        )}
 
-        <div>
-          <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Time
-          </p>
-          <p className="text-sm text-foreground tabular-nums">{timeLabel}</p>
-        </div>
-
-        <div>
-          <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Calendar
-          </p>
-          <p className="truncate text-sm text-foreground">{calendarLabel}</p>
-        </div>
-
-        {description ? (
-          <div>
-            <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              Description
-            </p>
-            <p className="whitespace-pre-wrap text-sm text-muted-foreground">
-              {description}
-            </p>
+        {/* When — clock-led row */}
+        <div className="flex gap-2.5">
+          <Clock
+            className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
+            aria-hidden
+          />
+          <div className="min-w-0 space-y-0.5">
+            <p className="text-sm tabular-nums text-foreground">{whenRange}</p>
+            <p className="text-sm text-muted-foreground">{dateLine}</p>
+            {showChips ? (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {showAllDay ? (
+                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
+                    All-day
+                  </span>
+                ) : null}
+                {timeZone ? (
+                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
+                    {timeZone}
+                  </span>
+                ) : null}
+                {showRepeat ? (
+                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
+                    Repeat
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
-        ) : null}
-      </div>
+        </div>
 
-      <div className="shrink-0 border-t border-border/60 p-3">
-        <Button
-          type="button"
-          variant="outline"
-          className="w-full text-destructive hover:bg-destructive/10 hover:text-destructive"
-          onClick={() => void onDelete()}
-          disabled={isDeleting || isSaving}
-        >
-          <Trash2 className="mr-2 h-4 w-4" />
-          {isDeleting ? 'Deleting…' : 'Delete event'}
-        </Button>
+        {/* Description — always visible, read-only */}
+        {description ? (
+          <p className="whitespace-pre-wrap text-sm text-foreground">
+            {description}
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground">Description</p>
+        )}
+
+        {/* Calendar — swatch + summary */}
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className="h-2.5 w-2.5 shrink-0 rounded-full"
+            style={{ backgroundColor: swatch }}
+            aria-hidden
+          />
+          <span className="truncate text-sm text-foreground">
+            {calendarLabel}
+          </span>
+        </div>
       </div>
     </>
   );
@@ -260,6 +351,7 @@ export function EventInspector({
   const isDesktop = useIsDesktop();
   const rect = useChipRect(event.id);
   const hidden = isDragging;
+  const writable = isCalendarWritable(calendar);
 
   // Sync local title when the selected event changes — but keep a dirty
   // (unblurred) edit across temp→server id remap so typed text is not lost.
@@ -271,11 +363,11 @@ export function EventInspector({
   }, [event.id, event.title]);
 
   useEffect(() => {
-    if (focusTitle) {
+    if (focusTitle && writable) {
       titleRef.current?.focus();
       titleRef.current?.select();
     }
-  }, [focusTitle, event.id]);
+  }, [focusTitle, event.id, writable]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -312,6 +404,7 @@ export function EventInspector({
       onDelete={onDelete}
       isSaving={isSaving}
       isDeleting={isDeleting}
+      writable={writable}
     />
   );
 
@@ -361,6 +454,7 @@ export function EventInspector({
             }
           }}
           data-event-inspector
+          aria-label="Event details"
         >
           {form}
         </PopoverContent>
