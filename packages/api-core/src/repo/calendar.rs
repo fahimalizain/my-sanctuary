@@ -587,6 +587,10 @@ pub const CALENDAR_RELEASE_LEASE_SQL: &str = "
 ";
 
 /// Renew expiry only if still owned by `owner`. Binds: expires, now, id, owner.
+///
+/// `expires` must be a **fresh** wall-clock expiry (`now + REPLICA_LEASE_TTL_SECS`
+/// as RFC 3339 `Z`), computed by the caller at renew time — not the walk-start
+/// stamp. Do not use SQLite `datetime()` (it is not RFC 3339 `Z`).
 pub const CALENDAR_RENEW_LEASE_SQL: &str = "
     UPDATE google_calendars
     SET lease_expires_at = ?, updated_at = ?

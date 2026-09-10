@@ -237,8 +237,8 @@ pub use webhook::{
 };
 pub use catalog::{list_calendars, list_calendars_after_refresh_failure};
 pub use cron::{
-    replica_due, run_fallback_cron, sync_calendar, sync_calendar_traced, CronReport,
-    SyncCalendarOutcome, SyncCalendarResult,
+    replica_due, run_fallback_cron, run_fallback_cron_with_clock, sync_calendar,
+    sync_calendar_traced, CronReport, SyncCalendarOutcome, SyncCalendarResult,
 };
 pub use diagnostics::{
     classify_operator_warning, mint_run_id, operator_warning_record, CheckpointResult,

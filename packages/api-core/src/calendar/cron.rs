@@ -23,7 +23,7 @@ use crate::oauth::HttpClient;
 use crate::repo::{
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TokenRepo, WatchChannelRepo,
 };
-use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339, Clock, FrozenClock};
 use crate::token::{is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError};
 use std::collections::{HashMap, HashSet};
 
@@ -175,6 +175,10 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///    calendar is missing-from-living-path (soft-deleted) or `!sync_enabled`.
 ///    Does **not** require a public HTTPS callback (stop needs no webhook URL).
 ///    Does **not** abort prior replica work. Failed stops leave rows + error.
+/// Thin wrapper: freezes `now_unix` for the whole tick so existing cron unit
+/// tests keep the same signature. Production uses
+/// [`run_fallback_cron_with_clock`] with a live wall clock so replica lease
+/// renewals advance past the tick-start instant.
 pub async fn run_fallback_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -185,6 +189,37 @@ pub async fn run_fallback_cron(
     oauth: &OAuthConfig,
     watch_callback_url: Option<&str>,
     now_unix: i64,
+) -> CronReport {
+    let clock = FrozenClock(now_unix);
+    run_fallback_cron_with_clock(
+        http,
+        calendars,
+        events,
+        operations,
+        watches,
+        tokens,
+        oauth,
+        watch_callback_url,
+        now_unix,
+        &clock,
+    )
+    .await
+}
+
+/// Like [`run_fallback_cron`], but replica walks renew leases from `clock`
+/// (fresh wall time on every page). Tick-start `now_unix` still gates
+/// [`replica_due`], list refresh stamps, and backoff.
+pub async fn run_fallback_cron_with_clock(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
+    watches: &dyn WatchChannelRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    watch_callback_url: Option<&str>,
+    now_unix: i64,
+    clock: &dyn Clock,
 ) -> CronReport {
     let mut report = CronReport::default();
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
@@ -335,6 +370,7 @@ pub async fn run_fallback_cron(
                     &access,
                     cal,
                     &now_rfc3339,
+                    clock,
                     ReplicaWalkMeta {
                         run_id: mint_run_id(),
                         trigger: ReplicaWalkTrigger::Cron,
@@ -697,6 +733,7 @@ pub async fn sync_calendar(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
+    let clock = FrozenClock::from_rfc3339(now_rfc3339);
     let result = sync_calendar_traced(
         http,
         calendars,
@@ -705,6 +742,7 @@ pub async fn sync_calendar(
         access,
         cal,
         now_rfc3339,
+        &clock,
         ReplicaWalkMeta {
             run_id: mint_run_id(),
             trigger: ReplicaWalkTrigger::Unspecified,
@@ -718,6 +756,9 @@ pub async fn sync_calendar(
 
 /// Like [`sync_calendar`], but returns a structured [`ReplicaWalkDiagnostic`]
 /// alongside the outcome for logging / CronReport.
+///
+/// `now_rfc3339` stamps attempt / lease-acquire at walk start. `clock` is
+/// read again on every replica page so lease renewals use fresh wall time.
 pub async fn sync_calendar_traced(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -726,6 +767,7 @@ pub async fn sync_calendar_traced(
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     now_rfc3339: &str,
+    clock: &dyn Clock,
     meta: ReplicaWalkMeta,
 ) -> SyncCalendarResult {
     let mut report = ReplicaApplyReport::default();
@@ -747,6 +789,7 @@ pub async fn sync_calendar_traced(
         cal,
         now_rfc3339,
         now_unix,
+        clock,
         &mut report,
     )
     .await;
@@ -798,6 +841,7 @@ async fn sync_calendar_traced_inner(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
     now_unix: i64,
+    clock: &dyn Clock,
     report: &mut ReplicaApplyReport,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
     calendars
@@ -833,7 +877,7 @@ async fn sync_calendar_traced_inner(
             access,
             &fresh,
             &owner,
-            now_rfc3339,
+            clock,
             report,
         )
         .await?;

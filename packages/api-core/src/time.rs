@@ -14,6 +14,44 @@ use chrono::{TimeZone, Timelike};
 use chrono_tz::Tz;
 use std::str::FromStr;
 
+/// Source of "now". Callers supply this so api-core never reads `SystemTime`
+/// (unreliable on `wasm32-unknown-unknown`). Production Workers use
+/// `worker::Date::now()`; tests use [`FrozenClock`] / [`CellClock`].
+pub trait Clock {
+    fn now_unix(&self) -> i64;
+
+    fn now_rfc3339(&self) -> String {
+        unix_secs_to_rfc3339(self.now_unix())
+    }
+}
+
+/// Fixed instant. Existing tests and `sync_calendar(&str)` keep a frozen walk.
+pub struct FrozenClock(pub i64);
+
+impl Clock for FrozenClock {
+    fn now_unix(&self) -> i64 {
+        self.0
+    }
+}
+
+impl FrozenClock {
+    /// Parse an RFC 3339 stamp; malformed input becomes the epoch.
+    pub fn from_rfc3339(s: &str) -> Self {
+        Self(rfc3339_to_unix_secs(s).unwrap_or(0))
+    }
+}
+
+/// Mutable test clock (`std::cell::Cell<i64>`).
+pub struct CellClock {
+    pub now_unix: std::cell::Cell<i64>,
+}
+
+impl Clock for CellClock {
+    fn now_unix(&self) -> i64 {
+        self.now_unix.get()
+    }
+}
+
 /// Formats a Unix timestamp (seconds) as an RFC 3339 UTC string in the exact
 /// shape Go's `time.Now().UTC().Format(time.RFC3339)` produced, e.g.
 /// `2026-08-17T12:34:56Z`. UTC strings of this shape sort lexicographically.

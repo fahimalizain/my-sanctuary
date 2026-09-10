@@ -43,7 +43,8 @@ pub use calendar::{
     list_events, list_events_after_refresh_failure, mint_run_id, operator_warning_record,
     parse_event_time_range, patch_event, patch_event_fields, persist_webhook_decision,
     renew_watch_if_needed, repair_inflight_operations, replica_due, request_calendar_repair,
-    run_fallback_cron, stop_watches_for_calendar, sync_calendar, sync_calendar_traced, tokens_match,
+    run_fallback_cron, run_fallback_cron_with_clock, stop_watches_for_calendar, sync_calendar,
+    sync_calendar_traced, tokens_match,
     update_event_for_user, CalendarError, CalendarEventsResponse, CalendarListOutput,
     CalendarRepairResponse, CalendarRepairStatus, CalendarView, CalendarsResponse, CheckpointResult,
     CreateEventOutput, CreateEventResponse, CronReport, DeleteEventResponse, OperatorWarningLevel,
@@ -159,7 +160,7 @@ pub use session::{
 };
 pub use time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, parse_iana_tz,
-    rfc3339_to_unix_secs, unix_secs_to_rfc3339,
+    rfc3339_to_unix_secs, unix_secs_to_rfc3339, CellClock, Clock, FrozenClock,
 };
 pub use token::{
     classify_refresh_failure, is_refresh_auth_revoked, refresh_if_needed, GoogleAccess,

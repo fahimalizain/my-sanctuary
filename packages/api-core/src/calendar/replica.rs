@@ -56,7 +56,7 @@ use super::sync::replica_query_fingerprint;
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
-use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339, Clock};
 use crate::token::GoogleAccess;
 use std::collections::HashSet;
 
@@ -97,7 +97,7 @@ pub async fn sync_replica(
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     lease_owner: &str,
-    now_rfc3339: &str,
+    clock: &dyn Clock,
     report: &mut ReplicaApplyReport,
 ) -> Result<(), CalendarError> {
     let fingerprint = replica_query_fingerprint();
@@ -110,10 +110,8 @@ pub async fn sync_replica(
         && cal.sync_query_fingerprint != fingerprint;
     let reseed = cal.full_sync_requested || fingerprint_mismatch;
     if reseed {
-        if let Err(err) = calendars
-            .begin_replica_reseed(&cal.id, now_rfc3339)
-            .await
-        {
+        let now = clock.now_rfc3339();
+        if let Err(err) = calendars.begin_replica_reseed(&cal.id, &now).await {
             report.checkpoint = CheckpointResult::Error;
             return Err(err.into());
         }
@@ -176,10 +174,8 @@ pub async fn sync_replica(
             // Never delete_stale / truncate mid-walk. Mint a fresh run so
             // incremental pages applied before the 410 do not count as
             // membership until they reappear on the full list.
-            if let Err(err) = calendars
-                .begin_replica_reseed(&cal.id, now_rfc3339)
-                .await
-            {
+            let now = clock.now_rfc3339();
+            if let Err(err) = calendars.begin_replica_reseed(&cal.id, &now).await {
                 report.checkpoint = CheckpointResult::Error;
                 return Err(err.into());
             }
@@ -212,6 +208,7 @@ pub async fn sync_replica(
                 // must not change the error class (still mapping_poison via
                 // InvalidResponse) or advance the token.
                 let payload = quarantine_replay_payload(&body);
+                let now = clock.now_rfc3339();
                 let _ = events
                     .upsert_quarantine(
                         &cal.id,
@@ -219,11 +216,11 @@ pub async fn sync_replica(
                         "replica_page",
                         "mapping_poison",
                         &payload,
-                        now_rfc3339,
+                        &now,
                     )
                     .await;
                 let _ = calendars
-                    .set_event_coverage(&cal.id, "degraded", now_rfc3339)
+                    .set_event_coverage(&cal.id, "degraded", &now)
                     .await;
                 return Err(CalendarError::InvalidResponse(format!(
                     "events.list body: {err}"
@@ -232,10 +229,10 @@ pub async fn sync_replica(
         };
 
         // Fence before apply: lost/expired owner must not write rows or token.
+        // Fresh wall clock so a multi-page walk longer than TTL still holds.
         report.phase = ReplicaWalkPhase::Apply;
-        if let Err(err) =
-            ensure_lease_held(calendars, &cal.id, lease_owner, now_rfc3339).await
-        {
+        let now = clock.now_rfc3339();
+        if let Err(err) = ensure_lease_held(calendars, &cal.id, lease_owner, &now).await {
             report.checkpoint = CheckpointResult::LeaseLost;
             return Err(err);
         }
@@ -247,7 +244,7 @@ pub async fn sync_replica(
                 // Skip upsert and soft-delete for in-flight google ids.
                 continue;
             }
-            match classify_replica_item(item, &cal.id, now_rfc3339) {
+            match classify_replica_item(item, &cal.id, &now) {
                 ReplicaApplyAction::SoftDelete { google_event_id } => {
                     report.deletes = report.deletes.saturating_add(1);
                     let deleted = match events
@@ -255,7 +252,7 @@ pub async fn sync_replica(
                             &cal.id,
                             &google_event_id,
                             lease_owner,
-                            now_rfc3339,
+                            &now,
                         )
                         .await
                     {
@@ -280,7 +277,7 @@ pub async fn sync_replica(
                 .upserts
                 .saturating_add(to_upsert.len() as u32);
             let applied = match events
-                .upsert_batch_if_owner(to_upsert, lease_owner, now_rfc3339)
+                .upsert_batch_if_owner(to_upsert, lease_owner, &now)
                 .await
             {
                 Ok(a) => a,
@@ -311,7 +308,7 @@ pub async fn sync_replica(
                 .filter(|id| !id.is_empty())
                 .collect();
             if let Err(err) = events
-                .record_replica_seen(&cal.id, rid, page_ids, now_rfc3339)
+                .record_replica_seen(&cal.id, rid, page_ids, &now)
                 .await
             {
                 report.checkpoint = CheckpointResult::Error;
@@ -322,9 +319,12 @@ pub async fn sync_replica(
         // Successful 2xx page applied.
         report.pages = report.pages.saturating_add(1);
 
-        let renew_expires = lease_expires_at(now_rfc3339);
+        // Fresh wall clock on every renew so a walk longer than TTL extends
+        // the lease (not frozen at walk-start + 90s).
+        let now = clock.now_rfc3339();
+        let renew_expires = lease_expires_at(&now);
         let renewed = match calendars
-            .renew_lease(&cal.id, lease_owner, &renew_expires, now_rfc3339)
+            .renew_lease(&cal.id, lease_owner, &renew_expires, &now)
             .await
         {
             Ok(r) => r,
@@ -355,9 +355,10 @@ pub async fn sync_replica(
 
         // Terminal order: ensure lease → (merge-full) sweep → publish.
         // Sweep failure or lease loss must not move the token.
+        let now = clock.now_rfc3339();
         if merge_full {
             if let Err(err) =
-                ensure_lease_held(calendars, &cal.id, lease_owner, now_rfc3339).await
+                ensure_lease_held(calendars, &cal.id, lease_owner, &now).await
             {
                 report.checkpoint = CheckpointResult::LeaseLost;
                 return Err(err);
@@ -369,7 +370,7 @@ pub async fn sync_replica(
                 ));
             };
             let swept = match events
-                .sweep_absent_if_owner(&cal.id, rid, lease_owner, now_rfc3339)
+                .sweep_absent_if_owner(&cal.id, rid, lease_owner, &now)
                 .await
             {
                 Ok(s) => s,
@@ -390,7 +391,7 @@ pub async fn sync_replica(
                 &next_token,
                 &fingerprint,
                 lease_owner,
-                now_rfc3339,
+                &now,
             )
             .await
         {

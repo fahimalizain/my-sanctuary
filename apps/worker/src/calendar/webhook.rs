@@ -172,6 +172,8 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                         }
                     };
                     let started_ms = worker::Date::now().as_millis() as i64;
+                    // Frozen for now; slice 3 removes this waitUntil path.
+                    let walk_clock = api_core::FrozenClock::from_rfc3339(&now_rfc3339);
                     let result = api_core::sync_calendar_traced(
                         &crate::http::WorkerHttp,
                         &calendars,
@@ -180,6 +182,7 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                         &access,
                         &calendar,
                         &now_rfc3339,
+                        &walk_clock,
                         api_core::ReplicaWalkMeta {
                             run_id: api_core::mint_run_id(),
                             trigger: api_core::ReplicaWalkTrigger::Webhook,

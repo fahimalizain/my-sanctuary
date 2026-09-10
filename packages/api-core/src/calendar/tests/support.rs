@@ -247,6 +247,8 @@ pub(crate) struct FakeCalendarRepo {
     /// Snapshot is taken before the bump so the caller still sees the
     /// pre-bump generation (mirrors mid-run dirty enqueue).
     pub(crate) bump_dirty_after_get_by_id: Mutex<Option<usize>>,
+    /// History of `expires_rfc3339` values passed to [`CalendarRepo::renew_lease`].
+    pub(crate) renew_expiries: Mutex<Vec<String>>,
 }
 
 impl FakeCalendarRepo {
@@ -279,6 +281,7 @@ impl FakeCalendarRepo {
             fail_bump_dirty: Mutex::new(false),
             fail_set_sync_enabled: Mutex::new(false),
             bump_dirty_after_get_by_id: Mutex::new(None),
+            renew_expiries: Mutex::new(Vec::new()),
         }
     }
 
@@ -663,6 +666,10 @@ impl CalendarRepo for FakeCalendarRepo {
         }
         cal.lease_expires_at = Some(expires_rfc3339.to_string());
         cal.updated_at = now_rfc3339.to_string();
+        self.renew_expiries
+            .lock()
+            .unwrap()
+            .push(expires_rfc3339.to_string());
         Ok(true)
     }
 
