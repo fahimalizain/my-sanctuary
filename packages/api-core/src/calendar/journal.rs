@@ -65,12 +65,16 @@ pub(crate) async fn create_event_with_journal(
     events: &dyn CalendarEventRepo,
     operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
+    user_id: &str,
     input: &NewEventInput,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
     let Some(cal) = calendars.get_by_id(&input.calendar_id).await? else {
         return Err(CalendarError::NotFound);
     };
+    if cal.user_id != user_id {
+        return Err(CalendarError::NotFound);
+    }
 
     let minted_id = mint_google_event_id();
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);

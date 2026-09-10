@@ -1104,6 +1104,7 @@ pub async fn start_occurrence(
         events,
         operations,
         access,
+        user_id,
         &NewEventInput {
             calendar_id: target.calendar_id.clone(),
             summary: resolved_title,
