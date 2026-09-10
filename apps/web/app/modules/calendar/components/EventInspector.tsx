@@ -526,12 +526,25 @@ export function EventInspector({
 
   // Times are derived from event props (no local dirty draft). Unchanged
   // range is a no-op so change+blur double-fire does not double-PATCH.
+  // Compare instants (getTime), not ISO strings — Google/replica often omits
+  // milliseconds (`...00Z`) while Date.toISOString() always emits `.000Z`.
   const commitTimes = (next: { start: Date; end: Date } | null) => {
     if (!next) return;
-    const startIso = next.start.toISOString();
-    const endIso = next.end.toISOString();
-    if (startIso === event.start_time && endIso === event.end_time) return;
-    void onSaveTimes(startIso, endIso);
+    const currentStart = new Date(event.start_time);
+    const currentEnd = new Date(event.end_time);
+    if (
+      Number.isNaN(currentStart.getTime()) ||
+      Number.isNaN(currentEnd.getTime())
+    ) {
+      return;
+    }
+    if (
+      next.start.getTime() === currentStart.getTime() &&
+      next.end.getTime() === currentEnd.getTime()
+    ) {
+      return;
+    }
+    void onSaveTimes(next.start.toISOString(), next.end.toISOString());
   };
 
   const form = (

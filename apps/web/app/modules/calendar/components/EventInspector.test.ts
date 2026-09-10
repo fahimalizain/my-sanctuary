@@ -241,6 +241,29 @@ test('timed when-block: unchanged change/blur does not call onSaveTimes', () => 
   assert.equal(spies.saveTimesCalls.length, 0);
 });
 
+test('timed when-block: unchanged blur with Google-shaped times (no ms) is no-op', () => {
+  // Google / replica often omits milliseconds; toISOString() always emits .000Z.
+  // Instant compare must treat these as equal so blur does not no-op-PATCH.
+  const spies = makeSpies();
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 5, 30);
+  const stripMs = (iso: string) => iso.replace('.000Z', 'Z');
+  mount(
+    {
+      event: makeEvent({
+        id: 'e-noms',
+        start_time: stripMs(start.toISOString()),
+        end_time: stripMs(end.toISOString()),
+      }),
+    },
+    spies,
+  );
+  const startInput = screen.getByLabelText('Start time') as HTMLInputElement;
+  fireEvent.change(startInput, { target: { value: '05:15' } });
+  fireEvent.blur(startInput);
+  assert.equal(spies.saveTimesCalls.length, 0);
+});
+
 test('timed when-block: empty/invalid values do not call onSaveTimes', () => {
   const spies = makeSpies();
   mount({}, spies);
