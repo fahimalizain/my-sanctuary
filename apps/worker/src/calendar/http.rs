@@ -287,6 +287,42 @@ pub async fn list_calendars(
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
 }
 
+/// `POST /api/calendar/calendars/:id/repair` → 200
+/// `{"status":"queued"|"in_progress"|"cooldown","retry_after_seconds":?}`.
+///
+/// Session-gated D1-only write: persists a tracked reseed
+/// (`full_sync_requested` / `rebuilding`) and returns immediately. Does **not**
+/// refresh the Google grant, walk the replica, or notify the user — cron is
+/// the walker and notifies on publish (issue #59).
+pub async fn repair_calendar(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, _oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
+        return json_error(&ctx, 404, "calendar not found");
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+
+    match api_core::request_calendar_repair(&calendars, &user_id, &id, now_unix).await {
+        Ok(body) => {
+            let response = Response::from_json(&body)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(CalendarError::NotFound) => json_error(&ctx, 404, "calendar not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(err) => {
+            console_log!("calendar: repair_calendar failed: {err}");
+            json_error(&ctx, 500, "failed to repair calendar")
+        }
+    }
+}
+
 /// `POST /api/calendar/events` → 200 `{"event":{...},"source":"google"}`.
 ///
 /// Body: `{calendar_id, summary, description?, start, end}`. Journals the

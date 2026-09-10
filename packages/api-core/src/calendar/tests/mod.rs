@@ -9,4 +9,5 @@ mod cron;
 mod diagnostics;
 mod replica;
 mod repair;
+mod repair_action;
 mod apply;
