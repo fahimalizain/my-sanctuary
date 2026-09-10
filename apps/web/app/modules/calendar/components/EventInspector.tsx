@@ -280,13 +280,14 @@ export function EventInspector({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (isDragging) return;
         e.preventDefault();
         onClose();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [isDragging, onClose]);
 
   const commitTitle = () => {
     const next = title.trim();

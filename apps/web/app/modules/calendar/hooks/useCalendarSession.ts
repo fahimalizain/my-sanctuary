@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import {
   removeCalendarEventFromCache,
   upsertCalendarEventInCache,
@@ -638,19 +645,25 @@ export function useCalendarSession({
     [drag.suppressNextClick, selectEvent],
   );
 
-  const timedPreviewByDay = useMemo(
-    () => timedPreviewSegments(drag.preview, drag.previewKind, days, hourH),
-    [drag.preview, drag.previewKind, days, hourH],
+  const handleAllDayChipPointerDown = useCallback(
+    (
+      e: ReactPointerEvent<HTMLElement>,
+      eventId: string,
+      chipEl: HTMLElement,
+    ) => {
+      const event =
+        overlaidEvents.find((ev) => ev.id === eventId) ??
+        events.find((ev) => ev.id === eventId);
+      if (!event) return;
+      drag.onAllDayChipPointerDown(e, event, chipEl);
+    },
+    [overlaidEvents, events, drag],
   );
 
-  const allDayPreview = useMemo(() => {
-    const idx = allDayPreviewIndices(drag.preview, drag.previewKind, days);
-    if (!idx) return null;
-    const color = writableCalendar
-      ? colorForCalendar(writableCalendar.id)
-      : colorForCalendar('preview');
-    return { ...idx, color };
-  }, [drag.preview, drag.previewKind, days, writableCalendar]);
+  const timedPreviewByDay = useMemo(
+    () => timedPreviewSegments(drag.preview, drag.previewZone, days, hourH),
+    [drag.preview, drag.previewZone, days, hourH],
+  );
 
   const activeDragEvent = drag.activeEventId
     ? overlaidEvents.find((e) => e.id === drag.activeEventId)
@@ -661,6 +674,12 @@ export function useCalendarSession({
       ? colorForCalendar(writableCalendar.id)
       : colorForCalendar('preview');
   const previewTitle = activeDragEvent?.title ?? '';
+
+  const allDayPreview = useMemo(() => {
+    const idx = allDayPreviewIndices(drag.preview, drag.previewZone, days);
+    if (!idx) return null;
+    return { ...idx, color: previewColor, title: previewTitle };
+  }, [drag.preview, drag.previewZone, days, previewColor, previewTitle]);
 
   // Tick "now" so the now-line creeps forward while the page is open.
   const [now, setNow] = useState(() => new Date());
@@ -729,6 +748,7 @@ export function useCalendarSession({
     onColumnPointerDown: drag.onColumnPointerDown,
     onChipPointerDown: drag.onChipPointerDown,
     onAllDayPointerDown: drag.onAllDayPointerDown,
+    onAllDayChipPointerDown: handleAllDayChipPointerDown,
     timedPreviewByDay,
     previewColor,
     previewTitle,

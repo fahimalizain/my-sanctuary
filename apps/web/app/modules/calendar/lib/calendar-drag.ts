@@ -2,6 +2,8 @@
 // No React. Deterministic. Native Date only.
 
 import {
+  DEFAULT_EVENT_DURATION_MIN,
+  MINUTES_PER_DAY,
   SNAP_MINUTES,
   addDays,
   clampMinutesToDay,
@@ -15,6 +17,11 @@ import {
 
 export const DRAG_THRESHOLD_PX = 4;
 export const RESIZE_HANDLE_PX = 6;
+export const AUTOSCROLL_EDGE_PX = 48;
+export const AUTOSCROLL_MAX_PX = 18;
+export const ALLDAY_CREATE_HOLD_MS = 220;
+
+export type DragZone = 'timed' | 'allday';
 
 export type DragKind =
   | 'create'
@@ -57,10 +64,42 @@ export function classifyTouchGesture(
   dx: number,
   dy: number,
   mode: 'create' | 'chip',
+  allowHorizontalDrag = false,
 ): TouchGestureIntent {
   if (!movedEnough(dx, dy)) return 'pending';
-  if (mode === 'create' && Math.abs(dx) > Math.abs(dy)) return 'scroll';
+  if (
+    mode === 'create' &&
+    Math.abs(dx) > Math.abs(dy) &&
+    !allowHorizontalDrag
+  ) {
+    return 'scroll';
+  }
   return 'drag';
+}
+
+/**
+ * Pixels to scroll this frame toward an edge. Negative = toward `start`.
+ * Pointer past an edge still scrolls at full speed (overshoot).
+ */
+export function autoscrollDelta(
+  pointer: number,
+  start: number,
+  end: number,
+  edgePx = AUTOSCROLL_EDGE_PX,
+  maxPx = AUTOSCROLL_MAX_PX,
+): number {
+  if (!(end > start) || edgePx <= 0 || maxPx <= 0) return 0;
+  const distStart = pointer - start;
+  const distEnd = end - pointer;
+  if (distStart < edgePx && distStart <= distEnd) {
+    const t = 1 - Math.max(0, distStart) / edgePx;
+    return -maxPx * t;
+  }
+  if (distEnd < edgePx) {
+    const t = 1 - Math.max(0, distEnd) / edgePx;
+    return maxPx * t;
+  }
+  return 0;
 }
 
 /**
@@ -127,6 +166,72 @@ export function rangeFromSlots(
   return { start, end };
 }
 
+/** One civil day, midnight → next midnight, on `slot.day`. */
+export function toAllDayRange(slot: DragSlot): TimedRange {
+  const start = startOfDay(slot.day);
+  return { start, end: addDays(start, 1) };
+}
+
+/**
+ * Default timed range at `slot` (same rules as click-to-create).
+ * Kept inside the civil day.
+ */
+export function toTimedRange(slot: DragSlot): TimedRange {
+  const startMin = snapMinutes(slot.minutes);
+  const endMin = Math.min(
+    MINUTES_PER_DAY,
+    startMin + DEFAULT_EVENT_DURATION_MIN,
+  );
+  const adjustedStart =
+    endMin - startMin < DEFAULT_EVENT_DURATION_MIN && startMin > 0
+      ? Math.max(0, MINUTES_PER_DAY - DEFAULT_EVENT_DURATION_MIN)
+      : startMin;
+  const adjustedEnd = Math.min(
+    MINUTES_PER_DAY,
+    adjustedStart + DEFAULT_EVENT_DURATION_MIN,
+  );
+  return {
+    start: dateOnDay(slot.day, adjustedStart),
+    end: dateOnDay(slot.day, adjustedEnd),
+  };
+}
+
+/**
+ * Inclusive day offset from the event's start civil day to the grab day.
+ */
+export function allDayGrabOffsetDays(
+  originalStart: Date,
+  grabDay: Date,
+): number {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.round(
+    (startOfDay(grabDay).getTime() - startOfDay(originalStart).getTime()) /
+      msPerDay,
+  );
+}
+
+/**
+ * Shift an all-day range so the grabbed day stays under the pointer.
+ * Duration is whole exclusive-end days (at least 1).
+ */
+export function movedAllDayRange(
+  originalStart: Date,
+  originalEnd: Date,
+  slot: DragSlot,
+  grabOffsetDays = 0,
+): TimedRange {
+  const start0 = startOfDay(originalStart);
+  let durationDays = Math.round(
+    (originalEnd.getTime() - start0.getTime()) / (24 * 60 * 60 * 1000),
+  );
+  if (!Number.isFinite(durationDays) || durationDays < 1) durationDays = 1;
+  const offset = Number.isFinite(grabOffsetDays)
+    ? Math.round(grabOffsetDays)
+    : 0;
+  const start = addDays(startOfDay(slot.day), -offset);
+  return { start, end: addDays(start, durationDays) };
+}
+
 /**
  * Move: keep duration, place start so the grab point stays under the pointer.
  * `grabOffsetMin` is minutes from the (painted) event start to the pointer at
@@ -186,12 +291,12 @@ export function resizedRange(
 /** Per-day ghost geometry for a timed preview range. */
 export function timedPreviewSegments(
   preview: TimedRange | null,
-  kind: DragKind | null,
+  zone: DragZone | null,
   days: Date[],
   hourH: number,
 ): Map<string, { top: number; height: number }> {
   const map = new Map<string, { top: number; height: number }>();
-  if (!preview || kind === 'allday-create') return map;
+  if (!preview || zone !== 'timed') return map;
   for (const day of days) {
     const clamped = clampMinutesToDay(preview.start, preview.end, day);
     if (!clamped) continue;
@@ -209,10 +314,10 @@ export function timedPreviewSegments(
  */
 export function allDayPreviewIndices(
   preview: TimedRange | null,
-  kind: DragKind | null,
+  zone: DragZone | null,
   days: Date[],
 ): { startDay: number; endDay: number } | null {
-  if (!preview || kind !== 'allday-create') return null;
+  if (!preview || zone !== 'allday') return null;
   const origin = days[0];
   if (!origin) return null;
   const msPerDay = 24 * 60 * 60 * 1000;

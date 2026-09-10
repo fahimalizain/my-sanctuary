@@ -11,14 +11,21 @@ import {
 import {
   type DragKind,
   type DragSlot,
+  type DragZone,
   type TimedRange,
+  ALLDAY_CREATE_HOLD_MS,
+  allDayGrabOffsetDays,
+  autoscrollDelta,
   classifyTouchGesture,
   isTapCreatePointer,
+  movedAllDayRange,
   movedEnough,
   movedRange,
   rangeFromSlots,
   resizeEdgeAt,
   resizedRange,
+  toAllDayRange,
+  toTimedRange,
 } from '../lib/calendar-drag';
 import { minutesFromY, snapMinutes, startOfDay } from '../lib/week-layout';
 import type { CalendarEvent } from '@/app/types';
@@ -49,8 +56,14 @@ export interface CalendarDragApi {
     chipEl: HTMLElement,
   ) => void;
   onAllDayPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
+  onAllDayChipPointerDown: (
+    e: ReactPointerEvent<HTMLElement>,
+    event: CalendarEvent,
+    chipEl: HTMLElement,
+  ) => void;
   preview: TimedRange | null;
   previewKind: DragKind | null;
+  previewZone: DragZone | null;
   /** Event being moved/resized (null for create gestures). */
   activeEventId: string | null;
   isDragging: boolean;
@@ -69,6 +82,11 @@ interface Session {
   originalEnd?: Date;
   /** Minutes from painted chip start to pointer at pointerdown (move only). */
   grabOffsetMin?: number;
+  /** Civil-day offset from all-day event start to the grab day. */
+  grabOffsetDays?: number;
+  originZone: DragZone;
+  currentZone: DragZone;
+  originTime: number;
   pointerId: number;
   /** touch waits for classify; mouse/pen is claimed immediately. */
   pointerType: string;
@@ -107,32 +125,74 @@ function hitTestTimed(
   return slotFromColumn(clientY, col, day, hourH);
 }
 
+function dayFromAllDayCell(cell: Element): Date | null {
+  return parseDayAttr(cell.getAttribute('data-allday-day'));
+}
+
 function hitTestAllDay(clientX: number, clientY: number): DragSlot | null {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return null;
-  const cell = el.closest('[data-allday-day]') as HTMLElement | null;
-  if (!cell) return null;
-  const day = parseDayAttr(cell.getAttribute('data-allday-day'));
-  if (!day) return null;
-  return { day, minutes: 0 };
+  const cell = el.closest('[data-allday-day]');
+  if (cell) {
+    const day = dayFromAllDayCell(cell);
+    if (day) return { day, minutes: 0 };
+  }
+  const row = el.closest('[data-allday-row]');
+  if (!row) return null;
+  for (const c of row.querySelectorAll('[data-allday-day]')) {
+    const r = c.getBoundingClientRect();
+    if (clientX >= r.left && clientX < r.right) {
+      const day = dayFromAllDayCell(c);
+      if (day) return { day, minutes: 0 };
+    }
+  }
+  return null;
+}
+
+function hitTestAny(
+  clientX: number,
+  clientY: number,
+  hourH: number,
+): { slot: DragSlot; zone: DragZone } | null {
+  const allDay = hitTestAllDay(clientX, clientY);
+  if (allDay) return { slot: allDay, zone: 'allday' };
+  const timed = hitTestTimed(clientX, clientY, hourH);
+  if (timed) return { slot: timed, zone: 'timed' };
+  return null;
 }
 
 function computePreview(session: Session): TimedRange | null {
   const {
     kind,
+    originZone,
+    currentZone,
     originSlot,
     currentSlot,
     originalStart,
     originalEnd,
     grabOffsetMin,
+    grabOffsetDays,
   } = session;
   switch (kind) {
     case 'create':
+      if (currentZone === 'allday') return toAllDayRange(currentSlot);
       return rangeFromSlots(originSlot, currentSlot, 'timed');
     case 'allday-create':
       return rangeFromSlots(originSlot, currentSlot, 'allday');
     case 'move':
       if (!originalStart || !originalEnd) return null;
+      if (currentZone === 'allday') {
+        if (originZone === 'allday') {
+          return movedAllDayRange(
+            originalStart,
+            originalEnd,
+            currentSlot,
+            grabOffsetDays ?? 0,
+          );
+        }
+        return toAllDayRange(currentSlot);
+      }
+      if (originZone === 'allday') return toTimedRange(currentSlot);
       return movedRange(
         originalStart,
         originalEnd,
@@ -150,6 +210,23 @@ function computePreview(session: Session): TimedRange | null {
   }
 }
 
+function nextSlotFromPoint(
+  session: Session,
+  clientX: number,
+  clientY: number,
+  hourH: number,
+): { slot: DragSlot; zone: DragZone } | null {
+  if (session.kind === 'allday-create') {
+    const slot = hitTestAllDay(clientX, clientY);
+    return slot ? { slot, zone: 'allday' } : null;
+  }
+  if (session.kind === 'resize-start' || session.kind === 'resize-end') {
+    const slot = hitTestTimed(clientX, clientY, hourH);
+    return slot ? { slot, zone: 'timed' } : null;
+  }
+  return hitTestAny(clientX, clientY, hourH);
+}
+
 export function useCalendarDrag(
   options: UseCalendarDragOptions,
 ): CalendarDragApi {
@@ -165,24 +242,71 @@ export function useCalendarDrag(
   /** Touch sessions start unclaimed so the scroller can pan. */
   const claimedRef = useRef(false);
   const captureTargetRef = useRef<HTMLElement | null>(null);
+  const lastPtrRef = useRef({ x: 0, y: 0 });
+  const autoScrollRafRef = useRef(0);
 
   const [session, setSession] = useState<Session | null>(null);
   const [didDrag, setDidDrag] = useState(false);
 
-  const claimGesture = useCallback((pointerId: number) => {
-    if (claimedRef.current) return;
-    claimedRef.current = true;
-    optsRef.current.setStripLocked(true);
-    document.body.style.userSelect = 'none';
-    const target = captureTargetRef.current;
-    if (target) {
-      try {
-        target.setPointerCapture(pointerId);
-      } catch {
-        // Capture can fail if the target is not active; window listeners still work.
-      }
+  const applyPoint = useCallback((clientX: number, clientY: number) => {
+    const s = sessionRef.current;
+    if (!s) return;
+    const hit = nextSlotFromPoint(s, clientX, clientY, optsRef.current.hourH);
+    if (!hit) return;
+    const updated: Session = {
+      ...s,
+      currentSlot: hit.slot,
+      currentZone: hit.zone,
+    };
+    sessionRef.current = updated;
+    setSession(updated);
+  }, []);
+
+  const stopAutoScroll = useCallback(() => {
+    if (autoScrollRafRef.current) {
+      cancelAnimationFrame(autoScrollRafRef.current);
+      autoScrollRafRef.current = 0;
     }
   }, []);
+
+  const tickAutoScroll = useCallback(() => {
+    autoScrollRafRef.current = 0;
+    if (!claimedRef.current || !sessionRef.current) return;
+    const scroller = document.querySelector('[data-calendar-scroller]');
+    if (!(scroller instanceof HTMLElement)) return;
+    const rect = scroller.getBoundingClientRect();
+    const { x, y } = lastPtrRef.current;
+    const dx = autoscrollDelta(x, rect.left, rect.right);
+    const dy = autoscrollDelta(y, rect.top, rect.bottom);
+    if (dx !== 0) scroller.scrollLeft += dx;
+    if (dy !== 0) scroller.scrollTop += dy;
+    if (dx !== 0 || dy !== 0) applyPoint(x, y);
+    autoScrollRafRef.current = requestAnimationFrame(tickAutoScroll);
+  }, [applyPoint]);
+
+  const startAutoScroll = useCallback(() => {
+    if (autoScrollRafRef.current) return;
+    autoScrollRafRef.current = requestAnimationFrame(tickAutoScroll);
+  }, [tickAutoScroll]);
+
+  const claimGesture = useCallback(
+    (pointerId: number) => {
+      if (claimedRef.current) return;
+      claimedRef.current = true;
+      optsRef.current.setStripLocked(true);
+      document.body.style.userSelect = 'none';
+      const target = captureTargetRef.current;
+      if (target) {
+        try {
+          target.setPointerCapture(pointerId);
+        } catch {
+          // Capture can fail if the target is not active; window listeners still work.
+        }
+      }
+      startAutoScroll();
+    },
+    [startAutoScroll],
+  );
 
   const beginSession = useCallback(
     (next: Session, target: HTMLElement, e: ReactPointerEvent<HTMLElement>) => {
@@ -191,6 +315,7 @@ export function useCalendarDrag(
       setSession(next);
       setDidDrag(false);
       captureTargetRef.current = target;
+      lastPtrRef.current = { x: e.clientX, y: e.clientY };
 
       const isTouch = e.pointerType === 'touch';
       if (isTouch) {
@@ -205,12 +330,14 @@ export function useCalendarDrag(
           // Capture can fail if the target is not active; window listeners still work.
         }
         document.body.style.userSelect = 'none';
+        startAutoScroll();
       }
     },
-    [],
+    [startAutoScroll],
   );
 
   const endSession = useCallback(() => {
+    stopAutoScroll();
     sessionRef.current = null;
     setSession(null);
     setDidDrag(false);
@@ -219,7 +346,7 @@ export function useCalendarDrag(
     captureTargetRef.current = null;
     optsRef.current.setStripLocked(false);
     document.body.style.userSelect = '';
-  }, []);
+  }, [stopAutoScroll]);
 
   // Window-level move / up while a session is active.
   useEffect(() => {
@@ -230,6 +357,7 @@ export function useCalendarDrag(
       if (!s) return;
       if (e.pointerId !== s.pointerId) return;
 
+      lastPtrRef.current = { x: e.clientX, y: e.clientY };
       const dx = e.clientX - s.originX;
       const dy = e.clientY - s.originY;
 
@@ -237,13 +365,15 @@ export function useCalendarDrag(
       if (!claimedRef.current && s.pointerType === 'touch') {
         const mode =
           s.kind === 'create' || s.kind === 'allday-create' ? 'create' : 'chip';
-        const intent = classifyTouchGesture(dx, dy, mode);
+        const held =
+          s.kind === 'allday-create' &&
+          performance.now() - s.originTime >= ALLDAY_CREATE_HOLD_MS;
+        const intent = classifyTouchGesture(dx, dy, mode, held);
         if (intent === 'pending') return;
         if (intent === 'scroll') {
           endSession();
           return;
         }
-        // 'drag' — claim now, then fall through into the move path.
         claimGesture(e.pointerId);
       }
 
@@ -253,19 +383,7 @@ export function useCalendarDrag(
       }
 
       e.preventDefault();
-
-      let nextSlot: DragSlot | null = null;
-      if (s.kind === 'allday-create') {
-        nextSlot = hitTestAllDay(e.clientX, e.clientY);
-      } else {
-        nextSlot = hitTestTimed(e.clientX, e.clientY, optsRef.current.hourH);
-      }
-
-      if (!nextSlot) return; // keep last slot on miss
-
-      const updated: Session = { ...s, currentSlot: nextSlot };
-      sessionRef.current = updated;
-      setSession(updated);
+      applyPoint(e.clientX, e.clientY);
     };
 
     const onUpWin = (e: PointerEvent) => {
@@ -337,15 +455,24 @@ export function useCalendarDrag(
       endSession();
     };
 
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      endSession();
+    };
+
     window.addEventListener('pointermove', onMoveWin, { passive: false });
     window.addEventListener('pointerup', onUpWin);
     window.addEventListener('pointercancel', onCancelWin);
+    window.addEventListener('keydown', onKeyDown, true);
     return () => {
       window.removeEventListener('pointermove', onMoveWin);
       window.removeEventListener('pointerup', onUpWin);
       window.removeEventListener('pointercancel', onCancelWin);
+      window.removeEventListener('keydown', onKeyDown, true);
     };
-  }, [session, endSession, claimGesture]);
+  }, [session, endSession, claimGesture, applyPoint]);
 
   // Cleanup body style if unmounted mid-drag.
   useEffect(() => {
@@ -370,6 +497,9 @@ export function useCalendarDrag(
           currentSlot: originSlot,
           originX: e.clientX,
           originY: e.clientY,
+          originZone: 'timed',
+          currentZone: 'timed',
+          originTime: performance.now(),
           pointerId: e.pointerId,
           pointerType: e.pointerType,
         },
@@ -440,6 +570,9 @@ export function useCalendarDrag(
           originalStart,
           originalEnd,
           grabOffsetMin: kind === 'move' ? grabOffsetMin : undefined,
+          originZone: 'timed',
+          currentZone: 'timed',
+          originTime: performance.now(),
           pointerId: e.pointerId,
           pointerType: e.pointerType,
         },
@@ -465,10 +598,52 @@ export function useCalendarDrag(
           currentSlot: originSlot,
           originX: e.clientX,
           originY: e.clientY,
+          originZone: 'allday',
+          currentZone: 'allday',
+          originTime: performance.now(),
           pointerId: e.pointerId,
           pointerType: e.pointerType,
         },
         e.currentTarget,
+        e,
+      );
+    },
+    [beginSession],
+  );
+
+  const onAllDayChipPointerDown = useCallback(
+    (
+      e: ReactPointerEvent<HTMLElement>,
+      event: CalendarEvent,
+      chipEl: HTMLElement,
+    ) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+
+      const originalStart = new Date(event.start_time);
+      const originalEnd = new Date(event.end_time);
+      const hit = hitTestAllDay(e.clientX, e.clientY);
+      const day = hit?.day ?? startOfDay(originalStart);
+      const originSlot: DragSlot = { day, minutes: 0 };
+
+      beginSession(
+        {
+          kind: 'move',
+          originSlot,
+          currentSlot: originSlot,
+          originX: e.clientX,
+          originY: e.clientY,
+          eventId: event.id,
+          originalStart,
+          originalEnd,
+          grabOffsetDays: allDayGrabOffsetDays(originalStart, day),
+          originZone: 'allday',
+          currentZone: 'allday',
+          originTime: performance.now(),
+          pointerId: e.pointerId,
+          pointerType: e.pointerType,
+        },
+        chipEl,
         e,
       );
     },
@@ -489,8 +664,10 @@ export function useCalendarDrag(
     onColumnPointerDown,
     onChipPointerDown,
     onAllDayPointerDown,
+    onAllDayChipPointerDown,
     preview,
     previewKind: preview && session ? session.kind : null,
+    previewZone: preview && session ? session.currentZone : null,
     activeEventId: session?.eventId ?? null,
     isDragging: session !== null && didDrag,
     suppressNextClick,

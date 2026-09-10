@@ -47,6 +47,11 @@ export interface CalendarWeekGridProps {
   ) => void;
   onSelectChip: (eventId: string) => void;
   onAllDayPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
+  onAllDayChipPointerDown: (
+    e: ReactPointerEvent<HTMLElement>,
+    eventId: string,
+    chipEl: HTMLElement,
+  ) => void;
   onChipSelect: (eventId: string) => void;
   isDragging: boolean;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
@@ -84,6 +89,7 @@ export function CalendarWeekGrid({
   onChipPointerDown,
   onSelectChip,
   onAllDayPointerDown,
+  onAllDayChipPointerDown,
   onChipSelect,
   isDragging,
   timedPreviewByDay,
@@ -160,8 +166,10 @@ export function CalendarWeekGrid({
               chips={allDayChips}
               todayIndex={todayIndex}
               onDayPointerDown={onAllDayPointerDown}
+              onChipPointerDown={onAllDayChipPointerDown}
               onChipSelect={onChipSelect}
               selectedEventId={selectedEventId}
+              draggingEventId={draggingEventId}
               preview={allDayPreview}
             />
           </div>
