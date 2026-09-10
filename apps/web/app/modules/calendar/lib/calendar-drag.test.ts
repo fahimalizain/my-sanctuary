@@ -332,6 +332,96 @@ test('resizedRange: start pulled earlier', () => {
   assert.equal(r.end.getHours(), 11);
 });
 
+test('resizedRange: end lands on a non-quarter minute', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // 11:07 keeps duration ≥ 15; 10:07 would clamp to start+15
+  const r = resizedRange(start, end, 'end', slot(day, 11 * 60 + 7));
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getHours(), 11);
+  assert.equal(r.end.getMinutes(), 7);
+});
+
+test('resizedRange: start lands on a non-quarter minute', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(start, end, 'start', slot(day, 9 * 60 + 52));
+  assert.equal(r.end.getTime(), end.getTime());
+  assert.equal(r.start.getHours(), 9);
+  assert.equal(r.start.getMinutes(), 52);
+});
+
+test('resizedRange: fixed edge is not re-snapped', () => {
+  const start = new Date(2024, 0, 1, 10, 7, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(start, end, 'end', slot(day, 12 * 60 + 23));
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.start.getMinutes(), 7);
+  assert.equal(r.end.getHours(), 12);
+  assert.equal(r.end.getMinutes(), 23);
+});
+
+test('resizedRange: clamp still 15 min with non-quarter fixed edge', () => {
+  const start = new Date(2024, 0, 1, 10, 7, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // Drag end to 10:10 → clamp to start + 15 = 10:22
+  const r = resizedRange(start, end, 'end', slot(day, 10 * 60 + 10));
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.start.getMinutes(), 7);
+  assert.equal(r.end.getHours(), 10);
+  assert.equal(r.end.getMinutes(), 22);
+});
+
+test('resizedRange: overnight end snaps to 1 minute', () => {
+  const start = new Date(2024, 0, 1, 22, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 23, 0, 0, 0);
+  const tue = localDay(2024, 0, 2);
+  const r = resizedRange(start, end, 'end', slot(tue, 7));
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getDate(), 2);
+  assert.equal(r.end.getHours(), 0);
+  assert.equal(r.end.getMinutes(), 7);
+});
+
+test('resizedRange: fractional minutes snap nearest 1', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // 11:07.6 → 11:08; stays above the 15-minute floor
+  const r = resizedRange(start, end, 'end', slot(day, 11 * 60 + 7.6));
+  assert.equal(r.end.getHours(), 11);
+  assert.equal(r.end.getMinutes(), 8);
+});
+
+test('movedRange: still snaps to 15-minute grid', () => {
+  const originalStart = new Date(2024, 0, 1, 9, 0, 0, 0);
+  const originalEnd = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // 10:07 nearest 15 is 10:00
+  const r = movedRange(originalStart, originalEnd, slot(day, 10 * 60 + 7));
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getHours(), 11);
+  assert.equal(r.end.getMinutes(), 0);
+});
+
+test('rangeFromSlots timed: still snaps to 15-minute grid', () => {
+  const day = localDay(2024, 0, 1);
+  const r = rangeFromSlots(
+    slot(day, 10 * 60 + 7),
+    slot(day, 11 * 60 + 7),
+    'timed',
+  );
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getHours(), 11);
+  assert.equal(r.end.getMinutes(), 0);
+});
+
 // ── preview geometry ────────────────────────────────────────────────────
 
 test('timedPreviewSegments: splits overnight range across two days', () => {
