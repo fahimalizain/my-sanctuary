@@ -9,23 +9,24 @@ use api_core::models::{
     NewCalendarEvent, NewCalendarEventOperation, NewToken, NewWatchChannel, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_if_owner_sql, build_event_upsert_sql, CalendarEventOperationRepo,
-    CalendarEventRepo, CalendarRepo, RepoError, TokenRepo, WatchChannelRepo,
-    CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL,
-    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL,
-    CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
-    CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL,
-    CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
+    build_event_upsert_if_owner_sql, build_event_upsert_sql, build_replica_seen_insert_sql,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo,
+    WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
+    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
+    CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
+    CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
     CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL,
     CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
-    EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
-    EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
-    EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
-    EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
+    EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL,
+    EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
+    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
+    EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
+    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_UPDATE_PROGRESS_SQL, OPERATION_UPDATE_STATUS_SQL,
-    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
+    REPLICA_SEEN_INSERT_CHUNK_SIZE, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
     WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
     WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_ALL_SQL,
     WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
@@ -664,6 +665,64 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
                 &older_than_rfc3339,
             ],
         )
+    }
+
+    async fn record_replica_seen(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        google_event_ids: Vec<String>,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        if google_event_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = lock(&self.db)?;
+        for chunk in google_event_ids.chunks(REPLICA_SEEN_INSERT_CHUNK_SIZE) {
+            let (sql, args) =
+                build_replica_seen_insert_sql(calendar_id, run_id, chunk, now_rfc3339);
+            Self::run_upsert(&conn, &sql, &args)?;
+        }
+        Ok(())
+    }
+
+    async fn clear_replica_seen_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        exec(&conn, EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL, &[&calendar_id])
+    }
+
+    async fn sweep_absent_if_owner(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        let conn = lock(&self.db)?;
+        exec(
+            &conn,
+            EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
+            &[
+                &now_rfc3339,
+                &now_rfc3339,
+                &calendar_id,
+                &calendar_id,
+                &run_id,
+                &lease_owner,
+                &now_rfc3339,
+            ],
+        )?;
+        #[derive(Deserialize)]
+        struct LeaseHeldRow {
+            #[allow(dead_code)]
+            ok: i64,
+        }
+        let held: Option<LeaseHeldRow> = query_one(
+            &conn,
+            CALENDAR_LEASE_HELD_SQL,
+            &[&calendar_id, &lease_owner, &now_rfc3339],
+        )?;
+        Ok(held.is_some())
     }
 }
 

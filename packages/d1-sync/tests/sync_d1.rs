@@ -367,3 +367,181 @@ fn d1_cron_published_only_after_health_commit() {
         Some("2023-11-14T22:13:20Z")
     );
 }
+
+fn seed_event(
+    conn: &rusqlite::Connection,
+    id: &str,
+    google_event_id: &str,
+    task_id: Option<&str>,
+    status: &str,
+    recurring_event_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO calendar_events (
+            id, calendar_id, google_event_id, google_etag, google_updated_at,
+            last_synced_at, title, description, start_time, end_time, recurrence,
+            task_id, ical_uid, sequence, status, recurring_event_id, original_start,
+            start_time_zone, end_time_zone, is_all_day, raw_json,
+            created_at, updated_at, deleted_at
+         ) VALUES (
+            ?1, 'cal-1', ?2, '', '',
+            ?3, ?2, '', '2026-08-18T09:00:00Z', '2026-08-18T09:30:00Z', '',
+            ?4, '', 0, ?5, ?6, '',
+            '', '', 0, '',
+            ?3, ?3, NULL
+         )",
+        rusqlite::params![
+            id,
+            google_event_id,
+            NOW_RFC,
+            task_id,
+            status,
+            recurring_event_id,
+        ],
+    )
+    .map_err(|e| format!("seed event {id}: {e}"))?;
+    Ok(())
+}
+
+#[test]
+fn d1_sweep_absent_if_owner_membership_and_lease_fence() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        // Hold lease for owner-a.
+        conn.execute(
+            "UPDATE google_calendars
+             SET lease_owner = ?1, lease_expires_at = ?2
+             WHERE id = 'cal-1'",
+            rusqlite::params!["owner-a", "2099-01-01T00:00:00Z"],
+        )
+        .expect("set lease");
+        seed_event(&conn, "e-keep", "keep", None, "confirmed", "").expect("keep");
+        seed_event(&conn, "e-ghost", "ghost", None, "confirmed", "").expect("ghost");
+        seed_event(
+            &conn,
+            "e-exc",
+            "exc-absent",
+            None,
+            "cancelled",
+            "master-1",
+        )
+        .expect("exc");
+        seed_event(
+            &conn,
+            "e-task",
+            "task-linked",
+            Some("task-99"),
+            "confirmed",
+            "",
+        )
+        .expect("task");
+        // Seen snapshot contains keep only.
+        conn.execute(
+            "INSERT INTO calendar_replica_seen (calendar_id, run_id, google_event_id, created_at)
+             VALUES ('cal-1', 'run-1', 'keep', ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("seed seen");
+    }
+
+    let ok = pollster::block_on(h.events.sweep_absent_if_owner(
+        "cal-1",
+        "run-1",
+        "owner-a",
+        NOW_RFC,
+    ))
+    .expect("sweep ok");
+    assert!(ok, "owner must hold lease");
+
+    let keep = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "keep"))
+        .expect("keep q")
+        .expect("keep living");
+    assert!(keep.deleted_at.is_none());
+
+    let ghost = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "ghost"))
+        .expect("ghost q");
+    assert!(ghost.is_none(), "ghost must be soft-deleted (get filters deleted)");
+    // Confirm tombstone via raw SQL.
+    {
+        let conn = h.db.lock().unwrap();
+        let deleted_at: Option<String> = conn
+            .query_row(
+                "SELECT deleted_at FROM calendar_events WHERE google_event_id = 'ghost'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("ghost row");
+        assert!(deleted_at.is_some(), "ghost deleted_at stamped");
+    }
+
+    let exc = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "exc-absent"))
+        .expect("exc q")
+        .expect("cancelled exception living");
+    assert!(exc.deleted_at.is_none());
+    assert_eq!(exc.status, "cancelled");
+    assert_eq!(exc.recurring_event_id, "master-1");
+
+    let task = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "task-linked"))
+        .expect("task q")
+        .expect("task-linked living");
+    assert!(task.deleted_at.is_none());
+    assert_eq!(task.task_id, "task-99");
+
+    // Foreign / expired lease → false and no further mutation.
+    // Restore ghost as living to observe no-op under foreign lease.
+    {
+        let conn = h.db.lock().unwrap();
+        conn.execute(
+            "UPDATE calendar_events SET deleted_at = NULL WHERE google_event_id = 'ghost'",
+            [],
+        )
+        .expect("restore ghost");
+        conn.execute(
+            "UPDATE google_calendars
+             SET lease_owner = ?1, lease_expires_at = ?2
+             WHERE id = 'cal-1'",
+            rusqlite::params!["other-owner", "2099-01-01T00:00:00Z"],
+        )
+        .expect("steal lease");
+    }
+    let denied = pollster::block_on(h.events.sweep_absent_if_owner(
+        "cal-1",
+        "run-1",
+        "owner-a",
+        NOW_RFC,
+    ))
+    .expect("sweep denied");
+    assert!(!denied, "foreign lease must return false");
+    let ghost_again =
+        pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "ghost"))
+            .expect("ghost q2")
+            .expect("ghost still living under foreign lease");
+    assert!(ghost_again.deleted_at.is_none());
+
+    // Expired lease also denies.
+    {
+        let conn = h.db.lock().unwrap();
+        conn.execute(
+            "UPDATE google_calendars
+             SET lease_owner = ?1, lease_expires_at = ?2
+             WHERE id = 'cal-1'",
+            rusqlite::params!["owner-a", "2020-01-01T00:00:00Z"],
+        )
+        .expect("expire lease");
+    }
+    let expired = pollster::block_on(h.events.sweep_absent_if_owner(
+        "cal-1",
+        "run-1",
+        "owner-a",
+        NOW_RFC,
+    ))
+    .expect("sweep expired");
+    assert!(!expired, "expired lease must return false");
+    let ghost_exp =
+        pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "ghost"))
+            .expect("ghost q3")
+            .expect("ghost still living under expired lease");
+    assert!(ghost_exp.deleted_at.is_none());
+}

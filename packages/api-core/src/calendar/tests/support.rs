@@ -816,17 +816,19 @@ pub(crate) struct FakeEventRepo {
     pub(crate) deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
     /// `(calendar_id, older_than, now)` — replica walk must never push.
     pub(crate) deleted_stale: Mutex<Vec<(String, String, String)>>,
+    /// `(calendar_id, run_id, google_event_id)` — merge-full seen snapshot.
+    pub(crate) replica_seen: Mutex<Vec<(String, String, String)>>,
     pub(crate) fail_upsert: Mutex<bool>,
     pub(crate) fail_delete: Mutex<bool>,
     pub(crate) next_id: Mutex<u64>,
     /// Shared live lease store from [`FakeCalendarRepo::stored`]. `None`
     /// means unbound: fenced methods behave like unfenced (lease held).
     pub(crate) lease_calendars: Mutex<Option<Arc<Mutex<Vec<GoogleCalendar>>>>>,
-    /// Count of non-empty fenced apply calls (both if_owner methods).
+    /// Count of non-empty fenced apply calls (upsert/delete/sweep if_owner).
     pub(crate) fenced_apply_count: Mutex<usize>,
     /// When `Some((n, owner, expires))`, on the **nth** fenced apply call
-    /// (1-based, across both if_owner methods), **before** the lease check,
-    /// write `owner` / `expires` onto matching calendar row(s).
+    /// (1-based, across all if_owner methods including sweep), **before** the
+    /// lease check, write `owner` / `expires` onto matching calendar row(s).
     pub(crate) inject_lease_before_fenced_apply:
         Mutex<Option<(usize, String, Option<String>)>>,
 }
@@ -842,6 +844,7 @@ impl FakeEventRepo {
             deleted: Mutex::new(Vec::new()),
             deleted_by_google_event_id: Mutex::new(Vec::new()),
             deleted_stale: Mutex::new(Vec::new()),
+            replica_seen: Mutex::new(Vec::new()),
             fail_upsert: Mutex::new(false),
             fail_delete: Mutex::new(false),
             next_id: Mutex::new(1),
@@ -1200,6 +1203,82 @@ impl CalendarEventRepo for FakeEventRepo {
             now_rfc3339.to_string(),
         ));
         Ok(())
+    }
+
+    async fn record_replica_seen(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        google_event_ids: Vec<String>,
+        _now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        if google_event_ids.is_empty() {
+            return Ok(());
+        }
+        let mut seen = self.replica_seen.lock().unwrap();
+        for gid in google_event_ids {
+            if gid.is_empty() {
+                continue;
+            }
+            let key = (calendar_id.to_string(), run_id.to_string(), gid);
+            if !seen.iter().any(|row| row == &key) {
+                seen.push(key);
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_replica_seen_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        self.replica_seen
+            .lock()
+            .unwrap()
+            .retain(|(cid, _, _)| cid != calendar_id);
+        Ok(())
+    }
+
+    async fn sweep_absent_if_owner(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        // Counts as a fenced apply (lease inject + gate).
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        let seen: std::collections::HashSet<String> = self
+            .replica_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(cid, rid, _)| cid == calendar_id && rid == run_id)
+            .map(|(_, _, gid)| gid.clone())
+            .collect();
+        let mut stored = self.stored.lock().unwrap();
+        for event in stored.iter_mut() {
+            if event.calendar_id != calendar_id {
+                continue;
+            }
+            if event.deleted_at.is_some() {
+                continue;
+            }
+            // Cancelled exception: keep living.
+            if event.status == "cancelled" && !event.recurring_event_id.trim().is_empty() {
+                continue;
+            }
+            // App-owned association: keep living.
+            if !event.task_id.trim().is_empty() {
+                continue;
+            }
+            if seen.contains(&event.google_event_id) {
+                continue;
+            }
+            // Soft-delete only — do not wipe task_id (already empty here).
+            event.deleted_at = Some(now_rfc3339.to_string());
+            event.updated_at = now_rfc3339.to_string();
+        }
+        Ok(true)
     }
 }
 

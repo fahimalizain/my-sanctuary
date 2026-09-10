@@ -4780,6 +4780,33 @@ mod tests {
         ) -> Result<(), RepoError> {
             Ok(())
         }
+
+        async fn record_replica_seen(
+            &self,
+            _calendar_id: &str,
+            _run_id: &str,
+            _google_event_ids: Vec<String>,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn clear_replica_seen_for_calendar(
+            &self,
+            _calendar_id: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn sweep_absent_if_owner(
+            &self,
+            _calendar_id: &str,
+            _run_id: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
     }
 
     #[derive(Default)]
