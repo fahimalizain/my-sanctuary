@@ -172,10 +172,7 @@ test('description: empty shows placeholder; non-empty is read-only text', () => 
   assert.ok(screen.getByText('Description'));
   // Placeholder is a <p>, not an input.
   assert.equal(document.querySelector('textarea'), null);
-  assert.equal(
-    document.querySelector('input[aria-label="Description"]'),
-    null,
-  );
+  assert.equal(document.querySelector('input[aria-label="Description"]'), null);
   cleanup();
 
   mount({

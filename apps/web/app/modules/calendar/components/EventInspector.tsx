@@ -128,9 +128,7 @@ function useChipRect(eventId: string): ChipRect | null {
 /** Writable when calendar is omitted, or access_role is owner/writer. */
 function isCalendarWritable(calendar?: GoogleCalendar): boolean {
   if (!calendar) return true;
-  return (
-    calendar.access_role === 'owner' || calendar.access_role === 'writer'
-  );
+  return calendar.access_role === 'owner' || calendar.access_role === 'writer';
 }
 
 /**
