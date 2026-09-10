@@ -401,7 +401,7 @@ fn replica_due_matrix() {
     cal.dirty_requested_generation = 0;
     cal.dirty_applied_generation = 0;
     cal.last_success_at = Some(twenty_min_ago.clone());
-    cal.next_retry_at = Some(future_retry);
+    cal.next_retry_at = Some(future_retry.clone());
     assert!(!replica_due(&cal, now), "future backoff blocks even stale");
 
     // next_retry_at in the past + last_success 1m ago + not dirty → due
@@ -412,8 +412,35 @@ fn replica_due_matrix() {
     // full_sync_requested + last_success 1m ago + not dirty → due
     cal.next_retry_at = None;
     cal.full_sync_requested = true;
-    cal.last_success_at = Some(one_min_ago);
+    cal.last_success_at = Some(one_min_ago.clone());
     assert!(replica_due(&cal, now), "full_sync_requested forces due");
+
+    // full_sync_requested + future next_retry_at + fresh last_success + not dirty
+    // → due (reseed wins over backoff; isolate death mid-410 recovery)
+    cal.next_retry_at = Some(future_retry.clone());
+    cal.last_success_at = Some(one_min_ago.clone());
+    cal.dirty_requested_generation = 0;
+    cal.dirty_applied_generation = 0;
+    cal.full_sync_requested = true;
+    assert!(
+        replica_due(&cal, now),
+        "full_sync_requested wins over future backoff"
+    );
+
+    // full_sync_requested + authorization_required → still not due
+    cal.sync_status = "authorization_required".to_string();
+    assert!(
+        !replica_due(&cal, now),
+        "auth_required still hard-skips even with full_sync_requested"
+    );
+
+    // full_sync_requested + freeBusyReader → still not due
+    cal.sync_status = String::new();
+    cal.access_role = "freeBusyReader".to_string();
+    assert!(
+        !replica_due(&cal, now),
+        "freeBusyReader still hard-skips even with full_sync_requested"
+    );
 
     // freeBusyReader + dirty + last_success 20m ago → not due
     cal.full_sync_requested = false;
