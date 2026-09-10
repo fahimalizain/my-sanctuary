@@ -5,18 +5,18 @@ use api_core::models::{
     NewCalendarEventOperation, NewWatchChannel, WatchChannel,
 };
 use api_core::repo::{
-    build_event_upsert_sql, build_operation_list_by_statuses_sql, CalendarEventOperationRepo,
-    CalendarEventRepo, CalendarRepo, RepoError, WatchChannelRepo, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
-    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
-    CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
+    build_event_upsert_if_owner_sql, build_event_upsert_sql, build_operation_list_by_statuses_sql,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, WatchChannelRepo,
+    CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL,
+    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL,
+    CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
     CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL,
-    CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL,
-    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
-    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
-    CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
+    CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
+    CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL,
-    CALENDAR_TRY_ACQUIRE_LEASE_SQL,
-    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
+    CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
     EVENT_LIST_RUNNING_BY_USER_ID_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
@@ -547,6 +547,46 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         Ok(())
     }
 
+    async fn upsert_batch_if_owner(
+        &self,
+        events: Vec<NewCalendarEvent>,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        if events.is_empty() {
+            return Ok(true);
+        }
+        // Same natural-key lookup + chunking as upsert_batch; fence binds add
+        // only 3 params per statement so chunk size stays 4 (92 + 3 = 95).
+        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+            let calendar_id = chunk[0].calendar_id.as_str();
+            let mut ids = Vec::with_capacity(chunk.len());
+            for event in chunk {
+                let id = match self
+                    .lookup_id_by_natural_key(&event.calendar_id, &event.google_event_id)
+                    .await?
+                {
+                    Some(existing) => existing,
+                    None => uuid::Uuid::new_v4().to_string(),
+                };
+                ids.push(id);
+            }
+            let (sql, args) = build_event_upsert_if_owner_sql(
+                chunk,
+                now_rfc3339,
+                ids,
+                calendar_id,
+                lease_owner,
+            );
+            let changes = self.run_upsert_changes(&sql, &args).await?;
+            if changes == 0 {
+                // Lease missing/stolen/expired: INSERT SELECT wrote nothing.
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError> {
         let stmt = self
             .db
@@ -632,6 +672,43 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         run_stmt(stmt).await
     }
 
+    async fn delete_by_google_event_id_if_owner(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        // Fenced UPDATE first so a lost owner cannot mutate even if the
+        // subsequent lease probe races. changes==0 is ambiguous (no living
+        // event vs lease lost) — probe lease ownership for the return value.
+        let stmt = self
+            .db
+            .prepare(EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL)
+            .bind_refs(&[
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(calendar_id),
+                D1Type::Text(google_event_id),
+                D1Type::Text(lease_owner),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+
+        let probe = self
+            .db
+            .prepare(CALENDAR_LEASE_HELD_SQL)
+            .bind_refs(&[
+                D1Type::Text(calendar_id),
+                D1Type::Text(lease_owner),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        let held: Option<LeaseHeldRow> = probe.first(None).await.map_err(backend)?;
+        Ok(held.is_some())
+    }
+
     async fn delete_stale(
         &self,
         calendar_id: &str,
@@ -658,12 +735,25 @@ struct EventIdRow {
     id: String,
 }
 
+/// Row projection for `CALENDAR_LEASE_HELD_SQL` (`SELECT 1 AS ok …`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct LeaseHeldRow {
+    ok: i64,
+}
+
 impl D1CalendarEventRepo {
     /// Binds all-string args as `D1Type::Text` and runs the statement.
     async fn run_upsert(&self, sql: &str, args: &[String]) -> Result<(), RepoError> {
         let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
         let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    /// Like [`Self::run_upsert`] but returns D1 `changes` (rows written).
+    async fn run_upsert_changes(&self, sql: &str, args: &[String]) -> Result<usize, RepoError> {
+        let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
+        let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
+        run_stmt_changes(stmt).await
     }
 
     /// Id for `(calendar_id, google_event_id)`, including soft-deleted rows.

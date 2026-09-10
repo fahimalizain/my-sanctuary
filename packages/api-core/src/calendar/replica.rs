@@ -9,9 +9,12 @@
 //! - **Never advance `sync_token` past uncommitted work.** Pages are applied as
 //!   they arrive; the terminal `nextSyncToken` is published only via
 //!   [`CalendarRepo::record_sync_success_if_owner`] after the last page commits.
-//! - **One fenced owner per calendar.** Acquire a lease before the walk; fence
-//!   before each page apply; renew after apply; release on the way out. A lost
-//!   owner must not write rows or publish a cursor.
+//! - **One fenced owner per calendar.** Acquire a lease before the walk; cheap
+//!   in-memory fence before each page; apply upserts/tombstones via SQL-fenced
+//!   `*_if_owner` writes on `google_calendars.lease_owner` / expiry; renew after
+//!   apply; publish the cursor only via
+//!   [`CalendarRepo::record_sync_success_if_owner`]. A lost owner must not write
+//!   rows or publish a cursor.
 //! - **410 is merge-full, not truncate.** Drop the in-memory token/page cursor
 //!   and restart the list once. Persist `full_sync_requested = 1` and
 //!   `sync_status = 'rebuilding'` via [`CalendarRepo::begin_replica_reseed`]
@@ -155,9 +158,17 @@ pub async fn sync_replica(
             }
             match classify_replica_item(item, &cal.id, now_rfc3339) {
                 ReplicaApplyAction::SoftDelete { google_event_id } => {
-                    events
-                        .delete_by_google_event_id(&cal.id, &google_event_id, now_rfc3339)
+                    let deleted = events
+                        .delete_by_google_event_id_if_owner(
+                            &cal.id,
+                            &google_event_id,
+                            lease_owner,
+                            now_rfc3339,
+                        )
                         .await?;
+                    if !deleted {
+                        return Err(CalendarError::Invalid("lost replica lease".into()));
+                    }
                 }
                 ReplicaApplyAction::Upsert(row) => {
                     to_upsert.push(row);
@@ -165,7 +176,12 @@ pub async fn sync_replica(
             }
         }
         if !to_upsert.is_empty() {
-            events.upsert_batch(to_upsert, now_rfc3339).await?;
+            let applied = events
+                .upsert_batch_if_owner(to_upsert, lease_owner, now_rfc3339)
+                .await?;
+            if !applied {
+                return Err(CalendarError::Invalid("lost replica lease".into()));
+            }
         }
 
         let renew_expires = lease_expires_at(now_rfc3339);

@@ -181,6 +181,19 @@ pub trait CalendarEventRepo: Send + Sync {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Fenced batch upsert: same as [`Self::upsert_batch`] but only when
+    /// `lease_owner` still holds an unexpired lease on the events' calendar
+    /// (`lease_owner = ? AND (lease_expires_at IS NULL OR lease_expires_at >= ?)`
+    /// plus living calendar `deleted_at IS NULL` — same predicate as
+    /// [`CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL`]). Returns `false` when
+    /// the lease is missing/stolen/expired (no rows written). Empty `events`
+    /// returns `true` without touching storage.
+    async fn upsert_batch_if_owner(
+        &self,
+        events: Vec<NewCalendarEvent>,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError>;
     async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError>;
     /// Returns the *living* cached event by `(calendar_id, google_event_id)` —
     /// the exit path (`stop_running_event`) resolves the event a `started` log
@@ -218,6 +231,20 @@ pub trait CalendarEventRepo: Send + Sync {
         google_event_id: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Fenced soft-delete by `(calendar_id, google_event_id)`. Returns `false`
+    /// when the lease is missing/stolen/expired (row unchanged). Returns `true`
+    /// when the owner still holds the lease, even if no living row existed
+    /// (idempotent delete). Ownership predicate matches
+    /// [`CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL`]:
+    /// `lease_owner = ? AND (lease_expires_at IS NULL OR lease_expires_at >= ?)`
+    /// plus living calendar (`deleted_at IS NULL`).
+    async fn delete_by_google_event_id_if_owner(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError>;
     /// SOFT delete of rows whose `last_synced_at` is older than
     /// `older_than_rfc3339` (stale-event cleanup).
     async fn delete_stale(
@@ -648,6 +675,35 @@ pub const EVENT_DELETE_SQL: &str =
 pub const EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND google_event_id = ? AND deleted_at IS NULL";
 
+/// Fenced soft-delete by `(calendar_id, google_event_id)`: same SET as
+/// [`EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL`] plus an EXISTS gate on
+/// `google_calendars` so a stolen/expired owner cannot tombstone rows.
+/// Binds: now, now, calendar_id, google_event_id, lease_owner, now.
+pub const EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL: &str = "
+    UPDATE calendar_events
+    SET deleted_at = ?, updated_at = ?
+    WHERE calendar_id = ? AND google_event_id = ? AND deleted_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM google_calendars
+        WHERE id = calendar_events.calendar_id
+          AND deleted_at IS NULL
+          AND lease_owner = ?
+          AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
+      )
+";
+
+/// Probe whether `lease_owner` still holds an unexpired lease on a living
+/// calendar. Used after a fenced delete (which may change 0 rows when no
+/// living event existed) to distinguish lease loss from idempotent no-op.
+/// Binds: calendar_id, lease_owner, now.
+pub const CALENDAR_LEASE_HELD_SQL: &str = "
+    SELECT 1 AS ok FROM google_calendars
+    WHERE id = ?
+      AND deleted_at IS NULL
+      AND lease_owner = ?
+      AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
+";
+
 /// SOFT delete of stale rows (older than a cutoff).
 pub const EVENT_DELETE_STALE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND last_synced_at < ? AND deleted_at IS NULL";
@@ -745,6 +801,94 @@ pub fn build_event_upsert_sql(
         ]);
     }
     sql.push(' ');
+    sql.push_str(EVENT_UPSERT_ON_CONFLICT);
+    (sql, args)
+}
+
+/// Builds a lease-fenced multi-row `INSERT … SELECT … WHERE EXISTS … ON
+/// CONFLICT` for one chunk of events (non-empty and ≤
+/// `EVENT_UPSERT_CHUNK_SIZE`). Same 23 columns and
+/// [`EVENT_UPSERT_ON_CONFLICT`] as [`build_event_upsert_sql`], but the INSERT
+/// is gated on `google_calendars` still holding `lease_owner` with an
+/// unexpired lease (same predicate as
+/// [`CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL`]). When the EXISTS fails the
+/// SELECT returns zero rows and nothing is written.
+///
+/// Extra binds (once per statement, not per row): `calendar_id`,
+/// `lease_owner`, `now_rfc3339` — so `23 * chunk + 3 ≤ 100` keeps
+/// `EVENT_UPSERT_CHUNK_SIZE` at 4 (`92 + 3 = 95`).
+///
+/// `calendar_id` is the replica calendar id (all events in a chunk share it).
+/// `ids` supplies the new UUID for each row and must match `events.len()`.
+pub fn build_event_upsert_if_owner_sql(
+    events: &[NewCalendarEvent],
+    now_rfc3339: &str,
+    ids: Vec<String>,
+    calendar_id: &str,
+    lease_owner: &str,
+) -> (String, Vec<String>) {
+    assert!(!events.is_empty(), "event upsert-if-owner chunk must not be empty");
+    assert!(
+        events.len() <= EVENT_UPSERT_CHUNK_SIZE,
+        "event upsert-if-owner chunk exceeds {EVENT_UPSERT_CHUNK_SIZE} rows"
+    );
+    assert_eq!(events.len(), ids.len(), "one id per event required");
+
+    let mut sql = String::from(
+        "INSERT INTO calendar_events
+        (id, calendar_id, google_event_id, google_etag, google_updated_at, last_synced_at, title, description, start_time, end_time, recurrence, task_id, ical_uid, sequence, status, recurring_event_id, original_start, start_time_zone, end_time_zone, is_all_day, raw_json, created_at, updated_at)
+        SELECT * FROM (",
+    );
+    let mut args: Vec<String> =
+        Vec::with_capacity(events.len() * EVENT_UPSERT_COL_COUNT + 3);
+    for (index, (event, id)) in events.iter().zip(ids).enumerate() {
+        if index > 0 {
+            sql.push_str(" UNION ALL ");
+        }
+        sql.push_str("SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?");
+        args.extend([
+            id,
+            event.calendar_id.clone(),
+            event.google_event_id.clone(),
+            event.google_etag.clone(),
+            event.google_updated_at.clone(),
+            event.last_synced_at.clone(),
+            event.title.clone(),
+            event.description.clone(),
+            event.start_time.clone(),
+            event.end_time.clone(),
+            event.recurrence.clone(),
+            event.task_id.clone(),
+            event.ical_uid.clone(),
+            event.sequence.to_string(),
+            event.status.clone(),
+            event.recurring_event_id.clone(),
+            event.original_start.clone(),
+            event.start_time_zone.clone(),
+            event.end_time_zone.clone(),
+            if event.is_all_day {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+            event.raw_json.clone(),
+            now_rfc3339.to_string(),
+            now_rfc3339.to_string(),
+        ]);
+    }
+    sql.push_str(
+        ")
+        WHERE EXISTS (
+          SELECT 1 FROM google_calendars
+          WHERE id = ?
+            AND deleted_at IS NULL
+            AND lease_owner = ?
+            AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
+        ) ",
+    );
+    args.push(calendar_id.to_string());
+    args.push(lease_owner.to_string());
+    args.push(now_rfc3339.to_string());
     sql.push_str(EVENT_UPSERT_ON_CONFLICT);
     (sql, args)
 }
@@ -1349,6 +1493,83 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn event_delete_by_google_event_id_if_owner_sql_fences_on_lease() {
+        let sql = EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("SET deleted_at = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("EXISTS"), "{sql}");
+        assert!(sql.contains("google_calendars"), "{sql}");
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(
+            sql.contains("lease_expires_at IS NULL OR lease_expires_at >= ?"),
+            "{sql}"
+        );
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("DELETE FROM"), "{sql}");
+    }
+
+    #[test]
+    fn event_upsert_if_owner_sql_fences_on_lease_and_preserves_task_id() {
+        let event = sample_new_event();
+        let (sql, args) = build_event_upsert_if_owner_sql(
+            &[event.clone()],
+            "2026-08-17T12:00:00Z",
+            vec!["evt-1".to_string()],
+            "cal-1",
+            "owner-a",
+        );
+
+        assert!(sql.starts_with("INSERT INTO calendar_events"), "{sql}");
+        assert!(sql.contains("EXISTS"), "{sql}");
+        assert!(sql.contains("google_calendars"), "{sql}");
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(
+            sql.contains("lease_expires_at IS NULL OR lease_expires_at >= ?"),
+            "{sql}"
+        );
+        assert!(sql.contains("ON CONFLICT(calendar_id, google_event_id)"), "{sql}");
+        assert!(
+            sql.contains(
+                "task_id = COALESCE(NULLIF(excluded.task_id, ''), calendar_events.task_id)"
+            ),
+            "{sql}"
+        );
+        // 23 row binds + calendar_id + lease_owner + now.
+        assert_eq!(args.len(), 23 + 3);
+        assert_eq!(args[0], "evt-1");
+        assert_eq!(args[23], "cal-1");
+        assert_eq!(args[24], "owner-a");
+        assert_eq!(args[25], "2026-08-17T12:00:00Z");
+        assert_eq!(sql.matches('?').count(), 23 + 3);
+    }
+
+    #[test]
+    fn event_upsert_if_owner_sql_chunks_4_rows_with_95_placeholders() {
+        let event = sample_new_event();
+        let events: Vec<NewCalendarEvent> = (0..4).map(|_| event.clone()).collect();
+        let ids: Vec<String> = (0..4).map(|i| format!("evt-{i}")).collect();
+        let (sql, args) = build_event_upsert_if_owner_sql(
+            &events,
+            "2026-08-17T12:00:00Z",
+            ids,
+            "cal-1",
+            "owner-a",
+        );
+
+        // 4 * 23 row binds + 3 fence binds.
+        assert_eq!(args.len(), 4 * 23 + 3);
+        assert_eq!(sql.matches('?').count(), 4 * 23 + 3);
+        assert!(4 * 23 + 3 <= 100);
+        assert_eq!(args[0], "evt-0");
+        assert_eq!(args[23], "evt-1");
+        assert_eq!(args[23 * 3], "evt-3");
+        assert_eq!(args[4 * 23], "cal-1");
+        assert_eq!(args[4 * 23 + 1], "owner-a");
+        assert_eq!(args[4 * 23 + 2], "2026-08-17T12:00:00Z");
     }
 
     #[test]
