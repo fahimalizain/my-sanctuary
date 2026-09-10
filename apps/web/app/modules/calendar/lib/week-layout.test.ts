@@ -24,6 +24,8 @@ import {
   eventTopPx,
   fitPeriodStart,
   formatDayRangeTitle,
+  formatEventDateLine,
+  formatEventDuration,
   formatWeekTitle,
   gutterWithRemainder,
   contrastingInk,
@@ -767,6 +769,64 @@ test('dateOnDay: 9:00 on a known local date', () => {
   assert.equal(at9.getHours(), 9);
   assert.equal(at9.getMinutes(), 0);
   assert.equal(at9.getSeconds(), 0);
+});
+
+// ── formatEventDuration ─────────────────────────────────────────────────
+
+test('formatEventDuration: 15 minutes → "15min"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 5, 15);
+  assert.equal(formatEventDuration(start, end), '15min');
+});
+
+test('formatEventDuration: exactly 60 minutes → "1h"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 0);
+  assert.equal(formatEventDuration(start, end), '1h');
+});
+
+test('formatEventDuration: 90 minutes → "1h 30min"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 30);
+  assert.equal(formatEventDuration(start, end), '1h 30min');
+});
+
+test('formatEventDuration: 5 hours → "5h"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 10, 0);
+  assert.equal(formatEventDuration(start, end), '5h');
+});
+
+test('formatEventDuration: zero-length → "0min"', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  assert.equal(formatEventDuration(start, start), '0min');
+});
+
+test('formatEventDuration: inverted range clamps to "0min"', () => {
+  const start = new Date(2026, 8, 13, 6, 0);
+  const end = new Date(2026, 8, 13, 5, 0);
+  assert.equal(formatEventDuration(start, end), '0min');
+});
+
+// ── formatEventDateLine ─────────────────────────────────────────────────
+
+test('formatEventDateLine: same civil day Sunday Sep 13 2026', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 6, 30);
+  assert.equal(formatEventDateLine(start, end), 'Sun Sep 13');
+});
+
+test('formatEventDateLine: cross midnight uses arrow between civil dates', () => {
+  const start = new Date(2026, 8, 13, 22, 0);
+  const end = new Date(2026, 8, 14, 0, 30);
+  assert.equal(formatEventDateLine(start, end), 'Sun Sep 13 → Mon Sep 14');
+});
+
+test('formatEventDateLine: Monday uses Sun-first names (not WEEK_DAYS)', () => {
+  // 2026-09-07 is a Monday.
+  const start = new Date(2026, 8, 7, 9, 0);
+  const end = new Date(2026, 8, 7, 10, 0);
+  assert.equal(formatEventDateLine(start, end), 'Mon Sep 7');
 });
 
 // ── defaultWritableCalendar ─────────────────────────────────────────────
