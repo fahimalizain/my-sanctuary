@@ -1,5 +1,9 @@
 use super::support::*;
-use crate::calendar::{list_events, parse_event_time_range, sync_calendar};
+use crate::calendar::{
+    list_events, list_events_after_refresh_failure, parse_event_time_range, sync_calendar,
+};
+use crate::oauth::HttpError;
+use crate::token::TokenError;
 
 // ──────────────────────────────────────────
 // parse_event_time_range
@@ -735,5 +739,196 @@ fn sync_error_does_not_fail_the_whole_listing() {
     assert_eq!(
         calendars.stored.lock().unwrap()[0].dirty_requested_generation,
         1
+    );
+}
+
+// ──────────────────────────────────────────
+// list_events_after_refresh_failure
+// ──────────────────────────────────────────
+
+fn ready_synced_calendar(id: &str, google_cal_id: &str, sync_enabled: bool) -> crate::models::GoogleCalendar {
+    let mut cal = calendar(id, google_cal_id, sync_enabled);
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    cal.sync_status = "ready".to_string();
+    cal.sync_token = "cursor-secret-xyz".to_string();
+    cal
+}
+
+#[test]
+fn refresh_failure_revoked_grant_serves_cache_and_stamps_auth_required() {
+    let mut enabled = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let success_before = enabled.last_success_at.clone();
+    let token_before = enabled.sync_token.clone();
+
+    let calendars = FakeCalendarRepo::with(vec![enabled, disabled]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let refresh_err = TokenError::Http(HttpError::Message(
+        "POST https://oauth2.googleapis.com/token returned 400".into(),
+    ));
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.events.len(), 1);
+    assert_eq!(output.events[0].id, "evt-local-1");
+    assert_eq!(output.events[0].title, "Standup");
+    assert_eq!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    let enabled_view = output
+        .sync
+        .calendars
+        .iter()
+        .find(|c| c.calendar_id == "cal-1")
+        .expect("enabled calendar in envelope");
+    assert_eq!(
+        enabled_view.state,
+        crate::calendar_sync::CalendarReplicaState::AuthorizationRequired
+    );
+    assert_eq!(enabled_view.error_code.as_deref(), Some("auth_revoked"));
+
+    let stored = calendars.stored.lock().unwrap();
+    let cal1 = stored.iter().find(|c| c.id == "cal-1").unwrap();
+    assert_eq!(cal1.sync_status, "authorization_required");
+    assert_eq!(cal1.last_error_code, "auth_revoked");
+    assert_eq!(cal1.sync_token, token_before, "cursor must not move");
+    assert_eq!(cal1.last_success_at, success_before, "success must not move");
+    let cal_disabled = stored.iter().find(|c| c.id == "cal-disabled").unwrap();
+    assert_ne!(
+        cal_disabled.sync_status, "authorization_required",
+        "disabled calendars are not stamped"
+    );
+    assert_eq!(cal_disabled.sync_status, "ready");
+
+    let json = serde_json::to_string(&output.sync).unwrap();
+    assert!(!json.contains("cursor-secret-xyz"), "{json}");
+    assert!(!json.contains("invalid_grant"), "{json}");
+    assert!(!json.contains("access_token"), "{json}");
+    assert!(!json.contains("raw_json"), "{json}");
+    assert!(!json.contains("ya29."), "{json}");
+}
+
+#[test]
+fn refresh_failure_no_token_does_not_stamp() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &TokenError::NoToken,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.events.len(), 1);
+    assert_ne!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::Ready
+    );
+    assert_ne!(
+        calendars.stored.lock().unwrap()[0].sync_status,
+        "authorization_required"
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_status, "ready");
+}
+
+#[test]
+fn refresh_failure_no_refresh_token_does_not_stamp() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &TokenError::NoRefreshToken,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.events.len(), 1);
+    assert_ne!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].sync_status,
+        "ready"
+    );
+}
+
+#[test]
+fn refresh_failure_revoked_grant_empty_cache_still_ok() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+
+    let refresh_err = TokenError::Http(HttpError::Message("invalid_grant".into()));
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert!(output.events.is_empty());
+    assert_eq!(output.source, "cache");
+    assert_eq!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].error_code.as_deref(),
+        Some("auth_revoked")
     );
 }

@@ -1,4 +1,5 @@
 use super::catalog::refresh_calendar_list;
+use super::cron::stamp_auth_revoked_for_user;
 use super::sync::{events_sync_envelope, EventsSyncEnvelope};
 use super::watch::{ensure_watch, is_public_https_callback, stop_watches_for_calendar};
 use super::window::fetch_and_apply_window;
@@ -7,7 +8,7 @@ use crate::models::CalendarEvent;
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventRepo, CalendarRepo, WatchChannelRepo};
 use crate::time::{add_months_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
-use crate::token::GoogleAccess;
+use crate::token::{is_refresh_auth_revoked, GoogleAccess, TokenError};
 
 /// Result of [`list_events`]: the cached (and/or window) events, per-calendar
 /// sync errors for the caller to log (failures never fail the whole listing),
@@ -237,6 +238,53 @@ pub async fn list_events(
         sync_errors,
         sync,
         source,
+    })
+}
+
+/// Serve cached events after a Google token refresh failure.
+///
+/// No Google HTTP, no access token. On a revoked grant
+/// ([`is_refresh_auth_revoked`]) stamps `authorization_required` on the
+/// user's sync-enabled calendars; on [`TokenError::NoToken`] /
+/// [`TokenError::NoRefreshToken`] serves cache without flipping health.
+/// Stamp failures are collected in `sync_errors` and never fail the listing.
+/// `source` is always `"cache"`.
+pub async fn list_events_after_refresh_failure(
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    user_id: &str,
+    start_rfc3339: &str,
+    end_rfc3339: &str,
+    now_unix: i64,
+    refresh_err: &TokenError,
+) -> Result<CalendarListOutput, CalendarError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let mut sync_errors: Vec<String> = Vec::new();
+
+    if is_refresh_auth_revoked(refresh_err) {
+        sync_errors.extend(
+            stamp_auth_revoked_for_user(calendars, user_id, now_unix, &now_rfc3339).await,
+        );
+    }
+
+    // Post-stamp snapshot for the envelope fallback.
+    let cals = calendars.list_by_user_id(user_id).await?;
+
+    let cached = events
+        .list_by_user_id_and_time_range(user_id, start_rfc3339, end_rfc3339)
+        .await?;
+
+    let fresh = match calendars.list_by_user_id(user_id).await {
+        Ok(rows) => rows,
+        Err(_) => cals,
+    };
+    let sync = events_sync_envelope(&fresh, now_unix);
+
+    Ok(CalendarListOutput {
+        events: cached,
+        sync_errors,
+        sync,
+        source: "cache".to_string(),
     })
 }
 
