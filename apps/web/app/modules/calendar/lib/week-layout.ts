@@ -453,7 +453,9 @@ export function toDateInputValue(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-function parseTimeInput(hhmm: string): { hours: number; minutes: number } | null {
+function parseTimeInput(
+  hhmm: string,
+): { hours: number; minutes: number } | null {
   const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
   if (!match) return null;
   const hours = Number(match[1]);
@@ -534,9 +536,7 @@ export function applyEndTime(
   if (newEnd.getTime() <= start.getTime()) {
     return {
       start: new Date(start.getTime()),
-      end: new Date(
-        start.getTime() + INSPECTOR_MIN_DURATION_MIN * 60_000,
-      ),
+      end: new Date(start.getTime() + INSPECTOR_MIN_DURATION_MIN * 60_000),
     };
   }
   return { start: new Date(start.getTime()), end: newEnd };

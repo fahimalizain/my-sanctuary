@@ -399,10 +399,7 @@ test('description: writable textarea shows non-empty value', () => {
 
 test('description commit: trim on blur; unchanged no-op; clear commits empty', () => {
   const spies = makeSpies();
-  mount(
-    { event: makeEvent({ id: 'e3', description: 'Bring snacks' }) },
-    spies,
-  );
+  mount({ event: makeEvent({ id: 'e3', description: 'Bring snacks' }) }, spies);
 
   const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
   assert.equal(ta.value, 'Bring snacks');
@@ -464,7 +461,10 @@ test('calendar select same value is a no-op', () => {
 
 test('read-only calendar row has no select; static summary remains', () => {
   mount({
-    calendar: makeCalendar({ access_role: 'reader', summary: 'Personal Goals' }),
+    calendar: makeCalendar({
+      access_role: 'reader',
+      summary: 'Personal Goals',
+    }),
     calendars: defaultCalendars(),
   });
   assert.equal(screen.queryByLabelText('Calendar'), null);

@@ -336,8 +336,7 @@ export function useCalendarSession({
               (local.description ?? '') !== postedDescription;
             const startDiffers = local.start_time !== startIso;
             const endDiffers = local.end_time !== endIso;
-            const allDayDiffers =
-              Boolean(local.is_all_day) !== postedAllDay;
+            const allDayDiffers = Boolean(local.is_all_day) !== postedAllDay;
             const zoneDiffers =
               (local.start_time_zone?.trim() || '') !== postedZone;
             const calendarDiffers =
@@ -404,7 +403,10 @@ export function useCalendarSession({
                   (local.start_time_zone?.trim() || '') &&
                 ev.calendar_id === local.calendar_id;
 
-              const overlayMatchesServer = (ev: CalendarEvent, server: CalendarEvent) =>
+              const overlayMatchesServer = (
+                ev: CalendarEvent,
+                server: CalendarEvent,
+              ) =>
                 ev.title === server.title &&
                 ev.description === server.description &&
                 ev.start_time === server.start_time &&
@@ -438,7 +440,10 @@ export function useCalendarSession({
                     if (
                       !patchAfter ||
                       (patchAfter.op === 'upsert' &&
-                        overlayMatchesServer(patchAfter.event, moveResult.event))
+                        overlayMatchesServer(
+                          patchAfter.event,
+                          moveResult.event,
+                        ))
                     ) {
                       queue.clear(serverId);
                     }
@@ -918,9 +923,7 @@ export function useCalendarSession({
         start_time: next.startIso,
         end_time: next.endIso,
         // All-day is civil dates; clear zones on the overlay when switching on.
-        ...(next.isAllDay
-          ? { start_time_zone: '', end_time_zone: '' }
-          : {}),
+        ...(next.isAllDay ? { start_time_zone: '', end_time_zone: '' } : {}),
       };
       queue.upsert(painted);
 

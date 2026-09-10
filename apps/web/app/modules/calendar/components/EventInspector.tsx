@@ -308,8 +308,7 @@ function InspectorForm({
   const zoneOptions = timeZoneOptions(timeZone);
   // Writable: always show All-day toggle; zone select when timed.
   // Read-only: static chips only when set.
-  const showChipRow =
-    writable || isAllDay || Boolean(timeZone) || showRepeat;
+  const showChipRow = writable || isAllDay || Boolean(timeZone) || showRepeat;
 
   const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
@@ -328,9 +327,9 @@ function InspectorForm({
       : writableCalendars;
 
   const allDayDateValue = isAllDay
-    ? (civilDateFromAllDayIso(event.start_time)
-        ? toDateInputValue(civilDateFromAllDayIso(event.start_time)!)
-        : toDateInputValue(start))
+    ? civilDateFromAllDayIso(event.start_time)
+      ? toDateInputValue(civilDateFromAllDayIso(event.start_time)!)
+      : toDateInputValue(start)
     : toDateInputValue(start);
 
   return (
@@ -596,11 +595,7 @@ function InspectorForm({
                     : cal.google_calendar_id;
                 const disabledOption = !isWritableCalendar(cal);
                 return (
-                  <option
-                    key={cal.id}
-                    value={cal.id}
-                    disabled={disabledOption}
-                  >
+                  <option key={cal.id} value={cal.id} disabled={disabledOption}>
                     {label}
                   </option>
                 );
