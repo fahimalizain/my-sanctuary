@@ -171,7 +171,8 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                             return;
                         }
                     };
-                    match api_core::sync_calendar(
+                    let started_ms = worker::Date::now().as_millis() as i64;
+                    let result = api_core::sync_calendar_traced(
                         &crate::http::WorkerHttp,
                         &calendars,
                         &events,
@@ -179,9 +180,21 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                         &access,
                         &calendar,
                         &now_rfc3339,
+                        api_core::ReplicaWalkMeta {
+                            run_id: api_core::mint_run_id(),
+                            trigger: api_core::ReplicaWalkTrigger::Webhook,
+                            deployed_version: env!("APP_VERSION").to_string(),
+                            // Avoid from_parts mixing Date-ms with rfc3339-ms.
+                            started_unix_ms: 0,
+                        },
                     )
-                    .await
-                    {
+                    .await;
+                    let finished_ms = worker::Date::now().as_millis() as i64;
+                    crate::sync_log::emit_replica_walk(
+                        result.diagnostic,
+                        Some(finished_ms.saturating_sub(started_ms).max(0)),
+                    );
+                    match result.outcome {
                         Ok(api_core::SyncCalendarOutcome::Published) => {
                             crate::user_hub::notify_user(
                                 &env,
@@ -196,9 +209,9 @@ pub async fn notifications(req: Request, env: Env, ctx: Context) -> Result<Respo
                                 calendar.id
                             );
                         }
-                        Err(err) => {
+                        Err(_) => {
                             console_log!(
-                                "calendar webhook: background sync for {} failed: {err}",
+                                "calendar webhook: background sync for {} failed (see replica_walk diagnostic)",
                                 calendar.id
                             );
                         }

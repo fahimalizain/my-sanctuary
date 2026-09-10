@@ -7,6 +7,7 @@ mod db;
 mod http;
 mod lists;
 mod routines;
+mod sync_log;
 mod tasks;
 mod user_hub;
 
