@@ -48,6 +48,7 @@ import {
   visibleStartIndex,
   weekRangeIso,
   snapMinutes,
+  RESIZE_SNAP_MINUTES,
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
@@ -733,6 +734,22 @@ test('snapMinutes: nearest 15, clamp 0..1440', () => {
   assert.equal(snapMinutes(-5), 0);
   assert.equal(snapMinutes(0), 0);
   assert.equal(snapMinutes(15), 15);
+});
+
+test('snapMinutes: optional 1-minute step (resize)', () => {
+  // nearest 1-minute
+  assert.equal(snapMinutes(10 * 60 + 7.4, RESIZE_SNAP_MINUTES), 607);
+  assert.equal(snapMinutes(10 * 60 + 7.6, RESIZE_SNAP_MINUTES), 608);
+  // contrast with default 15
+  assert.equal(snapMinutes(7, 1), 7);
+  assert.equal(snapMinutes(8, 1), 8);
+  // default arity still 15
+  assert.equal(snapMinutes(7), 0);
+  assert.equal(snapMinutes(8), 15);
+  // clamp
+  assert.equal(snapMinutes(-5, 1), 0);
+  assert.equal(snapMinutes(1440, 1), 1440);
+  assert.equal(snapMinutes(1440.2, 1), 1440);
 });
 
 test('minutesFromY: 88px at hourH=88 → 60', () => {

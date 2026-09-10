@@ -27,6 +27,8 @@ export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
 /** Snap click-to-create / drag start times to this many minutes. */
 export const SNAP_MINUTES = 15;
+/** Snap resize active-edge times to this many minutes. */
+export const RESIZE_SNAP_MINUTES = 1;
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
 
@@ -675,13 +677,14 @@ export function startOfDay(date: Date): Date {
 // ── Click-to-create geometry ────────────────────────────────────────────
 
 /**
- * Snap minutes-since-midnight to the nearest `SNAP_MINUTES` boundary.
- * Clamped to `[0, 1440]`; 1440 stays 1440 (end-of-day sentinel).
+ * Snap minutes-since-midnight to the nearest `step` boundary
+ * (default `SNAP_MINUTES`). Clamped to `[0, 1440]`; 1440 stays 1440.
  */
-export function snapMinutes(min: number): number {
+export function snapMinutes(min: number, step = SNAP_MINUTES): number {
   if (!Number.isFinite(min) || min <= 0) return 0;
   if (min >= MINUTES_PER_DAY) return MINUTES_PER_DAY;
-  return Math.round(min / SNAP_MINUTES) * SNAP_MINUTES;
+  const grid = Number.isFinite(step) && step > 0 ? step : SNAP_MINUTES;
+  return Math.round(min / grid) * grid;
 }
 
 /** Convert a Y offset (px) within the hours area to minutes since midnight. */
