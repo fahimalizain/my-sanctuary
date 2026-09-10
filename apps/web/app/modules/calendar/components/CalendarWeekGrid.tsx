@@ -110,7 +110,7 @@ export function CalendarWeekGrid({
       <div
         ref={scrollerRef}
         data-calendar-scroller
-        className="flex-1 min-h-0 overflow-auto touch-pan-x touch-pan-y [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        className="flex-1 min-h-0 overflow-auto [touch-action:pan-x_pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
         onScroll={onScroll}
       >
         {/* Content: sticky headers + all-day + hours strip */}

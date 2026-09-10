@@ -108,24 +108,18 @@ export function useCalendarZoom(options: {
       onPinchEndRef?.current?.();
     };
 
-    const onPointerDown = (e: PointerEvent) => {
-      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (pointers.size === 2 && !pinchActive) {
-        const pts = [...pointers.values()];
-        const originDist = pinchDistance(pts[0], pts[1]);
-        pinchOrigin = {
-          originHourH: hourHRef.current,
-          originDist,
-        };
-        pinchActive = true;
-        onPinchStartRef?.current?.();
-      }
-    };
+    // Move/up/cancel on window so pinch survives fingers sliding off the
+    // scroller (sidebar, header chrome, past the edge). pointerdown stays
+    // on the scroller so we only track fingers that land on the calendar.
+    // Do not use setPointerCapture — it synthesizes leave/out and fights
+    // the existing drag capture.
+    let windowBound = false;
 
     const onPointerMove = (e: PointerEvent) => {
       if (!pointers.has(e.pointerId)) return;
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
+      // preventDefault only while pinching — one-finger moves must scroll.
       if (pointers.size !== 2 || !pinchOrigin) return;
 
       e.preventDefault();
@@ -143,8 +137,42 @@ export function useCalendarZoom(options: {
     const onPointerEnd = (e: PointerEvent) => {
       if (!pointers.has(e.pointerId)) return;
       pointers.delete(e.pointerId);
-      if (pointers.size < 2) {
-        endPinchIfNeeded();
+      if (pointers.size < 2) endPinchIfNeeded();
+      if (pointers.size === 0) unbindWindow();
+    };
+
+    const bindWindow = () => {
+      if (windowBound) return;
+      windowBound = true;
+      window.addEventListener('pointermove', onPointerMove, {
+        capture: true,
+        passive: false,
+      });
+      window.addEventListener('pointerup', onPointerEnd, true);
+      window.addEventListener('pointercancel', onPointerEnd, true);
+    };
+
+    const unbindWindow = () => {
+      if (!windowBound) return;
+      windowBound = false;
+      window.removeEventListener('pointermove', onPointerMove, true);
+      window.removeEventListener('pointerup', onPointerEnd, true);
+      window.removeEventListener('pointercancel', onPointerEnd, true);
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      const wasEmpty = pointers.size === 0;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (wasEmpty) bindWindow();
+      if (pointers.size === 2 && !pinchActive) {
+        const pts = [...pointers.values()];
+        const originDist = pinchDistance(pts[0], pts[1]);
+        pinchOrigin = {
+          originHourH: hourHRef.current,
+          originDist,
+        };
+        pinchActive = true;
+        onPinchStartRef?.current?.();
       }
     };
 
@@ -153,23 +181,13 @@ export function useCalendarZoom(options: {
 
     el.addEventListener('wheel', onWheel, { passive: false });
     el.addEventListener('pointerdown', onPointerDown, true);
-    el.addEventListener('pointermove', onPointerMove, {
-      capture: true,
-      passive: false,
-    });
-    el.addEventListener('pointerup', onPointerEnd, true);
-    el.addEventListener('pointercancel', onPointerEnd, true);
-    el.addEventListener('pointerleave', onPointerEnd, true);
     el.addEventListener('gesturestart', killGesture, { passive: false });
     el.addEventListener('gesturechange', killGesture, { passive: false });
 
     return () => {
+      unbindWindow();
       el.removeEventListener('wheel', onWheel);
       el.removeEventListener('pointerdown', onPointerDown, true);
-      el.removeEventListener('pointermove', onPointerMove, true);
-      el.removeEventListener('pointerup', onPointerEnd, true);
-      el.removeEventListener('pointercancel', onPointerEnd, true);
-      el.removeEventListener('pointerleave', onPointerEnd, true);
       el.removeEventListener('gesturestart', killGesture);
       el.removeEventListener('gesturechange', killGesture);
     };
