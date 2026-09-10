@@ -12,6 +12,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::diagnostics::{
+    classify_operator_warning, OperatorWarningLevel, OperatorWarningThresholds,
+};
 use super::{CalendarError, WATCH_RENEW_HORIZON_SECS};
 use crate::models::{GoogleCalendar, WatchChannel};
 use crate::repo::{CalendarRepo, WatchChannelRepo};
@@ -222,6 +225,9 @@ pub struct CalendarSyncView {
     pub cache_revision: i64,
     /// Sanitized watch coverage; never channel secrets.
     pub watch_coverage: WatchCoverage,
+    /// Independent operator warning (1h stale / escalated / auth). Does not
+    /// change [`aggregate_sync_status`] rules.
+    pub operator_warning: OperatorWarningLevel,
 }
 
 /// SHA-256 hex (64 lowercase chars) of the canonical replica query string
@@ -498,6 +504,9 @@ pub fn calendar_sync_view(cal: &GoogleCalendar, now_unix: i64) -> CalendarSyncVi
 
     let initial_sync_complete = cal.initial_sync_complete || last_synced_parseable;
 
+    let operator_warning =
+        classify_operator_warning(cal, now_unix, &OperatorWarningThresholds::default());
+
     CalendarSyncView {
         calendar_id: cal.id.clone(),
         state,
@@ -510,6 +519,7 @@ pub fn calendar_sync_view(cal: &GoogleCalendar, now_unix: i64) -> CalendarSyncVi
         projection,
         cache_revision: cal.cache_revision,
         watch_coverage: WatchCoverage::from_stored(&cal.watch_coverage),
+        operator_warning,
     }
 }
 
@@ -590,6 +600,7 @@ mod tests {
             projection: REPLICA_PROJECTION.into(),
             cache_revision: 0,
             watch_coverage: WatchCoverage::Missing,
+            operator_warning: OperatorWarningLevel::None,
         }
     }
 
@@ -770,6 +781,12 @@ mod tests {
         assert!(json.contains("storage_transient"), "{json}");
         assert!(json.contains("\"watch_coverage\""), "{json}");
         assert!(json.contains("covered"), "{json}");
+        assert!(json.contains("\"operator_warning\""), "{json}");
+        assert!(
+            json.contains("\"operator_warning\":\"stale\""),
+            "{json}"
+        );
+        assert_eq!(view.operator_warning, OperatorWarningLevel::Stale);
         assert!(!json.contains("secret-sync-token-xyz"), "{json}");
         assert!(!json.contains("lease-secret-abc"), "{json}");
         assert!(!json.contains("sync_token"), "{json}");
@@ -792,6 +809,11 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains("\"watch_coverage\""), "{json}");
         assert!(json.contains("expiring"), "{json}");
+        assert!(json.contains("\"operator_warning\""), "{json}");
+        assert_eq!(
+            env.calendars[0].operator_warning,
+            OperatorWarningLevel::None
+        );
         assert!(!json.contains("secret-channel-token"), "{json}");
         assert!(!json.contains("resource_id"), "{json}");
         assert!(!json.contains("channel_id"), "{json}");

@@ -64,6 +64,7 @@
 
 
 pub mod apply;
+pub mod diagnostics;
 pub mod replica;
 pub mod repair;
 pub mod sync;
@@ -235,6 +236,12 @@ pub use webhook::{
 };
 pub use catalog::{list_calendars, list_calendars_after_refresh_failure};
 pub use cron::{
-    replica_due, run_fallback_cron, sync_calendar, CronReport, SyncCalendarOutcome,
+    replica_due, run_fallback_cron, sync_calendar, sync_calendar_traced, CronReport,
+    SyncCalendarOutcome, SyncCalendarResult,
+};
+pub use diagnostics::{
+    classify_operator_warning, mint_run_id, operator_warning_record, CheckpointResult,
+    OperatorWarningLevel, OperatorWarningRecord, OperatorWarningThresholds, ReplicaApplyReport,
+    ReplicaWalkDiagnostic, ReplicaWalkMeta, ReplicaWalkPhase, ReplicaWalkTrigger,
 };
 pub use repair::repair_inflight_operations;

@@ -1,4 +1,9 @@
 use super::catalog::refresh_calendar_list;
+use super::diagnostics::{
+    classify_operator_warning, mint_run_id, operator_warning_record, CheckpointResult,
+    OperatorWarningLevel, OperatorWarningRecord, OperatorWarningThresholds, ReplicaApplyReport,
+    ReplicaWalkDiagnostic, ReplicaWalkMeta, ReplicaWalkPhase, ReplicaWalkTrigger,
+};
 use super::labels::ensure_event_labels;
 use super::repair::repair_inflight_operations;
 use super::replica::{lease_expires_at, mint_lease_owner, sync_replica};
@@ -37,6 +42,19 @@ pub struct CronReport {
     /// Never includes failures or [`SyncCalendarOutcome::LeaseBusy`]. Worker
     /// notifies from this list **after** D1 is updated.
     pub published: Vec<(String, String)>,
+    /// Per-walk structured diagnostics for replica attempts this tick.
+    /// Never contains tokens, URLs, or event bodies.
+    pub diagnostics: Vec<ReplicaWalkDiagnostic>,
+    /// Non-`None` operator warnings for living sync-enabled calendars
+    /// (including `authorization_required`, which [`replica_due`] skips).
+    pub warnings: Vec<OperatorWarningRecord>,
+}
+
+/// Outcome + structured diagnostic from [`sync_calendar_traced`].
+#[derive(Debug)]
+pub struct SyncCalendarResult {
+    pub outcome: Result<SyncCalendarOutcome, CalendarError>,
+    pub diagnostic: ReplicaWalkDiagnostic,
 }
 
 /// Outcome of a successful [`sync_calendar`] call (errors use [`CalendarError`]).
@@ -299,7 +317,7 @@ pub async fn run_fallback_cron(
             let due = replica_due(cal, now_unix);
             if due && replica_attempts < CRON_MAX_REPLICA_CALENDARS {
                 replica_attempts += 1;
-                match sync_calendar(
+                let traced = sync_calendar_traced(
                     http,
                     calendars,
                     events,
@@ -307,9 +325,16 @@ pub async fn run_fallback_cron(
                     &access,
                     cal,
                     &now_rfc3339,
+                    ReplicaWalkMeta {
+                        run_id: mint_run_id(),
+                        trigger: ReplicaWalkTrigger::Cron,
+                        deployed_version: String::new(),
+                        started_unix_ms: now_unix.saturating_mul(1000),
+                    },
                 )
-                .await
-                {
+                .await;
+                report.diagnostics.push(traced.diagnostic);
+                match traced.outcome {
                     Ok(SyncCalendarOutcome::Published) => {
                         report.synced += 1;
                         report
@@ -479,7 +504,38 @@ pub async fn run_fallback_cron(
     )
     .await;
 
+    // Operator warnings for every living sync-enabled calendar — including
+    // `authorization_required` (which replica_due skips) and calendars that
+    // were not replica-due this tick (fresh dirty/retry gates but stale age).
+    collect_operator_warnings(calendars, now_unix, &mut report).await;
+
     report
+}
+
+/// Push non-`None` operator warnings for all living sync-enabled calendars.
+async fn collect_operator_warnings(
+    calendars: &dyn CalendarRepo,
+    now_unix: i64,
+    report: &mut CronReport,
+) {
+    let thresholds = OperatorWarningThresholds::default();
+    let cals = match calendars.list_sync_enabled().await {
+        Ok(cals) => cals,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("list_sync_enabled for operator warnings failed: {err}"));
+            return;
+        }
+    };
+    for cal in cals {
+        let level = classify_operator_warning(&cal, now_unix, &thresholds);
+        if level != OperatorWarningLevel::None {
+            report
+                .warnings
+                .push(operator_warning_record(&cal, level, now_unix));
+        }
+    }
 }
 
 /// Retry `channels.stop` for watch rows whose calendar is disabled or
@@ -599,6 +655,10 @@ async fn stop_leftover_watch_channels(
 /// Full or incremental sync of one calendar via the fenced replica walk
 /// ([`crate::calendar_replica::sync_replica`], ADR 0005).
 ///
+/// Thin wrapper around [`sync_calendar_traced`] with
+/// [`ReplicaWalkTrigger::Unspecified`] and empty version / zero start time
+/// so existing call sites keep the same signature.
+///
 /// - Attempt is stamped **before** lease acquire / any Google fetch.
 /// - A busy (unexpired foreign) lease is a quiet
 ///   [`SyncCalendarOutcome::LeaseBusy`] — not a failure, does not mark dirty
@@ -627,10 +687,112 @@ pub async fn sync_calendar(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
+    let result = sync_calendar_traced(
+        http,
+        calendars,
+        events,
+        operations,
+        access,
+        cal,
+        now_rfc3339,
+        ReplicaWalkMeta {
+            run_id: mint_run_id(),
+            trigger: ReplicaWalkTrigger::Unspecified,
+            deployed_version: String::new(),
+            started_unix_ms: 0,
+        },
+    )
+    .await;
+    result.outcome
+}
+
+/// Like [`sync_calendar`], but returns a structured [`ReplicaWalkDiagnostic`]
+/// alongside the outcome for logging / CronReport.
+pub async fn sync_calendar_traced(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    now_rfc3339: &str,
+    meta: ReplicaWalkMeta,
+) -> SyncCalendarResult {
+    let mut report = ReplicaApplyReport::default();
+    report.phase = ReplicaWalkPhase::LeaseAcquire;
+
+    let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
+    let finished_unix_ms = if meta.started_unix_ms == 0 {
+        0
+    } else {
+        now_unix.saturating_mul(1000)
+    };
+
+    let outcome = sync_calendar_traced_inner(
+        http,
+        calendars,
+        events,
+        operations,
+        access,
+        cal,
+        now_rfc3339,
+        now_unix,
+        &mut report,
+    )
+    .await;
+
+    let error_category = match &outcome {
+        Ok(SyncCalendarOutcome::Published) => {
+            report.phase = ReplicaWalkPhase::Done;
+            // sync_replica already set Published; keep it.
+            None
+        }
+        Ok(SyncCalendarOutcome::LeaseBusy) => {
+            report.phase = ReplicaWalkPhase::LeaseAcquire;
+            report.checkpoint = CheckpointResult::LeaseBusy;
+            None
+        }
+        Err(err) => {
+            let code = match err {
+                CalendarError::InvalidResponse(msg)
+                    if msg.contains("missing nextSyncToken") =>
+                {
+                    SyncErrorCode::MissingSyncToken
+                }
+                _ => classify_sync_error(err),
+            };
+            Some(code)
+        }
+    };
+
+    let diagnostic = ReplicaWalkDiagnostic::from_parts(
+        &meta,
+        cal.id.clone(),
+        &report,
+        error_category,
+        finished_unix_ms,
+    );
+
+    SyncCalendarResult {
+        outcome,
+        diagnostic,
+    }
+}
+
+async fn sync_calendar_traced_inner(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    now_rfc3339: &str,
+    now_unix: i64,
+    report: &mut ReplicaApplyReport,
+) -> Result<SyncCalendarOutcome, CalendarError> {
     calendars
         .record_sync_attempt(&cal.id, now_rfc3339)
         .await?;
-    let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
 
     let owner = mint_lease_owner();
     let expires = lease_expires_at(now_rfc3339);
@@ -645,6 +807,7 @@ pub async fn sync_calendar(
     // Re-read cursor/fingerprint under the lease (not the stale snapshot).
     // Snapshot dirty generation at start so mid-run bumps stay dirty.
     let body_result = async {
+        report.phase = ReplicaWalkPhase::Fetch;
         let fresh = calendars
             .get_by_id(&cal.id)
             .await?
@@ -661,6 +824,7 @@ pub async fn sync_calendar(
             &fresh,
             &owner,
             now_rfc3339,
+            report,
         )
         .await?;
         Ok::<i64, CalendarError>(dirty_snapshot)
@@ -671,6 +835,21 @@ pub async fn sync_calendar(
     let _ = calendars
         .release_lease(&cal.id, &owner, now_rfc3339)
         .await;
+    if report.phase != ReplicaWalkPhase::Done {
+        // Mark release unless the walk already finished cleanly inside
+        // sync_replica (checkpoint Published). Outer layer sets Done on Ok.
+        if matches!(
+            report.checkpoint,
+            CheckpointResult::Published
+                | CheckpointResult::MissingSyncToken
+                | CheckpointResult::LeaseLost
+                | CheckpointResult::Error
+        ) {
+            // Keep the walk's terminal phase (Checkpoint/Apply/Fetch).
+        } else {
+            report.phase = ReplicaWalkPhase::Release;
+        }
+    }
 
     match body_result {
         Ok(dirty_snapshot) => {
@@ -691,6 +870,11 @@ pub async fn sync_calendar(
                 }
                 _ => classify_sync_error(&err),
             };
+            // If the walk never set a checkpoint (e.g. ensure_event_labels
+            // failed before fetch), stamp Error so diagnostics are complete.
+            if report.checkpoint == CheckpointResult::NotAttempted {
+                report.checkpoint = CheckpointResult::Error;
+            }
             match persist_sync_failure(calendars, cal, code, now_unix, now_rfc3339).await {
                 Ok(()) => Err(err),
                 Err(persist_err) => Err(persist_err),
