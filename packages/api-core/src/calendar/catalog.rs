@@ -247,13 +247,10 @@ pub(crate) async fn refresh_calendar_list(
         break;
     }
 
-    // Backfill the event-label cache: newly imported rows start with an empty
-    // `event_labels` (cache miss), so fetch + persist it right away.
+    // Ensure event-label cache is populated / refreshed (empty or stale).
     let imported = calendars.list_by_user_id(user_id).await?;
     for cal in &imported {
-        if cal.event_labels.is_empty() {
-            ensure_event_labels(http, calendars, access, cal, now_rfc3339).await?;
-        }
+        ensure_event_labels(http, calendars, access, cal, now_rfc3339).await?;
     }
     Ok(new_local_ids)
 }

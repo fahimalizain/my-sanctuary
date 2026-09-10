@@ -209,8 +209,9 @@ fn calendar_get_without_label_properties_stores_empty_array() {
 
 #[test]
 fn sync_skips_calendars_get_when_label_cache_is_filled() {
-    // Both variants of a filled cache — `"[]"` (fetched, no labels) and a
-    // non-empty JSON array — must skip the `calendars.get` backfill.
+    // Both variants of a filled *fresh* cache — `"[]"` (fetched, no labels)
+    // and a non-empty JSON array — must skip the `calendars.get` backfill.
+    // `calendar()` stamps a fresh `event_labels_updated_at`.
     let mut empty_labels = calendar("cal-1", "primary@example.com", true);
     empty_labels.event_labels = "[]".to_string();
     let mut filled_labels = calendar("cal-2", "work@example.com", true);
@@ -240,6 +241,51 @@ fn sync_skips_calendars_get_when_label_cache_is_filled() {
         calendars.label_updates.lock().unwrap().is_empty(),
         "no label writes"
     );
+}
+
+#[test]
+fn sync_refreshes_stale_label_cache() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.event_labels = r##"[{"id":"old","backgroundColor":"#616161"}]"##.to_string();
+    cal.event_labels_updated_at = Some("2020-01-01T00:00:00Z".to_string());
+
+    let labels_body = r##"{"labelProperties":{"eventLabels":[
+        {"id":"new","backgroundColor":"#ac725e"}
+    ]}}"##;
+    let http = FakeHttp::new(vec![
+        ("/events", 200, EVENTS_JSON),
+        ("/calendars/", 200, labels_body),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    let now = "2023-11-14T22:13:20Z";
+
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        now,
+    ))
+    .unwrap();
+
+    let gets = http.gets.lock().unwrap();
+    assert!(
+        gets.iter()
+            .any(|url| url.contains("/calendars/primary%40example.com") && !url.contains("/events")),
+        "stale cache must trigger bare calendars.get: {gets:?}"
+    );
+    assert!(
+        gets.iter().any(|url| url.contains("/events")),
+        "events.list still runs: {gets:?}"
+    );
+
+    let expected = r##"[{"id":"new","backgroundColor":"#ac725e"}]"##;
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].event_labels, expected);
+    assert_eq!(stored[0].event_labels_updated_at.as_deref(), Some(now));
 }
 
 #[test]

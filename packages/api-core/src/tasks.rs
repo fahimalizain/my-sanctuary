@@ -4362,6 +4362,7 @@ mod tests {
             // The 24 seeded labels with stable fake ids — tasks never syncs,
             // so this is the cache `create_event` resolves colors against.
             event_labels: event_labels_json(),
+            event_labels_updated_at: Some("2026-08-17T00:00:00Z".to_string()),
             sync_query_fingerprint: String::new(),
             sync_status: String::new(),
             initial_sync_complete: false,
@@ -4559,13 +4560,14 @@ mod tests {
             &self,
             id: &str,
             event_labels_json: &str,
-            _now_rfc3339: &str,
+            now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             // Persist into the in-memory rows (tasks never reads it back, but
             // the fake must mirror the D1 write).
             let mut stored = self.stored.lock().unwrap();
             if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                 cal.event_labels = event_labels_json.to_string();
+                cal.event_labels_updated_at = Some(now_rfc3339.to_string());
             }
             Ok(())
         }

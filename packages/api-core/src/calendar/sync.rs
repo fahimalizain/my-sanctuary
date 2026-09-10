@@ -449,6 +449,7 @@ mod tests {
             sync_token: String::new(),
             last_synced_at: None,
             event_labels: "[]".to_string(),
+            event_labels_updated_at: Some("2026-08-17T00:00:00Z".to_string()),
             sync_query_fingerprint: String::new(),
             sync_status: String::new(),
             initial_sync_complete: false,

@@ -40,8 +40,14 @@ pub struct GoogleCalendar {
     pub last_synced_at: Option<String>,
     /// Cached `calendars.get` `labelProperties.eventLabels` JSON.
     /// Empty string = never fetched. `"[]"` or `[{id, backgroundColor}]` = fetched.
+    /// Freshness is tracked by [`GoogleCalendar::event_labels_updated_at`]
+    /// (not by whether this string is non-empty).
     #[serde(default, deserialize_with = "de_empty_string")]
     pub event_labels: String,
+    /// RFC 3339 instant of the last successful event-label fetch.
+    /// `None` = never stamped (treat as stale).
+    #[serde(default)]
+    pub event_labels_updated_at: Option<String>,
     /// Hash/canonical string of the replica query shape (singleEvents,
     /// optional timeMin, eventTypes). Empty until the first successful sync
     /// records it.
