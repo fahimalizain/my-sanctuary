@@ -57,8 +57,8 @@ pub use calendar_sync::{
     aggregate_sync_status, calendar_sync_view, classify_sync_error, classify_watch_coverage,
     events_sync_envelope, next_retry_rfc3339, next_retry_unix, refresh_watch_coverage,
     replica_query_fingerprint, replica_state_for_error, CalendarReplicaState, CalendarSyncView,
-    EventsSyncEnvelope, SyncAggregateStatus, SyncErrorCode, WatchCoverage, REPLICA_PROJECTION,
-    SYNC_HEALTH_STALE_SECS,
+    EventCoverage, EventsSyncEnvelope, SyncAggregateStatus, SyncErrorCode, WatchCoverage,
+    REPLICA_PROJECTION, SYNC_HEALTH_STALE_SECS,
 };
 pub use calendar_color::{
     calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,

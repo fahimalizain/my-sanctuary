@@ -15,13 +15,15 @@ use api_core::repo::{
     CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
     CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
-    CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
-    CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
-    EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL,
-    EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
-    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
+    CALENDAR_SET_EVENT_COVERAGE_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL,
+    CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL, EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL,
+    EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
+    EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
+    EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
+    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_QUARANTINE_SQL,
+    OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
     OPERATION_UPDATE_STATUS_SQL, REPLICA_SEEN_INSERT_CHUNK_SIZE,
     WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
@@ -441,6 +443,25 @@ impl CalendarRepo for D1CalendarRepo {
         run_stmt(stmt).await
     }
 
+    async fn set_event_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Binds: coverage, now, id.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_SET_EVENT_COVERAGE_SQL)
+            .bind_refs(&[
+                D1Type::Text(coverage),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
         let stmt = self
             .db
@@ -792,6 +813,42 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             .map_err(backend)?;
         let held: Option<LeaseHeldRow> = probe.first(None).await.map_err(backend)?;
         Ok(held.is_some())
+    }
+
+    async fn upsert_quarantine(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        phase: &str,
+        error_class: &str,
+        replay_payload: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Binds: calendar_id, google_event_id, phase, error_class,
+        // replay_payload, first_seen_at, last_attempt_at.
+        let stmt = self
+            .db
+            .prepare(EVENT_UPSERT_QUARANTINE_SQL)
+            .bind_refs(&[
+                D1Type::Text(calendar_id),
+                D1Type::Text(google_event_id),
+                D1Type::Text(phase),
+                D1Type::Text(error_class),
+                D1Type::Text(replay_payload),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn clear_quarantine_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL)
+            .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 }
 

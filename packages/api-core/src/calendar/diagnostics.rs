@@ -331,6 +331,7 @@ mod tests {
             cache_revision: 0,
             projection: "timed_masters_and_exceptions".to_string(),
             watch_coverage: String::new(),
+            event_coverage: String::new(),
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
             deleted_at: None,

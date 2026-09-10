@@ -208,6 +208,45 @@ impl fmt::Display for WatchCoverage {
     }
 }
 
+/// Sanitized replica event coverage for one calendar.
+///
+/// Stored on `google_calendars.event_coverage` when deterministic replica page
+/// poison is quarantined (`degraded`) or after a successful publish
+/// (`complete`). Never a replay payload, sync token, or raw Google body.
+/// Does **not** feed [`aggregate_sync_status`] (same independence as
+/// [`WatchCoverage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCoverage {
+    /// No open quarantine; replica coverage is complete.
+    Complete,
+    /// At least one quarantined poison page; coverage is degraded.
+    Degraded,
+}
+
+impl EventCoverage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    /// Parse a stored `event_coverage` string. Unknown / empty → [`Self::Complete`].
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "degraded" => Self::Degraded,
+            _ => Self::Complete,
+        }
+    }
+}
+
+impl fmt::Display for EventCoverage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Per-calendar sanitized health row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarSyncView {
@@ -225,6 +264,8 @@ pub struct CalendarSyncView {
     pub cache_revision: i64,
     /// Sanitized watch coverage; never channel secrets.
     pub watch_coverage: WatchCoverage,
+    /// Sanitized replica event coverage; never replay payloads or tokens.
+    pub event_coverage: EventCoverage,
     /// Independent operator warning (1h stale / escalated / auth). Does not
     /// change [`aggregate_sync_status`] rules.
     pub operator_warning: OperatorWarningLevel,
@@ -519,6 +560,7 @@ pub fn calendar_sync_view(cal: &GoogleCalendar, now_unix: i64) -> CalendarSyncVi
         projection,
         cache_revision: cal.cache_revision,
         watch_coverage: WatchCoverage::from_stored(&cal.watch_coverage),
+        event_coverage: EventCoverage::from_stored(&cal.event_coverage),
         operator_warning,
     }
 }
@@ -581,6 +623,7 @@ mod tests {
             cache_revision: 0,
             projection: REPLICA_PROJECTION.to_string(),
             watch_coverage: String::new(),
+            event_coverage: String::new(),
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -600,6 +643,7 @@ mod tests {
             projection: REPLICA_PROJECTION.into(),
             cache_revision: 0,
             watch_coverage: WatchCoverage::Missing,
+            event_coverage: EventCoverage::Complete,
             operator_warning: OperatorWarningLevel::None,
         }
     }
@@ -774,6 +818,7 @@ mod tests {
         cal.last_success_at = Some(unix_secs_to_rfc3339(NOW - 2 * 60 * 60));
         cal.last_attempt_at = Some(unix_secs_to_rfc3339(NOW - 60));
         cal.watch_coverage = "covered".into();
+        cal.event_coverage = "degraded".into();
 
         let view = calendar_sync_view(&cal, NOW);
         let json = serde_json::to_string(&view).unwrap();
@@ -781,12 +826,15 @@ mod tests {
         assert!(json.contains("storage_transient"), "{json}");
         assert!(json.contains("\"watch_coverage\""), "{json}");
         assert!(json.contains("covered"), "{json}");
+        assert!(json.contains("\"event_coverage\""), "{json}");
+        assert!(json.contains("degraded"), "{json}");
         assert!(json.contains("\"operator_warning\""), "{json}");
         assert!(
             json.contains("\"operator_warning\":\"stale\""),
             "{json}"
         );
         assert_eq!(view.operator_warning, OperatorWarningLevel::Stale);
+        assert_eq!(view.event_coverage, EventCoverage::Degraded);
         assert!(!json.contains("secret-sync-token-xyz"), "{json}");
         assert!(!json.contains("lease-secret-abc"), "{json}");
         assert!(!json.contains("sync_token"), "{json}");
@@ -796,6 +844,8 @@ mod tests {
         assert!(!json.contains("resource_id"), "{json}");
         assert!(!json.contains("channel_id"), "{json}");
         assert!(!json.contains("\"token\""), "{json}");
+        assert!(!json.contains("replay_payload"), "{json}");
+        assert!(!json.contains("not-json{{{"), "{json}");
     }
 
     #[test]
@@ -891,6 +941,30 @@ mod tests {
             ..view_with(CalendarReplicaState::Ready, false)
         }];
         assert_eq!(aggregate_sync_status(&views), SyncAggregateStatus::Ready);
+    }
+
+    #[test]
+    fn degraded_event_coverage_alone_does_not_degrade_aggregate() {
+        // Same independence as missing watch: ready + not stale stays Ready.
+        let views = vec![CalendarSyncView {
+            event_coverage: EventCoverage::Degraded,
+            ..view_with(CalendarReplicaState::Ready, false)
+        }];
+        assert_eq!(aggregate_sync_status(&views), SyncAggregateStatus::Ready);
+    }
+
+    #[test]
+    fn event_coverage_from_stored_unknown_is_complete() {
+        assert_eq!(EventCoverage::from_stored(""), EventCoverage::Complete);
+        assert_eq!(EventCoverage::from_stored("nope"), EventCoverage::Complete);
+        assert_eq!(
+            EventCoverage::from_stored("complete"),
+            EventCoverage::Complete
+        );
+        assert_eq!(
+            EventCoverage::from_stored("degraded"),
+            EventCoverage::Degraded
+        );
     }
 
     // ── classify ───────────────────────────────────────────────

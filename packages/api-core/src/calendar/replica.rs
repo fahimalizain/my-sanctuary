@@ -63,6 +63,20 @@ use std::collections::HashSet;
 /// Replica lease lifetime (seconds). Renewed after each applied page.
 pub const REPLICA_LEASE_TTL_SECS: i64 = 90;
 
+/// Max bytes retained in `calendar_event_quarantine.replay_payload` (64 KiB).
+const QUARANTINE_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+
+/// Lossy UTF-8 decode of a Google page body, capped for quarantine storage.
+/// Never log the result; never put it on diagnostics or the GET envelope.
+fn quarantine_replay_payload(body: &[u8]) -> String {
+    let slice = if body.len() > QUARANTINE_PAYLOAD_MAX_BYTES {
+        &body[..QUARANTINE_PAYLOAD_MAX_BYTES]
+    } else {
+        body
+    };
+    String::from_utf8_lossy(slice).into_owned()
+}
+
 /// Fenced page-by-page replica walk for one calendar.
 ///
 /// Caller must already hold the lease as `lease_owner`, have stamped
@@ -194,6 +208,23 @@ pub async fn sync_replica(
             Ok(p) => p,
             Err(err) => {
                 report.checkpoint = CheckpointResult::Error;
+                // Best-effort quarantine + degraded coverage. Failures here
+                // must not change the error class (still mapping_poison via
+                // InvalidResponse) or advance the token.
+                let payload = quarantine_replay_payload(&body);
+                let _ = events
+                    .upsert_quarantine(
+                        &cal.id,
+                        "",
+                        "replica_page",
+                        "mapping_poison",
+                        &payload,
+                        now_rfc3339,
+                    )
+                    .await;
+                let _ = calendars
+                    .set_event_coverage(&cal.id, "degraded", now_rfc3339)
+                    .await;
                 return Err(CalendarError::InvalidResponse(format!(
                     "events.list body: {err}"
                 )));
@@ -377,6 +408,8 @@ pub async fn sync_replica(
         if merge_full {
             let _ = events.clear_replica_seen_for_calendar(&cal.id).await;
         }
+        // Poison page is gone once we published a terminal token.
+        let _ = events.clear_quarantine_for_calendar(&cal.id).await;
         report.checkpoint = CheckpointResult::Published;
         return Ok(());
     }

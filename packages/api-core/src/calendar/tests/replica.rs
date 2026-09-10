@@ -667,7 +667,8 @@ fn replica_failure_after_page1_delete_replays_idempotently() {
 #[test]
 fn replica_poison_on_one_calendar_records_mapping_poison() {
     // Replica path (sync_calendar) still classifies invalid JSON as
-    // mapping_poison via record_sync_failure.
+    // mapping_poison via record_sync_failure; quarantines the page and
+    // marks event_coverage degraded without advancing the token or sweeping.
     let cal = calendar("cal-a", "a@example.com", true);
     let http = FakeHttp::new(vec![("a%40example.com/events", 200, "not-json{{{")]);
     let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
@@ -681,6 +682,100 @@ fn replica_poison_on_one_calendar_records_mapping_poison() {
     assert_eq!(stored[0].last_error_code, "mapping_poison");
     assert_eq!(stored[0].sync_status, "retrying");
     assert!(stored[0].sync_token.is_empty());
+    assert_eq!(stored[0].event_coverage, "degraded");
+    assert!(
+        stored[0].next_retry_at.is_some(),
+        "backoff must throttle retries"
+    );
+    drop(stored);
+
+    let q = events.quarantine.lock().unwrap();
+    assert_eq!(q.len(), 1, "quarantine row retained");
+    assert_eq!(q[0].calendar_id, "cal-a");
+    assert_eq!(q[0].google_event_id, "");
+    assert_eq!(q[0].phase, "replica_page");
+    assert_eq!(q[0].error_class, "mapping_poison");
+    assert!(
+        q[0].replay_payload.contains("not-json{{{"),
+        "payload retained: {}",
+        q[0].replay_payload
+    );
+    assert_eq!(q[0].attempt_count, 1);
+    drop(q);
+
+    assert!(
+        events.deleted_stale.lock().unwrap().is_empty(),
+        "must not call delete_stale on poison"
+    );
+    // No hot-loop: one events.list GET only.
+    let gets = http.gets.lock().unwrap();
+    let event_gets: Vec<_> = gets
+        .iter()
+        .filter(|u| u.contains("/events"))
+        .collect();
+    assert_eq!(
+        event_gets.len(),
+        1,
+        "poison walk must not hot-loop events.list: {gets:?}"
+    );
+}
+
+#[test]
+fn replica_success_after_poison_clears_coverage_and_quarantine() {
+    let cal = calendar("cal-a", "a@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+
+    // First walk: poison page → quarantine + degraded.
+    let http_poison = FakeHttp::new(vec![("a%40example.com/events", 200, "not-json{{{")]);
+    let err = pollster::block_on(sync_calendar(
+        &http_poison,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::InvalidResponse(_)), "{err:?}");
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].event_coverage,
+        "degraded"
+    );
+    assert_eq!(events.quarantine.lock().unwrap().len(), 1);
+
+    // Clear backoff so the next walk is allowed (caller would wait on
+    // next_retry_at in production; we force a clean retry here).
+    {
+        let mut stored = calendars.stored.lock().unwrap();
+        stored[0].next_retry_at = None;
+        stored[0].sync_status = "retrying".to_string();
+    }
+    let cal_retry = calendars.stored.lock().unwrap()[0].clone();
+
+    // Second walk: valid page → publish restores complete + drops quarantine.
+    let http_ok = FakeHttp::new(vec![("a%40example.com/events", 200, EVENTS_JSON)]);
+    pollster::block_on(sync_calendar(
+        &http_ok,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal_retry,
+        "2023-11-14T22:14:20Z",
+    ))
+    .unwrap();
+
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].sync_token, "st-9");
+    assert_eq!(stored[0].event_coverage, "complete");
+    assert_eq!(stored[0].sync_status, "ready");
+    assert!(stored[0].last_error_code.is_empty());
+    assert!(
+        events.quarantine.lock().unwrap().is_empty(),
+        "quarantine cleared after successful publish"
+    );
 }
 
 #[test]

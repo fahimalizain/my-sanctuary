@@ -18,13 +18,15 @@ use api_core::repo::{
     CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
     CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
-    CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL,
-    CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL,
+    CALENDAR_SET_EVENT_COVERAGE_SQL, CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL,
+    CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
+    CALENDAR_UPSERT_SQL, EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL,
     EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, OPERATION_GET_BY_ID_SQL,
+    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_QUARANTINE_SQL,
+    OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_UPDATE_PROGRESS_SQL, OPERATION_UPDATE_STATUS_SQL,
     REPLICA_SEEN_INSERT_CHUNK_SIZE, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
     WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
@@ -362,6 +364,20 @@ impl CalendarRepo for SqliteCalendarRepo {
         exec(
             &conn,
             CALENDAR_SET_WATCH_COVERAGE_SQL,
+            &[&coverage, &now_rfc3339, &id],
+        )
+    }
+
+    async fn set_event_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        exec(
+            &conn,
+            CALENDAR_SET_EVENT_COVERAGE_SQL,
             &[&coverage, &now_rfc3339, &id],
         )
     }
@@ -723,6 +739,42 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
             &[&calendar_id, &lease_owner, &now_rfc3339],
         )?;
         Ok(held.is_some())
+    }
+
+    async fn upsert_quarantine(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        phase: &str,
+        error_class: &str,
+        replay_payload: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        // Binds: calendar_id, google_event_id, phase, error_class,
+        // replay_payload, first_seen_at, last_attempt_at.
+        exec(
+            &conn,
+            EVENT_UPSERT_QUARANTINE_SQL,
+            &[
+                &calendar_id,
+                &google_event_id,
+                &phase,
+                &error_class,
+                &replay_payload,
+                &now_rfc3339,
+                &now_rfc3339,
+            ],
+        )
+    }
+
+    async fn clear_quarantine_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        exec(
+            &conn,
+            EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL,
+            &[&calendar_id],
+        )
     }
 }
 
