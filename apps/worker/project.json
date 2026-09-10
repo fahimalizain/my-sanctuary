@@ -28,6 +28,21 @@
         "commands": ["wrangler deploy"],
         "cwd": "apps/worker"
       }
+    },
+    "test-d1": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["cargo test -p d1-sync"],
+        "cwd": "."
+      },
+      "inputs": [
+        "{workspaceRoot}/packages/d1-sync/**",
+        "{workspaceRoot}/packages/api-core/**",
+        "{workspaceRoot}/apps/worker/migrations/**",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock"
+      ],
+      "cache": true
     }
   }
 }
