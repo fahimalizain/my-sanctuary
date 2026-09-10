@@ -12,7 +12,8 @@ use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_replica_seen_insert_sql,
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo,
     WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
-    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
+    CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL, CALENDAR_DELETE_SQL,
+    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
     CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
@@ -449,6 +450,21 @@ impl CalendarRepo for SqliteCalendarRepo {
         let conn = lock(&self.db)?;
         let rows: Vec<Row> = query_vec(&conn, CALENDAR_LIST_USER_IDS_SQL, &[])?;
         Ok(rows.into_iter().map(|r| r.user_id).collect())
+    }
+
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        // Binds: next_retry, now, user_id.
+        exec(
+            &conn,
+            CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
+            &[&next_retry_rfc3339, &now_rfc3339, &user_id],
+        )
     }
 }
 

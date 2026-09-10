@@ -149,9 +149,14 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///
 /// Per user, in order:
 /// 1. `refresh_if_needed` for the owner's Google token (cached per user).
-///    - Revoked refresh (`invalid_grant` / token-endpoint 400/401): stamp
-///      `auth_revoked` / `authorization_required` on the user's living
-///      sync-enabled calendars, keep events, skip Google for that user.
+///    - Ok (including still-fresh token, no HTTP): clear
+///      `authorization_required` on the user's living sync-enabled calendars
+///      (best-effort; clear failure is logged, tick continues) so
+///      [`replica_due`] can attempt them this same tick after re-list.
+///    - Revoked refresh (`invalid_grant` only — not bare token-endpoint
+///      400/401): stamp `auth_revoked` / `authorization_required` on the
+///      user's living sync-enabled calendars, keep events, skip Google for
+///      that user.
 ///    - `NoToken` / `NoRefreshToken`: skip + error string only (do not flip
 ///      healthy calendars to `authorization_required`).
 /// 2. GET-only [`repair_inflight_operations`] for stuck journal rows. Repair
@@ -284,7 +289,25 @@ pub async fn run_fallback_cron_with_clock(
         };
 
         let access = match access_result {
-            Ok(access) => access,
+            Ok(access) => {
+                // Successful refresh (including still-fresh token) clears
+                // authorization_required so replica_due can attempt those
+                // calendars this same tick after list_by_user_id. Do not abort
+                // the user on clear failure.
+                if let Err(err) = calendars
+                    .clear_authorization_required_for_user(
+                        user_id,
+                        &now_rfc3339,
+                        &now_rfc3339,
+                    )
+                    .await
+                {
+                    report.errors.push(format!(
+                        "failed to clear authorization_required for user {user_id}: {err}"
+                    ));
+                }
+                access
+            }
             Err(err) => {
                 report.errors.push(format!(
                     "token refresh failed for user {user_id}: {err}"

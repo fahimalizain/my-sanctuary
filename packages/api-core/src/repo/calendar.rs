@@ -182,6 +182,22 @@ pub trait CalendarRepo: Send + Sync {
     /// Distinct living-calendar owners, ordered. Cron uses this so users with
     /// only disabled calendars still get list refresh (they may add a calendar).
     async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError>;
+    /// Clear `authorization_required` on living sync-enabled calendars for
+    /// `user_id` after a successful token refresh or OAuth reconnect.
+    ///
+    /// Sets status to `retrying` when the calendar has ever succeeded
+    /// (`initial_sync_complete` or non-empty `last_success_at`), else
+    /// `never_initialized`. Clears error/streak. Binds `next_retry_at` to
+    /// `next_retry_rfc3339` (callers pass **now**) so [`replica_due`]'s
+    /// retry gate opens this tick — `NULL` would leave a recently-ready
+    /// misclassified row not due until stale. Does **not** touch
+    /// `sync_token`, lease, dirty gens, or `full_sync_requested`.
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
 }
 
 /// Cached Google Calendar event persistence (`calendar_events` rows).
@@ -673,6 +689,33 @@ pub const CALENDAR_SET_EVENT_COVERAGE_SQL: &str = "
 /// `(user_id, google_calendar_id)` slot.
 pub const CALENDAR_DELETE_SQL: &str =
     "UPDATE google_calendars SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// Clear `authorization_required` after a successful refresh / OAuth reconnect.
+///
+/// Binds: next_retry, now, user_id.
+///
+/// `next_retry_at = ?` (callers bind **now**) rather than NULL: a recently-ready
+/// calendar misclassified as auth-revoked would not be `replica_due` with a
+/// fresh `last_success_at` and NULL backoff. Binding now makes `retry_due`
+/// true so the next tick (and the same tick after re-list) attempts. Does
+/// **not** touch `sync_token`, lease, dirty gens, or `full_sync_requested`.
+pub const CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL: &str = "
+    UPDATE google_calendars
+    SET sync_status = CASE
+          WHEN initial_sync_complete = 1
+            OR (last_success_at IS NOT NULL AND last_success_at != '')
+          THEN 'retrying'
+          ELSE 'never_initialized'
+        END,
+        last_error_code = '',
+        failure_streak = 0,
+        next_retry_at = ?,
+        updated_at = ?
+    WHERE user_id = ?
+      AND deleted_at IS NULL
+      AND sync_enabled = 1
+      AND sync_status = 'authorization_required'
+";
 
 // ──────────────────────────────────────────
 // Calendar event SQL
@@ -1841,6 +1884,30 @@ mod tests {
         let sql = CALENDAR_RECORD_SYNC_FAILURE_SQL;
         assert!(!sql.contains("event_coverage"), "{sql}");
         assert!(!sql.contains("sync_token"), "{sql}");
+    }
+
+    #[test]
+    fn clear_authorization_required_sql_scopes_and_preserves_cursors() {
+        let sql = CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL;
+        assert!(sql.contains("sync_status = CASE"), "{sql}");
+        assert!(sql.contains("'retrying'"), "{sql}");
+        assert!(sql.contains("'never_initialized'"), "{sql}");
+        assert!(sql.contains("initial_sync_complete = 1"), "{sql}");
+        assert!(sql.contains("last_success_at IS NOT NULL"), "{sql}");
+        assert!(sql.contains("last_error_code = ''"), "{sql}");
+        assert!(sql.contains("failure_streak = 0"), "{sql}");
+        assert!(sql.contains("next_retry_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE user_id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(sql.contains("sync_enabled = 1"), "{sql}");
+        assert!(sql.contains("sync_status = 'authorization_required'"), "{sql}");
+        // Must not clobber replica cursor / lease / dirty / reseed flag.
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("lease_owner"), "{sql}");
+        assert!(!sql.contains("lease_expires_at"), "{sql}");
+        assert!(!sql.contains("dirty_requested"), "{sql}");
+        assert!(!sql.contains("dirty_applied"), "{sql}");
+        assert!(!sql.contains("full_sync_requested"), "{sql}");
     }
 
     #[test]

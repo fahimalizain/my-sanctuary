@@ -844,6 +844,40 @@ impl CalendarRepo for FakeCalendarRepo {
         ids.dedup();
         Ok(ids)
     }
+
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        for cal in stored.iter_mut() {
+            if cal.user_id != user_id
+                || cal.deleted_at.is_some()
+                || !cal.sync_enabled
+                || cal.sync_status != "authorization_required"
+            {
+                continue;
+            }
+            let had_success = cal.initial_sync_complete
+                || cal
+                    .last_success_at
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+            cal.sync_status = if had_success {
+                "retrying".to_string()
+            } else {
+                "never_initialized".to_string()
+            };
+            cal.last_error_code = String::new();
+            cal.failure_streak = 0;
+            cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
 }
 
 /// In-memory quarantine row for deterministic poison (issue #60).

@@ -186,7 +186,8 @@ fn refresh_failure_revoked_grant_serves_cached_calendars_and_stamps() {
     let calendars = FakeCalendarRepo::with(vec![enabled, disabled]);
 
     let refresh_err = TokenError::Http(HttpError::Message(
-        "POST https://oauth2.googleapis.com/token returned 400".into(),
+        "POST https://oauth2.googleapis.com/token returned 400: {\"error\":\"invalid_grant\"}"
+            .into(),
     ));
     let output = pollster::block_on(list_calendars_after_refresh_failure(
         &calendars,

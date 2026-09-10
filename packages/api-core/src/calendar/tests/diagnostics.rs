@@ -170,6 +170,9 @@ fn cron_warns_stale_and_auth_even_when_not_replica_due() {
     stale.next_retry_at = Some(unix_secs_to_rfc3339(NOW_UNIX + 3600));
 
     // Auth-required calendar: replica_due skips it; warning is immediate.
+    // No stored token so refresh fails with NoToken — successful refresh would
+    // clear authorization_required (recovery path); we need the status to stick
+    // so the operator warning still fires.
     let mut auth = calendar("cal-auth", "auth@example.com", true);
     auth.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
     auth.last_synced_at = auth.last_success_at.clone();
@@ -192,7 +195,9 @@ fn cron_warns_stale_and_auth_even_when_not_replica_due() {
     let calendars = FakeCalendarRepo::with(vec![stale, auth, fresh]);
     let events = FakeEventRepo::new();
     let watches = FakeWatchChannelRepo::new();
-    let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+    // Empty tokens → NoToken: user Google work skipped; auth_required stays;
+    // operator warnings still collected from the store after the loop.
+    let tokens = FakeTokenRepo::with(vec![]);
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(

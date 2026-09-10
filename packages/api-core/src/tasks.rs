@@ -4634,6 +4634,15 @@ mod tests {
         async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
             Ok(Vec::new())
         }
+
+        async fn clear_authorization_required_for_user(
+            &self,
+            _user_id: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
     }
 
     /// In-memory event repo: upserts materialize `CalendarEvent` rows (so the

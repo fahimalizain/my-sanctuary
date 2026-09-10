@@ -8,7 +8,8 @@ use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_operation_list_by_statuses_sql,
     build_replica_seen_insert_sql, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo,
     RepoError, WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL,
-    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
+    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
+    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
     CALENDAR_GET_BY_ID_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL,
     CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL,
@@ -545,6 +546,25 @@ impl CalendarRepo for D1CalendarRepo {
             .map_err(backend)?;
         let rows: Vec<Row> = query_vec(stmt).await?;
         Ok(rows.into_iter().map(|r| r.user_id).collect())
+    }
+
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Binds: next_retry, now, user_id.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL)
+            .bind_refs(&[
+                D1Type::Text(next_retry_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(user_id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 }
 
