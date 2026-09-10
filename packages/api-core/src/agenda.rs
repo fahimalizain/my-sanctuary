@@ -3147,6 +3147,17 @@ mod tests {
             Ok(())
         }
 
+        async fn record_sync_contention(
+            &self,
+            _id: &str,
+            _error_code: &str,
+            _sync_status: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn begin_replica_reseed(
             &self,
             _id: &str,

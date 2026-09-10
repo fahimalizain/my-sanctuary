@@ -128,6 +128,8 @@ pub enum SyncErrorCode {
     /// never run the replica walk (events.list strips details).
     InsufficientAccess,
     GoogleTransient,
+    /// Replica lease stolen/expired mid-walk — contention, not a bad calendar.
+    LostLease,
     Unknown,
 }
 
@@ -143,6 +145,7 @@ impl SyncErrorCode {
             Self::MissingSyncToken => "missing_sync_token",
             Self::InsufficientAccess => "insufficient_access",
             Self::GoogleTransient => "google_transient",
+            Self::LostLease => "lost_lease",
             Self::Unknown => "unknown",
         }
     }
@@ -289,6 +292,7 @@ pub fn classify_sync_error(err: &CalendarError) -> SyncErrorCode {
         CalendarError::InvalidResponse(_) => SyncErrorCode::MappingPoison,
         CalendarError::Http(_) => SyncErrorCode::GoogleTransient,
         CalendarError::GoogleApi(msg) => classify_google_api_message(msg),
+        CalendarError::Invalid(msg) if msg == "lost replica lease" => SyncErrorCode::LostLease,
         CalendarError::InvalidRange(_)
         | CalendarError::Invalid(_)
         | CalendarError::NotFound
@@ -327,13 +331,14 @@ fn status_from_returned_message(msg: &str) -> Option<u16> {
 /// - `Gone` → `rebuilding` (diagnosed 410 that could not finish in-process;
 ///   next action is still merge-full; `full_sync_requested` should already be
 ///   durable from [`CalendarRepo::begin_replica_reseed`])
-/// - everything else → `retrying`
+/// - `LostLease` / everything else → `retrying`
 ///
 /// Does **not** reset the sync token.
 pub fn replica_state_for_error(code: SyncErrorCode) -> CalendarReplicaState {
     match code {
         SyncErrorCode::AuthRevoked => CalendarReplicaState::AuthorizationRequired,
         SyncErrorCode::Gone => CalendarReplicaState::Rebuilding,
+        SyncErrorCode::LostLease => CalendarReplicaState::Retrying,
         _ => CalendarReplicaState::Retrying,
     }
 }
@@ -1039,6 +1044,14 @@ mod tests {
             classify_sync_error(&CalendarError::NotFound),
             SyncErrorCode::Unknown
         );
+        assert_eq!(
+            classify_sync_error(&CalendarError::Invalid("lost replica lease".into())),
+            SyncErrorCode::LostLease
+        );
+        assert_eq!(
+            classify_sync_error(&CalendarError::Invalid("some other invalid".into())),
+            SyncErrorCode::Unknown
+        );
 
         // Codes are categories — never the raw message.
         let code = classify_sync_error(&CalendarError::GoogleApi(
@@ -1046,6 +1059,17 @@ mod tests {
         ));
         assert_eq!(code.as_str(), "auth_revoked");
         assert!(!code.as_str().contains("invalid_grant") || code.as_str() == "auth_revoked");
+    }
+
+    #[test]
+    fn classify_sync_error_lost_replica_lease() {
+        let code = classify_sync_error(&CalendarError::Invalid("lost replica lease".into()));
+        assert_eq!(code, SyncErrorCode::LostLease);
+        assert_eq!(code.as_str(), "lost_lease");
+        assert_eq!(
+            classify_sync_error(&CalendarError::Invalid("calendar missing after lease acquire".into())),
+            SyncErrorCode::Unknown
+        );
     }
 
     #[test]
@@ -1060,6 +1084,10 @@ mod tests {
         );
         assert_eq!(
             replica_state_for_error(SyncErrorCode::StorageTransient),
+            CalendarReplicaState::Retrying
+        );
+        assert_eq!(
+            replica_state_for_error(SyncErrorCode::LostLease),
             CalendarReplicaState::Retrying
         );
     }
@@ -1155,6 +1183,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SyncErrorCode::AuthRevoked).unwrap(),
             "\"auth_revoked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SyncErrorCode::LostLease).unwrap(),
+            "\"lost_lease\""
         );
         assert_eq!(
             serde_json::to_string(&WatchCoverage::NoSuccessor).unwrap(),

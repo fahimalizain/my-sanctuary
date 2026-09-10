@@ -9,7 +9,7 @@ use super::repair::repair_inflight_operations;
 use super::replica::{lease_expires_at, mint_lease_owner, sync_replica};
 use super::sync::{
     classify_sync_error, next_retry_rfc3339, refresh_watch_coverage, replica_state_for_error,
-    SyncErrorCode,
+    CalendarReplicaState, SyncErrorCode,
 };
 use super::watch::{
     is_public_https_callback, renew_watch_if_needed, stop_watches_for_calendar,
@@ -978,8 +978,11 @@ pub(crate) async fn stamp_auth_revoked_for_user(
 /// Persist a classified failure without advancing the sync cursor.
 ///
 /// Uses `cal.failure_streak + 1` for backoff (the in-memory snapshot at
-/// invocation — attempt does not bump streak). Returns a repo error if the
-/// health write itself fails so callers never drop health silently.
+/// invocation — attempt does not bump streak). Lost lease is contention, not a
+/// bad calendar: persist `lost_lease` / retrying with `next_retry = now` and
+/// **do not** increment `failure_streak` or apply exponential backoff.
+/// Returns a repo error if the health write itself fails so callers never drop
+/// health silently.
 pub(crate) async fn persist_sync_failure(
     calendars: &dyn CalendarRepo,
     cal: &GoogleCalendar,
@@ -987,6 +990,18 @@ pub(crate) async fn persist_sync_failure(
     now_unix: i64,
     now_rfc3339: &str,
 ) -> Result<(), CalendarError> {
+    if code == SyncErrorCode::LostLease {
+        calendars
+            .record_sync_contention(
+                &cal.id,
+                code.as_str(),
+                CalendarReplicaState::Retrying.as_str(),
+                now_rfc3339, // next_retry = now → due immediately
+                now_rfc3339,
+            )
+            .await?;
+        return Ok(());
+    }
     let state = replica_state_for_error(code);
     let streak_for_backoff = cal.failure_streak.saturating_add(1);
     let retry = next_retry_rfc3339(now_unix, streak_for_backoff);

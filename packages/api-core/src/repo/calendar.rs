@@ -80,6 +80,16 @@ pub trait CalendarRepo: Send + Sync {
         next_retry_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Contention (lost/stolen lease): set error code + retrying + next_retry.
+    /// Does **not** increment `failure_streak`, does **not** touch token / success.
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// Persist that a merge-full / reseed is required and now in-flight.
     /// Sets `full_sync_requested = 1` and `sync_status = 'rebuilding'`.
     /// Does **not** touch `sync_token`, success stamps, error/streak, dirty gens, or lease.
@@ -547,6 +557,18 @@ pub const CALENDAR_RECORD_SYNC_FAILURE_SQL: &str = "
     UPDATE google_calendars SET
       last_error_code = ?,
       failure_streak = failure_streak + 1,
+      sync_status = ?,
+      next_retry_at = ?,
+      updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Contention (lost/stolen lease): error code, status, next retry. Does **not**
+/// increment `failure_streak`. Does not write `sync_token`, success stamps,
+/// lease, or dirty gens. Binds: error_code, sync_status, next_retry, now, id.
+pub const CALENDAR_RECORD_SYNC_CONTENTION_SQL: &str = "
+    UPDATE google_calendars SET
+      last_error_code = ?,
       sync_status = ?,
       next_retry_at = ?,
       updated_at = ?
@@ -2016,6 +2038,24 @@ mod tests {
         assert!(!sql.contains("last_success_at"), "{sql}");
         assert!(!sql.contains("last_synced_at"), "{sql}");
         assert!(!sql.contains("last_attempt_at"), "{sql}");
+        assert!(!sql.contains("full_sync_requested"), "{sql}");
+    }
+
+    #[test]
+    fn record_sync_contention_sql_does_not_touch_streak_token_or_success() {
+        let sql = CALENDAR_RECORD_SYNC_CONTENTION_SQL;
+        assert!(sql.contains("last_error_code = ?"), "{sql}");
+        assert!(sql.contains("sync_status = ?"), "{sql}");
+        assert!(sql.contains("next_retry_at = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("failure_streak"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("last_success_at"), "{sql}");
+        assert!(!sql.contains("last_synced_at"), "{sql}");
+        assert!(!sql.contains("last_attempt_at"), "{sql}");
+        assert!(!sql.contains("lease_owner"), "{sql}");
+        assert!(!sql.contains("dirty_"), "{sql}");
         assert!(!sql.contains("full_sync_requested"), "{sql}");
     }
 

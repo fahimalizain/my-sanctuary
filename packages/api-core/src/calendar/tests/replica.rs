@@ -901,7 +901,19 @@ fn replica_mid_walk_lease_loss_does_not_publish_token() {
         .unwrap()
         .iter()
         .any(|e| e.google_event_id == "p1"));
-    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+    let stored = calendars.stored.lock().unwrap()[0].clone();
+    assert_eq!(stored.sync_token, "old-tok");
+    assert_eq!(stored.last_error_code, "lost_lease");
+    assert_eq!(stored.sync_status, "retrying");
+    assert_eq!(
+        stored.failure_streak, 0,
+        "lost lease must not increment failure_streak"
+    );
+    assert_eq!(
+        stored.next_retry_at.as_deref(),
+        Some("2023-11-14T22:13:20Z"),
+        "next_retry = now so replica is due on next cron tick"
+    );
     assert!(calendars.sync_states.lock().unwrap().is_empty());
     // Must not have applied page 2 / published st-stolen.
     assert!(!events

@@ -12,7 +12,8 @@ use api_core::repo::{
     CALENDAR_GET_BY_ID_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL,
     CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL,
-    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_CONTENTION_SQL,
+    CALENDAR_RECORD_SYNC_FAILURE_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
     CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
     CALENDAR_SET_EVENT_COVERAGE_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL,
@@ -267,6 +268,28 @@ impl CalendarRepo for D1CalendarRepo {
         let stmt = self
             .db
             .prepare(CALENDAR_RECORD_SYNC_FAILURE_SQL)
+            .bind_refs(&[
+                D1Type::Text(error_code),
+                D1Type::Text(sync_status),
+                D1Type::Text(next_retry_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(CALENDAR_RECORD_SYNC_CONTENTION_SQL)
             .bind_refs(&[
                 D1Type::Text(error_code),
                 D1Type::Text(sync_status),

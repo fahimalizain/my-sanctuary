@@ -591,6 +591,26 @@ impl CalendarRepo for FakeCalendarRepo {
         Ok(())
     }
 
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            // Contention: do not increment failure_streak; do not touch token /
+            // success stamps / lease / dirty gens.
+            cal.last_error_code = error_code.to_string();
+            cal.sync_status = sync_status.to_string();
+            cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+
     async fn begin_replica_reseed(
         &self,
         id: &str,

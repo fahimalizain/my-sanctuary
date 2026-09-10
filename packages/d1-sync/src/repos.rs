@@ -16,7 +16,8 @@ use api_core::repo::{
     CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
     CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
-    CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
+    CALENDAR_RECORD_SYNC_CONTENTION_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_COVERAGE_SQL, CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL,
     CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
@@ -222,6 +223,28 @@ impl CalendarRepo for SqliteCalendarRepo {
         exec(
             &conn,
             CALENDAR_RECORD_SYNC_FAILURE_SQL,
+            &[
+                &error_code,
+                &sync_status,
+                &next_retry_rfc3339,
+                &now_rfc3339,
+                &id,
+            ],
+        )
+    }
+
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        exec(
+            &conn,
+            CALENDAR_RECORD_SYNC_CONTENTION_SQL,
             &[
                 &error_code,
                 &sync_status,
