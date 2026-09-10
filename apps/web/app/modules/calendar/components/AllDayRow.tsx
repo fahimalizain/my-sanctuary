@@ -46,6 +46,7 @@ export interface AllDayPreview {
   /** Inclusive day index into `days`. */
   endDay: number;
   color?: string;
+  title?: string;
 }
 
 export interface AllDayRowProps {
@@ -59,9 +60,15 @@ export interface AllDayRowProps {
   todayIndex?: number | null;
   /** Empty-cell pointerdown for all-day create / drag-create. */
   onDayPointerDown?: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
+  onChipPointerDown?: (
+    e: ReactPointerEvent<HTMLElement>,
+    eventId: string,
+    chipEl: HTMLElement,
+  ) => void;
   /** Chip click/tap selects the event. */
   onChipSelect?: (eventId: string) => void;
   selectedEventId?: string | null;
+  draggingEventId?: string | null;
   /** Ghost range while drag-creating across all-day cells. */
   preview?: AllDayPreview | null;
 }
@@ -74,8 +81,10 @@ export function AllDayRow({
   chips,
   todayIndex = null,
   onDayPointerDown,
+  onChipPointerDown,
   onChipSelect,
   selectedEventId = null,
+  draggingEventId = null,
   preview = null,
 }: AllDayRowProps) {
   const trackWidth = days.length * colWidth;
@@ -136,6 +145,7 @@ export function AllDayRow({
           const width = daySpan * colWidth - 2;
           const top = (ALLDAY_CHIP + ALLDAY_GAP) * chip.lane + ALLDAY_PAD;
           const selected = chip.id === selectedEventId;
+          const dragging = chip.id === draggingEventId;
 
           return (
             <div
@@ -145,8 +155,9 @@ export function AllDayRow({
               role="button"
               tabIndex={0}
               className={cn(
-                'absolute overflow-hidden rounded-[6px] pointer-events-auto z-[1] cursor-pointer',
+                'absolute overflow-hidden rounded-[6px] pointer-events-auto z-[1] cursor-grab active:cursor-grabbing',
                 selected && 'ring-1 ring-foreground/25',
+                dragging && 'opacity-40',
               )}
               style={{
                 top,
@@ -169,8 +180,7 @@ export function AllDayRow({
                 }
               }}
               onPointerDown={(e) => {
-                // Keep chip select from starting an all-day create on the hit layer.
-                e.stopPropagation();
+                onChipPointerDown?.(e, chip.id, e.currentTarget);
               }}
             >
               {/* 4px left ribbon — darker shade so it reads on solid fill */}
@@ -218,7 +228,9 @@ export function AllDayRow({
                     backgroundColor: hexToRgba(color, PREVIEW_FILL_ALPHA),
                   }}
                 >
-                  <div className="truncate text-[11px] font-medium leading-[17px]" />
+                  <div className="truncate text-[11px] font-medium leading-[17px]">
+                    {preview.title ?? ''}
+                  </div>
                 </div>
               </div>
             );

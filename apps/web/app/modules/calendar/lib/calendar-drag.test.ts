@@ -5,14 +5,22 @@ import assert from 'node:assert/strict';
 import {
   DRAG_THRESHOLD_PX,
   RESIZE_HANDLE_PX,
+  AUTOSCROLL_EDGE_PX,
+  AUTOSCROLL_MAX_PX,
+  allDayGrabOffsetDays,
   allDayPreviewIndices,
+  autoscrollDelta,
+  classifyTouchGesture,
   isTapCreatePointer,
+  movedAllDayRange,
   movedEnough,
   movedRange,
   rangeFromSlots,
   resizeEdgeAt,
   resizedRange,
   timedPreviewSegments,
+  toAllDayRange,
+  toTimedRange,
   type DragSlot,
 } from './calendar-drag';
 import { SNAP_MINUTES, addDays } from './week-layout';
@@ -56,6 +64,108 @@ test('isTapCreatePointer: pen → false', () => {
 
 test('isTapCreatePointer: empty → false', () => {
   assert.equal(isTapCreatePointer(''), false);
+});
+
+// ── classifyTouchGesture ────────────────────────────────────────────────
+
+test('classifyTouchGesture: under threshold → pending (create and chip)', () => {
+  assert.equal(classifyTouchGesture(2, 1, 'create'), 'pending');
+  assert.equal(classifyTouchGesture(1, 2, 'chip'), 'pending');
+  assert.equal(classifyTouchGesture(0, 0, 'create'), 'pending');
+});
+
+test('classifyTouchGesture: create + horizontal-dominant → scroll', () => {
+  assert.equal(classifyTouchGesture(10, 2, 'create'), 'scroll');
+});
+
+test('classifyTouchGesture: create + vertical-dominant → drag', () => {
+  assert.equal(classifyTouchGesture(2, 10, 'create'), 'drag');
+});
+
+test('classifyTouchGesture: create + 45° tie past threshold → drag', () => {
+  assert.equal(classifyTouchGesture(5, 5, 'create'), 'drag');
+});
+
+test('classifyTouchGesture: create + exactly threshold on X only → scroll', () => {
+  assert.equal(classifyTouchGesture(DRAG_THRESHOLD_PX, 0, 'create'), 'scroll');
+});
+
+test('classifyTouchGesture: create + exactly threshold on Y only → drag', () => {
+  assert.equal(classifyTouchGesture(0, DRAG_THRESHOLD_PX, 'create'), 'drag');
+});
+
+test('classifyTouchGesture: chip + horizontal-dominant → drag', () => {
+  assert.equal(classifyTouchGesture(10, 2, 'chip'), 'drag');
+});
+
+test('classifyTouchGesture: chip + vertical-dominant → drag', () => {
+  assert.equal(classifyTouchGesture(2, 10, 'chip'), 'drag');
+});
+
+test('classifyTouchGesture: chip under threshold → pending', () => {
+  assert.equal(classifyTouchGesture(3, 0, 'chip'), 'pending');
+});
+
+test('classifyTouchGesture: create + horizontal + allowHorizontalDrag → drag', () => {
+  assert.equal(classifyTouchGesture(10, 2, 'create', true), 'drag');
+});
+
+// ── autoscrollDelta ─────────────────────────────────────────────────────
+
+test('autoscrollDelta: center → 0', () => {
+  assert.equal(autoscrollDelta(100, 0, 200), 0);
+});
+
+test('autoscrollDelta: at start edge → -max', () => {
+  assert.equal(autoscrollDelta(0, 0, 400), -AUTOSCROLL_MAX_PX);
+});
+
+test('autoscrollDelta: at end edge → +max', () => {
+  assert.equal(autoscrollDelta(400, 0, 400), AUTOSCROLL_MAX_PX);
+});
+
+test('autoscrollDelta: halfway into start edge → half speed', () => {
+  const pointer = AUTOSCROLL_EDGE_PX / 2;
+  assert.equal(autoscrollDelta(pointer, 0, 400), -AUTOSCROLL_MAX_PX / 2);
+});
+
+test('autoscrollDelta: inverted bounds → 0', () => {
+  assert.equal(autoscrollDelta(10, 100, 0), 0);
+});
+
+// ── toAllDayRange / toTimedRange / movedAllDayRange ─────────────────────
+
+test('toAllDayRange: Tue → Tue 00:00 to Wed 00:00', () => {
+  const tue = localDay(2024, 0, 2);
+  const r = toAllDayRange(slot(tue, 9 * 60));
+  assert.equal(r.start.getDate(), 2);
+  assert.equal(r.start.getHours(), 0);
+  assert.equal(r.end.getDate(), 3);
+  assert.equal(r.end.getHours(), 0);
+});
+
+test('toTimedRange: 14:00 → 14:00–14:30', () => {
+  const tue = localDay(2024, 0, 2);
+  const r = toTimedRange(slot(tue, 14 * 60));
+  assert.equal(r.start.getHours(), 14);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getHours(), 14);
+  assert.equal(r.end.getMinutes(), 30);
+});
+
+test('allDayGrabOffsetDays: grab Wed of Mon-start → 2', () => {
+  const mon = localDay(2024, 0, 1);
+  const wed = localDay(2024, 0, 3);
+  assert.equal(allDayGrabOffsetDays(mon, wed), 2);
+});
+
+test('movedAllDayRange: Mon–Wed grabbed on Wed, drop Fri → Wed–Fri', () => {
+  const mon = localDay(2024, 0, 1);
+  const thu = localDay(2024, 0, 4); // exclusive end
+  const fri = localDay(2024, 0, 5);
+  const r = movedAllDayRange(mon, thu, slot(fri, 0), 2);
+  assert.equal(r.start.getDate(), 3); // Wed
+  assert.equal(r.end.getDate(), 6); // Sat exclusive → Fri last occupied
 });
 
 // ── resizeEdgeAt ────────────────────────────────────────────────────────
@@ -232,7 +342,7 @@ test('timedPreviewSegments: splits overnight range across two days', () => {
     start: new Date(2024, 0, 1, 22, 0, 0, 0),
     end: new Date(2024, 0, 2, 2, 0, 0, 0),
   };
-  const segs = timedPreviewSegments(preview, 'move', days, 60);
+  const segs = timedPreviewSegments(preview, 'timed', days, 60);
   assert.ok(segs.has(mon.toDateString()));
   assert.ok(segs.has(tue.toDateString()));
   // Mon: 22:00–24:00 → top = 22*60 = 1320 at hourH=60
@@ -248,13 +358,13 @@ test('allDayPreviewIndices: Mon–Wed exclusive end → indices 0..2', () => {
     start: mon,
     end: addDays(mon, 3), // exclusive Thu
   };
-  const idx = allDayPreviewIndices(preview, 'allday-create', days);
+  const idx = allDayPreviewIndices(preview, 'allday', days);
   assert.deepEqual(idx, { startDay: 0, endDay: 2 });
 });
 
-test('allDayPreviewIndices: null for timed kind', () => {
+test('allDayPreviewIndices: null for timed zone', () => {
   const mon = localDay(2024, 0, 1);
   const days = [mon];
   const preview = { start: mon, end: addDays(mon, 1) };
-  assert.equal(allDayPreviewIndices(preview, 'create', days), null);
+  assert.equal(allDayPreviewIndices(preview, 'timed', days), null);
 });

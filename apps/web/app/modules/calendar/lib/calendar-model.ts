@@ -4,16 +4,13 @@
 
 import type { CalendarEvent } from '@/app/types';
 import type { AllDayChip } from '../components/AllDayRow';
-import type { DragSlot, TimedRange } from './calendar-drag';
+import { toTimedRange, type DragSlot, type TimedRange } from './calendar-drag';
 import type { PositionedEvent } from '../components/EventChip';
 import {
-  DEFAULT_EVENT_DURATION_MIN,
-  MINUTES_PER_DAY,
   WEEK_DAYS,
   allDaySectionHeight,
   clampMinutesToDay,
   colorForCalendar,
-  dateOnDay,
   eventHeightPx,
   eventTopPx,
   lastOccupiedCivilDate,
@@ -33,23 +30,7 @@ export function dayNameShort(date: Date): string {
  * Click-to-create range from a snapped slot: default 30 min, kept inside the day.
  */
 export function clickCreateTimesFromSlot(slot: DragSlot): TimedRange {
-  const startMin = slot.minutes;
-  const endMin = Math.min(
-    MINUTES_PER_DAY,
-    startMin + DEFAULT_EVENT_DURATION_MIN,
-  );
-  const adjustedStart =
-    endMin - startMin < DEFAULT_EVENT_DURATION_MIN && startMin > 0
-      ? Math.max(0, MINUTES_PER_DAY - DEFAULT_EVENT_DURATION_MIN)
-      : startMin;
-  const adjustedEnd = Math.min(
-    MINUTES_PER_DAY,
-    adjustedStart + DEFAULT_EVENT_DURATION_MIN,
-  );
-  return {
-    start: dateOnDay(slot.day, adjustedStart),
-    end: dateOnDay(slot.day, adjustedEnd),
-  };
+  return toTimedRange(slot);
 }
 
 /** Category color from the API when present; otherwise hash the calendar id. */
