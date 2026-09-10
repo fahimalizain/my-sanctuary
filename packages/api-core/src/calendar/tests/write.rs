@@ -860,6 +860,7 @@ fn patch_fields_start_only_payload() {
             start: Some("2026-08-19T09:00:00Z".to_string()),
             end: None,
             summary: None,
+            description: None,
         },
         NOW_UNIX,
     ))
@@ -871,6 +872,7 @@ fn patch_fields_start_only_payload() {
     assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
     assert!(body.get("end").is_none(), "{body}");
     assert!(body.get("summary").is_none(), "{body}");
+    assert!(body.get("description").is_none(), "{body}");
 }
 
 #[test]
@@ -897,6 +899,7 @@ fn patch_fields_start_end_summary_payload() {
             start: Some("2026-08-19T09:00:00Z".to_string()),
             end: Some("2026-08-19T11:00:00Z".to_string()),
             summary: Some("Renamed".to_string()),
+            description: None,
         },
         NOW_UNIX,
     ))
@@ -908,6 +911,85 @@ fn patch_fields_start_end_summary_payload() {
     assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
     assert_eq!(body["end"]["dateTime"], "2026-08-19T11:00:00Z");
     assert_eq!(body["summary"], "Renamed");
+    assert!(body.get("description").is_none(), "{body}");
+}
+
+#[test]
+fn patch_fields_description_only_payload() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/google-evt-created",
+        200,
+        PATCHED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
+
+    pollster::block_on(patch_event_fields(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "cal-1",
+        "google-evt-created",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: Some("Bring snacks".to_string()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let patches = http.patches.lock().unwrap();
+    assert_eq!(patches.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+    assert_eq!(body["description"], "Bring snacks");
+    assert!(body.get("start").is_none(), "{body}");
+    assert!(body.get("end").is_none(), "{body}");
+    assert!(body.get("summary").is_none(), "{body}");
+}
+
+#[test]
+fn patch_fields_description_empty_string_clears() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events/google-evt-created",
+        200,
+        PATCHED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    seed_living(&events, "local-1", "cal-1", "google-evt-created");
+    let ops = FakeOperationRepo::new();
+
+    pollster::block_on(patch_event_fields(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "cal-1",
+        "google-evt-created",
+        &PatchEventFields {
+            start: None,
+            end: None,
+            summary: None,
+            description: Some(String::new()),
+        },
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let patches = http.patches.lock().unwrap();
+    assert_eq!(patches.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
+    assert_eq!(body["description"], "");
+    assert!(body.get("start").is_none(), "{body}");
+    assert!(body.get("end").is_none(), "{body}");
+    assert!(body.get("summary").is_none(), "{body}");
 }
 
 #[test]
@@ -1195,6 +1277,7 @@ fn update_event_for_user_wrong_owner_is_not_found() {
             start: None,
             end: None,
             summary: Some("Nope".to_string()),
+            description: None,
         },
         NOW_UNIX,
     ))
@@ -1254,6 +1337,7 @@ fn update_event_for_user_patches_owned_event() {
             start: None,
             end: None,
             summary: Some("Renamed".to_string()),
+            description: None,
         },
         NOW_UNIX,
     ))

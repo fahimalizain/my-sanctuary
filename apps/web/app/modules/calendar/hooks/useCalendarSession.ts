@@ -259,6 +259,7 @@ export function useCalendarSession({
 
     const event = latest.event;
     const postedSummary = event.title.trim();
+    const postedDescription = event.description ?? '';
     const startIso = event.start_time;
     const endIso = event.end_time;
 
@@ -269,6 +270,7 @@ export function useCalendarSession({
       {
         calendar_id: event.calendar_id,
         summary: postedSummary,
+        ...(postedDescription ? { description: postedDescription } : {}),
         start: startIso,
         end: endIso,
       },
@@ -302,18 +304,27 @@ export function useCalendarSession({
           queue.clear(tempId);
           upsertCalendarEventInCache(result.event);
 
-          // If the user renamed / moved the temp event before POST returned,
-          // keep those fields under the server id and flush a PATCH.
+          // If the user renamed / moved / annotated the temp event before
+          // POST returned, keep those fields under the server id and flush
+          // a PATCH.
           if (after.op === 'upsert') {
             const local = after.event;
             const titleDiffers = local.title !== postedSummary;
+            const descriptionDiffers =
+              (local.description ?? '') !== postedDescription;
             const startDiffers = local.start_time !== startIso;
             const endDiffers = local.end_time !== endIso;
 
-            if (titleDiffers || startDiffers || endDiffers) {
+            if (
+              titleDiffers ||
+              descriptionDiffers ||
+              startDiffers ||
+              endDiffers
+            ) {
               const merged: CalendarEvent = {
                 ...result.event,
                 title: local.title,
+                description: local.description,
                 start_time: local.start_time,
                 end_time: local.end_time,
               };
@@ -321,10 +332,14 @@ export function useCalendarSession({
 
               const input: {
                 summary?: string;
+                description?: string;
                 start?: string;
                 end?: string;
               } = {};
               if (titleDiffers) input.summary = local.title;
+              if (descriptionDiffers) {
+                input.description = local.description ?? '';
+              }
               if (startDiffers) input.start = local.start_time;
               if (endDiffers) input.end = local.end_time;
 
@@ -338,6 +353,8 @@ export function useCalendarSession({
                     !patchAfter ||
                     (patchAfter.op === 'upsert' &&
                       patchAfter.event.title === patchResult.event.title &&
+                      patchAfter.event.description ===
+                        patchResult.event.description &&
                       patchAfter.event.start_time ===
                         patchResult.event.start_time &&
                       patchAfter.event.end_time === patchResult.event.end_time)
@@ -351,6 +368,7 @@ export function useCalendarSession({
                   if (
                     patchAfter?.op === 'upsert' &&
                     patchAfter.event.title === local.title &&
+                    patchAfter.event.description === local.description &&
                     patchAfter.event.start_time === local.start_time &&
                     patchAfter.event.end_time === local.end_time
                   ) {
@@ -422,6 +440,7 @@ export function useCalendarSession({
           !latest ||
           (latest.op === 'upsert' &&
             latest.event.title === result.event.title &&
+            latest.event.description === result.event.description &&
             latest.event.start_time === result.event.start_time &&
             latest.event.end_time === result.event.end_time)
         ) {
@@ -431,6 +450,72 @@ export function useCalendarSession({
         // Revert only if overlay was not superseded by a newer edit.
         const latest = queue.getOverlay(selectedEventId);
         if (latest?.op === 'upsert' && latest.event.title === summary) {
+          queue.clear(selectedEventId);
+        }
+        reportWriteError("Couldn't save event", err);
+      }
+    },
+    [
+      selectedEventId,
+      unpersistedDraftId,
+      overlaidEvents,
+      queue,
+      updateEvent,
+      persistDraft,
+      clearWriteError,
+      reportWriteError,
+    ],
+  );
+
+  const handleSaveDescription = useCallback(
+    async (description: string) => {
+      if (!selectedEventId) return;
+      const current = overlaidEvents.find((e) => e.id === selectedEventId);
+      if (!current) return;
+
+      clearWriteError();
+
+      // Paint immediately.
+      queue.upsert({ ...current, description });
+
+      // Unpersisted draft: paint overlay and try persist. Create stays gated
+      // by isPersistableDraftTitle — description-only empty-title drafts do
+      // not POST. Title blur remains the primary persist trigger.
+      if (
+        selectedEventId === unpersistedDraftIdRef.current ||
+        selectedEventId === unpersistedDraftId
+      ) {
+        persistDraft();
+        return;
+      }
+
+      // Temp id with POST in flight — create onSuccess will flush description.
+      if (isTempEventId(selectedEventId)) return;
+
+      try {
+        const result = await updateEvent.mutateAsync({
+          id: selectedEventId,
+          input: { description },
+        });
+        upsertCalendarEventInCache(result.event);
+        const latest = queue.getOverlay(selectedEventId);
+        if (
+          !latest ||
+          (latest.op === 'upsert' &&
+            latest.event.title === result.event.title &&
+            latest.event.description === result.event.description &&
+            latest.event.start_time === result.event.start_time &&
+            latest.event.end_time === result.event.end_time)
+        ) {
+          queue.clear(selectedEventId);
+        }
+      } catch (err) {
+        // Revert only if overlay was not superseded by a newer edit.
+        const latest = queue.getOverlay(selectedEventId);
+        if (
+          latest?.op === 'upsert' &&
+          latest.event.description === description
+        ) {
           queue.clear(selectedEventId);
         }
         reportWriteError("Couldn't save event", err);
@@ -599,7 +684,8 @@ export function useCalendarSession({
             (latest.op === 'upsert' &&
               latest.event.start_time === result.event.start_time &&
               latest.event.end_time === result.event.end_time &&
-              latest.event.title === result.event.title)
+              latest.event.title === result.event.title &&
+              latest.event.description === result.event.description)
           ) {
             queue.clear(eventId);
           }
@@ -790,6 +876,7 @@ export function useCalendarSession({
     focusTitleOnOpen,
     closeInspector,
     handleSaveTitle,
+    handleSaveDescription,
     handleDeleteEvent,
     isSaving: updateEvent.isPending,
     isDeleting: deleteEvent.isPending,

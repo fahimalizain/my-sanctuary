@@ -1,9 +1,10 @@
 //! Journaled patch/delete with If-Match / 412 retry (issue #50 / Vertical 4).
 //!
-//! Minimal `events.patch` bodies only (start/end/summary or status:cancelled).
-//! Journals `pending` before Google, preconditions on the stored etag, retries
-//! 412 up to [`IF_MATCH_MAX_ATTEMPTS`] with the same payload + fresh etag, then
-//! marks the operation `conflict` without disabling the calendar.
+//! Minimal `events.patch` bodies only (start/end/summary/description or
+//! status:cancelled). Journals `pending` before Google, preconditions on the
+//! stored etag, retries 412 up to [`IF_MATCH_MAX_ATTEMPTS`] with the same
+//! payload + fresh etag, then marks the operation `conflict` without disabling
+//! the calendar.
 
 use super::apply::{map_google_event, row_from_new_event};
 use super::google::encode_path_segment;
@@ -26,6 +27,7 @@ pub(crate) const IF_MATCH_MAX_ATTEMPTS: u32 = 3;
 
 /// Builds the minimal `events.patch` JSON object (only present fields).
 /// Empty map → caller returns [`CalendarError::Invalid`] before journal.
+/// `description: Some("")` is emitted as `""` so Google notes can be cleared.
 pub(crate) fn build_patch_payload(fields: &PatchEventFields) -> serde_json::Map<String, serde_json::Value> {
     let mut payload = serde_json::Map::new();
     if let Some(start) = fields.start.as_ref() {
@@ -42,6 +44,9 @@ pub(crate) fn build_patch_payload(fields: &PatchEventFields) -> serde_json::Map<
     }
     if let Some(summary) = fields.summary.as_ref() {
         payload.insert("summary".to_string(), serde_json::json!(summary));
+    }
+    if let Some(description) = fields.description.as_ref() {
+        payload.insert("description".to_string(), serde_json::json!(description));
     }
     payload
 }

@@ -127,12 +127,12 @@ pub async fn create_event(
 /// Patches selected fields on Google (`events.patch`) via the outbound
 /// operation journal (issue #50 / Vertical 4).
 ///
-/// **Minimal body only:** `start.dateTime` / `end.dateTime` / `summary` —
-/// whichever of `fields` are `Some`. This is **not** `events.update` (full
-/// replace). Arrays replace on patch, so we deliberately never send
-/// attendees, conferenceData, extendedProperties, or recurrence — those
-/// stay on Google untouched. Empty (all `None`) → [`CalendarError::Invalid`]
-/// before any journal row.
+/// **Minimal body only:** `start.dateTime` / `end.dateTime` / `summary` /
+/// `description` — whichever of `fields` are `Some` (`Some("")` clears
+/// description). This is **not** `events.update` (full replace). Arrays
+/// replace on patch, so we deliberately never send attendees, conferenceData,
+/// extendedProperties, or recurrence — those stay on Google untouched.
+/// Empty (all `None`) → [`CalendarError::Invalid`] before any journal row.
 ///
 /// Journals `pending` before Google, sends `If-Match` with the stored
 /// `google_etag` (or GETs one first when empty), retries 412 up to three
@@ -190,6 +190,7 @@ pub async fn patch_event(
             start: None,
             end: Some(end_rfc3339.to_string()),
             summary: None,
+            description: None,
         },
         now_unix,
     )
@@ -221,6 +222,7 @@ pub async fn patch_event_summary(
             start: None,
             end: None,
             summary: Some(summary.to_string()),
+            description: None,
         },
         now_unix,
     )

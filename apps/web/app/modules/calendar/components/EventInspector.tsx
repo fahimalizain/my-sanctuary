@@ -32,6 +32,7 @@ export interface EventInspectorProps {
   focusTitle?: boolean;
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
+  onSaveDescription: (description: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -158,6 +159,9 @@ interface InspectorFormProps {
   setTitle: (v: string) => void;
   titleRef: RefObject<HTMLInputElement | null>;
   commitTitle: () => void;
+  description: string;
+  setDescription: (v: string) => void;
+  commitDescription: () => void;
   onClose: () => void;
   onDelete: () => void | Promise<void>;
   isSaving: boolean;
@@ -172,6 +176,9 @@ function InspectorForm({
   setTitle,
   titleRef,
   commitTitle,
+  description,
+  setDescription,
+  commitDescription,
   onClose,
   onDelete,
   isSaving,
@@ -190,7 +197,7 @@ function InspectorForm({
   const showRepeat = hasRepeat(event);
   const showChips = showAllDay || Boolean(timeZone) || showRepeat;
 
-  const description = event.description?.trim() ?? '';
+  const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
 
@@ -301,10 +308,28 @@ function InspectorForm({
           </div>
         </div>
 
-        {/* Description — always visible, read-only */}
-        {description ? (
+        {/* Description — textarea when writable; static when read-only */}
+        {writable ? (
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            onBlur={commitDescription}
+            onKeyDown={(e) => {
+              // Enter inserts a newline; Cmd/Ctrl+Enter blurs to commit.
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                (e.target as HTMLTextAreaElement).blur();
+              }
+            }}
+            disabled={isSaving || isDeleting}
+            aria-label="Description"
+            placeholder="Description"
+            rows={3}
+            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
+          />
+        ) : descriptionDisplay ? (
           <p className="whitespace-pre-wrap text-sm text-foreground">
-            {description}
+            {descriptionDisplay}
           </p>
         ) : (
           <p className="text-sm text-muted-foreground">Description</p>
@@ -337,6 +362,7 @@ export function EventInspector({
   focusTitle = false,
   onClose,
   onSaveTitle,
+  onSaveDescription,
   onDelete,
   isSaving = false,
   isDeleting = false,
@@ -346,6 +372,9 @@ export function EventInspector({
   const titleRef = useRef<HTMLInputElement>(null);
   // Track the last-saved title so blur after an unchanged edit is a no-op.
   const savedTitleRef = useRef(event.title);
+  const [description, setDescription] = useState(event.description ?? '');
+  // Committed (trimmed) description — blank is a valid clear, unlike title.
+  const savedDescriptionRef = useRef((event.description ?? '').trim());
   const isDesktop = useIsDesktop();
   const rect = useChipRect(event.id);
   const hidden = isDragging;
@@ -359,6 +388,15 @@ export function EventInspector({
     setTitle(event.title);
     savedTitleRef.current = event.title;
   }, [event.id, event.title]);
+
+  // Same dirty-across-remap rule for description.
+  useEffect(() => {
+    const dirty = description !== savedDescriptionRef.current;
+    if (dirty) return;
+    const next = event.description ?? '';
+    setDescription(next);
+    savedDescriptionRef.current = next.trim();
+  }, [event.id, event.description]);
 
   useEffect(() => {
     if (focusTitle && writable) {
@@ -390,6 +428,18 @@ export function EventInspector({
     void onSaveTitle(next);
   };
 
+  const commitDescription = () => {
+    const next = description.trim();
+    if (next === savedDescriptionRef.current) {
+      // Normalize whitespace-only / trailing spaces in the field.
+      if (description !== next) setDescription(next);
+      return;
+    }
+    savedDescriptionRef.current = next;
+    setDescription(next);
+    void onSaveDescription(next);
+  };
+
   const form = (
     <InspectorForm
       event={event}
@@ -398,6 +448,9 @@ export function EventInspector({
       setTitle={setTitle}
       titleRef={titleRef}
       commitTitle={commitTitle}
+      description={description}
+      setDescription={setDescription}
+      commitDescription={commitDescription}
       onClose={onClose}
       onDelete={onDelete}
       isSaving={isSaving}

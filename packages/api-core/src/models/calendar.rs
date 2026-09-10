@@ -358,6 +358,10 @@ pub struct PatchEventFields {
     /// Event title → Google `summary`.
     #[serde(default)]
     pub summary: Option<String>,
+    /// Event notes → Google `description`. `Some("")` clears notes;
+    /// `None` omits the field from the patch body.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Request body for `POST /api/calendar/events`.

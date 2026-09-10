@@ -305,8 +305,9 @@ pub async fn create_event(
 
 /// `PATCH /api/calendar/events/:id` → 200 `{"event":{...},"source":"google"}`.
 ///
-/// Body: `{start?, end?, summary?}` — at least one field required. Looks up
-/// the local event, verifies calendar ownership, then patches Google.
+/// Body: `{start?, end?, summary?, description?}` — at least one field
+/// required. Looks up the local event, verifies calendar ownership, then
+/// patches Google.
 pub async fn update_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,

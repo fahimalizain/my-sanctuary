@@ -15,6 +15,7 @@ type EventInspectorProps = {
   focusTitle?: boolean;
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
+  onSaveDescription: (description: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -80,25 +81,32 @@ function makeCalendar(overrides?: Partial<GoogleCalendar>): GoogleCalendar {
 type Spies = {
   onClose: (...args: unknown[]) => void;
   onSaveTitle: (...args: unknown[]) => void;
+  onSaveDescription: (...args: unknown[]) => void;
   onDelete: (...args: unknown[]) => void;
   closeCalls: unknown[][];
   saveCalls: unknown[][];
+  saveDescriptionCalls: unknown[][];
   deleteCalls: unknown[][];
 };
 
 function makeSpies(): Spies {
   const closeCalls: unknown[][] = [];
   const saveCalls: unknown[][] = [];
+  const saveDescriptionCalls: unknown[][] = [];
   const deleteCalls: unknown[][] = [];
   return {
     closeCalls,
     saveCalls,
+    saveDescriptionCalls,
     deleteCalls,
     onClose: (...args: unknown[]) => {
       closeCalls.push(args);
     },
     onSaveTitle: (...args: unknown[]) => {
       saveCalls.push(args);
+    },
+    onSaveDescription: (...args: unknown[]) => {
+      saveDescriptionCalls.push(args);
     },
     onDelete: (...args: unknown[]) => {
       deleteCalls.push(args);
@@ -123,6 +131,7 @@ function mount(
       focusTitle: props.focusTitle,
       onClose: spies.onClose,
       onSaveTitle: spies.onSaveTitle,
+      onSaveDescription: spies.onSaveDescription,
       onDelete: spies.onDelete,
     }),
   );
@@ -166,23 +175,54 @@ test('title commit: trim on blur; unchanged and blank are no-ops', () => {
 
 // ── 3. Description ──────────────────────────────────────────────────────
 
-test('description: empty shows placeholder; non-empty is read-only text', () => {
-  // Empty / whitespace → "Description"
-  mount({ event: makeEvent({ id: 'e1', description: '   ' }) });
-  assert.ok(screen.getByText('Description'));
-  // Placeholder is a <p>, not an input.
-  assert.equal(document.querySelector('textarea'), null);
-  assert.equal(document.querySelector('input[aria-label="Description"]'), null);
-  cleanup();
+test('description: writable textarea with placeholder when empty', () => {
+  mount({ event: makeEvent({ id: 'e1', description: '' }) });
+  const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
+  assert.equal(ta.tagName, 'TEXTAREA');
+  assert.equal(ta.value, '');
+  assert.equal(ta.placeholder, 'Description');
+});
 
+test('description: writable textarea shows non-empty value', () => {
   mount({
     event: makeEvent({ id: 'e2', description: 'Bring snacks' }),
   });
-  assert.ok(screen.getByText('Bring snacks'));
-  assert.equal(document.querySelector('textarea'), null);
-  // Still no description input.
-  const descInputs = screen.queryAllByLabelText('Description');
-  assert.equal(descInputs.length, 0);
+  const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
+  assert.equal(ta.value, 'Bring snacks');
+});
+
+test('description commit: trim on blur; unchanged no-op; clear commits empty', () => {
+  const spies = makeSpies();
+  mount(
+    { event: makeEvent({ id: 'e3', description: 'Bring snacks' }) },
+    spies,
+  );
+
+  const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
+  assert.equal(ta.value, 'Bring snacks');
+
+  // Changed + trimmed → onSaveDescription once.
+  fireEvent.change(ta, { target: { value: '  Pack lunch  ' } });
+  fireEvent.blur(ta);
+  assert.equal(spies.saveDescriptionCalls.length, 1);
+  assert.equal(spies.saveDescriptionCalls[0][0], 'Pack lunch');
+
+  // Same after trim → no-op.
+  fireEvent.change(ta, { target: { value: 'Pack lunch' } });
+  fireEvent.blur(ta);
+  assert.equal(spies.saveDescriptionCalls.length, 1);
+
+  // Clear to empty → commits "" (unlike title).
+  fireEvent.change(ta, { target: { value: '' } });
+  fireEvent.blur(ta);
+  assert.equal(spies.saveDescriptionCalls.length, 2);
+  assert.equal(spies.saveDescriptionCalls[1][0], '');
+
+  // Whitespace-only → treated as empty; already saved "" → no-op.
+  fireEvent.change(ta, { target: { value: '   ' } });
+  fireEvent.blur(ta);
+  assert.equal(spies.saveDescriptionCalls.length, 2);
+  assert.equal(ta.value, '');
 });
 
 // ── 4. Calendar row ─────────────────────────────────────────────────────
@@ -260,19 +300,37 @@ test('overflow Delete calls onDelete; available for owner/writer/omitted', () =>
 
 // ── 8. Read-only ────────────────────────────────────────────────────────
 
-test('read-only reader and freeBusyReader: static title, no Delete', () => {
+test('read-only reader and freeBusyReader: static title/description, no Delete', () => {
   for (const role of ['reader', 'freeBusyReader'] as const) {
     cleanup();
     mount({
-      event: makeEvent({ id: `ro-${role}`, title: 'Locked event' }),
+      event: makeEvent({
+        id: `ro-${role}`,
+        title: 'Locked event',
+        description: 'Secret notes',
+      }),
       calendar: makeCalendar({ access_role: role }),
     });
     // Title text visible, no Title input.
     assert.ok(screen.getByText('Locked event'));
     assert.equal(screen.queryByLabelText('Title'), null);
+    // Description is static text — no textarea.
+    assert.ok(screen.getByText('Secret notes'));
+    assert.equal(screen.queryByLabelText('Description'), null);
+    assert.equal(document.querySelector('textarea'), null);
     assert.equal(screen.queryByLabelText('More actions'), null);
     assert.equal(screen.queryByLabelText('Delete event'), null);
   }
+});
+
+test('read-only empty description shows static placeholder', () => {
+  mount({
+    event: makeEvent({ id: 'ro-empty-desc', description: '   ' }),
+    calendar: makeCalendar({ access_role: 'reader' }),
+  });
+  assert.ok(screen.getByText('Description'));
+  assert.equal(screen.queryByLabelText('Description'), null);
+  assert.equal(document.querySelector('textarea'), null);
 });
 
 // ── 9. data-event-inspector on both shells ──────────────────────────────

@@ -116,6 +116,8 @@ export interface PatchCalendarEventInput {
   start?: string;
   end?: string;
   summary?: string;
+  /** Event notes; empty string clears Google description. */
+  description?: string;
 }
 
 // Envelope for DELETE /api/calendar/events/:id

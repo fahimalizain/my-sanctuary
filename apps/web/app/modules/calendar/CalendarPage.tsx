@@ -148,6 +148,7 @@ export function CalendarPage() {
             focusTitle={session.focusTitleOnOpen}
             onClose={session.closeInspector}
             onSaveTitle={session.handleSaveTitle}
+            onSaveDescription={session.handleSaveDescription}
             onDelete={session.handleDeleteEvent}
             isSaving={session.isSaving}
             isDeleting={session.isDeleting}
