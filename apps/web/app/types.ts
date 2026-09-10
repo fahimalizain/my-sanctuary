@@ -94,6 +94,14 @@ export interface CalendarEventsResponse {
   sync: CalendarEventsSync;
 }
 
+// Response from POST /api/calendar/calendars/:id/repair
+export type CalendarRepairStatus = 'queued' | 'in_progress' | 'cooldown';
+
+export interface CalendarRepairResponse {
+  status: CalendarRepairStatus;
+  retry_after_seconds: number | null;
+}
+
 // Request body for POST /api/calendar/events
 export interface NewCalendarEventInput {
   /** Local `GoogleCalendar.id` (not the Google calendar id). */
