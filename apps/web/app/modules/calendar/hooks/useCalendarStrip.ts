@@ -9,6 +9,7 @@ import {
 } from 'react';
 import {
   DAYS_PER_PERIOD,
+  PERIOD_LENGTH_STORAGE_KEY,
   STRIP_OVERSCAN,
   addDays,
   clampPeriodLength,
@@ -17,6 +18,7 @@ import {
   formatDayRangeTitle,
   gutterWithRemainder,
   isSameDay,
+  parseStoredPeriodLength,
   rangeIso,
   scrollLeftForIndex,
   shiftWindowStart,
@@ -25,6 +27,19 @@ import {
   stripDayCount,
   visibleStartIndex as computeVisibleStartIndex,
 } from '../lib/week-layout';
+
+function readStoredPeriodLength(): number {
+  if (typeof window === 'undefined') return DAYS_PER_PERIOD;
+  try {
+    return (
+      parseStoredPeriodLength(
+        localStorage.getItem(PERIOD_LENGTH_STORAGE_KEY),
+      ) ?? DAYS_PER_PERIOD
+    );
+  } catch {
+    return DAYS_PER_PERIOD;
+  }
+}
 
 export interface CalendarStrip {
   periodLength: number;
@@ -58,13 +73,14 @@ export interface CalendarStrip {
  * events / drag / inspector.
  */
 export function useCalendarStrip(): CalendarStrip {
-  // Visible day-column count (1–7). Session-only; not persisted.
-  const [periodLength, setPeriodLength] = useState(DAYS_PER_PERIOD);
+  // Visible day-column count (1–7). Persisted under PERIOD_LENGTH_STORAGE_KEY.
+  const [periodLength, setPeriodLength] = useState(readStoredPeriodLength);
 
   // Strip window: first *rendered* day. Visible period is windowStart + scroll offset.
-  // Initial: overscan before current Mon–Sun so current week is centered in the buffer.
+  // Initial: overscan before current period so it is centered in the buffer.
+  // Uses stored period length so Day/short views do not Monday-snap on first paint.
   const [windowStart, setWindowStart] = useState(() =>
-    addDays(fitPeriodStart(new Date(), DAYS_PER_PERIOD), -STRIP_OVERSCAN),
+    addDays(fitPeriodStart(new Date(), readStoredPeriodLength()), -STRIP_OVERSCAN),
   );
 
   // First visible day index into the rendered strip (0 … dayCount-periodLength).
@@ -275,6 +291,11 @@ export function useCalendarStrip(): CalendarStrip {
     (n: number) => {
       const next = clampPeriodLength(n);
       setPeriodLength(next);
+      try {
+        localStorage.setItem(PERIOD_LENGTH_STORAGE_KEY, String(next));
+      } catch {
+        // private mode / quota — in-session change still applies
+      }
       const nextStart = fitPeriodStart(visibleStart, next);
       const nextDays = Array.from({ length: next }, (_, i) =>
         addDays(nextStart, i),

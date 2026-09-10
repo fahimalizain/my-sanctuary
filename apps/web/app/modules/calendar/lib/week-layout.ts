@@ -193,6 +193,20 @@ export function clampPeriodLength(n: number): number {
   return clamp(Math.trunc(n), MIN_PERIOD_LENGTH, MAX_PERIOD_LENGTH);
 }
 
+/** localStorage key for the visible period length (1–7). */
+export const PERIOD_LENGTH_STORAGE_KEY = 'sanctuary.calendar.periodLength';
+
+/**
+ * Parse localStorage value. null / '' / non-finite → null.
+ * Finite → clampPeriodLength(n).
+ */
+export function parseStoredPeriodLength(raw: string | null): number | null {
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return clampPeriodLength(n);
+}
+
 /** Notion button label: 1 → "Day", 7 → "Week", else `${n} days`. */
 export function periodLabel(periodLength: number): string {
   const n = clampPeriodLength(periodLength);
