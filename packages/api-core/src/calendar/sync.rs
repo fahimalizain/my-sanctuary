@@ -226,10 +226,17 @@ fn status_from_returned_message(msg: &str) -> Option<u16> {
 
 /// Replica state to persist after a classified failure.
 ///
-/// Does **not** auto-flip to `rebuilding` and does not reset the sync token.
+/// - `AuthRevoked` → `authorization_required`
+/// - `Gone` → `rebuilding` (diagnosed 410 that could not finish in-process;
+///   next action is still merge-full; `full_sync_requested` should already be
+///   durable from [`CalendarRepo::begin_replica_reseed`])
+/// - everything else → `retrying`
+///
+/// Does **not** reset the sync token.
 pub fn replica_state_for_error(code: SyncErrorCode) -> CalendarReplicaState {
     match code {
         SyncErrorCode::AuthRevoked => CalendarReplicaState::AuthorizationRequired,
+        SyncErrorCode::Gone => CalendarReplicaState::Rebuilding,
         _ => CalendarReplicaState::Retrying,
     }
 }
@@ -744,7 +751,7 @@ mod tests {
         );
         assert_eq!(
             replica_state_for_error(SyncErrorCode::Gone),
-            CalendarReplicaState::Retrying
+            CalendarReplicaState::Rebuilding
         );
         assert_eq!(
             replica_state_for_error(SyncErrorCode::StorageTransient),

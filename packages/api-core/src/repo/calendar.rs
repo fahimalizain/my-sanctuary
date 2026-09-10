@@ -80,6 +80,10 @@ pub trait CalendarRepo: Send + Sync {
         next_retry_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Persist that a merge-full / reseed is required and now in-flight.
+    /// Sets `full_sync_requested = 1` and `sync_status = 'rebuilding'`.
+    /// Does **not** touch `sync_token`, success stamps, error/streak, dirty gens, or lease.
+    async fn begin_replica_reseed(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
     /// Try to become the sole replica owner for `id`. Succeeds when the lease
     /// is empty, already ours, or expired. Returns `true` only when this
     /// `owner` holds the lease after the update.
@@ -442,6 +446,17 @@ pub const CALENDAR_RECORD_SYNC_FAILURE_SQL: &str = "
       sync_status = ?,
       next_retry_at = ?,
       updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Mark merge-full / reseed in-flight. Sets `full_sync_requested` and
+/// `sync_status = 'rebuilding'`. Does **not** touch `sync_token`, success
+/// stamps, error/streak, dirty gens, or lease. Binds: now, id.
+pub const CALENDAR_BEGIN_REPLICA_RESEED_SQL: &str = "
+    UPDATE google_calendars
+    SET full_sync_requested = 1,
+        sync_status = 'rebuilding',
+        updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
 ";
 
@@ -1344,6 +1359,24 @@ mod tests {
         assert!(!sql.contains("last_success_at"), "{sql}");
         assert!(!sql.contains("last_synced_at"), "{sql}");
         assert!(!sql.contains("last_attempt_at"), "{sql}");
+        assert!(!sql.contains("full_sync_requested"), "{sql}");
+    }
+
+    #[test]
+    fn begin_replica_reseed_sql_sets_flag_and_rebuilding_without_touching_token() {
+        let sql = CALENDAR_BEGIN_REPLICA_RESEED_SQL;
+        assert!(sql.contains("full_sync_requested = 1"), "{sql}");
+        assert!(sql.contains("sync_status = 'rebuilding'"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("last_success_at"), "{sql}");
+        assert!(!sql.contains("last_synced_at"), "{sql}");
+        assert!(!sql.contains("last_attempt_at"), "{sql}");
+        assert!(!sql.contains("last_error_code"), "{sql}");
+        assert!(!sql.contains("failure_streak"), "{sql}");
+        assert!(!sql.contains("lease_owner"), "{sql}");
+        assert!(!sql.contains("dirty_"), "{sql}");
     }
 
     #[test]

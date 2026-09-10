@@ -3147,6 +3147,14 @@ mod tests {
             Ok(())
         }
 
+        async fn begin_replica_reseed(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn try_acquire_lease(
             &self,
             _id: &str,

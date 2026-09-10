@@ -571,11 +571,27 @@ impl CalendarRepo for FakeCalendarRepo {
     ) -> Result<(), RepoError> {
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
-            // Do not touch sync_token / last_success_at / last_synced_at.
+            // Do not touch sync_token / last_success_at / last_synced_at /
+            // full_sync_requested.
             cal.last_error_code = error_code.to_string();
             cal.failure_streak += 1;
             cal.sync_status = sync_status.to_string();
             cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+
+    async fn begin_replica_reseed(
+        &self,
+        id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            // Do not touch sync_token.
+            cal.full_sync_requested = true;
+            cal.sync_status = "rebuilding".to_string();
             cal.updated_at = now_rfc3339.to_string();
         }
         Ok(())
