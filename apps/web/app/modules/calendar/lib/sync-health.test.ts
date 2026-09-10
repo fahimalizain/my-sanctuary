@@ -5,10 +5,7 @@ import type {
   CalendarSyncHealth,
   GoogleCalendar,
 } from '@/app/types';
-import {
-  repairTargetCalendarId,
-  selectSyncHealthBanner,
-} from './sync-health';
+import { repairTargetCalendarId, selectSyncHealthBanner } from './sync-health';
 
 function health(
   overrides: Partial<CalendarSyncHealth> &

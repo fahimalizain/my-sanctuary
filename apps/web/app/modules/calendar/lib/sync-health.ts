@@ -81,7 +81,9 @@ function withFeatured(
 }
 
 /** Calendar to POST /repair for this banner, or null (refetch only). */
-export function repairTargetCalendarId(banner: SyncHealthBanner): string | null {
+export function repairTargetCalendarId(
+  banner: SyncHealthBanner,
+): string | null {
   if (banner.kind === 'degraded' && banner.calendarId) return banner.calendarId;
   return null;
 }
