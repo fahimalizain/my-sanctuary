@@ -767,6 +767,10 @@ impl CalendarRepo for FakeCalendarRepo {
 /// time-range query returns them, and every call is recorded.
 pub(crate) struct FakeEventRepo {
     pub(crate) stored: Mutex<Vec<CalendarEvent>>,
+    /// Optional parent-calendar catalog for list queries. Empty = no join
+    /// filter (existing fixtures that only seed events keep working).
+    /// When populated, mirrors the SQL INNER JOIN + living + sync_enabled.
+    pub(crate) parent_calendars: Mutex<Vec<GoogleCalendar>>,
     pub(crate) upserted_batch: Mutex<Vec<NewCalendarEvent>>,
     pub(crate) upserted_single: Mutex<Option<(String, NewCalendarEvent)>>,
     pub(crate) ranged: Mutex<Vec<(String, String, String)>>,
@@ -783,6 +787,7 @@ impl FakeEventRepo {
     pub(crate) fn new() -> Self {
         Self {
             stored: Mutex::new(Vec::new()),
+            parent_calendars: Mutex::new(Vec::new()),
             upserted_batch: Mutex::new(Vec::new()),
             upserted_single: Mutex::new(None),
             ranged: Mutex::new(Vec::new()),
@@ -870,6 +875,25 @@ impl FakeEventRepo {
         }
         true
     }
+
+    /// Mirrors the SQL INNER JOIN on `google_calendars` plus living +
+    /// sync-enabled parent predicates. Empty catalog = no filter so fixtures
+    /// that only seed events keep working.
+    fn living_enabled_parent(
+        event: &CalendarEvent,
+        user_id: &str,
+        calendars: &[GoogleCalendar],
+    ) -> bool {
+        if calendars.is_empty() {
+            return true;
+        }
+        calendars.iter().any(|c| {
+            c.id == event.calendar_id
+                && c.user_id == user_id
+                && c.deleted_at.is_none()
+                && c.sync_enabled
+        })
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -941,13 +965,16 @@ impl CalendarEventRepo for FakeEventRepo {
             start_rfc3339.to_string(),
             end_rfc3339.to_string(),
         ));
-        // Mirrors EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL projection +
-        // overlap (start < window_end AND end > window_start).
+        // Mirrors EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: living+enabled
+        // parent join + projection + overlap (start < window_end AND end >
+        // window_start).
         let stored = self.stored.lock().unwrap();
+        let parents = self.parent_calendars.lock().unwrap();
         Ok(stored
             .iter()
             .filter(|event| {
-                Self::in_projection(event, &stored)
+                Self::living_enabled_parent(event, user_id, &parents)
+                    && Self::in_projection(event, &stored)
                     && event.start_time.as_str() < end_rfc3339
                     && event.end_time.as_str() > start_rfc3339
             })
@@ -957,16 +984,18 @@ impl CalendarEventRepo for FakeEventRepo {
 
     async fn list_running_by_user_id(
         &self,
-        _user_id: &str,
+        user_id: &str,
         now_rfc3339: &str,
     ) -> Result<Vec<CalendarEvent>, RepoError> {
-        // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: projection +
-        // task-tagged + `start_time <= now < end_time`.
+        // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: living+enabled parent
+        // join + projection + task-tagged + `start_time <= now < end_time`.
         let stored = self.stored.lock().unwrap();
+        let parents = self.parent_calendars.lock().unwrap();
         Ok(stored
             .iter()
             .filter(|event| {
-                Self::in_projection(event, &stored)
+                Self::living_enabled_parent(event, user_id, &parents)
+                    && Self::in_projection(event, &stored)
                     && !event.task_id.is_empty()
                     && event.start_time.as_str() <= now_rfc3339
                     && event.end_time.as_str() > now_rfc3339

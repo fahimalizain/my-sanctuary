@@ -526,6 +526,10 @@ pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
 /// the window ends AND ends after it begins — multi-day and overnight events
 /// are not clipped at window edges.
 ///
+/// Parent calendar must be living (`c.deleted_at IS NULL`) and sync-enabled
+/// (`c.sync_enabled = 1`). Soft-deleted or user-disabled calendars keep their
+/// cached events but must not paint on GET.
+///
 /// Projection `timed_masters_and_exceptions`: exclude all-day rows and
 /// cancelled exceptions (stored living for series correctness) from GET.
 ///
@@ -539,6 +543,8 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
+      AND c.deleted_at IS NULL
+      AND c.sync_enabled = 1
       AND e.deleted_at IS NULL
       AND e.is_all_day = 0
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
@@ -558,8 +564,9 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     ORDER BY e.start_time ASC
 ";
 
-/// The derived "running" set: task-tagged events joined to the user's (living)
-/// calendars where `task_id` is set AND `start_time <= now < end_time`.
+/// The derived "running" set: task-tagged events joined to the user's living,
+/// sync-enabled calendars where `task_id` is set AND `start_time <= now < end_time`.
+/// Soft-deleted or user-disabled parents are excluded (same as the range query).
 /// SQLite evaluates `NULL != ''` to NULL (falsy), so the NULL guard before the
 /// empty-string test is required, not cosmetic. RFC 3339 UTC strings of this
 /// shape (`…Z`, zero-padded, no fractions) compare lexicographically, so the
@@ -572,6 +579,8 @@ pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
+      AND c.deleted_at IS NULL
+      AND c.sync_enabled = 1
       AND e.deleted_at IS NULL
       AND e.is_all_day = 0
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
@@ -952,6 +961,18 @@ mod tests {
             sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn event_list_queries_require_living_enabled_parent() {
+        for sql in [
+            EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
+            EVENT_LIST_RUNNING_BY_USER_ID_SQL,
+        ] {
+            assert!(sql.contains("c.user_id = ?"), "{sql}");
+            assert!(sql.contains("c.deleted_at IS NULL"), "{sql}");
+            assert!(sql.contains("c.sync_enabled = 1"), "{sql}");
+        }
     }
 
     #[test]
