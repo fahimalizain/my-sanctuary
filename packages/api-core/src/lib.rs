@@ -7,6 +7,10 @@
 pub mod agenda;
 pub mod calendar;
 pub mod calendar_color;
+pub use calendar::apply as calendar_apply;
+pub use calendar::replica as calendar_replica;
+pub use calendar::sync as calendar_sync;
+pub use calendar::window as calendar_window;
 pub mod categories;
 pub mod google_color;
 pub mod lists;
@@ -36,12 +40,20 @@ pub use agenda::{
 pub use calendar::{
     create_event, decide_webhook, delete_event, delete_event_for_user, ensure_watch,
     is_public_https_callback, list_calendars, list_events, parse_event_time_range, patch_event,
-    patch_event_fields, renew_watch_if_needed, run_fallback_cron, stop_watches_for_calendar,
-    sync_calendar, tokens_match, update_event_for_user, CalendarError, CalendarEventsResponse,
-    CalendarListOutput, CalendarView, CalendarsResponse, CreateEventOutput, CreateEventResponse,
-    CronReport, DeleteEventResponse, WebhookDecision, CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL,
-    GOOGLE_CHANNELS_STOP_URL, GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS,
-    WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
+    patch_event_fields, persist_webhook_decision, renew_watch_if_needed, repair_inflight_operations,
+    replica_due, run_fallback_cron, stop_watches_for_calendar, sync_calendar, tokens_match,
+    update_event_for_user, CalendarError, CalendarEventsResponse, CalendarListOutput, CalendarView,
+    CalendarsResponse, CreateEventOutput, CreateEventResponse, CronReport, DeleteEventResponse,
+    SyncCalendarOutcome, WebhookDecision, WebhookPersistResult, CRON_MAX_REPLICA_CALENDARS,
+    CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL, GOOGLE_CHANNELS_STOP_URL,
+    GOOGLE_EVENTS_BASE_URL, SYNC_STALE_THRESHOLD_SECS, WATCH_DEFAULT_TTL_SECS,
+    WATCH_RENEW_HORIZON_SECS,
+};
+pub use calendar_sync::{
+    aggregate_sync_status, calendar_sync_view, classify_sync_error, events_sync_envelope,
+    next_retry_rfc3339, next_retry_unix, replica_query_fingerprint, replica_state_for_error,
+    CalendarReplicaState, CalendarSyncView, EventsSyncEnvelope, SyncAggregateStatus, SyncErrorCode,
+    REPLICA_PROJECTION, SYNC_HEALTH_STALE_SECS,
 };
 pub use calendar_color::{
     calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
@@ -81,7 +93,8 @@ pub use routines::{
 pub use repo::{
     build_event_upsert_sql, build_occurrence_insert_sql, build_occurrence_list_by_ids_sql,
     build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, AgendaItemRepo,
-    CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError, RoutineRepo, TaskCategoryRepo,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError,
+    RoutineRepo, TaskCategoryRepo,
     TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
     AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
     AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,
@@ -89,8 +102,16 @@ pub use repo::{
     AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_MAX_SORT_ORDER_SQL,
     AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
-    CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
-    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
+    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL,
+    CALENDAR_LIST_STATE_GET_SQL,
+    CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_LIST_USER_IDS_SQL,
+    CALENDAR_MARK_DIRTY_APPLIED_SQL,
+    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
+    CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL, CALENDAR_SET_EVENT_LABELS_SQL,
+    CALENDAR_TRY_ACQUIRE_LEASE_SQL,
+    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
     OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_INSERT_COL_COUNT,
@@ -110,6 +131,7 @@ pub use repo::{
     TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
     TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL,
+    WATCH_CHANNEL_LIST_ALL_SQL,
 };
 pub use tasks::{
     classify_title, complete_task, create_task, delete_task, delete_focus, discard_task,
@@ -131,4 +153,6 @@ pub use time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, parse_iana_tz,
     rfc3339_to_unix_secs, unix_secs_to_rfc3339,
 };
-pub use token::{refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS};
+pub use token::{
+    is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError, REFRESH_SKEW_SECS,
+};

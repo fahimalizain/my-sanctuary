@@ -78,6 +78,20 @@ pub trait HttpClient: Send + Sync {
         access_token: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), HttpError>;
+
+    /// Like [`patch_json`](Self::patch_json) but sets additional request
+    /// headers (e.g. `If-Match` for calendar writes). Default drops extras
+    /// and delegates so oauth/token/tasks/agenda fakes keep compiling.
+    async fn patch_json_with_headers(
+        &self,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<(u16, Vec<u8>), HttpError> {
+        let _ = extra_headers;
+        self.patch_json(url, access_token, body).await
+    }
 }
 
 /// Errors produced by the code-exchange/login orchestration.

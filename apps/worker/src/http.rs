@@ -70,7 +70,8 @@ impl api_core::HttpClient for WorkerHttp {
         access_token: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), HttpError> {
-        self.json_request(Method::Post, url, access_token, body).await
+        self.json_request(Method::Post, url, access_token, body, &[])
+            .await
     }
 
     async fn patch_json(
@@ -79,19 +80,33 @@ impl api_core::HttpClient for WorkerHttp {
         access_token: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), HttpError> {
-        self.json_request(Method::Patch, url, access_token, body).await
+        self.json_request(Method::Patch, url, access_token, body, &[])
+            .await
+    }
+
+    async fn patch_json_with_headers(
+        &self,
+        url: &str,
+        access_token: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> Result<(u16, Vec<u8>), HttpError> {
+        self.json_request(Method::Patch, url, access_token, body, extra_headers)
+            .await
     }
 }
 
 impl WorkerHttp {
     /// Shared JSON-with-bearer request used by both `post_json` and
-    /// `patch_json` (the timer's `events.patch`).
+    /// `patch_json` (the timer's `events.patch`), plus optional extras
+    /// (`If-Match` on journaled calendar writes).
     async fn json_request(
         &self,
         method: Method,
         url: &str,
         access_token: &str,
         body: &[u8],
+        extra_headers: &[(&str, &str)],
     ) -> Result<(u16, Vec<u8>), HttpError> {
         let headers = Headers::new();
         headers
@@ -100,6 +115,9 @@ impl WorkerHttp {
         headers
             .set("Authorization", &format!("Bearer {access_token}"))
             .map_err(http_err)?;
+        for &(name, value) in extra_headers {
+            headers.set(name, value).map_err(http_err)?;
+        }
         let mut init = RequestInit::new();
         init.with_method(method)
             .with_headers(headers)

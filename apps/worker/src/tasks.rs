@@ -61,6 +61,9 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: TasksError) -> R
         TasksError::Calendar(api_core::CalendarError::GoogleApi(message)) => {
             json_error(ctx, 502, &message)
         }
+        TasksError::Calendar(api_core::CalendarError::Conflict) => {
+            json_error(ctx, 409, "event write conflict")
+        }
         TasksError::Calendar(err) => {
             console_log!("tasks: calendar error: {err}");
             json_error(ctx, 500, "failed to update task")
@@ -313,6 +316,7 @@ pub async fn delete_task(
         http,
         &repos.calendars,
         &repos.events,
+        &repos.operations,
         &repos.logs,
         &users,
         access.as_ref(),
@@ -344,6 +348,7 @@ struct TimerRepos {
     lists: crate::db::D1TaskListRepo,
     calendars: crate::db::D1CalendarRepo,
     events: crate::db::D1CalendarEventRepo,
+    operations: crate::db::D1CalendarEventOperationRepo,
     logs: crate::db::D1TaskLogRepo,
     tokens: crate::db::D1TokenRepo,
 }
@@ -356,6 +361,7 @@ fn timer_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<TimerRepos> 
         lists: crate::db::D1TaskListRepo::new(db()?),
         calendars: crate::db::D1CalendarRepo::new(db()?),
         events: crate::db::D1CalendarEventRepo::new(db()?),
+        operations: crate::db::D1CalendarEventOperationRepo::new(db()?),
         logs: crate::db::D1TaskLogRepo::new(db()?),
         tokens: crate::db::D1TokenRepo::new(db()?),
     })
@@ -407,6 +413,7 @@ pub async fn start_task(
         &crate::http::WorkerHttp,
         &repos.calendars,
         &repos.events,
+        &repos.operations,
         &repos.lists,
         &repos.categories,
         &repos.tasks,
@@ -444,6 +451,7 @@ macro_rules! timer_action {
                 &crate::http::WorkerHttp,
                 &repos.calendars,
                 &repos.events,
+                &repos.operations,
                 &repos.categories,
                 &repos.tasks,
                 &repos.logs,
@@ -567,6 +575,7 @@ pub async fn move_task(
         http,
         &repos.calendars,
         &repos.events,
+        &repos.operations,
         &repos.lists,
         &repos.categories,
         &repos.tasks,
@@ -634,6 +643,7 @@ pub async fn focus_task(
         &crate::http::WorkerHttp,
         &repos.calendars,
         &repos.events,
+        &repos.operations,
         &repos.lists,
         &repos.categories,
         &repos.tasks,
@@ -669,6 +679,7 @@ pub async fn delete_focus(
         &crate::http::WorkerHttp,
         &repos.calendars,
         &repos.events,
+        &repos.operations,
         &repos.categories,
         &repos.tasks,
         &repos.logs,

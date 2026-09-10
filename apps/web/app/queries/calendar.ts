@@ -16,8 +16,17 @@ import type {
   CalendarEventsResponse,
   PatchCalendarEventInput,
 } from '@/app/types';
+import {
+  applyCalendarEventRemove,
+  applyCalendarEventUpsert,
+} from './calendar-events-cache';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';
+
+export {
+  applyCalendarEventRemove,
+  applyCalendarEventUpsert,
+} from './calendar-events-cache';
 
 // Same split as lists.ts: React-free `queryOptions` factory + hooks.
 // Query's signal is forwarded so a month change aborts the in-flight
@@ -64,38 +73,25 @@ export async function cancelCalendarEventsQuery(): Promise<void> {
 
 /**
  * Patch `event` into every cached events query (replace by id or append).
- * Preserves each entry's `source`. Used after a successful PATCH so the
- * durable cache matches the server without a full invalidate.
+ * Preserves each entry's `sync` and `source`. Used after a successful PATCH
+ * so the durable cache matches the server without a full invalidate.
  */
 export function upsertCalendarEventInCache(event: CalendarEvent): void {
   queryClient.setQueriesData<CalendarEventsResponse>(
     { queryKey: calendarEventsQueryKey },
-    (old) => {
-      if (!old?.events) return old;
-      const idx = old.events.findIndex((e) => e.id === event.id);
-      const events =
-        idx >= 0
-          ? old.events.map((e) => (e.id === event.id ? event : e))
-          : [...old.events, event];
-      return { ...old, events };
-    },
+    (old) => applyCalendarEventUpsert(old, event),
   );
 }
 
 /**
- * Drop `id` from every cached events query. Preserves each entry's `source`.
- * Used after a successful DELETE so the durable cache matches the server
- * without a full invalidate.
+ * Drop `id` from every cached events query. Preserves each entry's `sync`
+ * and `source`. Used after a successful DELETE so the durable cache matches
+ * the server without a full invalidate.
  */
 export function removeCalendarEventFromCache(id: string): void {
   queryClient.setQueriesData<CalendarEventsResponse>(
     { queryKey: calendarEventsQueryKey },
-    (old) => {
-      if (!old?.events) return old;
-      const events = old.events.filter((e) => e.id !== id);
-      if (events.length === old.events.length) return old;
-      return { ...old, events };
-    },
+    (old) => applyCalendarEventRemove(old, id),
   );
 }
 

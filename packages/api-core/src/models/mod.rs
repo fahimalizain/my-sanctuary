@@ -74,6 +74,9 @@ where
     deserializer.deserialize_any(EmptyStringVisitor)
 }
 
+pub mod calendar;
+pub use calendar::*;
+
 /// A user identity as stored in the `users` table.
 ///
 /// Identity only — Google OAuth tokens live in [`GoogleOAuthToken`].
@@ -140,129 +143,6 @@ pub struct NewToken {
     pub expiry: String,
     pub token_type: String,
     pub scope: Option<String>,
-}
-
-/// A calendar from the user's `/users/me/calendarList`, as stored in
-/// `google_calendars`. Doubles as the D1 row projection: field names match the
-/// schema, `is_primary`/`sync_enabled` deserialize from D1's `INTEGER 0/1`
-/// via [`de_d1_bool`], and nullable TEXT columns map to `""` via
-/// [`de_empty_string`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct GoogleCalendar {
-    pub id: String,
-    pub user_id: String,
-    pub google_calendar_id: String,
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub summary: String,
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub time_zone: String,
-    /// D1 stores this as `INTEGER 0/1`.
-    #[serde(default, deserialize_with = "de_d1_bool")]
-    pub is_primary: bool,
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub access_role: String,
-    /// D1 stores this as `INTEGER 0/1`.
-    #[serde(default, deserialize_with = "de_d1_bool")]
-    pub sync_enabled: bool,
-    /// Incremental sync cursor (Google `nextSyncToken`); empty when never synced.
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub sync_token: String,
-    /// RFC 3339 instant of the last successful sync; `None` when never synced.
-    pub last_synced_at: Option<String>,
-    /// Cached `calendars.get` `labelProperties.eventLabels` JSON.
-    /// Empty string = never fetched. `"[]"` or `[{id, backgroundColor}]` = fetched.
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub event_labels: String,
-    pub created_at: String,
-    pub updated_at: String,
-    /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
-    pub deleted_at: Option<String>,
-}
-
-/// Insert/update input for [`crate::repo::CalendarRepo::upsert`] /
-/// `upsert_batch`. The D1 implementation generates the UUID `id` and the
-/// `created_at`/`updated_at` timestamps.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewCalendar {
-    pub user_id: String,
-    pub google_calendar_id: String,
-    pub summary: String,
-    pub time_zone: String,
-    pub is_primary: bool,
-    pub access_role: String,
-    /// Defaults to `true` when importing from calendarList; the upsert's
-    /// `COALESCE` keeps an existing `sync_enabled` when re-imported.
-    pub sync_enabled: bool,
-    /// May be empty; the upsert's `COALESCE` keeps any stored sync token.
-    pub sync_token: String,
-    /// May be `None`; the upsert's `COALESCE` keeps any stored value.
-    pub last_synced_at: Option<String>,
-}
-
-/// A cached Google Calendar event, as stored in `calendar_events`.
-///
-/// Doubles as the D1 row projection AND the API response payload: serde field
-/// names are already snake_case and match the frontend `CalendarEvent` in
-/// `apps/web/app/types.ts` (`id, calendar_id, google_event_id, title,
-/// description, start_time, end_time, last_synced_at` — extra columns are
-/// included, which the frontend ignores).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CalendarEvent {
-    pub id: String,
-    pub calendar_id: String,
-    pub google_event_id: String,
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub google_etag: String,
-    /// Google's `updated` field (RFC 3339); empty when absent.
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub google_updated_at: String,
-    /// RFC 3339 instant of the last successful sync of this row.
-    pub last_synced_at: String,
-    pub title: String,
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub description: String,
-    /// RFC 3339 instant.
-    pub start_time: String,
-    /// RFC 3339 instant.
-    pub end_time: String,
-    /// JSON array of RRULE strings; empty for non-recurring events.
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub recurrence: String,
-    /// The task this event was created for (slice 4: start writes
-    /// `extendedProperties.shared.sanctuary_task_id`, sync maps it back).
-    /// Empty when the event never had one.
-    #[serde(default, deserialize_with = "de_empty_string")]
-    pub task_id: String,
-    pub created_at: String,
-    pub updated_at: String,
-    /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
-    pub deleted_at: Option<String>,
-}
-
-/// Insert/update input for [`crate::repo::CalendarEventRepo::upsert`] /
-/// `upsert_batch`. The D1 implementation generates the UUID `id` and the
-/// `created_at`/`updated_at` timestamps.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewCalendarEvent {
-    pub calendar_id: String,
-    pub google_event_id: String,
-    pub google_etag: String,
-    /// Google's `updated` field (RFC 3339); empty when absent.
-    pub google_updated_at: String,
-    /// RFC 3339 instant of this sync.
-    pub last_synced_at: String,
-    pub title: String,
-    pub description: String,
-    /// RFC 3339 instant.
-    pub start_time: String,
-    /// RFC 3339 instant.
-    pub end_time: String,
-    /// JSON array of RRULE strings; empty for non-recurring events.
-    pub recurrence: String,
-    /// Task link (from `extendedProperties.shared.sanctuary_task_id`); empty
-    /// for events that never had one. The upsert NEVER wipes a stored value
-    /// with an empty incoming one (`COALESCE` in SQL).
-    pub task_id: String,
 }
 
 /// A task list (the former "stream"), as stored in `task_lists`. Doubles as
@@ -758,108 +638,6 @@ pub struct RescheduleAgendaItemInput {
     pub date: String,
 }
 
-/// A Google Calendar watch channel (`events.watch` subscription), as stored in
-/// `google_calendars_watch_channels`. Doubles as the D1 row projection: field
-/// names match the schema exactly. All columns are NOT NULL TEXT, and — unlike
-/// every other table — there is **no** `deleted_at`: channels are hard-deleted
-/// on stop (see ADR 0001).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct WatchChannel {
-    pub id: String,
-    /// Owning calendar (`google_calendars.id`); many rows per calendar, since
-    /// renewal briefly overlaps two channels.
-    pub calendar_id: String,
-    /// The UUID we mint; the webhook lookup key (`X-Goog-Channel-ID`). UNIQUE.
-    pub channel_id: String,
-    /// Google's resource id; required to call `channels.stop`.
-    pub resource_id: String,
-    /// Secret we mint; compared to `X-Goog-Channel-Token`.
-    pub token: String,
-    /// RFC 3339 UTC instant when the channel expires.
-    pub expiration: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// Insert input for [`crate::repo::WatchChannelRepo::insert`]. The D1
-/// implementation generates the UUID `id` and the `created_at`/`updated_at`
-/// timestamps.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewWatchChannel {
-    pub calendar_id: String,
-    pub channel_id: String,
-    pub resource_id: String,
-    pub token: String,
-    /// RFC 3339 UTC instant when the channel expires.
-    pub expiration: String,
-}
-
-/// Request body for `PATCH /api/calendar/events/:id`.
-/// At least one field must be `Some` (empty patch → 400).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
-pub struct PatchEventFields {
-    /// RFC 3339 dateTime passed through to Google `start.dateTime`.
-    #[serde(default)]
-    pub start: Option<String>,
-    /// RFC 3339 dateTime passed through to Google `end.dateTime`.
-    #[serde(default)]
-    pub end: Option<String>,
-    /// Event title → Google `summary`.
-    #[serde(default)]
-    pub summary: Option<String>,
-}
-
-/// Request body for `POST /api/calendar/events`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct NewEventInput {
-    /// Local DB calendar id (`google_calendars.id`), not the Google id.
-    pub calendar_id: String,
-    pub summary: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    /// dateTime string (RFC 3339) passed through to Google.
-    pub start: String,
-    /// dateTime string (RFC 3339) passed through to Google.
-    pub end: String,
-    /// When set, the created event carries
-    /// `extendedProperties.shared.sanctuary_task_id` (the task timer's
-    /// carrier — slice 4). `None` for hand-created events.
-    #[serde(default)]
-    pub task_id: Option<String>,
-    /// When set (with `occurrence_id`), the created event carries
-    /// `extendedProperties.shared.sanctuary_routine_id` (slice 6 — a
-    /// started occurrence's one-shot log). Mutually exclusive with
-    /// `task_id` at the call sites; the two carriers never mix on one event.
-    #[serde(default)]
-    pub routine_id: Option<String>,
-    /// When set (with `routine_id`), the created event carries
-    /// `extendedProperties.shared.sanctuary_occurrence_id` (slice 6).
-    #[serde(default)]
-    pub occurrence_id: Option<String>,
-    /// Category hex (any `#rgb`/`#rrggbb`); `create_event` snaps it onto the
-    /// 24 event-label palette and sends the matching cached label id with
-    /// `eventLabelVersion=1`. Omitted from the Google payload when `None` or
-    /// blank after trim — hand-created events stay uncolored.
-    #[serde(default)]
-    pub color_hex: Option<String>,
-    /// Focus segment flag (task-focus, slice 3): when `task_id` is set AND
-    /// this is `true`, the insert payload also carries
-    /// `extendedProperties.shared.sanctuary_focus = "1"` next to the task
-    /// carrier — "never send a partial shared map" (the key is omitted, never
-    /// `"0"`, when `false`). `start_task` stays unfocused (`false`).
-    #[serde(default)]
-    pub sanctuary_focus: bool,
-    /// Create-time snapshot written to
-    /// `extendedProperties.shared.sanctuary_priority`. Omitted from the
-    /// shared map when `None`. Never patched when the task later changes.
-    #[serde(default)]
-    pub priority: Option<String>,
-    /// Create-time snapshot written to
-    /// `extendedProperties.shared.sanctuary_difficulty`. Omitted from the
-    /// shared map when `None`. Never patched when the task later changes.
-    #[serde(default)]
-    pub difficulty: Option<String>,
-}
 
 #[cfg(test)]
 mod tests {
@@ -913,43 +691,6 @@ mod tests {
         assert_eq!(calendar.sync_token, "");
         assert!(!calendar.is_primary);
         assert!(calendar.sync_enabled);
-    }
-
-    #[test]
-    fn calendar_event_serializes_with_frontend_field_names() {
-        let event = CalendarEvent {
-            id: "evt-1".to_string(),
-            calendar_id: "cal-1".to_string(),
-            google_event_id: "google-evt-1".to_string(),
-            google_etag: "etag".to_string(),
-            google_updated_at: "2026-08-17T10:00:00Z".to_string(),
-            last_synced_at: "2026-08-17T12:00:00Z".to_string(),
-            title: "Standup".to_string(),
-            description: "Daily".to_string(),
-            start_time: "2026-08-18T09:00:00Z".to_string(),
-            end_time: "2026-08-18T09:30:00Z".to_string(),
-            recurrence: String::new(),
-            task_id: "task-1".to_string(),
-            created_at: "2026-08-17T12:00:00Z".to_string(),
-            updated_at: "2026-08-17T12:00:00Z".to_string(),
-            deleted_at: None,
-        };
-        let value: serde_json::Value = serde_json::to_value(&event).unwrap();
-        // The seven fields the frontend `CalendarEvent` requires.
-        for key in [
-            "id",
-            "calendar_id",
-            "google_event_id",
-            "title",
-            "description",
-            "start_time",
-            "end_time",
-            "last_synced_at",
-        ] {
-            assert!(value.get(key).is_some(), "missing {key}: {value}");
-        }
-        assert_eq!(value["start_time"], "2026-08-18T09:00:00Z");
-        assert_eq!(value["task_id"], "task-1", "task link is part of the payload");
     }
 
     #[test]
@@ -1177,24 +918,6 @@ mod tests {
     }
 
     #[test]
-    fn calendar_event_accepts_null_optional_columns() {
-        let event: CalendarEvent = serde_json::from_str(
-            r#"{
-                "id": "evt-1", "calendar_id": "cal-1", "google_event_id": "g-1",
-                "google_etag": null, "google_updated_at": null, "last_synced_at": "x",
-                "title": "T", "description": null, "start_time": "s", "end_time": "e",
-                "recurrence": null, "task_id": null, "created_at": "x", "updated_at": "x",
-                "deleted_at": null
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(event.description, "");
-        assert_eq!(event.google_etag, "");
-        assert_eq!(event.recurrence, "");
-        assert_eq!(event.task_id, "", "NULL task_id maps to empty string");
-    }
-
-    #[test]
     fn task_log_deserializes_from_d1_row_shape() {
         // D1 returns NULL for the nullable columns and a plain `type` column.
         let log: TaskLog = serde_json::from_str(
@@ -1225,4 +948,5 @@ mod tests {
         let value: serde_json::Value = serde_json::to_value(&log).unwrap();
         assert_eq!(value["type"], "stopped", "raw identifier serializes as `type`");
     }
+
 }

@@ -4,9 +4,10 @@
 //!   + 5min)` in the event calendar's TZ)) so a running task never looks
 //!   finished on the calendar.
 //! - **only the 15-minute tick**: the fallback cron (ADR 0001 § Fallback
-//!   cron) — sync every sync-enabled calendar whose last sync is older than
-//!   15 minutes (or missing), and renew watch channels that would expire
-//!   within 24 hours. Never on a pure `*/2` tick.
+//!   cron) — publish replicas for dirty / stale / backoff-due calendars
+//!   (15-minute `last_success_at` backstop), renew watch channels that would
+//!   expire within 24 hours, and notify open browsers for each successful
+//!   publish. Never on a pure `*/2` tick.
 //!
 //! The orchestration lives in `api_core::run_elongate_cron` /
 //! `api_core::run_fallback_cron` (pure, unit-tested); this handler is a thin
@@ -82,6 +83,13 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             return;
         }
     };
+    let operations = match env.d1("DB") {
+        Ok(db) => crate::db::D1CalendarEventOperationRepo::new(db),
+        Err(err) => {
+            console_log!("cron: DB binding missing: {err} — skipping cron");
+            return;
+        }
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
@@ -92,6 +100,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &logs,
         &tasks,
         &tokens,
@@ -106,6 +115,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &crate::http::WorkerHttp,
         &calendars,
         &events,
+        &operations,
         &occurrences,
         &tokens,
         &oauth,
@@ -130,6 +140,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             &crate::http::WorkerHttp,
             &calendars,
             &events,
+            &operations,
             &watches,
             &tokens,
             &oauth,
@@ -140,10 +151,16 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         for error in &report.errors {
             console_log!("cron: {error}");
         }
+        // Notify only after D1 is updated — failures and LeaseBusy are absent
+        // from `published`.
+        for (user_id, calendar_id) in &report.published {
+            crate::user_hub::notify_user(&env, user_id, Some(calendar_id)).await;
+        }
         console_log!(
-            "cron: synced={} renewed={} errors={}",
+            "cron: synced={} renewed={} published={} errors={}",
             report.synced,
             report.renewed,
+            report.published.len(),
             report.errors.len()
         );
     }

@@ -120,8 +120,8 @@ use crate::models::{
 use crate::oauth::HttpClient;
 use crate::pattern_gen::{emit_affixes, fill_regex, split_hole};
 use crate::repo::{
-    CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo, TaskListRepo, TaskLogRepo,
-    TaskRepo, TokenRepo, UserRepo,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
+    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
 };
 use crate::time::{
     ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
@@ -893,6 +893,7 @@ pub async fn delete_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     logs: &dyn TaskLogRepo,
     users: &dyn UserRepo,
     access: Option<&GoogleAccess>,
@@ -917,7 +918,8 @@ pub async fn delete_task(
         // focused deletes on a refreshable token); the pointer is cleared even
         // without Google so a soft delete never leaves a ghost pointer.
         if let (Some(http), Some(access)) = (http, access) {
-            stop_running_event(http, calendars, events, logs, access, id, now_unix).await?;
+            stop_running_event(http, calendars, events, operations, logs, access, id, now_unix)
+                .await?;
         }
         users.set_focused_task_id(user_id, None, now_rfc3339).await?;
     }
@@ -964,6 +966,7 @@ pub async fn start_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
@@ -1005,6 +1008,7 @@ pub async fn start_task(
         http,
         calendars,
         events,
+        operations,
         access,
         &NewEventInput {
             calendar_id: target.calendar_id.clone(),
@@ -1065,6 +1069,7 @@ pub async fn stop_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1075,8 +1080,8 @@ pub async fn stop_task(
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
-        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
-        now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true,
+        http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+        user_id, task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true,
     )
     .await
 }
@@ -1094,6 +1099,7 @@ pub async fn pause_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1104,8 +1110,8 @@ pub async fn pause_task(
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
-        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
-        now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true,
+        http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+        user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true,
     )
     .await
 }
@@ -1120,6 +1126,7 @@ pub async fn complete_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1130,8 +1137,8 @@ pub async fn complete_task(
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
-        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
-        now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true,
+        http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+        user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true,
     )
     .await
 }
@@ -1147,6 +1154,7 @@ pub async fn discard_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1157,8 +1165,8 @@ pub async fn discard_task(
     now_unix: i64,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
-        http, calendars, events, category_repo, task_repo, logs, users, access, user_id, task_id,
-        now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true,
+        http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+        user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true,
     )
     .await
 }
@@ -1178,6 +1186,7 @@ async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1205,8 +1214,17 @@ async fn stop_or_pause(
     }
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let (patched, at, calendar_id, google_event_id) =
-        stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
+    let (patched, at, calendar_id, google_event_id) = stop_running_event(
+        http,
+        calendars,
+        events,
+        operations,
+        logs,
+        access,
+        task_id,
+        now_unix,
+    )
+    .await?;
 
     // Exiting the focused task is a focus exit (task-focus, slice 3): snap
     // (already done above — `stop_running_event` resolves the newest focus
@@ -1291,6 +1309,7 @@ async fn complete_or_discard(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1329,8 +1348,17 @@ async fn complete_or_discard(
 
     // Auto-stop: a running event is closed first, and that close is logged
     // (`stopped`) before the terminal log.
-    let (patched, at, calendar_id, google_event_id) =
-        stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
+    let (patched, at, calendar_id, google_event_id) = stop_running_event(
+        http,
+        calendars,
+        events,
+        operations,
+        logs,
+        access,
+        task_id,
+        now_unix,
+    )
+    .await?;
     if is_focused {
         if let Some(_event) = &patched {
             logs.insert(
@@ -1433,6 +1461,7 @@ async fn stop_running_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     logs: &dyn TaskLogRepo,
     access: &GoogleAccess,
     task_id: &str,
@@ -1454,6 +1483,7 @@ async fn stop_running_event(
         http,
         calendars,
         events,
+        operations,
         access,
         &found.calendar_id,
         &found.google_event_id,
@@ -1530,6 +1560,7 @@ pub async fn run_elongate_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     logs: &dyn TaskLogRepo,
     tasks: &dyn TaskRepo,
     tokens: &dyn TokenRepo,
@@ -1602,6 +1633,7 @@ pub async fn run_elongate_cron(
             http,
             calendars,
             events,
+            operations,
             &access,
             &event.calendar_id,
             &event.google_event_id,
@@ -1673,6 +1705,7 @@ async fn dispatch_matrix_action(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
@@ -1692,8 +1725,8 @@ async fn dispatch_matrix_action(
         (_, TASK_STATUS_IN_PROGRESS) => {
             let (http, access) = require_google(http, access)?;
             start_task(
-                http, calendars, events, list_repo, category_repo, task_repo, logs, access,
-                user_id, task_id, now_unix,
+                http, calendars, events, operations, list_repo, category_repo, task_repo, logs,
+                access, user_id, task_id, now_unix,
             )
             .await
             .map(|response| response.event)
@@ -1704,8 +1737,8 @@ async fn dispatch_matrix_action(
             // /stop endpoint only — `/move` places exactly once afterwards,
             // so a stop via the board is never double-placed.
             stop_or_pause(
-                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
-                task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, false,
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, false,
             )
             .await
             .map(|response| response.event)
@@ -1713,8 +1746,8 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_PLANNED) => {
             let (http, access) = require_google(http, access)?;
             stop_or_pause(
-                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
-                task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
             )
             .await
             .map(|response| response.event)
@@ -1722,8 +1755,8 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED) => {
             let (http, access) = require_google(http, access)?;
             complete_or_discard(
-                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
-                task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
             )
             .await
             .map(|response| response.event)
@@ -1731,8 +1764,8 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_IN_PROGRESS, TASK_STATUS_DISCARDED) => {
             let (http, access) = require_google(http, access)?;
             complete_or_discard(
-                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
-                task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
             )
             .await
             .map(|response| response.event)
@@ -1762,15 +1795,15 @@ async fn dispatch_matrix_action(
         // complete / discard from any non-running status: no Google writes.
         (_, TASK_STATUS_COMPLETED) => {
             terminal_transition(
-                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
-                task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix,
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix,
             )
             .await
         }
         (_, TASK_STATUS_DISCARDED) => {
             terminal_transition(
-                http, calendars, events, category_repo, task_repo, logs, users, access, user_id,
-                task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix,
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix,
             )
             .await
         }
@@ -1829,6 +1862,7 @@ async fn terminal_transition(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -1853,6 +1887,7 @@ async fn terminal_transition(
             http,
             calendars,
             events,
+            operations,
             category_repo,
             task_repo,
             logs,
@@ -1960,6 +1995,7 @@ pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
@@ -2043,8 +2079,8 @@ pub async fn move_task(
             }
         };
         let event = dispatch_matrix_action(
-            http, calendars, events, list_repo, category_repo, task_repo, logs, users, access,
-            user_id, task_id, &task.status, &input.status, now_unix,
+            http, calendars, events, operations, list_repo, category_repo, task_repo, logs, users,
+            access, user_id, task_id, &task.status, &input.status, now_unix,
         )
         .await?;
         let row = place_at(task_repo, user_id, task_id, &input.status, rank).await?;
@@ -2090,6 +2126,7 @@ async fn create_focus_segment(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     logs: &dyn TaskLogRepo,
     access: &GoogleAccess,
     taxonomy: &Taxonomy,
@@ -2122,6 +2159,7 @@ async fn create_focus_segment(
         http,
         calendars,
         events,
+        operations,
         access,
         &NewEventInput {
             calendar_id,
@@ -2168,6 +2206,7 @@ pub async fn focus_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
@@ -2222,13 +2261,15 @@ pub async fn focus_task(
 
     // 1. Snap A's living event (end only — the closed chip keeps its flag).
     if let Some(a) = &previous {
-        stop_running_event(http, calendars, events, logs, access, &a.id, now_unix).await?;
+        stop_running_event(http, calendars, events, operations, logs, access, &a.id, now_unix)
+            .await?;
     }
 
     // 2. Create B′ flagged (or the repaired flagged segment on the
     //    already-focused/no-chip path, which falls through here).
     let b_prime = create_focus_segment(
-        http, calendars, events, logs, access, &taxonomy, user_id, &task, true, now_unix,
+        http, calendars, events, operations, logs, access, &taxonomy, user_id, &task, true,
+        now_unix,
     )
     .await?;
     created.push(b_prime.clone());
@@ -2243,7 +2284,8 @@ pub async fn focus_task(
     //    now names the still-running continuation).
     if let Some(a) = &previous {
         let a_prime = create_focus_segment(
-            http, calendars, events, logs, access, &taxonomy, user_id, a, false, now_unix,
+            http, calendars, events, operations, logs, access, &taxonomy, user_id, a, false,
+            now_unix,
         )
         .await?;
         created.push(a_prime.clone());
@@ -2265,7 +2307,8 @@ pub async fn focus_task(
     //    flag). The newest event-bearing log still names B_old here — the
     //    `focused` log below is what moves the pointer forward.
     if !already_focused {
-        stop_running_event(http, calendars, events, logs, access, task_id, now_unix).await?;
+        stop_running_event(http, calendars, events, operations, logs, access, task_id, now_unix)
+            .await?;
     }
 
     // 6. Log `focused` on B with the B′ ids — the newest event-bearing log on
@@ -2309,6 +2352,7 @@ pub async fn delete_focus(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -2352,9 +2396,11 @@ pub async fn delete_focus(
 
     // Snap B (end only — the closed chip keeps its flag), open the unprefixed
     // continuation, clear the pointer, log `unfocused`.
-    stop_running_event(http, calendars, events, logs, access, &task.id, now_unix).await?;
+    stop_running_event(http, calendars, events, operations, logs, access, &task.id, now_unix)
+        .await?;
     let b_prime = create_focus_segment(
-        http, calendars, events, logs, access, &taxonomy, user_id, &task, false, now_unix,
+        http, calendars, events, operations, logs, access, &taxonomy, user_id, &task, false,
+        now_unix,
     )
     .await?;
     users
@@ -3994,7 +4040,7 @@ mod tests {
         let logs = FakeTaskLogRepo::default();
         let users = FakeUserRepo::default();
         let response = pollster::block_on(delete_task(
-            None, &calendars, &events, &logs, &users, None, &tasks, "u-1", &created.id,
+            None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &created.id,
             "2026-08-18T02:00:00Z", NOW_UNIX,
         ))
         .unwrap();
@@ -4006,7 +4052,7 @@ mod tests {
         );
         assert!(matches!(
             pollster::block_on(delete_task(
-                None, &calendars, &events, &logs, &users, None, &tasks, "u-1", &created.id,
+                None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &created.id,
                 "2026-08-18T02:00:00Z", NOW_UNIX,
             )),
             Err(TasksError::NotFound)
@@ -4027,14 +4073,14 @@ mod tests {
         let users = FakeUserRepo::default();
         assert!(matches!(
             pollster::block_on(delete_task(
-                None, &calendars, &events, &logs, &users, None, &tasks, "u-2", &created.id,
+                None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-2", &created.id,
                 "2026-08-18T02:00:00Z", NOW_UNIX,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(delete_task(
-                None, &calendars, &events, &logs, &users, None, &tasks, "u-1", "nope",
+                None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", "nope",
                 "2026-08-18T02:00:00Z", NOW_UNIX,
             )),
             Err(TasksError::NotFound)
@@ -4218,10 +4264,18 @@ mod tests {
 
         async fn get_bearer_raw(
             &self,
-            _url: &str,
+            url: &str,
             _token: &str,
         ) -> Result<(u16, Vec<u8>), HttpError> {
-            Ok((200, Vec::new()))
+            // Prefer scripted routes (same as PATCH); default a minimal event
+            // with etag so journaled If-Match bootstrap stays green when tests
+            // only scripted the patch response.
+            for (substr, status, body) in &self.routes {
+                if url.contains(substr.as_str()) {
+                    return Ok((*status, body.clone().into_bytes()));
+                }
+            }
+            Ok((200, br#"{"id":"unknown","etag":"e1"}"#.to_vec()))
         }
 
         async fn post_json(
@@ -4266,6 +4320,12 @@ mod tests {
         }
     }
 
+
+    fn ops() -> crate::calendar::FakeOperationRepo {
+        crate::calendar::FakeOperationRepo::new()
+    }
+
+
     /// All 24 event-label hexes as a cached `event_labels` JSON array with
     /// stable fake ids (`label-0` … `label-23`) — the fixture's default
     /// cache, so colored starts resolve their label id locally (create_event
@@ -4300,6 +4360,21 @@ mod tests {
             // The 24 seeded labels with stable fake ids — tasks never syncs,
             // so this is the cache `create_event` resolves colors against.
             event_labels: event_labels_json(),
+            sync_query_fingerprint: String::new(),
+            sync_status: String::new(),
+            initial_sync_complete: false,
+            last_attempt_at: None,
+            last_success_at: None,
+            last_error_code: String::new(),
+            failure_streak: 0,
+            next_retry_at: None,
+            dirty_requested_generation: 0,
+            dirty_applied_generation: 0,
+            full_sync_requested: false,
+            lease_owner: String::new(),
+            lease_expires_at: None,
+            cache_revision: 0,
+            projection: "timed_masters_and_exceptions".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4345,6 +4420,13 @@ mod tests {
                 .cloned())
         }
 
+        async fn get_by_id_unfiltered(
+            &self,
+            _id: &str,
+        ) -> Result<Option<GoogleCalendar>, RepoError> {
+            Ok(None)
+        }
+
         async fn get_by_google_cal_id(
             &self,
             _user_id: &str,
@@ -4376,6 +4458,92 @@ mod tests {
             Ok(())
         }
 
+        async fn record_sync_attempt(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn record_sync_success(
+            &self,
+            _id: &str,
+            _sync_token: &str,
+            _query_fingerprint: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn record_sync_success_if_owner(
+            &self,
+            _id: &str,
+            _sync_token: &str,
+            _query_fingerprint: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
+        async fn record_sync_failure(
+            &self,
+            _id: &str,
+            _error_code: &str,
+            _sync_status: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn try_acquire_lease(
+            &self,
+            _id: &str,
+            _owner: &str,
+            _now_rfc3339: &str,
+            _expires_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
+        async fn release_lease(
+            &self,
+            _id: &str,
+            _owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn renew_lease(
+            &self,
+            _id: &str,
+            _owner: &str,
+            _expires_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
+        async fn bump_dirty_requested(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn mark_dirty_applied(
+            &self,
+            _id: &str,
+            _generation: i64,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn set_sync_enabled(
             &self,
             _id: &str,
@@ -4402,6 +4570,26 @@ mod tests {
 
         async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
             Ok(())
+        }
+
+        async fn get_calendar_list_sync_token(
+            &self,
+            _user_id: &str,
+        ) -> Result<Option<String>, RepoError> {
+            Ok(None)
+        }
+
+        async fn set_calendar_list_sync_token(
+            &self,
+            _user_id: &str,
+            _token: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
+            Ok(Vec::new())
         }
     }
 
@@ -4453,6 +4641,15 @@ mod tests {
                 end_time: event.end_time.clone(),
                 recurrence: event.recurrence.clone(),
                 task_id: event.task_id.clone(),
+                ical_uid: event.ical_uid.clone(),
+                sequence: event.sequence,
+                status: event.status.clone(),
+                recurring_event_id: event.recurring_event_id.clone(),
+                original_start: event.original_start.clone(),
+                start_time_zone: event.start_time_zone.clone(),
+                end_time_zone: event.end_time_zone.clone(),
+                is_all_day: event.is_all_day,
+                raw_json: event.raw_json.clone(),
                 created_at: now_rfc3339.to_string(),
                 updated_at: now_rfc3339.to_string(),
                 deleted_at: None,
@@ -4725,7 +4922,7 @@ mod tests {
     /// elongate tests need more than the fixed `g-1`).
     fn patched_event_json_for(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
         format!(
-            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+            r#"{{"id":"{google_id}","etag":"e1","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
         )
     }
 
@@ -4734,7 +4931,7 @@ mod tests {
     /// collapses them).
     fn event_json_with_id(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
         format!(
-            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
+            r#"{{"id":"{google_id}","etag":"e1","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}"}}}}}}"#
         )
     }
 
@@ -4742,7 +4939,7 @@ mod tests {
     /// back for a focused segment.
     fn focused_event_json(google_id: &str, task_id: &str, start: &str, end: &str) -> String {
         format!(
-            r#"{{"id":"{google_id}","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}","sanctuary_focus":"1"}}}}}}"#
+            r#"{{"id":"{google_id}","etag":"e1","summary":"Work","start":{{"dateTime":"{start}"}},"end":{{"dateTime":"{end}"}},"extendedProperties":{{"shared":{{"sanctuary_task_id":"{task_id}","sanctuary_focus":"1"}}}}}}"#
         )
     }
 
@@ -4759,7 +4956,7 @@ mod tests {
             id: "evt-1".to_string(),
             calendar_id: calendar_id.to_string(),
             google_event_id: google_id.to_string(),
-            google_etag: String::new(),
+            google_etag: "e1".to_string(),
             google_updated_at: String::new(),
             last_synced_at: "2026-08-18T00:00:00Z".to_string(),
             title: "Work".to_string(),
@@ -4768,6 +4965,15 @@ mod tests {
             end_time: end.to_string(),
             recurrence: String::new(),
             task_id: task_id.to_string(),
+            ical_uid: String::new(),
+            sequence: 0,
+            status: String::new(),
+            recurring_event_id: String::new(),
+            original_start: String::new(),
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            is_all_day: false,
+            raw_json: String::new(),
             created_at: "2026-08-18T00:00:00Z".to_string(),
             updated_at: "2026-08-18T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4817,7 +5023,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -4905,7 +5111,7 @@ mod tests {
         )]);
 
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -4951,7 +5157,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -4997,7 +5203,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5048,7 +5254,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5096,7 +5302,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5143,7 +5349,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5202,7 +5408,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5247,7 +5453,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5286,7 +5492,7 @@ mod tests {
         )]);
 
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5330,7 +5536,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5358,7 +5564,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5380,7 +5586,7 @@ mod tests {
 
         let http = FakeHttp::new(vec![]);
         let err = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap_err();
@@ -5415,7 +5621,7 @@ mod tests {
             &created_event_json(&first.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &first.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5427,7 +5633,7 @@ mod tests {
             &created_event_json(&second.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &second.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5463,14 +5669,14 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
 
         let http = FakeHttp::new(vec![]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5508,7 +5714,7 @@ mod tests {
             &created_event_json(&second.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &second.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5542,7 +5748,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5570,7 +5776,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         let response = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5593,14 +5799,14 @@ mod tests {
 
         assert!(matches!(
             pollster::block_on(start_task(
-                &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+                &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
                 &access(), "u-2", &task.id, NOW_UNIX,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(start_task(
-                &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+                &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
                 &access(), "u-1", "nope", NOW_UNIX,
             )),
             Err(TasksError::NotFound)
@@ -5617,7 +5823,7 @@ mod tests {
 
         let http = FakeHttp::new(vec![("/events", 400, r#"{"error":"invalid"}"#)]);
         let err = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap_err();
@@ -5648,7 +5854,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5661,7 +5867,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix,
         ))
         .unwrap();
@@ -5697,7 +5903,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5711,7 +5917,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5739,7 +5945,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5772,7 +5978,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5792,7 +5998,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5823,7 +6029,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5836,7 +6042,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
         )]);
         let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix,
         ))
         .unwrap();
@@ -5854,7 +6060,7 @@ mod tests {
             &created_event_json(&task.id, "2023-11-14T22:23:00Z", "2023-11-14T22:38:00Z"),
         )]);
         let restarted = pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, pause_unix,
         ))
         .unwrap();
@@ -5873,7 +6079,7 @@ mod tests {
 
         let http = FakeHttp::new(vec![]);
         let err = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap_err();
@@ -5900,7 +6106,7 @@ mod tests {
         )]);
         let users = FakeUserRepo::default();
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &a.id, stop_unix,
         ))
         .unwrap();
@@ -5928,7 +6134,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, NOW_UNIX,
         ))
         .unwrap();
@@ -5964,7 +6170,7 @@ mod tests {
         )]);
         let users = FakeUserRepo::default();
         let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix,
         ))
         .unwrap();
@@ -5996,7 +6202,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6028,7 +6234,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6040,7 +6246,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, complete_unix,
         ))
         .unwrap();
@@ -6069,7 +6275,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6093,13 +6299,13 @@ mod tests {
 
         let http = FakeHttp::new(vec![]);
         pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
         // Second complete: no-op, still 200.
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6124,7 +6330,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6153,7 +6359,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6182,7 +6388,7 @@ mod tests {
             &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6194,7 +6400,7 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
         )]);
         let response = pollster::block_on(discard_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, discard_unix,
         ))
         .unwrap();
@@ -6217,7 +6423,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(discard_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6238,18 +6444,19 @@ mod tests {
         let http = FakeHttp::new(vec![]);
         let access = access();
 
+        let ops = ops();
         let complete_other = complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users, &access, "u-2",
+            &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-2",
             &task.id, NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(complete_other), Err(TasksError::NotFound)));
         let discard_other = discard_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users, &access, "u-2",
+            &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-2",
             &task.id, NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(discard_other), Err(TasksError::NotFound)));
         let complete_missing = complete_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users, &access, "u-1",
+            &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-1",
             "nope", NOW_UNIX,
         );
         assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
@@ -6290,7 +6497,7 @@ mod tests {
         ]);
         let users = FakeUserRepo::default();
         pollster::block_on(focus_task(
-            &http, &calendars, &events, lists, categories, tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), lists, categories, tasks, &logs, &users,
             &access(), "u-1", task_id, focus_unix,
         ))
         .unwrap();
@@ -6308,7 +6515,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let err = pollster::block_on(focus_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap_err();
@@ -6331,14 +6538,14 @@ mod tests {
 
         assert!(matches!(
             pollster::block_on(focus_task(
-                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+                &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
                 &access(), "u-2", &task.id, NOW_UNIX,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(focus_task(
-                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+                &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
                 &access(), "u-1", "nope", NOW_UNIX,
             )),
             Err(TasksError::NotFound)
@@ -6358,7 +6565,7 @@ mod tests {
             &event_json_with_id("g-1", &task.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http_start, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_start, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6384,7 +6591,7 @@ mod tests {
         ]);
         let users = FakeUserRepo::default();
         let response = pollster::block_on(focus_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, focus_unix,
         ))
         .unwrap();
@@ -6457,7 +6664,7 @@ mod tests {
         // Focus again while the flagged chip is alive: 200 no-op, no Google.
         let http = FakeHttp::new(vec![]);
         let response = pollster::block_on(focus_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX + 600,
         ))
         .unwrap();
@@ -6500,7 +6707,7 @@ mod tests {
             ),
         )]);
         let response = pollster::block_on(focus_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, repair_unix,
         ))
         .unwrap();
@@ -6543,7 +6750,7 @@ mod tests {
             &event_json_with_id("g-a", &a.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http_a, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_a, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &a.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6553,7 +6760,7 @@ mod tests {
             &event_json_with_id("g-b", &b.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6584,7 +6791,7 @@ mod tests {
         ]);
         let users = FakeUserRepo::focused(&a.id);
         let response = pollster::block_on(focus_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, switch_unix,
         ))
         .unwrap();
@@ -6665,7 +6872,7 @@ mod tests {
             &event_json_with_id("g-a", &a.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http_a, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_a, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &a.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6675,7 +6882,7 @@ mod tests {
             &event_json_with_id("g-b", &b.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, NOW_UNIX,
         ))
         .unwrap();
@@ -6690,7 +6897,7 @@ mod tests {
             ("/events", 200, &event_json_with_id("g-new", &b.id, "2023-11-14T22:18:00Z", "2023-11-14T22:33:00Z")),
         ]);
         let err = pollster::block_on(focus_task(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, switch_unix,
         ))
         .unwrap_err();
@@ -6725,7 +6932,7 @@ mod tests {
             ),
         ]);
         let response = pollster::block_on(delete_focus(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", delete_unix,
         ))
         .unwrap();
@@ -6772,7 +6979,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = pollster::block_on(delete_focus(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", NOW_UNIX,
         ))
         .unwrap();
@@ -6800,7 +7007,7 @@ mod tests {
             &patched_event_json_for("g-focus", &task.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix,
         ))
         .unwrap();
@@ -6842,7 +7049,7 @@ mod tests {
         ]);
         let users = FakeUserRepo::default();
         pollster::block_on(focus_task(
-            &focus_http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &focus_http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &a.id, focus_unix,
         ))
         .unwrap();
@@ -6854,7 +7061,7 @@ mod tests {
             &event_json_with_id("g-b", &b.id, "2023-11-14T22:18:00Z", "2023-11-14T22:33:00Z"),
         )]);
         pollster::block_on(start_task(
-            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, focus_unix,
         ))
         .unwrap();
@@ -6867,7 +7074,7 @@ mod tests {
             &patched_event_json_for("g-b", &b.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
         )]);
         let response = pollster::block_on(stop_task(
-            &stop_http, &calendars, &events, &categories, &tasks, &logs, &users,
+            &stop_http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, stop_unix,
         ))
         .unwrap();
@@ -6900,7 +7107,7 @@ mod tests {
             Some(&http),
             &calendars,
             &events,
-            &logs,
+            &ops(), &logs,
             &users,
             Some(&access()),
             &tasks,
@@ -6967,7 +7174,7 @@ mod tests {
         now_unix: i64,
     ) -> ElongateReport {
         pollster::block_on(run_elongate_cron(
-            http, calendars, events, logs, tasks, tokens, &oauth_config(), now_unix,
+            http, calendars, events, &ops(), logs, tasks, tokens, &oauth_config(), now_unix,
         ))
     }
 
@@ -7343,6 +7550,7 @@ mod tests {
             Some(http),
             calendars,
             events,
+            &ops(),
             lists,
             categories,
             tasks,
@@ -7377,7 +7585,7 @@ mod tests {
             &created_event_json(task_id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http, &calendars, &events, lists, categories, tasks, &logs,
+            &http, &calendars, &events, &ops(), lists, categories, tasks, &logs,
             &access(), "u-1", task_id, NOW_UNIX,
         ))
         .unwrap();
@@ -7564,7 +7772,7 @@ mod tests {
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
-            &events,
+            &events, &ops(),
             &lists,
             &categories,
             &tasks,
@@ -7607,7 +7815,7 @@ mod tests {
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
-            &events,
+            &events, &ops(),
             &lists,
             &categories,
             &tasks,
@@ -7655,7 +7863,7 @@ mod tests {
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
-            &events,
+            &events, &ops(),
             &lists,
             &categories,
             &tasks,
@@ -7748,7 +7956,7 @@ mod tests {
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
-            &events,
+            &events, &ops(),
             &lists,
             &categories,
             &tasks,
@@ -7790,7 +7998,7 @@ mod tests {
             &created_event_json(&b.id, NOW_SNAPPED, NOW_END),
         )]);
         pollster::block_on(start_task(
-            &http_b, &calendars, &events, &lists, &categories, &tasks, &logs,
+            &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, NOW_UNIX,
         ))
         .unwrap();
@@ -7843,7 +8051,7 @@ mod tests {
             sort_order: Some(0),
         };
         let err = pollster::block_on(move_task(
-            Some(&http), &calendars, &events, &lists,             &categories, &tasks, &logs, &users, None,
+            Some(&http), &calendars, &events, &ops(), &lists,             &categories, &tasks, &logs, &users, None,
             "u-1", &task.id, NOW_UNIX, &unknown,
         ))
         .unwrap_err();
@@ -7858,7 +8066,7 @@ mod tests {
             sort_order: Some(-1),
         };
         let err = pollster::block_on(move_task(
-            Some(&http), &calendars, &events, &lists,             &categories, &tasks, &logs, &users, None,
+            Some(&http), &calendars, &events, &ops(), &lists,             &categories, &tasks, &logs, &users, None,
             "u-1", &task.id, NOW_UNIX, &negative,
         ))
         .unwrap_err();
@@ -7887,14 +8095,14 @@ mod tests {
 
         assert!(matches!(
             pollster::block_on(move_task(
-                Some(&http), &calendars, &events, &lists,                 &categories, &tasks, &logs, &users,
+                Some(&http), &calendars, &events, &ops(), &lists,                 &categories, &tasks, &logs, &users,
                 None, "u-2", &task.id, NOW_UNIX, &input,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(move_task(
-                Some(&http), &calendars, &events, &lists,                 &categories, &tasks, &logs, &users,
+                Some(&http), &calendars, &events, &ops(), &lists,                 &categories, &tasks, &logs, &users,
                 None, "u-1", "nope", NOW_UNIX, &input,
             )),
             Err(TasksError::NotFound)
@@ -8016,7 +8224,7 @@ mod tests {
         let response = pollster::block_on(move_task(
             Some(&http),
             &calendars,
-            &events,
+            &events, &ops(),
             &lists,
             &categories,
             &tasks,

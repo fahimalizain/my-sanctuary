@@ -6,6 +6,7 @@ import type { CalendarEvent } from '@/app/types';
 import {
   applyEventOverlays,
   isTempEventId,
+  resetEventOverlays,
   TEMP_EVENT_PREFIX,
   type EventOverlay,
 } from './event-overlays';
@@ -227,4 +228,26 @@ test('applyEventOverlays: accepts Map values iterable', () => {
   ]);
   const result = applyEventOverlays([e1, e2], map.values());
   assert.equal(result[1], moved);
+});
+
+test('resetEventOverlays: clears map so apply matches server list', () => {
+  const moved = makeEvent({
+    id: 'e1',
+    title: 'Moved',
+    start_time: '2026-09-08T15:00:00.000Z',
+    end_time: '2026-09-08T16:00:00.000Z',
+  });
+  const map = new Map<string, EventOverlay>([
+    ['e1', { op: 'upsert', event: moved }],
+    ['e2', { op: 'delete', id: 'e2' }],
+  ]);
+  const server = [e1, e2];
+  assert.notDeepEqual(
+    applyEventOverlays(server, map.values()).map((e) => e.id),
+    server.map((e) => e.id),
+  );
+
+  resetEventOverlays(map);
+  assert.equal(map.size, 0);
+  assert.deepEqual(applyEventOverlays(server, map.values()), server);
 });

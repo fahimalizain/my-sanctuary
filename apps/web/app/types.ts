@@ -46,10 +46,42 @@ export interface CalendarEvent {
   color?: string;
 }
 
+export type CalendarSyncAggregateStatus =
+  | 'ready'
+  | 'degraded'
+  | 'authorization_required';
+
+export type CalendarReplicaState =
+  | 'never_initialized'
+  | 'ready'
+  | 'retrying'
+  | 'rebuilding'
+  | 'authorization_required'
+  | 'disabled';
+
+export interface CalendarSyncHealth {
+  calendar_id: string;
+  state: CalendarReplicaState;
+  initial_sync_complete: boolean;
+  last_success_at: string | null;
+  last_attempt_at: string | null;
+  stale: boolean;
+  error_code: string | null;
+  retry_after_seconds: number | null;
+  projection: 'timed_masters_and_exceptions' | string;
+  cache_revision: number;
+}
+
+export interface CalendarEventsSync {
+  status: CalendarSyncAggregateStatus;
+  calendars: CalendarSyncHealth[];
+}
+
 // The envelope returned by GET /api/calendar/events
 export interface CalendarEventsResponse {
   events: CalendarEvent[];
-  source: 'cache' | string;
+  source: 'cache' | 'window' | 'mixed' | string;
+  sync: CalendarEventsSync;
 }
 
 // Request body for POST /api/calendar/events

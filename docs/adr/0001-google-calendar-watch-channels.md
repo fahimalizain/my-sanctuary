@@ -3,6 +3,21 @@
 Status: Accepted
 Date: 2026-08-18
 
+> Amendment (2026-09-10): **Health signal superseded by ADR 0005.** Parseable
+> `last_synced_at` remains the request-path cache-only _gate_ after first
+> paint; it is no longer treated as freshness/health. Replica health lives in
+> dedicated columns and the sanitized `sync` envelope (ADR 0005). Watch
+> channels, 15-minute cron, no Queue, and 404-disable behaviour are unchanged.
+>
+> Amendment (2026-09-10, ADR 0005 V3): Webhook `exists` is **not** “200
+> immediately then `wait_until(sync_calendar)`.” HTTP 200 is valid only after a
+> durable dirty-generation write (`dirty_requested_generation += 1`). Lost
+> `wait_until` is recovered by the 15-minute incremental cron. `sync` handshake
+> → 200, no dirty. `not_exists` → persist disable, then 200; stop leftover
+> channels (retried by cron). Verify failures still 200, never 401/404/500.
+> Cron keys off dirty + `last_success_at` 15m backstop (not “watches exist ⇒
+> skip poll”). Cron notifies open browsers after a successful replica publish.
+
 ## Context
 
 Calendar sync is pull-only today: `GET /api/calendar/events` syncs on the request path, so changes from Google appear only when the user opens the app. We want Google to push changes to us instead. This ADR is slice 1 of N: it locks the design for `events.watch` push channels. Nothing is implemented yet; later slices implement against this document.
@@ -85,16 +100,32 @@ Indexes: `channel_id` (unique, via column constraint), `calendar_id`, `expiratio
 - Handle **outside** the workers-rs `Router` so the fetch `Context` is available (`Router` currently discards `_ctx`).
 - Verify `X-Goog-Channel-ID` exists and `X-Goog-Channel-Token` matches the stored token with a **constant-time** compare.
 - Unknown id, token mismatch, disabled/soft-deleted calendar → **200**, no work, log the miss. Never 401/404/500 for verify failures (no existence leak; no Google retry hammer).
-- `X-Goog-Resource-State: sync` (handshake) → 200, no sync.
-- `X-Goog-Resource-State: exists` → 200 immediately, then `ctx.wait_until(sync_calendar)`.
+- `X-Goog-Resource-State: sync` (handshake) → 200, no dirty, no sync.
+- `X-Goog-Resource-State: exists` → persist durable dirty
+  (`dirty_requested_generation += 1`) **then** 200. Optional
+  `ctx.wait_until(sync_calendar)` is an optimization only; lost
+  `wait_until` is recovered by the 15-minute incremental cron. Do **not**
+  200 before the dirty write lands.
+- `X-Goog-Resource-State: not_exists` → persist disable, then 200; stop
+  leftover channels best-effort (cron retries failed stops).
 - Token refresh via existing `refresh_if_needed` using the calendar's `user_id` (no session).
 
 ### Fallback cron
 
-- `#[event(scheduled)]` every 15 minutes (`*/15 * * * *` in wrangler.toml). None exists today.
-- For each sync-enabled calendar: if `last_synced_at` is older than 15 minutes (or NULL), run `sync_calendar`. Webhooks already refresh `last_synced_at`, so the cron no-ops when watches work. No separate `last_webhook_at` column.
-- Same job also **renews** watches: if a calendar has no channel with `expiration > now + 24h`, mint a new `events.watch` (new `channel_id`), then `channels.stop` + DELETE the old row. Overlap of two rows is expected and allowed.
-- Cron iterates calendars across users and refreshes each user's Google token. New repository methods (`list` sync-enabled / expiring) will be needed; SQL beyond that intent is left to the implementing slice.
+- `#[event(scheduled)]` every 15 minutes (`*/15 * * * *` in wrangler.toml).
+- For each sync-enabled calendar: publish a replica when dirty
+  (`requested > applied`), or `last_success_at` older than 15 minutes / NULL,
+  or `full_sync_requested`, or due `next_retry_at` — watches do **not**
+  disable the poll. No separate `last_webhook_at` column.
+- Same job also **renews** watches: if a calendar has no channel with
+  `expiration > now + 24h`, mint a new `events.watch` (new `channel_id`),
+  then `channels.stop` + DELETE the old row. Overlap of two rows is expected
+  and allowed.
+- Same job **retries leftover** watch channel rows on disabled or
+  soft-deleted calendars (`channels.stop` best-effort; rows remain on failure).
+- After a successful replica publish, the Worker notifies open browsers
+  (`CronReport.published`).
+- Cron iterates calendars across users and refreshes each user's Google token.
 
 ### Residual risk (documented, not fixed in this ADR)
 
