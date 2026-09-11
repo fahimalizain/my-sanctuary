@@ -17,12 +17,15 @@ import {
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
+  parseStoredPeriodLength,
   colWidth,
   dayIndexFromScroll,
   eventHeightPx,
   eventTopPx,
   fitPeriodStart,
   formatDayRangeTitle,
+  formatEventDateLine,
+  formatEventDuration,
   formatWeekTitle,
   gutterWithRemainder,
   contrastingInk,
@@ -47,6 +50,7 @@ import {
   visibleStartIndex,
   weekRangeIso,
   snapMinutes,
+  RESIZE_SNAP_MINUTES,
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
@@ -164,6 +168,20 @@ test('clampPeriodLength: 0→1, 3→3, 9→7, NaN→7', () => {
   assert.equal(clampPeriodLength(9), 7);
   assert.equal(clampPeriodLength(NaN), 7);
   assert.equal(clampPeriodLength(Infinity), 7);
+});
+
+test('parseStoredPeriodLength: null / empty / non-numeric → null', () => {
+  assert.equal(parseStoredPeriodLength(null), null);
+  assert.equal(parseStoredPeriodLength(''), null);
+  assert.equal(parseStoredPeriodLength('nope'), null);
+});
+
+test('parseStoredPeriodLength: valid number is clamped', () => {
+  assert.equal(parseStoredPeriodLength('1'), 1);
+  assert.equal(parseStoredPeriodLength('3'), 3);
+  assert.equal(parseStoredPeriodLength('7'), 7);
+  assert.equal(parseStoredPeriodLength('0'), 1);
+  assert.equal(parseStoredPeriodLength('9'), 7);
 });
 
 test('periodLabel: 1 Day, 3 "3 days", 7 Week', () => {
@@ -720,6 +738,22 @@ test('snapMinutes: nearest 15, clamp 0..1440', () => {
   assert.equal(snapMinutes(15), 15);
 });
 
+test('snapMinutes: optional 1-minute step (resize)', () => {
+  // nearest 1-minute
+  assert.equal(snapMinutes(10 * 60 + 7.4, RESIZE_SNAP_MINUTES), 607);
+  assert.equal(snapMinutes(10 * 60 + 7.6, RESIZE_SNAP_MINUTES), 608);
+  // contrast with default 15
+  assert.equal(snapMinutes(7, 1), 7);
+  assert.equal(snapMinutes(8, 1), 8);
+  // default arity still 15
+  assert.equal(snapMinutes(7), 0);
+  assert.equal(snapMinutes(8), 15);
+  // clamp
+  assert.equal(snapMinutes(-5, 1), 0);
+  assert.equal(snapMinutes(1440, 1), 1440);
+  assert.equal(snapMinutes(1440.2, 1), 1440);
+});
+
 test('minutesFromY: 88px at hourH=88 → 60', () => {
   assert.equal(minutesFromY(88, 88), 60);
   assert.equal(minutesFromY(0, 88), 0);
@@ -735,6 +769,64 @@ test('dateOnDay: 9:00 on a known local date', () => {
   assert.equal(at9.getHours(), 9);
   assert.equal(at9.getMinutes(), 0);
   assert.equal(at9.getSeconds(), 0);
+});
+
+// ── formatEventDuration ─────────────────────────────────────────────────
+
+test('formatEventDuration: 15 minutes → "15min"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 5, 15);
+  assert.equal(formatEventDuration(start, end), '15min');
+});
+
+test('formatEventDuration: exactly 60 minutes → "1h"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 0);
+  assert.equal(formatEventDuration(start, end), '1h');
+});
+
+test('formatEventDuration: 90 minutes → "1h 30min"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 30);
+  assert.equal(formatEventDuration(start, end), '1h 30min');
+});
+
+test('formatEventDuration: 5 hours → "5h"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 10, 0);
+  assert.equal(formatEventDuration(start, end), '5h');
+});
+
+test('formatEventDuration: zero-length → "0min"', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  assert.equal(formatEventDuration(start, start), '0min');
+});
+
+test('formatEventDuration: inverted range clamps to "0min"', () => {
+  const start = new Date(2026, 8, 13, 6, 0);
+  const end = new Date(2026, 8, 13, 5, 0);
+  assert.equal(formatEventDuration(start, end), '0min');
+});
+
+// ── formatEventDateLine ─────────────────────────────────────────────────
+
+test('formatEventDateLine: same civil day Sunday Sep 13 2026', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 6, 30);
+  assert.equal(formatEventDateLine(start, end), 'Sun Sep 13');
+});
+
+test('formatEventDateLine: cross midnight uses arrow between civil dates', () => {
+  const start = new Date(2026, 8, 13, 22, 0);
+  const end = new Date(2026, 8, 14, 0, 30);
+  assert.equal(formatEventDateLine(start, end), 'Sun Sep 13 → Mon Sep 14');
+});
+
+test('formatEventDateLine: Monday uses Sun-first names (not WEEK_DAYS)', () => {
+  // 2026-09-07 is a Monday.
+  const start = new Date(2026, 8, 7, 9, 0);
+  const end = new Date(2026, 8, 7, 10, 0);
+  assert.equal(formatEventDateLine(start, end), 'Mon Sep 7');
 });
 
 // ── defaultWritableCalendar ─────────────────────────────────────────────
