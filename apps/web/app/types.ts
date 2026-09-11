@@ -68,6 +68,12 @@ export type CalendarReplicaState =
   | 'authorization_required'
   | 'disabled';
 
+export type CalendarWatchCoverage =
+  | 'missing'
+  | 'expiring'
+  | 'no_successor'
+  | 'covered';
+
 export interface CalendarSyncHealth {
   calendar_id: string;
   state: CalendarReplicaState;
@@ -79,6 +85,12 @@ export interface CalendarSyncHealth {
   retry_after_seconds: number | null;
   projection: 'timed_masters_and_exceptions' | string;
   cache_revision: number;
+  /** Sanitized watch coverage; never channel secrets. */
+  watch_coverage: CalendarWatchCoverage;
+  /** Sanitized replica event coverage; never replay payloads. Optional for older fixtures. */
+  event_coverage?: 'complete' | 'degraded';
+  /** Independent operator warning (1h stale / escalated / auth). Optional for older fixtures. */
+  operator_warning?: 'none' | 'stale' | 'escalated' | 'authorization_required';
 }
 
 export interface CalendarEventsSync {
@@ -91,6 +103,14 @@ export interface CalendarEventsResponse {
   events: CalendarEvent[];
   source: 'cache' | 'window' | 'mixed' | string;
   sync: CalendarEventsSync;
+}
+
+// Response from POST /api/calendar/calendars/:id/repair
+export type CalendarRepairStatus = 'queued' | 'in_progress' | 'cooldown';
+
+export interface CalendarRepairResponse {
+  status: CalendarRepairStatus;
+  retry_after_seconds: number | null;
 }
 
 // Request body for POST /api/calendar/events

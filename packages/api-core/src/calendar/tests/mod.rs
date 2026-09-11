@@ -1,10 +1,14 @@
 pub(crate) mod support;
 mod list;
+mod labels;
 mod write;
 mod watch;
 mod webhook;
 mod catalog;
 mod cron;
+mod queue;
+mod diagnostics;
 mod replica;
 mod repair;
+mod repair_action;
 mod apply;

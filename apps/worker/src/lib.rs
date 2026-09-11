@@ -6,7 +6,9 @@ mod cron;
 mod db;
 mod http;
 mod lists;
+mod queue;
 mod routines;
+mod sync_log;
 mod tasks;
 mod user_hub;
 
@@ -56,9 +58,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let config = load_config(&env);
 
     // Google Calendar push webhooks (ADR 0001 § Webhook) are intercepted
-    // before the Router: `Router::run` never sees the fetch `Context`, and
-    // the background sync after a verified push must run via
-    // `ctx.wait_until`. Only a POST to the configured callback path (or the
+    // before the Router so they skip session/CORS middleware (Google is not
+    // a browser). Only a POST to the configured callback path (or the
     // documented default) is a webhook; everything else — including GETs to
     // that path — falls through to the Router.
     if is_webhook_request(&req, config.as_ref()) {
@@ -89,7 +90,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/calendar/events", auth::options)
         .options("/api/calendar/events/:id", auth::options)
         .get_async("/api/calendar/calendars", calendar::list_calendars)
+        .post_async(
+            "/api/calendar/calendars/:id/repair",
+            calendar::repair_calendar,
+        )
         .options("/api/calendar/calendars", auth::options)
+        .options("/api/calendar/calendars/:id/repair", auth::options)
         .get_async("/api/lists", lists::list_lists)
         .post_async("/api/lists", lists::create_list)
         .patch_async("/api/lists/:id", lists::update_list)

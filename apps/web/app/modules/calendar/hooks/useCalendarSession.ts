@@ -32,7 +32,11 @@ import {
 import { hourLabelStep } from '../lib/calendar-zoom';
 import { isPersistableDraftTitle } from '../lib/event-draft';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
-import { selectSyncHealthBanner } from '../lib/sync-health';
+import { repairCalendar } from '@/lib/api/calendar';
+import {
+  repairTargetCalendarId,
+  selectSyncHealthBanner,
+} from '../lib/sync-health';
 import { useCalendarDrag } from './useCalendarDrag';
 import { useCalendarZoom } from './useCalendarZoom';
 import {
@@ -98,9 +102,6 @@ export function useCalendarSession({
       : eventsQuery.error
         ? 'Failed to load events'
         : null;
-  const retry = () => {
-    void eventsQuery.refetch();
-  };
   const eventsEmpty = events.length === 0;
 
   // Optimistic create/move/resize/delete overlay (read-time; not setQueryData).
@@ -127,6 +128,17 @@ export function useCalendarSession({
       }),
     [sync, calendars, error, eventsEmpty, isLoading],
   );
+
+  const retry = () => {
+    const calendarId = repairTargetCalendarId(healthBanner);
+    if (calendarId) {
+      void repairCalendar(calendarId).finally(() => {
+        void eventsQuery.refetch();
+      });
+      return;
+    }
+    void eventsQuery.refetch();
+  };
 
   const [selectedCalendarIds, setSelectedCalendarIds] = useState<Set<string>>(
     () => new Set(),

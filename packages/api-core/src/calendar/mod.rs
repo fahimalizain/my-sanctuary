@@ -59,13 +59,16 @@
 //!   (`X-Goog-Channel-ID`/`-Token`/`-Resource-State`) against the stored
 //!   channel and calendar rows — pure and unit-tested. The Worker persists
 //!   the decision via [`persist_webhook_decision`] (dirty bump or disable)
-//!   **before** HTTP 200; an optional `ctx.wait_until` replica attempt is
-//!   only an optimization after durable dirty is written.
+//!   **before** HTTP 200. No `wait_until` replica — cron is the contract.
+//!   A queue consumer ([`run_queue_sync`]) is a latency layer on top of the
+//!   dirty bump; the fallback cron remains the correctness contract.
 
 
 pub mod apply;
+pub mod diagnostics;
 pub mod replica;
 pub mod repair;
+pub mod repair_action;
 pub mod sync;
 pub mod window;
 pub(crate) mod google;
@@ -77,6 +80,7 @@ pub(crate) mod watch;
 pub(crate) mod webhook;
 pub(crate) mod catalog;
 pub(crate) mod cron;
+pub(crate) mod queue;
 pub(crate) mod labels;
 
 #[cfg(test)]
@@ -220,7 +224,9 @@ pub struct CalendarsResponse {
 }
 
 
-pub use list::{list_events, parse_event_time_range, CalendarListOutput};
+pub use list::{
+    list_events, list_events_after_refresh_failure, parse_event_time_range, CalendarListOutput,
+};
 pub use write::{
     create_event, delete_event, delete_event_for_user, patch_event, patch_event_fields,
     patch_event_summary, update_event_for_user, CreateEventOutput,
@@ -231,8 +237,19 @@ pub use watch::{
 pub use webhook::{
     decide_webhook, persist_webhook_decision, tokens_match, WebhookDecision, WebhookPersistResult,
 };
-pub use catalog::list_calendars;
+pub use catalog::{list_calendars, list_calendars_after_refresh_failure};
 pub use cron::{
-    replica_due, run_fallback_cron, sync_calendar, CronReport, SyncCalendarOutcome,
+    replica_due, run_fallback_cron, run_fallback_cron_with_clock, sync_calendar,
+    sync_calendar_traced, CronReport, SyncCalendarOutcome, SyncCalendarResult,
+};
+pub use queue::{run_queue_sync, CalendarSyncMessage, QueueSyncAction, QueueSyncReport};
+pub use diagnostics::{
+    classify_operator_warning, mint_run_id, operator_warning_record, CheckpointResult,
+    OperatorWarningLevel, OperatorWarningRecord, OperatorWarningThresholds, ReplicaApplyReport,
+    ReplicaWalkDiagnostic, ReplicaWalkMeta, ReplicaWalkPhase, ReplicaWalkTrigger,
 };
 pub use repair::repair_inflight_operations;
+pub use repair_action::{
+    request_calendar_repair, CalendarRepairResponse, CalendarRepairStatus,
+    CALENDAR_REPAIR_COOLDOWN_SECS,
+};

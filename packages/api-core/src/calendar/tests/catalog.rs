@@ -1,8 +1,13 @@
 use super::support::*;
 use crate::calendar::catalog::refresh_calendar_list;
-use crate::calendar::{list_calendars, run_fallback_cron, CalendarView, CalendarsResponse};
+use crate::calendar::{
+    list_calendars, list_calendars_after_refresh_failure, run_fallback_cron, CalendarView,
+    CalendarsResponse,
+};
+use crate::oauth::HttpError;
 use crate::repo::CalendarRepo;
 use crate::time::unix_secs_to_rfc3339;
+use crate::token::TokenError;
 
 // ──────────────────────────────────────────
 // list_calendars
@@ -154,6 +159,126 @@ fn list_calendars_view_json_omits_sync_internals() {
             "sync internals must stay hidden: {key}"
         );
     }
+}
+
+// ──────────────────────────────────────────
+// list_calendars_after_refresh_failure
+// ──────────────────────────────────────────
+
+fn ready_synced_calendar(
+    id: &str,
+    google_cal_id: &str,
+    sync_enabled: bool,
+) -> crate::models::GoogleCalendar {
+    let mut cal = calendar(id, google_cal_id, sync_enabled);
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    cal.sync_status = "ready".to_string();
+    cal.sync_token = "cursor-secret-xyz".to_string();
+    cal
+}
+
+#[test]
+fn refresh_failure_revoked_grant_serves_cached_calendars_and_stamps() {
+    let enabled = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let calendars = FakeCalendarRepo::with(vec![enabled, disabled]);
+
+    let refresh_err = TokenError::Http(HttpError::Message(
+        "POST https://oauth2.googleapis.com/token returned 400: {\"error\":\"invalid_grant\"}"
+            .into(),
+    ));
+    let output = pollster::block_on(list_calendars_after_refresh_failure(
+        &calendars,
+        "u-1",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert_eq!(output.calendars.len(), 2);
+    let enabled_view = output
+        .calendars
+        .iter()
+        .find(|c| c.id == "cal-1")
+        .expect("enabled calendar in picker");
+    let disabled_view = output
+        .calendars
+        .iter()
+        .find(|c| c.id == "cal-disabled")
+        .expect("disabled calendar still listed");
+    assert!(enabled_view.sync_enabled);
+    assert!(!disabled_view.sync_enabled);
+
+    let stored = calendars.stored.lock().unwrap();
+    let cal1 = stored.iter().find(|c| c.id == "cal-1").unwrap();
+    assert_eq!(cal1.sync_status, "authorization_required");
+    assert_eq!(cal1.last_error_code, "auth_revoked");
+    let cal_disabled = stored.iter().find(|c| c.id == "cal-disabled").unwrap();
+    assert_eq!(cal_disabled.sync_status, "ready");
+    assert!(
+        calendars.upserted.lock().unwrap().is_empty(),
+        "no Google import on refresh failure"
+    );
+
+    let json = serde_json::to_string(&output).unwrap();
+    assert!(!json.contains("sync_token"), "{json}");
+    assert!(!json.contains("access_token"), "{json}");
+    assert!(!json.contains("invalid_grant"), "{json}");
+    assert!(!json.contains("cursor-secret-xyz"), "{json}");
+}
+
+#[test]
+fn refresh_failure_no_token_does_not_stamp() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+
+    let output = pollster::block_on(list_calendars_after_refresh_failure(
+        &calendars,
+        "u-1",
+        NOW_UNIX,
+        &TokenError::NoToken,
+    ))
+    .unwrap();
+
+    assert_eq!(output.calendars.len(), 1);
+    assert_eq!(output.calendars[0].id, "cal-1");
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_status, "ready");
+    assert_ne!(
+        calendars.stored.lock().unwrap()[0].sync_status,
+        "authorization_required"
+    );
+
+    let json = serde_json::to_string(&output).unwrap();
+    assert!(!json.contains("sync_token"), "{json}");
+    assert!(!json.contains("access_token"), "{json}");
+    assert!(!json.contains("invalid_grant"), "{json}");
+}
+
+#[test]
+fn refresh_failure_revoked_empty_store_still_ok() {
+    let calendars = FakeCalendarRepo::with(vec![]);
+
+    let refresh_err = TokenError::Http(HttpError::Message("invalid_grant".into()));
+    let output = pollster::block_on(list_calendars_after_refresh_failure(
+        &calendars,
+        "u-1",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert!(output.calendars.is_empty());
+    assert!(
+        calendars.upserted.lock().unwrap().is_empty(),
+        "empty store must not import on refresh failure"
+    );
+
+    let json = serde_json::to_string(&output).unwrap();
+    assert!(!json.contains("sync_token"), "{json}");
+    assert!(!json.contains("access_token"), "{json}");
+    assert!(!json.contains("invalid_grant"), "{json}");
 }
 
 

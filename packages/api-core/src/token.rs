@@ -30,9 +30,12 @@ pub struct GoogleAccess {
     pub token_type: String,
 }
 
-/// Errors produced by [`refresh_if_needed`]. The Worker maps every variant to
-/// `401 {"error":"unauthorized"}` (a user whose token cannot be refreshed is
-/// effectively logged out of the calendar API).
+/// Errors produced by [`refresh_if_needed`].
+///
+/// GET calendar handlers must not map these to HTTP 401 (401 is session-only,
+/// ADR 0005 invariant 10). Use [`classify_refresh_failure`]: revoked grant →
+/// 200 + `authorization_required`; missing grant → 200 cache without flipping
+/// health; transient → 500.
 #[derive(Debug, Clone, Error)]
 pub enum TokenError {
     #[error("no token stored for this user")]
@@ -126,7 +129,13 @@ pub async fn refresh_if_needed(
 }
 
 /// True when a token refresh failed because Google rejected the refresh grant
-/// (revoked / expired refresh token, or HTTP 400/401 from the token endpoint).
+/// with `invalid_grant` (revoked / expired refresh token).
+///
+/// Only `invalid_grant` is revoke. Bare token-endpoint HTTP 400/401 (or 5xx)
+/// without that body marker are **transient** — misclassified revoke used to
+/// stamp `authorization_required` as a one-way door. Production
+/// [`HttpClient::post_form`] must include a truncated response body snippet
+/// so real `{"error":"invalid_grant"}` still matches here.
 ///
 /// Used by the fallback cron to stamp `authorization_required` and stop
 /// hammering Google. Does **not** treat [`TokenError::NoToken`] /
@@ -134,16 +143,32 @@ pub async fn refresh_if_needed(
 /// not flip healthy calendars.
 pub fn is_refresh_auth_revoked(err: &TokenError) -> bool {
     match err {
-        TokenError::Http(HttpError::Message(msg)) => {
-            let lower = msg.to_ascii_lowercase();
-            lower.contains("invalid_grant")
-                || lower.contains("returned 400")
-                || lower.contains("returned 401")
-        }
-        TokenError::InvalidResponse(msg) | TokenError::InvalidStored(msg) => {
-            msg.to_ascii_lowercase().contains("invalid_grant")
-        }
+        TokenError::Http(HttpError::Message(msg))
+        | TokenError::InvalidResponse(msg)
+        | TokenError::InvalidStored(msg) => msg.to_ascii_lowercase().contains("invalid_grant"),
         TokenError::NoToken | TokenError::NoRefreshToken | TokenError::Repo(_) => false,
+    }
+}
+
+/// How a GET calendar handler should react to a [`refresh_if_needed`] failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailureKind {
+    /// Google rejected the refresh grant (`invalid_grant` only — not bare 400/401).
+    AuthorizationRequired,
+    /// `NoToken` / `NoRefreshToken` — do not flip healthy calendars.
+    MissingGrant,
+    /// Repo / non-revoked HTTP / other — caller returns HTTP 500.
+    Transient,
+}
+
+/// Classify a refresh failure for GET calendar handlers (ADR 0005 invariant 10).
+pub fn classify_refresh_failure(err: &TokenError) -> RefreshFailureKind {
+    if is_refresh_auth_revoked(err) {
+        return RefreshFailureKind::AuthorizationRequired;
+    }
+    match err {
+        TokenError::NoToken | TokenError::NoRefreshToken => RefreshFailureKind::MissingGrant,
+        _ => RefreshFailureKind::Transient,
     }
 }
 
@@ -411,14 +436,19 @@ mod tests {
 
     #[test]
     fn is_refresh_auth_revoked_detects_token_endpoint_rejections() {
-        assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+        // Bare status without invalid_grant is transient, not revoke.
+        assert!(!is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
             "POST https://oauth2.googleapis.com/token returned 400".into()
         ))));
-        assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+        assert!(!is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
             "POST https://oauth2.googleapis.com/token returned 401".into()
         ))));
         assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
             "invalid_grant".into()
+        ))));
+        assert!(is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
+            "POST https://oauth2.googleapis.com/token returned 400: {\"error\":\"invalid_grant\"}"
+                .into()
         ))));
         assert!(is_refresh_auth_revoked(&TokenError::InvalidResponse(
             "body has invalid_grant".into()
@@ -431,5 +461,59 @@ mod tests {
         assert!(!is_refresh_auth_revoked(&TokenError::Http(HttpError::Message(
             "connection refused".into()
         ))));
+    }
+
+    #[test]
+    fn classify_refresh_failure_matrix() {
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Http(HttpError::Message(
+                "invalid_grant".into()
+            ))),
+            RefreshFailureKind::AuthorizationRequired
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Http(HttpError::Message(
+                "POST https://oauth2.googleapis.com/token returned 400: {\"error\":\"invalid_grant\"}"
+                    .into()
+            ))),
+            RefreshFailureKind::AuthorizationRequired
+        );
+        // Bare 400/401 without invalid_grant → Transient (not AuthorizationRequired).
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Http(HttpError::Message(
+                "POST https://oauth2.googleapis.com/token returned 400".into()
+            ))),
+            RefreshFailureKind::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Http(HttpError::Message(
+                "POST https://oauth2.googleapis.com/token returned 401".into()
+            ))),
+            RefreshFailureKind::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::NoToken),
+            RefreshFailureKind::MissingGrant
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::NoRefreshToken),
+            RefreshFailureKind::MissingGrant
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Http(HttpError::Message(
+                "POST https://oauth2.googleapis.com/token returned 500".into()
+            ))),
+            RefreshFailureKind::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Http(HttpError::Message(
+                "connection refused".into()
+            ))),
+            RefreshFailureKind::Transient
+        );
+        assert_eq!(
+            classify_refresh_failure(&TokenError::Repo(RepoError::Backend("d1 down".into()))),
+            RefreshFailureKind::Transient
+        );
     }
 }

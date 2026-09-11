@@ -6,7 +6,7 @@ use api_core::{
     CalendarError, CalendarEventView, OAuthConfig,
 };
 
-/// 401 body for missing/invalid sessions and failed token refreshes.
+/// 401 body for missing/invalid session only (ADR 0005 invariant 10).
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
     json_error(ctx, 401, "unauthorized")
 }
@@ -115,14 +115,9 @@ pub async fn list_events(
     let tokens = crate::db::D1TokenRepo::new(d1()?);
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
-        Ok(access) => access,
-        Err(err) => {
-            console_log!("calendar: token refresh failed: {err}");
-            return unauthorized(&ctx);
-        }
-    };
 
+    // Parse bounds before refresh so the cache path has a range and bad
+    // bounds still 400 even when the grant is revoked.
     let url = req.url()?;
     let time_min = crate::auth::query_param(&url, "time_min");
     let time_max = crate::auth::query_param(&url, "time_max");
@@ -142,24 +137,61 @@ pub async fn list_events(
         .data
         .as_ref()
         .and_then(|config| config.watch_callback_url.as_deref());
-    let output = match api_core::list_events(
+
+    let output = match api_core::refresh_if_needed(
         &crate::http::WorkerHttp,
-        &calendars,
-        &events,
-        &watches,
-        &access,
+        &tokens,
+        oauth,
         &user_id,
-        &start,
-        &end,
         now_unix,
-        watch_callback_url,
     )
     .await
     {
-        Ok(output) => output,
+        Ok(access) => {
+            match api_core::list_events(
+                &crate::http::WorkerHttp,
+                &calendars,
+                &events,
+                &watches,
+                &access,
+                &user_id,
+                &start,
+                &end,
+                now_unix,
+                watch_callback_url,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    console_log!("calendar: list_events failed: {err}");
+                    return json_error(&ctx, 500, "failed to load events");
+                }
+            }
+        }
         Err(err) => {
-            console_log!("calendar: list_events failed: {err}");
-            return json_error(&ctx, 500, "failed to load events");
+            console_log!("calendar: token refresh failed: {err}");
+            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient
+            {
+                return json_error(&ctx, 500, "failed to load events");
+            }
+            match api_core::list_events_after_refresh_failure(
+                &calendars,
+                &events,
+                &user_id,
+                &start,
+                &end,
+                now_unix,
+                &err,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(list_err) => {
+                    console_log!("calendar: list_events failed: {list_err}");
+                    return json_error(&ctx, 500, "failed to load events");
+                }
+            }
         }
     };
     for error in &output.sync_errors {
@@ -183,8 +215,10 @@ pub async fn list_events(
 /// rows; an empty store runs the same first-contact `calendarList` import
 /// as `GET /api/calendar/events` (no event sync, no watch setup).
 ///
-/// Missing session or a failed token refresh → 401 `{"error":"unauthorized"}`;
-/// a `calendarList` import failure → 502 with Google's message; anything else
+/// Missing session → 401 `{"error":"unauthorized"}`.
+/// Google `refresh_if_needed` failure: revoked/missing grant → 200 cached
+/// calendars (stamp `authorization_required` on revoked); transient → 500.
+/// A `calendarList` import failure → 502 with Google's message; anything else
 /// → 500 `{"error":"failed to load calendars"}`.
 pub async fn list_calendars(
     req: Request,
@@ -199,32 +233,94 @@ pub async fn list_calendars(
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
-        Ok(access) => access,
-        Err(err) => {
-            console_log!("calendar: token refresh failed: {err}");
-            return unauthorized(&ctx);
-        }
-    };
-
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
-    let response = match api_core::list_calendars(
+
+    let response = match api_core::refresh_if_needed(
         &crate::http::WorkerHttp,
-        &calendars,
-        &access,
+        &tokens,
+        oauth,
         &user_id,
-        &now_rfc3339,
+        now_unix,
     )
     .await
     {
-            Ok(output) => Response::from_json(&output)?,
-            Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
-            Err(err) => {
-                console_log!("calendar: list_calendars failed: {err}");
+        Ok(access) => {
+            match api_core::list_calendars(
+                &crate::http::WorkerHttp,
+                &calendars,
+                &access,
+                &user_id,
+                &now_rfc3339,
+            )
+            .await
+            {
+                Ok(output) => Response::from_json(&output)?,
+                Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
+                Err(err) => {
+                    console_log!("calendar: list_calendars failed: {err}");
+                    return json_error(&ctx, 500, "failed to load calendars");
+                }
+            }
+        }
+        Err(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient
+            {
                 return json_error(&ctx, 500, "failed to load calendars");
             }
-        };
+            match api_core::list_calendars_after_refresh_failure(
+                &calendars,
+                &user_id,
+                now_unix,
+                &err,
+            )
+            .await
+            {
+                Ok(output) => Response::from_json(&output)?,
+                Err(list_err) => {
+                    console_log!("calendar: list_calendars failed: {list_err}");
+                    return json_error(&ctx, 500, "failed to load calendars");
+                }
+            }
+        }
+    };
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+}
+
+/// `POST /api/calendar/calendars/:id/repair` → 200
+/// `{"status":"queued"|"in_progress"|"cooldown","retry_after_seconds":?}`.
+///
+/// Session-gated D1-only write: persists a tracked reseed
+/// (`full_sync_requested` / `rebuilding`) and returns immediately. Does **not**
+/// refresh the Google grant, walk the replica, or notify the user — cron is
+/// the walker and notifies on publish (issue #59).
+pub async fn repair_calendar(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some((user_id, _oauth)) = session_and_oauth(&req, &ctx)? else {
+        return unauthorized(&ctx);
+    };
+    let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
+        return json_error(&ctx, 404, "calendar not found");
+    };
+
+    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+
+    match api_core::request_calendar_repair(&calendars, &user_id, &id, now_unix).await {
+        Ok(body) => {
+            let response = Response::from_json(&body)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(CalendarError::NotFound) => json_error(&ctx, 404, "calendar not found"),
+        Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
+        Err(err) => {
+            console_log!("calendar: repair_calendar failed: {err}");
+            json_error(&ctx, 500, "failed to repair calendar")
+        }
+    }
 }
 
 /// `POST /api/calendar/events` → 200 `{"event":{...},"source":"google"}`.
@@ -267,6 +363,7 @@ pub async fn create_event(
         &events,
         &operations,
         &access,
+        &user_id,
         &input,
         now_unix,
     )

@@ -40,8 +40,14 @@ pub struct GoogleCalendar {
     pub last_synced_at: Option<String>,
     /// Cached `calendars.get` `labelProperties.eventLabels` JSON.
     /// Empty string = never fetched. `"[]"` or `[{id, backgroundColor}]` = fetched.
+    /// Freshness is tracked by [`GoogleCalendar::event_labels_updated_at`]
+    /// (not by whether this string is non-empty).
     #[serde(default, deserialize_with = "de_empty_string")]
     pub event_labels: String,
+    /// RFC 3339 instant of the last successful event-label fetch.
+    /// `None` = never stamped (treat as stale).
+    #[serde(default)]
+    pub event_labels_updated_at: Option<String>,
     /// Hash/canonical string of the replica query shape (singleEvents,
     /// optional timeMin, eventTypes). Empty until the first successful sync
     /// records it.
@@ -87,6 +93,20 @@ pub struct GoogleCalendar {
     /// (all-day still out of projection).
     #[serde(default, deserialize_with = "de_empty_string")]
     pub projection: String,
+    /// Sanitized watch coverage for the GET events sync envelope.
+    /// Derived from `google_calendars_watch_channels`; never stores channel
+    /// tokens or resource ids.
+    /// Values: `missing` | `expiring` | `no_successor` | `covered`
+    /// (empty/unknown → treated as `missing` by the view).
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub watch_coverage: String,
+    /// Sanitized replica event coverage for the GET events sync envelope.
+    /// Values: `complete` | `degraded`
+    /// (empty/unknown → treated as `complete` by the view).
+    /// Independent of [`GoogleCalendar::watch_coverage`]; does not feed
+    /// aggregate sync status. Default column is `'complete'`.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub event_coverage: String,
     pub created_at: String,
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
@@ -557,6 +577,8 @@ mod tests {
         assert_eq!(calendar.lease_expires_at, None);
         assert_eq!(calendar.cache_revision, 0);
         assert_eq!(calendar.projection, "");
+        assert_eq!(calendar.watch_coverage, "");
+        assert_eq!(calendar.event_coverage, "");
     }
 
     #[test]

@@ -4,8 +4,13 @@ use crate::google_color::canonicalize_hex;
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
 use crate::repo::CalendarRepo;
+use crate::time::rfc3339_to_unix_secs;
 use crate::token::GoogleAccess;
 use serde::{Deserialize, Serialize};
+
+/// Event-label cache TTL. Labels rarely change; the 15-minute cron picks up
+/// expiry on the next catalog/sync touch after this window.
+pub(crate) const EVENT_LABELS_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// Subset of the `calendars.get` response: the label properties carrying the
 /// calendar's event labels (`labelProperties.eventLabels[]`, each
@@ -42,6 +47,32 @@ pub(crate) struct CachedEventLabel {
     pub(crate) background_color: String,
 }
 
+/// Whether the persisted event-label cache can be reused without a refetch.
+///
+/// Empty `event_labels` is never fresh. Missing / unparseable
+/// `event_labels_updated_at` or unparseable `now` → not fresh. A future stamp
+/// is treated as age 0 (fresh). Age is compared strictly less than
+/// [`EVENT_LABELS_TTL_SECS`] (exactly 24h is stale).
+pub(crate) fn event_labels_cache_is_fresh(
+    event_labels: &str,
+    event_labels_updated_at: Option<&str>,
+    now_rfc3339: &str,
+) -> bool {
+    if event_labels.is_empty() {
+        return false;
+    }
+    let Some(stamp) = event_labels_updated_at else {
+        return false;
+    };
+    let Some(fetched_unix) = rfc3339_to_unix_secs(stamp) else {
+        return false;
+    };
+    let Some(now_unix) = rfc3339_to_unix_secs(now_rfc3339) else {
+        return false;
+    };
+    now_unix.saturating_sub(fetched_unix) < EVENT_LABELS_TTL_SECS
+}
+
 /// Fetches a calendar's `labelProperties.eventLabels` via `calendars.get` and
 /// persists them as a JSON array on the `google_calendars` row.
 ///
@@ -49,9 +80,10 @@ pub(crate) struct CachedEventLabel {
 /// Absent `labelProperties.eventLabels` → `[]` (holiday/reader calendars).
 /// Each `backgroundColor` is canonicalized via [`canonicalize_hex`] when it
 /// parses (lowercased `#rrggbb`); the original is kept when it does not.
-/// Skipped entirely when `cal.event_labels` is non-empty (already fetched);
-/// Google 4xx/5xx is a hard [`CalendarError::GoogleApi`] — an import must not
-/// silently leave the cache empty.
+/// Skipped when the cache is non-empty and still within
+/// [`EVENT_LABELS_TTL_SECS`] of `event_labels_updated_at`. Google 4xx/5xx is a
+/// hard [`CalendarError::GoogleApi`] and does **not** call `set_event_labels`
+/// (previous payload and stamp stay put so the next catalog/sync retries).
 pub(crate) async fn ensure_event_labels(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -59,7 +91,11 @@ pub(crate) async fn ensure_event_labels(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
 ) -> Result<(), CalendarError> {
-    if !cal.event_labels.is_empty() {
+    if event_labels_cache_is_fresh(
+        &cal.event_labels,
+        cal.event_labels_updated_at.as_deref(),
+        now_rfc3339,
+    ) {
         return Ok(());
     }
     let url = format!(

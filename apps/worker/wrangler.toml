@@ -45,3 +45,21 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["UserHub"]
+
+# calendar-sync is a latency layer (issue #80). Dirty generation + the
+# 15-minute fallback cron remain the correctness contract.
+# Local `wrangler dev` simulates this queue in-process — no
+# `wrangler queues create` is required for local/dev. Do NOT run
+# `wrangler queues create calendar-sync` or deploy this queue to
+# production from this branch.
+[[queues.producers]]
+binding = "CALENDAR_SYNC"
+queue = "calendar-sync"
+
+[[queues.consumers]]
+queue = "calendar-sync"
+max_batch_size = 1
+max_batch_timeout = 0
+# max_retries left at the platform default (3).
+# max_concurrency unset (autoscaling; per-calendar lease is the real cap).
+# no dead-letter_queue — every meaningful failure Acks; cron recovers.

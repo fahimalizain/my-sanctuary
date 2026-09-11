@@ -1010,6 +1010,7 @@ pub async fn start_task(
         events,
         operations,
         access,
+        user_id,
         &NewEventInput {
             calendar_id: target.calendar_id.clone(),
             summary: task.title.clone(),
@@ -2161,6 +2162,7 @@ async fn create_focus_segment(
         events,
         operations,
         access,
+        user_id,
         &NewEventInput {
             calendar_id,
             summary: task.title.clone(),
@@ -4360,6 +4362,7 @@ mod tests {
             // The 24 seeded labels with stable fake ids — tasks never syncs,
             // so this is the cache `create_event` resolves colors against.
             event_labels: event_labels_json(),
+            event_labels_updated_at: Some("2026-08-17T00:00:00Z".to_string()),
             sync_query_fingerprint: String::new(),
             sync_status: String::new(),
             initial_sync_complete: false,
@@ -4375,6 +4378,8 @@ mod tests {
             lease_expires_at: None,
             cache_revision: 0,
             projection: "timed_masters_and_exceptions".to_string(),
+            watch_coverage: String::new(),
+            event_coverage: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4498,6 +4503,25 @@ mod tests {
             Ok(())
         }
 
+        async fn record_sync_contention(
+            &self,
+            _id: &str,
+            _error_code: &str,
+            _sync_status: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn begin_replica_reseed(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn try_acquire_lease(
             &self,
             _id: &str,
@@ -4557,14 +4581,33 @@ mod tests {
             &self,
             id: &str,
             event_labels_json: &str,
-            _now_rfc3339: &str,
+            now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             // Persist into the in-memory rows (tasks never reads it back, but
             // the fake must mirror the D1 write).
             let mut stored = self.stored.lock().unwrap();
             if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                 cal.event_labels = event_labels_json.to_string();
+                cal.event_labels_updated_at = Some(now_rfc3339.to_string());
             }
+            Ok(())
+        }
+
+        async fn set_watch_coverage(
+            &self,
+            _id: &str,
+            _coverage: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn set_event_coverage(
+            &self,
+            _id: &str,
+            _coverage: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
             Ok(())
         }
 
@@ -4590,6 +4633,15 @@ mod tests {
 
         async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
             Ok(Vec::new())
+        }
+
+        async fn clear_authorization_required_for_user(
+            &self,
+            _user_id: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
         }
     }
 
@@ -4663,6 +4715,15 @@ mod tests {
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             Ok(())
+        }
+
+        async fn upsert_batch_if_owner(
+            &self,
+            _events: Vec<NewCalendarEvent>,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
         }
 
         async fn get_by_id(&self, _id: &str) -> Result<Option<CalendarEvent>, RepoError> {
@@ -4747,11 +4808,67 @@ mod tests {
             Ok(())
         }
 
+        async fn delete_by_google_event_id_if_owner(
+            &self,
+            _calendar_id: &str,
+            _google_event_id: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
         async fn delete_stale(
             &self,
             _calendar_id: &str,
             _older_than_rfc3339: &str,
             _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn record_replica_seen(
+            &self,
+            _calendar_id: &str,
+            _run_id: &str,
+            _google_event_ids: Vec<String>,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn clear_replica_seen_for_calendar(
+            &self,
+            _calendar_id: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn sweep_absent_if_owner(
+            &self,
+            _calendar_id: &str,
+            _run_id: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
+        async fn upsert_quarantine(
+            &self,
+            _calendar_id: &str,
+            _google_event_id: &str,
+            _phase: &str,
+            _error_class: &str,
+            _replay_payload: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn clear_quarantine_for_calendar(
+            &self,
+            _calendar_id: &str,
         ) -> Result<(), RepoError> {
             Ok(())
         }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::calendar::apply::row_from_new_event;
 use crate::config::OAuthConfig;
@@ -221,8 +221,11 @@ fn rewrite_json_id(response: Vec<u8>, id: &str) -> Vec<u8> {
 /// `(user_id, google_calendar_id)` (like D1), so incremental calendarList
 /// tests do not invent duplicate rows. Lease methods mirror the V1 SQL
 /// semantics so replica tests exercise real fencing.
+///
+/// `stored` is `Arc`-shared so [`FakeEventRepo`] can gate fenced applies on
+/// the same live lease state.
 pub(crate) struct FakeCalendarRepo {
-    pub(crate) stored: Mutex<Vec<GoogleCalendar>>,
+    pub(crate) stored: Arc<Mutex<Vec<GoogleCalendar>>>,
     pub(crate) upserted: Mutex<Vec<NewCalendar>>,
     pub(crate) sync_states: Mutex<Vec<(String, String, String)>>,
     pub(crate) disabled: Mutex<Vec<(String, bool)>>,
@@ -244,6 +247,12 @@ pub(crate) struct FakeCalendarRepo {
     /// Snapshot is taken before the bump so the caller still sees the
     /// pre-bump generation (mirrors mid-run dirty enqueue).
     pub(crate) bump_dirty_after_get_by_id: Mutex<Option<usize>>,
+    /// Amount added to `dirty_requested_generation` when
+    /// [`Self::bump_dirty_after_get_by_id`] fires (default 1). Set >1 to
+    /// simulate multiple mid-walk dirty bumps coalescing into one re-enqueue.
+    pub(crate) bump_dirty_by: Mutex<i64>,
+    /// History of `expires_rfc3339` values passed to [`CalendarRepo::renew_lease`].
+    pub(crate) renew_expiries: Mutex<Vec<String>>,
 }
 
 impl FakeCalendarRepo {
@@ -263,7 +272,7 @@ impl FakeCalendarRepo {
             }
         }
         Self {
-            stored: Mutex::new(calendars),
+            stored: Arc::new(Mutex::new(calendars)),
             upserted: Mutex::new(Vec::new()),
             sync_states: Mutex::new(Vec::new()),
             disabled: Mutex::new(Vec::new()),
@@ -276,6 +285,8 @@ impl FakeCalendarRepo {
             fail_bump_dirty: Mutex::new(false),
             fail_set_sync_enabled: Mutex::new(false),
             bump_dirty_after_get_by_id: Mutex::new(None),
+            bump_dirty_by: Mutex::new(1),
+            renew_expiries: Mutex::new(Vec::new()),
         }
     }
 
@@ -306,6 +317,7 @@ impl FakeCalendarRepo {
         cal.sync_query_fingerprint = query_fingerprint.to_string();
         cal.cache_revision += 1;
         cal.full_sync_requested = false;
+        cal.event_coverage = "complete".to_string();
         cal.updated_at = now_rfc3339.to_string();
     }
 
@@ -368,9 +380,10 @@ impl CalendarRepo for FakeCalendarRepo {
         }
         if let Some(threshold) = *self.bump_dirty_after_get_by_id.lock().unwrap() {
             if n == threshold {
+                let by = (*self.bump_dirty_by.lock().unwrap()).max(0);
                 if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                     cal.dirty_requested_generation =
-                        cal.dirty_requested_generation.saturating_add(1);
+                        cal.dirty_requested_generation.saturating_add(by);
                 }
             }
         }
@@ -455,6 +468,7 @@ impl CalendarRepo for FakeCalendarRepo {
                     // Freshly imported rows start with an empty label cache
                     // (cache miss) — `refresh_calendar_list` backfills it.
                     event_labels: String::new(),
+                    event_labels_updated_at: None,
                     // Health defaults: calendarList upsert must never write these.
                     sync_query_fingerprint: String::new(),
                     sync_status: String::new(),
@@ -471,6 +485,8 @@ impl CalendarRepo for FakeCalendarRepo {
                     lease_expires_at: None,
                     cache_revision: 0,
                     projection: "timed_masters_and_exceptions".to_string(),
+                    watch_coverage: String::new(),
+                    event_coverage: String::new(),
                     created_at: "2026-08-17T00:00:00Z".to_string(),
                     updated_at: "2026-08-17T00:00:00Z".to_string(),
                     deleted_at: None,
@@ -570,11 +586,47 @@ impl CalendarRepo for FakeCalendarRepo {
     ) -> Result<(), RepoError> {
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
-            // Do not touch sync_token / last_success_at / last_synced_at.
+            // Do not touch sync_token / last_success_at / last_synced_at /
+            // full_sync_requested.
             cal.last_error_code = error_code.to_string();
             cal.failure_streak += 1;
             cal.sync_status = sync_status.to_string();
             cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            // Contention: do not increment failure_streak; do not touch token /
+            // success stamps / lease / dirty gens.
+            cal.last_error_code = error_code.to_string();
+            cal.sync_status = sync_status.to_string();
+            cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+
+    async fn begin_replica_reseed(
+        &self,
+        id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            // Do not touch sync_token.
+            cal.full_sync_requested = true;
+            cal.sync_status = "rebuilding".to_string();
             cal.updated_at = now_rfc3339.to_string();
         }
         Ok(())
@@ -640,6 +692,10 @@ impl CalendarRepo for FakeCalendarRepo {
         }
         cal.lease_expires_at = Some(expires_rfc3339.to_string());
         cal.updated_at = now_rfc3339.to_string();
+        self.renew_expiries
+            .lock()
+            .unwrap()
+            .push(expires_rfc3339.to_string());
         Ok(true)
     }
 
@@ -701,7 +757,7 @@ impl CalendarRepo for FakeCalendarRepo {
         &self,
         id: &str,
         event_labels_json: &str,
-        _now_rfc3339: &str,
+        now_rfc3339: &str,
     ) -> Result<(), RepoError> {
         self.label_updates
             .lock()
@@ -710,6 +766,39 @@ impl CalendarRepo for FakeCalendarRepo {
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
             cal.event_labels = event_labels_json.to_string();
+            cal.event_labels_updated_at = Some(now_rfc3339.to_string());
+        }
+        Ok(())
+    }
+
+    async fn set_watch_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            if cal.deleted_at.is_none() {
+                cal.watch_coverage = coverage.to_string();
+                cal.updated_at = now_rfc3339.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_event_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            if cal.deleted_at.is_none() {
+                cal.event_coverage = coverage.to_string();
+                cal.updated_at = now_rfc3339.to_string();
+            }
         }
         Ok(())
     }
@@ -761,12 +850,63 @@ impl CalendarRepo for FakeCalendarRepo {
         ids.dedup();
         Ok(ids)
     }
+
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        for cal in stored.iter_mut() {
+            if cal.user_id != user_id
+                || cal.deleted_at.is_some()
+                || !cal.sync_enabled
+                || cal.sync_status != "authorization_required"
+            {
+                continue;
+            }
+            let had_success = cal.initial_sync_complete
+                || cal
+                    .last_success_at
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+            cal.sync_status = if had_success {
+                "retrying".to_string()
+            } else {
+                "never_initialized".to_string()
+            };
+            cal.last_error_code = String::new();
+            cal.failure_streak = 0;
+            cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+}
+
+/// In-memory quarantine row for deterministic poison (issue #60).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FakeQuarantineRow {
+    pub(crate) calendar_id: String,
+    pub(crate) google_event_id: String,
+    pub(crate) phase: String,
+    pub(crate) error_class: String,
+    pub(crate) replay_payload: String,
+    pub(crate) first_seen_at: String,
+    pub(crate) last_attempt_at: String,
+    pub(crate) attempt_count: i64,
 }
 
 /// In-memory event repo: upserts materialize rows so the follow-up
 /// time-range query returns them, and every call is recorded.
 pub(crate) struct FakeEventRepo {
     pub(crate) stored: Mutex<Vec<CalendarEvent>>,
+    /// Optional parent-calendar catalog for list queries. Empty = no join
+    /// filter (existing fixtures that only seed events keep working).
+    /// When populated, mirrors the SQL INNER JOIN + living + sync_enabled.
+    pub(crate) parent_calendars: Mutex<Vec<GoogleCalendar>>,
     pub(crate) upserted_batch: Mutex<Vec<NewCalendarEvent>>,
     pub(crate) upserted_single: Mutex<Option<(String, NewCalendarEvent)>>,
     pub(crate) ranged: Mutex<Vec<(String, String, String)>>,
@@ -774,25 +914,92 @@ pub(crate) struct FakeEventRepo {
     pub(crate) deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
     /// `(calendar_id, older_than, now)` — replica walk must never push.
     pub(crate) deleted_stale: Mutex<Vec<(String, String, String)>>,
+    /// `(calendar_id, run_id, google_event_id)` — merge-full seen snapshot.
+    pub(crate) replica_seen: Mutex<Vec<(String, String, String)>>,
+    /// Poison quarantine rows (`calendar_event_quarantine`).
+    pub(crate) quarantine: Mutex<Vec<FakeQuarantineRow>>,
     pub(crate) fail_upsert: Mutex<bool>,
     pub(crate) fail_delete: Mutex<bool>,
     pub(crate) next_id: Mutex<u64>,
+    /// Shared live lease store from [`FakeCalendarRepo::stored`]. `None`
+    /// means unbound: fenced methods behave like unfenced (lease held).
+    pub(crate) lease_calendars: Mutex<Option<Arc<Mutex<Vec<GoogleCalendar>>>>>,
+    /// Count of non-empty fenced apply calls (upsert/delete/sweep if_owner).
+    pub(crate) fenced_apply_count: Mutex<usize>,
+    /// When `Some((n, owner, expires))`, on the **nth** fenced apply call
+    /// (1-based, across all if_owner methods including sweep), **before** the
+    /// lease check, write `owner` / `expires` onto matching calendar row(s).
+    pub(crate) inject_lease_before_fenced_apply:
+        Mutex<Option<(usize, String, Option<String>)>>,
 }
 
 impl FakeEventRepo {
     pub(crate) fn new() -> Self {
         Self {
             stored: Mutex::new(Vec::new()),
+            parent_calendars: Mutex::new(Vec::new()),
             upserted_batch: Mutex::new(Vec::new()),
             upserted_single: Mutex::new(None),
             ranged: Mutex::new(Vec::new()),
             deleted: Mutex::new(Vec::new()),
             deleted_by_google_event_id: Mutex::new(Vec::new()),
             deleted_stale: Mutex::new(Vec::new()),
+            replica_seen: Mutex::new(Vec::new()),
+            quarantine: Mutex::new(Vec::new()),
             fail_upsert: Mutex::new(false),
             fail_delete: Mutex::new(false),
             next_id: Mutex::new(1),
+            lease_calendars: Mutex::new(None),
+            fenced_apply_count: Mutex::new(0),
+            inject_lease_before_fenced_apply: Mutex::new(None),
         }
+    }
+
+    /// Bind fenced apply methods to `calendars.stored` so lease steal/expire
+    /// is visible at write time (mirrors SQL EXISTS on `google_calendars`).
+    pub(crate) fn gate_applies_on(&self, calendars: &FakeCalendarRepo) {
+        *self.lease_calendars.lock().unwrap() = Some(Arc::clone(&calendars.stored));
+    }
+
+    /// Run inject hook (if any) then return whether `lease_owner` still holds
+    /// an unexpired lease on `calendar_id`. Unbound fake → always held.
+    /// Empty upserts must not call this (they do not count as fenced applies).
+    fn begin_fenced_apply(
+        &self,
+        calendar_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> bool {
+        let lease_arc = {
+            let guard = self.lease_calendars.lock().unwrap();
+            match guard.as_ref() {
+                None => return true,
+                Some(arc) => Arc::clone(arc),
+            }
+        };
+
+        {
+            let mut count = self.fenced_apply_count.lock().unwrap();
+            *count += 1;
+            let n = *count;
+            drop(count);
+            if let Some((threshold, owner, expires)) =
+                self.inject_lease_before_fenced_apply.lock().unwrap().clone()
+            {
+                if n == threshold {
+                    let mut cals = lease_arc.lock().unwrap();
+                    for cal in cals.iter_mut().filter(|c| c.id == calendar_id) {
+                        cal.lease_owner = owner.clone();
+                        cal.lease_expires_at = expires.clone();
+                    }
+                }
+            }
+        }
+
+        let cals = lease_arc.lock().unwrap();
+        cals.iter()
+            .find(|c| c.id == calendar_id && c.deleted_at.is_none())
+            .is_some_and(|c| FakeCalendarRepo::lease_held(c, lease_owner, now_rfc3339))
     }
 
     /// Natural-key upsert including soft-deleted rows: on hit, update
@@ -871,6 +1078,25 @@ impl FakeEventRepo {
         }
         true
     }
+
+    /// Mirrors the SQL INNER JOIN on `google_calendars` plus living +
+    /// sync-enabled parent predicates. Empty catalog = no filter so fixtures
+    /// that only seed events keep working.
+    fn living_enabled_parent(
+        event: &CalendarEvent,
+        user_id: &str,
+        calendars: &[GoogleCalendar],
+    ) -> bool {
+        if calendars.is_empty() {
+            return true;
+        }
+        calendars.iter().any(|c| {
+            c.id == event.calendar_id
+                && c.user_id == user_id
+                && c.deleted_at.is_none()
+                && c.sync_enabled
+        })
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -901,6 +1127,29 @@ impl CalendarEventRepo for FakeEventRepo {
             self.apply_upsert(event, now_rfc3339);
         }
         Ok(())
+    }
+
+    async fn upsert_batch_if_owner(
+        &self,
+        events: Vec<NewCalendarEvent>,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        if events.is_empty() {
+            return Ok(true);
+        }
+        let calendar_id = events[0].calendar_id.as_str();
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        if *self.fail_upsert.lock().unwrap() {
+            return Err(RepoError::Backend("cache write failed".into()));
+        }
+        self.upserted_batch.lock().unwrap().extend(events.clone());
+        for event in events {
+            self.apply_upsert(event, now_rfc3339);
+        }
+        Ok(true)
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError> {
@@ -942,13 +1191,16 @@ impl CalendarEventRepo for FakeEventRepo {
             start_rfc3339.to_string(),
             end_rfc3339.to_string(),
         ));
-        // Mirrors EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL projection +
-        // overlap (start < window_end AND end > window_start).
+        // Mirrors EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: living+enabled
+        // parent join + projection + overlap (start < window_end AND end >
+        // window_start).
         let stored = self.stored.lock().unwrap();
+        let parents = self.parent_calendars.lock().unwrap();
         Ok(stored
             .iter()
             .filter(|event| {
-                Self::in_projection(event, &stored)
+                Self::living_enabled_parent(event, user_id, &parents)
+                    && Self::in_projection(event, &stored)
                     && event.start_time.as_str() < end_rfc3339
                     && event.end_time.as_str() > start_rfc3339
             })
@@ -958,16 +1210,18 @@ impl CalendarEventRepo for FakeEventRepo {
 
     async fn list_running_by_user_id(
         &self,
-        _user_id: &str,
+        user_id: &str,
         now_rfc3339: &str,
     ) -> Result<Vec<CalendarEvent>, RepoError> {
-        // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: projection +
-        // task-tagged + `start_time <= now < end_time`.
+        // Mirrors EVENT_LIST_RUNNING_BY_USER_ID_SQL: living+enabled parent
+        // join + projection + task-tagged + `start_time <= now < end_time`.
         let stored = self.stored.lock().unwrap();
+        let parents = self.parent_calendars.lock().unwrap();
         Ok(stored
             .iter()
             .filter(|event| {
-                Self::in_projection(event, &stored)
+                Self::living_enabled_parent(event, user_id, &parents)
+                    && Self::in_projection(event, &stored)
                     && !event.task_id.is_empty()
                     && event.start_time.as_str() <= now_rfc3339
                     && event.end_time.as_str() > now_rfc3339
@@ -1030,6 +1284,32 @@ impl CalendarEventRepo for FakeEventRepo {
         Ok(())
     }
 
+    async fn delete_by_google_event_id_if_owner(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        if *self.fail_delete.lock().unwrap() {
+            return Err(RepoError::Backend("cache delete failed".into()));
+        }
+        self.deleted_by_google_event_id
+            .lock()
+            .unwrap()
+            .push((calendar_id.to_string(), google_event_id.to_string()));
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(event) = stored.iter_mut().find(|event| {
+            event.calendar_id == calendar_id && event.google_event_id == google_event_id
+        }) {
+            event.deleted_at = Some(now_rfc3339.to_string());
+        }
+        Ok(true)
+    }
+
     async fn delete_stale(
         &self,
         calendar_id: &str,
@@ -1041,6 +1321,124 @@ impl CalendarEventRepo for FakeEventRepo {
             older_than_rfc3339.to_string(),
             now_rfc3339.to_string(),
         ));
+        Ok(())
+    }
+
+    async fn record_replica_seen(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        google_event_ids: Vec<String>,
+        _now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        if google_event_ids.is_empty() {
+            return Ok(());
+        }
+        let mut seen = self.replica_seen.lock().unwrap();
+        for gid in google_event_ids {
+            if gid.is_empty() {
+                continue;
+            }
+            let key = (calendar_id.to_string(), run_id.to_string(), gid);
+            if !seen.iter().any(|row| row == &key) {
+                seen.push(key);
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_replica_seen_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        self.replica_seen
+            .lock()
+            .unwrap()
+            .retain(|(cid, _, _)| cid != calendar_id);
+        Ok(())
+    }
+
+    async fn sweep_absent_if_owner(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        // Counts as a fenced apply (lease inject + gate).
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        let seen: std::collections::HashSet<String> = self
+            .replica_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(cid, rid, _)| cid == calendar_id && rid == run_id)
+            .map(|(_, _, gid)| gid.clone())
+            .collect();
+        let mut stored = self.stored.lock().unwrap();
+        for event in stored.iter_mut() {
+            if event.calendar_id != calendar_id {
+                continue;
+            }
+            if event.deleted_at.is_some() {
+                continue;
+            }
+            // Cancelled exception: keep living.
+            if event.status == "cancelled" && !event.recurring_event_id.trim().is_empty() {
+                continue;
+            }
+            // App-owned association: keep living.
+            if !event.task_id.trim().is_empty() {
+                continue;
+            }
+            if seen.contains(&event.google_event_id) {
+                continue;
+            }
+            // Soft-delete only — do not wipe task_id (already empty here).
+            event.deleted_at = Some(now_rfc3339.to_string());
+            event.updated_at = now_rfc3339.to_string();
+        }
+        Ok(true)
+    }
+
+    async fn upsert_quarantine(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        phase: &str,
+        error_class: &str,
+        replay_payload: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut rows = self.quarantine.lock().unwrap();
+        if let Some(row) = rows.iter_mut().find(|r| {
+            r.calendar_id == calendar_id
+                && r.google_event_id == google_event_id
+                && r.phase == phase
+        }) {
+            row.error_class = error_class.to_string();
+            row.replay_payload = replay_payload.to_string();
+            row.last_attempt_at = now_rfc3339.to_string();
+            row.attempt_count = row.attempt_count.saturating_add(1);
+        } else {
+            rows.push(FakeQuarantineRow {
+                calendar_id: calendar_id.to_string(),
+                google_event_id: google_event_id.to_string(),
+                phase: phase.to_string(),
+                error_class: error_class.to_string(),
+                replay_payload: replay_payload.to_string(),
+                first_seen_at: now_rfc3339.to_string(),
+                last_attempt_at: now_rfc3339.to_string(),
+                attempt_count: 1,
+            });
+        }
+        Ok(())
+    }
+
+    async fn clear_quarantine_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        self.quarantine
+            .lock()
+            .unwrap()
+            .retain(|r| r.calendar_id != calendar_id);
         Ok(())
     }
 }
@@ -1369,9 +1767,12 @@ pub(crate) fn calendar_for_user(
         sync_token: String::new(),
         last_synced_at: None,
         // `"[]"` = label cache already fetched (no labels) — existing sync
-        // tests skip the `calendars.get` backfill. Tests exercising the
-        // cache-miss path construct rows with an empty string explicitly.
+        // tests skip the `calendars.get` backfill. Stamp is fresh for every
+        // existing test `now` (2023-11-14 is in the future of this stamp;
+        // 2026-08-17 is age 0). Tests exercising the cache-miss path
+        // construct rows with an empty string / None stamp explicitly.
         event_labels: "[]".to_string(),
+        event_labels_updated_at: Some("2026-08-17T00:00:00Z".to_string()),
         sync_query_fingerprint: String::new(),
         // Empty string matches serde default for missing columns; production
         // backfill uses `never_initialized` / `ready` / `disabled`.
@@ -1389,6 +1790,8 @@ pub(crate) fn calendar_for_user(
         lease_expires_at: None,
         cache_revision: 0,
         projection: "timed_masters_and_exceptions".to_string(),
+        watch_coverage: String::new(),
+        event_coverage: String::new(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         deleted_at: None,

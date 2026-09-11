@@ -109,6 +109,7 @@ pub async fn create_event(
     events: &dyn CalendarEventRepo,
     operations: &dyn CalendarEventOperationRepo,
     access: &GoogleAccess,
+    user_id: &str,
     input: &NewEventInput,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
@@ -118,6 +119,7 @@ pub async fn create_event(
         events,
         operations,
         access,
+        user_id,
         input,
         now_unix,
     )

@@ -357,6 +357,120 @@ fn cron_token_refresh_failure_for_one_user_does_not_abort_the_rest() {
 
 
 // ──────────────────────────────────────────
+// authorization_required recovery
+// ──────────────────────────────────────────
+
+#[test]
+fn clear_authorization_required_for_user_scopes_and_status_case() {
+    let mut never_init = calendar_for_user("u-1", "cal-auth-new", "a@example.com", true);
+    never_init.sync_status = "authorization_required".to_string();
+    never_init.last_error_code = "auth_revoked".to_string();
+    never_init.failure_streak = 2;
+    never_init.initial_sync_complete = false;
+    never_init.last_success_at = None;
+
+    let mut was_ready = calendar_for_user("u-1", "cal-auth-old", "b@example.com", true);
+    was_ready.sync_status = "authorization_required".to_string();
+    was_ready.last_error_code = "auth_revoked".to_string();
+    was_ready.failure_streak = 5;
+    was_ready.initial_sync_complete = true;
+    was_ready.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    was_ready.sync_token = "keep-me".to_string();
+    was_ready.dirty_requested_generation = 3;
+    was_ready.dirty_applied_generation = 1;
+    was_ready.full_sync_requested = true;
+    was_ready.lease_owner = "owner-x".to_string();
+
+    let mut ready = calendar_for_user("u-1", "cal-ready", "c@example.com", true);
+    ready.sync_status = "ready".to_string();
+    ready.initial_sync_complete = true;
+    ready.last_success_at = Some("2023-11-14T22:00:00Z".to_string());
+
+    let mut other = calendar_for_user("u-2", "cal-other", "d@example.com", true);
+    other.sync_status = "authorization_required".to_string();
+    other.last_error_code = "auth_revoked".to_string();
+    other.failure_streak = 1;
+
+    let calendars = FakeCalendarRepo::with(vec![never_init, was_ready, ready, other]);
+    let now = unix_secs_to_rfc3339(NOW_UNIX);
+    pollster::block_on(calendars.clear_authorization_required_for_user("u-1", &now, &now))
+        .unwrap();
+
+    let stored = calendars.stored.lock().unwrap();
+    let new = stored.iter().find(|c| c.id == "cal-auth-new").unwrap();
+    assert_eq!(new.sync_status, "never_initialized");
+    assert!(new.last_error_code.is_empty());
+    assert_eq!(new.failure_streak, 0);
+    assert_eq!(new.next_retry_at.as_deref(), Some(now.as_str()));
+
+    let old = stored.iter().find(|c| c.id == "cal-auth-old").unwrap();
+    assert_eq!(old.sync_status, "retrying");
+    assert!(old.last_error_code.is_empty());
+    assert_eq!(old.failure_streak, 0);
+    assert_eq!(old.next_retry_at.as_deref(), Some(now.as_str()));
+    assert_eq!(old.sync_token, "keep-me", "cursor must not move");
+    assert_eq!(old.dirty_requested_generation, 3);
+    assert_eq!(old.dirty_applied_generation, 1);
+    assert!(old.full_sync_requested);
+    assert_eq!(old.lease_owner, "owner-x");
+
+    let ready_row = stored.iter().find(|c| c.id == "cal-ready").unwrap();
+    assert_eq!(ready_row.sync_status, "ready", "ready untouched");
+
+    let other_row = stored.iter().find(|c| c.id == "cal-other").unwrap();
+    assert_eq!(
+        other_row.sync_status, "authorization_required",
+        "other user untouched"
+    );
+    assert_eq!(other_row.last_error_code, "auth_revoked");
+    assert_eq!(other_row.failure_streak, 1);
+}
+
+#[test]
+fn cron_clears_authorization_required_after_successful_refresh_and_syncs() {
+    // Previously authorization_required + never-init + fresh token → clear →
+    // same-tick replica → ready. Acceptance for recoverable auth_required.
+    let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_status = "authorization_required".to_string();
+    cal.last_error_code = "auth_revoked".to_string();
+    cal.failure_streak = 3;
+    cal.initial_sync_complete = false;
+    cal.last_success_at = None;
+    // Sanity: still hard-skipped while status is authorization_required.
+    assert!(!replica_due(&cal, NOW_UNIX));
+
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::new();
+    let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+    let oauth = oauth_config();
+
+    let report = pollster::block_on(run_fallback_cron(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &watches,
+        &tokens,
+        &oauth,
+        None,
+        NOW_UNIX,
+    ));
+
+    assert_eq!(report.synced, 1, "auth_required calendar recovered: {:?}", report.errors);
+    assert_eq!(
+        report.published,
+        vec![("u-1".to_string(), "cal-1".to_string())]
+    );
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].sync_status, "ready");
+    assert!(stored[0].last_error_code.is_empty());
+    assert_eq!(stored[0].failure_streak, 0);
+    assert!(stored[0].initial_sync_complete);
+}
+
+// ──────────────────────────────────────────
 // replica_due / dirty-generation cron
 // ──────────────────────────────────────────
 
@@ -401,7 +515,7 @@ fn replica_due_matrix() {
     cal.dirty_requested_generation = 0;
     cal.dirty_applied_generation = 0;
     cal.last_success_at = Some(twenty_min_ago.clone());
-    cal.next_retry_at = Some(future_retry);
+    cal.next_retry_at = Some(future_retry.clone());
     assert!(!replica_due(&cal, now), "future backoff blocks even stale");
 
     // next_retry_at in the past + last_success 1m ago + not dirty → due
@@ -412,8 +526,35 @@ fn replica_due_matrix() {
     // full_sync_requested + last_success 1m ago + not dirty → due
     cal.next_retry_at = None;
     cal.full_sync_requested = true;
-    cal.last_success_at = Some(one_min_ago);
+    cal.last_success_at = Some(one_min_ago.clone());
     assert!(replica_due(&cal, now), "full_sync_requested forces due");
+
+    // full_sync_requested + future next_retry_at + fresh last_success + not dirty
+    // → due (reseed wins over backoff; isolate death mid-410 recovery)
+    cal.next_retry_at = Some(future_retry.clone());
+    cal.last_success_at = Some(one_min_ago.clone());
+    cal.dirty_requested_generation = 0;
+    cal.dirty_applied_generation = 0;
+    cal.full_sync_requested = true;
+    assert!(
+        replica_due(&cal, now),
+        "full_sync_requested wins over future backoff"
+    );
+
+    // full_sync_requested + authorization_required → still not due
+    cal.sync_status = "authorization_required".to_string();
+    assert!(
+        !replica_due(&cal, now),
+        "auth_required still hard-skips even with full_sync_requested"
+    );
+
+    // full_sync_requested + freeBusyReader → still not due
+    cal.sync_status = String::new();
+    cal.access_role = "freeBusyReader".to_string();
+    assert!(
+        !replica_due(&cal, now),
+        "freeBusyReader still hard-skips even with full_sync_requested"
+    );
 
     // freeBusyReader + dirty + last_success 20m ago → not due
     cal.full_sync_requested = false;
@@ -575,5 +716,90 @@ fn cron_failure_leaves_dirty_other_calendars_progress_and_lease_busy_not_publish
         !gets.iter().any(|u| u.contains("tertiary")),
         "LeaseBusy must not fetch: {:?}",
         gets
+    );
+}
+
+#[test]
+fn cron_poison_on_one_calendar_siblings_still_sync() {
+    // cal-a: due, invalid page JSON → mapping_poison + quarantine + degraded
+    // cal-b: due, valid EVENTS_JSON → publishes; complete coverage, no quarantine
+    let http = FakeHttp::new(vec![
+        ("primary%40example.com/events", 200, "not-json{{{"),
+        ("secondary%40example.com/events", 200, EVENTS_JSON),
+    ]);
+    let mut cal_a = calendar("cal-a", "primary@example.com", true);
+    cal_a.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+    cal_a.dirty_requested_generation = 2;
+    cal_a.dirty_applied_generation = 0;
+    let mut cal_b = calendar("cal-b", "secondary@example.com", true);
+    cal_b.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+    cal_b.dirty_requested_generation = 1;
+    cal_b.dirty_applied_generation = 0;
+    let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::new();
+    let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+    let oauth = oauth_config();
+
+    let report = pollster::block_on(run_fallback_cron(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &watches,
+        &tokens,
+        &oauth,
+        None,
+        NOW_UNIX,
+    ));
+
+    assert_eq!(report.synced, 1);
+    assert_eq!(
+        report.published,
+        vec![("u-1".to_string(), "cal-b".to_string())]
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0].contains("cal-a"),
+        "{:?}",
+        report.errors
+    );
+
+    let stored = calendars.stored.lock().unwrap();
+    let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+    assert!(a.sync_token.is_empty(), "poison must not advance token");
+    assert_eq!(a.last_error_code, "mapping_poison");
+    assert_eq!(a.sync_status, "retrying");
+    assert_eq!(a.event_coverage, "degraded");
+    assert_eq!(a.dirty_applied_generation, 0);
+
+    let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
+    assert_eq!(b.sync_token, "st-9");
+    assert_eq!(b.event_coverage, "complete");
+    assert!(b.last_error_code.is_empty());
+    assert_eq!(b.dirty_applied_generation, 1);
+    drop(stored);
+
+    let q = events.quarantine.lock().unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].calendar_id, "cal-a");
+    assert_eq!(q[0].phase, "replica_page");
+    assert_eq!(q[0].error_class, "mapping_poison");
+    assert!(q[0].replay_payload.contains("not-json{{{"));
+    assert!(
+        !q.iter().any(|r| r.calendar_id == "cal-b"),
+        "sibling must not be quarantined"
+    );
+
+    // No hot-loop on the poison calendar: one events.list GET for primary.
+    let gets = http.gets.lock().unwrap();
+    let primary_gets: Vec<_> = gets
+        .iter()
+        .filter(|u| u.contains("primary") && u.contains("/events"))
+        .collect();
+    assert_eq!(
+        primary_gets.len(),
+        1,
+        "poison must not hot-loop: {gets:?}"
     );
 }

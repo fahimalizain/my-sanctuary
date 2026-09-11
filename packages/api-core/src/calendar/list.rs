@@ -1,5 +1,8 @@
 use super::catalog::refresh_calendar_list;
-use super::sync::{events_sync_envelope, EventsSyncEnvelope};
+use super::cron::stamp_auth_revoked_for_user;
+use super::sync::{
+    classify_watch_coverage, events_sync_envelope, refresh_watch_coverage, EventsSyncEnvelope,
+};
 use super::watch::{ensure_watch, is_public_https_callback, stop_watches_for_calendar};
 use super::window::fetch_and_apply_window;
 use super::CalendarError;
@@ -7,7 +10,7 @@ use crate::models::CalendarEvent;
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventRepo, CalendarRepo, WatchChannelRepo};
 use crate::time::{add_months_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
-use crate::token::GoogleAccess;
+use crate::token::{is_refresh_auth_revoked, GoogleAccess, TokenError};
 
 /// Result of [`list_events`]: the cached (and/or window) events, per-calendar
 /// sync errors for the caller to log (failures never fail the whole listing),
@@ -129,6 +132,21 @@ pub async fn list_events(
                             cal.id
                         ));
                     }
+                    // Best-effort: stamp missing / leftover coverage after stop.
+                    if let Err(err) = refresh_watch_coverage(
+                        calendars,
+                        watches,
+                        &cal.id,
+                        now_unix,
+                        &now_rfc3339,
+                    )
+                    .await
+                    {
+                        sync_errors.push(format!(
+                            "failed to refresh watch coverage for calendar {}: {err}",
+                            cal.id
+                        ));
+                    }
                     continue;
                 }
                 Err(err) => {
@@ -200,6 +218,20 @@ pub async fn list_events(
                         cal.id
                     ));
                 }
+                if let Err(err) = refresh_watch_coverage(
+                    calendars,
+                    watches,
+                    &cal.id,
+                    now_unix,
+                    &now_rfc3339,
+                )
+                .await
+                {
+                    sync_errors.push(format!(
+                        "failed to refresh watch coverage for calendar {}: {err}",
+                        cal.id
+                    ));
+                }
             }
             Err(err) => sync_errors.push(format!(
                 "window fetch failed for calendar {} ({}): {err}",
@@ -219,10 +251,36 @@ pub async fn list_events(
     // from this request. On re-read failure, fall back to the in-memory
     // snapshot from the start of the request. Window path must not flip
     // ready / initial_sync_complete / sync_token.
-    let fresh = match calendars.list_by_user_id(user_id).await {
+    let mut fresh = match calendars.list_by_user_id(user_id).await {
         Ok(rows) => rows,
         Err(_) => cals,
     };
+    // Stamp sanitized watch coverage from live channel rows so GET is accurate
+    // after deploy (column defaults to `missing`). Best-effort persist; always
+    // stamp the in-memory row so the envelope is correct even if D1 write fails.
+    for cal in &mut fresh {
+        let channels = match watches.list_by_calendar_id(&cal.id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                sync_errors.push(format!(
+                    "failed to list watch channels for calendar {}: {err}",
+                    cal.id
+                ));
+                continue;
+            }
+        };
+        let coverage = classify_watch_coverage(&channels, now_unix);
+        cal.watch_coverage = coverage.as_str().to_string();
+        if let Err(err) = calendars
+            .set_watch_coverage(&cal.id, coverage.as_str(), &now_rfc3339)
+            .await
+        {
+            sync_errors.push(format!(
+                "failed to persist watch coverage for calendar {}: {err}",
+                cal.id
+            ));
+        }
+    }
     let sync = events_sync_envelope(&fresh, now_unix);
 
     let source = match (window_fetched, cache_only_initialized) {
@@ -237,6 +295,53 @@ pub async fn list_events(
         sync_errors,
         sync,
         source,
+    })
+}
+
+/// Serve cached events after a Google token refresh failure.
+///
+/// No Google HTTP, no access token. On a revoked grant
+/// ([`is_refresh_auth_revoked`]) stamps `authorization_required` on the
+/// user's sync-enabled calendars; on [`TokenError::NoToken`] /
+/// [`TokenError::NoRefreshToken`] serves cache without flipping health.
+/// Stamp failures are collected in `sync_errors` and never fail the listing.
+/// `source` is always `"cache"`.
+pub async fn list_events_after_refresh_failure(
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    user_id: &str,
+    start_rfc3339: &str,
+    end_rfc3339: &str,
+    now_unix: i64,
+    refresh_err: &TokenError,
+) -> Result<CalendarListOutput, CalendarError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let mut sync_errors: Vec<String> = Vec::new();
+
+    if is_refresh_auth_revoked(refresh_err) {
+        sync_errors.extend(
+            stamp_auth_revoked_for_user(calendars, user_id, now_unix, &now_rfc3339).await,
+        );
+    }
+
+    // Post-stamp snapshot for the envelope fallback.
+    let cals = calendars.list_by_user_id(user_id).await?;
+
+    let cached = events
+        .list_by_user_id_and_time_range(user_id, start_rfc3339, end_rfc3339)
+        .await?;
+
+    let fresh = match calendars.list_by_user_id(user_id).await {
+        Ok(rows) => rows,
+        Err(_) => cals,
+    };
+    let sync = events_sync_envelope(&fresh, now_unix);
+
+    Ok(CalendarListOutput {
+        events: cached,
+        sync_errors,
+        sync,
+        source: "cache".to_string(),
     })
 }
 

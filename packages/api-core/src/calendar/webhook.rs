@@ -28,8 +28,9 @@ pub enum WebhookDecision {
 /// Result of applying a [`WebhookDecision`] to D1 (dirty bump or disable).
 ///
 /// Only [`DirtyAccepted`] and [`GoneDisabled`] mean durable work landed.
-/// Persist failures must **not** be described as accepted work — cron recovers
-/// lost `wait_until`, not a failed dirty write that never happened.
+/// Persist failures must **not** be described as accepted work — the Worker
+/// no longer runs a background replica; cron is the contract for dirty
+/// recovery, not a failed dirty write that never happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebhookPersistResult {
     /// Decision was [`WebhookDecision::Ignore`]; no repo writes.

@@ -8,8 +8,11 @@
 //!
 //! Used by [`crate::calendar::list_events`] for never-initialized calendars so
 //! first paint is not blocked on the replica token. Write-through reuses
-//! [`classify_replica_item`]; on lease miss the live window is still returned
-//! ephemerally (no D1 write).
+//! [`classify_replica_item`] and applies via the same lease-fenced
+//! `*_if_owner` methods as replica (gated on `google_calendars.lease_owner` /
+//! expiry). On lease miss at acquire — or mid-window fence loss — the live
+//! window is still returned ephemerally when no write-through ran (no D1
+//! write); a mid-window steal/expire stops write-through without erroring.
 
 use url::Url;
 
@@ -122,9 +125,20 @@ async fn fetch_pages(
             for item in &items {
                 match classify_replica_item(item, &cal.id, now_rfc3339) {
                     ReplicaApplyAction::SoftDelete { google_event_id } => {
-                        events
-                            .delete_by_google_event_id(&cal.id, &google_event_id, now_rfc3339)
+                        let deleted = events
+                            .delete_by_google_event_id_if_owner(
+                                &cal.id,
+                                &google_event_id,
+                                lease_owner,
+                                now_rfc3339,
+                            )
                             .await?;
+                        if !deleted {
+                            // Lost lease mid-window: stop write-through without
+                            // erroring (not a listing failure). Prefer what is
+                            // already in D1 over half-ephemeral pages.
+                            return Ok(Vec::new());
+                        }
                     }
                     ReplicaApplyAction::Upsert(row) => {
                         to_upsert.push(row);
@@ -132,7 +146,12 @@ async fn fetch_pages(
                 }
             }
             if !to_upsert.is_empty() {
-                events.upsert_batch(to_upsert, now_rfc3339).await?;
+                let applied = events
+                    .upsert_batch_if_owner(to_upsert, lease_owner, now_rfc3339)
+                    .await?;
+                if !applied {
+                    return Ok(Vec::new());
+                }
             }
             let renew_expires = lease_expires_at(now_rfc3339);
             let renewed = calendars

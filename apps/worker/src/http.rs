@@ -33,7 +33,14 @@ impl api_core::HttpClient for WorkerHttp {
         let status = response.status_code();
         let bytes = response.bytes().await.map_err(http_err)?;
         if !(200..300).contains(&status) {
-            return Err(HttpError::Message(format!("POST {url} returned {status}")));
+            // Include a truncated body snippet so token-endpoint
+            // `{"error":"invalid_grant"}` is visible to
+            // `is_refresh_auth_revoked`. Never include the request form
+            // (refresh_token / client_secret).
+            let snippet: String = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+            return Err(HttpError::Message(format!(
+                "POST {url} returned {status}: {snippet}"
+            )));
         }
         Ok(bytes)
     }

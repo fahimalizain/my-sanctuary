@@ -17,6 +17,8 @@ export type SyncHealthBanner = {
   showRetry: boolean;
   showReconnect: boolean;
   calendarName?: string;
+  /** Featured health row's calendar_id when the banner names one calendar. */
+  calendarId?: string;
   state?: CalendarSyncHealth['state'];
   errorCode?: string | null;
   retryAfterSeconds?: number | null;
@@ -70,6 +72,7 @@ function withFeatured(
     showRetry,
     showReconnect,
     calendarName,
+    calendarId: health.calendar_id,
     state: health.state,
     errorCode: health.error_code,
     retryAfterSeconds: health.retry_after_seconds,
@@ -77,7 +80,18 @@ function withFeatured(
   };
 }
 
+/** Calendar to POST /repair for this banner, or null (refetch only). */
+export function repairTargetCalendarId(
+  banner: SyncHealthBanner,
+): string | null {
+  if (banner.kind === 'degraded' && banner.calendarId) return banner.calendarId;
+  return null;
+}
+
 function degradedMessage(name: string, health: CalendarSyncHealth): string {
+  if (health.error_code === 'lost_lease') {
+    return `${name} is waiting on another sync and will retry automatically`;
+  }
   let base: string;
   if (health.state === 'retrying') {
     base = `${name} is retrying`;

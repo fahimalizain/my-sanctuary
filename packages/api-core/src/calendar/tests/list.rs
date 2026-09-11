@@ -1,5 +1,11 @@
 use super::support::*;
-use crate::calendar::{list_events, parse_event_time_range, sync_calendar};
+use crate::calendar::{
+    list_events, list_events_after_refresh_failure, parse_event_time_range, sync_calendar,
+};
+use crate::calendar::window::fetch_and_apply_window;
+use crate::oauth::HttpError;
+use crate::repo::CalendarEventRepo;
+use crate::token::TokenError;
 
 // ──────────────────────────────────────────
 // parse_event_time_range
@@ -204,8 +210,9 @@ fn calendar_get_without_label_properties_stores_empty_array() {
 
 #[test]
 fn sync_skips_calendars_get_when_label_cache_is_filled() {
-    // Both variants of a filled cache — `"[]"` (fetched, no labels) and a
-    // non-empty JSON array — must skip the `calendars.get` backfill.
+    // Both variants of a filled *fresh* cache — `"[]"` (fetched, no labels)
+    // and a non-empty JSON array — must skip the `calendars.get` backfill.
+    // `calendar()` stamps a fresh `event_labels_updated_at`.
     let mut empty_labels = calendar("cal-1", "primary@example.com", true);
     empty_labels.event_labels = "[]".to_string();
     let mut filled_labels = calendar("cal-2", "work@example.com", true);
@@ -235,6 +242,51 @@ fn sync_skips_calendars_get_when_label_cache_is_filled() {
         calendars.label_updates.lock().unwrap().is_empty(),
         "no label writes"
     );
+}
+
+#[test]
+fn sync_refreshes_stale_label_cache() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.event_labels = r##"[{"id":"old","backgroundColor":"#616161"}]"##.to_string();
+    cal.event_labels_updated_at = Some("2020-01-01T00:00:00Z".to_string());
+
+    let labels_body = r##"{"labelProperties":{"eventLabels":[
+        {"id":"new","backgroundColor":"#ac725e"}
+    ]}}"##;
+    let http = FakeHttp::new(vec![
+        ("/events", 200, EVENTS_JSON),
+        ("/calendars/", 200, labels_body),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    let now = "2023-11-14T22:13:20Z";
+
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        now,
+    ))
+    .unwrap();
+
+    let gets = http.gets.lock().unwrap();
+    assert!(
+        gets.iter()
+            .any(|url| url.contains("/calendars/primary%40example.com") && !url.contains("/events")),
+        "stale cache must trigger bare calendars.get: {gets:?}"
+    );
+    assert!(
+        gets.iter().any(|url| url.contains("/events")),
+        "events.list still runs: {gets:?}"
+    );
+
+    let expected = r##"[{"id":"new","backgroundColor":"#ac725e"}]"##;
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].event_labels, expected);
+    assert_eq!(stored[0].event_labels_updated_at.as_deref(), Some(now));
 }
 
 #[test]
@@ -686,9 +738,12 @@ fn window_cancelled_event_delete_failure_does_not_advance_sync_token() {
     ))
     .unwrap();
 
-    assert_eq!(
-        *events.deleted_by_google_event_id.lock().unwrap(),
-        vec![("cal-1".to_string(), "cancelled".to_string())]
+    // Fenced delete path records only after a successful delete; fail_delete
+    // returns Err without pushing. Attempt still failed and aborted apply.
+    assert!(
+        events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+        "failed fenced delete is not recorded: {:?}",
+        events.deleted_by_google_event_id.lock().unwrap()
     );
     // Delete failure aborts the window apply: no upsert of the living
     // sibling, token must not advance (window never publishes anyway).
@@ -715,6 +770,196 @@ fn window_cancelled_event_delete_failure_does_not_advance_sync_token() {
 }
 
 #[test]
+fn window_steal_before_first_upsert_writes_nothing() {
+    // Two-page window; steal lease on the 1st fenced apply (page-1 upserts).
+    // Loser must not write page-1 or page-2 and must not publish a token.
+    let page_one = r#"{"items":[{"id":"p1","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+    let page_two = r#"{"items":[{"id":"p2","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-page"}"#;
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((1, "thief".to_string(), Some("2099-01-01T00:00:00Z".to_string())));
+    let http = FakeHttp::new(vec![
+        ("pageToken=tok-2", 200, page_two),
+        ("/events", 200, page_one),
+    ]);
+
+    let result = pollster::block_on(fetch_and_apply_window(
+        &http,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        result.unwrap().is_empty(),
+        "mid-window steal stops write-through with empty return"
+    );
+    assert!(
+        events.upserted_batch.lock().unwrap().is_empty(),
+        "no page-1 or page-2 upserts: {:?}",
+        events.upserted_batch.lock().unwrap()
+    );
+    assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+    assert!(calendars.sync_states.lock().unwrap().is_empty());
+    assert!(!calendars.stored.lock().unwrap()[0].initial_sync_complete);
+}
+
+#[test]
+fn window_expire_before_tombstone_leaves_row_living() {
+    // Cancelled + living on one page; expire lease on the 1st fenced apply
+    // (the tombstone). Cancelled row stays living; sibling not upserted.
+    let body = r#"{"items":[
+        {"id":"cancelled","status":"cancelled",
+         "start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"living","summary":"Keep",
+         "start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}
+    ],"nextSyncToken":"st-win"}"#;
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-cancel", "cal-1", "cancelled", ""));
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((1, "loser".to_string(), Some("2020-01-01T00:00:00Z".to_string())));
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+
+    let result = pollster::block_on(fetch_and_apply_window(
+        &http,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(result.is_ok(), "{result:?}");
+    assert!(result.unwrap().is_empty());
+    let stored_events = events.stored.lock().unwrap();
+    let cancelled = stored_events
+        .iter()
+        .find(|e| e.google_event_id == "cancelled")
+        .expect("cancelled seed");
+    assert!(
+        cancelled.deleted_at.is_none(),
+        "tombstone must not apply after lease expire"
+    );
+    assert!(
+        events.upserted_batch.lock().unwrap().is_empty(),
+        "living sibling must not upsert: {:?}",
+        events.upserted_batch.lock().unwrap()
+    );
+    assert!(
+        events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+        "delete must not be recorded: {:?}",
+        events.deleted_by_google_event_id.lock().unwrap()
+    );
+    assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+}
+
+#[test]
+fn window_winner_after_expired_loser_can_write_through() {
+    // After expire inject fails the loser, clear the hook and re-run: expired
+    // foreign lease is stealable; winner write-throughs but never publishes.
+    let body = r#"{"items":[
+        {"id":"cancelled","status":"cancelled",
+         "start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"living","summary":"Keep",
+         "start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}
+    ],"nextSyncToken":"st-win"}"#;
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-cancel", "cal-1", "cancelled", ""));
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((1, "loser".to_string(), Some("2020-01-01T00:00:00Z".to_string())));
+
+    let http_lose = FakeHttp::new(vec![("/events", 200, body)]);
+    let lose = pollster::block_on(fetch_and_apply_window(
+        &http_lose,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(lose.is_ok(), "{lose:?}");
+    assert!(lose.unwrap().is_empty());
+    assert!(events.upserted_batch.lock().unwrap().is_empty());
+    assert!(
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.google_event_id == "cancelled")
+            .unwrap()
+            .deleted_at
+            .is_none()
+    );
+
+    // Clear inject; lease remains expired foreign — stealable on next window.
+    *events.inject_lease_before_fenced_apply.lock().unwrap() = None;
+    let http_win = FakeHttp::new(vec![("/events", 200, body)]);
+    let win = pollster::block_on(fetch_and_apply_window(
+        &http_win,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(win.is_ok(), "{win:?}");
+    assert!(win.unwrap().is_empty(), "write-through returns empty vec");
+
+    let stored_events = events.stored.lock().unwrap();
+    let cancelled = stored_events
+        .iter()
+        .find(|e| e.google_event_id == "cancelled")
+        .expect("cancelled");
+    assert!(
+        cancelled.deleted_at.is_some(),
+        "winner tombstones cancelled row"
+    );
+    assert!(
+        events
+            .upserted_batch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "living"),
+        "living id in upserted_batch: {:?}",
+        events.upserted_batch.lock().unwrap()
+    );
+    assert!(
+        calendars.stored.lock().unwrap()[0].sync_token.is_empty(),
+        "window never publishes sync_token"
+    );
+    assert!(!calendars.stored.lock().unwrap()[0].initial_sync_complete);
+    assert!(calendars.sync_states.lock().unwrap().is_empty());
+}
+
+#[test]
 fn sync_error_does_not_fail_the_whole_listing() {
     let http = FakeHttp::new(vec![("/events", 500, "")]);
     let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
@@ -736,4 +981,345 @@ fn sync_error_does_not_fail_the_whole_listing() {
         calendars.stored.lock().unwrap()[0].dirty_requested_generation,
         1
     );
+}
+
+// ──────────────────────────────────────────
+// list_events_after_refresh_failure
+// ──────────────────────────────────────────
+
+fn ready_synced_calendar(id: &str, google_cal_id: &str, sync_enabled: bool) -> crate::models::GoogleCalendar {
+    let mut cal = calendar(id, google_cal_id, sync_enabled);
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    cal.sync_status = "ready".to_string();
+    cal.sync_token = "cursor-secret-xyz".to_string();
+    cal
+}
+
+#[test]
+fn refresh_failure_revoked_grant_serves_cache_and_stamps_auth_required() {
+    let enabled = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let success_before = enabled.last_success_at.clone();
+    let token_before = enabled.sync_token.clone();
+
+    let calendars = FakeCalendarRepo::with(vec![enabled, disabled]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let refresh_err = TokenError::Http(HttpError::Message(
+        "POST https://oauth2.googleapis.com/token returned 400: {\"error\":\"invalid_grant\"}"
+            .into(),
+    ));
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.events.len(), 1);
+    assert_eq!(output.events[0].id, "evt-local-1");
+    assert_eq!(output.events[0].title, "Standup");
+    assert_eq!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    let enabled_view = output
+        .sync
+        .calendars
+        .iter()
+        .find(|c| c.calendar_id == "cal-1")
+        .expect("enabled calendar in envelope");
+    assert_eq!(
+        enabled_view.state,
+        crate::calendar_sync::CalendarReplicaState::AuthorizationRequired
+    );
+    assert_eq!(enabled_view.error_code.as_deref(), Some("auth_revoked"));
+
+    let stored = calendars.stored.lock().unwrap();
+    let cal1 = stored.iter().find(|c| c.id == "cal-1").unwrap();
+    assert_eq!(cal1.sync_status, "authorization_required");
+    assert_eq!(cal1.last_error_code, "auth_revoked");
+    assert_eq!(cal1.sync_token, token_before, "cursor must not move");
+    assert_eq!(cal1.last_success_at, success_before, "success must not move");
+    let cal_disabled = stored.iter().find(|c| c.id == "cal-disabled").unwrap();
+    assert_ne!(
+        cal_disabled.sync_status, "authorization_required",
+        "disabled calendars are not stamped"
+    );
+    assert_eq!(cal_disabled.sync_status, "ready");
+
+    let json = serde_json::to_string(&output.sync).unwrap();
+    assert!(!json.contains("cursor-secret-xyz"), "{json}");
+    assert!(!json.contains("invalid_grant"), "{json}");
+    assert!(!json.contains("access_token"), "{json}");
+    assert!(!json.contains("raw_json"), "{json}");
+    assert!(!json.contains("ya29."), "{json}");
+}
+
+#[test]
+fn refresh_failure_no_token_does_not_stamp() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &TokenError::NoToken,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.events.len(), 1);
+    assert_ne!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::Ready
+    );
+    assert_ne!(
+        calendars.stored.lock().unwrap()[0].sync_status,
+        "authorization_required"
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_status, "ready");
+}
+
+#[test]
+fn refresh_failure_bare_400_does_not_stamp_auth_required() {
+    // Bare token-endpoint 400 without invalid_grant is transient — health stays ready.
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let refresh_err = TokenError::Http(HttpError::Message(
+        "POST https://oauth2.googleapis.com/token returned 400".into(),
+    ));
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_ne!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::Ready
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_status, "ready");
+}
+
+#[test]
+fn refresh_failure_no_refresh_token_does_not_stamp() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &TokenError::NoRefreshToken,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.events.len(), 1);
+    assert_ne!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].sync_status,
+        "ready"
+    );
+}
+
+#[test]
+fn refresh_failure_revoked_grant_empty_cache_still_ok() {
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+
+    let refresh_err = TokenError::Http(HttpError::Message("invalid_grant".into()));
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert!(output.events.is_empty());
+    assert_eq!(output.source, "cache");
+    assert_eq!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].error_code.as_deref(),
+        Some("auth_revoked")
+    );
+}
+
+// ──────────────────────────────────────────
+// Living + sync-enabled parent filter (issue #54)
+// ──────────────────────────────────────────
+
+#[test]
+fn list_events_omits_events_from_disabled_and_soft_deleted_parents() {
+    let live = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let mut deleted = ready_synced_calendar("cal-deleted", "deleted@example.com", true);
+    deleted.deleted_at = Some("2023-11-14T20:00:00Z".to_string());
+
+    let calendars = FakeCalendarRepo::with(vec![live.clone(), disabled.clone(), deleted.clone()]);
+    let events = FakeEventRepo::new();
+    *events.parent_calendars.lock().unwrap() = vec![live, disabled, deleted];
+    events.stored.lock().unwrap().extend([
+        seeded_event("evt-live", "cal-1", "live", ""),
+        seeded_event("evt-off", "cal-disabled", "hidden-disabled", ""),
+        seeded_event("evt-del", "cal-deleted", "hidden-deleted", ""),
+    ]);
+
+    let http = FakeHttp::new(vec![]);
+    let watches = FakeWatchChannelRepo::new();
+    let output = pollster::block_on(list_events(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(output.events.len(), 1, "{:?}", output.events);
+    assert_eq!(output.events[0].id, "evt-live");
+
+    let disabled_view = output
+        .sync
+        .calendars
+        .iter()
+        .find(|c| c.calendar_id == "cal-disabled")
+        .expect("disabled calendar still in envelope");
+    assert_eq!(
+        disabled_view.state,
+        crate::calendar_sync::CalendarReplicaState::Disabled
+    );
+    assert!(
+        output
+            .sync
+            .calendars
+            .iter()
+            .all(|c| c.calendar_id != "cal-deleted"),
+        "soft-deleted parent must not appear in envelope: {:?}",
+        output.sync.calendars
+    );
+    assert!(http.gets.lock().unwrap().is_empty(), "cache-only ready calendars");
+}
+
+#[test]
+fn list_by_user_id_and_time_range_hides_non_living_parents() {
+    let live = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let mut deleted = ready_synced_calendar("cal-deleted", "deleted@example.com", true);
+    deleted.deleted_at = Some("2023-11-14T20:00:00Z".to_string());
+    let other_user = calendar_for_user("other-user", "cal-other", "other@example.com", true);
+
+    let events = FakeEventRepo::new();
+    *events.parent_calendars.lock().unwrap() =
+        vec![live, disabled, deleted, other_user];
+    events.stored.lock().unwrap().extend([
+        seeded_event("evt-live", "cal-1", "live", ""),
+        seeded_event("evt-off", "cal-disabled", "hidden-disabled", ""),
+        seeded_event("evt-del", "cal-deleted", "hidden-deleted", ""),
+        seeded_event("evt-other", "cal-other", "other-user-event", ""),
+    ]);
+
+    let rows = pollster::block_on(events.list_by_user_id_and_time_range(
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+    ))
+    .unwrap();
+
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, "evt-live");
+}
+
+#[test]
+fn list_running_by_user_id_hides_disabled_parent() {
+    let live = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+
+    let events = FakeEventRepo::new();
+    *events.parent_calendars.lock().unwrap() = vec![live, disabled];
+    events.stored.lock().unwrap().extend([
+        seeded_event("evt-live", "cal-1", "running-live", "task-1"),
+        seeded_event("evt-off", "cal-disabled", "running-off", "task-2"),
+    ]);
+
+    // seeded_event windows are 2026-08-18T09:00–09:30.
+    let rows = pollster::block_on(events.list_running_by_user_id("u-1", "2026-08-18T09:15:00Z"))
+        .unwrap();
+
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, "evt-live");
+    assert_eq!(rows[0].task_id, "task-1");
 }
