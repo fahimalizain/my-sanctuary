@@ -24,6 +24,7 @@ const sync: CalendarEventsSync = {
       retry_after_seconds: 60,
       projection: 'timed_masters_and_exceptions',
       cache_revision: 3,
+      watch_coverage: 'missing',
     },
   ],
 };

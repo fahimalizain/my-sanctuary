@@ -4378,6 +4378,7 @@ mod tests {
             lease_expires_at: None,
             cache_revision: 0,
             projection: "timed_masters_and_exceptions".to_string(),
+            watch_coverage: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4501,6 +4502,14 @@ mod tests {
             Ok(())
         }
 
+        async fn begin_replica_reseed(
+            &self,
+            _id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn try_acquire_lease(
             &self,
             _id: &str,
@@ -4569,6 +4578,15 @@ mod tests {
                 cal.event_labels = event_labels_json.to_string();
                 cal.event_labels_updated_at = Some(now_rfc3339.to_string());
             }
+            Ok(())
+        }
+
+        async fn set_watch_coverage(
+            &self,
+            _id: &str,
+            _coverage: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
             Ok(())
         }
 

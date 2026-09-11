@@ -1,5 +1,5 @@
 use super::labels::ensure_event_labels;
-use super::sync::SyncErrorCode;
+use super::sync::{refresh_watch_coverage, SyncErrorCode};
 use super::watch::stop_watches_for_calendar;
 use super::cron::{persist_sync_failure, stamp_auth_revoked_for_user};
 use super::{
@@ -168,6 +168,15 @@ pub(crate) async fn refresh_calendar_list(
                         // Best-effort stop: calendar is already disabled. A
                         // failed stop leaves channel rows for slice-4 retry.
                         let _ = stop_watches_for_calendar(http, w, access, &cal.id).await;
+                        let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
+                        let _ = refresh_watch_coverage(
+                            calendars,
+                            w,
+                            &cal.id,
+                            now_unix,
+                            now_rfc3339,
+                        )
+                        .await;
                     }
                 }
                 seen_google_ids.insert(item.id);
@@ -231,6 +240,15 @@ pub(crate) async fn refresh_calendar_list(
                     calendars.delete(&cal.id, now_rfc3339).await?;
                     if let Some(w) = watches {
                         let _ = stop_watches_for_calendar(http, w, access, &cal.id).await;
+                        let now_unix = rfc3339_to_unix_secs(now_rfc3339).unwrap_or(0);
+                        let _ = refresh_watch_coverage(
+                            calendars,
+                            w,
+                            &cal.id,
+                            now_unix,
+                            now_rfc3339,
+                        )
+                        .await;
                     }
                 }
             }

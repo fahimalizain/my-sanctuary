@@ -12,8 +12,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::CalendarError;
-use crate::models::GoogleCalendar;
+use super::{CalendarError, WATCH_RENEW_HORIZON_SECS};
+use crate::models::{GoogleCalendar, WatchChannel};
+use crate::repo::{CalendarRepo, WatchChannelRepo};
 use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 
 /// A calendar with no valid success newer than this many seconds is `stale`
@@ -157,6 +158,53 @@ pub struct EventsSyncEnvelope {
     pub calendars: Vec<CalendarSyncView>,
 }
 
+/// Sanitized watch-channel coverage for one calendar.
+///
+/// Derived from `google_calendars_watch_channels` rows; never a channel token,
+/// resource id, or channel id. Stored on `google_calendars.watch_coverage` and
+/// exposed on the GET events sync envelope so a healthy watch is distinguishable
+/// from a healthy replica. Does **not** feed [`aggregate_sync_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchCoverage {
+    /// No channel rows for the calendar.
+    Missing,
+    /// At least one live channel, but none covers `WATCH_RENEW_HORIZON_SECS`.
+    Expiring,
+    /// Channel rows exist but all are already expired (no live successor).
+    NoSuccessor,
+    /// At least one channel expires after `now + WATCH_RENEW_HORIZON_SECS`.
+    Covered,
+}
+
+impl WatchCoverage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Expiring => "expiring",
+            Self::NoSuccessor => "no_successor",
+            Self::Covered => "covered",
+        }
+    }
+
+    /// Parse a stored `watch_coverage` string. Unknown / empty → [`Self::Missing`].
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "missing" => Self::Missing,
+            "expiring" => Self::Expiring,
+            "no_successor" => Self::NoSuccessor,
+            "covered" => Self::Covered,
+            _ => Self::Missing,
+        }
+    }
+}
+
+impl fmt::Display for WatchCoverage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Per-calendar sanitized health row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarSyncView {
@@ -172,6 +220,8 @@ pub struct CalendarSyncView {
     pub retry_after_seconds: Option<i64>,
     pub projection: String,
     pub cache_revision: i64,
+    /// Sanitized watch coverage; never channel secrets.
+    pub watch_coverage: WatchCoverage,
 }
 
 /// SHA-256 hex (64 lowercase chars) of the canonical replica query string
@@ -226,10 +276,17 @@ fn status_from_returned_message(msg: &str) -> Option<u16> {
 
 /// Replica state to persist after a classified failure.
 ///
-/// Does **not** auto-flip to `rebuilding` and does not reset the sync token.
+/// - `AuthRevoked` → `authorization_required`
+/// - `Gone` → `rebuilding` (diagnosed 410 that could not finish in-process;
+///   next action is still merge-full; `full_sync_requested` should already be
+///   durable from [`CalendarRepo::begin_replica_reseed`])
+/// - everything else → `retrying`
+///
+/// Does **not** reset the sync token.
 pub fn replica_state_for_error(code: SyncErrorCode) -> CalendarReplicaState {
     match code {
         SyncErrorCode::AuthRevoked => CalendarReplicaState::AuthorizationRequired,
+        SyncErrorCode::Gone => CalendarReplicaState::Rebuilding,
         _ => CalendarReplicaState::Retrying,
     }
 }
@@ -275,6 +332,53 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
+}
+
+/// Classify watch coverage from stored channel rows.
+///
+/// Uses the same lexicographic RFC 3339 compare as
+/// [`crate::calendar::renew_watch_if_needed`]:
+/// - empty → [`WatchCoverage::Missing`]
+/// - any `expiration > now + WATCH_RENEW_HORIZON_SECS` → [`WatchCoverage::Covered`]
+/// - else any `expiration > now` → [`WatchCoverage::Expiring`]
+/// - else (rows exist, all expired) → [`WatchCoverage::NoSuccessor`]
+///
+/// Input may contain channel tokens / resource ids; the returned enum and
+/// [`WatchCoverage::as_str`] never embed those strings.
+pub fn classify_watch_coverage(channels: &[WatchChannel], now_unix: i64) -> WatchCoverage {
+    if channels.is_empty() {
+        return WatchCoverage::Missing;
+    }
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let horizon = unix_secs_to_rfc3339(now_unix + WATCH_RENEW_HORIZON_SECS);
+    // RFC 3339 UTC strings of this shape compare lexicographically.
+    if channels.iter().any(|ch| ch.expiration.as_str() > horizon.as_str()) {
+        return WatchCoverage::Covered;
+    }
+    if channels.iter().any(|ch| ch.expiration.as_str() > now_rfc3339.as_str()) {
+        return WatchCoverage::Expiring;
+    }
+    WatchCoverage::NoSuccessor
+}
+
+/// List channels for `calendar_id`, classify, and persist the sanitized value.
+///
+/// Best-effort callers should log errors and still stamp the in-memory row
+/// when classification succeeds before persist fails. Uses per-calendar
+/// `list_by_calendar_id` — never `list_all` (cross-tenant).
+pub async fn refresh_watch_coverage(
+    calendars: &dyn CalendarRepo,
+    watches: &dyn WatchChannelRepo,
+    calendar_id: &str,
+    now_unix: i64,
+    now_rfc3339: &str,
+) -> Result<WatchCoverage, CalendarError> {
+    let channels = watches.list_by_calendar_id(calendar_id).await?;
+    let coverage = classify_watch_coverage(&channels, now_unix);
+    calendars
+        .set_watch_coverage(calendar_id, coverage.as_str(), now_rfc3339)
+        .await?;
+    Ok(coverage)
 }
 
 /// Build the full `sync` envelope for a list of calendars.
@@ -405,6 +509,7 @@ pub fn calendar_sync_view(cal: &GoogleCalendar, now_unix: i64) -> CalendarSyncVi
         retry_after_seconds,
         projection,
         cache_revision: cal.cache_revision,
+        watch_coverage: WatchCoverage::from_stored(&cal.watch_coverage),
     }
 }
 
@@ -465,6 +570,7 @@ mod tests {
             lease_expires_at: None,
             cache_revision: 0,
             projection: REPLICA_PROJECTION.to_string(),
+            watch_coverage: String::new(),
             created_at: "2023-01-01T00:00:00Z".to_string(),
             updated_at: "2023-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -483,6 +589,20 @@ mod tests {
             retry_after_seconds: None,
             projection: REPLICA_PROJECTION.into(),
             cache_revision: 0,
+            watch_coverage: WatchCoverage::Missing,
+        }
+    }
+
+    fn channel_expiring_at(expiration: &str) -> WatchChannel {
+        WatchChannel {
+            id: "wc-1".into(),
+            calendar_id: "cal-1".into(),
+            channel_id: "ch-secret".into(),
+            resource_id: "res-secret".into(),
+            token: "secret-channel-token".into(),
+            expiration: expiration.into(),
+            created_at: "2023-01-01T00:00:00Z".into(),
+            updated_at: "2023-01-01T00:00:00Z".into(),
         }
     }
 
@@ -642,17 +762,113 @@ mod tests {
         cal.initial_sync_complete = true;
         cal.last_success_at = Some(unix_secs_to_rfc3339(NOW - 2 * 60 * 60));
         cal.last_attempt_at = Some(unix_secs_to_rfc3339(NOW - 60));
+        cal.watch_coverage = "covered".into();
 
         let view = calendar_sync_view(&cal, NOW);
         let json = serde_json::to_string(&view).unwrap();
 
         assert!(json.contains("storage_transient"), "{json}");
+        assert!(json.contains("\"watch_coverage\""), "{json}");
+        assert!(json.contains("covered"), "{json}");
         assert!(!json.contains("secret-sync-token-xyz"), "{json}");
         assert!(!json.contains("lease-secret-abc"), "{json}");
         assert!(!json.contains("sync_token"), "{json}");
         assert!(!json.contains("lease_owner"), "{json}");
         assert!(!json.contains("raw_json"), "{json}");
         assert!(!json.contains("access_token"), "{json}");
+        assert!(!json.contains("resource_id"), "{json}");
+        assert!(!json.contains("channel_id"), "{json}");
+        assert!(!json.contains("\"token\""), "{json}");
+    }
+
+    #[test]
+    fn envelope_json_includes_watch_coverage_without_channel_secrets() {
+        let mut cal = base_cal("cal-1");
+        cal.sync_status = "ready".into();
+        cal.initial_sync_complete = true;
+        cal.last_success_at = Some(unix_secs_to_rfc3339(NOW - 60));
+        cal.watch_coverage = "expiring".into();
+        let env = events_sync_envelope(&[cal], NOW);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("\"watch_coverage\""), "{json}");
+        assert!(json.contains("expiring"), "{json}");
+        assert!(!json.contains("secret-channel-token"), "{json}");
+        assert!(!json.contains("resource_id"), "{json}");
+        assert!(!json.contains("channel_id"), "{json}");
+        assert!(!json.contains("sync_token"), "{json}");
+        assert!(!json.contains("lease_owner"), "{json}");
+        assert!(!json.contains("raw_json"), "{json}");
+        assert!(!json.contains("access_token"), "{json}");
+    }
+
+    // ── watch coverage classify ────────────────────────────────
+
+    #[test]
+    fn classify_watch_coverage_table() {
+        assert_eq!(
+            classify_watch_coverage(&[], NOW),
+            WatchCoverage::Missing
+        );
+
+        let covered_exp = unix_secs_to_rfc3339(NOW + WATCH_RENEW_HORIZON_SECS + 60);
+        assert_eq!(
+            classify_watch_coverage(&[channel_expiring_at(&covered_exp)], NOW),
+            WatchCoverage::Covered
+        );
+
+        let under_horizon = unix_secs_to_rfc3339(NOW + 3600);
+        assert_eq!(
+            classify_watch_coverage(&[channel_expiring_at(&under_horizon)], NOW),
+            WatchCoverage::Expiring
+        );
+
+        let expired = unix_secs_to_rfc3339(NOW - 60);
+        assert_eq!(
+            classify_watch_coverage(&[channel_expiring_at(&expired)], NOW),
+            WatchCoverage::NoSuccessor
+        );
+
+        // Mix: one expired + one past horizon → Covered.
+        assert_eq!(
+            classify_watch_coverage(
+                &[
+                    channel_expiring_at(&expired),
+                    channel_expiring_at(&covered_exp),
+                ],
+                NOW
+            ),
+            WatchCoverage::Covered
+        );
+
+        // Secrets in input must not appear in the enum / as_str.
+        let ch = channel_expiring_at(&covered_exp);
+        let cov = classify_watch_coverage(&[ch.clone()], NOW);
+        assert_eq!(cov.as_str(), "covered");
+        assert!(!cov.as_str().contains("secret"));
+        assert!(!format!("{cov:?}").contains("secret-channel-token"));
+        assert!(!format!("{cov:?}").contains("res-secret"));
+        assert_eq!(ch.token, "secret-channel-token"); // input still has it
+    }
+
+    #[test]
+    fn watch_coverage_from_stored_unknown_is_missing() {
+        assert_eq!(WatchCoverage::from_stored(""), WatchCoverage::Missing);
+        assert_eq!(WatchCoverage::from_stored("nope"), WatchCoverage::Missing);
+        assert_eq!(WatchCoverage::from_stored("covered"), WatchCoverage::Covered);
+        assert_eq!(
+            WatchCoverage::from_stored("no_successor"),
+            WatchCoverage::NoSuccessor
+        );
+    }
+
+    #[test]
+    fn missing_watch_coverage_does_not_degrade_aggregate() {
+        // Local wrangler dev has no watches; ready + missing must stay Ready.
+        let views = vec![CalendarSyncView {
+            watch_coverage: WatchCoverage::Missing,
+            ..view_with(CalendarReplicaState::Ready, false)
+        }];
+        assert_eq!(aggregate_sync_status(&views), SyncAggregateStatus::Ready);
     }
 
     // ── classify ───────────────────────────────────────────────
@@ -744,7 +960,7 @@ mod tests {
         );
         assert_eq!(
             replica_state_for_error(SyncErrorCode::Gone),
-            CalendarReplicaState::Retrying
+            CalendarReplicaState::Rebuilding
         );
         assert_eq!(
             replica_state_for_error(SyncErrorCode::StorageTransient),
@@ -843,6 +1059,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SyncErrorCode::AuthRevoked).unwrap(),
             "\"auth_revoked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WatchCoverage::NoSuccessor).unwrap(),
+            "\"no_successor\""
         );
     }
 }

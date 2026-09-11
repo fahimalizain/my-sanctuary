@@ -93,6 +93,13 @@ pub struct GoogleCalendar {
     /// (all-day still out of projection).
     #[serde(default, deserialize_with = "de_empty_string")]
     pub projection: String,
+    /// Sanitized watch coverage for the GET events sync envelope.
+    /// Derived from `google_calendars_watch_channels`; never stores channel
+    /// tokens or resource ids.
+    /// Values: `missing` | `expiring` | `no_successor` | `covered`
+    /// (empty/unknown → treated as `missing` by the view).
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub watch_coverage: String,
     pub created_at: String,
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
@@ -535,6 +542,7 @@ mod tests {
         assert_eq!(calendar.lease_expires_at, None);
         assert_eq!(calendar.cache_revision, 0);
         assert_eq!(calendar.projection, "");
+        assert_eq!(calendar.watch_coverage, "");
     }
 
     #[test]

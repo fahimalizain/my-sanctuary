@@ -3,7 +3,8 @@ use super::labels::ensure_event_labels;
 use super::repair::repair_inflight_operations;
 use super::replica::{lease_expires_at, mint_lease_owner, sync_replica};
 use super::sync::{
-    classify_sync_error, next_retry_rfc3339, replica_state_for_error, SyncErrorCode,
+    classify_sync_error, next_retry_rfc3339, refresh_watch_coverage, replica_state_for_error,
+    SyncErrorCode,
 };
 use super::watch::{
     is_public_https_callback, renew_watch_if_needed, stop_watches_for_calendar,
@@ -341,6 +342,20 @@ pub async fn run_fallback_cron(
                                 cal.id
                             ));
                         }
+                        if let Err(err) = refresh_watch_coverage(
+                            calendars,
+                            watches,
+                            &cal.id,
+                            now_unix,
+                            &now_rfc3339,
+                        )
+                        .await
+                        {
+                            report.errors.push(format!(
+                                "failed to refresh watch coverage for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
                         // Do not renew a calendar whose sync was just disabled.
                         continue;
                     }
@@ -367,8 +382,42 @@ pub async fn run_fallback_cron(
                 )
                 .await
                 {
-                    Ok(true) => report.renewed += 1,
-                    Ok(false) => {}
+                    Ok(true) => {
+                        report.renewed += 1;
+                        // Coverage changed (new channel) — stamp covered/expiring.
+                        if let Err(err) = refresh_watch_coverage(
+                            calendars,
+                            watches,
+                            &cal.id,
+                            now_unix,
+                            &now_rfc3339,
+                        )
+                        .await
+                        {
+                            report.errors.push(format!(
+                                "failed to refresh watch coverage for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                    }
+                    Ok(false) => {
+                        // Time passing must flip covered → expiring even when
+                        // renew no-ops because a channel already covers the horizon.
+                        if let Err(err) = refresh_watch_coverage(
+                            calendars,
+                            watches,
+                            &cal.id,
+                            now_unix,
+                            &now_rfc3339,
+                        )
+                        .await
+                        {
+                            report.errors.push(format!(
+                                "failed to refresh watch coverage for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                    }
                     Err(CalendarError::GoogleNotFound) => {
                         report.errors.push(format!(
                             "calendar {} ({}) returned 404 for events.watch — disabling sync",
@@ -387,6 +436,20 @@ pub async fn run_fallback_cron(
                         {
                             report.errors.push(format!(
                                 "failed to stop watch channels for calendar {}: {err}",
+                                cal.id
+                            ));
+                        }
+                        if let Err(err) = refresh_watch_coverage(
+                            calendars,
+                            watches,
+                            &cal.id,
+                            now_unix,
+                            &now_rfc3339,
+                        )
+                        .await
+                        {
+                            report.errors.push(format!(
+                                "failed to refresh watch coverage for calendar {}: {err}",
                                 cal.id
                             ));
                         }
@@ -514,6 +577,18 @@ async fn stop_leftover_watch_channels(
             {
                 report.errors.push(format!(
                     "failed to stop leftover watch channels for calendar {calendar_id}: {err}"
+                ));
+            } else if let Err(err) = refresh_watch_coverage(
+                calendars,
+                watches,
+                &calendar_id,
+                now_unix,
+                &unix_secs_to_rfc3339(now_unix),
+            )
+            .await
+            {
+                report.errors.push(format!(
+                    "failed to refresh watch coverage for leftover calendar {calendar_id}: {err}"
                 ));
             }
         }

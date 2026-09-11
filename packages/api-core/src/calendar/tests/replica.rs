@@ -203,7 +203,7 @@ fn missing_terminal_next_sync_token_is_not_success() {
 
 #[test]
 fn events_list_410_after_retry_records_gone() {
-    // First 410 retries in-invocation; second 410 is gone (not success).
+    // First 410 retries in-invocation (durable reseed); second 410 is gone.
     let http = FakeHttp::new(vec![("/events", 410, "")]);
     let mut cal = calendar("cal-1", "primary@example.com", true);
     cal.sync_token = "stale-token".to_string();
@@ -221,13 +221,194 @@ fn events_list_410_after_retry_records_gone() {
 
     let stored = calendars.stored.lock().unwrap();
     assert_eq!(stored[0].sync_token, "stale-token", "token not cleared on gone");
+    assert!(
+        stored[0].full_sync_requested,
+        "reseed must stay durable after unfinished 410"
+    );
     assert_eq!(stored[0].last_error_code, "gone");
-    assert_eq!(stored[0].sync_status, "retrying");
+    assert_eq!(stored[0].sync_status, "rebuilding");
     assert_eq!(stored[0].failure_streak, 1);
     assert!(stored[0].last_success_at.is_none());
     assert_eq!(
         stored[0].last_attempt_at.as_deref(),
         Some("2023-11-14T22:13:20Z")
+    );
+    drop(stored);
+
+    // Envelope reads the real write path (begin_replica_reseed + Gone → rebuilding).
+    let watches = FakeWatchChannelRepo::new();
+    let output = pollster::block_on(list_events(
+        &http, &calendars, &events, &watches, &access(), "u-1",
+        "2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z", NOW_UNIX, None,
+    ))
+    .unwrap();
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::Rebuilding
+    );
+    assert_eq!(
+        output.sync.calendars[0].error_code.as_deref(),
+        Some("gone")
+    );
+}
+
+#[test]
+fn events_list_410_then_success_clears_full_sync_requested() {
+    // First GET with syncToken → 410; second without token → 200 + nextSyncToken.
+    let merge = r#"{"items":[],"nextSyncToken":"st-after-410"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "stale-token".to_string();
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    cal.sync_status = "ready".to_string();
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    let http = FakeHttp::new(vec![
+        ("syncToken=stale-token", 410, ""),
+        ("/events", 200, merge),
+    ]);
+
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+
+    let stored = calendars.stored.lock().unwrap();
+    assert!(!stored[0].full_sync_requested, "success clears reseed flag");
+    assert_eq!(stored[0].sync_status, "ready");
+    assert_eq!(stored[0].sync_token, "st-after-410");
+    assert!(stored[0].last_error_code.is_empty());
+}
+
+#[test]
+fn full_sync_requested_drops_stored_token_on_next_walk() {
+    // Isolate-death recovery: durable flag must not retry incremental with
+    // the old stored token.
+    let body = r#"{"items":[],"nextSyncToken":"st-reseed"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.full_sync_requested = true;
+    cal.sync_status = "retrying".to_string();
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    // Guard: any request that still carries the old token must not succeed.
+    let http = FakeHttp::new(vec![
+        ("syncToken=old-tok", 599, ""),
+        ("/events", 200, body),
+    ]);
+
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+
+    let gets = http.gets.lock().unwrap();
+    assert!(
+        gets.iter().any(|u| u.contains("/events") && !u.contains("syncToken=")),
+        "walk must list without syncToken: {gets:?}"
+    );
+    assert!(
+        gets.iter().all(|u| !u.contains("syncToken=old-tok")),
+        "must not send old token: {gets:?}"
+    );
+    drop(gets);
+
+    let stored = calendars.stored.lock().unwrap();
+    assert!(!stored[0].full_sync_requested);
+    assert_eq!(stored[0].sync_token, "st-reseed");
+    assert_eq!(stored[0].sync_status, "ready");
+}
+
+#[test]
+fn fingerprint_mismatch_requests_full_sync() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.sync_query_fingerprint = "not-the-current-fp".to_string();
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    cal.sync_status = "ready".to_string();
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+
+    // Phase 1: merge-full GET (no token) fails — flag stays, token untouched,
+    // status is retrying (google_transient), not rebuilding.
+    let http_fail = FakeHttp::new(vec![
+        ("syncToken=old-tok", 599, ""),
+        ("/events", 500, ""),
+    ]);
+    let err = pollster::block_on(sync_calendar(
+        &http_fail,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")),
+        "{err:?}"
+    );
+    {
+        let stored = calendars.stored.lock().unwrap();
+        assert!(stored[0].full_sync_requested);
+        assert_eq!(stored[0].sync_token, "old-tok");
+        assert_eq!(stored[0].sync_status, "retrying");
+        assert_eq!(stored[0].last_error_code, "google_transient");
+    }
+    let fail_gets = http_fail.gets.lock().unwrap();
+    assert!(
+        fail_gets
+            .iter()
+            .all(|u| !u.contains("syncToken=old-tok")),
+        "fingerprint mismatch must drop token: {fail_gets:?}"
+    );
+    drop(fail_gets);
+
+    // Phase 2: successful merge-full clears the flag and publishes a new token.
+    // Re-seed flag on the stored row (already true) and use a fresh cal snapshot
+    // that still carries the stale fingerprint so the walk reseeds again.
+    let http_ok = FakeHttp::new(vec![
+        ("syncToken=old-tok", 599, ""),
+        ("/events", 200, r#"{"items":[],"nextSyncToken":"st-fp"}"#),
+    ]);
+    // Pass a cal that still has the mismatch; sync_calendar re-reads from store.
+    pollster::block_on(sync_calendar(
+        &http_ok,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+
+    let stored = calendars.stored.lock().unwrap();
+    assert!(!stored[0].full_sync_requested);
+    assert_eq!(stored[0].sync_token, "st-fp");
+    assert_eq!(stored[0].sync_status, "ready");
+    assert_eq!(
+        stored[0].sync_query_fingerprint,
+        crate::calendar_sync::replica_query_fingerprint()
     );
 }
 

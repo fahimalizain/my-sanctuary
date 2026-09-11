@@ -13,14 +13,21 @@
 //!   before each page apply; renew after apply; release on the way out. A lost
 //!   owner must not write rows or publish a cursor.
 //! - **410 is merge-full, not truncate.** Drop the in-memory token/page cursor
-//!   and restart the list once. Do **not** call `delete_stale`, do **not** wipe
-//!   already-applied rows. Ghosts may remain until a later delta or operator
-//!   action. A second 410 in the same invocation is an error (not a loop).
-//! - **Fingerprint mismatch → merge-full.** A non-empty stored
-//!   `sync_query_fingerprint` that differs from [`replica_query_fingerprint`]
-//!   drops the token for this walk only (not persisted until success). An
-//!   **empty** stored fingerprint with an existing token is treated as
-//!   compatible (production tokens stay valid).
+//!   and restart the list once. Persist `full_sync_requested = 1` and
+//!   `sync_status = 'rebuilding'` via [`CalendarRepo::begin_replica_reseed`]
+//!   so the next cron tick does not depend on in-memory state. Do **not** clear
+//!   the stored `sync_token` until a successful publish. Do **not** call
+//!   `delete_stale`, do **not** wipe already-applied rows. Ghosts may remain
+//!   until a later delta or operator action. A second 410 in the same
+//!   invocation is an error (not a loop); failure classification keeps
+//!   `rebuilding` while leaving the stored token alone.
+//! - **Fingerprint mismatch / `full_sync_requested` → merge-full.** A non-empty
+//!   stored `sync_query_fingerprint` that differs from
+//!   [`replica_query_fingerprint`], or a durable `full_sync_requested` flag,
+//!   drops the in-memory token for this walk and persists reseed via
+//!   [`CalendarRepo::begin_replica_reseed`]. The stored token is still not
+//!   cleared until success. An **empty** stored fingerprint with an existing
+//!   token is treated as compatible (production tokens stay valid).
 //! - **Poison is not skip.** Invalid page JSON is `InvalidResponse`
 //!   (`mapping_poison`); the page is not silently dropped and the token is not
 //!   advanced.
@@ -67,16 +74,24 @@ pub async fn sync_replica(
     now_rfc3339: &str,
 ) -> Result<(), CalendarError> {
     let fingerprint = replica_query_fingerprint();
-    let mut token: Option<String> = if cal.sync_token.is_empty() {
+    // Empty stored fingerprint is compatible with an existing token (do not
+    // invalidate production cursors). Only a non-empty mismatch, or a durable
+    // full_sync_requested flag, forces merge-full. First-ever sync (empty
+    // token, empty fingerprint, flag clear) stays never_initialized — do not
+    // stamp rebuilding.
+    let fingerprint_mismatch = !cal.sync_query_fingerprint.is_empty()
+        && cal.sync_query_fingerprint != fingerprint;
+    let reseed = cal.full_sync_requested || fingerprint_mismatch;
+    if reseed {
+        calendars
+            .begin_replica_reseed(&cal.id, now_rfc3339)
+            .await?;
+    }
+    let mut token: Option<String> = if reseed || cal.sync_token.is_empty() {
         None
     } else {
         Some(cal.sync_token.clone())
     };
-    // Empty stored fingerprint is compatible with an existing token (do not
-    // invalidate production cursors). Only a non-empty mismatch forces merge-full.
-    if !cal.sync_query_fingerprint.is_empty() && cal.sync_query_fingerprint != fingerprint {
-        token = None;
-    }
 
     let mut page_token: Option<String> = None;
     let mut retried_410 = false;
@@ -104,8 +119,12 @@ pub async fn sync_replica(
                     "google events.list returned 410".into(),
                 ));
             }
-            // Merge-full: drop cursor for this walk, keep already-applied rows.
+            // Merge-full: durable reseed flag + drop in-memory cursor. Keep
+            // already-applied rows and the stored token until success.
             // Never delete_stale / truncate.
+            calendars
+                .begin_replica_reseed(&cal.id, now_rfc3339)
+                .await?;
             retried_410 = true;
             token = None;
             page_token = None;

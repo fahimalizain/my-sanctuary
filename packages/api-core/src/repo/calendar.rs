@@ -80,6 +80,10 @@ pub trait CalendarRepo: Send + Sync {
         next_retry_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Persist that a merge-full / reseed is required and now in-flight.
+    /// Sets `full_sync_requested = 1` and `sync_status = 'rebuilding'`.
+    /// Does **not** touch `sync_token`, success stamps, error/streak, dirty gens, or lease.
+    async fn begin_replica_reseed(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
     /// Try to become the sole replica owner for `id`. Succeeds when the lease
     /// is empty, already ours, or expired. Returns `true` only when this
     /// `owner` holds the lease after the update.
@@ -131,6 +135,14 @@ pub trait CalendarRepo: Send + Sync {
         &self,
         id: &str,
         event_labels_json: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+    /// Persist sanitized watch coverage (`missing` | `expiring` |
+    /// `no_successor` | `covered`). Never stores channel tokens / resource ids.
+    async fn set_watch_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
@@ -445,6 +457,17 @@ pub const CALENDAR_RECORD_SYNC_FAILURE_SQL: &str = "
     WHERE id = ? AND deleted_at IS NULL
 ";
 
+/// Mark merge-full / reseed in-flight. Sets `full_sync_requested` and
+/// `sync_status = 'rebuilding'`. Does **not** touch `sync_token`, success
+/// stamps, error/streak, dirty gens, or lease. Binds: now, id.
+pub const CALENDAR_BEGIN_REPLICA_RESEED_SQL: &str = "
+    UPDATE google_calendars
+    SET full_sync_requested = 1,
+        sync_status = 'rebuilding',
+        updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
 /// Steal or re-acquire the replica lease when empty, same owner, or expired.
 /// Binds: owner, expires, now, id, owner, now.
 pub const CALENDAR_TRY_ACQUIRE_LEASE_SQL: &str = "
@@ -505,6 +528,15 @@ pub const CALENDAR_SET_SYNC_ENABLED_SQL: &str =
 /// the cache or the stamp.
 pub const CALENDAR_SET_EVENT_LABELS_SQL: &str =
     "UPDATE google_calendars SET event_labels = ?, event_labels_updated_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// Persist sanitized watch coverage. Binds: coverage, now, id.
+/// Values: `missing` | `expiring` | `no_successor` | `covered`. Never stores
+/// channel tokens or resource ids (those live only on watch channel rows).
+pub const CALENDAR_SET_WATCH_COVERAGE_SQL: &str = "
+    UPDATE google_calendars
+    SET watch_coverage = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
 
 /// SOFT delete: stamps `deleted_at`, keeping the row's UNIQUE
 /// `(user_id, google_calendar_id)` slot.
@@ -931,6 +963,50 @@ mod tests {
     }
 
     #[test]
+    fn calendar_set_watch_coverage_writes_column_and_stamps_updated_at() {
+        let sql = CALENDAR_SET_WATCH_COVERAGE_SQL;
+        assert!(sql.contains("watch_coverage = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        // Never writes channel secrets.
+        assert!(!sql.contains("token"), "{sql}");
+        assert!(!sql.contains("resource_id"), "{sql}");
+        assert!(!sql.contains("channel_id"), "{sql}");
+    }
+
+    #[test]
+    fn migration_0014_adds_watch_coverage_without_secrets() {
+        let migration =
+            include_str!("../../../../apps/worker/migrations/0014_watch_coverage.sql");
+        assert!(
+            migration.contains("ALTER TABLE google_calendars ADD COLUMN watch_coverage"),
+            "migration must add watch_coverage column: {migration}"
+        );
+        assert!(
+            migration.contains("DEFAULT 'missing'"),
+            "default must be missing: {migration}"
+        );
+        assert!(
+            migration.contains("never stores channel tokens"),
+            "comment must note secrets are not stored: {migration}"
+        );
+        // Must not introduce secret-bearing columns.
+        assert!(
+            !migration.contains("resource_id"),
+            "must not add resource_id: {migration}"
+        );
+        assert!(
+            !migration.contains("channel_id"),
+            "must not add channel_id: {migration}"
+        );
+        assert!(
+            !migration.contains(" ADD COLUMN token"),
+            "must not add token column: {migration}"
+        );
+    }
+
+    #[test]
     fn calendar_list_orders_primary_first_then_summary() {
         let sql = CALENDAR_LIST_BY_USER_ID_SQL;
         let order_start = sql.find("ORDER BY").expect("has ORDER BY");
@@ -1191,6 +1267,7 @@ mod tests {
             "lease_owner",
             "lease_expires_at",
             "projection",
+            "watch_coverage",
         ] {
             assert!(
                 !CALENDAR_UPSERT_SQL.contains(col),
@@ -1344,6 +1421,24 @@ mod tests {
         assert!(!sql.contains("last_success_at"), "{sql}");
         assert!(!sql.contains("last_synced_at"), "{sql}");
         assert!(!sql.contains("last_attempt_at"), "{sql}");
+        assert!(!sql.contains("full_sync_requested"), "{sql}");
+    }
+
+    #[test]
+    fn begin_replica_reseed_sql_sets_flag_and_rebuilding_without_touching_token() {
+        let sql = CALENDAR_BEGIN_REPLICA_RESEED_SQL;
+        assert!(sql.contains("full_sync_requested = 1"), "{sql}");
+        assert!(sql.contains("sync_status = 'rebuilding'"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("last_success_at"), "{sql}");
+        assert!(!sql.contains("last_synced_at"), "{sql}");
+        assert!(!sql.contains("last_attempt_at"), "{sql}");
+        assert!(!sql.contains("last_error_code"), "{sql}");
+        assert!(!sql.contains("failure_streak"), "{sql}");
+        assert!(!sql.contains("lease_owner"), "{sql}");
+        assert!(!sql.contains("dirty_"), "{sql}");
     }
 
     #[test]

@@ -10,10 +10,12 @@ use api_core::repo::{
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL,
     CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL,
-    CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
-    CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
-    CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
-    CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
+    CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL,
+    CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL, CALENDAR_RECORD_SYNC_SUCCESS_SQL,
+    CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
+    CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL,
+    CALENDAR_TRY_ACQUIRE_LEASE_SQL,
     CALENDAR_UPDATE_SYNC_STATE_SQL, CALENDAR_UPSERT_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL,
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
@@ -272,6 +274,16 @@ impl CalendarRepo for D1CalendarRepo {
         run_stmt(stmt).await
     }
 
+    async fn begin_replica_reseed(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        // Binds: updated_at, id.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_BEGIN_REPLICA_RESEED_SQL)
+            .bind_refs(&[D1Type::Text(now_rfc3339), D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
     async fn try_acquire_lease(
         &self,
         id: &str,
@@ -401,6 +413,25 @@ impl CalendarRepo for D1CalendarRepo {
             .bind_refs(&[
                 D1Type::Text(event_labels_json),
                 D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn set_watch_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Binds: coverage, now, id.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_SET_WATCH_COVERAGE_SQL)
+            .bind_refs(&[
+                D1Type::Text(coverage),
                 D1Type::Text(now_rfc3339),
                 D1Type::Text(id),
             ])

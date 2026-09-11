@@ -68,6 +68,12 @@ export type CalendarReplicaState =
   | 'authorization_required'
   | 'disabled';
 
+export type CalendarWatchCoverage =
+  | 'missing'
+  | 'expiring'
+  | 'no_successor'
+  | 'covered';
+
 export interface CalendarSyncHealth {
   calendar_id: string;
   state: CalendarReplicaState;
@@ -79,6 +85,8 @@ export interface CalendarSyncHealth {
   retry_after_seconds: number | null;
   projection: 'timed_masters_and_exceptions' | string;
   cache_revision: number;
+  /** Sanitized watch coverage; never channel secrets. */
+  watch_coverage: CalendarWatchCoverage;
 }
 
 export interface CalendarEventsSync {
