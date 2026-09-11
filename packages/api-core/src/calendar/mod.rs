@@ -67,6 +67,7 @@ pub mod apply;
 pub mod diagnostics;
 pub mod replica;
 pub mod repair;
+pub mod repair_action;
 pub mod sync;
 pub mod window;
 pub(crate) mod google;
@@ -245,3 +246,7 @@ pub use diagnostics::{
     ReplicaWalkDiagnostic, ReplicaWalkMeta, ReplicaWalkPhase, ReplicaWalkTrigger,
 };
 pub use repair::repair_inflight_operations;
+pub use repair_action::{
+    request_calendar_repair, CalendarRepairResponse, CalendarRepairStatus,
+    CALENDAR_REPAIR_COOLDOWN_SECS,
+};

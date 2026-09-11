@@ -90,7 +90,12 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/calendar/events", auth::options)
         .options("/api/calendar/events/:id", auth::options)
         .get_async("/api/calendar/calendars", calendar::list_calendars)
+        .post_async(
+            "/api/calendar/calendars/:id/repair",
+            calendar::repair_calendar,
+        )
         .options("/api/calendar/calendars", auth::options)
+        .options("/api/calendar/calendars/:id/repair", auth::options)
         .get_async("/api/lists", lists::list_lists)
         .post_async("/api/lists", lists::create_list)
         .patch_async("/api/lists/:id", lists::update_list)

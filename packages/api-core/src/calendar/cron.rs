@@ -68,18 +68,23 @@ pub enum SyncCalendarOutcome {
 
 /// Whether a sync-enabled calendar should start a replica walk this tick.
 ///
-/// Due when **all** of:
-/// - `access_role != "freeBusyReader"` (replica `singleEvents=false` strips
+/// Hard skips (even when a reseed is diagnosed):
+/// - `access_role == "freeBusyReader"` (replica `singleEvents=false` strips
 ///   details on freeBusyReader calendars — keep events, never walk)
-/// - `sync_status != "authorization_required"` (do not hot-loop Google; keep events)
-/// - `next_retry_at` is missing/unparseable **or** `<= now_unix` (honor V1 backoff)
+/// - `sync_status == "authorization_required"` (do not hot-loop Google; keep events)
 ///
-/// AND **any** of:
+/// Then, if `full_sync_requested` is set → **due**. A diagnosed reseed wins
+/// over a future `next_retry_at` so isolate death mid-410 (after
+/// `begin_replica_reseed` and/or `persist_sync_failure` stamped backoff)
+/// still starts merge-full on the next cron tick instead of waiting out
+/// backoff behind a dead incremental token.
+///
+/// Otherwise due when backoff allows
+/// (`next_retry_at` missing/unparseable **or** `<= now_unix`) **and** any of:
 /// - `dirty_requested_generation > dirty_applied_generation`
 /// - `last_success_at` missing/unparseable
 /// - `last_success_at` older than [`CRON_SYNC_STALE_SECS`] (15m backstop; watches
 ///   do not disable the poll)
-/// - `full_sync_requested`
 /// - `next_retry_at` is due (`Some` and `<= now`) — a failed run with a still-fresh
 ///   `last_success_at` still retries when backoff expires
 ///
@@ -90,6 +95,11 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
     }
     if cal.sync_status == "authorization_required" {
         return false;
+    }
+
+    // Diagnosed reseed beats backoff (issue #59 isolate-death gap).
+    if cal.full_sync_requested {
+        return true;
     }
 
     let retry_unix = cal
@@ -116,7 +126,7 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
     };
     let retry_due = retry_unix.is_some_and(|retry| retry <= now_unix);
 
-    dirty || success_stale || cal.full_sync_requested || retry_due
+    dirty || success_stale || retry_due
 }
 
 /// The fallback cron (ADR 0001 § Fallback cron + ADR 0005 V3): per user,

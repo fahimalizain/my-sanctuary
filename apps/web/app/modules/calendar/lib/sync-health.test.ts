@@ -5,7 +5,7 @@ import type {
   CalendarSyncHealth,
   GoogleCalendar,
 } from '@/app/types';
-import { selectSyncHealthBanner } from './sync-health';
+import { repairTargetCalendarId, selectSyncHealthBanner } from './sync-health';
 
 function health(
   overrides: Partial<CalendarSyncHealth> &
@@ -99,6 +99,8 @@ test('never_initialized → quiet syncing copy', () => {
   assert.equal(banner.showRetry, false);
   assert.equal(banner.showReconnect, false);
   assert.equal(banner.calendarName, 'Personal Goals');
+  assert.equal(banner.calendarId, 'cal-personal');
+  assert.equal(repairTargetCalendarId(banner), null);
 });
 
 test('never_initialized + stale → still quiet syncing (not out of date)', () => {
@@ -159,6 +161,8 @@ test('authorization_required → reconnect, strongest vs stale sibling', () => {
   assert.equal(banner.showReconnect, true);
   assert.equal(banner.showRetry, false);
   assert.equal(banner.calendarName, 'Personal Goals');
+  assert.equal(banner.calendarId, 'cal-personal');
+  assert.equal(repairTargetCalendarId(banner), null);
 });
 
 test('degraded: retrying includes calendar name', () => {
@@ -176,6 +180,8 @@ test('degraded: retrying includes calendar name', () => {
   assert.equal(banner.message, 'Personal Goals is retrying (rate_limited)');
   assert.equal(banner.showRetry, true);
   assert.equal(banner.showReconnect, false);
+  assert.equal(banner.calendarId, 'cal-personal');
+  assert.equal(repairTargetCalendarId(banner), 'cal-personal');
 });
 
 test('degraded: stale ready is still degraded', () => {
@@ -192,6 +198,8 @@ test('degraded: stale ready is still degraded', () => {
   assert.equal(banner.kind, 'degraded');
   assert.equal(banner.message, 'Personal Goals is out of date');
   assert.equal(banner.showRetry, true);
+  assert.equal(banner.calendarId, 'cal-personal');
+  assert.equal(repairTargetCalendarId(banner), 'cal-personal');
 });
 
 test('degraded: rebuilding', () => {
@@ -206,6 +214,8 @@ test('degraded: rebuilding', () => {
   });
   assert.equal(banner.kind, 'degraded');
   assert.equal(banner.message, 'Work is rebuilding');
+  assert.equal(banner.calendarId, 'cal-work');
+  assert.equal(repairTargetCalendarId(banner), 'cal-work');
 });
 
 test('disabled is ignored even when stale', () => {
@@ -235,6 +245,8 @@ test('fetch_error with retained rows', () => {
   assert.equal(banner.message, "Couldn't refresh events: network down");
   assert.equal(banner.showRetry, true);
   assert.equal(banner.showReconnect, false);
+  assert.equal(banner.calendarId, undefined);
+  assert.equal(repairTargetCalendarId(banner), null);
 });
 
 test('first-load loading + empty → none', () => {
@@ -325,6 +337,8 @@ test('featured name: first degraded when no auth', () => {
   });
   assert.equal(banner.calendarName, 'Work');
   assert.equal(banner.kind, 'degraded');
+  assert.equal(banner.calendarId, 'cal-work');
+  assert.equal(repairTargetCalendarId(banner), 'cal-work');
 });
 
 test('never_initialized loses to degraded sibling', () => {

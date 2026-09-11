@@ -23,5 +23,7 @@
 mod http;
 mod webhook;
 
-pub use http::{create_event, delete_event, list_calendars, list_events, update_event};
+pub use http::{
+    create_event, delete_event, list_calendars, list_events, repair_calendar, update_event,
+};
 pub use webhook::notifications;

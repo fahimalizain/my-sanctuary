@@ -1,6 +1,7 @@
 import { fetchJson } from './client';
 import type {
   CalendarEventsResponse,
+  CalendarRepairResponse,
   CalendarsResponse,
   CreateEventResponse,
   DeleteCalendarEventResponse,
@@ -51,4 +52,13 @@ export function deleteCalendarEvent(
   return fetchJson<DeleteCalendarEventResponse>(`/api/calendar/events/${id}`, {
     method: 'DELETE',
   });
+}
+
+export function repairCalendar(id: string): Promise<CalendarRepairResponse> {
+  return fetchJson<CalendarRepairResponse>(
+    `/api/calendar/calendars/${id}/repair`,
+    {
+      method: 'POST',
+    },
+  );
 }
