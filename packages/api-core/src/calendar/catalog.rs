@@ -1,15 +1,15 @@
 use super::labels::ensure_event_labels;
 use super::sync::SyncErrorCode;
 use super::watch::stop_watches_for_calendar;
-use super::cron::persist_sync_failure;
+use super::cron::{persist_sync_failure, stamp_auth_revoked_for_user};
 use super::{
     CalendarError, CalendarView, CalendarsResponse, GOOGLE_CALENDAR_LIST_URL,
 };
 use crate::models::NewCalendar;
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarRepo, WatchChannelRepo};
-use crate::time::rfc3339_to_unix_secs;
-use crate::token::GoogleAccess;
+use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+use crate::token::{is_refresh_auth_revoked, GoogleAccess, TokenError};
 use serde::Deserialize;
 use std::collections::HashSet;
 use url::Url;
@@ -27,7 +27,8 @@ use url::Url;
 ///
 /// Rows are mapped to [`CalendarView`] (repo order: `is_primary DESC,
 /// summary ASC`). Import failures propagate as [`CalendarError`] — nothing
-/// is swallowed.
+/// is swallowed. Callers that hit a Google grant refresh failure should use
+/// [`list_calendars_after_refresh_failure`] instead (cache only, no import).
 pub async fn list_calendars(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -42,6 +43,31 @@ pub async fn list_calendars(
         refresh_calendar_list(http, calendars, None, access, user_id, now_rfc3339).await?;
         rows = calendars.list_by_user_id(user_id).await?;
     }
+    Ok(CalendarsResponse {
+        calendars: rows.into_iter().map(CalendarView::from).collect(),
+    })
+}
+
+/// Serve cached calendars after a Google token refresh failure.
+///
+/// No Google HTTP, no access token, never imports. On a revoked grant
+/// ([`is_refresh_auth_revoked`]) stamps `authorization_required` on the
+/// user's sync-enabled calendars; stamp failures are discarded (this
+/// response has no `sync_errors` field) and never fail the listing. On
+/// [`TokenError::NoToken`] / [`TokenError::NoRefreshToken`] serves cache
+/// without flipping health.
+pub async fn list_calendars_after_refresh_failure(
+    calendars: &dyn CalendarRepo,
+    user_id: &str,
+    now_unix: i64,
+    refresh_err: &TokenError,
+) -> Result<CalendarsResponse, CalendarError> {
+    if is_refresh_auth_revoked(refresh_err) {
+        let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+        let _ = stamp_auth_revoked_for_user(calendars, user_id, now_unix, &now_rfc3339).await;
+    }
+
+    let rows = calendars.list_by_user_id(user_id).await?;
     Ok(CalendarsResponse {
         calendars: rows.into_iter().map(CalendarView::from).collect(),
     })

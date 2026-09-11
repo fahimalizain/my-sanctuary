@@ -220,7 +220,9 @@ pub struct CalendarsResponse {
 }
 
 
-pub use list::{list_events, parse_event_time_range, CalendarListOutput};
+pub use list::{
+    list_events, list_events_after_refresh_failure, parse_event_time_range, CalendarListOutput,
+};
 pub use write::{
     create_event, delete_event, delete_event_for_user, patch_event, patch_event_fields,
     patch_event_summary, update_event_for_user, CreateEventOutput,
@@ -231,7 +233,7 @@ pub use watch::{
 pub use webhook::{
     decide_webhook, persist_webhook_decision, tokens_match, WebhookDecision, WebhookPersistResult,
 };
-pub use catalog::list_calendars;
+pub use catalog::{list_calendars, list_calendars_after_refresh_failure};
 pub use cron::{
     replica_due, run_fallback_cron, sync_calendar, CronReport, SyncCalendarOutcome,
 };

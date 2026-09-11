@@ -227,29 +227,15 @@ pub async fn run_fallback_cron(
                 ));
                 if is_refresh_auth_revoked(&err) {
                     // Keep events; stop Google for this user's calendars this tick.
-                    match calendars.list_by_user_id(user_id).await {
-                        Ok(user_cals) => {
-                            for cal in user_cals.iter().filter(|c| c.sync_enabled) {
-                                if let Err(persist_err) = persist_sync_failure(
-                                    calendars,
-                                    cal,
-                                    SyncErrorCode::AuthRevoked,
-                                    now_unix,
-                                    &now_rfc3339,
-                                )
-                                .await
-                                {
-                                    report.errors.push(format!(
-                                        "failed to stamp auth_revoked for calendar {}: {persist_err}",
-                                        cal.id
-                                    ));
-                                }
-                            }
-                        }
-                        Err(list_err) => report.errors.push(format!(
-                            "failed to list calendars for auth_revoked stamp (user {user_id}): {list_err}"
-                        )),
-                    }
+                    report.errors.extend(
+                        stamp_auth_revoked_for_user(
+                            calendars,
+                            user_id,
+                            now_unix,
+                            &now_rfc3339,
+                        )
+                        .await,
+                    );
                 }
                 continue;
             }
@@ -636,6 +622,44 @@ pub async fn sync_calendar(
             }
         }
     }
+}
+
+/// Stamp `auth_revoked` / `authorization_required` on every living
+/// sync-enabled calendar for `user_id`. Keeps events and cursors.
+///
+/// Returns human-readable failures (never tokens). Used by the fallback cron
+/// and by GET handlers when Google rejects the refresh grant.
+pub(crate) async fn stamp_auth_revoked_for_user(
+    calendars: &dyn CalendarRepo,
+    user_id: &str,
+    now_unix: i64,
+    now_rfc3339: &str,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    match calendars.list_by_user_id(user_id).await {
+        Ok(user_cals) => {
+            for cal in user_cals.iter().filter(|c| c.sync_enabled) {
+                if let Err(persist_err) = persist_sync_failure(
+                    calendars,
+                    cal,
+                    SyncErrorCode::AuthRevoked,
+                    now_unix,
+                    now_rfc3339,
+                )
+                .await
+                {
+                    errors.push(format!(
+                        "failed to stamp auth_revoked for calendar {}: {persist_err}",
+                        cal.id
+                    ));
+                }
+            }
+        }
+        Err(list_err) => errors.push(format!(
+            "failed to list calendars for auth_revoked stamp (user {user_id}): {list_err}"
+        )),
+    }
+    errors
 }
 
 /// Persist a classified failure without advancing the sync cursor.
