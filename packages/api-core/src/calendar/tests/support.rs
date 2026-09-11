@@ -1046,13 +1046,14 @@ impl FakeEventRepo {
         id
     }
 
-    /// Mirrors GET projection filters (`timed_masters_and_exceptions`),
-    /// including the master/instance dedupe rule on
-    /// [`crate::repo::EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`].
+    /// Mirrors GET range-list projection filters (cancelled + master/instance
+    /// dedupe on [`crate::repo::EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`]).
+    /// All-day rows are included in GET (week grid); running-query still
+    /// filters them separately.
     ///
     /// `all` is the full stored set so sibling masters can be found.
     pub(crate) fn in_projection(event: &CalendarEvent, all: &[CalendarEvent]) -> bool {
-        if event.deleted_at.is_some() || event.is_all_day {
+        if event.deleted_at.is_some() {
             return false;
         }
         if !event.status.is_empty() && event.status == "cancelled" {
@@ -1240,6 +1241,23 @@ impl CalendarEventRepo for FakeEventRepo {
         let mut stored = self.stored.lock().unwrap();
         if let Some(event) = stored.iter_mut().find(|event| event.id == id) {
             event.deleted_at = Some(now_rfc3339.to_string());
+        }
+        Ok(())
+    }
+
+    async fn reassign_calendar(
+        &self,
+        id: &str,
+        new_calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(event) = stored
+            .iter_mut()
+            .find(|event| event.deleted_at.is_none() && event.id == id)
+        {
+            event.calendar_id = new_calendar_id.to_string();
+            event.updated_at = now_rfc3339.to_string();
         }
         Ok(())
     }

@@ -257,6 +257,15 @@ pub trait CalendarEventRepo: Send + Sync {
     ) -> Result<Vec<CalendarEvent>, RepoError>;
     /// SOFT delete by local id.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
+    /// Reassign a living event's `calendar_id` in place (same local `id`).
+    /// Used after Google `events.move` so the natural key can flip without
+    /// inserting a second row.
+    async fn reassign_calendar(
+        &self,
+        id: &str,
+        new_calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// SOFT delete by `(calendar_id, google_event_id)` — used when incremental
     /// sync reports a cancelled event.
     async fn delete_by_google_event_id(
@@ -737,8 +746,9 @@ pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
 /// (`c.sync_enabled = 1`). Soft-deleted or user-disabled calendars keep their
 /// cached events but must not paint on GET.
 ///
-/// Projection `timed_masters_and_exceptions`: exclude all-day rows and
-/// cancelled exceptions (stored living for series correctness) from GET.
+/// Projection name remains `timed_masters_and_exceptions` (health string), but
+/// GET range list **includes all-day rows** so the week grid can paint them.
+/// Cancelled exceptions (stored living for series correctness) stay excluded.
 ///
 /// Also hide an unmodified window instance when a living **master** exists in
 /// the same calendar (`m.google_event_id = e.recurring_event_id`,
@@ -753,7 +763,6 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
       AND c.deleted_at IS NULL
       AND c.sync_enabled = 1
       AND e.deleted_at IS NULL
-      AND e.is_all_day = 0
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
       AND e.start_time < ? AND e.end_time > ?
       AND NOT (
@@ -779,9 +788,9 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
 /// shape (`…Z`, zero-padded, no fractions) compare lexicographically, so the
 /// range test needs no timestamp function.
 ///
-/// Same projection filters as the range query: a running task chip must not be
-/// an all-day or cancelled row, and unmodified window instances are hidden
-/// when a living master exists (see [`EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`]).
+/// Running task chips stay **timed only** (`is_all_day = 0`); cancelled rows
+/// and unmodified window instances are hidden when a living master exists
+/// (same instance dedupe as [`EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL`]).
 pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
@@ -817,6 +826,10 @@ pub const EVENT_GET_ID_BY_NATURAL_KEY_SQL: &str =
 /// SOFT delete by local id.
 pub const EVENT_DELETE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
+
+/// Reassign living event to another calendar (keeps local id).
+pub const EVENT_REASSIGN_CALENDAR_SQL: &str =
+    "UPDATE calendar_events SET calendar_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
 /// SOFT delete by `(calendar_id, google_event_id)`.
 pub const EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL: &str =
@@ -1312,6 +1325,16 @@ mod tests {
     }
 
     #[test]
+    fn event_reassign_calendar_sql_updates_living_row() {
+        assert_eq!(
+            EVENT_REASSIGN_CALENDAR_SQL,
+            "UPDATE calendar_events SET calendar_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL"
+        );
+        assert!(EVENT_REASSIGN_CALENDAR_SQL.starts_with("UPDATE"), "{EVENT_REASSIGN_CALENDAR_SQL}");
+        assert!(!EVENT_REASSIGN_CALENDAR_SQL.contains("DELETE FROM"), "{EVENT_REASSIGN_CALENDAR_SQL}");
+    }
+
+    #[test]
     fn calendar_upsert_preserves_sync_token_and_last_synced_at() {
         assert!(
             CALENDAR_UPSERT_SQL.contains(
@@ -1535,8 +1558,11 @@ mod tests {
         assert!(sql.contains("e.end_time > ?"), "{sql}");
         assert!(sql.contains("c.user_id = ?"), "{sql}");
         assert!(sql.contains("ORDER BY e.start_time ASC"), "{sql}");
-        // timed_masters_and_exceptions projection
-        assert!(sql.contains("e.is_all_day = 0"), "{sql}");
+        // Range GET includes all-day rows (week grid); do not filter is_all_day.
+        assert!(
+            !sql.contains("e.is_all_day = 0"),
+            "range list must include all-day: {sql}"
+        );
         assert!(
             sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
             "{sql}"
@@ -1556,12 +1582,11 @@ mod tests {
     }
 
     #[test]
-    fn event_range_and_running_queries_exclude_all_day_and_cancelled() {
+    fn event_range_and_running_queries_share_cancelled_and_master_filters() {
         for sql in [
             EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL,
             EVENT_LIST_RUNNING_BY_USER_ID_SQL,
         ] {
-            assert!(sql.contains("e.is_all_day = 0"), "{sql}");
             assert!(
                 sql.contains("(e.status IS NULL OR e.status = '' OR e.status != 'cancelled')"),
                 "{sql}"

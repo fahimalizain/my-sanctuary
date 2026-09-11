@@ -297,6 +297,7 @@ pub struct NewWatchChannel {
 pub const OP_VERB_INSERT: &str = "insert";
 pub const OP_VERB_PATCH: &str = "patch";
 pub const OP_VERB_DELETE: &str = "delete";
+pub const OP_VERB_MOVE: &str = "move";
 
 /// Status constants for [`CalendarEventOperation::status`].
 ///
@@ -326,7 +327,7 @@ pub struct CalendarEventOperation {
     /// Minted before insert HTTP; known for patch/delete.
     #[serde(default, deserialize_with = "de_empty_string")]
     pub google_event_id: String,
-    /// `insert` | `patch` | `delete`.
+    /// `insert` | `patch` | `delete` | `move`.
     pub verb: String,
     /// Hex sha256 (or stable hex) of canonical payload JSON.
     pub payload_fingerprint: String,
@@ -367,17 +368,44 @@ pub struct NewCalendarEventOperation {
 
 /// Request body for `PATCH /api/calendar/events/:id`.
 /// At least one field must be `Some` (empty patch → 400).
+///
+/// `calendar_id` is exclusive: when set, it must be the only field (local
+/// destination calendar id → Google `events.move`). Combining it with
+/// `start` / `end` / `summary` / `description` / `is_all_day` /
+/// `start_time_zone` is rejected as invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct PatchEventFields {
-    /// RFC 3339 dateTime passed through to Google `start.dateTime`.
+    /// RFC 3339 dateTime or civil `YYYY-MM-DD` (all-day). Timed patches emit
+    /// Google `start.dateTime`; all-day (`is_all_day: true`) emits `start.date`.
     #[serde(default)]
     pub start: Option<String>,
-    /// RFC 3339 dateTime passed through to Google `end.dateTime`.
+    /// RFC 3339 dateTime or civil `YYYY-MM-DD` (all-day). Timed patches emit
+    /// Google `end.dateTime`; all-day (`is_all_day: true`) emits `end.date`
+    /// (exclusive end date).
     #[serde(default)]
     pub end: Option<String>,
     /// Event title → Google `summary`.
     #[serde(default)]
     pub summary: Option<String>,
+    /// Event notes → Google `description`. `Some("")` clears notes;
+    /// `None` omits the field from the patch body.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// When `Some(true)`, start/end are written as Google all-day `date`
+    /// fields (civil `YYYY-MM-DD`). Requires both start and end. When
+    /// `Some(false)` or omitted with start/end, timed `dateTime` path.
+    #[serde(default)]
+    pub is_all_day: Option<bool>,
+    /// IANA zone applied to both start and end `timeZone` on timed patches.
+    /// Requires start and end. Ignored / not emitted on all-day date objects.
+    /// Empty after trim is treated as omitted from the Google payload.
+    #[serde(default)]
+    pub start_time_zone: Option<String>,
+    /// Local destination calendar id (`google_calendars.id`). Exclusive —
+    /// cannot be combined with start/end/summary/description/is_all_day/
+    /// start_time_zone. Routes to Google `events.move` (not `events.patch`).
+    #[serde(default)]
+    pub calendar_id: Option<String>,
 }
 
 /// Request body for `POST /api/calendar/events`.

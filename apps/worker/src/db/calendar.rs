@@ -24,8 +24,8 @@ use api_core::repo::{
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_QUARANTINE_SQL,
-    OPERATION_GET_BY_ID_SQL,
+    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_UPSERT_QUARANTINE_SQL, OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
     OPERATION_UPDATE_STATUS_SQL, REPLICA_SEEN_INSERT_CHUNK_SIZE,
     WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
@@ -696,6 +696,24 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             .prepare(EVENT_DELETE_SQL)
             .bind_refs(&[
                 D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn reassign_calendar(
+        &self,
+        id: &str,
+        new_calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let stmt = self
+            .db
+            .prepare(EVENT_REASSIGN_CALENDAR_SQL)
+            .bind_refs(&[
+                D1Type::Text(new_calendar_id),
                 D1Type::Text(now_rfc3339),
                 D1Type::Text(id),
             ])

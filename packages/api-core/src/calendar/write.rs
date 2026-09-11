@@ -129,12 +129,12 @@ pub async fn create_event(
 /// Patches selected fields on Google (`events.patch`) via the outbound
 /// operation journal (issue #50 / Vertical 4).
 ///
-/// **Minimal body only:** `start.dateTime` / `end.dateTime` / `summary` —
-/// whichever of `fields` are `Some`. This is **not** `events.update` (full
-/// replace). Arrays replace on patch, so we deliberately never send
-/// attendees, conferenceData, extendedProperties, or recurrence — those
-/// stay on Google untouched. Empty (all `None`) → [`CalendarError::Invalid`]
-/// before any journal row.
+/// **Minimal body only:** `start.dateTime` / `end.dateTime` / `summary` /
+/// `description` — whichever of `fields` are `Some` (`Some("")` clears
+/// description). This is **not** `events.update` (full replace). Arrays
+/// replace on patch, so we deliberately never send attendees, conferenceData,
+/// extendedProperties, or recurrence — those stay on Google untouched.
+/// Empty (all `None`) → [`CalendarError::Invalid`] before any journal row.
 ///
 /// Journals `pending` before Google, sends `If-Match` with the stored
 /// `google_etag` (or GETs one first when empty), retries 412 up to three
@@ -192,6 +192,10 @@ pub async fn patch_event(
             start: None,
             end: Some(end_rfc3339.to_string()),
             summary: None,
+            description: None,
+            is_all_day: None,
+            start_time_zone: None,
+            calendar_id: None,
         },
         now_unix,
     )
@@ -223,6 +227,10 @@ pub async fn patch_event_summary(
             start: None,
             end: None,
             summary: Some(summary.to_string()),
+            description: None,
+            is_all_day: None,
+            start_time_zone: None,
+            calendar_id: None,
         },
         now_unix,
     )
@@ -230,8 +238,14 @@ pub async fn patch_event_summary(
 }
 
 /// Looks up a local event by id, verifies the owning calendar belongs to
-/// `user_id`, then patches via [`patch_event_fields`]. Wrong owner / missing
-/// → [`CalendarError::NotFound`] (no Google call, no journal).
+/// `user_id`, then either:
+/// - moves the event (`fields.calendar_id` only → Google `events.move`), or
+/// - patches fields via [`patch_event_fields`].
+///
+/// `calendar_id` is exclusive and must not be combined with start/end/summary/
+/// description/is_all_day/start_time_zone. `start_time_zone` requires start
+/// and end. Wrong owner / missing → [`CalendarError::NotFound`] (no Google
+/// call, no journal).
 pub async fn update_event_for_user(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -243,6 +257,54 @@ pub async fn update_event_for_user(
     fields: &PatchEventFields,
     now_unix: i64,
 ) -> Result<CreateEventOutput, CalendarError> {
+    let has_other = fields.start.is_some()
+        || fields.end.is_some()
+        || fields.summary.is_some()
+        || fields.description.is_some()
+        || fields.is_all_day.is_some()
+        || fields.start_time_zone.is_some();
+
+    if let Some(dest_local_id) = fields.calendar_id.as_deref() {
+        let dest_local_id = dest_local_id.trim();
+        if dest_local_id.is_empty() {
+            return Err(CalendarError::Invalid(
+                "calendar_id must not be empty".to_string(),
+            ));
+        }
+        if has_other {
+            return Err(CalendarError::Invalid(
+                "calendar_id cannot be combined with start, end, summary, description, is_all_day, or start_time_zone"
+                    .to_string(),
+            ));
+        }
+        let (source, event) = lookup_owned_event(calendars, events, user_id, event_id).await?;
+        return super::write_journal::move_event_with_journal(
+            http,
+            calendars,
+            events,
+            operations,
+            access,
+            &source,
+            &event.id,
+            &event.google_event_id,
+            dest_local_id,
+            now_unix,
+        )
+        .await;
+    }
+
+    if fields.start_time_zone.is_some() && (fields.start.is_none() || fields.end.is_none()) {
+        return Err(CalendarError::Invalid(
+            "time zone requires start and end".to_string(),
+        ));
+    }
+
+    if fields.is_all_day == Some(true) && (fields.start.is_none() || fields.end.is_none()) {
+        return Err(CalendarError::Invalid(
+            "is_all_day requires start and end".to_string(),
+        ));
+    }
+
     let (cal, event) = lookup_owned_event(calendars, events, user_id, event_id).await?;
     patch_event_fields(
         http,

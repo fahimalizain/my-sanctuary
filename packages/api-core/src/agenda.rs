@@ -3413,6 +3413,22 @@ mod tests {
             Ok(())
         }
 
+        async fn reassign_calendar(
+            &self,
+            id: &str,
+            new_calendar_id: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            if let Some(event) = stored
+                .iter_mut()
+                .find(|event| event.deleted_at.is_none() && event.id == id)
+            {
+                event.calendar_id = new_calendar_id.to_string();
+            }
+            Ok(())
+        }
+
         async fn delete_by_google_event_id(
             &self,
             _calendar_id: &str,

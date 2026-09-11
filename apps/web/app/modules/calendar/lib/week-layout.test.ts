@@ -24,9 +24,15 @@ import {
   eventTopPx,
   fitPeriodStart,
   formatDayRangeTitle,
+  applyStartDate,
+  applyEndTime,
+  applyStartTime,
   formatEventDateLine,
   formatEventDuration,
   formatWeekTitle,
+  INSPECTOR_MIN_DURATION_MIN,
+  toDateInputValue,
+  toTimeInputValue,
   gutterWithRemainder,
   contrastingInk,
   hexLuminance,
@@ -54,6 +60,10 @@ import {
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
+  civilDateFromAllDayIso,
+  timedRangeToAllDay,
+  allDayRangeToTimed,
+  applyAllDayStartDate,
 } from './week-layout';
 
 // ── startOfWeek ─────────────────────────────────────────────────────────
@@ -829,6 +839,98 @@ test('formatEventDateLine: Monday uses Sun-first names (not WEEK_DAYS)', () => {
   assert.equal(formatEventDateLine(start, end), 'Mon Sep 7');
 });
 
+// ── toTimeInputValue / toDateInputValue ──────────────────────────────────
+
+test('toTimeInputValue: zero-pads local 24h HH:mm', () => {
+  assert.equal(toTimeInputValue(new Date(2026, 8, 13, 5, 15)), '05:15');
+  assert.equal(toTimeInputValue(new Date(2026, 8, 13, 0, 0)), '00:00');
+  assert.equal(toTimeInputValue(new Date(2026, 8, 13, 23, 5)), '23:05');
+});
+
+test('toDateInputValue: local civil YYYY-MM-DD', () => {
+  assert.equal(toDateInputValue(new Date(2026, 8, 13, 5, 15)), '2026-09-13');
+  assert.equal(toDateInputValue(new Date(2026, 0, 5, 23, 59)), '2026-01-05');
+});
+
+// ── applyStartTime / applyEndTime / applyStartDate ───────────────────────
+
+test('applyStartTime: preserves duration; invalid → null', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 5, 30);
+  const next = applyStartTime(start, end, '06:00');
+  assert.ok(next);
+  assert.equal(next.start.getHours(), 6);
+  assert.equal(next.start.getMinutes(), 0);
+  assert.equal(next.end.getHours(), 6);
+  assert.equal(next.end.getMinutes(), 15);
+  assert.equal(next.start.getDate(), 13);
+  assert.equal(applyStartTime(start, end, ''), null);
+  assert.equal(applyStartTime(start, end, 'garbage'), null);
+  assert.equal(applyStartTime(start, end, '25:00'), null);
+});
+
+test('applyEndTime: keeps start; clamps when end ≤ start; invalid → null', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 5, 30);
+
+  const later = applyEndTime(start, end, '07:00');
+  assert.ok(later);
+  assert.equal(later.start.getTime(), start.getTime());
+  assert.equal(later.end.getHours(), 7);
+  assert.equal(later.end.getMinutes(), 0);
+
+  const clamped = applyEndTime(start, end, '04:00');
+  assert.ok(clamped);
+  assert.equal(clamped.start.getTime(), start.getTime());
+  assert.equal(
+    clamped.end.getTime(),
+    start.getTime() + INSPECTOR_MIN_DURATION_MIN * 60_000,
+  );
+  assert.equal(clamped.end.getHours(), 5);
+  assert.equal(clamped.end.getMinutes(), 30);
+
+  // Overnight: end civil date kept when editing end clock.
+  const nightStart = new Date(2026, 8, 13, 23, 0);
+  const nightEnd = new Date(2026, 8, 14, 1, 0);
+  const overnight = applyEndTime(nightStart, nightEnd, '01:30');
+  assert.ok(overnight);
+  assert.equal(overnight.end.getDate(), 14);
+  assert.equal(overnight.end.getHours(), 1);
+  assert.equal(overnight.end.getMinutes(), 30);
+
+  assert.equal(applyEndTime(start, end, ''), null);
+  assert.equal(applyEndTime(start, end, 'xx:yy'), null);
+});
+
+test('applyStartDate: shifts both instants by whole-day delta; invalid → null', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 5, 30);
+  const next = applyStartDate(start, end, '2026-09-14');
+  assert.ok(next);
+  assert.equal(next.start.getFullYear(), 2026);
+  assert.equal(next.start.getMonth(), 8);
+  assert.equal(next.start.getDate(), 14);
+  assert.equal(next.start.getHours(), 5);
+  assert.equal(next.start.getMinutes(), 15);
+  assert.equal(next.end.getDate(), 14);
+  assert.equal(next.end.getHours(), 5);
+  assert.equal(next.end.getMinutes(), 30);
+
+  // Overnight: both shift, end stays next day relative.
+  const nightStart = new Date(2026, 8, 13, 23, 0);
+  const nightEnd = new Date(2026, 8, 14, 1, 0);
+  const shifted = applyStartDate(nightStart, nightEnd, '2026-09-15');
+  assert.ok(shifted);
+  assert.equal(shifted.start.getDate(), 15);
+  assert.equal(shifted.start.getHours(), 23);
+  assert.equal(shifted.end.getDate(), 16);
+  assert.equal(shifted.end.getHours(), 1);
+
+  assert.equal(applyStartDate(start, end, ''), null);
+  assert.equal(applyStartDate(start, end, 'not-a-date'), null);
+  assert.equal(applyStartDate(start, end, '2026-02-30'), null);
+});
+
 // ── defaultWritableCalendar ─────────────────────────────────────────────
 
 test('defaultWritableCalendar: prefers primary writer; skips reader', () => {
@@ -884,4 +986,55 @@ test('defaultWritableCalendar: undefined when only readers', () => {
     ]),
     undefined,
   );
+});
+
+// ── All-day civil helpers ───────────────────────────────────────────────
+
+test('civilDateFromAllDayIso: uses ISO prefix, not local Date(iso) shift', () => {
+  // UTC midnight Sep 13 is previous evening in US zones — prefix must win.
+  const d = civilDateFromAllDayIso('2026-09-13T00:00:00Z');
+  assert.ok(d);
+  assert.equal(d!.getFullYear(), 2026);
+  assert.equal(d!.getMonth(), 8);
+  assert.equal(d!.getDate(), 13);
+  assert.equal(d!.getHours(), 0);
+  assert.equal(d!.getMinutes(), 0);
+  assert.equal(civilDateFromAllDayIso('not-a-date'), null);
+  assert.equal(civilDateFromAllDayIso(''), null);
+});
+
+test('timedRangeToAllDay: same-day timed → exclusive next civil day', () => {
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 5, 30);
+  const next = timedRangeToAllDay(start, end);
+  assert.equal(next.startDate, '2026-09-13');
+  assert.equal(next.endDate, '2026-09-14');
+  assert.equal(next.startIso, '2026-09-13T00:00:00Z');
+  assert.equal(next.endIso, '2026-09-14T00:00:00Z');
+});
+
+test('allDayRangeToTimed: civil start at 09:00–10:00 local', () => {
+  const next = allDayRangeToTimed(
+    '2026-09-13T00:00:00Z',
+    '2026-09-14T00:00:00Z',
+  );
+  assert.ok(next);
+  assert.equal(next!.start.getFullYear(), 2026);
+  assert.equal(next!.start.getMonth(), 8);
+  assert.equal(next!.start.getDate(), 13);
+  assert.equal(next!.start.getHours(), 9);
+  assert.equal(next!.start.getMinutes(), 0);
+  assert.equal(next!.end.getHours(), 10);
+  assert.equal(next!.end.getMinutes(), 0);
+});
+
+test('applyAllDayStartDate: shifts exclusive end by same day delta', () => {
+  const next = applyAllDayStartDate(
+    '2026-09-13T00:00:00Z',
+    '2026-09-14T00:00:00Z',
+    '2026-09-15',
+  );
+  assert.ok(next);
+  assert.equal(next!.startIso, '2026-09-15T00:00:00Z');
+  assert.equal(next!.endIso, '2026-09-16T00:00:00Z');
 });

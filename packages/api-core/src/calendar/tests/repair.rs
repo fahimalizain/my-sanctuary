@@ -2,7 +2,7 @@ use super::support::*;
 use crate::calendar::repair_inflight_operations;
 use crate::models::{
     CalendarEventOperation, OP_STATUS_CACHE_APPLIED, OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED,
-    OP_STATUS_PENDING, OP_VERB_INSERT,
+    OP_STATUS_PENDING, OP_VERB_INSERT, OP_VERB_MOVE,
 };
 use crate::repo::CalendarEventRepo;
 
@@ -29,6 +29,18 @@ fn journal_op(
         created_at: "2023-11-14T22:00:00Z".to_string(),
         updated_at: "2023-11-14T22:00:00Z".to_string(),
     }
+}
+
+fn move_journal_op(
+    id: &str,
+    status: &str,
+    google_event_id: &str,
+    local_event_id: &str,
+    dest_google_cal_id: &str,
+) -> CalendarEventOperation {
+    let mut op = journal_op(id, OP_VERB_MOVE, status, google_event_id, local_event_id);
+    op.payload_json = serde_json::json!({ "destination": dest_google_cal_id }).to_string();
+    op
 }
 
 #[test]
@@ -189,6 +201,113 @@ fn repair_skips_other_users_and_continues_on_get_error() {
     assert_eq!(stored[0].status, OP_STATUS_GOOGLE_COMMITTED);
     assert_eq!(stored[1].status, OP_STATUS_GOOGLE_COMMITTED);
     assert!(events.stored.lock().unwrap().is_empty());
+}
+
+#[test]
+fn repair_google_committed_move_source_gone_dest_200_reassigns_zero_posts() {
+    // Move committed on Google; cache apply failed. Source GET 404, dest GET
+    // 200 → reassign + upsert dest, cache_applied. Never POSTs.
+    let dest_body = r#"{
+        "id": "g-moved",
+        "etag": "e-dest",
+        "summary": "Moved meeting",
+        "start": {"dateTime": "2026-08-19T09:00:00Z"},
+        "end": {"dateTime": "2026-08-19T10:00:00Z"}
+    }"#;
+    // One-shots: source 404 first, then dest 200 (substring match order).
+    let http = FakeHttp::new(vec![]).with_one_shots(vec![
+        ("/calendars/primary%40example.com/events/g-moved", 404, ""),
+        ("/calendars/work%40example.com/events/g-moved", 200, dest_body),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![
+        calendar("cal-1", "primary@example.com", true),
+        calendar("cal-2", "work@example.com", true),
+    ]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(living_event("local-1", "cal-1", "g-moved"));
+    let ops = FakeOperationRepo::with(vec![move_journal_op(
+        "op-move",
+        OP_STATUS_GOOGLE_COMMITTED,
+        "g-moved",
+        "local-1",
+        "work@example.com",
+    )]);
+
+    let errors = pollster::block_on(repair_inflight_operations(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        NOW_UNIX,
+    ));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(http.posts.lock().unwrap().is_empty(), "repair is GET-only");
+    assert_eq!(http.gets.lock().unwrap().len(), 2, "source + dest GET");
+
+    let stored = events.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, "local-1", "local id preserved");
+    assert_eq!(stored[0].calendar_id, "cal-2");
+    assert_eq!(stored[0].title, "Moved meeting");
+    assert!(stored[0].deleted_at.is_none());
+
+    let op = &ops.stored.lock().unwrap()[0];
+    assert_eq!(op.status, OP_STATUS_CACHE_APPLIED);
+    assert_eq!(op.local_event_id, "local-1");
+}
+
+#[test]
+fn repair_pending_move_source_and_dest_gone_marks_failed_keeps_local() {
+    // Pending move, event on neither calendar → failed; local row remains.
+    let http = FakeHttp::new(vec![]).with_one_shots(vec![
+        ("/calendars/primary%40example.com/events/g-pending", 404, ""),
+        ("/calendars/work%40example.com/events/g-pending", 404, ""),
+    ]);
+    let calendars = FakeCalendarRepo::with(vec![
+        calendar("cal-1", "primary@example.com", true),
+        calendar("cal-2", "work@example.com", true),
+    ]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(living_event("local-1", "cal-1", "g-pending"));
+    let ops = FakeOperationRepo::with(vec![move_journal_op(
+        "op-move",
+        OP_STATUS_PENDING,
+        "g-pending",
+        "local-1",
+        "work@example.com",
+    )]);
+
+    let errors = pollster::block_on(repair_inflight_operations(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        "u-1",
+        NOW_UNIX,
+    ));
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(http.posts.lock().unwrap().is_empty());
+
+    let stored = events.stored.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, "local-1");
+    assert_eq!(stored[0].calendar_id, "cal-1");
+    assert!(stored[0].deleted_at.is_none(), "do not delete on pending 404");
+
+    let op = &ops.stored.lock().unwrap()[0];
+    assert_eq!(op.status, OP_STATUS_FAILED);
+    assert!(op.last_error.contains("never reached Google"), "{}", op.last_error);
 }
 
 #[test]

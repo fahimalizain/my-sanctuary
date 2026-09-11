@@ -18,20 +18,91 @@ import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
 import { eventChipSelector } from '../lib/inspector-anchor';
 import {
+  allDayRangeToTimed,
+  applyAllDayStartDate,
+  applyStartDate,
+  applyEndTime,
+  applyStartTime,
+  civilDateFromAllDayIso,
   formatEventDateLine,
   formatEventDuration,
   formatEventTime,
+  timedRangeToAllDay,
+  toDateInputValue,
+  toTimeInputValue,
 } from '../lib/week-layout';
 
 const DESKTOP_MQ = '(min-width: 768px)';
 
+const FALLBACK_TIME_ZONES = [
+  'UTC',
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Los_Angeles',
+  'Europe/London',
+  'Europe/Paris',
+  'Asia/Riyadh',
+  'Asia/Dubai',
+  'Asia/Kolkata',
+  'Asia/Tokyo',
+  'Australia/Sydney',
+] as const;
+
+function browserTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+function supportedTimeZones(): string[] {
+  try {
+    const intlWithZones = Intl as typeof Intl & {
+      supportedValuesOf?: (key: string) => string[];
+    };
+    const values = intlWithZones.supportedValuesOf?.('timeZone');
+    if (values && values.length > 0) return [...values];
+  } catch {
+    // fall through
+  }
+  return [...FALLBACK_TIME_ZONES];
+}
+
+function timeZoneOptions(current: string): string[] {
+  const set = new Set(supportedTimeZones());
+  const browser = browserTimeZone();
+  if (browser) set.add(browser);
+  if (current) set.add(current);
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
 export interface EventInspectorProps {
   event: CalendarEvent;
   calendar?: GoogleCalendar;
+  /** Writable calendars for the calendar select (local ids). */
+  calendars?: GoogleCalendar[];
   /** Focus the title input on mount (click-to-create path). */
   focusTitle?: boolean;
   onClose: () => void;
   onSaveTitle: (summary: string) => void | Promise<void>;
+  onSaveDescription: (description: string) => void | Promise<void>;
+  onSaveTimes: (startIso: string, endIso: string) => void | Promise<void>;
+  /** Toggle all-day; start/end are overlay ISO (UTC midnight civil or timed). */
+  onSaveAllDay: (next: {
+    isAllDay: boolean;
+    startIso: string;
+    endIso: string;
+  }) => void | Promise<void>;
+  /** Change event time zone (empty = local / omit zone on PATCH). */
+  onSaveTimeZone: (
+    timeZone: string,
+    startIso: string,
+    endIso: string,
+  ) => void | Promise<void>;
+  /** Move event to another calendar (local calendar id). */
+  onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving?: boolean;
   isDeleting?: boolean;
@@ -151,28 +222,59 @@ function hasRepeat(event: CalendarEvent): boolean {
   }
 }
 
+function isWritableCalendar(cal: GoogleCalendar): boolean {
+  return cal.access_role === 'owner' || cal.access_role === 'writer';
+}
+
 interface InspectorFormProps {
   event: CalendarEvent;
   calendar?: GoogleCalendar;
+  calendars: GoogleCalendar[];
   title: string;
   setTitle: (v: string) => void;
   titleRef: RefObject<HTMLInputElement | null>;
   commitTitle: () => void;
+  description: string;
+  setDescription: (v: string) => void;
+  commitDescription: () => void;
+  commitTimes: (next: { start: Date; end: Date } | null) => void;
+  commitAllDayDate: (ymd: string) => void;
+  onToggleAllDay: () => void;
+  onChangeTimeZone: (zone: string) => void;
   onClose: () => void;
+  onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isSaving: boolean;
   isDeleting: boolean;
   writable: boolean;
 }
 
+const timeInputClassName =
+  'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+const dateInputClassName =
+  'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+const chipClassName =
+  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground';
+const chipToggleClassName =
+  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 aria-pressed:border-foreground/40 aria-pressed:bg-muted/40 aria-pressed:text-foreground disabled:opacity-50';
+
 function InspectorForm({
   event,
   calendar,
+  calendars,
   title,
   setTitle,
   titleRef,
   commitTitle,
+  description,
+  setDescription,
+  commitDescription,
+  commitTimes,
+  commitAllDayDate,
+  onToggleAllDay,
+  onChangeTimeZone,
   onClose,
+  onSaveCalendar,
   onDelete,
   isSaving,
   isDeleting,
@@ -180,19 +282,55 @@ function InspectorForm({
 }: InspectorFormProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
-  const start = new Date(event.start_time);
-  const end = new Date(event.end_time);
-  const whenRange = `${formatEventTime(start)} → ${formatEventTime(end)} ${formatEventDuration(start, end)}`;
+  const isAllDay = event.is_all_day === true;
+  const start = isAllDay
+    ? (civilDateFromAllDayIso(event.start_time) ?? new Date(event.start_time))
+    : new Date(event.start_time);
+  const end = isAllDay
+    ? (civilDateFromAllDayIso(event.end_time) ?? new Date(event.end_time))
+    : new Date(event.end_time);
+  const durationLabel = formatEventDuration(
+    new Date(event.start_time),
+    new Date(event.end_time),
+  );
+  const whenRange = `${formatEventTime(new Date(event.start_time))} → ${formatEventTime(new Date(event.end_time))} ${durationLabel}`;
   const dateLine = formatEventDateLine(start, end);
+  const timesEditable = writable && !isAllDay;
+  const allDayDateEditable = writable && isAllDay;
+  const crossDay =
+    start.getFullYear() !== end.getFullYear() ||
+    start.getMonth() !== end.getMonth() ||
+    start.getDate() !== end.getDate();
 
   const timeZone = event.start_time_zone?.trim() || '';
-  const showAllDay = event.is_all_day === true;
   const showRepeat = hasRepeat(event);
-  const showChips = showAllDay || Boolean(timeZone) || showRepeat;
+  const browserZone = browserTimeZone();
+  const zoneOptions = timeZoneOptions(timeZone);
+  // Writable: always show All-day toggle; zone select when timed.
+  // Read-only: static chips only when set.
+  const showChipRow = writable || isAllDay || Boolean(timeZone) || showRepeat;
 
-  const description = event.description?.trim() ?? '';
+  const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
+  const inputsDisabled = isSaving || isDeleting;
+
+  const writableCalendars = calendars.filter(isWritableCalendar);
+  const currentInWritable = writableCalendars.some(
+    (c) => c.id === event.calendar_id,
+  );
+  // Reader calendar not in writable list: keep a disabled option so value
+  // does not reset.
+  const calendarSelectOptions =
+    !currentInWritable && calendar
+      ? [calendar, ...writableCalendars]
+      : writableCalendars;
+
+  const allDayDateValue = isAllDay
+    ? civilDateFromAllDayIso(event.start_time)
+      ? toDateInputValue(civilDateFromAllDayIso(event.start_time)!)
+      : toDateInputValue(start)
+    : toDateInputValue(start);
 
   return (
     <>
@@ -270,56 +408,204 @@ function InspectorForm({
           <p className="text-lg font-semibold text-foreground">{title}</p>
         )}
 
-        {/* When — clock-led row */}
+        {/* When — clock-led row; timed+writable uses native time/date inputs */}
         <div className="flex gap-2.5">
           <Clock
             className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
             aria-hidden
           />
           <div className="min-w-0 space-y-0.5">
-            <p className="text-sm tabular-nums text-foreground">{whenRange}</p>
-            <p className="text-sm text-muted-foreground">{dateLine}</p>
-            {showChips ? (
-              <div className="flex flex-wrap gap-1.5 pt-1">
-                {showAllDay ? (
-                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
+            {timesEditable ? (
+              <>
+                <div className="flex flex-wrap items-baseline gap-x-1 text-sm tabular-nums text-foreground">
+                  <input
+                    type="time"
+                    step={60}
+                    aria-label="Start time"
+                    value={toTimeInputValue(start)}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      commitTimes(applyStartTime(start, end, e.target.value));
+                    }}
+                    onBlur={(e) => {
+                      commitTimes(applyStartTime(start, end, e.target.value));
+                    }}
+                    className={timeInputClassName}
+                  />
+                  <span aria-hidden>→</span>
+                  <input
+                    type="time"
+                    step={60}
+                    aria-label="End time"
+                    value={toTimeInputValue(end)}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      commitTimes(applyEndTime(start, end, e.target.value));
+                    }}
+                    onBlur={(e) => {
+                      commitTimes(applyEndTime(start, end, e.target.value));
+                    }}
+                    className={timeInputClassName}
+                  />
+                  <span className="text-sm tabular-nums text-foreground">
+                    {durationLabel}
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-baseline gap-x-1.5">
+                  <input
+                    type="date"
+                    aria-label="Date"
+                    value={toDateInputValue(start)}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      commitTimes(applyStartDate(start, end, e.target.value));
+                    }}
+                    onBlur={(e) => {
+                      commitTimes(applyStartDate(start, end, e.target.value));
+                    }}
+                    className={dateInputClassName}
+                  />
+                  {crossDay ? (
+                    <span className="text-sm text-muted-foreground">
+                      {dateLine}
+                    </span>
+                  ) : null}
+                </div>
+              </>
+            ) : allDayDateEditable ? (
+              <div className="flex flex-wrap items-baseline gap-x-1.5">
+                <input
+                  type="date"
+                  aria-label="Date"
+                  value={allDayDateValue}
+                  disabled={inputsDisabled}
+                  onChange={(e) => {
+                    commitAllDayDate(e.target.value);
+                  }}
+                  onBlur={(e) => {
+                    commitAllDayDate(e.target.value);
+                  }}
+                  className={dateInputClassName}
+                />
+              </div>
+            ) : (
+              <>
+                <p className="text-sm tabular-nums text-foreground">
+                  {whenRange}
+                </p>
+                <p className="text-sm text-muted-foreground">{dateLine}</p>
+              </>
+            )}
+            {showChipRow ? (
+              <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                {writable ? (
+                  <button
+                    type="button"
+                    aria-label="All-day"
+                    aria-pressed={isAllDay}
+                    disabled={inputsDisabled}
+                    onClick={onToggleAllDay}
+                    className={chipToggleClassName}
+                  >
                     All-day
-                  </span>
+                  </button>
+                ) : isAllDay ? (
+                  <span className={chipClassName}>All-day</span>
                 ) : null}
-                {timeZone ? (
-                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
-                    {timeZone}
-                  </span>
+                {writable && !isAllDay ? (
+                  <select
+                    aria-label="Time zone"
+                    value={timeZone}
+                    disabled={inputsDisabled}
+                    onChange={(e) => {
+                      onChangeTimeZone(e.target.value);
+                    }}
+                    className="max-w-[12rem] truncate rounded-full border border-border/70 bg-transparent px-2 py-0.5 text-xs text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+                  >
+                    <option value="">
+                      {browserZone ? browserZone : 'Local'}
+                    </option>
+                    {zoneOptions.map((z) => (
+                      <option key={z} value={z}>
+                        {z}
+                      </option>
+                    ))}
+                  </select>
+                ) : !writable && timeZone ? (
+                  <span className={chipClassName}>{timeZone}</span>
                 ) : null}
                 {showRepeat ? (
-                  <span className="rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground">
-                    Repeat
-                  </span>
+                  <span className={chipClassName}>Repeat</span>
                 ) : null}
               </div>
             ) : null}
           </div>
         </div>
 
-        {/* Description — always visible, read-only */}
-        {description ? (
+        {/* Description — textarea when writable; static when read-only */}
+        {writable ? (
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            onBlur={commitDescription}
+            onKeyDown={(e) => {
+              // Enter inserts a newline; Cmd/Ctrl+Enter blurs to commit.
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                (e.target as HTMLTextAreaElement).blur();
+              }
+            }}
+            disabled={isSaving || isDeleting}
+            aria-label="Description"
+            placeholder="Description"
+            rows={3}
+            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
+          />
+        ) : descriptionDisplay ? (
           <p className="whitespace-pre-wrap text-sm text-foreground">
-            {description}
+            {descriptionDisplay}
           </p>
         ) : (
           <p className="text-sm text-muted-foreground">Description</p>
         )}
 
-        {/* Calendar — swatch + summary */}
+        {/* Calendar — swatch + select (writable) or static summary */}
         <div className="flex min-w-0 items-center gap-2">
           <span
             className="h-2.5 w-2.5 shrink-0 rounded-full"
             style={{ backgroundColor: swatch }}
             aria-hidden
           />
-          <span className="truncate text-sm text-foreground">
-            {calendarLabel}
-          </span>
+          {writable ? (
+            <select
+              aria-label="Calendar"
+              value={event.calendar_id}
+              disabled={inputsDisabled}
+              onChange={(e) => {
+                const next = e.target.value;
+                if (next === event.calendar_id) return;
+                void onSaveCalendar(next);
+              }}
+              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-sm text-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+            >
+              {calendarSelectOptions.map((cal) => {
+                const label =
+                  cal.summary.trim().length > 0
+                    ? cal.summary
+                    : cal.google_calendar_id;
+                const disabledOption = !isWritableCalendar(cal);
+                return (
+                  <option key={cal.id} value={cal.id} disabled={disabledOption}>
+                    {label}
+                  </option>
+                );
+              })}
+            </select>
+          ) : (
+            <span className="truncate text-sm text-foreground">
+              {calendarLabel}
+            </span>
+          )}
         </div>
       </div>
     </>
@@ -334,9 +620,15 @@ function InspectorForm({
 export function EventInspector({
   event,
   calendar,
+  calendars = [],
   focusTitle = false,
   onClose,
   onSaveTitle,
+  onSaveDescription,
+  onSaveTimes,
+  onSaveAllDay,
+  onSaveTimeZone,
+  onSaveCalendar,
   onDelete,
   isSaving = false,
   isDeleting = false,
@@ -346,6 +638,9 @@ export function EventInspector({
   const titleRef = useRef<HTMLInputElement>(null);
   // Track the last-saved title so blur after an unchanged edit is a no-op.
   const savedTitleRef = useRef(event.title);
+  const [description, setDescription] = useState(event.description ?? '');
+  // Committed (trimmed) description — blank is a valid clear, unlike title.
+  const savedDescriptionRef = useRef((event.description ?? '').trim());
   const isDesktop = useIsDesktop();
   const rect = useChipRect(event.id);
   const hidden = isDragging;
@@ -359,6 +654,15 @@ export function EventInspector({
     setTitle(event.title);
     savedTitleRef.current = event.title;
   }, [event.id, event.title]);
+
+  // Same dirty-across-remap rule for description.
+  useEffect(() => {
+    const dirty = description !== savedDescriptionRef.current;
+    if (dirty) return;
+    const next = event.description ?? '';
+    setDescription(next);
+    savedDescriptionRef.current = next.trim();
+  }, [event.id, event.description]);
 
   useEffect(() => {
     if (focusTitle && writable) {
@@ -390,15 +694,113 @@ export function EventInspector({
     void onSaveTitle(next);
   };
 
+  const commitDescription = () => {
+    const next = description.trim();
+    if (next === savedDescriptionRef.current) {
+      // Normalize whitespace-only / trailing spaces in the field.
+      if (description !== next) setDescription(next);
+      return;
+    }
+    savedDescriptionRef.current = next;
+    setDescription(next);
+    void onSaveDescription(next);
+  };
+
+  // Times are derived from event props (no local dirty draft). Unchanged
+  // range is a no-op so change+blur double-fire does not double-PATCH.
+  // Compare instants (getTime), not ISO strings — Google/replica often omits
+  // milliseconds (`...00Z`) while Date.toISOString() always emits `.000Z`.
+  const commitTimes = (next: { start: Date; end: Date } | null) => {
+    if (!next) return;
+    const currentStart = new Date(event.start_time);
+    const currentEnd = new Date(event.end_time);
+    if (
+      Number.isNaN(currentStart.getTime()) ||
+      Number.isNaN(currentEnd.getTime())
+    ) {
+      return;
+    }
+    if (
+      next.start.getTime() === currentStart.getTime() &&
+      next.end.getTime() === currentEnd.getTime()
+    ) {
+      return;
+    }
+    void onSaveTimes(next.start.toISOString(), next.end.toISOString());
+  };
+
+  const commitAllDayDate = (ymd: string) => {
+    if (!ymd.trim()) return;
+    const next = applyAllDayStartDate(event.start_time, event.end_time, ymd);
+    if (!next) return;
+    // Compare civil prefixes so replica `…Z` vs helper `…Z` stay no-ops.
+    const curS = civilDateFromAllDayIso(event.start_time);
+    const curE = civilDateFromAllDayIso(event.end_time);
+    const nextS = civilDateFromAllDayIso(next.startIso);
+    const nextE = civilDateFromAllDayIso(next.endIso);
+    if (
+      curS &&
+      curE &&
+      nextS &&
+      nextE &&
+      curS.getTime() === nextS.getTime() &&
+      curE.getTime() === nextE.getTime()
+    ) {
+      return;
+    }
+    void onSaveAllDay({
+      isAllDay: true,
+      startIso: next.startIso,
+      endIso: next.endIso,
+    });
+  };
+
+  const onToggleAllDay = () => {
+    if (event.is_all_day === true) {
+      const timed = allDayRangeToTimed(event.start_time, event.end_time);
+      if (!timed) return;
+      void onSaveAllDay({
+        isAllDay: false,
+        startIso: timed.start.toISOString(),
+        endIso: timed.end.toISOString(),
+      });
+      return;
+    }
+    const start = new Date(event.start_time);
+    const end = new Date(event.end_time);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return;
+    const allDay = timedRangeToAllDay(start, end);
+    void onSaveAllDay({
+      isAllDay: true,
+      startIso: allDay.startIso,
+      endIso: allDay.endIso,
+    });
+  };
+
+  const onChangeTimeZone = (zone: string) => {
+    const current = event.start_time_zone?.trim() || '';
+    if (zone === current) return;
+    void onSaveTimeZone(zone, event.start_time, event.end_time);
+  };
+
   const form = (
     <InspectorForm
       event={event}
       calendar={calendar}
+      calendars={calendars}
       title={title}
       setTitle={setTitle}
       titleRef={titleRef}
       commitTitle={commitTitle}
+      description={description}
+      setDescription={setDescription}
+      commitDescription={commitDescription}
+      commitTimes={commitTimes}
+      commitAllDayDate={commitAllDayDate}
+      onToggleAllDay={onToggleAllDay}
+      onChangeTimeZone={onChangeTimeZone}
       onClose={onClose}
+      onSaveCalendar={onSaveCalendar}
       onDelete={onDelete}
       isSaving={isSaving}
       isDeleting={isDeleting}
@@ -448,6 +850,11 @@ export function EventInspector({
                 '[data-event-chip], [data-allday-chip], [data-event-id]',
               )
             ) {
+              e.preventDefault();
+              return;
+            }
+            // Native time/date pickers often render outside the popover.
+            if (target.closest('input[type="time"], input[type="date"]')) {
               e.preventDefault();
             }
           }}

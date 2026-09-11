@@ -11,9 +11,10 @@
 //!   TEXT lexicographic on that shape. Residual risk: a non-UTC civil date
 //!   stored as Z midnight is not the true instant — accepted this slice; do
 //!   not invent INTEGER epoch columns here.
-//! - **GET projection** remains `timed_masters_and_exceptions`: all-day rows
-//!   are **stored** (so a timed→all-day overwrite hits the same natural key and
-//!   the obsolete timed chip disappears) but **excluded from list SQL**.
+//! - **GET projection** name remains `timed_masters_and_exceptions` (health
+//!   string unchanged). All-day rows are **stored** (so a timed→all-day
+//!   overwrite hits the same natural key) and **included in range list SQL**
+//!   so the week grid can paint them. Running-task list still excludes all-day.
 //! - **Cancelled exceptions** (`status=cancelled` + non-empty `recurringEventId`)
 //!   are stored as living sparse rows. Ordinary cancelled events (no
 //!   `recurringEventId`) are soft-deleted.

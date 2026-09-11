@@ -145,9 +145,15 @@ export function CalendarPage() {
           <EventInspector
             event={session.selectedEvent}
             calendar={session.selectedEventCalendar}
+            calendars={session.calendars}
             focusTitle={session.focusTitleOnOpen}
             onClose={session.closeInspector}
             onSaveTitle={session.handleSaveTitle}
+            onSaveDescription={session.handleSaveDescription}
+            onSaveTimes={session.handleSaveTimes}
+            onSaveAllDay={session.handleSaveAllDay}
+            onSaveTimeZone={session.handleSaveTimeZone}
+            onSaveCalendar={session.handleSaveCalendar}
             onDelete={session.handleDeleteEvent}
             isSaving={session.isSaving}
             isDeleting={session.isDeleting}

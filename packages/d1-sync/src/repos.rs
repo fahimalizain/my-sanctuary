@@ -27,7 +27,8 @@ use api_core::repo::{
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_QUARANTINE_SQL,
+    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_UPSERT_QUARANTINE_SQL,
     OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_UPDATE_PROGRESS_SQL, OPERATION_UPDATE_STATUS_SQL,
     REPLICA_SEEN_INSERT_CHUNK_SIZE, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
@@ -638,6 +639,20 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
             &conn,
             EVENT_DELETE_SQL,
             &[&now_rfc3339, &now_rfc3339, &id],
+        )
+    }
+
+    async fn reassign_calendar(
+        &self,
+        id: &str,
+        new_calendar_id: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        exec(
+            &conn,
+            EVENT_REASSIGN_CALENDAR_SQL,
+            &[&new_calendar_id, &now_rfc3339, &id],
         )
     }
 

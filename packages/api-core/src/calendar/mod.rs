@@ -41,9 +41,9 @@
 //! - Apply is classified in [`crate::calendar_apply`]: ordinary cancelled
 //!   events (`status == "cancelled"`, no `recurringEventId`) are soft-deleted;
 //!   cancelled exceptions are upserted as sparse living rows; all-day and
-//!   no-time events are upserted (stored out of the GET projection
-//!   `timed_masters_and_exceptions`). Window write-through reuses the same
-//!   classifier.
+//!   no-time events are upserted (GET range list includes all-day; projection
+//!   name stays `timed_masters_and_exceptions`). Window write-through reuses
+//!   the same classifier.
 //! - Watch: every `sync_enabled` calendar is ensure-watched (`events.watch`)
 //!   before its first-paint window, but only when `WATCH_CALLBACK_URL` is set
 //!   and is a public HTTPS URL ([`is_public_https_callback`]). Watch 404

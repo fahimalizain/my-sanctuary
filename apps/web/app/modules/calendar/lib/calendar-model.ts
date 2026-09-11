@@ -8,7 +8,9 @@ import { toTimedRange, type DragSlot, type TimedRange } from './calendar-drag';
 import type { PositionedEvent } from '../components/EventChip';
 import {
   WEEK_DAYS,
+  addDays,
   allDaySectionHeight,
+  civilDateFromAllDayIso,
   clampMinutesToDay,
   colorForCalendar,
   eventHeightPx,
@@ -67,10 +69,28 @@ export function buildAllDayChips(
   }[] = [];
 
   for (const event of allDayEvents) {
-    const start = new Date(event.start_time);
-    const end = new Date(event.end_time);
-    const first = startOfDay(start);
-    const last = lastOccupiedCivilDate(start, end);
+    let first: Date;
+    let last: Date;
+
+    if (event.is_all_day) {
+      // Stored as UTC midnight of the civil date — use the ISO prefix, not
+      // local Date(iso) which shifts US zones to the previous evening.
+      const startCivil = civilDateFromAllDayIso(event.start_time);
+      const endCivil = civilDateFromAllDayIso(event.end_time);
+      if (!startCivil || !endCivil) continue;
+      first = startCivil;
+      // Google all-day end is exclusive: last occupied = end − 1 day.
+      last =
+        endCivil.getTime() > startCivil.getTime()
+          ? addDays(endCivil, -1)
+          : startCivil;
+    } else {
+      // Multi-day timed events in the all-day band: local Date conversion.
+      const start = new Date(event.start_time);
+      const end = new Date(event.end_time);
+      first = startOfDay(start);
+      last = lastOccupiedCivilDate(start, end);
+    }
 
     let startDay = Math.round((first.getTime() - origin.getTime()) / msPerDay);
     let endDay = Math.round((last.getTime() - origin.getTime()) / msPerDay);

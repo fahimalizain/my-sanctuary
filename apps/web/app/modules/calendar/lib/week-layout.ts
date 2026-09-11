@@ -31,6 +31,8 @@ export const SNAP_MINUTES = 15;
 export const RESIZE_SNAP_MINUTES = 1;
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
+/** Inspector floor when end is moved to ≤ start (do not reuse DEFAULT_EVENT_DURATION_MIN). */
+export const INSPECTOR_MIN_DURATION_MIN = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -438,6 +440,136 @@ export function formatEventDateLine(start: Date, end: Date): string {
   return `${startLabel} → ${formatCivilDateLabel(end)}`;
 }
 
+/** `type="time"` value: local 24h zero-padded "HH:mm". */
+export function toTimeInputValue(date: Date): string {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+/** `type="date"` value: local civil "YYYY-MM-DD". */
+export function toDateInputValue(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function parseTimeInput(
+  hhmm: string,
+): { hours: number; minutes: number } | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (
+    !Number.isInteger(hours) ||
+    !Number.isInteger(minutes) ||
+    hours < 0 ||
+    hours > 23 ||
+    minutes < 0 ||
+    minutes > 59
+  ) {
+    return null;
+  }
+  return { hours, minutes };
+}
+
+function parseDateInput(
+  ymd: string,
+): { year: number; monthIndex: number; day: number } | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day)
+  ) {
+    return null;
+  }
+  const monthIndex = month - 1;
+  // Reject impossible civil dates (e.g. 2026-02-30) via round-trip.
+  const probe = new Date(year, monthIndex, day);
+  if (
+    probe.getFullYear() !== year ||
+    probe.getMonth() !== monthIndex ||
+    probe.getDate() !== day
+  ) {
+    return null;
+  }
+  return { year, monthIndex, day };
+}
+
+/**
+ * Apply a start-time edit: set hours:minutes on start's civil date, keep duration.
+ * Invalid `hhmm` → null.
+ */
+export function applyStartTime(
+  start: Date,
+  end: Date,
+  hhmm: string,
+): { start: Date; end: Date } | null {
+  const parsed = parseTimeInput(hhmm);
+  if (!parsed) return null;
+  const newStart = new Date(start.getTime());
+  newStart.setHours(parsed.hours, parsed.minutes, 0, 0);
+  const durationMs = end.getTime() - start.getTime();
+  const newEnd = new Date(newStart.getTime() + durationMs);
+  return { start: newStart, end: newEnd };
+}
+
+/**
+ * Apply an end-time edit on end's civil date (overnight-safe). Start unchanged.
+ * If newEnd ≤ start, clamp to start + INSPECTOR_MIN_DURATION_MIN.
+ * Invalid `hhmm` → null.
+ */
+export function applyEndTime(
+  start: Date,
+  end: Date,
+  hhmm: string,
+): { start: Date; end: Date } | null {
+  const parsed = parseTimeInput(hhmm);
+  if (!parsed) return null;
+  const newEnd = new Date(end.getTime());
+  newEnd.setHours(parsed.hours, parsed.minutes, 0, 0);
+  if (newEnd.getTime() <= start.getTime()) {
+    return {
+      start: new Date(start.getTime()),
+      end: new Date(start.getTime() + INSPECTOR_MIN_DURATION_MIN * 60_000),
+    };
+  }
+  return { start: new Date(start.getTime()), end: newEnd };
+}
+
+/**
+ * Shift both instants by the whole-day delta from start's civil date to `ymd`.
+ * Clock times and duration are preserved. Invalid → null.
+ */
+export function applyStartDate(
+  start: Date,
+  end: Date,
+  ymd: string,
+): { start: Date; end: Date } | null {
+  const parsed = parseDateInput(ymd);
+  if (!parsed) return null;
+  const oldMidnight = new Date(
+    start.getFullYear(),
+    start.getMonth(),
+    start.getDate(),
+  ).getTime();
+  const newMidnight = new Date(
+    parsed.year,
+    parsed.monthIndex,
+    parsed.day,
+  ).getTime();
+  const deltaMs = newMidnight - oldMidnight;
+  return {
+    start: new Date(start.getTime() + deltaMs),
+    end: new Date(end.getTime() + deltaMs),
+  };
+}
+
 /**
  * Hour row height for the current viewport hours area.
  * Short viewports stay at ≥48 and scroll; tall ones stretch up to 208.
@@ -720,6 +852,125 @@ export function lastOccupiedCivilDate(start: Date, end: Date): Date {
 /** Local midnight of the civil date containing `date`. */
 export function startOfDay(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+/**
+ * Parse the leading `YYYY-MM-DD` of a stored all-day ISO (typically
+ * `YYYY-MM-DDT00:00:00Z`) as **local civil midnight**. Do not use
+ * `new Date(iso)` — UTC midnight shifts to the previous evening in US zones.
+ */
+export function civilDateFromAllDayIso(iso: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day)
+  ) {
+    return null;
+  }
+  const monthIndex = month - 1;
+  const probe = new Date(year, monthIndex, day);
+  if (
+    probe.getFullYear() !== year ||
+    probe.getMonth() !== monthIndex ||
+    probe.getDate() !== day
+  ) {
+    return null;
+  }
+  return probe;
+}
+
+/** Replica / overlay shape for an all-day civil date: `YYYY-MM-DDT00:00:00Z`. */
+export function civilYmdToUtcMidnightIso(ymd: string): string {
+  return `${ymd.trim()}T00:00:00Z`;
+}
+
+/**
+ * Timed → all-day conversion for the inspector toggle.
+ * Start = local civil date of start; end = exclusive day after last occupied.
+ * Overlay ISO values match the replica (`…T00:00:00Z`).
+ */
+export function timedRangeToAllDay(
+  start: Date,
+  end: Date,
+): {
+  startDate: string;
+  endDate: string;
+  startIso: string;
+  endIso: string;
+} {
+  const startDate = toDateInputValue(start);
+  const lastOccupied = lastOccupiedCivilDate(start, end);
+  const endExclusive = addDays(lastOccupied, 1);
+  const endDate = toDateInputValue(endExclusive);
+  return {
+    startDate,
+    endDate,
+    startIso: civilYmdToUtcMidnightIso(startDate),
+    endIso: civilYmdToUtcMidnightIso(endDate),
+  };
+}
+
+/**
+ * All-day → timed conversion for the inspector toggle.
+ * Start civil date at 09:00 local → 10:00 local (1 hour).
+ * Uses the ISO date prefix (not `new Date(iso)` local conversion).
+ */
+export function allDayRangeToTimed(
+  startIso: string,
+  _endIso: string,
+): { start: Date; end: Date } | null {
+  const civil = civilDateFromAllDayIso(startIso);
+  if (!civil) return null;
+  const start = new Date(
+    civil.getFullYear(),
+    civil.getMonth(),
+    civil.getDate(),
+    9,
+    0,
+    0,
+    0,
+  );
+  const end = new Date(
+    civil.getFullYear(),
+    civil.getMonth(),
+    civil.getDate(),
+    10,
+    0,
+    0,
+    0,
+  );
+  return { start, end };
+}
+
+/**
+ * Shift an all-day exclusive range so start becomes `ymd`, preserving span
+ * in whole days. Inputs/outputs are replica ISO (`…T00:00:00Z`) or bare dates.
+ */
+export function applyAllDayStartDate(
+  startIso: string,
+  endIso: string,
+  ymd: string,
+): { startIso: string; endIso: string } | null {
+  const startCivil = civilDateFromAllDayIso(startIso);
+  const endCivil = civilDateFromAllDayIso(endIso);
+  const parsed = parseDateInput(ymd);
+  if (!startCivil || !endCivil || !parsed) return null;
+  const newStart = new Date(parsed.year, parsed.monthIndex, parsed.day);
+  const spanMs = endCivil.getTime() - startCivil.getTime();
+  // Preserve exclusive span; if inverted/zero, default to one day exclusive.
+  const safeSpan = spanMs > 0 ? spanMs : 24 * 60 * 60 * 1000;
+  const newEnd = new Date(newStart.getTime() + safeSpan);
+  const startDate = toDateInputValue(newStart);
+  const endDate = toDateInputValue(newEnd);
+  return {
+    startIso: civilYmdToUtcMidnightIso(startDate),
+    endIso: civilYmdToUtcMidnightIso(endDate),
+  };
 }
 
 // ── Click-to-create geometry ────────────────────────────────────────────

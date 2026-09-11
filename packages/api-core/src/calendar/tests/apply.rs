@@ -4,7 +4,7 @@ use crate::models::NewCalendarEvent;
 use crate::repo::CalendarEventRepo;
 
 #[test]
-fn all_day_and_no_time_events_are_upserted_out_of_projection() {
+fn all_day_and_no_time_events_are_upserted_and_all_day_in_projection() {
     // Window write-through reuses classify_replica_item; token not advanced.
     let body = r#"{"items":[
         {"id": "all-day", "summary": "Holiday",
@@ -37,9 +37,11 @@ fn all_day_and_no_time_events_are_upserted_out_of_projection() {
         events.deleted_by_google_event_id.lock().unwrap().is_empty(),
         "all-day/no-time are not deleted"
     );
-    // GET projection only surfaces the timed living event.
-    assert_eq!(output.events.len(), 1);
-    assert_eq!(output.events[0].google_event_id, "real");
+    // GET range includes all-day + timed; no-time has empty bounds so no overlap.
+    assert_eq!(output.events.len(), 2);
+    let ids: Vec<_> = output.events.iter().map(|e| e.google_event_id.as_str()).collect();
+    assert!(ids.contains(&"all-day"), "{ids:?}");
+    assert!(ids.contains(&"real"), "{ids:?}");
     assert!(calendars.sync_states.lock().unwrap().is_empty());
     assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
     assert_eq!(output.source, "window");

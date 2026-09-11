@@ -402,8 +402,13 @@ pub async fn create_event(
 
 /// `PATCH /api/calendar/events/:id` → 200 `{"event":{...},"source":"google"}`.
 ///
-/// Body: `{start?, end?, summary?}` — at least one field required. Looks up
-/// the local event, verifies calendar ownership, then patches Google.
+/// Body: `{start?, end?, summary?, description?, is_all_day?, start_time_zone?,
+/// calendar_id?}` — at least one field required. `calendar_id` is exclusive
+/// (local dest calendar id → Google `events.move`); cannot combine with
+/// start/end/summary/description/is_all_day/start_time_zone. All-day patches
+/// send Google `start.date`/`end.date`; timed patches may include `timeZone`
+/// on start/end. Looks up the local event, verifies calendar ownership, then
+/// patches or moves on Google.
 pub async fn update_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
