@@ -87,6 +87,8 @@ export interface CalendarSyncHealth {
   cache_revision: number;
   /** Sanitized watch coverage; never channel secrets. */
   watch_coverage: CalendarWatchCoverage;
+  /** Sanitized replica event coverage; never replay payloads. Optional for older fixtures. */
+  event_coverage?: 'complete' | 'degraded';
   /** Independent operator warning (1h stale / escalated / auth). Optional for older fixtures. */
   operator_warning?: 'none' | 'stale' | 'escalated' | 'authorization_required';
 }

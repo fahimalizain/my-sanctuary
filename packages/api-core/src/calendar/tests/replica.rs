@@ -426,6 +426,12 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
     cal.initial_sync_complete = true;
     let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
     let events = FakeEventRepo::new();
+    // Pre-existing ghost must survive incremental (no merge-full sweep).
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("e-ghost", "cal-1", "ghost", ""));
     let http_fail = FakeHttp::new(vec![
         ("pageToken=tok-2", 500, ""),
         ("/events", 200, page_one),
@@ -440,8 +446,21 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
     assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
     assert!(calendars.sync_states.lock().unwrap().is_empty());
     assert!(events.deleted_stale.lock().unwrap().is_empty());
+    assert!(
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.google_event_id == "ghost")
+            .unwrap()
+            .deleted_at
+            .is_none(),
+        "mid-walk incremental failure must not sweep"
+    );
 
     // Phase 2: both pages succeed — terminal token published + fingerprint.
+    // Incremental completed walk must still leave the ghost living.
     let http_ok = FakeHttp::new(vec![
         ("pageToken=tok-2", 200, page_two),
         ("/events", 200, page_one),
@@ -460,10 +479,22 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
         crate::calendar_sync::replica_query_fingerprint()
     );
     assert!(events.deleted_stale.lock().unwrap().is_empty());
+    let ghost = events
+        .stored
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.google_event_id == "ghost")
+        .unwrap()
+        .clone();
+    assert!(
+        ghost.deleted_at.is_none(),
+        "incremental success must not sweep pre-existing ghost"
+    );
 }
 
 #[test]
-fn replica_410_first_page_merge_full_preserves_task_id_and_ghosts() {
+fn replica_410_completed_merge_full_sweeps_ghosts_and_preserves_task_id() {
     let merge = r#"{"items":[
         {"id":"keep","summary":"Keep","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}
     ],"nextSyncToken":"st-merge"}"#;
@@ -490,8 +521,12 @@ fn replica_410_first_page_merge_full_preserves_task_id_and_ghosts() {
     let stored_ev = events.stored.lock().unwrap();
     let keep = stored_ev.iter().find(|e| e.google_event_id == "keep").unwrap();
     assert_eq!(keep.task_id, "keep-me", "COALESCE must preserve task_id");
+    assert!(keep.deleted_at.is_none(), "seen keep must stay living");
     let ghost = stored_ev.iter().find(|e| e.google_event_id == "ghost").unwrap();
-    assert!(ghost.deleted_at.is_none(), "ghost must not be truncated");
+    assert!(
+        ghost.deleted_at.is_some(),
+        "empty-task_id ghost absent from merge-full must be soft-deleted"
+    );
     assert!(events.deleted_stale.lock().unwrap().is_empty());
     assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-merge");
 }
@@ -536,6 +571,7 @@ fn replica_410_later_page_merge_full_keeps_partial_apply() {
         .unwrap()
         .clone();
     assert_eq!(keep.task_id, "keep-me");
+    assert!(keep.deleted_at.is_none(), "keep in merge body stays living");
     // Partial apply of A from page1 is OK (also in merge-full).
     assert!(events
         .stored
@@ -631,7 +667,8 @@ fn replica_failure_after_page1_delete_replays_idempotently() {
 #[test]
 fn replica_poison_on_one_calendar_records_mapping_poison() {
     // Replica path (sync_calendar) still classifies invalid JSON as
-    // mapping_poison via record_sync_failure.
+    // mapping_poison via record_sync_failure; quarantines the page and
+    // marks event_coverage degraded without advancing the token or sweeping.
     let cal = calendar("cal-a", "a@example.com", true);
     let http = FakeHttp::new(vec![("a%40example.com/events", 200, "not-json{{{")]);
     let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
@@ -645,6 +682,100 @@ fn replica_poison_on_one_calendar_records_mapping_poison() {
     assert_eq!(stored[0].last_error_code, "mapping_poison");
     assert_eq!(stored[0].sync_status, "retrying");
     assert!(stored[0].sync_token.is_empty());
+    assert_eq!(stored[0].event_coverage, "degraded");
+    assert!(
+        stored[0].next_retry_at.is_some(),
+        "backoff must throttle retries"
+    );
+    drop(stored);
+
+    let q = events.quarantine.lock().unwrap();
+    assert_eq!(q.len(), 1, "quarantine row retained");
+    assert_eq!(q[0].calendar_id, "cal-a");
+    assert_eq!(q[0].google_event_id, "");
+    assert_eq!(q[0].phase, "replica_page");
+    assert_eq!(q[0].error_class, "mapping_poison");
+    assert!(
+        q[0].replay_payload.contains("not-json{{{"),
+        "payload retained: {}",
+        q[0].replay_payload
+    );
+    assert_eq!(q[0].attempt_count, 1);
+    drop(q);
+
+    assert!(
+        events.deleted_stale.lock().unwrap().is_empty(),
+        "must not call delete_stale on poison"
+    );
+    // No hot-loop: one events.list GET only.
+    let gets = http.gets.lock().unwrap();
+    let event_gets: Vec<_> = gets
+        .iter()
+        .filter(|u| u.contains("/events"))
+        .collect();
+    assert_eq!(
+        event_gets.len(),
+        1,
+        "poison walk must not hot-loop events.list: {gets:?}"
+    );
+}
+
+#[test]
+fn replica_success_after_poison_clears_coverage_and_quarantine() {
+    let cal = calendar("cal-a", "a@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+
+    // First walk: poison page → quarantine + degraded.
+    let http_poison = FakeHttp::new(vec![("a%40example.com/events", 200, "not-json{{{")]);
+    let err = pollster::block_on(sync_calendar(
+        &http_poison,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::InvalidResponse(_)), "{err:?}");
+    assert_eq!(
+        calendars.stored.lock().unwrap()[0].event_coverage,
+        "degraded"
+    );
+    assert_eq!(events.quarantine.lock().unwrap().len(), 1);
+
+    // Clear backoff so the next walk is allowed (caller would wait on
+    // next_retry_at in production; we force a clean retry here).
+    {
+        let mut stored = calendars.stored.lock().unwrap();
+        stored[0].next_retry_at = None;
+        stored[0].sync_status = "retrying".to_string();
+    }
+    let cal_retry = calendars.stored.lock().unwrap()[0].clone();
+
+    // Second walk: valid page → publish restores complete + drops quarantine.
+    let http_ok = FakeHttp::new(vec![("a%40example.com/events", 200, EVENTS_JSON)]);
+    pollster::block_on(sync_calendar(
+        &http_ok,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal_retry,
+        "2023-11-14T22:14:20Z",
+    ))
+    .unwrap();
+
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].sync_token, "st-9");
+    assert_eq!(stored[0].event_coverage, "complete");
+    assert_eq!(stored[0].sync_status, "ready");
+    assert!(stored[0].last_error_code.is_empty());
+    assert!(
+        events.quarantine.lock().unwrap().is_empty(),
+        "quarantine cleared after successful publish"
+    );
 }
 
 #[test]
@@ -1102,4 +1233,304 @@ fn replica_skips_inflight_google_event_ids() {
         .find(|e| e.google_event_id == "g-inflight")
         .unwrap();
     assert_eq!(inflight.title, "User rewrite");
+}
+
+#[test]
+fn replica_merge_full_sweeps_absent_preserves_exceptions_and_task_id() {
+    // Successful reseed merge-full: ghost gone; cancelled exception + task-linked
+    // absent stay living; seen row's task_id COALESCE preserved.
+    let merge = r#"{"items":[
+        {"id":"keep","summary":"Keep","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"exc-seen","status":"cancelled","recurringEventId":"master-1",
+         "originalStartTime":{"dateTime":"2026-08-18T10:00:00Z"},
+         "start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}
+    ],"nextSyncToken":"st-mf"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old".to_string();
+    cal.full_sync_requested = true;
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    let mut cancel_exc = seeded_event("e-exc-absent", "cal-1", "exc-absent", "");
+    cancel_exc.status = "cancelled".to_string();
+    cancel_exc.recurring_event_id = "master-1".to_string();
+    events.stored.lock().unwrap().extend([
+        seeded_event("e-keep", "cal-1", "keep", "keep-me"),
+        seeded_event("e-ghost", "cal-1", "ghost", ""),
+        seeded_event("e-task", "cal-1", "task-linked", "task-99"),
+        cancel_exc,
+        seeded_event("e-exc-seen", "cal-1", "exc-seen", ""),
+    ]);
+    let http = FakeHttp::new(vec![("/events", 200, merge)]);
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+
+    let stored = events.stored.lock().unwrap();
+    let keep = stored.iter().find(|e| e.google_event_id == "keep").unwrap();
+    assert_eq!(keep.task_id, "keep-me");
+    assert!(keep.deleted_at.is_none());
+    let ghost = stored.iter().find(|e| e.google_event_id == "ghost").unwrap();
+    assert!(ghost.deleted_at.is_some(), "absent ghost must be swept");
+    let task = stored
+        .iter()
+        .find(|e| e.google_event_id == "task-linked")
+        .unwrap();
+    assert!(
+        task.deleted_at.is_none(),
+        "task_id row absent from snapshot must stay living"
+    );
+    assert_eq!(task.task_id, "task-99");
+    let exc_absent = stored
+        .iter()
+        .find(|e| e.google_event_id == "exc-absent")
+        .unwrap();
+    assert!(
+        exc_absent.deleted_at.is_none(),
+        "cancelled exception absent from snapshot must stay living"
+    );
+    assert!(events.deleted_stale.lock().unwrap().is_empty());
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-mf");
+    assert!(!calendars.stored.lock().unwrap()[0].full_sync_requested);
+}
+
+#[test]
+fn replica_merge_full_mid_walk_failure_does_not_sweep() {
+    // full_sync_requested walk: page1 ok, page2 500 → no sweep, ghost living,
+    // token unchanged, flag still set.
+    let page_one = r#"{"items":[{"id":"p1","summary":"A","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.full_sync_requested = true;
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("e-ghost", "cal-1", "ghost", ""));
+    let http = FakeHttp::new(vec![
+        ("pageToken=tok-2", 500, ""),
+        ("/events", 200, page_one),
+    ]);
+    let err = pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")), "{err:?}");
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+    assert!(
+        calendars.stored.lock().unwrap()[0].full_sync_requested,
+        "flag must remain set after mid-walk failure"
+    );
+    let ghost = events
+        .stored
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.google_event_id == "ghost")
+        .unwrap()
+        .clone();
+    assert!(
+        ghost.deleted_at.is_none(),
+        "mid-walk failure must never sweep"
+    );
+    assert!(events.deleted_stale.lock().unwrap().is_empty());
+}
+
+#[test]
+fn replica_merge_full_lease_lost_before_sweep_does_not_tombstone_or_publish() {
+    // One-page reseed: upsert is fenced apply #1; steal lease on sweep (#2).
+    // No tombstones; token unchanged.
+    let merge = r#"{"items":[
+        {"id":"keep","summary":"Keep","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-lost"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.full_sync_requested = true;
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events.stored.lock().unwrap().extend([
+        seeded_event("e-keep", "cal-1", "keep", ""),
+        seeded_event("e-ghost", "cal-1", "ghost", ""),
+    ]);
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((2, "thief".to_string(), Some("2099-01-01T00:00:00Z".to_string())));
+    let http = FakeHttp::new(vec![("/events", 200, merge)]);
+    let err = pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, CalendarError::Invalid(ref m) if m.contains("lost replica lease")),
+        "{err:?}"
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+    assert!(
+        calendars.stored.lock().unwrap()[0].full_sync_requested,
+        "must not clear flag without publish"
+    );
+    let ghost = events
+        .stored
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.google_event_id == "ghost")
+        .unwrap()
+        .clone();
+    assert!(
+        ghost.deleted_at.is_none(),
+        "lost lease must not tombstone ghosts"
+    );
+    // Upsert counted + sweep attempt = 2 fenced applies.
+    assert_eq!(*events.fenced_apply_count.lock().unwrap(), 2);
+    assert!(events.deleted_stale.lock().unwrap().is_empty());
+}
+
+#[test]
+fn replica_incremental_completed_does_not_sweep_preexisting_ghost() {
+    let body = r#"{"items":[
+        {"id":"p1","summary":"A","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-inc"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("e-ghost", "cal-1", "ghost", ""));
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-inc");
+    let ghost = events
+        .stored
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.google_event_id == "ghost")
+        .unwrap()
+        .clone();
+    assert!(
+        ghost.deleted_at.is_none(),
+        "incremental must not sweep pre-existing ghost"
+    );
+    assert!(events.replica_seen.lock().unwrap().is_empty());
+    assert!(events.deleted_stale.lock().unwrap().is_empty());
+}
+
+#[test]
+fn replica_merge_full_records_inflight_as_seen_and_does_not_sweep() {
+    use crate::models::{CalendarEventOperation, OP_STATUS_PENDING, OP_VERB_PATCH};
+
+    let merge = r#"{"items":[
+        {"id":"keep","summary":"Keep","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"g-inflight","summary":"Stale","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}
+    ],"nextSyncToken":"st-inf"}"#;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old".to_string();
+    cal.full_sync_requested = true;
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    let mut living = living_event("local-inflight", "cal-1", "g-inflight");
+    living.title = "User rewrite".to_string();
+    events.stored.lock().unwrap().extend([
+        seeded_event("e-keep", "cal-1", "keep", ""),
+        living,
+        seeded_event("e-ghost", "cal-1", "ghost", ""),
+    ]);
+    let ops = FakeOperationRepo::with(vec![CalendarEventOperation {
+        id: "op-1".to_string(),
+        user_id: "u-1".to_string(),
+        calendar_id: "cal-1".to_string(),
+        local_event_id: "local-inflight".to_string(),
+        google_event_id: "g-inflight".to_string(),
+        verb: OP_VERB_PATCH.to_string(),
+        payload_fingerprint: "fp".to_string(),
+        payload_json: "{}".to_string(),
+        status: OP_STATUS_PENDING.to_string(),
+        google_etag: "e1".to_string(),
+        attempt_count: 0,
+        last_error: String::new(),
+        created_at: "2023-11-14T22:00:00Z".to_string(),
+        updated_at: "2023-11-14T22:00:00Z".to_string(),
+    }]);
+    let http = FakeHttp::new(vec![("/events", 200, merge)]);
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &ops,
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+    ))
+    .unwrap();
+
+    let stored = events.stored.lock().unwrap();
+    let inflight = stored
+        .iter()
+        .find(|e| e.google_event_id == "g-inflight")
+        .unwrap();
+    assert!(
+        inflight.deleted_at.is_none(),
+        "in-flight id recorded as seen must not be swept"
+    );
+    assert_eq!(inflight.title, "User rewrite");
+    let ghost = stored.iter().find(|e| e.google_event_id == "ghost").unwrap();
+    assert!(ghost.deleted_at.is_some(), "true ghost still swept");
+    assert!(
+        events
+            .upserted_batch
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.google_event_id != "g-inflight"),
+        "inflight must not be upserted"
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-inf");
 }

@@ -20,10 +20,14 @@
 //!   `sync_status = 'rebuilding'` via [`CalendarRepo::begin_replica_reseed`]
 //!   so the next cron tick does not depend on in-memory state. Do **not** clear
 //!   the stored `sync_token` until a successful publish. Do **not** call
-//!   `delete_stale`, do **not** wipe already-applied rows. Ghosts may remain
-//!   until a later delta or operator action. A second 410 in the same
-//!   invocation is an error (not a loop); failure classification keeps
-//!   `rebuilding` while leaving the stored token alone.
+//!   `delete_stale`, do **not** wipe already-applied rows mid-walk. On a
+//!   **completed** fenced merge-full, soft-delete living Google ids absent
+//!   from this walk's seen snapshot via
+//!   [`CalendarEventRepo::sweep_absent_if_owner`] (generation membership —
+//!   not a timestamp sweep). Mid-walk failure keeps the old published view;
+//!   lost lease cannot sweep or publish. A second 410 in the same invocation
+//!   is an error (not a loop); failure classification keeps `rebuilding`
+//!   while leaving the stored token alone.
 //! - **Fingerprint mismatch / `full_sync_requested` → merge-full.** A non-empty
 //!   stored `sync_query_fingerprint` that differs from
 //!   [`replica_query_fingerprint`], or a durable `full_sync_requested` flag,
@@ -46,7 +50,7 @@ use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use super::apply::{
     classify_replica_item, EventsPage, ReplicaApplyAction,
 };
-use super::diagnostics::{CheckpointResult, ReplicaApplyReport, ReplicaWalkPhase};
+use super::diagnostics::{mint_run_id, CheckpointResult, ReplicaApplyReport, ReplicaWalkPhase};
 use super::google::encode_path_segment;
 use super::sync::replica_query_fingerprint;
 use crate::models::GoogleCalendar;
@@ -58,6 +62,20 @@ use std::collections::HashSet;
 
 /// Replica lease lifetime (seconds). Renewed after each applied page.
 pub const REPLICA_LEASE_TTL_SECS: i64 = 90;
+
+/// Max bytes retained in `calendar_event_quarantine.replay_payload` (64 KiB).
+const QUARANTINE_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+
+/// Lossy UTF-8 decode of a Google page body, capped for quarantine storage.
+/// Never log the result; never put it on diagnostics or the GET envelope.
+fn quarantine_replay_payload(body: &[u8]) -> String {
+    let slice = if body.len() > QUARANTINE_PAYLOAD_MAX_BYTES {
+        &body[..QUARANTINE_PAYLOAD_MAX_BYTES]
+    } else {
+        body
+    };
+    String::from_utf8_lossy(slice).into_owned()
+}
 
 /// Fenced page-by-page replica walk for one calendar.
 ///
@@ -108,6 +126,16 @@ pub async fn sync_replica(
 
     let mut page_token: Option<String> = None;
     let mut retried_410 = false;
+    // Merge-full = reseed start or 410 restart. First-ever and ordinary
+    // incremental never mint a seen-set or sweep (window instance ids).
+    let mut merge_full = reseed;
+    let mut run_id: Option<String> = None;
+    if merge_full {
+        if let Err(err) = start_merge_full_run(events, &cal.id, &mut run_id).await {
+            report.checkpoint = CheckpointResult::Error;
+            return Err(err);
+        }
+    }
 
     // Snapshot once per walk: user writes in flight must not be clobbered by
     // a replica page that still carries the pre-write Google shape.
@@ -145,13 +173,20 @@ pub async fn sync_replica(
             }
             // Merge-full: durable reseed flag + drop in-memory cursor. Keep
             // already-applied rows and the stored token until success.
-            // Never delete_stale / truncate.
+            // Never delete_stale / truncate mid-walk. Mint a fresh run so
+            // incremental pages applied before the 410 do not count as
+            // membership until they reappear on the full list.
             if let Err(err) = calendars
                 .begin_replica_reseed(&cal.id, now_rfc3339)
                 .await
             {
                 report.checkpoint = CheckpointResult::Error;
                 return Err(err.into());
+            }
+            merge_full = true;
+            if let Err(err) = start_merge_full_run(events, &cal.id, &mut run_id).await {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err);
             }
             retried_410 = true;
             token = None;
@@ -173,6 +208,23 @@ pub async fn sync_replica(
             Ok(p) => p,
             Err(err) => {
                 report.checkpoint = CheckpointResult::Error;
+                // Best-effort quarantine + degraded coverage. Failures here
+                // must not change the error class (still mapping_poison via
+                // InvalidResponse) or advance the token.
+                let payload = quarantine_replay_payload(&body);
+                let _ = events
+                    .upsert_quarantine(
+                        &cal.id,
+                        "",
+                        "replica_page",
+                        "mapping_poison",
+                        &payload,
+                        now_rfc3339,
+                    )
+                    .await;
+                let _ = calendars
+                    .set_event_coverage(&cal.id, "degraded", now_rfc3339)
+                    .await;
                 return Err(CalendarError::InvalidResponse(format!(
                     "events.list body: {err}"
                 )));
@@ -243,6 +295,30 @@ pub async fn sync_replica(
             }
         }
 
+        // Successful 2xx page applied. On merge-full, record every Google id
+        // on the page (upserted, cancelled, cancelled exceptions, in-flight
+        // skips) so the terminal sweep will not tombstone them.
+        if merge_full {
+            let Some(rid) = run_id.as_deref() else {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(CalendarError::Invalid(
+                    "merge-full walk missing run_id".into(),
+                ));
+            };
+            let page_ids: Vec<String> = items
+                .iter()
+                .map(|item| item.id.clone())
+                .filter(|id| !id.is_empty())
+                .collect();
+            if let Err(err) = events
+                .record_replica_seen(&cal.id, rid, page_ids, now_rfc3339)
+                .await
+            {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err.into());
+            }
+        }
+
         // Successful 2xx page applied.
         report.pages = report.pages.saturating_add(1);
 
@@ -277,6 +353,37 @@ pub async fn sync_replica(
             ));
         };
 
+        // Terminal order: ensure lease → (merge-full) sweep → publish.
+        // Sweep failure or lease loss must not move the token.
+        if merge_full {
+            if let Err(err) =
+                ensure_lease_held(calendars, &cal.id, lease_owner, now_rfc3339).await
+            {
+                report.checkpoint = CheckpointResult::LeaseLost;
+                return Err(err);
+            }
+            let Some(rid) = run_id.as_deref() else {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(CalendarError::Invalid(
+                    "merge-full walk missing run_id".into(),
+                ));
+            };
+            let swept = match events
+                .sweep_absent_if_owner(&cal.id, rid, lease_owner, now_rfc3339)
+                .await
+            {
+                Ok(s) => s,
+                Err(err) => {
+                    report.checkpoint = CheckpointResult::Error;
+                    return Err(err.into());
+                }
+            };
+            if !swept {
+                report.checkpoint = CheckpointResult::LeaseLost;
+                return Err(CalendarError::Invalid("lost replica lease".into()));
+            }
+        }
+
         let published = match calendars
             .record_sync_success_if_owner(
                 &cal.id,
@@ -297,9 +404,28 @@ pub async fn sync_replica(
             report.checkpoint = CheckpointResult::LeaseLost;
             return Err(CalendarError::Invalid("lost replica lease".into()));
         }
+        // Best-effort clear; leftovers are OK (next merge-full clears first).
+        if merge_full {
+            let _ = events.clear_replica_seen_for_calendar(&cal.id).await;
+        }
+        // Poison page is gone once we published a terminal token.
+        let _ = events.clear_quarantine_for_calendar(&cal.id).await;
         report.checkpoint = CheckpointResult::Published;
         return Ok(());
     }
+}
+
+/// Mint a new `run_id` and abandon any previous incomplete seen snapshot.
+async fn start_merge_full_run(
+    events: &dyn CalendarEventRepo,
+    calendar_id: &str,
+    run_id: &mut Option<String>,
+) -> Result<(), CalendarError> {
+    if let Err(err) = events.clear_replica_seen_for_calendar(calendar_id).await {
+        return Err(err.into());
+    }
+    *run_id = Some(mint_run_id());
+    Ok(())
 }
 
 async fn ensure_lease_held(

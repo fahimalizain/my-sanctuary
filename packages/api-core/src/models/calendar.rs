@@ -100,6 +100,13 @@ pub struct GoogleCalendar {
     /// (empty/unknown → treated as `missing` by the view).
     #[serde(default, deserialize_with = "de_empty_string")]
     pub watch_coverage: String,
+    /// Sanitized replica event coverage for the GET events sync envelope.
+    /// Values: `complete` | `degraded`
+    /// (empty/unknown → treated as `complete` by the view).
+    /// Independent of [`GoogleCalendar::watch_coverage`]; does not feed
+    /// aggregate sync status. Default column is `'complete'`.
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub event_coverage: String,
     pub created_at: String,
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
@@ -543,6 +550,7 @@ mod tests {
         assert_eq!(calendar.cache_revision, 0);
         assert_eq!(calendar.projection, "");
         assert_eq!(calendar.watch_coverage, "");
+        assert_eq!(calendar.event_coverage, "");
     }
 
     #[test]

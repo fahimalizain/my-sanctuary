@@ -604,3 +604,88 @@ fn cron_failure_leaves_dirty_other_calendars_progress_and_lease_busy_not_publish
         gets
     );
 }
+
+#[test]
+fn cron_poison_on_one_calendar_siblings_still_sync() {
+    // cal-a: due, invalid page JSON → mapping_poison + quarantine + degraded
+    // cal-b: due, valid EVENTS_JSON → publishes; complete coverage, no quarantine
+    let http = FakeHttp::new(vec![
+        ("primary%40example.com/events", 200, "not-json{{{"),
+        ("secondary%40example.com/events", 200, EVENTS_JSON),
+    ]);
+    let mut cal_a = calendar("cal-a", "primary@example.com", true);
+    cal_a.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+    cal_a.dirty_requested_generation = 2;
+    cal_a.dirty_applied_generation = 0;
+    let mut cal_b = calendar("cal-b", "secondary@example.com", true);
+    cal_b.last_success_at = Some("2023-11-14T22:12:20Z".to_string());
+    cal_b.dirty_requested_generation = 1;
+    cal_b.dirty_applied_generation = 0;
+    let calendars = FakeCalendarRepo::with(vec![cal_a, cal_b]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::new();
+    let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+    let oauth = oauth_config();
+
+    let report = pollster::block_on(run_fallback_cron(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &watches,
+        &tokens,
+        &oauth,
+        None,
+        NOW_UNIX,
+    ));
+
+    assert_eq!(report.synced, 1);
+    assert_eq!(
+        report.published,
+        vec![("u-1".to_string(), "cal-b".to_string())]
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0].contains("cal-a"),
+        "{:?}",
+        report.errors
+    );
+
+    let stored = calendars.stored.lock().unwrap();
+    let a = stored.iter().find(|c| c.id == "cal-a").unwrap();
+    assert!(a.sync_token.is_empty(), "poison must not advance token");
+    assert_eq!(a.last_error_code, "mapping_poison");
+    assert_eq!(a.sync_status, "retrying");
+    assert_eq!(a.event_coverage, "degraded");
+    assert_eq!(a.dirty_applied_generation, 0);
+
+    let b = stored.iter().find(|c| c.id == "cal-b").unwrap();
+    assert_eq!(b.sync_token, "st-9");
+    assert_eq!(b.event_coverage, "complete");
+    assert!(b.last_error_code.is_empty());
+    assert_eq!(b.dirty_applied_generation, 1);
+    drop(stored);
+
+    let q = events.quarantine.lock().unwrap();
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].calendar_id, "cal-a");
+    assert_eq!(q[0].phase, "replica_page");
+    assert_eq!(q[0].error_class, "mapping_poison");
+    assert!(q[0].replay_payload.contains("not-json{{{"));
+    assert!(
+        !q.iter().any(|r| r.calendar_id == "cal-b"),
+        "sibling must not be quarantined"
+    );
+
+    // No hot-loop on the poison calendar: one events.list GET for primary.
+    let gets = http.gets.lock().unwrap();
+    let primary_gets: Vec<_> = gets
+        .iter()
+        .filter(|u| u.contains("primary") && u.contains("/events"))
+        .collect();
+    assert_eq!(
+        primary_gets.len(),
+        1,
+        "poison must not hot-loop: {gets:?}"
+    );
+}

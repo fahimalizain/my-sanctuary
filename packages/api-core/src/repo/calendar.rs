@@ -145,6 +145,14 @@ pub trait CalendarRepo: Send + Sync {
         coverage: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+    /// Persist sanitized event coverage (`complete` | `degraded`). Never stores
+    /// replay payloads, sync tokens, or channel ids.
+    async fn set_event_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// SOFT delete: stamps `deleted_at = now_rfc3339`.
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError>;
     /// Stored calendarList.list `nextSyncToken` for `user_id`, if any.
@@ -247,12 +255,70 @@ pub trait CalendarEventRepo: Send + Sync {
     ) -> Result<bool, RepoError>;
     /// SOFT delete of rows whose `last_synced_at` is older than
     /// `older_than_rfc3339` (stale-event cleanup).
+    ///
+    /// **Do not call from the replica walk.** Generation membership uses
+    /// [`Self::sweep_absent_if_owner`] after a completed merge-full; an
+    /// unfenced timestamp sweep is not generation membership (issue #60).
     async fn delete_stale(
         &self,
         calendar_id: &str,
         older_than_rfc3339: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
+
+    /// Record Google event ids seen on one page of a merge-full walk.
+    /// `INSERT OR IGNORE` into `calendar_replica_seen` for
+    /// `(calendar_id, run_id, google_event_id)`. Empty `google_event_ids` is a
+    /// no-op. Chunked for D1's 100-bind limit (4 binds/row → ≤ 25 rows).
+    async fn record_replica_seen(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        google_event_ids: Vec<String>,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+
+    /// Drop all `calendar_replica_seen` rows for `calendar_id` (abandon an
+    /// incomplete snapshot or clear after successful publish).
+    async fn clear_replica_seen_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError>;
+
+    /// Fenced generation-membership sweep: soft-delete living rows on
+    /// `calendar_id` whose `google_event_id` is **not** in
+    /// `calendar_replica_seen` for `(calendar_id, run_id)`, excluding cancelled
+    /// exceptions (`status = 'cancelled'` + non-empty trimmed
+    /// `recurring_event_id`), non-empty trimmed `task_id`, and already-deleted
+    /// rows. Lease predicate matches
+    /// [`CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL`]. Returns `false` when the
+    /// lease is missing/stolen/expired (no further mutation). Zero updated
+    /// rows is ambiguous — probe with [`CALENDAR_LEASE_HELD_SQL`] like
+    /// [`Self::delete_by_google_event_id_if_owner`].
+    async fn sweep_absent_if_owner(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError>;
+
+    /// Upsert a deterministic poison quarantine row (issue #60).
+    ///
+    /// Page-level poison uses `google_event_id = ""` and `phase = "replica_page"`.
+    /// `replay_payload` is a capped lossy-UTF-8 body retained for operator
+    /// repair only — never expose on the GET envelope, diagnostics, or logs.
+    /// ON CONFLICT bumps `attempt_count` and replaces payload / error_class /
+    /// `last_attempt_at`; leaves `first_seen_at` unchanged.
+    async fn upsert_quarantine(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        phase: &str,
+        error_class: &str,
+        replay_payload: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+
+    /// Drop all quarantine rows for `calendar_id` after a successful publish.
+    async fn clear_quarantine_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError>;
 }
 
 /// Google Calendar watch channel persistence (`google_calendars_watch_channels`
@@ -429,8 +495,9 @@ pub const CALENDAR_RECORD_SYNC_ATTEMPT_SQL: &str = "
 ";
 
 /// Successful apply: token + both success timestamps, clear error/streak,
-/// ready status, bump cache_revision. Binds: token, now, now, now, fingerprint,
-/// now, id (`last_synced_at` and `last_success_at` share the same instant).
+/// ready status, bump cache_revision, restore event_coverage. Binds: token,
+/// now, now, now, fingerprint, now, id (`last_synced_at` and `last_success_at`
+/// share the same instant).
 pub const CALENDAR_RECORD_SYNC_SUCCESS_SQL: &str = "
     UPDATE google_calendars SET
       sync_token = ?,
@@ -445,6 +512,7 @@ pub const CALENDAR_RECORD_SYNC_SUCCESS_SQL: &str = "
       sync_query_fingerprint = ?,
       cache_revision = cache_revision + 1,
       full_sync_requested = 0,
+      event_coverage = 'complete',
       updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
 ";
@@ -466,6 +534,7 @@ pub const CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL: &str = "
       sync_query_fingerprint = ?,
       cache_revision = cache_revision + 1,
       full_sync_requested = 0,
+      event_coverage = 'complete',
       updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
       AND lease_owner = ?
@@ -562,6 +631,15 @@ pub const CALENDAR_SET_EVENT_LABELS_SQL: &str =
 pub const CALENDAR_SET_WATCH_COVERAGE_SQL: &str = "
     UPDATE google_calendars
     SET watch_coverage = ?, updated_at = ?
+    WHERE id = ? AND deleted_at IS NULL
+";
+
+/// Persist sanitized event coverage. Binds: coverage, now, id.
+/// Values: `complete` | `degraded`. Never stores replay payloads, tokens, or
+/// channel ids (those live only on quarantine rows / other tables).
+pub const CALENDAR_SET_EVENT_COVERAGE_SQL: &str = "
+    UPDATE google_calendars
+    SET event_coverage = ?, updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
 ";
 
@@ -705,13 +783,116 @@ pub const CALENDAR_LEASE_HELD_SQL: &str = "
 ";
 
 /// SOFT delete of stale rows (older than a cutoff).
+/// **Unused by the replica walk** — see [`CalendarEventRepo::sweep_absent_if_owner`].
 pub const EVENT_DELETE_STALE_SQL: &str =
     "UPDATE calendar_events SET deleted_at = ?, updated_at = ? WHERE calendar_id = ? AND last_synced_at < ? AND deleted_at IS NULL";
+
+/// Clear all generation-membership seen rows for one calendar.
+/// Binds: calendar_id.
+pub const EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL: &str =
+    "DELETE FROM calendar_replica_seen WHERE calendar_id = ?";
+
+/// Upsert a deterministic poison quarantine row (issue #60).
+/// ON CONFLICT replaces payload + error_class, bumps attempt_count, stamps
+/// last_attempt_at; first_seen_at is unchanged.
+/// Binds: calendar_id, google_event_id, phase, error_class, replay_payload,
+/// first_seen_at (= now on insert), last_attempt_at (= now).
+/// Never stores OAuth tokens, lease owners, or channel ids.
+pub const EVENT_UPSERT_QUARANTINE_SQL: &str = "
+    INSERT INTO calendar_event_quarantine (
+      calendar_id, google_event_id, phase, error_class, replay_payload,
+      first_seen_at, last_attempt_at, attempt_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(calendar_id, google_event_id, phase) DO UPDATE SET
+      error_class = excluded.error_class,
+      replay_payload = excluded.replay_payload,
+      last_attempt_at = excluded.last_attempt_at,
+      attempt_count = calendar_event_quarantine.attempt_count + 1
+";
+
+/// Drop all quarantine rows for one calendar (after successful publish).
+/// Binds: calendar_id.
+pub const EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL: &str =
+    "DELETE FROM calendar_event_quarantine WHERE calendar_id = ?";
+
+/// Fenced generation-membership sweep (issue #60). Soft-deletes living rows
+/// whose Google id is absent from this walk's completed seen snapshot.
+/// Does **not** use `last_synced_at`. Excludes cancelled exceptions and
+/// non-empty `task_id`. Lease EXISTS matches
+/// [`EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL`].
+/// Binds: now, now, calendar_id, calendar_id, run_id, lease_owner, now.
+pub const EVENT_SWEEP_ABSENT_IF_OWNER_SQL: &str = "
+    UPDATE calendar_events
+    SET deleted_at = ?, updated_at = ?
+    WHERE calendar_id = ?
+      AND deleted_at IS NULL
+      AND NOT (
+        status = 'cancelled'
+        AND recurring_event_id IS NOT NULL
+        AND TRIM(recurring_event_id) != ''
+      )
+      AND NOT (
+        task_id IS NOT NULL
+        AND TRIM(task_id) != ''
+      )
+      AND google_event_id NOT IN (
+        SELECT google_event_id FROM calendar_replica_seen
+        WHERE calendar_id = ? AND run_id = ?
+      )
+      AND EXISTS (
+        SELECT 1 FROM google_calendars
+        WHERE id = calendar_events.calendar_id
+          AND deleted_at IS NULL
+          AND lease_owner = ?
+          AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
+      )
+";
 
 /// D1 allows at most 100 bound parameters per SQL statement.
 /// `calendar_events` upsert binds 23 columns per row → max 4 rows per statement.
 pub const EVENT_UPSERT_COL_COUNT: usize = 23;
 pub const EVENT_UPSERT_CHUNK_SIZE: usize = 100 / EVENT_UPSERT_COL_COUNT; // 4
+
+/// `calendar_replica_seen` insert binds 4 columns per row → max 25 rows.
+pub const REPLICA_SEEN_INSERT_COL_COUNT: usize = 4;
+pub const REPLICA_SEEN_INSERT_CHUNK_SIZE: usize = 100 / REPLICA_SEEN_INSERT_COL_COUNT; // 25
+
+/// Builds a multi-row `INSERT OR IGNORE` into `calendar_replica_seen` for one
+/// chunk (non-empty and ≤ [`REPLICA_SEEN_INSERT_CHUNK_SIZE`]).
+/// Binds per row: calendar_id, run_id, google_event_id, created_at.
+pub fn build_replica_seen_insert_sql(
+    calendar_id: &str,
+    run_id: &str,
+    google_event_ids: &[String],
+    now_rfc3339: &str,
+) -> (String, Vec<String>) {
+    assert!(
+        !google_event_ids.is_empty(),
+        "replica_seen insert chunk must not be empty"
+    );
+    assert!(
+        google_event_ids.len() <= REPLICA_SEEN_INSERT_CHUNK_SIZE,
+        "replica_seen insert chunk exceeds {REPLICA_SEEN_INSERT_CHUNK_SIZE} rows"
+    );
+
+    let mut sql = String::from(
+        "INSERT OR IGNORE INTO calendar_replica_seen \
+         (calendar_id, run_id, google_event_id, created_at) VALUES ",
+    );
+    let mut args: Vec<String> =
+        Vec::with_capacity(google_event_ids.len() * REPLICA_SEEN_INSERT_COL_COUNT);
+    for (index, gid) in google_event_ids.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,?,?,?)");
+        args.push(calendar_id.to_string());
+        args.push(run_id.to_string());
+        args.push(gid.clone());
+        args.push(now_rfc3339.to_string());
+    }
+    (sql, args)
+}
 
 const EVENT_UPSERT_ON_CONFLICT: &str = "
     ON CONFLICT(calendar_id, google_event_id) DO UPDATE SET
@@ -1120,6 +1301,19 @@ mod tests {
     }
 
     #[test]
+    fn calendar_set_event_coverage_writes_column_and_stamps_updated_at() {
+        let sql = CALENDAR_SET_EVENT_COVERAGE_SQL;
+        assert!(sql.contains("event_coverage = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(sql.contains("WHERE id = ?"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("channel_id"), "{sql}");
+        assert!(!sql.contains("resource_id"), "{sql}");
+        assert!(!sql.contains("replay_payload"), "{sql}");
+    }
+
+    #[test]
     fn migration_0014_adds_watch_coverage_without_secrets() {
         let migration =
             include_str!("../../../../apps/worker/migrations/0014_watch_coverage.sql");
@@ -1147,6 +1341,97 @@ mod tests {
         assert!(
             !migration.contains(" ADD COLUMN token"),
             "must not add token column: {migration}"
+        );
+    }
+
+    #[test]
+    fn migration_0015_adds_replica_seen_without_tokens_or_secrets() {
+        let migration =
+            include_str!("../../../../apps/worker/migrations/0015_replica_generation.sql");
+        assert!(
+            migration.contains("CREATE TABLE IF NOT EXISTS calendar_replica_seen"),
+            "migration must create calendar_replica_seen: {migration}"
+        );
+        assert!(
+            migration.contains("PRIMARY KEY (calendar_id, run_id, google_event_id)"),
+            "PK must be (calendar_id, run_id, google_event_id): {migration}"
+        );
+        assert!(
+            migration.contains("idx_replica_seen_calendar_run"),
+            "must index (calendar_id, run_id): {migration}"
+        );
+        assert!(
+            migration.contains("created_at TEXT"),
+            "timestamps must be TEXT RFC 3339: {migration}"
+        );
+        // No resume-cursor or secret-bearing columns (comments may mention
+        // pageToken/nextSyncToken as deliberately omitted).
+        assert!(
+            !migration.contains("page_token") && !migration.contains("pageToken TEXT"),
+            "must not add pageToken column: {migration}"
+        );
+        assert!(
+            !migration.contains("sync_token") && !migration.contains("next_sync_token"),
+            "must not add syncToken column: {migration}"
+        );
+        assert!(
+            !migration.contains("channel_id"),
+            "must not store channel_id: {migration}"
+        );
+        assert!(
+            !migration.contains("resource_id"),
+            "must not store resource_id: {migration}"
+        );
+        assert!(
+            migration.contains("issue #60") || migration.contains("Issue #60"),
+            "comment must reference issue #60: {migration}"
+        );
+    }
+
+    #[test]
+    fn migration_0016_adds_quarantine_and_event_coverage_without_secrets() {
+        let migration =
+            include_str!("../../../../apps/worker/migrations/0016_replica_quarantine.sql");
+        assert!(
+            migration.contains("ALTER TABLE google_calendars ADD COLUMN event_coverage"),
+            "migration must add event_coverage column: {migration}"
+        );
+        assert!(
+            migration.contains("DEFAULT 'complete'"),
+            "default must be complete: {migration}"
+        );
+        assert!(
+            migration.contains("CREATE TABLE IF NOT EXISTS calendar_event_quarantine"),
+            "migration must create calendar_event_quarantine: {migration}"
+        );
+        assert!(
+            migration.contains("replay_payload"),
+            "table must have replay_payload: {migration}"
+        );
+        assert!(
+            migration.contains("PRIMARY KEY (calendar_id, google_event_id, phase)"),
+            "PK must be (calendar_id, google_event_id, phase): {migration}"
+        );
+        assert!(
+            migration.contains("issue #60") || migration.contains("Issue #60"),
+            "comment must reference issue #60: {migration}"
+        );
+        // Must not introduce secret-bearing / cursor columns on the table.
+        assert!(
+            !migration.contains("sync_token"),
+            "must not add sync_token: {migration}"
+        );
+        assert!(
+            !migration.contains("channel_id"),
+            "must not add channel_id: {migration}"
+        );
+        assert!(
+            !migration.contains("resource_id"),
+            "must not add resource_id: {migration}"
+        );
+        assert!(
+            !migration.contains("lease_owner"),
+            "must not add lease_owner: {migration}"
         );
     }
 
@@ -1412,6 +1697,7 @@ mod tests {
             "lease_expires_at",
             "projection",
             "watch_coverage",
+            "event_coverage",
         ] {
             assert!(
                 !CALENDAR_UPSERT_SQL.contains(col),
@@ -1475,6 +1761,7 @@ mod tests {
         assert!(sql.contains("initial_sync_complete = 1"), "{sql}");
         assert!(sql.contains("sync_query_fingerprint = ?"), "{sql}");
         assert!(sql.contains("full_sync_requested = 0"), "{sql}");
+        assert!(sql.contains("event_coverage = 'complete'"), "{sql}");
         assert!(sql.contains("next_retry_at = NULL"), "{sql}");
         assert!(sql.contains("last_error_code = ''"), "{sql}");
     }
@@ -1487,12 +1774,47 @@ mod tests {
         assert!(sql.contains("last_synced_at = ?"), "{sql}");
         assert!(sql.contains("sync_query_fingerprint = ?"), "{sql}");
         assert!(sql.contains("cache_revision = cache_revision + 1"), "{sql}");
+        assert!(sql.contains("full_sync_requested = 0"), "{sql}");
+        assert!(sql.contains("event_coverage = 'complete'"), "{sql}");
         assert!(sql.contains("lease_owner = ?"), "{sql}");
         assert!(
             sql.contains("lease_expires_at IS NULL OR lease_expires_at >= ?"),
             "{sql}"
         );
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
+    }
+
+    #[test]
+    fn event_upsert_quarantine_sql_retains_payload_without_secrets() {
+        let sql = EVENT_UPSERT_QUARANTINE_SQL;
+        assert!(sql.contains("INSERT INTO calendar_event_quarantine"), "{sql}");
+        assert!(sql.contains("replay_payload"), "{sql}");
+        assert!(sql.contains("ON CONFLICT(calendar_id, google_event_id, phase)"), "{sql}");
+        assert!(sql.contains("attempt_count = calendar_event_quarantine.attempt_count + 1"), "{sql}");
+        assert!(sql.contains("first_seen_at"), "{sql}");
+        // first_seen_at must not be overwritten on conflict.
+        assert!(
+            !sql.contains("first_seen_at = excluded"),
+            "must leave first_seen_at unchanged on conflict: {sql}"
+        );
+        assert!(!sql.contains("sync_token"), "{sql}");
+        assert!(!sql.contains("channel_id"), "{sql}");
+        assert!(!sql.contains("resource_id"), "{sql}");
+        assert!(!sql.contains("lease_owner"), "{sql}");
+    }
+
+    #[test]
+    fn event_clear_quarantine_for_calendar_sql_is_scoped() {
+        let sql = EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL;
+        assert!(sql.contains("DELETE FROM calendar_event_quarantine"), "{sql}");
+        assert!(sql.contains("WHERE calendar_id = ?"), "{sql}");
+    }
+
+    #[test]
+    fn record_sync_failure_sql_does_not_touch_event_coverage() {
+        let sql = CALENDAR_RECORD_SYNC_FAILURE_SQL;
+        assert!(!sql.contains("event_coverage"), "{sql}");
+        assert!(!sql.contains("sync_token"), "{sql}");
     }
 
     #[test]
@@ -1510,6 +1832,54 @@ mod tests {
         );
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
         assert!(!sql.contains("DELETE FROM"), "{sql}");
+    }
+
+    #[test]
+    fn event_sweep_absent_if_owner_sql_fences_and_excludes_exceptions() {
+        let sql = EVENT_SWEEP_ABSENT_IF_OWNER_SQL;
+        assert!(sql.trim_start().starts_with("UPDATE"), "{sql}");
+        assert!(sql.contains("SET deleted_at = ?"), "{sql}");
+        assert!(sql.contains("calendar_replica_seen"), "{sql}");
+        assert!(sql.contains("EXISTS"), "{sql}");
+        assert!(sql.contains("google_calendars"), "{sql}");
+        assert!(sql.contains("lease_owner = ?"), "{sql}");
+        assert!(
+            sql.contains("lease_expires_at IS NULL OR lease_expires_at >= ?"),
+            "{sql}"
+        );
+        // Generation membership — never a timestamp sweep.
+        assert!(!sql.contains("last_synced_at"), "{sql}");
+        // Cancelled exceptions + task-linked rows must survive.
+        assert!(sql.contains("status = 'cancelled'"), "{sql}");
+        assert!(sql.contains("recurring_event_id"), "{sql}");
+        assert!(sql.contains("task_id"), "{sql}");
+        assert!(sql.contains("TRIM(recurring_event_id)"), "{sql}");
+        assert!(sql.contains("TRIM(task_id)"), "{sql}");
+        assert!(!sql.contains("DELETE FROM"), "{sql}");
+    }
+
+    #[test]
+    fn replica_seen_insert_sql_chunks_and_uses_or_ignore() {
+        let ids: Vec<String> = (0..3).map(|i| format!("g-{i}")).collect();
+        let (sql, args) =
+            build_replica_seen_insert_sql("cal-1", "run-a", &ids, "2023-11-14T22:13:20Z");
+        assert!(sql.starts_with("INSERT OR IGNORE INTO calendar_replica_seen"), "{sql}");
+        assert_eq!(args.len(), 3 * REPLICA_SEEN_INSERT_COL_COUNT);
+        assert_eq!(sql.matches('?').count(), 3 * REPLICA_SEEN_INSERT_COL_COUNT);
+        assert_eq!(args[0], "cal-1");
+        assert_eq!(args[1], "run-a");
+        assert_eq!(args[2], "g-0");
+        assert_eq!(args[3], "2023-11-14T22:13:20Z");
+        assert_eq!(REPLICA_SEEN_INSERT_CHUNK_SIZE, 25);
+        assert!(REPLICA_SEEN_INSERT_CHUNK_SIZE * REPLICA_SEEN_INSERT_COL_COUNT <= 100);
+    }
+
+    #[test]
+    fn event_clear_replica_seen_sql_is_calendar_scoped_delete() {
+        let sql = EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL;
+        assert!(sql.contains("DELETE FROM calendar_replica_seen"), "{sql}");
+        assert!(sql.contains("WHERE calendar_id = ?"), "{sql}");
+        assert!(!sql.contains("google_event_id"), "{sql}");
     }
 
     #[test]

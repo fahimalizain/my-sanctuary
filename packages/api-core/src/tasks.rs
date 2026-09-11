@@ -4379,6 +4379,7 @@ mod tests {
             cache_revision: 0,
             projection: "timed_masters_and_exceptions".to_string(),
             watch_coverage: String::new(),
+            event_coverage: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
@@ -4590,6 +4591,15 @@ mod tests {
             Ok(())
         }
 
+        async fn set_event_coverage(
+            &self,
+            _id: &str,
+            _coverage: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
             Ok(())
         }
@@ -4777,6 +4787,52 @@ mod tests {
             _calendar_id: &str,
             _older_than_rfc3339: &str,
             _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn record_replica_seen(
+            &self,
+            _calendar_id: &str,
+            _run_id: &str,
+            _google_event_ids: Vec<String>,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn clear_replica_seen_for_calendar(
+            &self,
+            _calendar_id: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn sweep_absent_if_owner(
+            &self,
+            _calendar_id: &str,
+            _run_id: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
+        async fn upsert_quarantine(
+            &self,
+            _calendar_id: &str,
+            _google_event_id: &str,
+            _phase: &str,
+            _error_class: &str,
+            _replay_payload: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
+        async fn clear_quarantine_for_calendar(
+            &self,
+            _calendar_id: &str,
         ) -> Result<(), RepoError> {
             Ok(())
         }

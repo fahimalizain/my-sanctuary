@@ -309,6 +309,7 @@ impl FakeCalendarRepo {
         cal.sync_query_fingerprint = query_fingerprint.to_string();
         cal.cache_revision += 1;
         cal.full_sync_requested = false;
+        cal.event_coverage = "complete".to_string();
         cal.updated_at = now_rfc3339.to_string();
     }
 
@@ -476,6 +477,7 @@ impl CalendarRepo for FakeCalendarRepo {
                     cache_revision: 0,
                     projection: "timed_masters_and_exceptions".to_string(),
                     watch_coverage: String::new(),
+                    event_coverage: String::new(),
                     created_at: "2026-08-17T00:00:00Z".to_string(),
                     updated_at: "2026-08-17T00:00:00Z".to_string(),
                     deleted_at: None,
@@ -752,6 +754,22 @@ impl CalendarRepo for FakeCalendarRepo {
         Ok(())
     }
 
+    async fn set_event_coverage(
+        &self,
+        id: &str,
+        coverage: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            if cal.deleted_at.is_none() {
+                cal.event_coverage = coverage.to_string();
+                cal.updated_at = now_rfc3339.to_string();
+            }
+        }
+        Ok(())
+    }
+
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
@@ -801,6 +819,19 @@ impl CalendarRepo for FakeCalendarRepo {
     }
 }
 
+/// In-memory quarantine row for deterministic poison (issue #60).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FakeQuarantineRow {
+    pub(crate) calendar_id: String,
+    pub(crate) google_event_id: String,
+    pub(crate) phase: String,
+    pub(crate) error_class: String,
+    pub(crate) replay_payload: String,
+    pub(crate) first_seen_at: String,
+    pub(crate) last_attempt_at: String,
+    pub(crate) attempt_count: i64,
+}
+
 /// In-memory event repo: upserts materialize rows so the follow-up
 /// time-range query returns them, and every call is recorded.
 pub(crate) struct FakeEventRepo {
@@ -816,17 +847,21 @@ pub(crate) struct FakeEventRepo {
     pub(crate) deleted_by_google_event_id: Mutex<Vec<(String, String)>>,
     /// `(calendar_id, older_than, now)` — replica walk must never push.
     pub(crate) deleted_stale: Mutex<Vec<(String, String, String)>>,
+    /// `(calendar_id, run_id, google_event_id)` — merge-full seen snapshot.
+    pub(crate) replica_seen: Mutex<Vec<(String, String, String)>>,
+    /// Poison quarantine rows (`calendar_event_quarantine`).
+    pub(crate) quarantine: Mutex<Vec<FakeQuarantineRow>>,
     pub(crate) fail_upsert: Mutex<bool>,
     pub(crate) fail_delete: Mutex<bool>,
     pub(crate) next_id: Mutex<u64>,
     /// Shared live lease store from [`FakeCalendarRepo::stored`]. `None`
     /// means unbound: fenced methods behave like unfenced (lease held).
     pub(crate) lease_calendars: Mutex<Option<Arc<Mutex<Vec<GoogleCalendar>>>>>,
-    /// Count of non-empty fenced apply calls (both if_owner methods).
+    /// Count of non-empty fenced apply calls (upsert/delete/sweep if_owner).
     pub(crate) fenced_apply_count: Mutex<usize>,
     /// When `Some((n, owner, expires))`, on the **nth** fenced apply call
-    /// (1-based, across both if_owner methods), **before** the lease check,
-    /// write `owner` / `expires` onto matching calendar row(s).
+    /// (1-based, across all if_owner methods including sweep), **before** the
+    /// lease check, write `owner` / `expires` onto matching calendar row(s).
     pub(crate) inject_lease_before_fenced_apply:
         Mutex<Option<(usize, String, Option<String>)>>,
 }
@@ -842,6 +877,8 @@ impl FakeEventRepo {
             deleted: Mutex::new(Vec::new()),
             deleted_by_google_event_id: Mutex::new(Vec::new()),
             deleted_stale: Mutex::new(Vec::new()),
+            replica_seen: Mutex::new(Vec::new()),
+            quarantine: Mutex::new(Vec::new()),
             fail_upsert: Mutex::new(false),
             fail_delete: Mutex::new(false),
             next_id: Mutex::new(1),
@@ -1201,6 +1238,124 @@ impl CalendarEventRepo for FakeEventRepo {
         ));
         Ok(())
     }
+
+    async fn record_replica_seen(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        google_event_ids: Vec<String>,
+        _now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        if google_event_ids.is_empty() {
+            return Ok(());
+        }
+        let mut seen = self.replica_seen.lock().unwrap();
+        for gid in google_event_ids {
+            if gid.is_empty() {
+                continue;
+            }
+            let key = (calendar_id.to_string(), run_id.to_string(), gid);
+            if !seen.iter().any(|row| row == &key) {
+                seen.push(key);
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_replica_seen_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        self.replica_seen
+            .lock()
+            .unwrap()
+            .retain(|(cid, _, _)| cid != calendar_id);
+        Ok(())
+    }
+
+    async fn sweep_absent_if_owner(
+        &self,
+        calendar_id: &str,
+        run_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        // Counts as a fenced apply (lease inject + gate).
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        let seen: std::collections::HashSet<String> = self
+            .replica_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(cid, rid, _)| cid == calendar_id && rid == run_id)
+            .map(|(_, _, gid)| gid.clone())
+            .collect();
+        let mut stored = self.stored.lock().unwrap();
+        for event in stored.iter_mut() {
+            if event.calendar_id != calendar_id {
+                continue;
+            }
+            if event.deleted_at.is_some() {
+                continue;
+            }
+            // Cancelled exception: keep living.
+            if event.status == "cancelled" && !event.recurring_event_id.trim().is_empty() {
+                continue;
+            }
+            // App-owned association: keep living.
+            if !event.task_id.trim().is_empty() {
+                continue;
+            }
+            if seen.contains(&event.google_event_id) {
+                continue;
+            }
+            // Soft-delete only — do not wipe task_id (already empty here).
+            event.deleted_at = Some(now_rfc3339.to_string());
+            event.updated_at = now_rfc3339.to_string();
+        }
+        Ok(true)
+    }
+
+    async fn upsert_quarantine(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        phase: &str,
+        error_class: &str,
+        replay_payload: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut rows = self.quarantine.lock().unwrap();
+        if let Some(row) = rows.iter_mut().find(|r| {
+            r.calendar_id == calendar_id
+                && r.google_event_id == google_event_id
+                && r.phase == phase
+        }) {
+            row.error_class = error_class.to_string();
+            row.replay_payload = replay_payload.to_string();
+            row.last_attempt_at = now_rfc3339.to_string();
+            row.attempt_count = row.attempt_count.saturating_add(1);
+        } else {
+            rows.push(FakeQuarantineRow {
+                calendar_id: calendar_id.to_string(),
+                google_event_id: google_event_id.to_string(),
+                phase: phase.to_string(),
+                error_class: error_class.to_string(),
+                replay_payload: replay_payload.to_string(),
+                first_seen_at: now_rfc3339.to_string(),
+                last_attempt_at: now_rfc3339.to_string(),
+                attempt_count: 1,
+            });
+        }
+        Ok(())
+    }
+
+    async fn clear_quarantine_for_calendar(&self, calendar_id: &str) -> Result<(), RepoError> {
+        self.quarantine
+            .lock()
+            .unwrap()
+            .retain(|r| r.calendar_id != calendar_id);
+        Ok(())
+    }
 }
 
 /// In-memory watch-channel repo: stores rows and records every
@@ -1551,6 +1706,7 @@ pub(crate) fn calendar_for_user(
         cache_revision: 0,
         projection: "timed_masters_and_exceptions".to_string(),
         watch_coverage: String::new(),
+        event_coverage: String::new(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         deleted_at: None,

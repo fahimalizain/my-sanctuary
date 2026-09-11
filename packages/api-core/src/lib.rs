@@ -57,8 +57,8 @@ pub use calendar_sync::{
     aggregate_sync_status, calendar_sync_view, classify_sync_error, classify_watch_coverage,
     events_sync_envelope, next_retry_rfc3339, next_retry_unix, refresh_watch_coverage,
     replica_query_fingerprint, replica_state_for_error, CalendarReplicaState, CalendarSyncView,
-    EventsSyncEnvelope, SyncAggregateStatus, SyncErrorCode, WatchCoverage, REPLICA_PROJECTION,
-    SYNC_HEALTH_STALE_SECS,
+    EventCoverage, EventsSyncEnvelope, SyncAggregateStatus, SyncErrorCode, WatchCoverage,
+    REPLICA_PROJECTION, SYNC_HEALTH_STALE_SECS,
 };
 pub use calendar_color::{
     calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
@@ -97,7 +97,7 @@ pub use routines::{
 };
 pub use repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_insert_sql,
-    build_occurrence_list_by_ids_sql,
+    build_occurrence_list_by_ids_sql, build_replica_seen_insert_sql,
     build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, AgendaItemRepo,
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError,
     RoutineRepo, TaskCategoryRepo,
@@ -117,9 +117,10 @@ pub use repo::{
     CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
-    CALENDAR_LEASE_HELD_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL,
-    EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
-    EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
+    CALENDAR_LEASE_HELD_SQL, EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL,
+    EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
+    EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_UPSERT_COL_COUNT, REPLICA_SEEN_INSERT_CHUNK_SIZE, REPLICA_SEEN_INSERT_COL_COUNT,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
     OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_INSERT_COL_COUNT,
     OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE, OCCURRENCE_LIST_BY_USER_AND_DATE_SQL,
