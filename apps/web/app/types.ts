@@ -44,6 +44,15 @@ export interface CalendarEvent {
   last_synced_at: string;
   /** Matched category color from the API (`#rrggbb`). May be absent from older workers. */
   color?: string;
+  /** Replica bool; missing/undefined means false. All-day is out of GET projection today. */
+  is_all_day?: boolean;
+  /** IANA zone; empty / missing = unset. */
+  start_time_zone?: string;
+  end_time_zone?: string;
+  /** JSON array of RRULE strings as stored on the replica, e.g. `["RRULE:FREQ=DAILY"]`. Empty / missing = one-shot. Do not type this as string[]. */
+  recurrence?: string;
+  /** Google recurringEventId for instances; empty / missing = master or one-shot. */
+  recurring_event_id?: string;
 }
 
 export type CalendarSyncAggregateStatus =

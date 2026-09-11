@@ -4,6 +4,7 @@
 import {
   DEFAULT_EVENT_DURATION_MIN,
   MINUTES_PER_DAY,
+  RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
   addDays,
   clampMinutesToDay,
@@ -34,7 +35,10 @@ export type DragKind =
 export interface DragSlot {
   /** Local midnight of the civil day. */
   day: Date;
-  /** Minutes since midnight, snapped to SNAP_MINUTES, in [0, 1440]. */
+  /**
+   * Minutes since midnight in [0, 1440].
+   * Create/move snap to `SNAP_MINUTES`; resize snaps to `RESIZE_SNAP_MINUTES`.
+   */
   minutes: number;
 }
 
@@ -129,8 +133,8 @@ export function resizeEdgeAt(
   return null;
 }
 
-function slotInstant(slot: DragSlot): Date {
-  return dateOnDay(startOfDay(slot.day), snapMinutes(slot.minutes));
+function slotInstant(slot: DragSlot, step = SNAP_MINUTES): Date {
+  return dateOnDay(startOfDay(slot.day), snapMinutes(slot.minutes, step));
 }
 
 /**
@@ -260,7 +264,8 @@ export function movedRange(
 
 /**
  * Resize one edge; keep the other fixed. Min duration is SNAP_MINUTES.
- * The active edge is placed at the snapped slot (may cross days).
+ * The active edge snaps to RESIZE_SNAP_MINUTES (may cross days).
+ * The fixed edge is not re-snapped.
  */
 export function resizedRange(
   originalStart: Date,
@@ -269,7 +274,7 @@ export function resizedRange(
   slot: DragSlot,
 ): TimedRange {
   const minMs = SNAP_MINUTES * 60_000;
-  const slotTime = slotInstant(slot);
+  const slotTime = slotInstant(slot, RESIZE_SNAP_MINUTES);
 
   if (edge === 'start') {
     const end = originalEnd;
