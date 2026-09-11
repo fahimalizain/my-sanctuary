@@ -93,6 +93,14 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
+    /// Live wall clock for replica lease renewal (never `SystemTime` on wasm32).
+    struct WorkerClock;
+    impl api_core::Clock for WorkerClock {
+        fn now_unix(&self) -> i64 {
+            (worker::Date::now().as_millis() / 1000) as i64
+        }
+    }
+
     // Every tick (*/2 and */15): grow living IN_PROGRESS events — tasks and
     // in_progress occurrences alike (slice 6), so a running occurrence's
     // one-shot log never looks finished either.
@@ -136,7 +144,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Only the 15-minute tick runs the fallback sync + watch renewal — never
     // on a pure */2 tick.
     if event.cron() == "*/15 * * * *" {
-        let report = api_core::run_fallback_cron(
+        let report = api_core::run_fallback_cron_with_clock(
             &crate::http::WorkerHttp,
             &calendars,
             &events,
@@ -146,6 +154,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             &oauth,
             config.watch_callback_url.as_deref(),
             now_unix,
+            &WorkerClock,
         )
         .await;
         for error in &report.errors {

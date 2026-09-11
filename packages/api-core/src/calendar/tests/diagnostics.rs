@@ -8,7 +8,7 @@ use crate::calendar::{
     run_fallback_cron, sync_calendar_traced, CalendarError, ReplicaWalkMeta, SyncCalendarOutcome,
 };
 use crate::calendar_sync::SyncErrorCode;
-use crate::time::unix_secs_to_rfc3339;
+use crate::time::{unix_secs_to_rfc3339, FrozenClock};
 
 #[test]
 fn traced_paginated_walk_counts_and_sanitizes_diagnostic() {
@@ -28,6 +28,7 @@ fn traced_paginated_walk_counts_and_sanitizes_diagnostic() {
         ("/events", 200, page_one),
     ]);
 
+    let clock = FrozenClock::from_rfc3339(now);
     let result = pollster::block_on(sync_calendar_traced(
         &http,
         &calendars,
@@ -36,6 +37,7 @@ fn traced_paginated_walk_counts_and_sanitizes_diagnostic() {
         &access(),
         &cal,
         now,
+        &clock,
         ReplicaWalkMeta {
             run_id: "run-paginated-test".into(),
             trigger: ReplicaWalkTrigger::Cron,
@@ -106,6 +108,8 @@ fn traced_missing_terminal_token_sets_checkpoint_and_preserves_success() {
     let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
     let events = FakeEventRepo::new();
 
+    let now = "2023-11-14T22:13:20Z";
+    let clock = FrozenClock::from_rfc3339(now);
     let result = pollster::block_on(sync_calendar_traced(
         &http,
         &calendars,
@@ -113,7 +117,8 @@ fn traced_missing_terminal_token_sets_checkpoint_and_preserves_success() {
         &FakeOperationRepo::new(),
         &access(),
         &cal,
-        "2023-11-14T22:13:20Z",
+        now,
+        &clock,
         ReplicaWalkMeta {
             run_id: "run-missing-token".into(),
             trigger: ReplicaWalkTrigger::Unspecified,
@@ -165,6 +170,9 @@ fn cron_warns_stale_and_auth_even_when_not_replica_due() {
     stale.next_retry_at = Some(unix_secs_to_rfc3339(NOW_UNIX + 3600));
 
     // Auth-required calendar: replica_due skips it; warning is immediate.
+    // No stored token so refresh fails with NoToken — successful refresh would
+    // clear authorization_required (recovery path); we need the status to stick
+    // so the operator warning still fires.
     let mut auth = calendar("cal-auth", "auth@example.com", true);
     auth.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
     auth.last_synced_at = auth.last_success_at.clone();
@@ -187,7 +195,9 @@ fn cron_warns_stale_and_auth_even_when_not_replica_due() {
     let calendars = FakeCalendarRepo::with(vec![stale, auth, fresh]);
     let events = FakeEventRepo::new();
     let watches = FakeWatchChannelRepo::new();
-    let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+    // Empty tokens → NoToken: user Google work skipped; auth_required stays;
+    // operator warnings still collected from the store after the loop.
+    let tokens = FakeTokenRepo::with(vec![]);
     let oauth = oauth_config();
 
     let report = pollster::block_on(run_fallback_cron(

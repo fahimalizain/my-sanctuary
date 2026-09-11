@@ -357,6 +357,120 @@ fn cron_token_refresh_failure_for_one_user_does_not_abort_the_rest() {
 
 
 // ──────────────────────────────────────────
+// authorization_required recovery
+// ──────────────────────────────────────────
+
+#[test]
+fn clear_authorization_required_for_user_scopes_and_status_case() {
+    let mut never_init = calendar_for_user("u-1", "cal-auth-new", "a@example.com", true);
+    never_init.sync_status = "authorization_required".to_string();
+    never_init.last_error_code = "auth_revoked".to_string();
+    never_init.failure_streak = 2;
+    never_init.initial_sync_complete = false;
+    never_init.last_success_at = None;
+
+    let mut was_ready = calendar_for_user("u-1", "cal-auth-old", "b@example.com", true);
+    was_ready.sync_status = "authorization_required".to_string();
+    was_ready.last_error_code = "auth_revoked".to_string();
+    was_ready.failure_streak = 5;
+    was_ready.initial_sync_complete = true;
+    was_ready.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    was_ready.sync_token = "keep-me".to_string();
+    was_ready.dirty_requested_generation = 3;
+    was_ready.dirty_applied_generation = 1;
+    was_ready.full_sync_requested = true;
+    was_ready.lease_owner = "owner-x".to_string();
+
+    let mut ready = calendar_for_user("u-1", "cal-ready", "c@example.com", true);
+    ready.sync_status = "ready".to_string();
+    ready.initial_sync_complete = true;
+    ready.last_success_at = Some("2023-11-14T22:00:00Z".to_string());
+
+    let mut other = calendar_for_user("u-2", "cal-other", "d@example.com", true);
+    other.sync_status = "authorization_required".to_string();
+    other.last_error_code = "auth_revoked".to_string();
+    other.failure_streak = 1;
+
+    let calendars = FakeCalendarRepo::with(vec![never_init, was_ready, ready, other]);
+    let now = unix_secs_to_rfc3339(NOW_UNIX);
+    pollster::block_on(calendars.clear_authorization_required_for_user("u-1", &now, &now))
+        .unwrap();
+
+    let stored = calendars.stored.lock().unwrap();
+    let new = stored.iter().find(|c| c.id == "cal-auth-new").unwrap();
+    assert_eq!(new.sync_status, "never_initialized");
+    assert!(new.last_error_code.is_empty());
+    assert_eq!(new.failure_streak, 0);
+    assert_eq!(new.next_retry_at.as_deref(), Some(now.as_str()));
+
+    let old = stored.iter().find(|c| c.id == "cal-auth-old").unwrap();
+    assert_eq!(old.sync_status, "retrying");
+    assert!(old.last_error_code.is_empty());
+    assert_eq!(old.failure_streak, 0);
+    assert_eq!(old.next_retry_at.as_deref(), Some(now.as_str()));
+    assert_eq!(old.sync_token, "keep-me", "cursor must not move");
+    assert_eq!(old.dirty_requested_generation, 3);
+    assert_eq!(old.dirty_applied_generation, 1);
+    assert!(old.full_sync_requested);
+    assert_eq!(old.lease_owner, "owner-x");
+
+    let ready_row = stored.iter().find(|c| c.id == "cal-ready").unwrap();
+    assert_eq!(ready_row.sync_status, "ready", "ready untouched");
+
+    let other_row = stored.iter().find(|c| c.id == "cal-other").unwrap();
+    assert_eq!(
+        other_row.sync_status, "authorization_required",
+        "other user untouched"
+    );
+    assert_eq!(other_row.last_error_code, "auth_revoked");
+    assert_eq!(other_row.failure_streak, 1);
+}
+
+#[test]
+fn cron_clears_authorization_required_after_successful_refresh_and_syncs() {
+    // Previously authorization_required + never-init + fresh token → clear →
+    // same-tick replica → ready. Acceptance for recoverable auth_required.
+    let http = FakeHttp::new(vec![("/events", 200, EVENTS_JSON)]);
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_status = "authorization_required".to_string();
+    cal.last_error_code = "auth_revoked".to_string();
+    cal.failure_streak = 3;
+    cal.initial_sync_complete = false;
+    cal.last_success_at = None;
+    // Sanity: still hard-skipped while status is authorization_required.
+    assert!(!replica_due(&cal, NOW_UNIX));
+
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::new();
+    let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
+    let oauth = oauth_config();
+
+    let report = pollster::block_on(run_fallback_cron(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &watches,
+        &tokens,
+        &oauth,
+        None,
+        NOW_UNIX,
+    ));
+
+    assert_eq!(report.synced, 1, "auth_required calendar recovered: {:?}", report.errors);
+    assert_eq!(
+        report.published,
+        vec![("u-1".to_string(), "cal-1".to_string())]
+    );
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].sync_status, "ready");
+    assert!(stored[0].last_error_code.is_empty());
+    assert_eq!(stored[0].failure_streak, 0);
+    assert!(stored[0].initial_sync_complete);
+}
+
+// ──────────────────────────────────────────
 // replica_due / dirty-generation cron
 // ──────────────────────────────────────────
 

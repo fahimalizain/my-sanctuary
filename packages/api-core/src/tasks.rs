@@ -4503,6 +4503,17 @@ mod tests {
             Ok(())
         }
 
+        async fn record_sync_contention(
+            &self,
+            _id: &str,
+            _error_code: &str,
+            _sync_status: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+
         async fn begin_replica_reseed(
             &self,
             _id: &str,
@@ -4622,6 +4633,15 @@ mod tests {
 
         async fn list_user_ids_with_calendars(&self) -> Result<Vec<String>, RepoError> {
             Ok(Vec::new())
+        }
+
+        async fn clear_authorization_required_for_user(
+            &self,
+            _user_id: &str,
+            _next_retry_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
         }
     }
 

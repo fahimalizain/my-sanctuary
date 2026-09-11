@@ -12,11 +12,13 @@ use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_replica_seen_insert_sql,
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo,
     WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
-    CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
+    CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL, CALENDAR_DELETE_SQL,
+    CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
     CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
     CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
-    CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
+    CALENDAR_RECORD_SYNC_CONTENTION_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_COVERAGE_SQL, CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_SYNC_ENABLED_SQL,
     CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL, CALENDAR_UPDATE_SYNC_STATE_SQL,
@@ -232,6 +234,28 @@ impl CalendarRepo for SqliteCalendarRepo {
         )
     }
 
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        exec(
+            &conn,
+            CALENDAR_RECORD_SYNC_CONTENTION_SQL,
+            &[
+                &error_code,
+                &sync_status,
+                &next_retry_rfc3339,
+                &now_rfc3339,
+                &id,
+            ],
+        )
+    }
+
     async fn begin_replica_reseed(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
         let conn = lock(&self.db)?;
         exec(
@@ -427,6 +451,21 @@ impl CalendarRepo for SqliteCalendarRepo {
         let rows: Vec<Row> = query_vec(&conn, CALENDAR_LIST_USER_IDS_SQL, &[])?;
         Ok(rows.into_iter().map(|r| r.user_id).collect())
     }
+
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        // Binds: next_retry, now, user_id.
+        exec(
+            &conn,
+            CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
+            &[&next_retry_rfc3339, &now_rfc3339, &user_id],
+        )
+    }
 }
 
 // ── CalendarEventRepo ───────────────────────────────────────────────────────
@@ -504,20 +543,13 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
+        // Mint candidate UUIDs; ON CONFLICT(calendar_id, google_event_id)
+        // preserves existing id and sets deleted_at = NULL (no per-event SELECT).
         let conn = lock(&self.db)?;
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match Self::lookup_id_by_natural_key(
-                    &conn,
-                    &event.calendar_id,
-                    &event.google_event_id,
-                )? {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
+            let ids: Vec<String> = (0..chunk.len())
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect();
             let (sql, args) = build_event_upsert_sql(chunk, now_rfc3339, ids);
             Self::run_upsert(&conn, &sql, &args)?;
         }
@@ -533,21 +565,13 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
         if events.is_empty() {
             return Ok(true);
         }
+        // Same mint-UUID + chunking as upsert_batch; fence binds unchanged.
         let conn = lock(&self.db)?;
         for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
             let calendar_id = chunk[0].calendar_id.as_str();
-            let mut ids = Vec::with_capacity(chunk.len());
-            for event in chunk {
-                let id = match Self::lookup_id_by_natural_key(
-                    &conn,
-                    &event.calendar_id,
-                    &event.google_event_id,
-                )? {
-                    Some(existing) => existing,
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                ids.push(id);
-            }
+            let ids: Vec<String> = (0..chunk.len())
+                .map(|_| uuid::Uuid::new_v4().to_string())
+                .collect();
             let (sql, args) = build_event_upsert_if_owner_sql(
                 chunk,
                 now_rfc3339,

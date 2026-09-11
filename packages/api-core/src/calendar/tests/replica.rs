@@ -1,6 +1,12 @@
 use super::support::*;
-use crate::calendar::{list_events, sync_calendar, CalendarError};
+use crate::calendar::diagnostics::{ReplicaWalkMeta, ReplicaWalkTrigger};
+use crate::calendar::replica::lease_expires_at;
+use crate::calendar::{
+    list_events, sync_calendar, sync_calendar_traced, CalendarError, SyncCalendarOutcome,
+};
 use crate::repo::CalendarRepo;
+use crate::time::{unix_secs_to_rfc3339, Clock};
+use std::cell::Cell;
 
 #[test]
 fn empty_items_with_next_sync_token_is_replica_success() {
@@ -895,7 +901,19 @@ fn replica_mid_walk_lease_loss_does_not_publish_token() {
         .unwrap()
         .iter()
         .any(|e| e.google_event_id == "p1"));
-    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "old-tok");
+    let stored = calendars.stored.lock().unwrap()[0].clone();
+    assert_eq!(stored.sync_token, "old-tok");
+    assert_eq!(stored.last_error_code, "lost_lease");
+    assert_eq!(stored.sync_status, "retrying");
+    assert_eq!(
+        stored.failure_streak, 0,
+        "lost lease must not increment failure_streak"
+    );
+    assert_eq!(
+        stored.next_retry_at.as_deref(),
+        Some("2023-11-14T22:13:20Z"),
+        "next_retry = now so replica is due on next cron tick"
+    );
     assert!(calendars.sync_states.lock().unwrap().is_empty());
     // Must not have applied page 2 / published st-stolen.
     assert!(!events
@@ -1533,4 +1551,152 @@ fn replica_merge_full_records_inflight_as_seen_and_does_not_sweep() {
         "inflight must not be upserted"
     );
     assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-inf");
+}
+
+/// Clock whose `now_unix` is `base + 60 * events.list GET count`. After two
+/// page fetches wall time is past the 90s lease TTL, so renewals must advance
+/// expiry past walk-start + 90s or the walk loses the lease.
+struct AdvancingHttpClock<'a> {
+    base: i64,
+    http: &'a FakeHttp,
+    calendars: &'a FakeCalendarRepo,
+    /// Set once after the 2nd page fetch: whether a foreign acquire at base+91s
+    /// was blocked while the walk still held the lease.
+    mid_walk_steal_blocked: Cell<Option<bool>>,
+}
+
+impl Clock for AdvancingHttpClock<'_> {
+    fn now_unix(&self) -> i64 {
+        let n = self.http.gets.lock().unwrap().len() as i64;
+        let now = self.base + 60 * n;
+        // After 2 fetches: now = base+120 (> 90s TTL). A second owner at
+        // base+91s must not steal while the first owner is still renewing.
+        // Synchronous (mirrors FakeCalendarRepo::try_acquire_lease) — no
+        // nested pollster::block_on inside the walk.
+        if n >= 2 && self.mid_walk_steal_blocked.get().is_none() {
+            let steal_now = unix_secs_to_rfc3339(self.base + 91);
+            let mut stored = self.calendars.stored.lock().unwrap();
+            let acquired = if let Some(cal) = stored.iter_mut().find(|c| c.id == "cal-1") {
+                let can_take = cal.lease_owner.is_empty()
+                    || cal
+                        .lease_expires_at
+                        .as_deref()
+                        .is_some_and(|exp| exp < steal_now.as_str());
+                if can_take {
+                    cal.lease_owner = "thief".to_string();
+                    cal.lease_expires_at = Some(lease_expires_at(&steal_now));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            self.mid_walk_steal_blocked.set(Some(acquired));
+        }
+        now
+    }
+}
+
+#[test]
+fn replica_lease_expiry_advances_with_wall_time_on_long_walk() {
+    // 3 pages: nextPageToken → nextPageToken → terminal nextSyncToken.
+    // Clock advances 60s per events.list GET so after page 2, wall time is
+    // past REPLICA_LEASE_TTL_SECS (90s). Renewals must write fresh expiries.
+    let page_one = r#"{"items":[{"id":"p1","summary":"A","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+    let page_two = r#"{"items":[{"id":"p2","summary":"B","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextPageToken":"tok-3"}"#;
+    let page_three = r#"{"items":[{"id":"p3","summary":"C","start":{"dateTime":"2026-08-18T11:00:00Z"},"end":{"dateTime":"2026-08-18T11:30:00Z"}}],"nextSyncToken":"st-long"}"#;
+
+    let base = NOW_UNIX;
+    let start = unix_secs_to_rfc3339(base);
+    let start_plus_ttl = lease_expires_at(&start);
+
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.last_synced_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.last_success_at = Some("2023-11-14T21:00:00Z".to_string());
+    cal.initial_sync_complete = true;
+
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    let http = FakeHttp::new(vec![
+        ("pageToken=tok-3", 200, page_three),
+        ("pageToken=tok-2", 200, page_two),
+        ("/events", 200, page_one),
+    ]);
+
+    let clock = AdvancingHttpClock {
+        base,
+        http: &http,
+        calendars: &calendars,
+        mid_walk_steal_blocked: Cell::new(None),
+    };
+
+    let result = pollster::block_on(sync_calendar_traced(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        &start,
+        &clock,
+        ReplicaWalkMeta {
+            run_id: "run-long-walk".into(),
+            trigger: ReplicaWalkTrigger::Cron,
+            deployed_version: String::new(),
+            started_unix_ms: base.saturating_mul(1000),
+        },
+    ));
+
+    assert!(
+        matches!(result.outcome, Ok(SyncCalendarOutcome::Published)),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-long");
+
+    let renewals = calendars.renew_expiries.lock().unwrap().clone();
+    assert!(
+        renewals.len() >= 2,
+        "expected multi-page renewals, got {renewals:?}"
+    );
+    // Later renewals must strictly advance past walk-start + TTL.
+    let advanced: Vec<&String> = renewals
+        .iter()
+        .filter(|exp| exp.as_str() > start_plus_ttl.as_str())
+        .collect();
+    assert!(
+        !advanced.is_empty(),
+        "renew expiries must advance past {start_plus_ttl}, got {renewals:?}"
+    );
+    // Monotonic non-decreasing renewals (wall clock only moves forward).
+    for window in renewals.windows(2) {
+        assert!(
+            window[1] >= window[0],
+            "renew expiries must not go backwards: {renewals:?}"
+        );
+    }
+
+    assert_eq!(
+        clock.mid_walk_steal_blocked.get(),
+        Some(false),
+        "foreign acquire at base+91s must fail while first owner renews"
+    );
+
+    // Lease released after the walk — a new owner at the late clock succeeds.
+    let late = clock.now_rfc3339();
+    let late_expires = lease_expires_at(&late);
+    let acquired = pollster::block_on(calendars.try_acquire_lease(
+        "cal-1",
+        "new-owner",
+        &late,
+        &late_expires,
+    ))
+    .unwrap();
+    assert!(
+        acquired,
+        "after release, late acquire must succeed; lease={:?}",
+        calendars.stored.lock().unwrap()[0].lease_owner
+    );
 }

@@ -43,7 +43,8 @@ pub use calendar::{
     list_events, list_events_after_refresh_failure, mint_run_id, operator_warning_record,
     parse_event_time_range, patch_event, patch_event_fields, persist_webhook_decision,
     renew_watch_if_needed, repair_inflight_operations, replica_due, request_calendar_repair,
-    run_fallback_cron, stop_watches_for_calendar, sync_calendar, sync_calendar_traced, tokens_match,
+    run_fallback_cron, run_fallback_cron_with_clock, stop_watches_for_calendar, sync_calendar,
+    sync_calendar_traced, tokens_match,
     update_event_for_user, CalendarError, CalendarEventsResponse, CalendarListOutput,
     CalendarRepairResponse, CalendarRepairStatus, CalendarView, CalendarsResponse, CheckpointResult,
     CreateEventOutput, CreateEventResponse, CronReport, DeleteEventResponse, OperatorWarningLevel,
@@ -108,13 +109,15 @@ pub use repo::{
     AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_MAX_SORT_ORDER_SQL,
     AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
-    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL,
+    CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
+    CALENDAR_GET_BY_ID_UNFILTERED_SQL,
     CALENDAR_LIST_STATE_GET_SQL,
     CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL,
     CALENDAR_MARK_DIRTY_APPLIED_SQL,
     CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
-    CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
+    CALENDAR_RECORD_SYNC_CONTENTION_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
+    CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
     CALENDAR_LEASE_HELD_SQL, EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL,
@@ -159,7 +162,7 @@ pub use session::{
 };
 pub use time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, parse_iana_tz,
-    rfc3339_to_unix_secs, unix_secs_to_rfc3339,
+    rfc3339_to_unix_secs, unix_secs_to_rfc3339, CellClock, Clock, FrozenClock,
 };
 pub use token::{
     classify_refresh_failure, is_refresh_auth_revoked, refresh_if_needed, GoogleAccess,

@@ -205,6 +205,24 @@ pub async fn google_callback(
         }
     };
 
+    // Best-effort: OAuth reconnect clears authorization_required so cron can
+    // attempt those calendars again. Never fail the login 302 on D1 clear.
+    let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
+    if let Ok(db) = ctx.d1("DB") {
+        use api_core::repo::CalendarRepo;
+        let calendars = crate::db::D1CalendarRepo::new(db);
+        if let Err(err) = CalendarRepo::clear_authorization_required_for_user(
+            &calendars,
+            &user.id,
+            &now_rfc3339,
+            &now_rfc3339,
+        )
+        .await
+        {
+            console_log!("oauth callback: failed to clear authorization_required: {err}");
+        }
+    }
+
     let sealed = match api_core::seal(&config.session_secret, &user, now_unix) {
         Ok(sealed) => sealed,
         Err(err) => {

@@ -9,7 +9,7 @@ use super::repair::repair_inflight_operations;
 use super::replica::{lease_expires_at, mint_lease_owner, sync_replica};
 use super::sync::{
     classify_sync_error, next_retry_rfc3339, refresh_watch_coverage, replica_state_for_error,
-    SyncErrorCode,
+    CalendarReplicaState, SyncErrorCode,
 };
 use super::watch::{
     is_public_https_callback, renew_watch_if_needed, stop_watches_for_calendar,
@@ -23,7 +23,7 @@ use crate::oauth::HttpClient;
 use crate::repo::{
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TokenRepo, WatchChannelRepo,
 };
-use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
+use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339, Clock, FrozenClock};
 use crate::token::{is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError};
 use std::collections::{HashMap, HashSet};
 
@@ -149,9 +149,14 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///
 /// Per user, in order:
 /// 1. `refresh_if_needed` for the owner's Google token (cached per user).
-///    - Revoked refresh (`invalid_grant` / token-endpoint 400/401): stamp
-///      `auth_revoked` / `authorization_required` on the user's living
-///      sync-enabled calendars, keep events, skip Google for that user.
+///    - Ok (including still-fresh token, no HTTP): clear
+///      `authorization_required` on the user's living sync-enabled calendars
+///      (best-effort; clear failure is logged, tick continues) so
+///      [`replica_due`] can attempt them this same tick after re-list.
+///    - Revoked refresh (`invalid_grant` only — not bare token-endpoint
+///      400/401): stamp `auth_revoked` / `authorization_required` on the
+///      user's living sync-enabled calendars, keep events, skip Google for
+///      that user.
 ///    - `NoToken` / `NoRefreshToken`: skip + error string only (do not flip
 ///      healthy calendars to `authorization_required`).
 /// 2. GET-only [`repair_inflight_operations`] for stuck journal rows. Repair
@@ -175,6 +180,10 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
 ///    calendar is missing-from-living-path (soft-deleted) or `!sync_enabled`.
 ///    Does **not** require a public HTTPS callback (stop needs no webhook URL).
 ///    Does **not** abort prior replica work. Failed stops leave rows + error.
+/// Thin wrapper: freezes `now_unix` for the whole tick so existing cron unit
+/// tests keep the same signature. Production uses
+/// [`run_fallback_cron_with_clock`] with a live wall clock so replica lease
+/// renewals advance past the tick-start instant.
 pub async fn run_fallback_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -185,6 +194,37 @@ pub async fn run_fallback_cron(
     oauth: &OAuthConfig,
     watch_callback_url: Option<&str>,
     now_unix: i64,
+) -> CronReport {
+    let clock = FrozenClock(now_unix);
+    run_fallback_cron_with_clock(
+        http,
+        calendars,
+        events,
+        operations,
+        watches,
+        tokens,
+        oauth,
+        watch_callback_url,
+        now_unix,
+        &clock,
+    )
+    .await
+}
+
+/// Like [`run_fallback_cron`], but replica walks renew leases from `clock`
+/// (fresh wall time on every page). Tick-start `now_unix` still gates
+/// [`replica_due`], list refresh stamps, and backoff.
+pub async fn run_fallback_cron_with_clock(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    operations: &dyn CalendarEventOperationRepo,
+    watches: &dyn WatchChannelRepo,
+    tokens: &dyn TokenRepo,
+    oauth: &OAuthConfig,
+    watch_callback_url: Option<&str>,
+    now_unix: i64,
+    clock: &dyn Clock,
 ) -> CronReport {
     let mut report = CronReport::default();
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
@@ -249,7 +289,25 @@ pub async fn run_fallback_cron(
         };
 
         let access = match access_result {
-            Ok(access) => access,
+            Ok(access) => {
+                // Successful refresh (including still-fresh token) clears
+                // authorization_required so replica_due can attempt those
+                // calendars this same tick after list_by_user_id. Do not abort
+                // the user on clear failure.
+                if let Err(err) = calendars
+                    .clear_authorization_required_for_user(
+                        user_id,
+                        &now_rfc3339,
+                        &now_rfc3339,
+                    )
+                    .await
+                {
+                    report.errors.push(format!(
+                        "failed to clear authorization_required for user {user_id}: {err}"
+                    ));
+                }
+                access
+            }
             Err(err) => {
                 report.errors.push(format!(
                     "token refresh failed for user {user_id}: {err}"
@@ -335,6 +393,7 @@ pub async fn run_fallback_cron(
                     &access,
                     cal,
                     &now_rfc3339,
+                    clock,
                     ReplicaWalkMeta {
                         run_id: mint_run_id(),
                         trigger: ReplicaWalkTrigger::Cron,
@@ -697,6 +756,7 @@ pub async fn sync_calendar(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
+    let clock = FrozenClock::from_rfc3339(now_rfc3339);
     let result = sync_calendar_traced(
         http,
         calendars,
@@ -705,6 +765,7 @@ pub async fn sync_calendar(
         access,
         cal,
         now_rfc3339,
+        &clock,
         ReplicaWalkMeta {
             run_id: mint_run_id(),
             trigger: ReplicaWalkTrigger::Unspecified,
@@ -718,6 +779,9 @@ pub async fn sync_calendar(
 
 /// Like [`sync_calendar`], but returns a structured [`ReplicaWalkDiagnostic`]
 /// alongside the outcome for logging / CronReport.
+///
+/// `now_rfc3339` stamps attempt / lease-acquire at walk start. `clock` is
+/// read again on every replica page so lease renewals use fresh wall time.
 pub async fn sync_calendar_traced(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -726,6 +790,7 @@ pub async fn sync_calendar_traced(
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     now_rfc3339: &str,
+    clock: &dyn Clock,
     meta: ReplicaWalkMeta,
 ) -> SyncCalendarResult {
     let mut report = ReplicaApplyReport::default();
@@ -747,6 +812,7 @@ pub async fn sync_calendar_traced(
         cal,
         now_rfc3339,
         now_unix,
+        clock,
         &mut report,
     )
     .await;
@@ -798,6 +864,7 @@ async fn sync_calendar_traced_inner(
     cal: &GoogleCalendar,
     now_rfc3339: &str,
     now_unix: i64,
+    clock: &dyn Clock,
     report: &mut ReplicaApplyReport,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
     calendars
@@ -833,7 +900,7 @@ async fn sync_calendar_traced_inner(
             access,
             &fresh,
             &owner,
-            now_rfc3339,
+            clock,
             report,
         )
         .await?;
@@ -934,8 +1001,11 @@ pub(crate) async fn stamp_auth_revoked_for_user(
 /// Persist a classified failure without advancing the sync cursor.
 ///
 /// Uses `cal.failure_streak + 1` for backoff (the in-memory snapshot at
-/// invocation — attempt does not bump streak). Returns a repo error if the
-/// health write itself fails so callers never drop health silently.
+/// invocation — attempt does not bump streak). Lost lease is contention, not a
+/// bad calendar: persist `lost_lease` / retrying with `next_retry = now` and
+/// **do not** increment `failure_streak` or apply exponential backoff.
+/// Returns a repo error if the health write itself fails so callers never drop
+/// health silently.
 pub(crate) async fn persist_sync_failure(
     calendars: &dyn CalendarRepo,
     cal: &GoogleCalendar,
@@ -943,6 +1013,18 @@ pub(crate) async fn persist_sync_failure(
     now_unix: i64,
     now_rfc3339: &str,
 ) -> Result<(), CalendarError> {
+    if code == SyncErrorCode::LostLease {
+        calendars
+            .record_sync_contention(
+                &cal.id,
+                code.as_str(),
+                CalendarReplicaState::Retrying.as_str(),
+                now_rfc3339, // next_retry = now → due immediately
+                now_rfc3339,
+            )
+            .await?;
+        return Ok(());
+    }
     let state = replica_state_for_error(code);
     let streak_for_backoff = cal.failure_streak.saturating_add(1);
     let retry = next_retry_rfc3339(now_unix, streak_for_backoff);

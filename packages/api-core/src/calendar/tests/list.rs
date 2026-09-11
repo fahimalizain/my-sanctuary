@@ -1013,7 +1013,8 @@ fn refresh_failure_revoked_grant_serves_cache_and_stamps_auth_required() {
         .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
 
     let refresh_err = TokenError::Http(HttpError::Message(
-        "POST https://oauth2.googleapis.com/token returned 400".into(),
+        "POST https://oauth2.googleapis.com/token returned 400: {\"error\":\"invalid_grant\"}"
+            .into(),
     ));
     let output = pollster::block_on(list_events_after_refresh_failure(
         &calendars,
@@ -1102,6 +1103,44 @@ fn refresh_failure_no_token_does_not_stamp() {
     assert_ne!(
         calendars.stored.lock().unwrap()[0].sync_status,
         "authorization_required"
+    );
+    assert_eq!(calendars.stored.lock().unwrap()[0].sync_status, "ready");
+}
+
+#[test]
+fn refresh_failure_bare_400_does_not_stamp_auth_required() {
+    // Bare token-endpoint 400 without invalid_grant is transient — health stays ready.
+    let cal = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-local-1", "cal-1", "Standup", ""));
+
+    let refresh_err = TokenError::Http(HttpError::Message(
+        "POST https://oauth2.googleapis.com/token returned 400".into(),
+    ));
+    let output = pollster::block_on(list_events_after_refresh_failure(
+        &calendars,
+        &events,
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        &refresh_err,
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_ne!(
+        output.sync.status,
+        crate::calendar_sync::SyncAggregateStatus::AuthorizationRequired
+    );
+    assert_eq!(
+        output.sync.calendars[0].state,
+        crate::calendar_sync::CalendarReplicaState::Ready
     );
     assert_eq!(calendars.stored.lock().unwrap()[0].sync_status, "ready");
 }

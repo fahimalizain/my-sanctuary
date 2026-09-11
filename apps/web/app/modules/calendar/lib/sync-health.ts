@@ -89,6 +89,9 @@ export function repairTargetCalendarId(
 }
 
 function degradedMessage(name: string, health: CalendarSyncHealth): string {
+  if (health.error_code === 'lost_lease') {
+    return `${name} is waiting on another sync and will retry automatically`;
+  }
   let base: string;
   if (health.state === 'retrying') {
     base = `${name} is retrying`;

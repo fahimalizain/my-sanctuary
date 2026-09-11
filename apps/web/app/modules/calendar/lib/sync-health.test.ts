@@ -184,6 +184,29 @@ test('degraded: retrying includes calendar name', () => {
   assert.equal(repairTargetCalendarId(banner), 'cal-personal');
 });
 
+test('degraded: lost_lease is actionable without raw code', () => {
+  const banner = selectSyncHealthBanner({
+    ...base,
+    sync: sync(
+      health({
+        calendar_id: 'cal-personal',
+        state: 'retrying',
+        error_code: 'lost_lease',
+      }),
+    ),
+  });
+  assert.equal(banner.kind, 'degraded');
+  assert.equal(
+    banner.message,
+    'Personal Goals is waiting on another sync and will retry automatically',
+  );
+  assert.equal(banner.showRetry, true);
+  assert.equal(banner.showReconnect, false);
+  assert.equal(banner.errorCode, 'lost_lease');
+  assert.equal(banner.calendarId, 'cal-personal');
+  assert.equal(repairTargetCalendarId(banner), 'cal-personal');
+});
+
 test('degraded: stale ready is still degraded', () => {
   const banner = selectSyncHealthBanner({
     ...base,

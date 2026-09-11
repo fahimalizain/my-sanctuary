@@ -247,6 +247,8 @@ pub(crate) struct FakeCalendarRepo {
     /// Snapshot is taken before the bump so the caller still sees the
     /// pre-bump generation (mirrors mid-run dirty enqueue).
     pub(crate) bump_dirty_after_get_by_id: Mutex<Option<usize>>,
+    /// History of `expires_rfc3339` values passed to [`CalendarRepo::renew_lease`].
+    pub(crate) renew_expiries: Mutex<Vec<String>>,
 }
 
 impl FakeCalendarRepo {
@@ -279,6 +281,7 @@ impl FakeCalendarRepo {
             fail_bump_dirty: Mutex::new(false),
             fail_set_sync_enabled: Mutex::new(false),
             bump_dirty_after_get_by_id: Mutex::new(None),
+            renew_expiries: Mutex::new(Vec::new()),
         }
     }
 
@@ -588,6 +591,26 @@ impl CalendarRepo for FakeCalendarRepo {
         Ok(())
     }
 
+    async fn record_sync_contention(
+        &self,
+        id: &str,
+        error_code: &str,
+        sync_status: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
+            // Contention: do not increment failure_streak; do not touch token /
+            // success stamps / lease / dirty gens.
+            cal.last_error_code = error_code.to_string();
+            cal.sync_status = sync_status.to_string();
+            cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
+    }
+
     async fn begin_replica_reseed(
         &self,
         id: &str,
@@ -663,6 +686,10 @@ impl CalendarRepo for FakeCalendarRepo {
         }
         cal.lease_expires_at = Some(expires_rfc3339.to_string());
         cal.updated_at = now_rfc3339.to_string();
+        self.renew_expiries
+            .lock()
+            .unwrap()
+            .push(expires_rfc3339.to_string());
         Ok(true)
     }
 
@@ -816,6 +843,40 @@ impl CalendarRepo for FakeCalendarRepo {
         ids.sort();
         ids.dedup();
         Ok(ids)
+    }
+
+    async fn clear_authorization_required_for_user(
+        &self,
+        user_id: &str,
+        next_retry_rfc3339: &str,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        let mut stored = self.stored.lock().unwrap();
+        for cal in stored.iter_mut() {
+            if cal.user_id != user_id
+                || cal.deleted_at.is_some()
+                || !cal.sync_enabled
+                || cal.sync_status != "authorization_required"
+            {
+                continue;
+            }
+            let had_success = cal.initial_sync_complete
+                || cal
+                    .last_success_at
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+            cal.sync_status = if had_success {
+                "retrying".to_string()
+            } else {
+                "never_initialized".to_string()
+            };
+            cal.last_error_code = String::new();
+            cal.failure_streak = 0;
+            cal.next_retry_at = Some(next_retry_rfc3339.to_string());
+            cal.updated_at = now_rfc3339.to_string();
+        }
+        Ok(())
     }
 }
 
