@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::calendar::apply::row_from_new_event;
 use crate::config::OAuthConfig;
@@ -221,8 +221,11 @@ fn rewrite_json_id(response: Vec<u8>, id: &str) -> Vec<u8> {
 /// `(user_id, google_calendar_id)` (like D1), so incremental calendarList
 /// tests do not invent duplicate rows. Lease methods mirror the V1 SQL
 /// semantics so replica tests exercise real fencing.
+///
+/// `stored` is `Arc`-shared so [`FakeEventRepo`] can gate fenced applies on
+/// the same live lease state.
 pub(crate) struct FakeCalendarRepo {
-    pub(crate) stored: Mutex<Vec<GoogleCalendar>>,
+    pub(crate) stored: Arc<Mutex<Vec<GoogleCalendar>>>,
     pub(crate) upserted: Mutex<Vec<NewCalendar>>,
     pub(crate) sync_states: Mutex<Vec<(String, String, String)>>,
     pub(crate) disabled: Mutex<Vec<(String, bool)>>,
@@ -263,7 +266,7 @@ impl FakeCalendarRepo {
             }
         }
         Self {
-            stored: Mutex::new(calendars),
+            stored: Arc::new(Mutex::new(calendars)),
             upserted: Mutex::new(Vec::new()),
             sync_states: Mutex::new(Vec::new()),
             disabled: Mutex::new(Vec::new()),
@@ -816,6 +819,16 @@ pub(crate) struct FakeEventRepo {
     pub(crate) fail_upsert: Mutex<bool>,
     pub(crate) fail_delete: Mutex<bool>,
     pub(crate) next_id: Mutex<u64>,
+    /// Shared live lease store from [`FakeCalendarRepo::stored`]. `None`
+    /// means unbound: fenced methods behave like unfenced (lease held).
+    pub(crate) lease_calendars: Mutex<Option<Arc<Mutex<Vec<GoogleCalendar>>>>>,
+    /// Count of non-empty fenced apply calls (both if_owner methods).
+    pub(crate) fenced_apply_count: Mutex<usize>,
+    /// When `Some((n, owner, expires))`, on the **nth** fenced apply call
+    /// (1-based, across both if_owner methods), **before** the lease check,
+    /// write `owner` / `expires` onto matching calendar row(s).
+    pub(crate) inject_lease_before_fenced_apply:
+        Mutex<Option<(usize, String, Option<String>)>>,
 }
 
 impl FakeEventRepo {
@@ -832,7 +845,57 @@ impl FakeEventRepo {
             fail_upsert: Mutex::new(false),
             fail_delete: Mutex::new(false),
             next_id: Mutex::new(1),
+            lease_calendars: Mutex::new(None),
+            fenced_apply_count: Mutex::new(0),
+            inject_lease_before_fenced_apply: Mutex::new(None),
         }
+    }
+
+    /// Bind fenced apply methods to `calendars.stored` so lease steal/expire
+    /// is visible at write time (mirrors SQL EXISTS on `google_calendars`).
+    pub(crate) fn gate_applies_on(&self, calendars: &FakeCalendarRepo) {
+        *self.lease_calendars.lock().unwrap() = Some(Arc::clone(&calendars.stored));
+    }
+
+    /// Run inject hook (if any) then return whether `lease_owner` still holds
+    /// an unexpired lease on `calendar_id`. Unbound fake → always held.
+    /// Empty upserts must not call this (they do not count as fenced applies).
+    fn begin_fenced_apply(
+        &self,
+        calendar_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> bool {
+        let lease_arc = {
+            let guard = self.lease_calendars.lock().unwrap();
+            match guard.as_ref() {
+                None => return true,
+                Some(arc) => Arc::clone(arc),
+            }
+        };
+
+        {
+            let mut count = self.fenced_apply_count.lock().unwrap();
+            *count += 1;
+            let n = *count;
+            drop(count);
+            if let Some((threshold, owner, expires)) =
+                self.inject_lease_before_fenced_apply.lock().unwrap().clone()
+            {
+                if n == threshold {
+                    let mut cals = lease_arc.lock().unwrap();
+                    for cal in cals.iter_mut().filter(|c| c.id == calendar_id) {
+                        cal.lease_owner = owner.clone();
+                        cal.lease_expires_at = expires.clone();
+                    }
+                }
+            }
+        }
+
+        let cals = lease_arc.lock().unwrap();
+        cals.iter()
+            .find(|c| c.id == calendar_id && c.deleted_at.is_none())
+            .is_some_and(|c| FakeCalendarRepo::lease_held(c, lease_owner, now_rfc3339))
     }
 
     /// Natural-key upsert including soft-deleted rows: on hit, update
@@ -961,6 +1024,29 @@ impl CalendarEventRepo for FakeEventRepo {
         Ok(())
     }
 
+    async fn upsert_batch_if_owner(
+        &self,
+        events: Vec<NewCalendarEvent>,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        if events.is_empty() {
+            return Ok(true);
+        }
+        let calendar_id = events[0].calendar_id.as_str();
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        if *self.fail_upsert.lock().unwrap() {
+            return Err(RepoError::Backend("cache write failed".into()));
+        }
+        self.upserted_batch.lock().unwrap().extend(events.clone());
+        for event in events {
+            self.apply_upsert(event, now_rfc3339);
+        }
+        Ok(true)
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<CalendarEvent>, RepoError> {
         Ok(self
             .stored
@@ -1074,6 +1160,32 @@ impl CalendarEventRepo for FakeEventRepo {
             event.deleted_at = Some(now_rfc3339.to_string());
         }
         Ok(())
+    }
+
+    async fn delete_by_google_event_id_if_owner(
+        &self,
+        calendar_id: &str,
+        google_event_id: &str,
+        lease_owner: &str,
+        now_rfc3339: &str,
+    ) -> Result<bool, RepoError> {
+        if !self.begin_fenced_apply(calendar_id, lease_owner, now_rfc3339) {
+            return Ok(false);
+        }
+        if *self.fail_delete.lock().unwrap() {
+            return Err(RepoError::Backend("cache delete failed".into()));
+        }
+        self.deleted_by_google_event_id
+            .lock()
+            .unwrap()
+            .push((calendar_id.to_string(), google_event_id.to_string()));
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(event) = stored.iter_mut().find(|event| {
+            event.calendar_id == calendar_id && event.google_event_id == google_event_id
+        }) {
+            event.deleted_at = Some(now_rfc3339.to_string());
+        }
+        Ok(true)
     }
 
     async fn delete_stale(

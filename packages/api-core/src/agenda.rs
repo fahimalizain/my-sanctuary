@@ -3332,6 +3332,15 @@ mod tests {
             Ok(())
         }
 
+        async fn upsert_batch_if_owner(
+            &self,
+            _events: Vec<NewCalendarEvent>,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
+        }
+
         async fn get_by_id(&self, _id: &str) -> Result<Option<CalendarEvent>, RepoError> {
             Ok(None)
         }
@@ -3382,6 +3391,16 @@ mod tests {
             _now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             Ok(())
+        }
+
+        async fn delete_by_google_event_id_if_owner(
+            &self,
+            _calendar_id: &str,
+            _google_event_id: &str,
+            _lease_owner: &str,
+            _now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            Ok(true)
         }
 
         async fn delete_stale(

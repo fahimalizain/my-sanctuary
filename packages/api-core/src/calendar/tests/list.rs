@@ -2,6 +2,7 @@ use super::support::*;
 use crate::calendar::{
     list_events, list_events_after_refresh_failure, parse_event_time_range, sync_calendar,
 };
+use crate::calendar::window::fetch_and_apply_window;
 use crate::oauth::HttpError;
 use crate::repo::CalendarEventRepo;
 use crate::token::TokenError;
@@ -737,9 +738,12 @@ fn window_cancelled_event_delete_failure_does_not_advance_sync_token() {
     ))
     .unwrap();
 
-    assert_eq!(
-        *events.deleted_by_google_event_id.lock().unwrap(),
-        vec![("cal-1".to_string(), "cancelled".to_string())]
+    // Fenced delete path records only after a successful delete; fail_delete
+    // returns Err without pushing. Attempt still failed and aborted apply.
+    assert!(
+        events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+        "failed fenced delete is not recorded: {:?}",
+        events.deleted_by_google_event_id.lock().unwrap()
     );
     // Delete failure aborts the window apply: no upsert of the living
     // sibling, token must not advance (window never publishes anyway).
@@ -763,6 +767,196 @@ fn window_cancelled_event_delete_failure_does_not_advance_sync_token() {
         crate::calendar_sync::CalendarReplicaState::NeverInitialized
     );
     assert_eq!(output.source, "window");
+}
+
+#[test]
+fn window_steal_before_first_upsert_writes_nothing() {
+    // Two-page window; steal lease on the 1st fenced apply (page-1 upserts).
+    // Loser must not write page-1 or page-2 and must not publish a token.
+    let page_one = r#"{"items":[{"id":"p1","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextPageToken":"tok-2"}"#;
+    let page_two = r#"{"items":[{"id":"p2","start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}],"nextSyncToken":"st-page"}"#;
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((1, "thief".to_string(), Some("2099-01-01T00:00:00Z".to_string())));
+    let http = FakeHttp::new(vec![
+        ("pageToken=tok-2", 200, page_two),
+        ("/events", 200, page_one),
+    ]);
+
+    let result = pollster::block_on(fetch_and_apply_window(
+        &http,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        result.unwrap().is_empty(),
+        "mid-window steal stops write-through with empty return"
+    );
+    assert!(
+        events.upserted_batch.lock().unwrap().is_empty(),
+        "no page-1 or page-2 upserts: {:?}",
+        events.upserted_batch.lock().unwrap()
+    );
+    assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+    assert!(calendars.sync_states.lock().unwrap().is_empty());
+    assert!(!calendars.stored.lock().unwrap()[0].initial_sync_complete);
+}
+
+#[test]
+fn window_expire_before_tombstone_leaves_row_living() {
+    // Cancelled + living on one page; expire lease on the 1st fenced apply
+    // (the tombstone). Cancelled row stays living; sibling not upserted.
+    let body = r#"{"items":[
+        {"id":"cancelled","status":"cancelled",
+         "start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"living","summary":"Keep",
+         "start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}
+    ],"nextSyncToken":"st-win"}"#;
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-cancel", "cal-1", "cancelled", ""));
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((1, "loser".to_string(), Some("2020-01-01T00:00:00Z".to_string())));
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+
+    let result = pollster::block_on(fetch_and_apply_window(
+        &http,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(result.is_ok(), "{result:?}");
+    assert!(result.unwrap().is_empty());
+    let stored_events = events.stored.lock().unwrap();
+    let cancelled = stored_events
+        .iter()
+        .find(|e| e.google_event_id == "cancelled")
+        .expect("cancelled seed");
+    assert!(
+        cancelled.deleted_at.is_none(),
+        "tombstone must not apply after lease expire"
+    );
+    assert!(
+        events.upserted_batch.lock().unwrap().is_empty(),
+        "living sibling must not upsert: {:?}",
+        events.upserted_batch.lock().unwrap()
+    );
+    assert!(
+        events.deleted_by_google_event_id.lock().unwrap().is_empty(),
+        "delete must not be recorded: {:?}",
+        events.deleted_by_google_event_id.lock().unwrap()
+    );
+    assert!(calendars.stored.lock().unwrap()[0].sync_token.is_empty());
+}
+
+#[test]
+fn window_winner_after_expired_loser_can_write_through() {
+    // After expire inject fails the loser, clear the hook and re-run: expired
+    // foreign lease is stealable; winner write-throughs but never publishes.
+    let body = r#"{"items":[
+        {"id":"cancelled","status":"cancelled",
+         "start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}},
+        {"id":"living","summary":"Keep",
+         "start":{"dateTime":"2026-08-18T10:00:00Z"},"end":{"dateTime":"2026-08-18T10:30:00Z"}}
+    ],"nextSyncToken":"st-win"}"#;
+    let cal = calendar("cal-1", "primary@example.com", true);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    events
+        .stored
+        .lock()
+        .unwrap()
+        .push(seeded_event("evt-cancel", "cal-1", "cancelled", ""));
+    events.gate_applies_on(&calendars);
+    *events.inject_lease_before_fenced_apply.lock().unwrap() =
+        Some((1, "loser".to_string(), Some("2020-01-01T00:00:00Z".to_string())));
+
+    let http_lose = FakeHttp::new(vec![("/events", 200, body)]);
+    let lose = pollster::block_on(fetch_and_apply_window(
+        &http_lose,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(lose.is_ok(), "{lose:?}");
+    assert!(lose.unwrap().is_empty());
+    assert!(events.upserted_batch.lock().unwrap().is_empty());
+    assert!(
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.google_event_id == "cancelled")
+            .unwrap()
+            .deleted_at
+            .is_none()
+    );
+
+    // Clear inject; lease remains expired foreign — stealable on next window.
+    *events.inject_lease_before_fenced_apply.lock().unwrap() = None;
+    let http_win = FakeHttp::new(vec![("/events", 200, body)]);
+    let win = pollster::block_on(fetch_and_apply_window(
+        &http_win,
+        &calendars,
+        &events,
+        &access(),
+        &cal,
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        "2023-11-14T22:13:20Z",
+    ));
+    assert!(win.is_ok(), "{win:?}");
+    assert!(win.unwrap().is_empty(), "write-through returns empty vec");
+
+    let stored_events = events.stored.lock().unwrap();
+    let cancelled = stored_events
+        .iter()
+        .find(|e| e.google_event_id == "cancelled")
+        .expect("cancelled");
+    assert!(
+        cancelled.deleted_at.is_some(),
+        "winner tombstones cancelled row"
+    );
+    assert!(
+        events
+            .upserted_batch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.google_event_id == "living"),
+        "living id in upserted_batch: {:?}",
+        events.upserted_batch.lock().unwrap()
+    );
+    assert!(
+        calendars.stored.lock().unwrap()[0].sync_token.is_empty(),
+        "window never publishes sync_token"
+    );
+    assert!(!calendars.stored.lock().unwrap()[0].initial_sync_complete);
+    assert!(calendars.sync_states.lock().unwrap().is_empty());
 }
 
 #[test]

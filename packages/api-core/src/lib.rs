@@ -93,7 +93,8 @@ pub use routines::{
     RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
 };
 pub use repo::{
-    build_event_upsert_sql, build_occurrence_insert_sql, build_occurrence_list_by_ids_sql,
+    build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_insert_sql,
+    build_occurrence_list_by_ids_sql,
     build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, AgendaItemRepo,
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError,
     RoutineRepo, TaskCategoryRepo,
@@ -113,6 +114,7 @@ pub use repo::{
     CALENDAR_RECORD_SYNC_FAILURE_SQL, CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_SQL, CALENDAR_RELEASE_LEASE_SQL, CALENDAR_RENEW_LEASE_SQL,
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
+    CALENDAR_LEASE_HELD_SQL, EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_UPSERT_CHUNK_SIZE, EVENT_UPSERT_COL_COUNT,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
