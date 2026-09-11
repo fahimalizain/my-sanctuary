@@ -1,5 +1,6 @@
 pub(crate) mod support;
 mod list;
+mod labels;
 mod write;
 mod watch;
 mod webhook;

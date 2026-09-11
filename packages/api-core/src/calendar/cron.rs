@@ -575,7 +575,7 @@ pub async fn sync_calendar(
             .await?
             .ok_or_else(|| CalendarError::Invalid("calendar missing after lease acquire".into()))?;
         let dirty_snapshot = fresh.dirty_requested_generation;
-        // Deploy backfill: empty event-label cache before the first fetch.
+        // Refresh event-label cache when empty or stale (TTL).
         ensure_event_labels(http, calendars, access, &fresh, now_rfc3339).await?;
         sync_replica(
             http,

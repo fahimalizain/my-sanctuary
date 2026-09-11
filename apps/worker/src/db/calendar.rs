@@ -401,6 +401,7 @@ impl CalendarRepo for D1CalendarRepo {
             .bind_refs(&[
                 D1Type::Text(event_labels_json),
                 D1Type::Text(now_rfc3339),
+                D1Type::Text(now_rfc3339),
                 D1Type::Text(id),
             ])
             .map_err(backend)?;

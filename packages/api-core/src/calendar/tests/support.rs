@@ -455,6 +455,7 @@ impl CalendarRepo for FakeCalendarRepo {
                     // Freshly imported rows start with an empty label cache
                     // (cache miss) — `refresh_calendar_list` backfills it.
                     event_labels: String::new(),
+                    event_labels_updated_at: None,
                     // Health defaults: calendarList upsert must never write these.
                     sync_query_fingerprint: String::new(),
                     sync_status: String::new(),
@@ -701,7 +702,7 @@ impl CalendarRepo for FakeCalendarRepo {
         &self,
         id: &str,
         event_labels_json: &str,
-        _now_rfc3339: &str,
+        now_rfc3339: &str,
     ) -> Result<(), RepoError> {
         self.label_updates
             .lock()
@@ -710,6 +711,7 @@ impl CalendarRepo for FakeCalendarRepo {
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
             cal.event_labels = event_labels_json.to_string();
+            cal.event_labels_updated_at = Some(now_rfc3339.to_string());
         }
         Ok(())
     }
@@ -1380,9 +1382,12 @@ pub(crate) fn calendar_for_user(
         sync_token: String::new(),
         last_synced_at: None,
         // `"[]"` = label cache already fetched (no labels) — existing sync
-        // tests skip the `calendars.get` backfill. Tests exercising the
-        // cache-miss path construct rows with an empty string explicitly.
+        // tests skip the `calendars.get` backfill. Stamp is fresh for every
+        // existing test `now` (2023-11-14 is in the future of this stamp;
+        // 2026-08-17 is age 0). Tests exercising the cache-miss path
+        // construct rows with an empty string / None stamp explicitly.
         event_labels: "[]".to_string(),
+        event_labels_updated_at: Some("2026-08-17T00:00:00Z".to_string()),
         sync_query_fingerprint: String::new(),
         // Empty string matches serde default for missing columns; production
         // backfill uses `never_initialized` / `ready` / `disabled`.
