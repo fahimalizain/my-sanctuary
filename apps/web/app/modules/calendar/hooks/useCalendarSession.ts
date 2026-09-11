@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
 } from 'react';
 import {
   removeCalendarEventFromCache,
@@ -28,10 +29,12 @@ import {
   clickCreateTimesFromSlot,
   eventChipColor,
 } from '../lib/calendar-model';
+import { hourLabelStep } from '../lib/calendar-zoom';
 import { isPersistableDraftTitle } from '../lib/event-draft';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
 import { selectSyncHealthBanner } from '../lib/sync-health';
 import { useCalendarDrag } from './useCalendarDrag';
+import { useCalendarZoom } from './useCalendarZoom';
 import {
   COL_HEADER_H,
   colorForCalendar,
@@ -48,6 +51,7 @@ export interface CalendarSessionInput {
   days: Date[];
   dayCount: number;
   scrollerHeight: number;
+  scrollerRef: RefObject<HTMLElement | null>;
   setStripLocked: (locked: boolean) => void;
 }
 
@@ -61,6 +65,7 @@ export function useCalendarSession({
   days,
   dayCount,
   scrollerHeight,
+  scrollerRef,
   setStripLocked,
 }: CalendarSessionInput) {
   const eventsQuery = useCalendarEventsQuery(timeMin, timeMax);
@@ -543,10 +548,22 @@ export function useCalendarSession({
     return Math.max(0, scrollerHeight - COL_HEADER_H - allDayHeight);
   }, [scrollerHeight, allDayHeight]);
 
-  const hourH = useMemo(
+  const autoHourH = useMemo(
     () => computeHourHeight(availableHoursPx),
     [availableHoursPx],
   );
+
+  // Pinch callbacks assigned after drag is created (drag needs hourH first).
+  const onPinchStartRef = useRef<(() => void) | null>(null);
+  const onPinchEndRef = useRef<(() => void) | null>(null);
+
+  const { hourH } = useCalendarZoom({
+    scrollerRef,
+    autoHourH,
+    headerOffset: COL_HEADER_H + allDayHeight,
+    onPinchStartRef,
+    onPinchEndRef,
+  });
   const totalHoursH = hourH * 24;
 
   const handleMoveOrResize = useCallback(
@@ -633,6 +650,14 @@ export function useCalendarSession({
     onEmptyClick: handleEmptyClick,
   });
 
+  onPinchStartRef.current = () => {
+    drag.cancel();
+    setStripLocked(true);
+  };
+  onPinchEndRef.current = () => {
+    setStripLocked(false);
+  };
+
   // Stable across pointermove — only flips at drag start/end (not every move).
   const draggingEventId =
     drag.isDragging && drag.activeEventId ? drag.activeEventId : null;
@@ -701,7 +726,12 @@ export function useCalendarSession({
     return idx >= 0 ? idx : null;
   }, [days]);
 
-  const hourLabels = useMemo(() => Array.from({ length: 24 }, (_, h) => h), []);
+  const hourLabels = useMemo(() => {
+    const step = hourLabelStep(hourH);
+    return Array.from({ length: 24 }, (_, h) => h).filter(
+      (h) => h % step === 0,
+    );
+  }, [hourH]);
 
   const hourGridBg = useMemo(() => hourGridBackground(hourH), [hourH]);
 

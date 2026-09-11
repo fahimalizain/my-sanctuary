@@ -27,6 +27,8 @@ export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
 /** Snap click-to-create / drag start times to this many minutes. */
 export const SNAP_MINUTES = 15;
+/** Snap resize active-edge times to this many minutes. */
+export const RESIZE_SNAP_MINUTES = 1;
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
 
@@ -191,6 +193,20 @@ export const STRIP_REBASE_THRESHOLD = 3;
 export function clampPeriodLength(n: number): number {
   if (!Number.isFinite(n)) return DAYS_PER_PERIOD;
   return clamp(Math.trunc(n), MIN_PERIOD_LENGTH, MAX_PERIOD_LENGTH);
+}
+
+/** localStorage key for the visible period length (1–7). */
+export const PERIOD_LENGTH_STORAGE_KEY = 'sanctuary.calendar.periodLength';
+
+/**
+ * Parse localStorage value. null / '' / non-finite → null.
+ * Finite → clampPeriodLength(n).
+ */
+export function parseStoredPeriodLength(raw: string | null): number | null {
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return clampPeriodLength(n);
 }
 
 /** Notion button label: 1 → "Day", 7 → "Week", else `${n} days`. */
@@ -372,6 +388,54 @@ export function formatEventTime(date: Date): string {
 /** Range label: "5 AM – 6:15 AM" (en-dash). */
 export function formatEventTimeRange(start: Date, end: Date): string {
   return `${formatEventTime(start)} – ${formatEventTime(end)}`;
+}
+
+/**
+ * Compact duration for the inspector when-block: "15min", "1h", "1h 30min".
+ * Whole minutes from end − start, rounded to nearest, clamped ≥ 0.
+ */
+export function formatEventDuration(start: Date, end: Date): string {
+  const totalMin = Math.max(
+    0,
+    Math.round((end.getTime() - start.getTime()) / 60_000),
+  );
+  const hours = Math.floor(totalMin / 60);
+  const minutes = totalMin % 60;
+  if (hours === 0) return `${minutes}min`;
+  if (minutes === 0) return `${hours}h`;
+  return `${hours}h ${minutes}min`;
+}
+
+/** Sun-first weekday labels for civil date lines (not WEEK_DAYS, which is Mon-first). */
+const WEEKDAY_SUN_FIRST = [
+  'Sun',
+  'Mon',
+  'Tue',
+  'Wed',
+  'Thu',
+  'Fri',
+  'Sat',
+] as const;
+
+function formatCivilDateLabel(date: Date): string {
+  const weekday = WEEKDAY_SUN_FIRST[date.getDay()];
+  return `${weekday} ${MONTH_SHORT[date.getMonth()]} ${date.getDate()}`;
+}
+
+/**
+ * Civil date line for the inspector when-block, browser local zone.
+ * Same day → "Sun Sep 13"; cross-day → "Sun Sep 13 → Mon Sep 14".
+ */
+export function formatEventDateLine(start: Date, end: Date): string {
+  const startLabel = formatCivilDateLabel(start);
+  if (
+    start.getFullYear() === end.getFullYear() &&
+    start.getMonth() === end.getMonth() &&
+    start.getDate() === end.getDate()
+  ) {
+    return startLabel;
+  }
+  return `${startLabel} → ${formatCivilDateLabel(end)}`;
 }
 
 /**
@@ -661,13 +725,14 @@ export function startOfDay(date: Date): Date {
 // ── Click-to-create geometry ────────────────────────────────────────────
 
 /**
- * Snap minutes-since-midnight to the nearest `SNAP_MINUTES` boundary.
- * Clamped to `[0, 1440]`; 1440 stays 1440 (end-of-day sentinel).
+ * Snap minutes-since-midnight to the nearest `step` boundary
+ * (default `SNAP_MINUTES`). Clamped to `[0, 1440]`; 1440 stays 1440.
  */
-export function snapMinutes(min: number): number {
+export function snapMinutes(min: number, step = SNAP_MINUTES): number {
   if (!Number.isFinite(min) || min <= 0) return 0;
   if (min >= MINUTES_PER_DAY) return MINUTES_PER_DAY;
-  return Math.round(min / SNAP_MINUTES) * SNAP_MINUTES;
+  const grid = Number.isFinite(step) && step > 0 ? step : SNAP_MINUTES;
+  return Math.round(min / grid) * grid;
 }
 
 /** Convert a Y offset (px) within the hours area to minutes since midnight. */
