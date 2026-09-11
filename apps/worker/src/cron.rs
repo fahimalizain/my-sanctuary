@@ -163,5 +163,12 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             report.published.len(),
             report.errors.len()
         );
+        // Structured diagnostics (APP_VERSION stamped; duration from api-core).
+        for diagnostic in report.diagnostics {
+            crate::sync_log::emit_replica_walk(diagnostic, None);
+        }
+        for warning in &report.warnings {
+            crate::sync_log::emit_operator_warning(warning);
+        }
     }
 }

@@ -46,6 +46,7 @@ use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use super::apply::{
     classify_replica_item, EventsPage, ReplicaApplyAction,
 };
+use super::diagnostics::{CheckpointResult, ReplicaApplyReport, ReplicaWalkPhase};
 use super::google::encode_path_segment;
 use super::sync::replica_query_fingerprint;
 use crate::models::GoogleCalendar;
@@ -66,6 +67,10 @@ pub const REPLICA_LEASE_TTL_SECS: i64 = 90;
 ///
 /// `cal` must be a **fresh** re-read after lease acquire (cursor + fingerprint),
 /// not a stale request-path snapshot.
+///
+/// `report` is updated in place with page/upsert/delete/attempt counts,
+/// phase, and checkpoint outcome. Secrets (tokens, URLs, bodies) are never
+/// written onto the report.
 pub async fn sync_replica(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -75,6 +80,7 @@ pub async fn sync_replica(
     cal: &GoogleCalendar,
     lease_owner: &str,
     now_rfc3339: &str,
+    report: &mut ReplicaApplyReport,
 ) -> Result<(), CalendarError> {
     let fingerprint = replica_query_fingerprint();
     // Empty stored fingerprint is compatible with an existing token (do not
@@ -86,9 +92,13 @@ pub async fn sync_replica(
         && cal.sync_query_fingerprint != fingerprint;
     let reseed = cal.full_sync_requested || fingerprint_mismatch;
     if reseed {
-        calendars
+        if let Err(err) = calendars
             .begin_replica_reseed(&cal.id, now_rfc3339)
-            .await?;
+            .await
+        {
+            report.checkpoint = CheckpointResult::Error;
+            return Err(err.into());
+        }
     }
     let mut token: Option<String> = if reseed || cal.sync_token.is_empty() {
         None
@@ -101,12 +111,15 @@ pub async fn sync_replica(
 
     // Snapshot once per walk: user writes in flight must not be clobbered by
     // a replica page that still carries the pre-write Google shape.
-    let inflight: HashSet<String> = operations
-        .list_inflight_google_ids(&cal.id)
-        .await?
-        .into_iter()
-        .filter(|id| !id.is_empty())
-        .collect();
+    let inflight: HashSet<String> = match operations.list_inflight_google_ids(&cal.id).await {
+        Ok(ids) => ids.into_iter().filter(|id| !id.is_empty()).collect(),
+        Err(err) => {
+            report.checkpoint = CheckpointResult::Error;
+            return Err(err.into());
+        }
+    };
+
+    report.phase = ReplicaWalkPhase::Fetch;
 
     loop {
         let url = google_events_url(
@@ -114,10 +127,18 @@ pub async fn sync_replica(
             token.as_deref(),
             page_token.as_deref(),
         );
-        let (status, body) = http.get_bearer_raw(&url, &access.access_token).await?;
+        report.attempts = report.attempts.saturating_add(1);
+        let (status, body) = match http.get_bearer_raw(&url, &access.access_token).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err.into());
+            }
+        };
 
         if status == 410 {
             if retried_410 {
+                report.checkpoint = CheckpointResult::Error;
                 return Err(CalendarError::GoogleApi(
                     "google events.list returned 410".into(),
                 ));
@@ -125,29 +146,47 @@ pub async fn sync_replica(
             // Merge-full: durable reseed flag + drop in-memory cursor. Keep
             // already-applied rows and the stored token until success.
             // Never delete_stale / truncate.
-            calendars
+            if let Err(err) = calendars
                 .begin_replica_reseed(&cal.id, now_rfc3339)
-                .await?;
+                .await
+            {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err.into());
+            }
             retried_410 = true;
             token = None;
             page_token = None;
             continue;
         }
         if status == 404 {
+            report.checkpoint = CheckpointResult::Error;
             return Err(CalendarError::GoogleNotFound);
         }
         if !(200..300).contains(&status) {
+            report.checkpoint = CheckpointResult::Error;
             return Err(CalendarError::GoogleApi(format!(
                 "google events.list returned {status}"
             )));
         }
 
-        let page: EventsPage = serde_json::from_slice(&body).map_err(|err| {
-            CalendarError::InvalidResponse(format!("events.list body: {err}"))
-        })?;
+        let page: EventsPage = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(err) => {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(CalendarError::InvalidResponse(format!(
+                    "events.list body: {err}"
+                )));
+            }
+        };
 
         // Fence before apply: lost/expired owner must not write rows or token.
-        ensure_lease_held(calendars, &cal.id, lease_owner, now_rfc3339).await?;
+        report.phase = ReplicaWalkPhase::Apply;
+        if let Err(err) =
+            ensure_lease_held(calendars, &cal.id, lease_owner, now_rfc3339).await
+        {
+            report.checkpoint = CheckpointResult::LeaseLost;
+            return Err(err);
+        }
 
         let items = page.items.unwrap_or_default();
         let mut to_upsert = Vec::new();
@@ -158,15 +197,24 @@ pub async fn sync_replica(
             }
             match classify_replica_item(item, &cal.id, now_rfc3339) {
                 ReplicaApplyAction::SoftDelete { google_event_id } => {
-                    let deleted = events
+                    report.deletes = report.deletes.saturating_add(1);
+                    let deleted = match events
                         .delete_by_google_event_id_if_owner(
                             &cal.id,
                             &google_event_id,
                             lease_owner,
                             now_rfc3339,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(err) => {
+                            report.checkpoint = CheckpointResult::Error;
+                            return Err(err.into());
+                        }
+                    };
                     if !deleted {
+                        report.checkpoint = CheckpointResult::LeaseLost;
                         return Err(CalendarError::Invalid("lost replica lease".into()));
                     }
                 }
@@ -176,35 +224,60 @@ pub async fn sync_replica(
             }
         }
         if !to_upsert.is_empty() {
-            let applied = events
+            report.upserts = report
+                .upserts
+                .saturating_add(to_upsert.len() as u32);
+            let applied = match events
                 .upsert_batch_if_owner(to_upsert, lease_owner, now_rfc3339)
-                .await?;
+                .await
+            {
+                Ok(a) => a,
+                Err(err) => {
+                    report.checkpoint = CheckpointResult::Error;
+                    return Err(err.into());
+                }
+            };
             if !applied {
+                report.checkpoint = CheckpointResult::LeaseLost;
                 return Err(CalendarError::Invalid("lost replica lease".into()));
             }
         }
 
+        // Successful 2xx page applied.
+        report.pages = report.pages.saturating_add(1);
+
         let renew_expires = lease_expires_at(now_rfc3339);
-        let renewed = calendars
+        let renewed = match calendars
             .renew_lease(&cal.id, lease_owner, &renew_expires, now_rfc3339)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err.into());
+            }
+        };
         if !renewed {
+            report.checkpoint = CheckpointResult::LeaseLost;
             return Err(CalendarError::Invalid("lost replica lease".into()));
         }
 
         if let Some(next) = page.next_page_token.filter(|t| !t.is_empty()) {
             page_token = Some(next);
+            report.phase = ReplicaWalkPhase::Fetch;
             continue;
         }
 
         // Terminal page: publication requires a non-empty nextSyncToken.
+        report.phase = ReplicaWalkPhase::Checkpoint;
         let Some(next_token) = page.next_sync_token.filter(|t| !t.is_empty()) else {
+            report.checkpoint = CheckpointResult::MissingSyncToken;
             return Err(CalendarError::InvalidResponse(
                 "missing nextSyncToken on terminal page".into(),
             ));
         };
 
-        let published = calendars
+        let published = match calendars
             .record_sync_success_if_owner(
                 &cal.id,
                 &next_token,
@@ -212,10 +285,19 @@ pub async fn sync_replica(
                 lease_owner,
                 now_rfc3339,
             )
-            .await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err.into());
+            }
+        };
         if !published {
+            report.checkpoint = CheckpointResult::LeaseLost;
             return Err(CalendarError::Invalid("lost replica lease".into()));
         }
+        report.checkpoint = CheckpointResult::Published;
         return Ok(());
     }
 }
