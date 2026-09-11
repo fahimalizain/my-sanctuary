@@ -27,7 +27,13 @@ import {
   toAllDayRange,
   toTimedRange,
 } from '../lib/calendar-drag';
-import { minutesFromY, snapMinutes, startOfDay } from '../lib/week-layout';
+import {
+  minutesFromY,
+  RESIZE_SNAP_MINUTES,
+  SNAP_MINUTES,
+  snapMinutes,
+  startOfDay,
+} from '../lib/week-layout';
 import type { CalendarEvent } from '@/app/types';
 
 export interface UseCalendarDragOptions {
@@ -69,6 +75,8 @@ export interface CalendarDragApi {
   isDragging: boolean;
   /** True after a drag commit so a synthetic click can be ignored. */
   suppressNextClick: () => boolean;
+  /** Drop an in-progress gesture without committing create/move/resize. */
+  cancel: () => void;
 }
 
 interface Session {
@@ -104,10 +112,11 @@ function slotFromColumn(
   colEl: Element,
   day: Date,
   hourH: number,
+  step = SNAP_MINUTES,
 ): DragSlot {
   const top = colEl.getBoundingClientRect().top;
   const y = clientY - top;
-  const minutes = snapMinutes(minutesFromY(y, hourH));
+  const minutes = snapMinutes(minutesFromY(y, hourH), step);
   return { day: startOfDay(day), minutes };
 }
 
@@ -115,6 +124,7 @@ function hitTestTimed(
   clientX: number,
   clientY: number,
   hourH: number,
+  step = SNAP_MINUTES,
 ): DragSlot | null {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return null;
@@ -122,7 +132,7 @@ function hitTestTimed(
   if (!col) return null;
   const day = parseDayAttr(col.getAttribute('data-day-col'));
   if (!day) return null;
-  return slotFromColumn(clientY, col, day, hourH);
+  return slotFromColumn(clientY, col, day, hourH, step);
 }
 
 function dayFromAllDayCell(cell: Element): Date | null {
@@ -221,7 +231,7 @@ function nextSlotFromPoint(
     return slot ? { slot, zone: 'allday' } : null;
   }
   if (session.kind === 'resize-start' || session.kind === 'resize-end') {
-    const slot = hitTestTimed(clientX, clientY, hourH);
+    const slot = hitTestTimed(clientX, clientY, hourH, RESIZE_SNAP_MINUTES);
     return slot ? { slot, zone: 'timed' } : null;
   }
   return hitTestAny(clientX, clientY, hourH);
@@ -529,6 +539,15 @@ export function useCalendarDrag(
           ? resizeAttr
           : resizeEdgeAt(localY, rect.height);
 
+      let kind: DragKind = 'move';
+      if (edge === 'start') kind = 'resize-start';
+      else if (edge === 'end') kind = 'resize-end';
+
+      const step =
+        kind === 'resize-start' || kind === 'resize-end'
+          ? RESIZE_SNAP_MINUTES
+          : SNAP_MINUTES;
+
       const originalStart = new Date(event.start_time);
       const originalEnd = new Date(event.end_time);
 
@@ -537,17 +556,14 @@ export function useCalendarDrag(
       const dayAttr = col?.getAttribute('data-day-col');
       const day = parseDayAttr(dayAttr) ?? startOfDay(originalStart);
       const originSlot = col
-        ? slotFromColumn(e.clientY, col, day, hourH)
+        ? slotFromColumn(e.clientY, col, day, hourH, step)
         : {
             day: startOfDay(originalStart),
             minutes: snapMinutes(
               originalStart.getHours() * 60 + originalStart.getMinutes(),
+              step,
             ),
           };
-
-      let kind: DragKind = 'move';
-      if (edge === 'start') kind = 'resize-start';
-      else if (edge === 'end') kind = 'resize-end';
 
       // Grab offset from the painted (possibly clamped overnight) chip start,
       // not the absolute event start — keeps the hold point under the pointer.
@@ -656,6 +672,11 @@ export function useCalendarDrag(
     return true;
   }, []);
 
+  const cancel = useCallback(() => {
+    if (!sessionRef.current) return;
+    endSession();
+  }, [endSession]);
+
   // Ghost only after the pointer has moved past the threshold — click-without-
   // drag must not flash a preview.
   const preview = session && didDrag ? computePreview(session) : null;
@@ -671,5 +692,6 @@ export function useCalendarDrag(
     activeEventId: session?.eventId ?? null,
     isDragging: session !== null && didDrag,
     suppressNextClick,
+    cancel,
   };
 }

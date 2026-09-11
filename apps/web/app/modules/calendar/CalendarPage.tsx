@@ -16,6 +16,7 @@ export function CalendarPage() {
     days: strip.days,
     dayCount: strip.dayCount,
     scrollerHeight: strip.scrollerHeight,
+    scrollerRef: strip.scrollerRef,
     setStripLocked: strip.setStripLocked,
   });
 
