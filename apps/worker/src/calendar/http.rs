@@ -327,6 +327,7 @@ pub async fn create_event(
         &events,
         &operations,
         &access,
+        &user_id,
         &input,
         now_unix,
     )

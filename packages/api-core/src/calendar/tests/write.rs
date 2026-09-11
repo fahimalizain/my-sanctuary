@@ -152,7 +152,7 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
     let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap();
 
@@ -232,7 +232,7 @@ fn create_with_color_hex_sends_event_label_id() {
     input.color_hex = Some("#535050".to_string());
 
     pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
     ))
     .unwrap();
 
@@ -262,7 +262,7 @@ fn create_with_blank_color_hex_omits_color_keys() {
         input.color_hex = Some(blank.to_string());
 
         pollster::block_on(create_event(
-            &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+            &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
         ))
         .unwrap();
 
@@ -294,7 +294,7 @@ fn create_with_color_hex_and_empty_label_cache_is_invalid() {
     input.color_hex = Some("#4285f4".to_string());
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
     ))
     .unwrap_err();
     assert!(
@@ -316,7 +316,7 @@ fn create_with_color_hex_and_no_matching_label_is_invalid() {
     cobalt_input.color_hex = Some("#4285f4".to_string());
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &cobalt_input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &cobalt_input, NOW_UNIX,
     ))
     .unwrap_err();
     assert!(
@@ -337,7 +337,7 @@ fn create_with_color_hex_and_no_matching_label_is_invalid() {
     banana_input.color_hex = Some("#4285f4".to_string());
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &banana_input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &banana_input, NOW_UNIX,
     ))
     .unwrap_err();
     assert!(
@@ -355,12 +355,49 @@ fn create_missing_calendar_is_not_found() {
     let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
     assert!(http.posts.lock().unwrap().is_empty(), "no Google call");
     assert!(ops.stored.lock().unwrap().is_empty(), "no journal row");
+}
+
+#[test]
+fn create_wrong_owner_is_not_found() {
+    let http = FakeHttp::new(vec![]);
+    let calendars =
+        FakeCalendarRepo::with(vec![calendar_for_user("other-user", "cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+    assert!(http.posts.lock().unwrap().is_empty(), "no Google insert");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal row");
+    assert!(events.upserted_single.lock().unwrap().is_none());
+}
+
+#[test]
+fn create_soft_deleted_calendar_is_not_found() {
+    let http = FakeHttp::new(vec![]);
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.deleted_at = Some("2023-11-14T20:00:00Z".to_string());
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+
+    let err = pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
+    assert!(http.posts.lock().unwrap().is_empty(), "no Google insert");
+    assert!(ops.stored.lock().unwrap().is_empty(), "no journal row");
+    assert!(events.upserted_single.lock().unwrap().is_none());
 }
 
 #[test]
@@ -371,7 +408,7 @@ fn create_google_non_2xx_is_an_api_error() {
     let ops = FakeOperationRepo::new();
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
@@ -395,7 +432,7 @@ fn create_cache_failure_after_google_is_repo_error() {
     *events.fail_upsert.lock().unwrap() = true;
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap_err();
 
@@ -438,7 +475,7 @@ fn create_409_duplicate_gets_existing_and_applies_cache() {
     let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap();
 
@@ -478,7 +515,7 @@ fn create_journal_insert_failure_skips_google() {
     *ops.fail_insert.lock().unwrap() = true;
 
     let err = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap_err();
 
@@ -502,7 +539,7 @@ fn create_with_task_id_sends_extended_properties_and_maps_it_back() {
     let mut input = input();
     input.task_id = Some("task-1".to_string());
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
     ))
     .unwrap();
 
@@ -543,7 +580,7 @@ fn create_without_task_id_sends_only_sanctuary_event_id() {
     let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap();
 
@@ -580,7 +617,7 @@ fn create_with_task_and_focus_sends_both_shared_keys() {
     input.task_id = Some("task-1".to_string());
     input.sanctuary_focus = true;
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
     ))
     .unwrap();
 
@@ -627,7 +664,7 @@ fn create_with_task_but_no_focus_omits_the_focus_key() {
     input.task_id = Some("task-1".to_string());
     input.sanctuary_focus = false;
     pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
     ))
     .unwrap();
 
@@ -660,7 +697,7 @@ fn create_with_task_priority_and_difficulty_snapshots_both_keys() {
     input.difficulty = Some("hard".to_string());
     input.sanctuary_focus = false;
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input, NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
     ))
     .unwrap();
 
@@ -1284,7 +1321,7 @@ fn create_echo_upsert_same_google_id_keeps_one_local_row() {
     let ops = FakeOperationRepo::new();
 
     let output = pollster::block_on(create_event(
-        &http, &calendars, &events, &ops, &access(), &input(), NOW_UNIX,
+        &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
     ))
     .unwrap();
     let google_id = output.event.google_event_id.clone();

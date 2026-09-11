@@ -3,6 +3,7 @@ use crate::calendar::{
     list_events, list_events_after_refresh_failure, parse_event_time_range, sync_calendar,
 };
 use crate::oauth::HttpError;
+use crate::repo::CalendarEventRepo;
 use crate::token::TokenError;
 
 // ──────────────────────────────────────────
@@ -931,4 +932,115 @@ fn refresh_failure_revoked_grant_empty_cache_still_ok() {
         output.sync.calendars[0].error_code.as_deref(),
         Some("auth_revoked")
     );
+}
+
+// ──────────────────────────────────────────
+// Living + sync-enabled parent filter (issue #54)
+// ──────────────────────────────────────────
+
+#[test]
+fn list_events_omits_events_from_disabled_and_soft_deleted_parents() {
+    let live = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let mut deleted = ready_synced_calendar("cal-deleted", "deleted@example.com", true);
+    deleted.deleted_at = Some("2023-11-14T20:00:00Z".to_string());
+
+    let calendars = FakeCalendarRepo::with(vec![live.clone(), disabled.clone(), deleted.clone()]);
+    let events = FakeEventRepo::new();
+    *events.parent_calendars.lock().unwrap() = vec![live, disabled, deleted];
+    events.stored.lock().unwrap().extend([
+        seeded_event("evt-live", "cal-1", "live", ""),
+        seeded_event("evt-off", "cal-disabled", "hidden-disabled", ""),
+        seeded_event("evt-del", "cal-deleted", "hidden-deleted", ""),
+    ]);
+
+    let http = FakeHttp::new(vec![]);
+    let watches = FakeWatchChannelRepo::new();
+    let output = pollster::block_on(list_events(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(output.events.len(), 1, "{:?}", output.events);
+    assert_eq!(output.events[0].id, "evt-live");
+
+    let disabled_view = output
+        .sync
+        .calendars
+        .iter()
+        .find(|c| c.calendar_id == "cal-disabled")
+        .expect("disabled calendar still in envelope");
+    assert_eq!(
+        disabled_view.state,
+        crate::calendar_sync::CalendarReplicaState::Disabled
+    );
+    assert!(
+        output
+            .sync
+            .calendars
+            .iter()
+            .all(|c| c.calendar_id != "cal-deleted"),
+        "soft-deleted parent must not appear in envelope: {:?}",
+        output.sync.calendars
+    );
+    assert!(http.gets.lock().unwrap().is_empty(), "cache-only ready calendars");
+}
+
+#[test]
+fn list_by_user_id_and_time_range_hides_non_living_parents() {
+    let live = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+    let mut deleted = ready_synced_calendar("cal-deleted", "deleted@example.com", true);
+    deleted.deleted_at = Some("2023-11-14T20:00:00Z".to_string());
+    let other_user = calendar_for_user("other-user", "cal-other", "other@example.com", true);
+
+    let events = FakeEventRepo::new();
+    *events.parent_calendars.lock().unwrap() =
+        vec![live, disabled, deleted, other_user];
+    events.stored.lock().unwrap().extend([
+        seeded_event("evt-live", "cal-1", "live", ""),
+        seeded_event("evt-off", "cal-disabled", "hidden-disabled", ""),
+        seeded_event("evt-del", "cal-deleted", "hidden-deleted", ""),
+        seeded_event("evt-other", "cal-other", "other-user-event", ""),
+    ]);
+
+    let rows = pollster::block_on(events.list_by_user_id_and_time_range(
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+    ))
+    .unwrap();
+
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, "evt-live");
+}
+
+#[test]
+fn list_running_by_user_id_hides_disabled_parent() {
+    let live = ready_synced_calendar("cal-1", "primary@example.com", true);
+    let disabled = ready_synced_calendar("cal-disabled", "disabled@example.com", false);
+
+    let events = FakeEventRepo::new();
+    *events.parent_calendars.lock().unwrap() = vec![live, disabled];
+    events.stored.lock().unwrap().extend([
+        seeded_event("evt-live", "cal-1", "running-live", "task-1"),
+        seeded_event("evt-off", "cal-disabled", "running-off", "task-2"),
+    ]);
+
+    // seeded_event windows are 2026-08-18T09:00–09:30.
+    let rows = pollster::block_on(events.list_running_by_user_id("u-1", "2026-08-18T09:15:00Z"))
+        .unwrap();
+
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].id, "evt-live");
+    assert_eq!(rows[0].task_id, "task-1");
 }

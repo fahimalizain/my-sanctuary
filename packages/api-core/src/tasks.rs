@@ -1010,6 +1010,7 @@ pub async fn start_task(
         events,
         operations,
         access,
+        user_id,
         &NewEventInput {
             calendar_id: target.calendar_id.clone(),
             summary: task.title.clone(),
@@ -2161,6 +2162,7 @@ async fn create_focus_segment(
         events,
         operations,
         access,
+        user_id,
         &NewEventInput {
             calendar_id,
             summary: task.title.clone(),
