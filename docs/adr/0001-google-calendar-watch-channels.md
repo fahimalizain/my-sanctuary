@@ -10,12 +10,13 @@ Date: 2026-08-18
 > onto `calendar-sync` in the same script (`fetch` + `scheduled` + queue
 > consumer). Failed enqueue is logged and swallowed — 200 never depends
 > on the queue. The consumer runs `run_queue_sync` (api-core): Published
-> + still-dirty → one follow-up re-enqueue then ack; Published + clean,
-> LeaseBusy, sync failure, missing/disabled/soft-deleted → Ack. Sync
-> failure Acks so `next_retry_at` backoff is preserved; cron owns retry.
-> No dead-letter queue. No `wait_until` replica (#79). The 15-minute
-> fallback cron is unchanged and remains the recovery contract. This
-> reverses the original "No Cloudflare Queue" out-of-scope line.
+>
+> - still-dirty → one follow-up re-enqueue then ack; Published + clean,
+>   LeaseBusy, sync failure, missing/disabled/soft-deleted → Ack. Sync
+>   failure Acks so `next_retry_at` backoff is preserved; cron owns retry.
+>   No dead-letter queue. No `wait_until` replica (#79). The 15-minute
+>   fallback cron is unchanged and remains the recovery contract. This
+>   reverses the original "No Cloudflare Queue" out-of-scope line.
 >
 > Amendment (2026-09-10): **Health signal superseded by ADR 0005.** Parseable
 > `last_synced_at` remains the request-path cache-only _gate_ after first
