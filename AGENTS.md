@@ -46,7 +46,7 @@ The Cloudflare Worker is a workers-rs (Rust → WASM) app that serves `GET /heal
 
 - **Version** — root `package.json` is the single source of truth. The pre-commit hook auto-bumps the patch version. `apps/worker/build.rs` reads it at build time and injects it as `APP_VERSION` (consumed via `env!("APP_VERSION")`), replacing the old Go `-ldflags` mechanism.
 - **Build** — `npx nx run worker:build` runs `worker-build --release` (implies `web:build` via `dependsOn`). Output lands in `apps/worker/build` (`build/index.js` is `main` in `wrangler.toml`).
-- **Dev** — `npx nx serve worker` (`wrangler dev` in `apps/worker`), frontend on `http://localhost:5173` with Vite proxying `/api`, `/auth`, `/health`, `/version` to `http://127.0.0.1:8787`.
+- **Dev** — `npx nx serve worker` (`wrangler dev` in `apps/worker`; implies `web:build` via `dependsOn`), frontend on `http://localhost:5173` with Vite proxying `/api`, `/auth`, `/health`, `/version` to `http://127.0.0.1:8787`.
 - **Static Assets** — `[assets]` serves `dist/apps/web` with `not_found_handling = "single-page-application"`; `run_worker_first = ["/api/*", "/auth/*", "/health", "/version"]` keeps API paths on the Worker.
-- **Deploy** — `npx nx deploy worker` pushes via wrangler (custom domain `my-sanctuary.fahimalizain.com`).
+- **Deploy** — `npx nx deploy worker` pushes via wrangler (implies `web:build` via `dependsOn`; custom domain `my-sanctuary.fahimalizain.com`).
 - **Toolchain** — pinned by the root `rust-toolchain.toml` (stable + `wasm32-unknown-unknown`); `worker-build` is installed via `cargo install worker-build --version 0.8.4` (pinned: 0.8.5 regressed on `strip = true` with "externref table required for catch wrappers").

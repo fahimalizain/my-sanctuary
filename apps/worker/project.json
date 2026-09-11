@@ -16,6 +16,7 @@
       "outputs": ["{projectRoot}/build"]
     },
     "serve": {
+      "dependsOn": ["^build"],
       "executor": "nx:run-commands",
       "options": {
         "commands": ["wrangler dev"],
@@ -23,6 +24,7 @@
       }
     },
     "deploy": {
+      "dependsOn": ["^build"],
       "executor": "nx:run-commands",
       "options": {
         "commands": ["wrangler deploy"],
