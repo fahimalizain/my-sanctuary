@@ -3,6 +3,20 @@
 Status: Accepted
 Date: 2026-08-18
 
+> Amendment (2026-09-11, issue #80): **Cloudflare Queue `calendar-sync` is
+> a latency layer, not the correctness contract.** Webhook `exists` still
+> persists `dirty_requested_generation += 1` then HTTP 200. After a
+> successful dirty write the Worker best-effort enqueues `{calendar_id}`
+> onto `calendar-sync` in the same script (`fetch` + `scheduled` + queue
+> consumer). Failed enqueue is logged and swallowed — 200 never depends
+> on the queue. The consumer runs `run_queue_sync` (api-core): Published
+> + still-dirty → one follow-up re-enqueue then ack; Published + clean,
+> LeaseBusy, sync failure, missing/disabled/soft-deleted → Ack. Sync
+> failure Acks so `next_retry_at` backoff is preserved; cron owns retry.
+> No dead-letter queue. No `wait_until` replica (#79). The 15-minute
+> fallback cron is unchanged and remains the recovery contract. This
+> reverses the original "No Cloudflare Queue" out-of-scope line.
+>
 > Amendment (2026-09-10): **Health signal superseded by ADR 0005.** Parseable
 > `last_synced_at` remains the request-path cache-only _gate_ after first
 > paint; it is no longer treated as freshness/health. Replica health lives in
@@ -34,7 +48,9 @@ Use `events.watch` push channels on `sync_enabled` calendars, with a 15-minute c
 ### Out of scope
 
 - No `calendarList.watch` — only `events.watch` on `sync_enabled` calendars.
-- No Cloudflare Queue.
+- ~~No Cloudflare Queue.~~ Reversed 2026-09-11 (issue #80): queue
+  `calendar-sync` is a latency layer; dirty generation + 15-minute
+  cron remain the contract. See amendment above.
 - No `watch_*` columns on `google_calendars`.
 
 ### Table `google_calendars_watch_channels`
@@ -102,10 +118,12 @@ Indexes: `channel_id` (unique, via column constraint), `calendar_id`, `expiratio
 - Unknown id, token mismatch, disabled/soft-deleted calendar → **200**, no work, log the miss. Never 401/404/500 for verify failures (no existence leak; no Google retry hammer).
 - `X-Goog-Resource-State: sync` (handshake) → 200, no dirty, no sync.
 - `X-Goog-Resource-State: exists` → persist durable dirty
-  (`dirty_requested_generation += 1`) **then** 200. Optional
-  `ctx.wait_until(sync_calendar)` is an optimization only; lost
-  `wait_until` is recovered by the 15-minute incremental cron. Do **not**
-  200 before the dirty write lands.
+  (`dirty_requested_generation += 1`) **then** 200. After a successful
+  dirty write, best-effort enqueue onto `calendar-sync` (issue #80).
+  Failed enqueue is swallowed; 200 never depends on the queue. There is
+  **no** `wait_until` replica (#79). Lost or dropped queue messages are
+  recovered by the 15-minute incremental cron. Do **not** 200 before
+  the dirty write lands.
 - `X-Goog-Resource-State: not_exists` → persist disable, then 200; stop
   leftover channels best-effort (cron retries failed stops).
 - Token refresh via existing `refresh_if_needed` using the calendar's `user_id` (no session).

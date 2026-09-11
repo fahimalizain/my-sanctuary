@@ -24,7 +24,9 @@ request-path gate and an implied health signal.** Those must diverge.
 
 - `google_calendars_watch_channels` table and lifecycle
 - 15-minute fallback cron
-- No Cloudflare Queue
+- ~~No Cloudflare Queue~~ — reversed 2026-09-11 (issue #80 / V6):
+  queue is a latency layer; dirty generation + 15-minute cron remain
+  the contract
 - Request-path cache-only after first successful publication
   (`initial_sync_complete` / parseable `last_synced_at` as the _gate_, not as
   health)
@@ -115,6 +117,7 @@ permanent.
 
 - Watches are **hints**; webhook `exists` persists `dirty_requested_generation`
   then HTTP 200; optional `wait_until` replica is an optimization only
+  (removed by #79; V6 replaces that optimization with a queue)
 - `not_exists` persists disable then 200; stop is best-effort
 - Cron consumes dirty (`requested > applied`) **and** the 15-minute
   `last_success_at` backstop **and** `full_sync_requested` **and** due
@@ -156,9 +159,36 @@ permanent.
 - Failed writes surface a small error; no offline queue; no user-facing Full
   Refresh
 
+**V6 (shipped)** — 2026-09-11 (issue #80)
+
+- Cloudflare Queue `calendar-sync` in the **same** Worker (`fetch` +
+  `scheduled` + queue consumer). Binding `CALENDAR_SYNC`.
+  `max_batch_size = 1`, `max_batch_timeout = 0`, default `max_retries`
+  (3), `max_concurrency` unset, **no dead-letter queue**.
+- Webhook contract unchanged through the durable write: verify →
+  `persist_webhook_decision` → 200. Best-effort enqueue **after** a
+  successful dirty write. Failed enqueue is logged and swallowed.
+- Orchestration in api-core (`run_queue_sync`). Worker shell:
+  deserialize, wire D1, `refresh_if_needed`, map
+  `Ack` / `Retry` / `Reenqueue` to `message.ack()` / `message.retry()` /
+  `queue.send()`. `Retry` is reserved; current rules never return it.
+- Action rules: Published + `requested == applied` → Ack; Published +
+  `requested > applied` after the walk (post-publish generation
+  predicate, not a pre/post requested comparison) → one Reenqueue then
+  ack; LeaseBusy → Ack; sync failure → Ack (preserves `next_retry_at`;
+  cron owns retry); missing / disabled / soft-deleted → Ack.
+- Follow-up send failure: log and ack. Never throw.
+- After a successful queue publish the Worker notifies open browsers
+  (`notify_user`), same predicate as cron (`published`).
+- Cron unchanged. No change to `sync_calendar` lease semantics, replica
+  walk, token refresh, or the sanitized `sync` envelope.
+- Queue is **not** a second source of truth. Watches remain hints
+  (invariant 4). Dirty generation + fallback cron remain the contract.
+
 **Later**
 
-- **Not planned:** Cloudflare Queues (ADR 0001)
+- Cloudflare Queues: **shipped as V6 latency layer** (issue #80).
+  Not the correctness contract.
 
 ## Consequences
 
@@ -176,6 +206,8 @@ permanent.
 - Cron keys off dirty generation + `last_success_at` (15-minute backstop) +
   `full_sync_requested` + due `next_retry_at`. Window bumps dirty as a hint
   without setting `full_sync_requested`. Watches never disable the poll.
+- Queue `calendar-sync` cuts webhook staleness from the 15-minute cron
+  cadence to seconds; dropped messages still converge on the next cron tick.
 
 ## Residual risk
 
@@ -200,14 +232,14 @@ Calendar code is split by boundary so a newcomer does not scroll a single novel:
 
 - **Service** (`packages/api-core/src/calendar/`): `list` / `write` /
   `write_journal` / `journal` / `repair` / `watch` / `webhook` / `catalog` /
-  `cron` / `labels` / `apply` / `replica` / `window` / `sync` (health). Shared
-  URL encoding lives in `google.rs`. Public names are re-exported from
-  `calendar/mod.rs` and `lib.rs`.
+  `cron` / `queue` / `labels` / `apply` / `replica` / `window` / `sync`
+  (health). Shared URL encoding lives in `google.rs`. Public names are
+  re-exported from `calendar/mod.rs` and `lib.rs`.
 - **Persistence**: `models/calendar.rs` (row types), `repo/calendar.rs`
   (traits + SQL), `apps/worker/src/db/calendar.rs` (D1 impls).
-- **Worker HTTP**: `apps/worker/src/calendar/http.rs` (REST) and
-  `calendar/webhook.rs` (push notifications). Route wiring stays in
-  `apps/worker/src/lib.rs`.
+- **Worker HTTP**: `apps/worker/src/calendar/http.rs` (REST),
+  `calendar/webhook.rs` (push notifications), and `apps/worker/src/queue.rs`
+  (queue consumer). Route wiring stays in `apps/worker/src/lib.rs`.
 
 V4 writes land in `calendar/write.rs` (facade), `journal.rs` (insert),
 `write_journal.rs` (patch/delete), and `repair.rs` (GET-only recovery).
