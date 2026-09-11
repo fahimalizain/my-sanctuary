@@ -60,6 +60,8 @@
 //!   channel and calendar rows — pure and unit-tested. The Worker persists
 //!   the decision via [`persist_webhook_decision`] (dirty bump or disable)
 //!   **before** HTTP 200. No `wait_until` replica — cron is the contract.
+//!   A queue consumer ([`run_queue_sync`]) is a latency layer on top of the
+//!   dirty bump; the fallback cron remains the correctness contract.
 
 
 pub mod apply;
@@ -78,6 +80,7 @@ pub(crate) mod watch;
 pub(crate) mod webhook;
 pub(crate) mod catalog;
 pub(crate) mod cron;
+pub(crate) mod queue;
 pub(crate) mod labels;
 
 #[cfg(test)]
@@ -239,6 +242,7 @@ pub use cron::{
     replica_due, run_fallback_cron, run_fallback_cron_with_clock, sync_calendar,
     sync_calendar_traced, CronReport, SyncCalendarOutcome, SyncCalendarResult,
 };
+pub use queue::{run_queue_sync, CalendarSyncMessage, QueueSyncAction, QueueSyncReport};
 pub use diagnostics::{
     classify_operator_warning, mint_run_id, operator_warning_record, CheckpointResult,
     OperatorWarningLevel, OperatorWarningRecord, OperatorWarningThresholds, ReplicaApplyReport,
