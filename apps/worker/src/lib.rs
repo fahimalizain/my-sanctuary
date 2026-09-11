@@ -6,6 +6,7 @@ mod cron;
 mod db;
 mod http;
 mod lists;
+mod queue;
 mod routines;
 mod sync_log;
 mod tasks;
