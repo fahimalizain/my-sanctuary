@@ -247,6 +247,10 @@ pub(crate) struct FakeCalendarRepo {
     /// Snapshot is taken before the bump so the caller still sees the
     /// pre-bump generation (mirrors mid-run dirty enqueue).
     pub(crate) bump_dirty_after_get_by_id: Mutex<Option<usize>>,
+    /// Amount added to `dirty_requested_generation` when
+    /// [`Self::bump_dirty_after_get_by_id`] fires (default 1). Set >1 to
+    /// simulate multiple mid-walk dirty bumps coalescing into one re-enqueue.
+    pub(crate) bump_dirty_by: Mutex<i64>,
     /// History of `expires_rfc3339` values passed to [`CalendarRepo::renew_lease`].
     pub(crate) renew_expiries: Mutex<Vec<String>>,
 }
@@ -281,6 +285,7 @@ impl FakeCalendarRepo {
             fail_bump_dirty: Mutex::new(false),
             fail_set_sync_enabled: Mutex::new(false),
             bump_dirty_after_get_by_id: Mutex::new(None),
+            bump_dirty_by: Mutex::new(1),
             renew_expiries: Mutex::new(Vec::new()),
         }
     }
@@ -375,9 +380,10 @@ impl CalendarRepo for FakeCalendarRepo {
         }
         if let Some(threshold) = *self.bump_dirty_after_get_by_id.lock().unwrap() {
             if n == threshold {
+                let by = (*self.bump_dirty_by.lock().unwrap()).max(0);
                 if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
                     cal.dirty_requested_generation =
-                        cal.dirty_requested_generation.saturating_add(1);
+                        cal.dirty_requested_generation.saturating_add(by);
                 }
             }
         }

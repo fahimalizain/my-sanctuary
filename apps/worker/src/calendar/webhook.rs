@@ -17,8 +17,10 @@ use api_core::repo::{CalendarRepo, WatchChannelRepo};
 ///    [`api_core::persist_webhook_decision`].
 /// 3. Return HTTP 200.
 ///
-/// No background replica and no token refresh on this path. Cron is the
-/// recovery contract for dirty calendars and leftover channel stops.
+/// After a successful dirty write, best-effort enqueue onto `CALENDAR_SYNC`.
+/// Enqueue failure is logged and swallowed; HTTP 200 never depends on the
+/// queue. Cron remains the recovery contract for dirty calendars and leftover
+/// channel stops. No `wait_until` replica and no token refresh on this path.
 ///
 /// Invoked from `fetch` (see `crate::is_webhook_request`) *before* the
 /// Router so Google's POST skips session/CORS middleware — not because this
@@ -102,6 +104,28 @@ pub async fn notifications(req: Request, env: Env, _ctx: Context) -> Result<Resp
             console_log!(
                 "calendar webhook: dirty accepted for calendar {calendar_id} (channel {channel_id}, state {resource_state:?})"
             );
+            // Best-effort latency enqueue after the durable dirty write.
+            // Failed enqueue is logged and swallowed — HTTP 200 never depends
+            // on the queue; cron recovers.
+            match env.queue("CALENDAR_SYNC") {
+                Ok(q) => {
+                    if let Err(err) = q
+                        .send(api_core::CalendarSyncMessage {
+                            calendar_id: calendar_id.clone(),
+                        })
+                        .await
+                    {
+                        console_log!(
+                            "calendar webhook: enqueue failed for calendar {calendar_id}: {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    console_log!(
+                        "calendar webhook: CALENDAR_SYNC binding missing — cron will recover: {err}"
+                    );
+                }
+            }
         }
         (
             api_core::WebhookDecision::EnqueueDirty { calendar_id },

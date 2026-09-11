@@ -6,6 +6,7 @@ mod watch;
 mod webhook;
 mod catalog;
 mod cron;
+mod queue;
 mod diagnostics;
 mod replica;
 mod repair;
