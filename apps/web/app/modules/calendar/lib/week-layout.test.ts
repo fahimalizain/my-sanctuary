@@ -41,6 +41,7 @@ import {
   hourHeight,
   isCompactChip,
   isMultiDay,
+  isStripWidthMeasured,
   monthGridDays,
   monthGridStart,
   nowLineY,
@@ -220,6 +221,23 @@ test('fitPeriodStart: short period keeps civil day; long snaps to Monday', () =>
 });
 
 // ── Infinite strip geometry ─────────────────────────────────────────────
+
+// Regression gate for first-visit strip park (Aug 31–Sep 6 bug):
+// mainWidth starts at 0; colWidth(0) returns the 16px fallback. Init park must
+// wait for a real measured width (mainWidth > 0), not colW > 0.
+test('isStripWidthMeasured: only finite positive widths count as measured', () => {
+  assert.equal(isStripWidthMeasured(0), false);
+  assert.equal(isStripWidthMeasured(-1), false);
+  assert.equal(isStripWidthMeasured(NaN), false);
+  assert.equal(isStripWidthMeasured(Infinity), false);
+  assert.equal(isStripWidthMeasured(-Infinity), false);
+  assert.equal(isStripWidthMeasured(1), true);
+  assert.equal(isStripWidthMeasured(800), true);
+  // Document why colW is the wrong gate: unmeasured → 16, which is > 0.
+  assert.equal(colWidth(0), 16);
+  assert.ok(colWidth(0) > 0);
+  assert.equal(isStripWidthMeasured(0), false);
+});
 
 test('colWidth / gutterWithRemainder: available 800 → 7 cols + gutter = 800', () => {
   const available = 800;
