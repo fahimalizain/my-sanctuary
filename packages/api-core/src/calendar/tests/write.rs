@@ -215,6 +215,30 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
 }
 
 #[test]
+fn create_without_description_omits_the_key() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+
+    let mut input = input();
+    input.description = None;
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap();
+
+    // Absent notes omit the key entirely — never `"description": null`.
+    let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(body.get("description").is_none(), "{body}");
+}
+
+#[test]
 fn create_with_color_hex_sends_event_label_id() {
     // `#535050` snaps chroma-first to graphite `#616161`; the cache maps
     // graphite to a stable fake id.
