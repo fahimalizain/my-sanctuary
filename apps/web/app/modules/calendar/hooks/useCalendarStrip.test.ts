@@ -121,6 +121,10 @@ function StripHarness({
 
 test('useCalendarStrip: after measure, visibleStart is fitPeriodStart(today), not overscan week', async () => {
   let latest: CalendarStrip | null = null;
+  // Direct reads of `latest` narrow to `null`: the callback assignment is
+  // invisible to control-flow analysis. Read through a function to recover the
+  // declared union before snapshotting into a const.
+  const getLatest = (): CalendarStrip | null => latest;
 
   await act(async () => {
     render(
@@ -140,8 +144,8 @@ test('useCalendarStrip: after measure, visibleStart is fitPeriodStart(today), no
     });
   });
 
-  assert.ok(latest, 'harness should report strip state');
-  const strip = latest!;
+  const strip = getLatest();
+  assert.ok(strip, 'harness should report strip state');
 
   const expectedStart = fitPeriodStart(new Date(), DAYS_PER_PERIOD);
   const overscanStart = addDays(expectedStart, -STRIP_OVERSCAN);
@@ -169,6 +173,8 @@ test('useCalendarStrip: after measure, visibleStart is fitPeriodStart(today), no
 test('useCalendarStrip: onScrollerScroll before measured park does not clobber visibleStartIdx', async () => {
   // gridWidth 0 → measure stays unmeasured; didInitScrollRef stays false.
   let latest: CalendarStrip | null = null;
+  // See note above: read through a function to recover the declared union.
+  const getLatest = (): CalendarStrip | null => latest;
 
   await act(async () => {
     render(
@@ -181,8 +187,8 @@ test('useCalendarStrip: onScrollerScroll before measured park does not clobber v
     );
   });
 
-  assert.ok(latest);
-  const strip = latest!;
+  const strip = getLatest();
+  assert.ok(strip);
   const before = strip.visibleStart.getTime();
 
   // Simulate a mount scroll with scrollLeft ≈ 0 (would set idx 0 if unguarded).
@@ -193,15 +199,14 @@ test('useCalendarStrip: onScrollerScroll before measured park does not clobber v
     strip.onScrollerScroll();
   });
 
+  const after = getLatest();
+  assert.ok(after);
   assert.equal(
-    latest!.visibleStart.getTime(),
+    after.visibleStart.getTime(),
     before,
     'pre-init onScroll must not move visibleStart off the seeded overscan index',
   );
   assert.ok(
-    isSameDay(
-      latest!.visibleStart,
-      fitPeriodStart(new Date(), DAYS_PER_PERIOD),
-    ),
+    isSameDay(after.visibleStart, fitPeriodStart(new Date(), DAYS_PER_PERIOD)),
   );
 });
