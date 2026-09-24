@@ -18,6 +18,7 @@ import {
   formatDayRangeTitle,
   gutterWithRemainder,
   isSameDay,
+  isStripWidthMeasured,
   parseStoredPeriodLength,
   rangeIso,
   scrollLeftForIndex,
@@ -208,7 +209,15 @@ export function useCalendarStrip(): CalendarStrip {
     }
 
     // Initial mount: park scroll so current period is visible.
+    // Gate on measured mainWidth — not colW > 0. colWidth(0) falls back to 16px,
+    // so an early park sets scrollLeft = STRIP_OVERSCAN * 16 and marks init done.
+    // When the real width arrives, the effect skips re-parking; track grows while
+    // scrollLeft stays ~0/112; onScrollerScroll then sets visibleStartIdx to 0 and
+    // the title shows the overscan week (e.g. Aug 31–Sep 6 instead of Mon–Sun
+    // containing today). Leave didInitScrollRef false until mainWidth > 0;
+    // visibleStartIdx stays seeded at STRIP_OVERSCAN (first paint already correct).
     if (!didInitScrollRef.current) {
+      if (!isStripWidthMeasured(mainWidth)) return;
       didInitScrollRef.current = true;
       suppressRebaseRef.current = true;
       scroller.scrollLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
@@ -224,10 +233,15 @@ export function useCalendarStrip(): CalendarStrip {
       setVisibleStartIdx(STRIP_OVERSCAN);
       releaseSuppressRebase();
     }
-  }, [colW, dayCount, periodLength, windowStart, scrollNonce]);
+  }, [colW, dayCount, mainWidth, periodLength, windowStart, scrollNonce]);
 
   // Horizontal scroll: update visible start; request rebase near the edges.
   const onScrollerScroll = useCallback(() => {
+    // Ignore until init park has run with a measured width. Otherwise a mount
+    // scrollLeft write (or scrollLeft ≈ 0) sets visibleStartIdx to 0 and the
+    // title flashes / sticks on the overscan buffer week.
+    if (!didInitScrollRef.current) return;
+
     const scroller = scrollerRef.current;
     if (!scroller || colW <= 0) return;
 

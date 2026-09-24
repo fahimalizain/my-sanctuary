@@ -231,6 +231,15 @@ export function fitPeriodStart(date: Date, periodLength: number): Date {
   return startOfDay(date);
 }
 
+/**
+ * True once the grid column has a real layout width.
+ * Do not use `colWidth(mainWidth) > 0` — `colWidth(0)` falls back to 16px, which
+ * is enough to falsely complete the strip's initial overscan park.
+ */
+export function isStripWidthMeasured(mainWidth: number): boolean {
+  return Number.isFinite(mainWidth) && mainWidth > 0;
+}
+
 /** Floor column width so exactly `periodLength` columns fit; leftover px go to the gutter. */
 export function colWidth(
   availablePx: number,
