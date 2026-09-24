@@ -128,8 +128,8 @@ check_local_d1_free() {
     holder="$(lsof +D "$D1_STATE_DIR" 2>/dev/null | grep -E '\.sqlite' || true)"
   fi
   if [ -z "$holder" ] && command -v pgrep >/dev/null 2>&1; then
-    if pgrep -f 'wrangler dev|workerd' >/dev/null 2>&1; then
-      holder="a wrangler/workerd process is running"
+    if pgrep -f 'wrangler dev' >/dev/null 2>&1; then
+      holder="a wrangler dev process is running"
     fi
   fi
   if [ -n "$holder" ]; then

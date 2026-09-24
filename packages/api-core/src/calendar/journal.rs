@@ -82,10 +82,14 @@ pub(crate) async fn create_event_with_journal(
     let mut payload = serde_json::json!({
         "id": minted_id,
         "summary": input.summary,
-        "description": input.description,
         "start": { "dateTime": input.start },
         "end": { "dateTime": input.end },
     });
+    // Notes are the event's `description`; absent notes omit the key entirely
+    // (never `"description": null`). `Some("")` is an explicit empty string.
+    if let Some(description) = input.description.as_deref() {
+        payload["description"] = serde_json::json!(description);
+    }
     let shared = build_shared_properties(input, &minted_id);
     payload["extendedProperties"] = serde_json::json!({ "shared": shared });
 
