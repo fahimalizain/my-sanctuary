@@ -2152,7 +2152,9 @@ fn category_color_hex(taxonomy: &Taxonomy, title: &str) -> Option<String> {
 /// back to `resolve_target_calendar` exactly like `start_task`. `color_hex` is
 /// re-resolved from the category (the cache has no color column). `focused`
 /// controls the `sanctuary_focus = "1"` flag; the summary is the task title
-/// exactly, never a `▶` prefix.
+/// exactly, never a `▶` prefix. The event description is the task's notes
+/// (trimmed), omitted from the insert payload when blank — the same mapping as
+/// `start_task` via [`task_segment_input`].
 async fn create_focus_segment(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -2193,21 +2195,14 @@ async fn create_focus_segment(
         operations,
         access,
         user_id,
-        &NewEventInput {
+        &task_segment_input(
+            task,
             calendar_id,
-            summary: task.title.clone(),
-            description: None,
-            start: start_rfc3339,
-            end: end_rfc3339,
-            task_id: Some(task.id.clone()),
-            routine_id: None,
-            occurrence_id: None,
             color_hex,
-            sanctuary_focus: focused,
-            // Create-time snapshot of the task's P/D — never patched later.
-            priority: Some(task.priority.clone()),
-            difficulty: Some(task.difficulty.clone()),
-        },
+            focused,
+            start_rfc3339,
+            end_rfc3339,
+        ),
         now_unix,
     )
     .await?;
@@ -6862,6 +6857,8 @@ mod tests {
             create["extendedProperties"]["shared"]["sanctuary_difficulty"],
             "easy"
         );
+        // Blank notes omit the key entirely — never `"description": null`.
+        assert!(create.get("description").is_none(), "{body}");
 
         // Logs: started then focused (the focused log names the new segment).
         let inserted = logs.inserted.lock().unwrap().clone();
@@ -6872,6 +6869,66 @@ mod tests {
             Some("cal-primary@example.com")
         );
         assert_eq!(inserted[1].google_event_id.as_deref(), Some("g-focus"));
+    }
+
+    #[test]
+    fn focus_segment_carries_task_notes_onto_the_insert_body() {
+        let (lists, categories, tasks) = seeded();
+        let mut notes_input = input("Work");
+        notes_input.description = Some("Deep focus session".to_string());
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &notes_input,
+        ))
+        .unwrap()
+        .task;
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http_start = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &event_json_with_id("g-1", &task.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http_start, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Focus 5 minutes later (22:18:20 → snapped 22:18:00): the old chip
+        // snaps and the flagged segment opens.
+        let focus_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-1",
+                200,
+                &patched_event_json_for("g-1", &task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &focused_event_json(
+                    "g-focus",
+                    &task.id,
+                    "2023-11-14T22:18:00Z",
+                    "2023-11-14T22:33:00Z",
+                ),
+            ),
+        ]);
+        let users = FakeUserRepo::default();
+        pollster::block_on(focus_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, focus_unix,
+        ))
+        .unwrap();
+
+        // The flagged segment carries the task's notes as the Google
+        // `description`, exactly like the started chip.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let (_, body) = posts.first().unwrap().clone();
+        let create: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(create["description"], "Deep focus session");
     }
 
     #[test]
@@ -7188,6 +7245,56 @@ mod tests {
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_UNFOCUSED);
         assert_eq!(inserted.last().unwrap().google_event_id.as_deref(), Some("g-after"));
+    }
+
+    #[test]
+    fn delete_focus_continuation_carries_task_notes_onto_the_insert_body() {
+        let (lists, categories, tasks) = seeded();
+        let mut notes_input = input("Work");
+        notes_input.description = Some("Deep focus session".to_string());
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &notes_input,
+        ))
+        .unwrap()
+        .task;
+        let (_focus_http, calendars, events, logs, users) =
+            focus_first(&lists, &categories, &tasks, &task.id);
+        assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
+
+        let delete_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![
+            (
+                "/events/g-focus",
+                200,
+                &patched_event_json_for("g-focus", &task.id, "2023-11-14T22:18:00Z", "2023-11-14T22:23:00Z"),
+            ),
+            (
+                "/events",
+                200,
+                &event_json_with_id("g-after", &task.id, "2023-11-14T22:23:00Z", "2023-11-14T22:38:00Z"),
+            ),
+        ]);
+        let response = pollster::block_on(delete_focus(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", delete_unix,
+        ))
+        .unwrap();
+
+        assert_eq!(users.pointer(), None, "pointer cleared");
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].google_event_id, "g-after");
+
+        // The unprefixed continuation carries the task's notes as the Google
+        // `description`, exactly like the started chip.
+        let posts = http.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        let (_, body) = posts.first().unwrap().clone();
+        let create: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(create["description"], "Deep focus session");
+        assert!(
+            create["extendedProperties"]["shared"].get("sanctuary_focus").is_none(),
+            "the continuation never carries the flag: {body}"
+        );
     }
 
     #[test]
