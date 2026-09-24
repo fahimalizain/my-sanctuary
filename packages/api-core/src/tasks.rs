@@ -39,7 +39,9 @@
 //!   `task.duration_minutes` — where `T = nearest_minute_unix(now)`) with
 //!   `extendedProperties.shared.sanctuary_task_id` = task UUID (never
 //!   `private`, never a description footer). Summary is the task **title**
-//!   exactly — no `| Category` suffix.
+//!   exactly — no `| Category` suffix. The event description is the task's
+//!   **notes** (trimmed); blank notes omit the `description` key from the
+//!   insert payload entirely.
 //! - Calendar pick: `wanted` is the first non-empty of the matched
 //!   category's first regex-matching pattern's `google_calendar_id` (patterns
 //!   walked in stored `sort_order`), the matched category's
@@ -931,6 +933,41 @@ pub async fn delete_task(
 // Timer (slice 4): start / stop / pause / complete / discard
 // ──────────────────────────────────────────
 
+/// The Google insert input for one task timer segment — the single mapping
+/// point for task→event creates (start, focus, switch).
+///
+/// The event description is the task's notes, trimmed; blank notes omit the
+/// `description` key from the insert payload entirely.
+fn task_segment_input(
+    task: &Task,
+    calendar_id: String,
+    color_hex: Option<String>,
+    focused: bool,
+    start: String,
+    end: String,
+) -> NewEventInput {
+    let notes = task.description.trim();
+    NewEventInput {
+        calendar_id,
+        summary: task.title.clone(),
+        description: if notes.is_empty() {
+            None
+        } else {
+            Some(notes.to_string())
+        },
+        start,
+        end,
+        task_id: Some(task.id.clone()),
+        routine_id: None,
+        occurrence_id: None,
+        color_hex,
+        sanctuary_focus: focused,
+        // Create-time snapshot of the task's P/D — never patched later.
+        priority: Some(task.priority.clone()),
+        difficulty: Some(task.difficulty.clone()),
+    }
+}
+
 /// Starts a task: opens a timed Google Calendar event and marks the task
 /// IN_PROGRESS. The event's summary is the task **title** exactly and carries
 /// `extendedProperties.shared.sanctuary_task_id` = task UUID.
@@ -1011,22 +1048,15 @@ pub async fn start_task(
         operations,
         access,
         user_id,
-        &NewEventInput {
-            calendar_id: target.calendar_id.clone(),
-            summary: task.title.clone(),
-            description: None,
-            start: start_rfc3339,
-            end: end_rfc3339,
-            task_id: Some(task.id.clone()),
-            routine_id: None,
-            occurrence_id: None,
-            color_hex: target.color_hex,
+        &task_segment_input(
+            &task,
+            target.calendar_id.clone(),
+            target.color_hex,
             // Start never takes focus: the started chip is unfocused.
-            sanctuary_focus: false,
-            // Create-time snapshot of the task's P/D — never patched later.
-            priority: Some(task.priority.clone()),
-            difficulty: Some(task.difficulty.clone()),
-        },
+            false,
+            start_rfc3339,
+            end_rfc3339,
+        ),
         now_unix,
     )
     .await?;
@@ -5260,6 +5290,64 @@ mod tests {
             body["extendedProperties"]["shared"]["sanctuary_difficulty"],
             "hard"
         );
+    }
+
+    #[test]
+    fn start_carries_task_notes_onto_the_insert_body() {
+        let (lists, categories, tasks) = seeded();
+        let mut notes_input = input("Work");
+        notes_input.description = Some("Deep focus session".to_string());
+        let task = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &notes_input,
+        ))
+        .unwrap()
+        .task;
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // The task's notes ride onto the Google `description` at create time.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["description"], "Deep focus session");
+    }
+
+    #[test]
+    fn start_omits_description_when_task_has_no_notes() {
+        let (lists, categories, tasks) = seeded();
+        let task = work_task(&lists, &categories, &tasks);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, NOW_UNIX,
+        ))
+        .unwrap();
+
+        // Blank notes omit the key entirely — never `"description": null`.
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(body.get("description").is_none(), "{body}");
     }
 
     #[test]

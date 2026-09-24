@@ -414,6 +414,9 @@ pub struct NewEventInput {
     /// Local DB calendar id (`google_calendars.id`), not the Google id.
     pub calendar_id: String,
     pub summary: String,
+    /// Event notes → Google `description`. `None` omits the key from the
+    /// insert payload; task timer events carry the task's notes as a
+    /// create-time snapshot (never patched when the task's notes change).
     #[serde(default)]
     pub description: Option<String>,
     /// dateTime string (RFC 3339) passed through to Google.
