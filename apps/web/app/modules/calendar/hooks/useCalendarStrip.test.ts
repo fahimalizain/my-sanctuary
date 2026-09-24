@@ -92,9 +92,8 @@ function StripHarness({
     'div',
     {
       ref: (el: HTMLDivElement | null) => {
-        (
-          strip.gridColumnRef as { current: HTMLDivElement | null }
-        ).current = el;
+        (strip.gridColumnRef as { current: HTMLDivElement | null }).current =
+          el;
         if (el && !gridAttached.current) {
           stubClientWidth(el, gridWidth);
           gridAttached.current = true;
