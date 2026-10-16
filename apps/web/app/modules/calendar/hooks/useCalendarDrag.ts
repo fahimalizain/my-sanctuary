@@ -37,13 +37,15 @@ import {
   SNAP_MINUTES,
   snapMinutes,
   startOfDay,
+  type StripLockReason,
 } from '../lib/week-layout';
 import type { CalendarEvent } from '@/app/types';
 
 export interface UseCalendarDragOptions {
   hourH: number;
-  /** Lock the infinite strip so it does not rebase mid-drag. */
-  setStripLocked: (locked: boolean) => void;
+  /** Take / release the infinite strip's drag lock (snap off, no rebase). */
+  lockStrip: (reason: StripLockReason) => void;
+  unlockStrip: (reason: StripLockReason) => void;
   onClickCreate: (slot: DragSlot) => void;
   onDragCreate: (range: TimedRange) => void;
   onMove: (eventId: string, range: TimedRange) => void;
@@ -342,7 +344,7 @@ export function useCalendarDrag(
       if (claimedRef.current) return;
       claimedRef.current = true;
       tick();
-      optsRef.current.setStripLocked(true);
+      optsRef.current.lockStrip('drag');
       document.body.style.userSelect = 'none';
       const target = captureTargetRef.current;
       if (target) {
@@ -380,7 +382,7 @@ export function useCalendarDrag(
       } else {
         claimedRef.current = true;
         if (isTouch) tick();
-        optsRef.current.setStripLocked(true);
+        optsRef.current.lockStrip('drag');
         try {
           target.setPointerCapture(e.pointerId);
         } catch {
@@ -401,7 +403,7 @@ export function useCalendarDrag(
     didDragRef.current = false;
     claimedRef.current = false;
     captureTargetRef.current = null;
-    optsRef.current.setStripLocked(false);
+    optsRef.current.unlockStrip('drag');
     document.body.style.userSelect = '';
   }, [stopAutoScroll]);
 

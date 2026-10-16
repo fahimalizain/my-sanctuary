@@ -53,6 +53,8 @@ import {
   shouldRebase,
   startOfWeek,
   stripDayCount,
+  stripRebaseSuppressed,
+  stripSnapDisabled,
   visibleStartIndex,
   weekRangeIso,
   snapMinutes,
@@ -65,6 +67,7 @@ import {
   timedRangeToAllDay,
   allDayRangeToTimed,
   applyAllDayStartDate,
+  type StripLockReason,
 } from './week-layout';
 
 // ── startOfWeek ─────────────────────────────────────────────────────────
@@ -354,6 +357,72 @@ test('shiftWindowStart: period 3 → ±3 days', () => {
   assert.equal(right.getFullYear(), 2026);
   assert.equal(right.getMonth(), 8);
   assert.equal(right.getDate(), 10); // Thu Sep 10
+});
+
+// ── Strip lock ownership ────────────────────────────────────────────────
+
+test('stripSnapDisabled: true while any owner is held', () => {
+  assert.equal(stripSnapDisabled(new Set<StripLockReason>()), false);
+  for (const reason of ['drag', 'pinch', 'axis'] as const) {
+    assert.equal(stripSnapDisabled(new Set<StripLockReason>([reason])), true);
+  }
+  assert.equal(
+    stripSnapDisabled(new Set<StripLockReason>(['drag', 'pinch'])),
+    true,
+  );
+});
+
+test('stripRebaseSuppressed: drag / pinch yes, axis alone no', () => {
+  assert.equal(stripRebaseSuppressed(new Set<StripLockReason>(['drag'])), true);
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['pinch'])),
+    true,
+  );
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'pinch'])),
+    true,
+  );
+  // axis holds snap off but leaves rebase free (the window may still slide).
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['axis'])),
+    false,
+  );
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'axis'])),
+    true,
+  );
+});
+
+test('strip lock: releasing one owner leaves another owner in effect', () => {
+  const held = new Set<StripLockReason>(['drag', 'axis']);
+  assert.equal(stripSnapDisabled(held), true);
+  assert.equal(stripRebaseSuppressed(held), true);
+
+  // Drag ends while the axis owner still holds.
+  held.delete('drag');
+  assert.equal(stripSnapDisabled(held), true);
+  assert.equal(stripRebaseSuppressed(held), false);
+
+  // Last owner releases → snap re-engages.
+  held.delete('axis');
+  assert.equal(stripSnapDisabled(held), false);
+  assert.equal(stripRebaseSuppressed(held), false);
+});
+
+// Set, not a counter: lock twice + unlock once must release.
+test('strip lock: repeat holds are idempotent', () => {
+  const held = new Set<StripLockReason>();
+  held.add('pinch');
+  held.add('pinch');
+  held.delete('pinch');
+  assert.equal(stripSnapDisabled(held), false);
+  assert.equal(stripRebaseSuppressed(held), false);
+});
+
+test('strip lock: empty set means snap enabled and no suppression', () => {
+  const held: ReadonlySet<StripLockReason> = new Set();
+  assert.equal(stripSnapDisabled(held), false);
+  assert.equal(stripRebaseSuppressed(held), false);
 });
 
 // ── clampMinutesToDay ───────────────────────────────────────────────────

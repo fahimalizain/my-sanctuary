@@ -26,7 +26,10 @@ import {
   shouldRebase,
   startOfDay,
   stripDayCount,
+  stripRebaseSuppressed,
+  stripSnapDisabled,
   visibleStartIndex as computeVisibleStartIndex,
+  type StripLockReason,
 } from '../lib/week-layout';
 
 function readStoredPeriodLength(): number {
@@ -59,7 +62,8 @@ export interface CalendarStrip {
   gutterW: number;
   trackWidth: number;
   contentWidth: number;
-  setStripLocked: (locked: boolean) => void;
+  lockStrip: (reason: StripLockReason) => void;
+  unlockStrip: (reason: StripLockReason) => void;
   onScrollerScroll: () => void;
   shiftPeriod: (deltaPeriods: number) => void;
   goToToday: () => void;
@@ -137,7 +141,9 @@ export function useCalendarStrip(): CalendarStrip {
   // Rebase direction requested by the scroll handler; applied in layout effect.
   const pendingRebaseRef = useRef<-1 | 0 | 1>(0);
   const [scrollNonce, setScrollNonce] = useState(0);
-  // Suppress rebase while applying a programmatic scrollLeft write.
+  // Suppress rebase while applying a transient programmatic scrollLeft write
+  // (init park / jump / rebase compensation). Held lock owners suppress via
+  // stripRebaseSuppressed instead, so a rAF release here cannot clobber them.
   const suppressRebaseRef = useRef(false);
 
   useLayoutEffect(() => {
@@ -169,14 +175,42 @@ export function useCalendarStrip(): CalendarStrip {
   const trackWidth = dayCount * colW;
   const contentWidth = gutterW + trackWidth;
 
-  const setStripLocked = useCallback((locked: boolean) => {
-    suppressRebaseRef.current = locked;
+  // Lock owners (drag / pinch / axis) that hold the scroller's snap override.
+  // A Set, not a counter: repeat holds are idempotent and releasing one owner
+  // cannot clear another owner's `scroll-snap-type: none`.
+  const stripLockReasonsRef = useRef<Set<StripLockReason>>(new Set());
+
+  /** Apply the scroller's snap override from the currently held owners. */
+  const applyStripLock = useCallback(() => {
     // CSS scroll-snap re-snaps on every programmatic scrollLeft write, which
-    // would fight drag auto-scroll. Suspend it while locked; clearing the
-    // inline override re-engages snap and settles on the nearest column.
+    // would fight drag auto-scroll. Suspend it while any owner holds the lock;
+    // clearing the inline override re-engages snap and settles on the nearest
+    // column.
     const scroller = scrollerRef.current;
-    if (scroller) scroller.style.scrollSnapType = locked ? 'none' : '';
+    if (scroller) {
+      scroller.style.scrollSnapType = stripSnapDisabled(
+        stripLockReasonsRef.current,
+      )
+        ? 'none'
+        : '';
+    }
   }, []);
+
+  const lockStrip = useCallback(
+    (reason: StripLockReason) => {
+      stripLockReasonsRef.current.add(reason);
+      applyStripLock();
+    },
+    [applyStripLock],
+  );
+
+  const unlockStrip = useCallback(
+    (reason: StripLockReason) => {
+      stripLockReasonsRef.current.delete(reason);
+      applyStripLock();
+    },
+    [applyStripLock],
+  );
 
   const releaseSuppressRebase = () => {
     // scroll events from programmatic scrollLeft can be sync or rAF-deferred.
@@ -259,6 +293,9 @@ export function useCalendarStrip(): CalendarStrip {
     setVisibleStartIdx((prev) => (prev === idx ? prev : idx));
 
     if (suppressRebaseRef.current) return;
+    // Drag / pinch own the strip lock: no rebase while they are held. 'axis'
+    // is exempt — it disables snap only, so the window may still slide.
+    if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
 
     const dir = shouldRebase(idx, dayCount, periodLength);
     if (dir !== 0 && pendingRebaseRef.current === 0) {
@@ -376,7 +413,8 @@ export function useCalendarStrip(): CalendarStrip {
     gutterW,
     trackWidth,
     contentWidth,
-    setStripLocked,
+    lockStrip,
+    unlockStrip,
     onScrollerScroll,
     shiftPeriod,
     goToToday,

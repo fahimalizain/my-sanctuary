@@ -55,6 +55,7 @@ import {
   hourHeight as computeHourHeight,
   isMultiDay,
   isSameDay,
+  type StripLockReason,
 } from '../lib/week-layout';
 
 /** Overlay still matches server response for fields we paint optimistically. */
@@ -83,7 +84,8 @@ export interface CalendarSessionInput {
   dayCount: number;
   scrollerHeight: number;
   scrollerRef: RefObject<HTMLElement | null>;
-  setStripLocked: (locked: boolean) => void;
+  lockStrip: (reason: StripLockReason) => void;
+  unlockStrip: (reason: StripLockReason) => void;
 }
 
 /**
@@ -97,7 +99,8 @@ export function useCalendarSession({
   dayCount,
   scrollerHeight,
   scrollerRef,
-  setStripLocked,
+  lockStrip,
+  unlockStrip,
 }: CalendarSessionInput) {
   const eventsQuery = useCalendarEventsQuery(timeMin, timeMax);
   const events = eventsQuery.data?.events ?? [];
@@ -853,7 +856,8 @@ export function useCalendarSession({
 
   const drag = useCalendarDrag({
     hourH,
-    setStripLocked,
+    lockStrip,
+    unlockStrip,
     onClickCreate: (slot) => {
       if (closeSelectionOnMobile()) return;
       beginDraft(clickCreateTimesFromSlot(slot));
@@ -872,10 +876,10 @@ export function useCalendarSession({
 
   onPinchStartRef.current = () => {
     drag.cancel();
-    setStripLocked(true);
+    lockStrip('pinch');
   };
   onPinchEndRef.current = () => {
-    setStripLocked(false);
+    unlockStrip('pinch');
   };
 
   // Stable across pointermove — only flips at drag start/end (not every move).

@@ -338,6 +338,31 @@ export function shiftWindowStart(
   return addDays(windowStart, direction * clampPeriodLength(periodLength));
 }
 
+// ── Strip lock ownership ────────────────────────────────────────────────
+
+/** Gesture owners that can hold the horizontal strip's scroll-snap off. */
+export type StripLockReason = 'drag' | 'pinch' | 'axis';
+
+/**
+ * Scroll-snap stays `none` while any owner holds the lock.
+ * Membership is a Set, not a counter: holding twice and releasing once
+ * releases the lock.
+ */
+export function stripSnapDisabled(held: ReadonlySet<StripLockReason>): boolean {
+  return held.size > 0;
+}
+
+/**
+ * Rebase is suppressed only for owners that write `scrollLeft` themselves.
+ * `axis` holds snap off but not rebase, so the window may still slide to stay
+ * infinite during a vertical gesture.
+ */
+export function stripRebaseSuppressed(
+  held: ReadonlySet<StripLockReason>,
+): boolean {
+  return held.has('drag') || held.has('pinch');
+}
+
 /**
  * Notion-style day-range title (inclusive first…last):
  *   same day   → "Tue, Sep 8, 2026"
