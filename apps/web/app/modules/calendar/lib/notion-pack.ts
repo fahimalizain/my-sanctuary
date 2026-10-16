@@ -216,10 +216,25 @@ function sortByStartMin(events: PackInput[]): PackInput[] {
 
 /**
  * Notion cascade packing for one civil day.
- * Caller clamps each event to the day before packing.
+ * Caller clamps each event to the day before packing. `minDurationMin` is the
+ * painted min-chip height in minutes (0 = true durations; zero → ε only).
  */
-export function packDayEvents(items: PackInput[]): PackResult[] {
+export function packDayEvents(
+  items: PackInput[],
+  minDurationMin = 0,
+): PackResult[] {
   if (items.length === 0) return [];
+
+  // Events shorter than the painted min-chip height occupy that height for
+  // overlap purposes, so a 0-min chip never sits on top of a neighbour it
+  // visually covers. Results are keyed by id, so the widened ends are internal.
+  if (minDurationMin > 0) {
+    items = items.map((e) =>
+      e.endMin - e.startMin < minDurationMin
+        ? { ...e, endMin: e.startMin + minDurationMin }
+        : e,
+    );
+  }
 
   // Call-site order: startMin ascending (stable)
   const sorted = sortByStartMin(items);

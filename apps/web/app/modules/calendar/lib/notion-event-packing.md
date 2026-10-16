@@ -63,6 +63,10 @@ overlaps(a, b) ⇔ a.start < b.end && b.start < a.end
   (Notion extends equal start/end by 1 second before testing; Sanctuary may use
   a small ε such as `0.001` minutes). Point intervals still collide when nested
   inside another interval.
+- **Painted min height:** `packDayEvents(items, minDurationMin)` widens any event
+  shorter than `minDurationMin` (the `CHIP_MIN_H` chip height in minutes at the
+  current `hourH`) to that length before overlap tests, so 0-min chips pack as
+  the space they actually paint. Default `0` keeps the spec examples exact.
 - **Always-on-top:** if either event is always-on-top, they do **not** overlap
   (used for drag clones). Default false → no effect.
 

@@ -291,7 +291,8 @@ function slotInstant(slot: DragSlot, step = SNAP_MINUTES): Date {
 
 /**
  * Drag-create / all-day-create: order the two slots and enforce min duration.
- * - timed: snapped instants; equal slots → SNAP_MINUTES duration
+ * - timed: snapped instants; equal slots → SNAP_MINUTES duration (drag-create
+ *   never yields a 0-min event; only resize / inspector edits do)
  * - allday: earlier day 00:00 → later day + 1 day 00:00 (exclusive end)
  */
 export function rangeFromSlots(
@@ -415,7 +416,8 @@ export function movedRange(
 }
 
 /**
- * Resize one edge; keep the other fixed. Min duration is SNAP_MINUTES.
+ * Resize one edge; keep the other fixed. Min duration is 0: dragging past
+ * the fixed edge clamps onto it (start === end), never inverts.
  * The active edge snaps to RESIZE_SNAP_MINUTES (may cross days).
  * The fixed edge is not re-snapped.
  */
@@ -425,23 +427,16 @@ export function resizedRange(
   edge: 'start' | 'end',
   slot: DragSlot,
 ): TimedRange {
-  const minMs = SNAP_MINUTES * 60_000;
   const slotTime = slotInstant(slot, RESIZE_SNAP_MINUTES);
 
   if (edge === 'start') {
     const end = originalEnd;
-    let start = slotTime;
-    if (end.getTime() - start.getTime() < minMs) {
-      start = new Date(end.getTime() - minMs);
-    }
+    const start = slotTime.getTime() > end.getTime() ? end : slotTime;
     return { start, end };
   }
 
   const start = originalStart;
-  let end = slotTime;
-  if (end.getTime() - start.getTime() < minMs) {
-    end = new Date(start.getTime() + minMs);
-  }
+  const end = slotTime.getTime() < start.getTime() ? start : slotTime;
   return { start, end };
 }
 

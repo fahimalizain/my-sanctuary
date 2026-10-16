@@ -7,6 +7,7 @@ import type { AllDayChip } from '../components/AllDayRow';
 import { toTimedRange, type DragSlot, type TimedRange } from './calendar-drag';
 import type { PositionedEvent } from '../components/EventChip';
 import {
+  CHIP_MIN_H,
   WEEK_DAYS,
   addDays,
   allDaySectionHeight,
@@ -170,6 +171,7 @@ export function buildEventsByDay(
         startMin: d.startMin,
         endMin: d.endMin,
       })),
+      (CHIP_MIN_H / hourH) * 60,
     );
     const packById = new Map(packed.map((p) => [p.id, p]));
 

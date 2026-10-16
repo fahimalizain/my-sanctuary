@@ -299,26 +299,47 @@ test('movedRange: grab 15 min in, drop at 14:00 → 13:45–14:45', () => {
 
 // ── resizedRange ────────────────────────────────────────────────────────
 
-test('resizedRange: end dragged earlier than start+15 → clamped', () => {
+test('resizedRange: end dragged onto start → 0-min (start === end)', () => {
   const start = new Date(2024, 0, 1, 10, 0, 0, 0);
   const end = new Date(2024, 0, 1, 12, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // Drag end to 10:00 (same as start) → clamp to 10:15
   const r = resizedRange(start, end, 'end', slot(day, 10 * 60));
   assert.equal(r.start.getTime(), start.getTime());
-  assert.equal(r.end.getHours(), 10);
-  assert.equal(r.end.getMinutes(), 15);
+  assert.equal(r.end.getTime(), start.getTime());
 });
 
-test('resizedRange: start dragged later than end-15 → clamped', () => {
+test('resizedRange: end dragged past start clamps at start, never inverts', () => {
   const start = new Date(2024, 0, 1, 10, 0, 0, 0);
   const end = new Date(2024, 0, 1, 12, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // Drag start to 12:00 → clamp to 11:45
+  const r = resizedRange(start, end, 'end', slot(day, 9 * 60));
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getTime(), start.getTime());
+});
+
+test('resizedRange: start dragged onto end → 0-min (start === end)', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 12, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
   const r = resizedRange(start, end, 'start', slot(day, 12 * 60));
   assert.equal(r.end.getTime(), end.getTime());
-  assert.equal(r.start.getHours(), 11);
-  assert.equal(r.start.getMinutes(), 45);
+  assert.equal(r.start.getTime(), end.getTime());
+});
+
+test('resizedRange: start dragged past end clamps at end, never inverts', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 12, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(start, end, 'start', slot(day, 13 * 60));
+  assert.equal(r.end.getTime(), end.getTime());
+  assert.equal(r.start.getTime(), end.getTime());
+});
+
+test('resizedRange: a 0-min event can be resized back out', () => {
+  const t = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(t, t, 'end', slot(day, 10 * 60 + 5));
+  assert.equal(r.end.getTime() - r.start.getTime(), 5 * 60_000);
 });
 
 test('resizedRange: end extended freely', () => {
@@ -371,16 +392,15 @@ test('resizedRange: fixed edge is not re-snapped', () => {
   assert.equal(r.end.getMinutes(), 23);
 });
 
-test('resizedRange: clamp still 15 min with non-quarter fixed edge', () => {
+test('resizedRange: clamps to a non-quarter fixed edge (0-min)', () => {
   const start = new Date(2024, 0, 1, 10, 7, 0, 0);
   const end = new Date(2024, 0, 1, 11, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // Drag end to 10:10 → clamp to start + 15 = 10:22
-  const r = resizedRange(start, end, 'end', slot(day, 10 * 60 + 10));
+  // Drag end to 10:03 (before start) → clamp to start = 10:07
+  const r = resizedRange(start, end, 'end', slot(day, 10 * 60 + 3));
   assert.equal(r.start.getHours(), 10);
   assert.equal(r.start.getMinutes(), 7);
-  assert.equal(r.end.getHours(), 10);
-  assert.equal(r.end.getMinutes(), 22);
+  assert.equal(r.end.getTime(), start.getTime());
 });
 
 test('resizedRange: overnight end snaps to 1 minute', () => {

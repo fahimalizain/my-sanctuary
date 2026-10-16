@@ -248,9 +248,9 @@ test('timed when-block: end time change keeps start', () => {
   assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
 });
 
-test('timed when-block: end before start clamps to start+15min', () => {
+test('timed when-block: end before start clamps to start (0-min)', () => {
   const spies = makeSpies();
-  // Longer initial end so clamp (start+15) is a real change vs current.
+  // Longer initial end so the clamp to start is a real change vs current.
   const start = new Date(2026, 8, 13, 5, 15);
   const end = new Date(2026, 8, 13, 7, 0);
   mount(
@@ -267,9 +267,30 @@ test('timed when-block: end before start clamps to start+15min', () => {
   fireEvent.change(endInput, { target: { value: '04:00' } });
   assert.equal(spies.saveTimesCalls.length, 1);
   const expectedStart = new Date(2026, 8, 13, 5, 15);
-  const expectedEnd = new Date(2026, 8, 13, 5, 30);
+  const expectedEnd = new Date(2026, 8, 13, 5, 15);
   assert.equal(spies.saveTimesCalls[0][0], expectedStart.toISOString());
   assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
+});
+
+test('timed when-block: end equal to start is allowed (0-min)', () => {
+  const spies = makeSpies();
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 7, 0);
+  mount(
+    {
+      event: makeEvent({
+        id: 'e-zero',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+      }),
+    },
+    spies,
+  );
+  const endInput = screen.getByLabelText('End time') as HTMLInputElement;
+  fireEvent.change(endInput, { target: { value: '05:15' } });
+  assert.equal(spies.saveTimesCalls.length, 1);
+  assert.equal(spies.saveTimesCalls[0][0], start.toISOString());
+  assert.equal(spies.saveTimesCalls[0][1], start.toISOString());
 });
 
 test('timed when-block: date change shifts both instants by one day', () => {
