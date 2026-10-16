@@ -592,6 +592,7 @@ export function useCalendarSession({
       id === unpersistedDraftIdRef.current ||
       id === unpersistedDraftId
     ) {
+      patchQueue.cancel(id);
       queue.clear(id);
       if (unpersistedDraftIdRef.current === id || unpersistedDraftId === id) {
         setDraftId(null);
@@ -601,7 +602,9 @@ export function useCalendarSession({
       return;
     }
 
-    // Chip gone now; close inspector immediately.
+    // Chip gone now; close inspector immediately. Cancel queued/in-flight
+    // PATCHes so they neither 404 nor resurrect the row in the cache.
+    patchQueue.cancel(id);
     queue.remove(id);
     setSelectedEventId(null);
     setFocusTitleOnOpen(false);
@@ -619,6 +622,7 @@ export function useCalendarSession({
     selectedEventId,
     unpersistedDraftId,
     queue,
+    patchQueue,
     deleteEvent,
     setDraftId,
     clearWriteError,

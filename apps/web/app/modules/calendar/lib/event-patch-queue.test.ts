@@ -250,3 +250,53 @@ test('temp flush then a later user edit stay ordered on the server id', async ()
   await tick();
   assert.deepEqual(calls[2].input, { calendar_id: 'cal-2' });
 });
+
+test('cancel with a request in flight ignores its success', async () => {
+  const { queue, calls, log } = harness();
+  queue.enqueue('e1', { summary: 'A' });
+  queue.cancel('e1');
+  calls[0].resolve();
+  await tick();
+  assert.deepEqual(log, []);
+  assert.equal(queue.isBusy('e1'), false);
+});
+
+test('cancel with a request in flight ignores its failure', async () => {
+  const { queue, calls, log } = harness();
+  queue.enqueue('e1', { summary: 'A' });
+  queue.cancel('e1');
+  calls[0].reject(new Error('404'));
+  await tick();
+  assert.deepEqual(log, []);
+});
+
+test('cancel drops pending edits', async () => {
+  const { queue, calls, log } = harness();
+  queue.enqueue('e1', { summary: 'A' });
+  queue.enqueue('e1', { summary: 'B' });
+  queue.cancel('e1');
+  calls[0].resolve();
+  await tick();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(log, []);
+});
+
+test('enqueue after cancel works normally (in flight and idle)', async () => {
+  const { queue, calls, log } = harness();
+  queue.enqueue('e1', { summary: 'A' });
+  queue.cancel('e1');
+  queue.enqueue('e1', { summary: 'B' });
+  calls[0].resolve();
+  await tick();
+  // A's result is ignored; B goes out next and reports normally.
+  assert.deepEqual(calls[1].input, { summary: 'B' });
+  calls[1].resolve();
+  await tick();
+  assert.deepEqual(log, ['ok:e1:summary:true']);
+
+  queue.cancel('e1');
+  queue.enqueue('e1', { summary: 'C' });
+  calls[2].resolve();
+  await tick();
+  assert.deepEqual(log, ['ok:e1:summary:true', 'ok:e1:summary:true']);
+});

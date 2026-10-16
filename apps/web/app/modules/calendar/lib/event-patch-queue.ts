@@ -59,6 +59,8 @@ export interface EventPatchQueueHandlers {
 export class EventPatchQueue {
   private pending = new Map<string, EventPatch>();
   private running = new Set<string>();
+  // Ids whose in-flight request result must be ignored (event was deleted).
+  private cancelled = new Set<string>();
 
   constructor(private handlers: EventPatchQueueHandlers) {}
 
@@ -67,6 +69,16 @@ export class EventPatchQueue {
     if (isEmpty(patch)) return;
     this.pending.set(id, mergeEventPatch(this.pending.get(id) ?? {}, patch));
     if (!this.running.has(id)) void this.drain(id);
+  }
+
+  /**
+   * Drop pending edits and ignore the in-flight request's result (no
+   * callbacks), e.g. after the event is deleted. The mark applies to that one
+   * request only, so a later enqueue for the same id works normally.
+   */
+  cancel(id: string): void {
+    this.pending.delete(id);
+    if (this.running.has(id)) this.cancelled.add(id);
   }
 
   /** True while a request is in flight or edits are waiting for this id. */
@@ -98,6 +110,7 @@ export class EventPatchQueue {
         } catch (err) {
           failure = { err };
         }
+        if (this.cancelled.delete(id)) continue;
         const idle = !this.pending.has(id);
         // A throwing handler must not wedge the chain.
         try {

@@ -294,13 +294,13 @@ interface InspectorFormProps {
 }
 
 const timeInputClassName =
-  'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+  'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0';
 const dateInputClassName =
-  'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+  'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0';
 const chipClassName =
   'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground';
 const chipToggleClassName =
-  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 aria-pressed:border-foreground/40 aria-pressed:bg-muted/40 aria-pressed:text-foreground disabled:opacity-50';
+  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 aria-pressed:border-foreground/40 aria-pressed:bg-muted/40 aria-pressed:text-foreground';
 
 function InspectorForm({
   event,
@@ -442,7 +442,7 @@ function InspectorForm({
               }
             }}
             aria-label="Title"
-            className="w-full border-0 bg-transparent p-0 text-lg font-semibold text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
+            className="w-full border-0 bg-transparent p-0 text-lg font-semibold text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0"
           />
         ) : (
           <p className="text-lg font-semibold text-foreground">{title}</p>
@@ -554,7 +554,7 @@ function InspectorForm({
                     onChange={(e) => {
                       onChangeTimeZone(e.target.value);
                     }}
-                    className="max-w-[12rem] truncate rounded-full border border-border/70 bg-transparent px-2 py-0.5 text-xs text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+                    className="max-w-[12rem] truncate rounded-full border border-border/70 bg-transparent px-2 py-0.5 text-xs text-muted-foreground focus:outline-none focus:ring-0"
                   >
                     <option value="">
                       {browserZone ? browserZone : 'Local'}
@@ -592,7 +592,7 @@ function InspectorForm({
             aria-label="Description"
             placeholder="Description"
             rows={3}
-            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
+            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0"
           />
         ) : descriptionDisplay ? (
           <p className="whitespace-pre-wrap text-sm text-foreground">
@@ -618,7 +618,7 @@ function InspectorForm({
                 if (next === event.calendar_id) return;
                 void onSaveCalendar(next);
               }}
-              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-sm text-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-sm text-foreground focus:outline-none focus:ring-0"
             >
               {calendarSelectOptions.map((cal) => {
                 const label =
