@@ -7,7 +7,7 @@ import {
   type ReactNode,
 } from 'react';
 import type { CalendarEvent } from '@/app/types';
-import { GripVertical } from 'lucide-react';
+import { GripVertical, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
   type HandleRect,
@@ -38,10 +38,13 @@ function TouchHandles({
   height,
   color,
   ink,
+  onRequestDelete,
 }: {
   height: number;
   color: string;
   ink: string;
+  /** Omitted for read-only events: no delete handle. */
+  onRequestDelete?: () => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
@@ -104,6 +107,39 @@ function TouchHandles({
             { 'data-move-handle': true },
             <GripVertical className="h-3.5 w-3.5" />,
           )}
+          {onRequestDelete && g.remove && g.knobs.remove && (
+            // Tap-only: no touch-none (a pan may still scroll) and pointerdown
+            // never reaches the chip/column, so it can't drag, create or deselect.
+            <button
+              type="button"
+              data-delete-handle
+              aria-label="Delete event"
+              className="pointer-events-auto absolute z-[3]"
+              style={{
+                left: g.remove.x,
+                top: g.remove.y,
+                width: g.remove.w,
+                height: g.remove.h,
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                onRequestDelete();
+              }}
+            >
+              <span
+                className={cn(knobClassName, 'bg-destructive text-white')}
+                style={{
+                  width: knob,
+                  height: knob,
+                  left: g.knobs.remove[0] - knob / 2 - g.remove.x,
+                  top: g.knobs.remove[1] - knob / 2 - g.remove.y,
+                }}
+              >
+                <Trash2 className="h-3 w-3" />
+              </span>
+            </button>
+          )}
         </>
       )}
     </div>
@@ -145,6 +181,8 @@ interface EventChipProps {
   positioned: PositionedEvent;
   selected: boolean;
   onSelect: (eventId: string) => void;
+  /** Touch delete handle; leave undefined for read-only events. */
+  onRequestDelete?: () => void;
   onPointerDown?: (
     e: ReactPointerEvent<HTMLElement>,
     event: CalendarEvent,
@@ -158,6 +196,7 @@ export const EventChip = memo(function EventChip({
   positioned,
   selected,
   onSelect,
+  onRequestDelete,
   onPointerDown,
   dragging = false,
 }: EventChipProps) {
@@ -293,7 +332,14 @@ export const EventChip = memo(function EventChip({
           )}
         </div>
       </div>
-      {selected && <TouchHandles height={height} color={color} ink={ink} />}
+      {selected && (
+        <TouchHandles
+          height={height}
+          color={color}
+          ink={ink}
+          onRequestDelete={onRequestDelete}
+        />
+      )}
     </div>
   );
 });

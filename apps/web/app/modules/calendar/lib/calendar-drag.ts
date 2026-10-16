@@ -108,6 +108,10 @@ export type TouchGestureIntent = 'pending' | 'scroll' | 'drag';
 /** Touch target of the fat selected-chip handles (visual knob is smaller). */
 export const TOUCH_HANDLE_HIT_PX = 44;
 export const TOUCH_HANDLE_KNOB_PX = 20;
+/** Narrower chips drop the delete handle: three knobs no longer fit apart. */
+export const DELETE_HANDLE_MIN_CHIP_W = 36;
+/** Degenerate-height chips drop it too (the box would be all outside). */
+export const DELETE_HANDLE_MIN_CHIP_H = 10;
 
 export type ChipHandle = 'start' | 'end' | 'move';
 
@@ -158,21 +162,28 @@ export interface TouchHandleGeometry {
   start: HandleRect;
   end: HandleRect;
   move: HandleRect;
+  /** Tap-only delete box; null when the chip is too small to host it. */
+  remove: HandleRect | null;
   /** Knob centres in chip-local px. */
   knobs: {
     start: [number, number];
     end: [number, number];
     move: [number, number];
+    remove: [number, number] | null;
   };
 }
 
 /**
- * Chip-local geometry of the three touch handles.
+ * Chip-local geometry of the four touch handles.
  * - start/end: centred on the chip's horizontal middle; each hit box reaches
  *   at most to the chip midline, so short chips push knobs outward instead of
  *   overlapping.
  * - move: left edge, vertically centred. Where it could meet the start/end
  *   boxes (short or narrow chips) it slides outside the left edge instead.
+ * - remove: mirror of move on the right edge; where it could meet start/end it
+ *   slides outside the right edge, and it never reaches left of move's box.
+ *   Hidden (null) below DELETE_HANDLE_MIN_CHIP_W / _H so it can't crowd the
+ *   move/resize knobs; those always stay.
  */
 export function touchHandleGeometry(
   chipWidth: number,
@@ -195,15 +206,27 @@ export function touchHandleGeometry(
   const moveRight = mayMeet ? Math.min(18, start.x) : 18;
   const move = { x: moveRight - hit, y: h / 2 - half, w: hit, h: hit };
 
+  // Mirror of `move`: clear of start/end when they could meet, else of move.
+  const removeLeft = Math.max(w - 18, mayMeet ? start.x + hit : move.x + hit);
+  const hasRemove =
+    w >= DELETE_HANDLE_MIN_CHIP_W && h >= DELETE_HANDLE_MIN_CHIP_H;
+  const remove = hasRemove
+    ? { x: removeLeft, y: h / 2 - half, w: hit, h: hit }
+    : null;
+
   return {
     start,
     end,
     move,
+    remove,
     knobs: {
       start: [midX, -shift],
       end: [midX, h + shift],
       // Keep the knob straddling the left edge even when the hit box slid out.
       move: [Math.max(moveRight - half, -(knob / 2 - 4)), h / 2],
+      remove: remove
+        ? [Math.min(removeLeft + half, w + (knob / 2 - 4)), h / 2]
+        : null,
     },
   };
 }

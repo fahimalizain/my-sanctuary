@@ -47,6 +47,7 @@ export interface CalendarWeekGridProps {
     chipEl: HTMLElement,
   ) => void;
   onSelectChip: (eventId: string) => void;
+  onRequestDelete?: () => void;
   onAllDayPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   onAllDayChipPointerDown: (
     e: ReactPointerEvent<HTMLElement>,
@@ -90,6 +91,7 @@ export function CalendarWeekGrid({
   onColumnPointerDown,
   onChipPointerDown,
   onSelectChip,
+  onRequestDelete,
   onAllDayPointerDown,
   onAllDayChipPointerDown,
   onChipSelect,
@@ -226,6 +228,7 @@ export function CalendarWeekGrid({
                   onColumnPointerDown={onColumnPointerDown}
                   onChipPointerDown={onChipPointerDown}
                   onSelectChip={onSelectChip}
+                  onRequestDelete={onRequestDelete}
                 />
               );
             })}
