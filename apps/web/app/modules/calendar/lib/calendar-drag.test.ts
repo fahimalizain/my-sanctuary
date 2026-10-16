@@ -13,6 +13,9 @@ import {
   classifyTouchGesture,
   createTouchTracker,
   isTapCreatePointer,
+  resolveChipGesture,
+  touchHandleGeometry,
+  TOUCH_HANDLE_HIT_PX,
   movedAllDayRange,
   movedEnough,
   movedRange,
@@ -536,4 +539,69 @@ test('touch tracker: reset clears ids and latch', () => {
   t.reset();
   assert.equal(t.latched, false);
   assert.equal(t.count, 0);
+});
+
+test('classifyTouchGesture: chip-body pans hand off to scroll', () => {
+  assert.equal(classifyTouchGesture(0, 0, 'chip-body'), 'pending');
+  assert.equal(
+    classifyTouchGesture(0, DRAG_THRESHOLD_PX, 'chip-body'),
+    'scroll',
+  );
+  assert.equal(
+    classifyTouchGesture(DRAG_THRESHOLD_PX, 0, 'chip-body'),
+    'scroll',
+  );
+});
+
+test('resolveChipGesture: touch body is tap-only, even on an edge', () => {
+  const g = resolveChipGesture('touch', null, 1, 60);
+  assert.deepEqual(g, { kind: 'move', claimImmediately: false, tapOnly: true });
+});
+
+test('resolveChipGesture: touch handles claim immediately', () => {
+  assert.deepEqual(resolveChipGesture('touch', 'start', 30, 60), {
+    kind: 'resize-start',
+    claimImmediately: true,
+    tapOnly: false,
+  });
+  assert.equal(resolveChipGesture('touch', 'end', 30, 60).kind, 'resize-end');
+  assert.deepEqual(resolveChipGesture('touch', 'move', 1, 60), {
+    kind: 'move',
+    claimImmediately: true,
+    tapOnly: false,
+  });
+});
+
+test('resolveChipGesture: mouse/pen keep edge zones and body move', () => {
+  for (const type of ['mouse', 'pen']) {
+    assert.equal(resolveChipGesture(type, null, 2, 60).kind, 'resize-start');
+    assert.equal(resolveChipGesture(type, null, 58, 60).kind, 'resize-end');
+    assert.deepEqual(resolveChipGesture(type, null, 30, 60), {
+      kind: 'move',
+      claimImmediately: false,
+      tapOnly: false,
+    });
+    assert.equal(resolveChipGesture(type, 'end', 30, 60).kind, 'resize-end');
+  }
+});
+
+test('touchHandleGeometry: tall chips straddle the edge symmetrically', () => {
+  const g = touchHandleGeometry(200);
+  assert.equal(g.hitInto, TOUCH_HANDLE_HIT_PX / 2);
+  assert.equal(g.knobShift, 0);
+});
+
+test('touchHandleGeometry: short chips never overlap top and bottom hits', () => {
+  for (const h of [15, 20, 30, 43, 44, 90]) {
+    const g = touchHandleGeometry(h);
+    // top hit ends at hitInto, bottom hit starts at h - hitInto.
+    assert.ok(g.hitInto <= h / 2);
+    assert.ok(h - g.hitInto >= g.hitInto);
+    assert.ok(g.knobShift >= 0);
+  }
+  assert.ok(touchHandleGeometry(15).knobShift > 0);
+});
+
+test('touchHandleGeometry: bad input is safe', () => {
+  assert.deepEqual(touchHandleGeometry(NaN).hitInto, 0);
 });

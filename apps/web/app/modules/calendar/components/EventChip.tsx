@@ -1,6 +1,12 @@
 import { memo, type PointerEvent as ReactPointerEvent } from 'react';
 import type { CalendarEvent } from '@/app/types';
+import { GripVertical } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import {
+  TOUCH_HANDLE_HIT_PX,
+  TOUCH_HANDLE_KNOB_PX,
+  touchHandleGeometry,
+} from '../lib/calendar-drag';
 import {
   CHIP_MARGIN_RIGHT,
   CHIP_Z_BASE,
@@ -13,6 +19,96 @@ import {
 } from '../lib/week-layout';
 
 const PREVIEW_FILL_ALPHA = 0.18;
+
+// Primary input is a finger: fat handles replace the hover pills.
+const COARSE_HIDE = '[@media(hover:none)_and_(pointer:coarse)]:hidden';
+const COARSE_BLOCK = '[@media(hover:none)_and_(pointer:coarse)]:block';
+
+const knobClassName =
+  'pointer-events-none absolute flex items-center justify-center rounded-full ring-2 ring-white shadow-[0_1px_4px_rgba(0,0,0,0.45)]';
+
+function TouchHandles({
+  height,
+  color,
+  ink,
+}: {
+  height: number;
+  color: string;
+  ink: string;
+}) {
+  const { hitInto, knobShift } = touchHandleGeometry(height);
+  const hit = TOUCH_HANDLE_HIT_PX;
+  const knob = TOUCH_HANDLE_KNOB_PX;
+  const knobStyle = { backgroundColor: color, color: ink };
+  // Top/bottom sit right of the move handle so their hit boxes never overlap it.
+  const xStyle = { left: 'max(50%, 68px)', width: hit, marginLeft: -hit / 2 };
+  return (
+    <>
+      <div
+        data-resize="start"
+        className={cn('absolute z-[3] touch-none hidden', COARSE_BLOCK)}
+        style={{ ...xStyle, top: hitInto - hit, height: hit }}
+        aria-hidden
+      >
+        <span
+          className={knobClassName}
+          style={{
+            ...knobStyle,
+            width: knob,
+            height: knob,
+            left: (hit - knob) / 2,
+            top: hit - hitInto - knobShift - knob / 2,
+          }}
+        >
+          <span className="h-0.5 w-2.5 rounded-full bg-current" />
+        </span>
+      </div>
+      <div
+        data-resize="end"
+        className={cn('absolute z-[3] touch-none hidden', COARSE_BLOCK)}
+        style={{ ...xStyle, top: height - hitInto, height: hit }}
+        aria-hidden
+      >
+        <span
+          className={knobClassName}
+          style={{
+            ...knobStyle,
+            width: knob,
+            height: knob,
+            left: (hit - knob) / 2,
+            top: hitInto + knobShift - knob / 2,
+          }}
+        >
+          <span className="h-0.5 w-2.5 rounded-full bg-current" />
+        </span>
+      </div>
+      <div
+        data-move-handle
+        className={cn('absolute z-[3] touch-none hidden', COARSE_BLOCK)}
+        style={{
+          left: -hit / 2 - 4,
+          top: height / 2 - hit / 2,
+          width: hit,
+          height: hit,
+        }}
+        aria-hidden
+      >
+        <span
+          className={knobClassName}
+          style={{
+            ...knobStyle,
+            width: knob,
+            height: knob,
+            left: (hit - knob) / 2,
+            top: (hit - knob) / 2,
+          }}
+        >
+          <GripVertical className="h-3.5 w-3.5" />
+        </span>
+      </div>
+    </>
+  );
+}
 
 /** Mix hex with black ~20% so the left ribbon still reads on a solid body. */
 function darkerRibbon(hex: string): string {
@@ -82,13 +178,14 @@ export const EventChip = memo(function EventChip({
   const timeLabel = formatEventTime(start);
   const rangeLabel = formatEventTimeRange(start, end);
   const compact = isCompactChip(height);
+  const ink = contrastingInk(color);
 
   return (
     <div
       role="button"
       tabIndex={0}
       className={cn(
-        'event-chip group absolute overflow-hidden rounded-[6px] pointer-events-auto',
+        'event-chip group absolute rounded-[6px] pointer-events-auto',
         'cursor-grab active:cursor-grabbing',
         selected && 'ring-1 ring-foreground/25',
         dragging && 'opacity-40',
@@ -100,8 +197,7 @@ export const EventChip = memo(function EventChip({
         marginLeft: `${leftPercent * 100}%`,
         width: `calc(${widthPercent * 100}% - ${leftPixels}px - ${CHIP_MARGIN_RIGHT}px)`,
         zIndex: selected ? CHIP_Z_SELECTED : CHIP_Z_BASE + layerIndex,
-        backgroundColor: color,
-        color: contrastingInk(color),
+        color: ink,
       }}
       title={`${event.title} · ${rangeLabel}`}
       data-event-chip
@@ -125,66 +221,79 @@ export const EventChip = memo(function EventChip({
         }
       }}
     >
-      {/* Resize handles — 6px hit targets at top/bottom edges */}
+      {/* Clipped body; the root stays unclipped so touch handles can overflow. */}
       <div
-        data-resize="start"
-        className="absolute inset-x-0 top-0 z-[2] flex h-1.5 cursor-ns-resize items-center justify-center"
-        aria-hidden
+        className="absolute inset-0 overflow-hidden rounded-[6px]"
+        style={{ backgroundColor: color }}
       >
-        <span
+        {/* Resize handles — 6px hit targets at top/bottom edges */}
+        <div
+          data-resize="start"
           className={cn(
-            'pointer-events-none h-[3px] w-[32%] max-w-[40px] rounded-full bg-current opacity-0 transition-opacity',
-            'group-hover:opacity-45',
-            selected && 'opacity-45',
+            'absolute inset-x-0 top-0 z-[2] flex h-1.5 cursor-ns-resize items-center justify-center',
+            COARSE_HIDE,
           )}
-        />
-      </div>
-      <div
-        data-resize="end"
-        className="absolute inset-x-0 bottom-0 z-[2] flex h-1.5 cursor-ns-resize items-center justify-center"
-        aria-hidden
-      >
-        <span
+          aria-hidden
+        >
+          <span
+            className={cn(
+              'pointer-events-none h-[3px] w-[32%] max-w-[40px] rounded-full bg-current opacity-0 transition-opacity',
+              'group-hover:opacity-45',
+              selected && 'opacity-45',
+            )}
+          />
+        </div>
+        <div
+          data-resize="end"
           className={cn(
-            'pointer-events-none h-[3px] w-[32%] max-w-[40px] rounded-full bg-current opacity-0 transition-opacity',
-            'group-hover:opacity-45',
-            selected && 'opacity-45',
+            'absolute inset-x-0 bottom-0 z-[2] flex h-1.5 cursor-ns-resize items-center justify-center',
+            COARSE_HIDE,
           )}
-        />
-      </div>
+          aria-hidden
+        >
+          <span
+            className={cn(
+              'pointer-events-none h-[3px] w-[32%] max-w-[40px] rounded-full bg-current opacity-0 transition-opacity',
+              'group-hover:opacity-45',
+              selected && 'opacity-45',
+            )}
+          />
+        </div>
 
-      {/* 4px left ribbon — darker shade so it reads on solid fill */}
-      <div
-        className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-        style={{ backgroundColor: darkerRibbon(color) }}
-        aria-hidden
-      />
-      <div
-        className={cn(
-          'h-full min-w-0 pl-2 pr-1',
-          compact ? 'flex items-center gap-1 py-0' : 'py-px',
-        )}
-      >
-        {compact ? (
-          <>
-            <span className="truncate text-[11px] font-medium leading-[13px]">
-              {event.title}
-            </span>
-            <span className="shrink-0 text-[9px] leading-[11px] opacity-80">
-              {timeLabel}
-            </span>
-          </>
-        ) : (
-          <>
-            <div className="truncate text-[11px] font-medium leading-[13px]">
-              {event.title}
-            </div>
-            <div className="mt-0.5 truncate text-[9px] leading-[11px] opacity-80">
-              {timeLabel}
-            </div>
-          </>
-        )}
+        {/* 4px left ribbon — darker shade so it reads on solid fill */}
+        <div
+          className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
+          style={{ backgroundColor: darkerRibbon(color) }}
+          aria-hidden
+        />
+        <div
+          className={cn(
+            'h-full min-w-0 pl-2 pr-1',
+            compact ? 'flex items-center gap-1 py-0' : 'py-px',
+          )}
+        >
+          {compact ? (
+            <>
+              <span className="truncate text-[11px] font-medium leading-[13px]">
+                {event.title}
+              </span>
+              <span className="shrink-0 text-[9px] leading-[11px] opacity-80">
+                {timeLabel}
+              </span>
+            </>
+          ) : (
+            <>
+              <div className="truncate text-[11px] font-medium leading-[13px]">
+                {event.title}
+              </div>
+              <div className="mt-0.5 truncate text-[9px] leading-[11px] opacity-80">
+                {timeLabel}
+              </div>
+            </>
+          )}
+        </div>
       </div>
+      {selected && <TouchHandles height={height} color={color} ink={ink} />}
     </div>
   );
 });

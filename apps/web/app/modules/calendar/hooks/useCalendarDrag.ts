@@ -23,7 +23,7 @@ import {
   movedEnough,
   movedRange,
   rangeFromSlots,
-  resizeEdgeAt,
+  resolveChipGesture,
   resizedRange,
   toAllDayRange,
   toTimedRange,
@@ -99,6 +99,8 @@ interface Session {
   pointerId: number;
   /** touch waits for classify; mouse/pen is claimed immediately. */
   pointerType: string;
+  /** Touch chip-body press: tap selects, pan scrolls, never moves. */
+  tapOnly?: boolean;
 }
 
 function parseDayAttr(value: string | null | undefined): Date | null {
@@ -322,7 +324,12 @@ export function useCalendarDrag(
   );
 
   const beginSession = useCallback(
-    (next: Session, target: HTMLElement, e: ReactPointerEvent<HTMLElement>) => {
+    (
+      next: Session,
+      target: HTMLElement,
+      e: ReactPointerEvent<HTMLElement>,
+      claimImmediately = false,
+    ) => {
       // Pinch / multi-touch: never start a session (React runs after capture).
       if (touchesRef.current.latched) return;
       sessionRef.current = next;
@@ -333,7 +340,7 @@ export function useCalendarDrag(
       lastPtrRef.current = { x: e.clientX, y: e.clientY };
 
       const isTouch = e.pointerType === 'touch';
-      if (isTouch) {
+      if (isTouch && !claimImmediately) {
         // Leave unclaimed so native scroll on [data-calendar-scroller] works.
         claimedRef.current = false;
       } else {
@@ -406,8 +413,11 @@ export function useCalendarDrag(
 
       // Unclaimed touch: classify before stealing the gesture.
       if (!claimedRef.current && s.pointerType === 'touch') {
-        const mode =
-          s.kind === 'create' || s.kind === 'allday-create' ? 'create' : 'chip';
+        const mode = s.tapOnly
+          ? 'chip-body'
+          : s.kind === 'create' || s.kind === 'allday-create'
+            ? 'create'
+            : 'chip';
         const held =
           s.kind === 'allday-create' &&
           performance.now() - s.originTime >= ALLDAY_CREATE_HOLD_MS;
@@ -564,17 +574,25 @@ export function useCalendarDrag(
 
       const rect = chipEl.getBoundingClientRect();
       const localY = e.clientY - rect.top;
-      const resizeAttr = (e.target as HTMLElement | null)
-        ?.closest?.('[data-resize]')
+      const handleAttr = (e.target as HTMLElement | null)
+        ?.closest?.('[data-resize], [data-move-handle]')
         ?.getAttribute('data-resize');
-      const edge: 'start' | 'end' | null =
-        resizeAttr === 'start' || resizeAttr === 'end'
-          ? resizeAttr
-          : resizeEdgeAt(localY, rect.height);
-
-      let kind: DragKind = 'move';
-      if (edge === 'start') kind = 'resize-start';
-      else if (edge === 'end') kind = 'resize-end';
+      const isMoveHandle = Boolean(
+        (e.target as HTMLElement | null)?.closest?.('[data-move-handle]'),
+      );
+      const handle =
+        handleAttr === 'start' || handleAttr === 'end'
+          ? handleAttr
+          : isMoveHandle
+            ? 'move'
+            : null;
+      const gesture = resolveChipGesture(
+        e.pointerType,
+        handle,
+        localY,
+        rect.height,
+      );
+      const kind: DragKind = gesture.kind;
 
       const step =
         kind === 'resize-start' || kind === 'resize-end'
@@ -624,9 +642,11 @@ export function useCalendarDrag(
           originTime: performance.now(),
           pointerId: e.pointerId,
           pointerType: e.pointerType,
+          tapOnly: gesture.tapOnly,
         },
         chipEl,
         e,
+        gesture.claimImmediately,
       );
     },
     [hourH, beginSession],

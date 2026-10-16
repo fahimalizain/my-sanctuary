@@ -105,18 +105,80 @@ export function createTouchTracker(): TouchTracker {
 
 export type TouchGestureIntent = 'pending' | 'scroll' | 'drag';
 
+/** Touch target of the fat selected-chip handles (visual knob is smaller). */
+export const TOUCH_HANDLE_HIT_PX = 44;
+export const TOUCH_HANDLE_KNOB_PX = 20;
+
+export type ChipHandle = 'start' | 'end' | 'move';
+
+export interface ChipGesture {
+  kind: 'move' | 'resize-start' | 'resize-end';
+  /** Touch only: claim at pointerdown (no scroll-vs-drag ambiguity). */
+  claimImmediately: boolean;
+  /** Touch body press: a tap selects, a pan scrolls; it never moves. */
+  tapOnly: boolean;
+}
+
+/**
+ * What a pointerdown on a chip means.
+ * - touch on a handle: that handle's action, claimed immediately
+ * - touch elsewhere: tap-only (scroll natively; no body move, no edge resize)
+ * - mouse/pen: explicit handle, else the 6px edge zones, else move
+ */
+export function resolveChipGesture(
+  pointerType: string,
+  handle: ChipHandle | null,
+  localY: number,
+  chipHeight: number,
+): ChipGesture {
+  const isTouch = pointerType === 'touch';
+  if (isTouch && !handle) {
+    return { kind: 'move', claimImmediately: false, tapOnly: true };
+  }
+  const edge =
+    handle === 'start' || handle === 'end'
+      ? handle
+      : handle === 'move'
+        ? null
+        : resizeEdgeAt(localY, chipHeight);
+  const kind =
+    edge === 'start' ? 'resize-start' : edge === 'end' ? 'resize-end' : 'move';
+  return { kind, claimImmediately: isTouch, tapOnly: false };
+}
+
+/**
+ * Vertical geometry of the top/bottom touch handles for a chip of
+ * `chipHeight`. Each hit box reaches `hitInto` px inside the chip (never past
+ * the midline, so short chips push them outward instead of overlapping), and
+ * the knob centre sits `knobShift` px outside the edge (clamped so it still
+ * straddles the edge).
+ */
+export function touchHandleGeometry(chipHeight: number): {
+  hitInto: number;
+  knobShift: number;
+} {
+  const h = Number.isFinite(chipHeight) ? Math.max(0, chipHeight) : 0;
+  const half = TOUCH_HANDLE_HIT_PX / 2;
+  const hitInto = Math.min(half, h / 2);
+  const knobShift = Math.min(half - hitInto, TOUCH_HANDLE_KNOB_PX / 2 - 4);
+  return { hitInto, knobShift };
+}
+
 /**
  * Classify a touch pan before claiming the gesture.
  * Create: horizontal-dominant past threshold → scroll; else → drag.
  * Chip: any movement past threshold → drag (cancel lets flicks scroll).
+ * Chip-body: any movement past threshold → scroll (tap-only press).
  */
 export function classifyTouchGesture(
   dx: number,
   dy: number,
-  mode: 'create' | 'chip',
+  mode: 'create' | 'chip' | 'chip-body',
   allowHorizontalDrag = false,
 ): TouchGestureIntent {
   if (!movedEnough(dx, dy)) return 'pending';
+  // Chip body never drags on touch: any pan hands off to native scroll.
+  if (mode === 'chip-body') return 'scroll';
   if (
     mode === 'create' &&
     Math.abs(dx) > Math.abs(dy) &&
