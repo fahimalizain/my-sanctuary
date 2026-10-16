@@ -3,6 +3,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
@@ -16,6 +17,7 @@ import {
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
+import { isTempEventId } from '../lib/event-overlays';
 import { DESKTOP_MQ, eventChipSelector } from '../lib/inspector-anchor';
 import {
   allDayRangeToTimed,
@@ -121,9 +123,48 @@ type ChipRect = {
 
 /** Peek sheet height: ~10% of the viewport, never below a readable minimum. */
 const PEEK_HEIGHT = 'max(76px, 10dvh)';
+const PEEK_SHEET_HEIGHT = `calc(${PEEK_HEIGHT} + env(safe-area-inset-bottom))`;
 const PEEK_SWIPE_PX = 32;
 /** Room kept below the selected chip for its bottom touch handle. */
 const PEEK_HANDLE_CLEARANCE_PX = 32;
+
+/**
+ * Pointer handlers for a sheet grabber: tap, or a vertical swipe past
+ * PEEK_SWIPE_PX. A swipe suppresses the click that follows it.
+ */
+function useGrabber(cb: {
+  onTap: () => void;
+  onUp?: () => void;
+  onDown?: () => void;
+}) {
+  const startY = useRef<number | null>(null);
+  const swiped = useRef(false);
+  return {
+    onPointerDown: (e: ReactPointerEvent<HTMLElement>) => {
+      startY.current = e.clientY;
+      swiped.current = false;
+    },
+    onPointerUp: (e: ReactPointerEvent<HTMLElement>) => {
+      const start = startY.current;
+      startY.current = null;
+      if (start === null) return;
+      const dy = e.clientY - start;
+      const handler =
+        dy < -PEEK_SWIPE_PX ? cb.onUp : dy > PEEK_SWIPE_PX ? cb.onDown : null;
+      if (handler) {
+        swiped.current = true;
+        handler();
+      }
+    },
+    onClick: () => {
+      if (swiped.current) {
+        swiped.current = false;
+        return;
+      }
+      cb.onTap();
+    },
+  };
+}
 
 function useIsDesktop(): boolean {
   const [isDesktop, setIsDesktop] = useState(
@@ -652,8 +693,15 @@ export function EventInspector({
   // Mobile drawer: new drafts open expanded (title focus); taps peek.
   const [expanded, setExpanded] = useState(focusTitle);
   const sheetRef = useRef<HTMLDivElement>(null);
-  const swipeStartYRef = useRef<number | null>(null);
-  const swipedRef = useRef(false);
+  const peekGrab = useGrabber({
+    onTap: () => setExpanded(true),
+    onUp: () => setExpanded(true),
+    onDown: () => onClose(),
+  });
+  const sheetGrab = useGrabber({
+    onTap: () => setExpanded(false),
+    onDown: () => setExpanded(false),
+  });
   const writable = isCalendarWritable(calendar);
 
   // Sync local title when the selected event changes — but keep a dirty
@@ -681,9 +729,32 @@ export function EventInspector({
     }
   }, [focusTitle, event.id, writable]);
 
+  // Reset on a new selection or a focusTitle flip, but not when a draft's
+  // temp id is remapped to its server id (same logical event).
+  const prevIdRef = useRef(event.id);
+  const prevFocusRef = useRef(focusTitle);
   useEffect(() => {
-    setExpanded(focusTitle);
+    const prevId = prevIdRef.current;
+    const remap =
+      prevId !== event.id &&
+      isTempEventId(prevId) &&
+      prevFocusRef.current === focusTitle;
+    prevIdRef.current = event.id;
+    prevFocusRef.current = focusTitle;
+    if (!remap) setExpanded(focusTitle);
   }, [event.id, focusTitle]);
+
+  // While peeking, let the grid scroll past the sheet so late events stay reachable.
+  useEffect(() => {
+    if (isDesktop || expanded) return;
+    const scroller = document.querySelector('[data-calendar-scroller]');
+    if (!(scroller instanceof HTMLElement)) return;
+    const prev = scroller.style.paddingBottom;
+    scroller.style.paddingBottom = PEEK_SHEET_HEIGHT;
+    return () => {
+      scroller.style.paddingBottom = prev;
+    };
+  }, [isDesktop, expanded]);
 
   // Keep the selected chip clear of the peek sheet (and its handles).
   useEffect(() => {
@@ -939,9 +1010,7 @@ export function EventInspector({
         aria-label="Event details"
         className="pointer-events-auto absolute inset-x-0 bottom-0 flex flex-col overflow-hidden rounded-t-2xl border-t border-border bg-cream shadow-lg transition-[max-height] duration-200 ease-out motion-reduce:transition-none"
         style={{
-          maxHeight: expanded
-            ? '85dvh'
-            : `calc(${PEEK_HEIGHT} + env(safe-area-inset-bottom))`,
+          maxHeight: expanded ? '85dvh' : PEEK_SHEET_HEIGHT,
         }}
       >
         {!expanded && (
@@ -951,33 +1020,8 @@ export function EventInspector({
               aria-label="Expand event details"
               aria-expanded={false}
               className="flex w-full touch-none flex-col items-stretch px-4 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-2 pr-12 text-left"
-              style={{
-                minHeight: `calc(${PEEK_HEIGHT} + env(safe-area-inset-bottom))`,
-              }}
-              onPointerDown={(e) => {
-                swipeStartYRef.current = e.clientY;
-                swipedRef.current = false;
-              }}
-              onPointerUp={(e) => {
-                const start = swipeStartYRef.current;
-                swipeStartYRef.current = null;
-                if (start === null) return;
-                const dy = e.clientY - start;
-                if (dy < -PEEK_SWIPE_PX) {
-                  swipedRef.current = true;
-                  setExpanded(true);
-                } else if (dy > PEEK_SWIPE_PX) {
-                  swipedRef.current = true;
-                  onClose();
-                }
-              }}
-              onClick={() => {
-                if (swipedRef.current) {
-                  swipedRef.current = false;
-                  return;
-                }
-                setExpanded(true);
-              }}
+              style={{ minHeight: PEEK_SHEET_HEIGHT }}
+              {...peekGrab}
             >
               <span
                 className="mx-auto mb-2 h-1 w-10 shrink-0 rounded-full bg-muted-foreground/40"
@@ -1001,6 +1045,19 @@ export function EventInspector({
               <X className="h-4 w-4" />
             </Button>
           </div>
+        )}
+        {expanded && (
+          <button
+            type="button"
+            aria-label="Collapse drawer"
+            className="flex h-6 w-full shrink-0 touch-none items-center justify-center"
+            {...sheetGrab}
+          >
+            <span
+              className="h-1 w-10 rounded-full bg-muted-foreground/40"
+              aria-hidden
+            />
+          </button>
         )}
         {/* Stays mounted while peeking so unsaved edits and focus survive. */}
         <div

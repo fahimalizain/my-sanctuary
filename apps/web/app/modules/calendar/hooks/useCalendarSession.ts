@@ -1103,6 +1103,10 @@ export function useCalendarSession({
     onMove: handleMoveOrResize,
     onResize: handleMoveOrResize,
     onAllDayCreate: beginDraft,
+    onAllDayTapCreate: (range) => {
+      if (closeSelectionOnMobile()) return;
+      beginDraft(range);
+    },
     onChipTap: selectEvent,
     onEmptyClick: handleEmptyClick,
   });

@@ -46,6 +46,8 @@ export interface UseCalendarDragOptions {
   onMove: (eventId: string, range: TimedRange) => void;
   onResize: (eventId: string, range: TimedRange) => void;
   onAllDayCreate: (range: TimedRange) => void;
+  /** All-day tap without drag; defaults to `onAllDayCreate`. */
+  onAllDayTapCreate?: (range: TimedRange) => void;
   /** Chip tap without drag — open inspector. */
   onChipTap: (eventId: string) => void;
   /**
@@ -453,6 +455,7 @@ export function useCalendarDrag(
         onMove: moveCb,
         onResize: resizeCb,
         onAllDayCreate: allDayCreate,
+        onAllDayTapCreate: allDayTapCreate,
         onChipTap: chipTap,
         onEmptyClick: emptyClick,
       } = optsRef.current;
@@ -474,7 +477,9 @@ export function useCalendarDrag(
       } else if (s.kind === 'allday-create') {
         if (!dragged) {
           if (isTapCreatePointer(e.pointerType)) {
-            allDayCreate(rangeFromSlots(s.originSlot, s.originSlot, 'allday'));
+            (allDayTapCreate ?? allDayCreate)(
+              rangeFromSlots(s.originSlot, s.originSlot, 'allday'),
+            );
           } else {
             emptyClick?.();
           }

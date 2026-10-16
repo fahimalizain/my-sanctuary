@@ -679,3 +679,11 @@ test('mobile: new drafts (focusTitle) open expanded', () => {
   mount({ focusTitle: true });
   assert.equal(screen.queryByLabelText('Expand event details'), null);
 });
+
+test('mobile: expanded sheet has a grabber that collapses to peek', () => {
+  const spies = makeSpies();
+  mount({ focusTitle: true }, spies);
+  fireEvent.click(screen.getByLabelText('Collapse drawer'));
+  assert.equal(spies.closeCalls.length, 0);
+  assert.ok(screen.getByLabelText('Expand event details'));
+});
