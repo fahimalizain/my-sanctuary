@@ -9,6 +9,7 @@ import {
 } from 'react';
 import {
   DAYS_PER_PERIOD,
+  EMPTY_WHEEL_BURST,
   PERIOD_LENGTH_STORAGE_KEY,
   STRIP_OVERSCAN,
   addDays,
@@ -20,6 +21,7 @@ import {
   gutterWithRemainder,
   isSameDay,
   isStripWidthMeasured,
+  nextWheelBurst,
   parseStoredPeriodLength,
   rangeIso,
   scrollLeftForIndex,
@@ -30,8 +32,10 @@ import {
   stripRebaseSuppressed,
   stripSnapDisabled,
   visibleStartIndex as computeVisibleStartIndex,
+  wheelDeltaPx,
   type ScrollAxis,
   type StripLockReason,
+  type WheelBurst,
 } from '../lib/week-layout';
 
 /**
@@ -395,6 +399,49 @@ export function useCalendarStrip(): CalendarStrip {
     finishAxisGesture();
   }, [finishAxisGesture]);
 
+  // ── Wheel axis gesture ────────────────────────────────────────────────
+  // Same failure as the touch axis lock, with no finger to lift: a Mac
+  // trackpad adds a little horizontal delta to a vertical two-finger scroll,
+  // the mandatory day snap walks the strip sideways, and there is no settle to
+  // restore on. So the sideways component must never reach the scroller at
+  // all: latch the burst's axis, then drop the horizontal part for a vertical
+  // burst — re-applying its vertical delta by hand, since preventing the
+  // default would otherwise swallow the scroll the user asked for.
+  const wheelBurstRef = useRef<WheelBurst>(EMPTY_WHEEL_BURST);
+
+  const onWheel = useCallback((e: WheelEvent) => {
+    // Ctrl/meta wheel is pinch-zoom, owned by useCalendarZoom: that handler
+    // preventDefaults and rewrites `scrollTop`. Leave it entirely alone.
+    if (e.ctrlKey || e.metaKey) return;
+    // Drag / pinch write `scrollLeft` themselves (auto-scroll, zoom); a wheel
+    // burst must not be classified against, or fight, those writes.
+    if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
+
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+
+    const dxPx = wheelDeltaPx(e.deltaX, e.deltaMode, scroller.clientWidth);
+    const dyPx = wheelDeltaPx(e.deltaY, e.deltaMode, scroller.clientHeight);
+    const burst = nextWheelBurst(wheelBurstRef.current, {
+      dx: dxPx,
+      dy: dyPx,
+      t: e.timeStamp,
+    });
+    wheelBurstRef.current = burst;
+
+    // `pending` (under the slop, so at most half a column of drift — mandatory
+    // snap settles back on the same day) and `x` (native horizontal scroll and
+    // day paging) both stay native.
+    if (burst.axis !== 'y') return;
+    // deltaX 0 is an ordinary mouse wheel: exactly the pre-fix behaviour.
+    if (e.deltaX === 0) return;
+
+    // Vertical burst carrying sideways drift: consume the event and apply the
+    // vertical part ourselves, so `scrollLeft` never moves under the day snap.
+    e.preventDefault();
+    scroller.scrollBy({ top: dyPx, behavior: 'instant' });
+  }, []);
+
   // The scroller is always mounted, so this attaches once.
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
@@ -407,6 +454,9 @@ export function useCalendarStrip(): CalendarStrip {
     scroller.addEventListener('touchcancel', onTouchEnd, opts);
     scroller.addEventListener('scroll', onAxisSettleScroll, opts);
     scroller.addEventListener('scrollend', onAxisScrollEnd, opts);
+    // Non-passive, unlike the touch listeners: a vertical burst has to cancel
+    // the sideways component before native snap sees it.
+    scroller.addEventListener('wheel', onWheel, { passive: false });
 
     return () => {
       scroller.removeEventListener('touchstart', onTouchStart);
@@ -415,6 +465,7 @@ export function useCalendarStrip(): CalendarStrip {
       scroller.removeEventListener('touchcancel', onTouchEnd);
       scroller.removeEventListener('scroll', onAxisSettleScroll);
       scroller.removeEventListener('scrollend', onAxisScrollEnd);
+      scroller.removeEventListener('wheel', onWheel);
       clearAxisSettle();
     };
   }, [
@@ -424,6 +475,7 @@ export function useCalendarStrip(): CalendarStrip {
     onTouchEnd,
     onTouchMove,
     onTouchStart,
+    onWheel,
   ]);
 
   const releaseSuppressRebase = () => {

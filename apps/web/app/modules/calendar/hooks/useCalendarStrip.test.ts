@@ -502,3 +502,219 @@ test('useCalendarStrip: drag taking the strip drops the axis lock without restor
   });
   assert.equal(scroller!.style.scrollSnapType, '');
 });
+
+// ── Wheel axis latch ────────────────────────────────────────────────────
+// A Mac trackpad adds a small horizontal delta to a vertical two-finger
+// scroll. Mandatory day snap then walks the strip onto the neighbouring day,
+// and — unlike a touch gesture — there is no finger-up to settle on. The
+// sideways component therefore has to be cancelled before the scroller sees
+// it, so the axis is latched per burst and a Y burst is re-applied vertically.
+
+/** jsdom has no Element.scrollBy; mirror the browser's relative vertical write. */
+function stubScrollBy(el: HTMLElement): ScrollToOptions[] {
+  const calls: ScrollToOptions[] = [];
+  Object.defineProperty(el, 'scrollBy', {
+    configurable: true,
+    value: (options: ScrollToOptions) => {
+      calls.push(options);
+      el.scrollTop += options.top ?? 0;
+    },
+  });
+  return calls;
+}
+
+/** Cancelable, as a real wheel over a scroll container is. */
+function wheelEvent(
+  init: {
+    deltaX?: number;
+    deltaY?: number;
+    deltaMode?: number;
+    ctrlKey?: boolean;
+  } = {},
+): WheelEvent {
+  return new window.WheelEvent('wheel', {
+    deltaX: init.deltaX ?? 0,
+    deltaY: init.deltaY ?? 0,
+    deltaMode: init.deltaMode ?? 0,
+    ctrlKey: init.ctrlKey ?? false,
+    bubbles: true,
+    cancelable: true,
+  });
+}
+
+/** Render the harness, let the init park land, and hand back the strip. */
+async function mountParkedStrip(): Promise<CalendarStrip> {
+  let latest: CalendarStrip | null = null;
+  const getLatest = (): CalendarStrip | null => latest;
+
+  await act(async () => {
+    render(
+      createElement(StripHarness, {
+        gridWidth: GRID_WIDTH,
+        onStrip: (s) => {
+          latest = s;
+        },
+      }),
+    );
+  });
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
+  const strip = getLatest();
+  assert.ok(strip, 'harness should report strip state');
+  return strip;
+}
+
+test('useCalendarStrip: a ctrl-wheel pinch-zoom is left to the zoom handler', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollByCalls = stubScrollBy(scroller!);
+
+  // Pinch-zoom carries a deltaX too, and useCalendarZoom owns it.
+  const zoom = wheelEvent({ ctrlKey: true, deltaX: 3, deltaY: -50 });
+  await act(async () => {
+    scroller!.dispatchEvent(zoom);
+  });
+
+  assert.equal(zoom.defaultPrevented, false, 'zoom wheels stay untouched here');
+  assert.deepEqual(scrollByCalls, []);
+});
+
+test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollByCalls = stubScrollBy(scroller!);
+  const left0 = scroller!.scrollLeft;
+
+  // First event of the burst is under the slop: native, and at most half a
+  // column of drift, so mandatory snap settles back on the same day.
+  const underSlop = wheelEvent({ deltaX: 2, deltaY: 6 });
+  await act(async () => {
+    scroller!.dispatchEvent(underSlop);
+  });
+  assert.equal(
+    underSlop.defaultPrevented,
+    false,
+    'sub-slop drift stays native',
+  );
+  assert.deepEqual(scrollByCalls, []);
+
+  // The accumulated burst now resolves to Y, so every event that carries
+  // sideways drift applies its vertical part only.
+  const events = [
+    wheelEvent({ deltaX: 4, deltaY: 40 }),
+    wheelEvent({ deltaX: 4, deltaY: 40 }),
+    wheelEvent({ deltaX: -4, deltaY: 40 }),
+  ];
+  await act(async () => {
+    for (const ev of events) scroller!.dispatchEvent(ev);
+  });
+
+  assert.deepEqual(
+    events.map((ev) => ev.defaultPrevented),
+    [true, true, true],
+    'a vertical burst cancels the sideways component',
+  );
+  assert.deepEqual(scrollByCalls, [
+    { top: 40, behavior: 'instant' },
+    { top: 40, behavior: 'instant' },
+    { top: 40, behavior: 'instant' },
+  ]);
+  assert.equal(scroller!.scrollLeft, left0, 'scrollLeft never moves');
+  assert.equal(
+    scroller!.style.scrollSnapType,
+    '',
+    'a wheel burst holds no snap lock: nothing is left to restore',
+  );
+
+  // A pause starts a new burst, so this one decides its own (horizontal) axis
+  // and the strip pages natively again.
+  await act(async () => {
+    await sleep(150);
+  });
+  const horizontal = wheelEvent({ deltaX: -60, deltaY: 4 });
+  await act(async () => {
+    scroller!.dispatchEvent(horizontal);
+  });
+  assert.equal(horizontal.defaultPrevented, false, 'a new burst re-decides');
+  assert.equal(scrollByCalls.length, 3);
+});
+
+test('useCalendarStrip: a horizontal wheel burst keeps native day paging', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollByCalls = stubScrollBy(scroller!);
+
+  // Clear 15:1 horizontal start, then momentum: both stay native.
+  const events = [
+    wheelEvent({ deltaX: -60, deltaY: 4 }),
+    wheelEvent({ deltaX: -30, deltaY: 2 }),
+  ];
+  await act(async () => {
+    for (const ev of events) scroller!.dispatchEvent(ev);
+  });
+
+  assert.deepEqual(
+    events.map((ev) => ev.defaultPrevented),
+    [false, false],
+    'horizontal scrolling and snap paging must stay native',
+  );
+  assert.deepEqual(scrollByCalls, []);
+});
+
+test('useCalendarStrip: a mouse wheel with no deltaX behaves exactly as before', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollByCalls = stubScrollBy(scroller!);
+
+  // px and line deltas: an ordinary mouse reports deltaX 0, so nothing is
+  // intercepted and the browser keeps doing the scrolling.
+  const events = [
+    wheelEvent({ deltaY: 100 }),
+    wheelEvent({ deltaY: 100, deltaMode: 1 }),
+  ];
+  await act(async () => {
+    for (const ev of events) scroller!.dispatchEvent(ev);
+  });
+
+  assert.deepEqual(
+    events.map((ev) => ev.defaultPrevented),
+    [false, false],
+  );
+  assert.deepEqual(scrollByCalls, [], 'no manual write for a pure Y wheel');
+});
+
+test('useCalendarStrip: a wheel burst under a drag owner is left alone', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollByCalls = stubScrollBy(scroller!);
+
+  await act(async () => {
+    strip.lockStrip('drag');
+  });
+  const during = wheelEvent({ deltaX: 4, deltaY: 40 });
+  await act(async () => {
+    scroller!.dispatchEvent(during);
+  });
+  assert.equal(during.defaultPrevented, false, 'drag writes scrollLeft itself');
+  assert.deepEqual(scrollByCalls, []);
+
+  // Released again: the next burst classifies and the vertical part applies.
+  await act(async () => {
+    strip.unlockStrip('drag');
+  });
+  const after = wheelEvent({ deltaX: 4, deltaY: 40 });
+  await act(async () => {
+    scroller!.dispatchEvent(after);
+  });
+  assert.equal(after.defaultPrevented, true);
+  assert.deepEqual(scrollByCalls, [{ top: 40, behavior: 'instant' }]);
+});

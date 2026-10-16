@@ -8,6 +8,7 @@ import {
   ALLDAY_MIN,
   CHIP_MIN_H,
   DAYS_PER_PERIOD,
+  EMPTY_WHEEL_BURST,
   HOUR_H_BASE,
   HOUR_H_MAX,
   HOUR_H_MIN,
@@ -15,11 +16,15 @@ import {
   STRIP_OVERSCAN,
   STRIP_REBASE_THRESHOLD,
   TIME_GUTTER_W,
+  WHEEL_BURST_IDLE_MS,
+  WHEEL_LINE_PX,
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
   classifyScrollAxis,
+  nextWheelBurst,
   parseStoredPeriodLength,
+  wheelDeltaPx,
   colWidth,
   dayIndexFromScroll,
   eventHeightPx,
@@ -70,6 +75,7 @@ import {
   allDayRangeToTimed,
   applyAllDayStartDate,
   type StripLockReason,
+  type WheelBurst,
 } from './week-layout';
 
 // ── startOfWeek ─────────────────────────────────────────────────────────
@@ -479,6 +485,128 @@ test('classifyScrollAxis: custom slop', () => {
   assert.equal(classifyScrollAxis(3, 3, 8), 'pending');
   assert.equal(classifyScrollAxis(5, 2, 4), 'x');
   assert.equal(classifyScrollAxis(2, 8, 6), 'y');
+});
+
+// ── wheelDeltaPx ────────────────────────────────────────────────────────
+
+test('wheelDeltaPx: pixel deltas pass through untouched', () => {
+  assert.equal(wheelDeltaPx(12, 0, 600), 12);
+  assert.equal(wheelDeltaPx(-8.5, 0, 600), -8.5);
+  assert.equal(wheelDeltaPx(0, 0, 0), 0, 'px mode needs no viewport size');
+});
+
+test('wheelDeltaPx: line deltas scale by the 16px line box', () => {
+  assert.equal(WHEEL_LINE_PX, 16, 'zoomFactorFromWheel assumes the same box');
+  assert.equal(wheelDeltaPx(3, 1, 600), 48);
+  assert.equal(
+    wheelDeltaPx(-1, 1, 0),
+    -WHEEL_LINE_PX,
+    'lines need no page size',
+  );
+});
+
+test('wheelDeltaPx: page deltas scale by the caller-measured viewport', () => {
+  assert.equal(wheelDeltaPx(2, 2, 600), 1200);
+  assert.equal(wheelDeltaPx(-1, 2, 480), -480);
+  // A page delta on an unmeasured scroller must still move something: the
+  // handler has already preventDefault-ed the event by then.
+  assert.equal(wheelDeltaPx(1, 2, 0), WHEEL_LINE_PX);
+  assert.equal(wheelDeltaPx(1, 2, Number.NaN), WHEEL_LINE_PX);
+});
+
+test('wheelDeltaPx: non-finite deltas never scroll', () => {
+  assert.equal(wheelDeltaPx(Number.NaN, 0, 600), 0);
+  assert.equal(wheelDeltaPx(Number.POSITIVE_INFINITY, 1, 600), 0);
+  assert.equal(wheelDeltaPx(Number.NEGATIVE_INFINITY, 2, 600), 0);
+});
+
+// ── nextWheelBurst ──────────────────────────────────────────────────────
+
+test('nextWheelBurst: an idle gap starts a new burst with fresh sums and axis', () => {
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 0, dy: 40, t: 1000 });
+  assert.equal(first.axis, 'y');
+
+  // Horizontal-heavy within the same burst: the latch must hold — re-deciding
+  // here would hand the strip back to native snap mid-gesture.
+  const latched = nextWheelBurst(first, { dx: 200, dy: 0, t: 1050 });
+  assert.equal(latched.axis, 'y');
+  assert.equal(latched.sumX, 200);
+  assert.equal(latched.sumY, 40);
+
+  // 200ms later: a new gesture, so this event's delta decides the axis.
+  const restarted = nextWheelBurst(latched, { dx: 60, dy: 0, t: 1250 });
+  assert.equal(restarted.axis, 'x');
+  assert.equal(restarted.sumX, 60, 'sums restart with the burst');
+  assert.equal(restarted.sumY, 0);
+  assert.equal(restarted.lastT, 1250);
+});
+
+test('nextWheelBurst: stays pending while the burst is under the slop', () => {
+  let burst: WheelBurst = EMPTY_WHEEL_BURST;
+  for (let i = 0; i < 4; i++) {
+    burst = nextWheelBurst(burst, { dx: 1, dy: 2, t: 1000 + i * 10 });
+  }
+  assert.equal(burst.axis, 'pending', '4× (1, 2) is still under 8px');
+  assert.equal(burst.sumX, 4);
+  assert.equal(burst.sumY, 8);
+
+  // The 5th event crosses the slop on the accumulated delta and commits.
+  burst = nextWheelBurst(burst, { dx: 1, dy: 2, t: 1050 });
+  assert.equal(burst.axis, 'y');
+  assert.equal(burst.sumX, 5);
+  assert.equal(burst.sumY, 10);
+});
+
+test('nextWheelBurst: latches x on a clear horizontal start and keeps it', () => {
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: -60, dy: 4, t: 0 });
+  assert.equal(first.axis, 'x');
+
+  // Vertical-heavy momentum after a horizontal flick must not flip the latch.
+  const later = nextWheelBurst(first, { dx: -10, dy: -80, t: 16 });
+  assert.equal(later.axis, 'x');
+  assert.equal(later.sumY, -76);
+});
+
+test('nextWheelBurst: a gap over WHEEL_BURST_IDLE_MS is the only restart', () => {
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 0, dy: 40, t: 1000 });
+
+  const justUnder = nextWheelBurst(first, {
+    dx: 80,
+    dy: 0,
+    t: 1000 + WHEEL_BURST_IDLE_MS - 1,
+  });
+  assert.equal(justUnder.axis, 'y', 'a slow burst keeps its latch');
+  assert.equal(justUnder.sumY, 40, 'and keeps accumulating its delta');
+
+  const atBoundary = nextWheelBurst(first, {
+    dx: 80,
+    dy: 0,
+    t: 1000 + WHEEL_BURST_IDLE_MS,
+  });
+  assert.equal(
+    atBoundary.axis,
+    'y',
+    'the boundary gap still continues the burst',
+  );
+  assert.equal(atBoundary.sumY, 40);
+
+  const justOver = nextWheelBurst(first, {
+    dx: 80,
+    dy: 0,
+    t: 1000 + WHEEL_BURST_IDLE_MS + 1,
+  });
+  assert.equal(justOver.axis, 'x');
+  assert.equal(justOver.sumY, 0, 'the new burst starts from this event only');
+});
+
+test('nextWheelBurst: is pure, and an unusable timestamp restarts', () => {
+  const seeded = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 1, dy: 2, t: 500 });
+  const snapshot = { ...seeded };
+  // A bad timestamp must start a fresh burst, never continue stale state.
+  const nan = nextWheelBurst(seeded, { dx: 60, dy: 0, t: Number.NaN });
+  assert.equal(nan.axis, 'x');
+  assert.equal(nan.sumY, 0);
+  assert.deepEqual(seeded, snapshot, 'the reducer does not mutate its input');
 });
 
 // ── clampMinutesToDay ───────────────────────────────────────────────────

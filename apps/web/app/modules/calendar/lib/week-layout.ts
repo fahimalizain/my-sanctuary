@@ -394,6 +394,88 @@ export function classifyScrollAxis(
   return adx > ady * 2 ? 'x' : 'y';
 }
 
+// ── Wheel scroll axis ───────────────────────────────────────────────────
+
+/**
+ * Line box (px) assumed for `deltaMode === 1` (line) wheel deltas.
+ * Mirrors `zoomFactorFromWheel` in calendar-zoom so both wheel paths read the
+ * same device delta the same way.
+ */
+export const WHEEL_LINE_PX = 16;
+
+/**
+ * Quiet gap (ms) between wheel events that starts a new burst. A trackpad
+ * emits a burst of events per gesture ~8–16ms apart; a pause longer than this
+ * is a new gesture, so it decides its own axis.
+ */
+export const WHEEL_BURST_IDLE_MS = 120;
+
+/**
+ * Convert a raw wheel `delta` to px. Mode 0 is already px, mode 1 is lines,
+ * mode 2 is pages and needs the viewport size the caller measured.
+ * Non-finite deltas are 0, so a malformed event can never move the scroller.
+ * A degenerate page falls back to the line box rather than to 0: the handler
+ * has already preventDefault-ed the event by the time it scrolls.
+ */
+export function wheelDeltaPx(
+  delta: number,
+  deltaMode: number,
+  pagePx: number,
+): number {
+  if (!Number.isFinite(delta)) return 0;
+  if (deltaMode === 1) return delta * WHEEL_LINE_PX;
+  if (deltaMode === 2) {
+    const page = Number.isFinite(pagePx) && pagePx > 0 ? pagePx : WHEEL_LINE_PX;
+    return delta * page;
+  }
+  return delta;
+}
+
+/** Latched wheel burst: committed axis, accumulated px, last event time. */
+export interface WheelBurst {
+  /** `pending` until the burst's accumulated delta crosses the slop. */
+  axis: ScrollAxis;
+  sumX: number;
+  sumY: number;
+  /** `timeStamp` of the last event folded in. */
+  lastT: number;
+}
+
+/** No burst in flight: `lastT` −∞ makes the next event start one. */
+export const EMPTY_WHEEL_BURST: WheelBurst = {
+  axis: 'pending',
+  sumX: 0,
+  sumY: 0,
+  lastT: Number.NEGATIVE_INFINITY,
+};
+
+/**
+ * Fold one wheel event (px deltas + `timeStamp`) into the burst latch.
+ *
+ * A Mac trackpad puts a little horizontal delta on a nominally vertical
+ * two-finger scroll. The axis is decided from the *accumulated* burst — one
+ * event alone is noisy — and then latched: momentum keeps arriving after the
+ * fingers lift, so a vertical burst that later turns horizontal-heavy must not
+ * hand the strip back to native snap mid-gesture.
+ *
+ * A gap over `WHEEL_BURST_IDLE_MS` starts a fresh burst (sums and axis reset).
+ * The comparison is NaN-safe: an unusable timestamp counts as a new burst,
+ * never as a continuation of stale state.
+ */
+export function nextWheelBurst(
+  prev: WheelBurst,
+  event: { dx: number; dy: number; t: number },
+): WheelBurst {
+  const dx = Number.isFinite(event.dx) ? event.dx : 0;
+  const dy = Number.isFinite(event.dy) ? event.dy : 0;
+  const fresh = !(event.t - prev.lastT <= WHEEL_BURST_IDLE_MS);
+  const sumX = (fresh ? 0 : prev.sumX) + dx;
+  const sumY = (fresh ? 0 : prev.sumY) + dy;
+  let axis = fresh ? 'pending' : prev.axis;
+  if (axis === 'pending') axis = classifyScrollAxis(sumX, sumY);
+  return { axis, sumX, sumY, lastT: event.t };
+}
+
 /**
  * Notion-style day-range title (inclusive first…last):
  *   same day   → "Tue, Sep 8, 2026"
