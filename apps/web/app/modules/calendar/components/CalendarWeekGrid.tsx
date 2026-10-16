@@ -115,7 +115,10 @@ export function CalendarWeekGrid({
       <div
         ref={scrollerRef}
         data-calendar-scroller
-        className="flex-1 min-h-0 overflow-auto [touch-action:pan-x_pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        className="flex-1 min-h-0 overflow-auto snap-x snap-mandatory [touch-action:pan-x_pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        // Day columns snap (snap-start) to the track's left edge, i.e. just
+        // right of the sticky gutter; padding = gutter keeps them aligned there.
+        style={{ scrollPaddingLeft: gutterW }}
         onScroll={onScroll}
       >
         {/* Content: sticky headers + all-day + hours strip */}

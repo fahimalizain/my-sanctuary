@@ -68,7 +68,7 @@ export const DayColumn = memo(function DayColumn({
     <div
       data-day-col={day.toISOString()}
       className={cn(
-        'relative shrink-0 border-r last:border-r-0 cursor-pointer',
+        'relative shrink-0 snap-start border-r last:border-r-0 cursor-pointer',
         isWeekend ? 'border-border/60' : 'border-border/40',
         isToday ? 'bg-primary/[0.03]' : isWeekend && 'bg-muted/40',
       )}
