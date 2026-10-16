@@ -38,6 +38,8 @@ export interface DayColumnProps {
     chipEl: HTMLElement,
   ) => void;
   onSelectChip: (eventId: string) => void;
+  /** Delete for the selected chip (touch handle); undefined if read-only. */
+  onRequestDelete?: () => void;
 }
 
 /**
@@ -60,6 +62,7 @@ export const DayColumn = memo(function DayColumn({
   onColumnPointerDown,
   onChipPointerDown,
   onSelectChip,
+  onRequestDelete,
 }: DayColumnProps) {
   return (
     <div
@@ -82,6 +85,9 @@ export const DayColumn = memo(function DayColumn({
           positioned={p}
           selected={p.event.id === selectedEventId}
           onSelect={onSelectChip}
+          onRequestDelete={
+            p.event.id === selectedEventId ? onRequestDelete : undefined
+          }
           onPointerDown={onChipPointerDown}
           dragging={draggingEventId === p.event.id}
         />

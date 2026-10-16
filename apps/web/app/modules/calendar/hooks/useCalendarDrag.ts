@@ -609,6 +609,10 @@ export function useCalendarDrag(
     ) => {
       if (e.button !== 0) return;
       e.stopPropagation();
+      // Delete handle is tap-only: no session, no scroll claim.
+      if ((e.target as HTMLElement | null)?.closest?.('[data-delete-handle]')) {
+        return;
+      }
 
       const rect = chipEl.getBoundingClientRect();
       const localY = e.clientY - rect.top;

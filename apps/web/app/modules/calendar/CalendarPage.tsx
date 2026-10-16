@@ -1,9 +1,13 @@
-import { useLayoutEffect } from 'react';
+import { useCallback, useLayoutEffect, useState } from 'react';
 import { CalendarHeader } from './components/CalendarHeader';
 import { CalendarSidebar } from './components/CalendarSidebar';
 import { CalendarSyncBanner } from './components/CalendarSyncBanner';
 import { CalendarWeekGrid } from './components/CalendarWeekGrid';
-import { EventInspector } from './components/EventInspector';
+import { DeleteEventDialog } from './components/DeleteEventDialog';
+import {
+  EventInspector,
+  isCalendarWritable,
+} from './components/EventInspector';
 import { useCalendarSession } from './hooks/useCalendarSession';
 import { useCalendarStrip } from './hooks/useCalendarStrip';
 import { COL_HEADER_H, addDays, isSameDay, nowLineY } from './lib/week-layout';
@@ -19,6 +23,22 @@ export function CalendarPage() {
     scrollerRef: strip.scrollerRef,
     setStripLocked: strip.setStripLocked,
   });
+
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const selectedId = session.selectedEvent?.id ?? null;
+  // The dialog belongs to the selection it was opened for.
+  const confirmOpen =
+    confirmDeleteId !== null && confirmDeleteId === selectedId;
+  const canTouchDelete =
+    session.selectedEvent !== null &&
+    isCalendarWritable(session.selectedEventCalendar);
+
+  // Stable across drag/now re-renders so memoized DayColumns keep their props;
+  // it only changes with the selection.
+  const requestDelete = useCallback(
+    () => setConfirmDeleteId(selectedId),
+    [selectedId],
+  );
 
   // Scroll so the now line sits ~⅓ down the visible hours area — once per
   // mount / Today jump, and only when the visible period contains today.
@@ -128,6 +148,7 @@ export function CalendarPage() {
           onColumnPointerDown={session.onColumnPointerDown}
           onChipPointerDown={session.onChipPointerDown}
           onSelectChip={session.handleSelectChip}
+          onRequestDelete={canTouchDelete ? requestDelete : undefined}
           onAllDayPointerDown={session.onAllDayPointerDown}
           onAllDayChipPointerDown={session.onAllDayChipPointerDown}
           onChipSelect={session.handleSelectChip}
@@ -162,6 +183,17 @@ export function CalendarPage() {
           />
         )}
       </div>
+
+      <DeleteEventDialog
+        open={confirmOpen}
+        title={session.selectedEvent?.title ?? ''}
+        isDeleting={session.isDeleting}
+        onCancel={() => setConfirmDeleteId(null)}
+        onConfirm={() => {
+          setConfirmDeleteId(null);
+          void session.handleDeleteEvent();
+        }}
+      />
     </div>
   );
 }

@@ -19,6 +19,8 @@ import {
   type HandleRect,
   TOUCH_HANDLE_HIT_PX,
   TOUCH_HANDLE_KNOB_PX,
+  DELETE_HANDLE_MIN_CHIP_W,
+  DELETE_HANDLE_MIN_CHIP_H,
   movedAllDayRange,
   movedEnough,
   movedRange,
@@ -623,11 +625,18 @@ test('touchHandleGeometry: no hit-box overlap, knobs belong to the chip', () => 
       assert.ok(!intersects(g.start, g.end), `start/end ${label}`);
       assert.ok(!intersects(g.start, g.move), `start/move ${label}`);
       assert.ok(!intersects(g.end, g.move), `end/move ${label}`);
+      if (g.remove) {
+        assert.ok(!intersects(g.remove, g.start), `remove/start ${label}`);
+        assert.ok(!intersects(g.remove, g.end), `remove/end ${label}`);
+        assert.ok(!intersects(g.remove, g.move), `remove/move ${label}`);
+      }
       const chip = { x: 0, y: 0, w, h };
-      for (const [name, [cx, cy]] of Object.entries(g.knobs)) {
+      for (const [name, knobCentre] of Object.entries(g.knobs)) {
+        if (!knobCentre) continue;
+        const [cx, cy] = knobCentre;
         const knob = { x: cx - half, y: cy - half, w: half * 2, h: half * 2 };
         assert.ok(intersects(knob, chip), `${name} knob touches chip ${label}`);
-        assert.ok(cx >= -half && cx <= w, `${name} knob x ${label}`);
+        assert.ok(cx >= -half && cx <= w + half, `${name} knob x ${label}`);
       }
       // Top/bottom knobs sit at the horizontal middle of the chip.
       assert.equal(g.knobs.start[0], w / 2);
@@ -638,6 +647,20 @@ test('touchHandleGeometry: no hit-box overlap, knobs belong to the chip', () => 
       assert.ok(inside(g.start, g.knobs.start), `start knob in box ${label}`);
       assert.ok(inside(g.end, g.knobs.end), `end knob in box ${label}`);
       assert.ok(inside(g.move, g.knobs.move), `move knob in box ${label}`);
+      if (g.remove && g.knobs.remove) {
+        assert.ok(
+          inside(g.remove, g.knobs.remove),
+          `remove knob in box ${label}`,
+        );
+        // Knobs stay visually distinct (no stacking on each other).
+        for (const other of [g.knobs.start, g.knobs.end, g.knobs.move]) {
+          const d = Math.hypot(
+            g.knobs.remove[0] - other[0],
+            g.knobs.remove[1] - other[1],
+          );
+          assert.ok(d >= TOUCH_HANDLE_KNOB_PX, `remove knob spacing ${label}`);
+        }
+      }
     }
   }
 });
@@ -647,6 +670,40 @@ test('touchHandleGeometry: tall wide chips straddle the edge symmetrically', () 
   assert.equal(g.start.y + g.start.h, TOUCH_HANDLE_HIT_PX / 2);
   assert.equal(Math.abs(g.knobs.start[1]), 0);
   assert.equal(g.move.x + g.move.w, 18);
+});
+
+test('touchHandleGeometry: delete mirrors move on the right of roomy chips', () => {
+  const g = touchHandleGeometry(200, 200);
+  assert.ok(g.remove && g.knobs.remove);
+  assert.equal(g.remove.x, 200 - 18);
+  assert.equal(g.remove.y, g.move.y);
+  assert.equal(g.knobs.remove[1], 100);
+});
+
+test('touchHandleGeometry: delete never overlaps on phone-narrow columns', () => {
+  // 7/5/3-day phone columns, tall and short chips.
+  for (const w of [DELETE_HANDLE_MIN_CHIP_W, 40, 46, 70, 110]) {
+    for (const h of [10, 20, 44, 87, 88, 120]) {
+      const g = touchHandleGeometry(w, h);
+      assert.ok(g.remove, `delete shown w=${w} h=${h}`);
+      for (const other of [g.start, g.end, g.move]) {
+        assert.ok(!intersects(g.remove, other), `w=${w} h=${h}`);
+      }
+    }
+  }
+});
+
+test('touchHandleGeometry: delete hides on tiny chips, move/resize stay', () => {
+  for (const [w, h] of [
+    [DELETE_HANDLE_MIN_CHIP_W - 1, 60],
+    [100, DELETE_HANDLE_MIN_CHIP_H - 1],
+    [0, 0],
+  ]) {
+    const g = touchHandleGeometry(w, h);
+    assert.equal(g.remove, null);
+    assert.equal(g.knobs.remove, null);
+    assert.ok(g.start && g.end && g.move);
+  }
 });
 
 test('touchHandleGeometry: bad input is safe', () => {
