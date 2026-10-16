@@ -11,6 +11,7 @@ import {
   allDayPreviewIndices,
   autoscrollDelta,
   classifyTouchGesture,
+  createTouchTracker,
   isTapCreatePointer,
   movedAllDayRange,
   movedEnough,
@@ -457,4 +458,57 @@ test('allDayPreviewIndices: null for timed zone', () => {
   const days = [mon];
   const preview = { start: mon, end: addDays(mon, 1) };
   assert.equal(allDayPreviewIndices(preview, 'timed', days), null);
+});
+
+test('touch tracker: single touch never latches', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  assert.equal(t.latched, false);
+  t.up(1);
+  assert.equal(t.count, 0);
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: 2nd touch latches until ALL lift', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'touch');
+  assert.equal(t.latched, true);
+  t.up(1);
+  assert.equal(t.latched, true); // one finger still down
+  t.up(2);
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: new touch after pinch while one finger remains stays latched', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'touch');
+  t.up(2);
+  t.down(3, 'touch');
+  assert.equal(t.latched, true);
+  t.up(1);
+  t.up(3);
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: mouse/pen pointers are ignored', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'mouse');
+  t.down(3, 'pen');
+  assert.equal(t.latched, false);
+  assert.equal(t.count, 1);
+  t.up(2); // unknown id: no-op
+  assert.equal(t.count, 1);
+});
+
+test('touch tracker: fresh touch after a full pinch is not latched', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'touch');
+  t.up(1);
+  t.up(2);
+  t.down(5, 'touch');
+  assert.equal(t.latched, false);
 });

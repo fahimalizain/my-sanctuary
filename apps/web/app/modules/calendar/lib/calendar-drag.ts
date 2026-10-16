@@ -57,6 +57,41 @@ export function isTapCreatePointer(pointerType: string): boolean {
   return pointerType === 'touch';
 }
 
+/**
+ * Tracks active touch pointers and a multi-touch latch. The latch is set when
+ * 2+ touches are down and cleared only once ALL touches have lifted, so a
+ * pinch can never leak into create/move/resize/tap handling.
+ */
+export interface TouchTracker {
+  down: (pointerId: number, pointerType: string) => void;
+  up: (pointerId: number) => void;
+  /** True from the 2nd touch landing until every touch has lifted. */
+  readonly latched: boolean;
+  readonly count: number;
+}
+
+export function createTouchTracker(): TouchTracker {
+  const ids = new Set<number>();
+  let latched = false;
+  return {
+    down(pointerId, pointerType) {
+      if (pointerType !== 'touch') return;
+      ids.add(pointerId);
+      if (ids.size >= 2) latched = true;
+    },
+    up(pointerId) {
+      if (!ids.delete(pointerId)) return;
+      if (ids.size === 0) latched = false;
+    },
+    get latched() {
+      return latched;
+    },
+    get count() {
+      return ids.size;
+    },
+  };
+}
+
 export type TouchGestureIntent = 'pending' | 'scroll' | 'drag';
 
 /**

@@ -17,6 +17,7 @@ import {
   allDayGrabOffsetDays,
   autoscrollDelta,
   classifyTouchGesture,
+  createTouchTracker,
   isTapCreatePointer,
   movedAllDayRange,
   movedEnough,
@@ -254,6 +255,8 @@ export function useCalendarDrag(
   const captureTargetRef = useRef<HTMLElement | null>(null);
   const lastPtrRef = useRef({ x: 0, y: 0 });
   const autoScrollRafRef = useRef(0);
+  /** Active touches + multi-touch latch (pinch must never start a session). */
+  const touchesRef = useRef(createTouchTracker());
 
   const [session, setSession] = useState<Session | null>(null);
   const [didDrag, setDidDrag] = useState(false);
@@ -320,6 +323,8 @@ export function useCalendarDrag(
 
   const beginSession = useCallback(
     (next: Session, target: HTMLElement, e: ReactPointerEvent<HTMLElement>) => {
+      // Pinch / multi-touch: never start a session (React runs after capture).
+      if (touchesRef.current.latched) return;
       sessionRef.current = next;
       didDragRef.current = false;
       setSession(next);
@@ -357,6 +362,26 @@ export function useCalendarDrag(
     optsRef.current.setStripLocked(false);
     document.body.style.userSelect = '';
   }, [stopAutoScroll]);
+
+  // Track touches at window capture (ahead of React's delegated handlers).
+  // A 2nd finger latches multi-touch: drop any session and block new ones
+  // until every finger lifts, whatever order native/React handlers run in.
+  useEffect(() => {
+    const touches = touchesRef.current;
+    const onDown = (e: PointerEvent) => {
+      touches.down(e.pointerId, e.pointerType);
+      if (touches.latched && sessionRef.current) endSession();
+    };
+    const onEnd = (e: PointerEvent) => touches.up(e.pointerId);
+    window.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('pointerup', onEnd, true);
+    window.addEventListener('pointercancel', onEnd, true);
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('pointerup', onEnd, true);
+      window.removeEventListener('pointercancel', onEnd, true);
+    };
+  }, [endSession]);
 
   // Window-level move / up while a session is active.
   useEffect(() => {
