@@ -26,7 +26,9 @@
 
 use std::collections::HashMap;
 
+use crate::pattern_gen::{ExtractError, HoleSplit, HoleSplitter};
 use regex::Regex;
+use std::cell::OnceCell;
 use thiserror::Error;
 
 use crate::google_color::{canonicalize_hex, is_event_label_hex};
@@ -116,6 +118,10 @@ pub struct CategoryWithPatterns {
     pub patterns: Vec<TaskCategoryPattern>,
     /// Parallel to `patterns`: the compiled regex, `None` when invalid.
     compiled: Vec<Option<Regex>>,
+    /// Parallel to `patterns`: [`HoleSplitter`]s, built on first use (only
+    /// matched categories' patterns are ever split) and then reused for every
+    /// title in the request.
+    splitters: Vec<OnceCell<HoleSplitter>>,
 }
 
 impl CategoryWithPatterns {
@@ -129,12 +135,22 @@ impl CategoryWithPatterns {
             .iter()
             .map(|pattern| Regex::new(pattern.regex.trim()).ok())
             .collect();
+        let splitters = patterns.iter().map(|_| OnceCell::new()).collect();
         Self {
             category_id,
             parent_id,
             patterns,
             compiled,
+            splitters,
         }
+    }
+
+    /// [`crate::pattern_gen::split_hole`] for the pattern at `index`, with the
+    /// parsed hole split and anchored prefix/suffix regexes built once.
+    pub(crate) fn split_hole_at(&self, index: usize, s: &str) -> Result<HoleSplit, ExtractError> {
+        self.splitters[index]
+            .get_or_init(|| HoleSplitter::new(&self.patterns[index].regex))
+            .split(s)
     }
 
     /// Whether `pattern` (the one at `index`) applies under `scope` and its
@@ -247,9 +263,17 @@ pub(crate) fn first_matching_pattern<'a>(
     scope: CalendarScope<'_>,
     category: &'a CategoryWithPatterns,
 ) -> Option<&'a TaskCategoryPattern> {
-    (0..category.patterns.len())
-        .find(|&index| category.pattern_matches(index, title, &scope))
-        .map(|index| &category.patterns[index])
+    first_matching_index(title, scope, category).map(|index| &category.patterns[index])
+}
+
+/// Index form of [`first_matching_pattern`], for callers that also want the
+/// category's cached per-pattern state ([`CategoryWithPatterns::split_hole_at`]).
+pub(crate) fn first_matching_index(
+    title: &str,
+    scope: CalendarScope<'_>,
+    category: &CategoryWithPatterns,
+) -> Option<usize> {
+    (0..category.patterns.len()).find(|&index| category.pattern_matches(index, title, &scope))
 }
 
 /// Classifies a title (task title or event summary) into exactly one

@@ -150,21 +150,16 @@ pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
     };
-    let focused_task_id = users_d1(&ctx)?
-        .get_by_id(&user.id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| row.focused_task_id);
-    match api_core::list_tasks(
-        &lists_d1(&ctx)?,
-        &categories_d1(&ctx)?,
-        &d1(&ctx)?,
-        &user.id,
-        focused_task_id.as_deref(),
-    )
-    .await
-    {
+    let users = users_d1(&ctx)?;
+    let (lists, categories, tasks) = (lists_d1(&ctx)?, categories_d1(&ctx)?, d1(&ctx)?);
+    // The user row (focus pointer) is independent of the taxonomy and tasks
+    // reads, so all of them are in flight together (one round trip deep).
+    let (user_row, snapshot) = futures::join!(
+        users.get_by_id(&user.id),
+        api_core::load_tasks_snapshot(&lists, &categories, &tasks, &user.id),
+    );
+    let focused_task_id = user_row.ok().flatten().and_then(|row| row.focused_task_id);
+    match snapshot.map(|snapshot| snapshot.into_response(focused_task_id.as_deref())) {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))

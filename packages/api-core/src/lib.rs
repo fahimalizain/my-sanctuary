@@ -149,8 +149,8 @@ pub use repo::{
 };
 pub use tasks::{
     classify_title, complete_task, create_task, delete_task, delete_focus, discard_task,
-    focus_task, list_tasks, move_task, pause_task, run_elongate_cron, start_task, stop_task,
-    update_task, ClassifyResponse, DeleteTaskResponse, ElongateReport, FocusTaskResponse,
+    focus_task, list_tasks, load_tasks_snapshot, move_task, pause_task, run_elongate_cron, start_task, stop_task,
+    update_task, TasksSnapshot, ClassifyResponse, DeleteTaskResponse, ElongateReport, FocusTaskResponse,
     MoveTaskInput, MoveTaskResponse, TaskActionResponse, TaskCategorySummary, TaskResponse,
     TasksError, TasksResponse, TaskView, DEFAULT_DURATION_MINUTES, MIN_DURATION_MINUTES,
     START_EVENT_MINUTES, TASK_LOG_COMPLETED, TASK_LOG_DISCARDED, TASK_LOG_FOCUSED,

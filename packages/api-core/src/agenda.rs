@@ -101,7 +101,7 @@ use crate::calendar::{
     create_event, patch_event, patch_event_summary, CalendarError, CreateEventOutput,
 };
 use crate::categories::{
-    classify, ensure_taxonomy, first_matching_pattern, CalendarScope, CategoryWithPatterns,
+    classify, ensure_taxonomy, first_matching_index, first_matching_pattern, CalendarScope, CategoryWithPatterns,
     ClassifyOutcome,
 };
 use crate::config::OAuthConfig;
@@ -1946,10 +1946,10 @@ fn task_view(task: &Task, taxonomy: &Taxonomy, focused_task_id: Option<&str>) ->
 /// The chrome around `title` as ACTUALLY spelled under the first matching
 /// pattern of `matcher` — a copy of `tasks.rs::split_affixes`.
 fn split_affixes(title: &str, matcher: &CategoryWithPatterns) -> (String, String, String) {
-    let Some(pattern) = first_matching_pattern(title, CalendarScope::Ignore, matcher) else {
+    let Some(index) = first_matching_index(title, CalendarScope::Ignore, matcher) else {
         return (String::new(), String::new(), title.to_string());
     };
-    match crate::pattern_gen::split_hole(&pattern.regex, title) {
+    match matcher.split_hole_at(index, title) {
         Ok(split) => (split.prefix, split.suffix, split.hole),
         Err(_) => (String::new(), String::new(), title.to_string()),
     }
