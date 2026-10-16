@@ -298,42 +298,72 @@ export const EventChip = memo(function EventChip({
   );
 });
 
+/** Below this the ghost can't fit a second line, so the label becomes a pill. */
+const PREVIEW_LABEL_FIT_PX = 30;
+
 /** Ghost chip painted during drag-create / move / resize. */
 export const PreviewChip = memo(function PreviewChip({
   top,
   height,
   color,
   title,
+  label = null,
+  floatingLabel = false,
 }: {
   top: number;
   height: number;
   color: string;
   title: string;
+  /** Live time range; null on day segments that don't carry the label. */
+  label?: string | null;
+  /** A touch pill already shows the label, so skip the outside pill. */
+  floatingLabel?: boolean;
 }) {
+  const fits = height >= PREVIEW_LABEL_FIT_PX;
   return (
-    <div
-      className="absolute overflow-hidden rounded-[6px] pointer-events-none z-[50] opacity-70"
-      style={{
-        top,
-        height,
-        left: 0,
-        right: CHIP_MARGIN_RIGHT,
-        color: 'var(--foreground)',
-      }}
-      aria-hidden
-    >
+    <>
       <div
-        className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-        style={{ backgroundColor: color }}
-      />
-      <div
-        className="h-full min-w-0 pl-2 pr-1 py-px"
-        style={{ backgroundColor: hexToRgba(color, PREVIEW_FILL_ALPHA) }}
+        className="absolute overflow-hidden rounded-[6px] pointer-events-none z-[50] opacity-70"
+        style={{
+          top,
+          height,
+          left: 0,
+          right: CHIP_MARGIN_RIGHT,
+          color: 'var(--foreground)',
+        }}
+        aria-hidden
       >
-        <div className="truncate text-[11px] font-medium leading-[13px]">
-          {title}
+        <div
+          className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
+          style={{ backgroundColor: color }}
+        />
+        <div
+          className="h-full min-w-0 pl-2 pr-1 py-px"
+          style={{ backgroundColor: hexToRgba(color, PREVIEW_FILL_ALPHA) }}
+        >
+          <div className="truncate text-[11px] font-medium leading-[13px]">
+            {title}
+          </div>
+          {label && fits && (
+            <div className="truncate text-[10px] leading-[13px] tabular-nums opacity-80">
+              {label}
+            </div>
+          )}
         </div>
       </div>
-    </div>
+      {label && !fits && !floatingLabel && (
+        <div
+          className="absolute z-[60] whitespace-nowrap rounded-full bg-foreground px-1.5 text-[10px] font-medium leading-4 tabular-nums text-background shadow pointer-events-none"
+          style={
+            top >= 20
+              ? { left: 0, top: top - 18 }
+              : { left: 0, top: top + height + 2 }
+          }
+          aria-hidden
+        >
+          {label}
+        </div>
+      )}
+    </>
   );
 });

@@ -440,6 +440,13 @@ export function resizedRange(
   return { start, end };
 }
 
+/** What the drag ghost needs to label itself (kept out of DayColumn props). */
+export interface DragPreviewInfo {
+  range: TimedRange;
+  kind: DragKind;
+  pointerType: string;
+}
+
 /** True when `nextMs` sits in a different `stepMin` bucket than `prevMs`. */
 export function crossedTickBoundary(
   prevMs: number,

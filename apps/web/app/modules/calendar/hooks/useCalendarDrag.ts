@@ -75,6 +75,7 @@ export interface CalendarDragApi {
   ) => void;
   preview: TimedRange | null;
   previewKind: DragKind | null;
+  previewPointerType: string | null;
   previewZone: DragZone | null;
   /** Event being moved/resized (null for create gestures). */
   activeEventId: string | null;
@@ -778,6 +779,7 @@ export function useCalendarDrag(
     onAllDayChipPointerDown,
     preview,
     previewKind: preview && session ? session.kind : null,
+    previewPointerType: preview && session ? session.pointerType : null,
     previewZone: preview && session ? session.currentZone : null,
     activeEventId: session?.eventId ?? null,
     isDragging: session !== null && didDrag,

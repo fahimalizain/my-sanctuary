@@ -1,8 +1,18 @@
-import { memo, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  memo,
+  useLayoutEffect,
+  useRef,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
-import { nowLineY } from '../lib/week-layout';
+import type { DragPreviewInfo } from '../lib/calendar-drag';
+import {
+  formatEventDuration,
+  formatEventTimeRange,
+  nowLineY,
+} from '../lib/week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
 
@@ -104,6 +114,7 @@ export interface TimedPreviewLayerProps {
   trackWidth: number;
   totalHoursH: number;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
+  previewInfo: DragPreviewInfo | null;
   previewColor: string;
   previewTitle: string;
 }
@@ -119,10 +130,24 @@ export const TimedPreviewLayer = memo(function TimedPreviewLayer({
   trackWidth,
   totalHoursH,
   timedPreviewByDay,
+  previewInfo,
   previewColor,
   previewTitle,
 }: TimedPreviewLayerProps) {
   if (timedPreviewByDay.size === 0) return null;
+
+  const label = previewInfo
+    ? `${formatEventTimeRange(previewInfo.range.start, previewInfo.range.end)} · ${formatEventDuration(previewInfo.range.start, previewInfo.range.end)}`
+    : null;
+  // Label once: on the segment holding the dragged edge, else the first.
+  const segmentDays = days.filter((d) =>
+    timedPreviewByDay.has(d.toDateString()),
+  );
+  const labelDay =
+    previewInfo?.kind === 'resize-end'
+      ? segmentDays[segmentDays.length - 1]
+      : segmentDays[0];
+  const isTouch = previewInfo?.pointerType === 'touch';
 
   return (
     <div
@@ -153,10 +178,82 @@ export const TimedPreviewLayer = memo(function TimedPreviewLayer({
               height={ghost.height}
               color={previewColor}
               title={previewTitle}
+              label={day === labelDay ? label : null}
+              floatingLabel={isTouch}
             />
+            {day === labelDay && label && isTouch && previewInfo && (
+              <FloatingTimePill
+                label={label}
+                top={ghost.top}
+                bottom={ghost.top + ghost.height}
+                below={previewInfo.kind === 'resize-end'}
+                gutterW={gutterW}
+              />
+            )}
           </div>
         );
       })}
     </div>
   );
 });
+
+const FLOAT_GAP_PX = 28;
+const FLOAT_MARGIN_PX = 4;
+
+/**
+ * Touch-only pill held clear of the finger. Positioned and clamped to the
+ * visible scroller area in a layout effect (every render, i.e. every move),
+ * so it never reaches React state.
+ */
+function FloatingTimePill({
+  label,
+  top,
+  bottom,
+  below,
+  gutterW,
+}: {
+  label: string;
+  top: number;
+  bottom: number;
+  below: boolean;
+  gutterW: number;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const layer = el?.parentElement; // the day wrapper (top = grid top)
+    const scroller = document.querySelector('[data-calendar-scroller]');
+    if (!el || !layer || !scroller) return;
+    const s = scroller.getBoundingClientRect();
+    const l = layer.getBoundingClientRect();
+    // Sticky day header + all-day band cover the top of the scroller.
+    const allDay = document.querySelector('[data-allday-row]');
+    const visTop =
+      Math.max(s.top, allDay ? allDay.getBoundingClientRect().bottom : s.top) -
+      l.top;
+    const visBottom = s.bottom - l.top;
+    const visLeft = s.left + gutterW - l.left;
+    const visRight = s.right - l.left;
+    const h = el.offsetHeight;
+    const w = el.offsetWidth;
+    const want = below ? bottom + FLOAT_GAP_PX : top - FLOAT_GAP_PX - h;
+    const y = Math.max(
+      visTop + FLOAT_MARGIN_PX,
+      Math.min(visBottom - h - FLOAT_MARGIN_PX, want),
+    );
+    el.style.top = `${y}px`;
+    el.style.left = `${Math.max(
+      visLeft + FLOAT_MARGIN_PX,
+      Math.min(visRight - w - FLOAT_MARGIN_PX, 0),
+    )}px`;
+  });
+  return (
+    <div
+      ref={ref}
+      className="absolute z-[60] whitespace-nowrap rounded-full bg-foreground px-2 py-0.5 text-[11px] font-medium leading-4 tabular-nums text-background shadow-md pointer-events-none"
+      style={{ top, left: 0 }}
+    >
+      {label}
+    </div>
+  );
+}

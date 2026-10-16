@@ -21,6 +21,7 @@ import { useCalendarEventsQueue } from '../events-context';
 import {
   allDayPreviewIndices,
   timedPreviewSegments,
+  type DragPreviewInfo,
   type TimedRange,
 } from '../lib/calendar-drag';
 import {
@@ -1151,6 +1152,18 @@ export function useCalendarSession({
     [drag.preview, drag.previewZone, days, hourH],
   );
 
+  const previewInfo = useMemo<DragPreviewInfo | null>(
+    () =>
+      drag.preview && drag.previewKind && drag.previewPointerType
+        ? {
+            range: drag.preview,
+            kind: drag.previewKind,
+            pointerType: drag.previewPointerType,
+          }
+        : null,
+    [drag.preview, drag.previewKind, drag.previewPointerType],
+  );
+
   const activeDragEvent = drag.activeEventId
     ? overlaidEvents.find((e) => e.id === drag.activeEventId)
     : undefined;
@@ -1164,7 +1177,12 @@ export function useCalendarSession({
   const allDayPreview = useMemo(() => {
     const idx = allDayPreviewIndices(drag.preview, drag.previewZone, days);
     if (!idx) return null;
-    return { ...idx, color: previewColor, title: previewTitle };
+    return {
+      ...idx,
+      color: previewColor,
+      title: previewTitle,
+      range: drag.preview,
+    };
   }, [drag.preview, drag.previewZone, days, previewColor, previewTitle]);
 
   // Tick "now" so the now-line creeps forward while the page is open.
@@ -1241,6 +1259,7 @@ export function useCalendarSession({
     onAllDayPointerDown: drag.onAllDayPointerDown,
     onAllDayChipPointerDown: handleAllDayChipPointerDown,
     timedPreviewByDay,
+    previewInfo,
     previewColor,
     previewTitle,
     allDayPreview,
