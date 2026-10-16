@@ -600,7 +600,9 @@ test('packDayEvents: two 0-min events at the same instant sit side by side', () 
   );
   assert.equal(packed.length, 2);
   for (const p of packed) {
-    assert.ok(Number.isFinite(p.leftPercent) && Number.isFinite(p.widthPercent));
+    assert.ok(
+      Number.isFinite(p.leftPercent) && Number.isFinite(p.widthPercent),
+    );
     assert.ok(p.widthPercent > 0);
   }
   assert.notEqual(packed[0].leftPercent, packed[1].leftPercent);
@@ -637,10 +639,16 @@ test('packDayEvents: min painted height makes nearby 0-min events collide', () =
     { id: 'b', startMin: 610, endMin: 610 },
   ];
   // True durations: ε only → no overlap, both full width.
-  assert.equal(packDayEvents(items).every((p) => p.widthPercent === 1), true);
+  assert.equal(
+    packDayEvents(items).every((p) => p.widthPercent === 1),
+    true,
+  );
   // Painted height 22.5 min covers b → they share the row.
   const packed = packDayEvents(items, 22.5);
-  assert.equal(packed.some((p) => p.widthPercent < 1 + 1e-9 && p.leftPercent > 0), true);
+  assert.equal(
+    packed.some((p) => p.widthPercent < 1 + 1e-9 && p.leftPercent > 0),
+    true,
+  );
 });
 
 test('packDayEvents: back-to-back 15-min events keep full width at hourH=48', () => {
