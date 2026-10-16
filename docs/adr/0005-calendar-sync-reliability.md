@@ -153,6 +153,9 @@ permanent.
   events…” not an out-of-date warning
 - WS open/reconnect cancel-then-invalidates events + calendars so a missed cron
   `notify_user` converges
+  (exception: the first open while the mount-time events GET is still in
+  flight skips it — that request already is the catch-up, and cancelling it
+  doubled the initial load)
 - `calendar.changed` uses the same catch-up runner (cron already notifies; no
   second push channel)
 - Overlay map resets on logout / account change

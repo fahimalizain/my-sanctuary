@@ -33,8 +33,19 @@ export function parseRealtimeMessage(raw: string): RealtimeMessage | null {
   return message;
 }
 
-/** Every successful socket open, including first connect and reconnect. */
-export function shouldInvalidateCalendarOnOpen(): boolean {
+/**
+ * Catch up on every successful socket open (first connect and reconnect),
+ * except one case: the *first* open of this hook while an events GET is
+ * already in flight. That GET was issued at mount, alongside the socket, so
+ * it is itself the catch-up; cancel-then-invalidate would abort it and fire an
+ * identical second request (the worker still executes the cancelled one).
+ * Reconnects always catch up. With no context, always true.
+ */
+export function shouldInvalidateCalendarOnOpen(ctx?: {
+  firstOpen: boolean;
+  eventsInFlight: boolean;
+}): boolean {
+  if (ctx && ctx.firstOpen && ctx.eventsInFlight) return false;
   return true;
 }
 
