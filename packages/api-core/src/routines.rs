@@ -479,11 +479,11 @@ async fn load_taxonomy(
     let mut matchers = Vec::with_capacity(categories.len());
     for category in &categories {
         let patterns = patterns_by_category.remove(&category.id).unwrap_or_default();
-        matchers.push(CategoryWithPatterns {
-            category_id: category.id.clone(),
-            parent_id: category.parent_id.clone(),
+        matchers.push(CategoryWithPatterns::new(
+            category.id.clone(),
+            category.parent_id.clone(),
             patterns,
-        });
+        ));
     }
     Ok(Taxonomy { categories, matchers })
 }

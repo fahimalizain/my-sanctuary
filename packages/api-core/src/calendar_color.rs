@@ -117,11 +117,11 @@ pub fn matchers_from(
         let patterns = patterns_by_category
             .remove(&category.id)
             .unwrap_or_default();
-        matchers.push(CategoryWithPatterns {
-            category_id: category.id.clone(),
-            parent_id: category.parent_id.clone(),
+        matchers.push(CategoryWithPatterns::new(
+            category.id.clone(),
+            category.parent_id.clone(),
             patterns,
-        });
+        ));
     }
     matchers
 }
@@ -274,11 +274,11 @@ mod tests {
         parent_id: Option<&str>,
         patterns: Vec<TaskCategoryPattern>,
     ) -> CategoryWithPatterns {
-        CategoryWithPatterns {
-            category_id: category_id.to_string(),
-            parent_id: parent_id.map(str::to_string),
+        CategoryWithPatterns::new(
+            category_id.to_string(),
+            parent_id.map(str::to_string),
             patterns,
-        }
+        )
     }
 
     #[test]
