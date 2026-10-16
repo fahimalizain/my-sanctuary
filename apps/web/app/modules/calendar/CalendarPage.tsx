@@ -157,7 +157,6 @@ export function CalendarPage() {
             onSaveTimeZone={session.handleSaveTimeZone}
             onSaveCalendar={session.handleSaveCalendar}
             onDelete={session.handleDeleteEvent}
-            isSaving={session.isSaving}
             isDeleting={session.isDeleting}
             isDragging={session.isDragging}
           />

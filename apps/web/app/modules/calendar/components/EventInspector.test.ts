@@ -30,7 +30,6 @@ type EventInspectorProps = {
   ) => void | Promise<void>;
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
-  isSaving?: boolean;
   isDeleting?: boolean;
   isDragging?: boolean;
 };
@@ -610,6 +609,87 @@ test('overflow Delete calls onDelete; available for owner/writer/omitted', () =>
   // Omitted calendar → still writable
   mount({ calendar: undefined });
   assert.ok(screen.getByLabelText('More actions'));
+});
+
+// ── 7b. Saves never disable the form ────────────────────────────────────
+
+test('fields stay enabled and editable while earlier saves are pending', () => {
+  const spies = makeSpies();
+  // Handlers that never settle: a save stays "in flight" for the whole test.
+  const pending = new Promise<void>(() => {});
+  spies.onSaveTitle = (...args) => {
+    spies.saveCalls.push(args);
+    return pending;
+  };
+  spies.onSaveTimes = (...args) => {
+    spies.saveTimesCalls.push(args);
+    return pending;
+  };
+  spies.onSaveCalendar = (...args) => {
+    spies.saveCalendarCalls.push(args);
+    return pending;
+  };
+  mount({ focusTitle: true }, spies);
+
+  const title = screen.getByLabelText('Title') as HTMLInputElement;
+  fireEvent.change(title, { target: { value: 'First' } });
+  fireEvent.blur(title);
+  fireEvent.change(screen.getByLabelText('Start time'), {
+    target: { value: '06:00' },
+  });
+  fireEvent.change(screen.getByLabelText('Calendar'), {
+    target: { value: 'cal-2' },
+  });
+
+  const labels = [
+    'Title',
+    'Description',
+    'Start time',
+    'End time',
+    'Date',
+    'All-day',
+    'Time zone',
+    'Calendar',
+    'More actions',
+  ];
+  for (const label of labels) {
+    const el = screen.getByLabelText(label) as HTMLInputElement;
+    assert.equal(el.disabled, false, `${label} should stay enabled`);
+  }
+
+  // The same field can be edited again while the first save is pending.
+  fireEvent.change(title, { target: { value: 'Second' } });
+  fireEvent.blur(title);
+  assert.equal(spies.saveCalls.length, 2);
+  assert.equal(spies.saveCalls[1][0], 'Second');
+});
+
+test('deleting disables only the delete action', () => {
+  const noop = () => {};
+  render(
+    createElement(EventInspector, {
+      event: makeEvent({ id: 'e-del' }),
+      calendar: makeCalendar(),
+      calendars: defaultCalendars(),
+      onClose: noop,
+      onSaveTitle: noop,
+      onSaveDescription: noop,
+      onSaveTimes: noop,
+      onSaveAllDay: noop,
+      onSaveTimeZone: noop,
+      onSaveCalendar: noop,
+      onDelete: noop,
+      isDeleting: true,
+      focusTitle: true,
+    }),
+  );
+  for (const label of ['Title', 'Start time', 'Calendar', 'All-day']) {
+    const el = screen.getByLabelText(label) as HTMLInputElement;
+    assert.equal(el.disabled, false, `${label} should stay enabled`);
+  }
+  fireEvent.click(screen.getByLabelText('More actions'));
+  const del = screen.getByLabelText('Delete event') as HTMLButtonElement;
+  assert.equal(del.disabled, true);
 });
 
 // ── 8. Read-only ────────────────────────────────────────────────────────

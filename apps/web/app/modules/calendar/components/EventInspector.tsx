@@ -105,7 +105,6 @@ export interface EventInspectorProps {
   /** Move event to another calendar (local calendar id). */
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
-  isSaving?: boolean;
   isDeleting?: boolean;
   /**
    * While a drag is in progress, hide the inspector visually without
@@ -290,7 +289,6 @@ interface InspectorFormProps {
   onClose: () => void;
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
-  isSaving: boolean;
   isDeleting: boolean;
   writable: boolean;
 }
@@ -322,7 +320,6 @@ function InspectorForm({
   onClose,
   onSaveCalendar,
   onDelete,
-  isSaving,
   isDeleting,
   writable,
 }: InspectorFormProps) {
@@ -359,7 +356,6 @@ function InspectorForm({
   const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
-  const inputsDisabled = isSaving || isDeleting;
 
   const writableCalendars = calendars.filter(isWritableCalendar);
   const currentInWritable = writableCalendars.some(
@@ -390,7 +386,6 @@ function InspectorForm({
               className="h-8 w-8 shrink-0"
               onClick={() => setMenuOpen((open) => !open)}
               aria-label="More actions"
-              disabled={isDeleting || isSaving}
             >
               <MoreHorizontal className="h-4 w-4" />
             </Button>
@@ -404,7 +399,7 @@ function InspectorForm({
                   <button
                     type="button"
                     aria-label="Delete event"
-                    disabled={isDeleting || isSaving}
+                    disabled={isDeleting}
                     onClick={() => {
                       setMenuOpen(false);
                       void onDelete();
@@ -446,7 +441,6 @@ function InspectorForm({
                 (e.target as HTMLInputElement).blur();
               }
             }}
-            disabled={isSaving || isDeleting}
             aria-label="Title"
             className="w-full border-0 bg-transparent p-0 text-lg font-semibold text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
           />
@@ -469,7 +463,6 @@ function InspectorForm({
                     step={60}
                     aria-label="Start time"
                     value={toTimeInputValue(start)}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       commitTimes(applyStartTime(start, end, e.target.value));
                     }}
@@ -484,7 +477,6 @@ function InspectorForm({
                     step={60}
                     aria-label="End time"
                     value={toTimeInputValue(end)}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       commitTimes(applyEndTime(start, end, e.target.value));
                     }}
@@ -502,7 +494,6 @@ function InspectorForm({
                     type="date"
                     aria-label="Date"
                     value={toDateInputValue(start)}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       commitTimes(applyStartDate(start, end, e.target.value));
                     }}
@@ -524,7 +515,6 @@ function InspectorForm({
                   type="date"
                   aria-label="Date"
                   value={allDayDateValue}
-                  disabled={inputsDisabled}
                   onChange={(e) => {
                     commitAllDayDate(e.target.value);
                   }}
@@ -549,7 +539,6 @@ function InspectorForm({
                     type="button"
                     aria-label="All-day"
                     aria-pressed={isAllDay}
-                    disabled={inputsDisabled}
                     onClick={onToggleAllDay}
                     className={chipToggleClassName}
                   >
@@ -562,7 +551,6 @@ function InspectorForm({
                   <select
                     aria-label="Time zone"
                     value={timeZone}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       onChangeTimeZone(e.target.value);
                     }}
@@ -601,7 +589,6 @@ function InspectorForm({
                 (e.target as HTMLTextAreaElement).blur();
               }
             }}
-            disabled={isSaving || isDeleting}
             aria-label="Description"
             placeholder="Description"
             rows={3}
@@ -626,7 +613,6 @@ function InspectorForm({
             <select
               aria-label="Calendar"
               value={event.calendar_id}
-              disabled={inputsDisabled}
               onChange={(e) => {
                 const next = e.target.value;
                 if (next === event.calendar_id) return;
@@ -676,7 +662,6 @@ export function EventInspector({
   onSaveTimeZone,
   onSaveCalendar,
   onDelete,
-  isSaving = false,
   isDeleting = false,
   isDragging = false,
 }: EventInspectorProps) {
@@ -907,7 +892,6 @@ export function EventInspector({
       onClose={onClose}
       onSaveCalendar={onSaveCalendar}
       onDelete={onDelete}
-      isSaving={isSaving}
       isDeleting={isDeleting}
       writable={writable}
     />
