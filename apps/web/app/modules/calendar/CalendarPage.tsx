@@ -10,6 +10,7 @@ import {
 } from './components/EventInspector';
 import { useCalendarSession } from './hooks/useCalendarSession';
 import { useCalendarStrip } from './hooks/useCalendarStrip';
+import { useHideNavOnLateHours } from './hooks/useHideNavOnLateHours';
 import { COL_HEADER_H, addDays, isSameDay, nowLineY } from './lib/week-layout';
 
 export function CalendarPage() {
@@ -23,6 +24,8 @@ export function CalendarPage() {
     scrollerRef: strip.scrollerRef,
     setStripLocked: strip.setStripLocked,
   });
+
+  useHideNavOnLateHours(strip.scrollerRef, session.hourH, session.allDayHeight);
 
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const selectedId = session.selectedEvent?.id ?? null;

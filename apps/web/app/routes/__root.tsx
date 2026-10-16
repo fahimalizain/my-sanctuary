@@ -10,6 +10,7 @@ import '../styles/globals.css';
 import { Home, LayoutGrid, CalendarDays, Target, Settings } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ReloadPrompt } from '@/app/components/ReloadPrompt';
+import { useNavHidden } from '@/app/nav-visibility';
 import { NAV_LABEL_MIN_WIDTH_PX, navPillDestination } from '@/app/nav-pill';
 declare const __APP_VERSION__: string;
 
@@ -23,6 +24,7 @@ const navItems = [
 
 function Navigation() {
   const location = useLocation();
+  const navHidden = useNavHidden();
   const rowRef = useRef<HTMLDivElement>(null);
   const labelRefs = useRef(new Map<string, HTMLSpanElement | null>());
   const [pillPosition, setPillPosition] = useState({ left: 0, width: 0 });
@@ -154,7 +156,16 @@ function Navigation() {
   }
 
   return (
-    <nav className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-card rounded-full shadow-lg border border-border px-2 py-2 z-50">
+    <nav
+      aria-hidden={navHidden || undefined}
+      inert={navHidden}
+      className={cn(
+        'fixed bottom-6 left-1/2 -translate-x-1/2 bg-card rounded-full shadow-lg border border-border px-2 py-2 z-50',
+        'transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-opacity',
+        navHidden &&
+          'opacity-0 translate-y-2 motion-reduce:translate-y-0 pointer-events-none',
+      )}
+    >
       <div ref={rowRef} className="relative flex items-center gap-1">
         {/* Shared pill that slides/resizes between items. Mounted only once
             measured so first paint is already on the active tab. */}
