@@ -92,7 +92,9 @@ jobs:
 
       - run: npm ci
 
-      - run: cargo install worker-build --version 0.8.4
+      # --locked: 0.8.4's Cargo.lock pins yanked zip 2.4.2. A fresh resolve
+      # cannot select any zip 2.x. Do not bump worker-build (strip = true breaks).
+      - run: cargo install worker-build --version 0.8.4 --locked
 
       - run: npx nx run-many -t build
 
@@ -119,7 +121,9 @@ jobs:
 
       - run: npm ci
 
-      - run: cargo install worker-build --version 0.8.4
+      # --locked: 0.8.4's Cargo.lock pins yanked zip 2.4.2. A fresh resolve
+      # cannot select any zip 2.x. Do not bump worker-build (strip = true breaks).
+      - run: cargo install worker-build --version 0.8.4 --locked
 
       - run: npx nx build worker
 
