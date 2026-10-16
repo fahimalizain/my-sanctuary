@@ -63,8 +63,11 @@ export function isTapCreatePointer(pointerType: string): boolean {
  * pinch can never leak into create/move/resize/tap handling.
  */
 export interface TouchTracker {
-  down: (pointerId: number, pointerType: string) => void;
+  /** A primary touch means no other touch is active: drops stale ids. */
+  down: (pointerId: number, pointerType: string, isPrimary?: boolean) => void;
   up: (pointerId: number) => void;
+  /** Forget all touches (page hidden / window blur). */
+  reset: () => void;
   /** True from the 2nd touch landing until every touch has lifted. */
   readonly latched: boolean;
   readonly count: number;
@@ -74,14 +77,22 @@ export function createTouchTracker(): TouchTracker {
   const ids = new Set<number>();
   let latched = false;
   return {
-    down(pointerId, pointerType) {
+    down(pointerId, pointerType, isPrimary = false) {
       if (pointerType !== 'touch') return;
+      if (isPrimary) {
+        ids.clear();
+        latched = false;
+      }
       ids.add(pointerId);
       if (ids.size >= 2) latched = true;
     },
     up(pointerId) {
       if (!ids.delete(pointerId)) return;
       if (ids.size === 0) latched = false;
+    },
+    reset() {
+      ids.clear();
+      latched = false;
     },
     get latched() {
       return latched;

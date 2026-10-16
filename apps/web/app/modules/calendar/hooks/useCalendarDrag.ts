@@ -369,14 +369,22 @@ export function useCalendarDrag(
   useEffect(() => {
     const touches = touchesRef.current;
     const onDown = (e: PointerEvent) => {
-      touches.down(e.pointerId, e.pointerType);
+      touches.down(e.pointerId, e.pointerType, e.isPrimary);
       if (touches.latched && sessionRef.current) endSession();
     };
     const onEnd = (e: PointerEvent) => touches.up(e.pointerId);
+    const onReset = () => touches.reset();
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') touches.reset();
+    };
+    window.addEventListener('blur', onReset);
+    document.addEventListener('visibilitychange', onHidden);
     window.addEventListener('pointerdown', onDown, true);
     window.addEventListener('pointerup', onEnd, true);
     window.addEventListener('pointercancel', onEnd, true);
     return () => {
+      window.removeEventListener('blur', onReset);
+      document.removeEventListener('visibilitychange', onHidden);
       window.removeEventListener('pointerdown', onDown, true);
       window.removeEventListener('pointerup', onEnd, true);
       window.removeEventListener('pointercancel', onEnd, true);

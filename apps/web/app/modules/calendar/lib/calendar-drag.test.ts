@@ -512,3 +512,28 @@ test('touch tracker: fresh touch after a full pinch is not latched', () => {
   t.down(5, 'touch');
   assert.equal(t.latched, false);
 });
+
+test('touch tracker: stale id then new primary touch is not latched', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch', true);
+  // pointerup for 1 missed
+  t.down(7, 'touch', true);
+  assert.equal(t.latched, false);
+  assert.equal(t.count, 1);
+});
+
+test('touch tracker: non-primary second touch still latches', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch', true);
+  t.down(2, 'touch', false);
+  assert.equal(t.latched, true);
+});
+
+test('touch tracker: reset clears ids and latch', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch', true);
+  t.down(2, 'touch', false);
+  t.reset();
+  assert.equal(t.latched, false);
+  assert.equal(t.count, 0);
+});
