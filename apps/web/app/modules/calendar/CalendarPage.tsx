@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from 'react';
+import { useCallback, useLayoutEffect, useState } from 'react';
 import { CalendarHeader } from './components/CalendarHeader';
 import { CalendarSidebar } from './components/CalendarSidebar';
 import { CalendarSyncBanner } from './components/CalendarSyncBanner';
@@ -32,6 +32,13 @@ export function CalendarPage() {
   const canTouchDelete =
     session.selectedEvent !== null &&
     isCalendarWritable(session.selectedEventCalendar);
+
+  // Stable across drag/now re-renders so memoized DayColumns keep their props;
+  // it only changes with the selection.
+  const requestDelete = useCallback(
+    () => setConfirmDeleteId(selectedId),
+    [selectedId],
+  );
 
   // Scroll so the now line sits ~⅓ down the visible hours area — once per
   // mount / Today jump, and only when the visible period contains today.
@@ -141,9 +148,7 @@ export function CalendarPage() {
           onColumnPointerDown={session.onColumnPointerDown}
           onChipPointerDown={session.onChipPointerDown}
           onSelectChip={session.handleSelectChip}
-          onRequestDelete={
-            canTouchDelete ? () => setConfirmDeleteId(selectedId) : undefined
-          }
+          onRequestDelete={canTouchDelete ? requestDelete : undefined}
           onAllDayPointerDown={session.onAllDayPointerDown}
           onAllDayChipPointerDown={session.onAllDayChipPointerDown}
           onChipSelect={session.handleSelectChip}
