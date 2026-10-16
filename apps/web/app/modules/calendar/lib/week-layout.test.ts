@@ -57,6 +57,7 @@ import {
   weekRangeIso,
   snapMinutes,
   RESIZE_SNAP_MINUTES,
+  SNAP_MINUTES,
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
@@ -595,6 +596,7 @@ test('packDayEvents: two 0-min events at the same instant sit side by side', () 
       { id: 'b', startMin: 600, endMin: 600 },
     ],
     22.5,
+    SNAP_MINUTES,
   );
   assert.equal(packed.length, 2);
   for (const p of packed) {
@@ -639,6 +641,21 @@ test('packDayEvents: min painted height makes nearby 0-min events collide', () =
   // Painted height 22.5 min covers b → they share the row.
   const packed = packDayEvents(items, 22.5);
   assert.equal(packed.some((p) => p.widthPercent < 1 + 1e-9 && p.leftPercent > 0), true);
+});
+
+test('packDayEvents: back-to-back 15-min events keep full width at hourH=48', () => {
+  const packed = packDayEvents(
+    [
+      { id: 'a', startMin: 600, endMin: 615 },
+      { id: 'b', startMin: 615, endMin: 630 },
+    ],
+    (CHIP_MIN_H / 48) * 60,
+    SNAP_MINUTES,
+  );
+  for (const p of packed) {
+    assert.equal(p.leftPercent, 0);
+    assert.equal(p.widthPercent, 1);
+  }
 });
 
 // ── nowLineY ────────────────────────────────────────────────────────────
