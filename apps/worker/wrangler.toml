@@ -2,6 +2,14 @@ name = "my-sanctuary"
 main = "build/index.js"
 compatibility_date = "2026-05-02"
 
+# Smart Placement: run the fetch handler near the D1 primary (Singapore)
+# instead of the caller's colo (Chennai), so the Worker's D1 round trips are
+# in-region. Static assets still serve from the edge (`[assets]`); only
+# `run_worker_first` paths invoke the Worker. Cron / queue handlers are
+# unaffected. Remove this block to go back to default placement.
+[placement]
+mode = "smart"
+
 [observability]
 enabled = false
 head_sampling_rate = 1

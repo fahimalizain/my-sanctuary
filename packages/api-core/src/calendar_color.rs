@@ -117,18 +117,75 @@ pub fn matchers_from(
         let patterns = patterns_by_category
             .remove(&category.id)
             .unwrap_or_default();
-        matchers.push(CategoryWithPatterns {
-            category_id: category.id.clone(),
-            parent_id: category.parent_id.clone(),
+        matchers.push(CategoryWithPatterns::new(
+            category.id.clone(),
+            category.parent_id.clone(),
             patterns,
-        });
+        ));
     }
     matchers
 }
 
-/// Load lists+categories, `ensure_taxonomy`, reload, load patterns, paint.
+/// Categories plus compiled matchers, ready to paint any number of events.
+/// Built once per request by [`load_paint_taxonomy`].
+#[derive(Debug, Clone)]
+pub struct PaintTaxonomy {
+    pub categories: Vec<TaskCategory>,
+    pub matchers: Vec<CategoryWithPatterns>,
+}
+
+/// Loads the paint taxonomy. Lists, categories and patterns are read
+/// concurrently (one round trip deep). [`ensure_taxonomy`] only writes when
+/// lists or categories are empty (first visit); only then are categories and
+/// patterns re-read — otherwise the first read is used as-is.
+///
 /// Taxonomy failure should be returned as Err — worker logs and falls back
 /// via [`paint_events_default`] (listing must not 500).
+pub async fn load_paint_taxonomy(
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    user_id: &str,
+) -> Result<PaintTaxonomy, CategoriesError> {
+    let (lists, categories, patterns) = futures::join!(
+        list_repo.list_by_user_id(user_id),
+        category_repo.list_by_user_id(user_id),
+        category_repo.list_patterns_by_user_id(user_id),
+    );
+    let (lists, mut categories, mut patterns) = (lists?, categories?, patterns?);
+    if lists.is_empty() || categories.is_empty() {
+        ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id).await?;
+        categories = category_repo.list_by_user_id(user_id).await?;
+        patterns = category_repo.list_patterns_by_user_id(user_id).await?;
+    }
+    let matchers = matchers_from(&categories, patterns);
+    Ok(PaintTaxonomy {
+        categories,
+        matchers,
+    })
+}
+
+/// Paints `events` with an already-loaded taxonomy. `calendars` supplies the
+/// local → Google calendar id map for scoped patterns.
+pub fn paint_events_with_taxonomy(
+    taxonomy: &PaintTaxonomy,
+    calendars: &[GoogleCalendar],
+    events: Vec<CalendarEvent>,
+) -> Vec<CalendarEventView> {
+    let google_calendar_id_by_local_id: HashMap<String, String> = calendars
+        .iter()
+        .map(|cal| (cal.id.clone(), cal.google_calendar_id.clone()))
+        .collect();
+    paint_events(
+        events,
+        &google_calendar_id_by_local_id,
+        &taxonomy.categories,
+        &taxonomy.matchers,
+    )
+}
+
+/// Load the taxonomy ([`load_paint_taxonomy`]) and paint. Taxonomy failure
+/// should be returned as Err — worker logs and falls back via
+/// [`paint_events_default`] (listing must not 500).
 pub async fn paint_events_for_user(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -136,25 +193,8 @@ pub async fn paint_events_for_user(
     events: Vec<CalendarEvent>,
     user_id: &str,
 ) -> Result<Vec<CalendarEventView>, CategoriesError> {
-    let lists = list_repo.list_by_user_id(user_id).await?;
-    let categories = category_repo.list_by_user_id(user_id).await?;
-    ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id).await?;
-
-    let categories = category_repo.list_by_user_id(user_id).await?;
-    let patterns = category_repo.list_patterns_by_user_id(user_id).await?;
-    let matchers = matchers_from(&categories, patterns);
-
-    let google_calendar_id_by_local_id: HashMap<String, String> = calendars
-        .iter()
-        .map(|cal| (cal.id.clone(), cal.google_calendar_id.clone()))
-        .collect();
-
-    Ok(paint_events(
-        events,
-        &google_calendar_id_by_local_id,
-        &categories,
-        &matchers,
-    ))
+    let taxonomy = load_paint_taxonomy(list_repo, category_repo, user_id).await?;
+    Ok(paint_events_with_taxonomy(&taxonomy, calendars, events))
 }
 
 /// Fallback paint when taxonomy load fails — each event gets a stable color
@@ -274,11 +314,11 @@ mod tests {
         parent_id: Option<&str>,
         patterns: Vec<TaskCategoryPattern>,
     ) -> CategoryWithPatterns {
-        CategoryWithPatterns {
-            category_id: category_id.to_string(),
-            parent_id: parent_id.map(str::to_string),
+        CategoryWithPatterns::new(
+            category_id.to_string(),
+            parent_id.map(str::to_string),
             patterns,
-        }
+        )
     }
 
     #[test]

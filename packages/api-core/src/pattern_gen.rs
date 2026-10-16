@@ -157,57 +157,110 @@ fn emit_class(class: &Class) -> Result<String, FillError> {
 /// `s` must be in `L(pattern)`. The first hole is the first `.*` / `.+`
 /// sibling in the flattened HIR. A greedy hole takes the rightmost legal cut,
 /// an ungreedy hole the leftmost. Capture groups are never consulted.
+///
+/// One-shot convenience over [`HoleSplitter`]; callers splitting many strings
+/// against the same pattern should build the splitter once.
 pub fn split_hole(pattern: &str, s: &str) -> Result<HoleSplit, ExtractError> {
-    let compiled = Regex::new(pattern).map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
-    if !compiled.is_match(s) {
-        return Err(ExtractError::NoMatch);
+    HoleSplitter::new(pattern).split(s)
+}
+
+/// A pattern prepared for [`split_hole`]: the full regex, the parsed/flattened
+/// HIR split at the first hole, and the compiled anchored prefix/suffix
+/// regexes. Built once per pattern; each [`split`](Self::split) is then only
+/// matching, with exactly [`split_hole`]'s results (including errors).
+#[derive(Debug, Clone)]
+pub struct HoleSplitter {
+    plan: Result<SplitPlan, ExtractError>,
+}
+
+#[derive(Debug, Clone)]
+struct SplitPlan {
+    full: Regex,
+    /// `Ok(None)` = the pattern parses but has no hole (`NoHole` on split).
+    hole: Result<Option<HolePlan>, ExtractError>,
+}
+
+#[derive(Debug, Clone)]
+struct HolePlan {
+    greedy: bool,
+    min: usize,
+    prefix_re: Regex,
+    suffix_re: Regex,
+}
+
+impl HoleSplitter {
+    /// Compiles everything [`split_hole`] needs for `pattern`. Failures are
+    /// kept and returned from [`split`](Self::split) in the same order
+    /// `split_hole` reports them.
+    pub fn new(pattern: &str) -> Self {
+        let plan = Regex::new(pattern)
+            .map_err(|e| ExtractError::InvalidRegex(e.to_string()))
+            .map(|full| SplitPlan {
+                full,
+                hole: Self::plan_hole(pattern),
+            });
+        Self { plan }
     }
 
-    let hir = parse(pattern).map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
-    let flat = flatten(&hir);
-    let idx = flat
-        .iter()
-        .position(hir_is_hole)
-        .ok_or(ExtractError::NoHole)?;
+    fn plan_hole(pattern: &str) -> Result<Option<HolePlan>, ExtractError> {
+        let hir = parse(pattern).map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        let flat = flatten(&hir);
+        let Some(idx) = flat.iter().position(hir_is_hole) else {
+            return Ok(None);
+        };
+        let (greedy, min) = match flat[idx].kind() {
+            HirKind::Repetition(rep) => (rep.greedy, rep.min as usize),
+            _ => (true, 0),
+        };
+        let prefix_re = compile_anchored_prefix(&nodes_to_pattern(&flat[..idx]))
+            .map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        let suffix_re = compile_anchored_suffix(&nodes_to_pattern(&flat[idx + 1..]))
+            .map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        Ok(Some(HolePlan {
+            greedy,
+            min,
+            prefix_re,
+            suffix_re,
+        }))
+    }
 
-    let greedy = match flat[idx].kind() {
-        HirKind::Repetition(rep) => rep.greedy,
-        _ => true,
-    };
-    let min = match flat[idx].kind() {
-        HirKind::Repetition(rep) => rep.min as usize,
-        _ => 0,
-    };
-
-    let prefix_re = compile_anchored_prefix(&nodes_to_pattern(&flat[..idx]))
-        .map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
-    let suffix_re = compile_anchored_suffix(&nodes_to_pattern(&flat[idx + 1..]))
-        .map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
-
-    let prefix_end = prefix_re.find(s).ok_or(ExtractError::NoMatch)?.end();
-
-    let mut found = None;
-    for j in prefix_end..=s.len() {
-        if !s.is_char_boundary(j) {
-            continue;
+    /// See [`split_hole`].
+    pub fn split(&self, s: &str) -> Result<HoleSplit, ExtractError> {
+        let plan = self.plan.as_ref().map_err(Clone::clone)?;
+        if !plan.full.is_match(s) {
+            return Err(ExtractError::NoMatch);
         }
-        if j - prefix_end < min {
-            continue;
-        }
-        if suffix_re.is_match(&s[j..]) {
-            found = Some(j);
-            if !greedy {
-                break;
+        let hole = match &plan.hole {
+            Ok(Some(hole)) => hole,
+            Ok(None) => return Err(ExtractError::NoHole),
+            Err(err) => return Err(err.clone()),
+        };
+
+        let prefix_end = hole.prefix_re.find(s).ok_or(ExtractError::NoMatch)?.end();
+
+        let mut found = None;
+        for j in prefix_end..=s.len() {
+            if !s.is_char_boundary(j) {
+                continue;
+            }
+            if j - prefix_end < hole.min {
+                continue;
+            }
+            if hole.suffix_re.is_match(&s[j..]) {
+                found = Some(j);
+                if !hole.greedy {
+                    break;
+                }
             }
         }
-    }
 
-    let j = found.ok_or(ExtractError::NoMatch)?;
-    Ok(HoleSplit {
-        prefix: s[..prefix_end].to_string(),
-        hole: s[prefix_end..j].to_string(),
-        suffix: s[j..].to_string(),
-    })
+        let j = found.ok_or(ExtractError::NoMatch)?;
+        Ok(HoleSplit {
+            prefix: s[..prefix_end].to_string(),
+            hole: s[prefix_end..j].to_string(),
+            suffix: s[j..].to_string(),
+        })
+    }
 }
 
 /// The substring that the first `.*` / `.+` hole consumed from a matching `s`.
@@ -284,6 +337,102 @@ fn compile_anchored_suffix(src: &str) -> Result<Regex, regex::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-`HoleSplitter` implementation, verbatim: compiles the full
+    /// regex, parses and splits the HIR, and builds the anchored regexes on
+    /// every call. `HoleSplitter` must agree with it, errors included.
+    fn reference_split_hole(pattern: &str, s: &str) -> Result<HoleSplit, ExtractError> {
+        let compiled =
+            Regex::new(pattern).map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        if !compiled.is_match(s) {
+            return Err(ExtractError::NoMatch);
+        }
+        let hir = parse(pattern).map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        let flat = flatten(&hir);
+        let idx = flat
+            .iter()
+            .position(hir_is_hole)
+            .ok_or(ExtractError::NoHole)?;
+        let (greedy, min) = match flat[idx].kind() {
+            HirKind::Repetition(rep) => (rep.greedy, rep.min as usize),
+            _ => (true, 0),
+        };
+        let prefix_re = compile_anchored_prefix(&nodes_to_pattern(&flat[..idx]))
+            .map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        let suffix_re = compile_anchored_suffix(&nodes_to_pattern(&flat[idx + 1..]))
+            .map_err(|e| ExtractError::InvalidRegex(e.to_string()))?;
+        let prefix_end = prefix_re.find(s).ok_or(ExtractError::NoMatch)?.end();
+        let mut found = None;
+        for j in prefix_end..=s.len() {
+            if !s.is_char_boundary(j) || j - prefix_end < min {
+                continue;
+            }
+            if suffix_re.is_match(&s[j..]) {
+                found = Some(j);
+                if !greedy {
+                    break;
+                }
+            }
+        }
+        let j = found.ok_or(ExtractError::NoMatch)?;
+        Ok(HoleSplit {
+            prefix: s[..prefix_end].to_string(),
+            hole: s[prefix_end..j].to_string(),
+            suffix: s[j..].to_string(),
+        })
+    }
+
+    #[test]
+    fn hole_splitter_agrees_with_the_per_call_reference() {
+        let patterns = [
+            SPICY,
+            r"^.* [|] Work$",
+            r"^Work$",
+            r"^(?:Deep|Focus): .+$",
+            r"^.*? - (a|b)$",
+            r"^(?s:.*) end$",
+            r"^.+x.+$",
+            r"^\.*$",
+            "[unclosed",
+            "(",
+            "",
+        ];
+        let titles = [
+            "Review PR | Spicy Home",
+            "x | SpicyHome",
+            " | Spicy Home",
+            "Work",
+            "Foo | Work",
+            "Deep: thing",
+            "Focus: ",
+            "t - a - b",
+            "multi\nline end",
+            "axb",
+            "é | Work",
+            "nothing",
+            "",
+        ];
+        for pattern in patterns {
+            let splitter = HoleSplitter::new(pattern);
+            for title in titles {
+                assert_eq!(
+                    splitter.split(title),
+                    reference_split_hole(pattern, title),
+                    "pattern {pattern:?} title {title:?}"
+                );
+                // The splitter is reusable: a second split is identical.
+                assert_eq!(
+                    splitter.split(title),
+                    reference_split_hole(pattern, title),
+                    "reuse: pattern {pattern:?} title {title:?}"
+                );
+                assert_eq!(
+                    split_hole(pattern, title),
+                    reference_split_hole(pattern, title)
+                );
+            }
+        }
+    }
 
     /// The canonical category pattern: a hole followed by literal chrome and a
     /// two-way alternation. Both spellings must be accepted; filling emits the

@@ -41,17 +41,6 @@ fn session_and_oauth<'a>(
     Ok(Some((user.id, oauth)))
 }
 
-/// Paint cached events with category colors. Taxonomy failures are logged and
-/// every event falls back to [`api_core::DEFAULT_EVENT_LABEL_COLOR`] — listing
-/// must never 500 because paint failed.
-async fn paint_listed_events(
-    ctx: &RouteContext<Option<api_core::Config>>,
-    user_id: &str,
-    events: Vec<api_core::models::CalendarEvent>,
-) -> Result<Vec<CalendarEventView>> {
-    paint_events_with_fallback(ctx, user_id, events).await
-}
-
 async fn paint_single_event(
     ctx: &RouteContext<Option<api_core::Config>>,
     user_id: &str,
@@ -133,22 +122,34 @@ pub async fn list_events(
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     let watches = crate::db::D1WatchChannelRepo::new(d1()?);
+    let list_repo = crate::db::D1TaskListRepo::new(d1()?);
+    let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
     let watch_callback_url = ctx
         .data
         .as_ref()
         .and_then(|config| config.watch_callback_url.as_deref());
 
-    let output = match api_core::refresh_if_needed(
-        &crate::http::WorkerHttp,
-        &tokens,
-        oauth,
-        &user_id,
-        now_unix,
-    )
-    .await
-    {
+    // Everything that does not depend on the token or on each other runs
+    // concurrently (D1 round trips cost ~100ms each from the Worker's
+    // region): the token read/refresh, the calendars + watch channels
+    // snapshot, and the paint taxonomy (lists, categories, patterns). Only
+    // the range query has to wait — a window fetch may write through first.
+    let (refresh, snapshot, taxonomy) = futures::join!(
+        api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix),
+        api_core::load_list_snapshot(&calendars, &watches, &user_id),
+        api_core::load_paint_taxonomy(&list_repo, &category_repo, &user_id),
+    );
+
+    let output = match refresh {
         Ok(access) => {
-            match api_core::list_events(
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    console_log!("calendar: list_events failed: {err}");
+                    return json_error(&ctx, 500, "failed to load events");
+                }
+            };
+            match api_core::list_events_with_snapshot(
                 &crate::http::WorkerHttp,
                 &calendars,
                 &events,
@@ -159,6 +160,7 @@ pub async fn list_events(
                 &end,
                 now_unix,
                 watch_callback_url,
+                snapshot,
             )
             .await
             {
@@ -175,6 +177,8 @@ pub async fn list_events(
             {
                 return json_error(&ctx, 500, "failed to load events");
             }
+            // The snapshot was loaded before a revoked grant stamped the
+            // calendars, so this path re-reads them itself.
             match api_core::list_events_after_refresh_failure(
                 &calendars,
                 &events,
@@ -198,7 +202,18 @@ pub async fn list_events(
         console_log!("calendar sync: {error}");
     }
 
-    let events = paint_listed_events(&ctx, &user_id, output.events).await?;
+    // Paint with the taxonomy loaded above. Taxonomy failures are logged and
+    // every event falls back to a per-calendar default color — listing must
+    // never 500 because paint failed.
+    let events = match taxonomy {
+        Ok(taxonomy) => {
+            api_core::paint_events_with_taxonomy(&taxonomy, &output.calendars, output.events)
+        }
+        Err(err) => {
+            console_log!("calendar: paint events failed: {err}");
+            paint_events_default(output.events)
+        }
+    };
 
     let response = Response::from_json(&api_core::CalendarEventsResponse {
         events,

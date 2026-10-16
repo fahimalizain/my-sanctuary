@@ -111,7 +111,8 @@ use thiserror::Error;
 
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{
-    classify, classify_detailed, ensure_taxonomy, first_matching_pattern, CalendarScope,
+    classify, classify_detailed, ensure_taxonomy, first_matching_index, first_matching_pattern,
+    CalendarScope,
     CategoryWithPatterns, ClassifyOutcome,
 };
 use crate::config::OAuthConfig;
@@ -383,17 +384,49 @@ pub async fn list_tasks(
     user_id: &str,
     focused_task_id: Option<&str>,
 ) -> Result<TasksResponse, TasksError> {
-    let lists = list_repo.list_by_user_id(user_id).await?;
-    let categories = category_repo.list_by_user_id(user_id).await?;
-    ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id).await?;
-    // Re-load: the seed may have inserted lists/categories.
-    let taxonomy = load_taxonomy(category_repo, user_id).await?;
-    let tasks = task_repo.list_by_user_id(user_id).await?;
-    let views = tasks
-        .iter()
-        .map(|task| to_view(task, &taxonomy, focused_task_id))
-        .collect();
-    Ok(TasksResponse { tasks: views })
+    Ok(load_tasks_snapshot(list_repo, category_repo, task_repo, user_id)
+        .await?
+        .into_response(focused_task_id))
+}
+
+/// Everything [`list_tasks`] reads, so a caller can run the independent
+/// `users` read (for `focused_task_id`) concurrently and paint afterwards with
+/// [`TasksSnapshot::into_response`].
+pub struct TasksSnapshot {
+    taxonomy: Taxonomy,
+    tasks: Vec<Task>,
+}
+
+impl TasksSnapshot {
+    /// Paints every task (category summary, display title, focused flag).
+    /// Pure: the regexes were compiled once when the taxonomy loaded.
+    pub fn into_response(self, focused_task_id: Option<&str>) -> TasksResponse {
+        let views = self
+            .tasks
+            .iter()
+            .map(|task| to_view(task, &self.taxonomy, focused_task_id))
+            .collect();
+        TasksResponse { tasks: views }
+    }
+}
+
+/// Loads the seeded taxonomy and the user's tasks concurrently (see
+/// [`list_tasks`] for the seeding rules). The tasks read does not depend on
+/// the taxonomy; a first-visit seed only ever coexists with zero tasks.
+pub async fn load_tasks_snapshot(
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
+    task_repo: &dyn TaskRepo,
+    user_id: &str,
+) -> Result<TasksSnapshot, TasksError> {
+    let (taxonomy, tasks) = futures::join!(
+        load_taxonomy_seeded(list_repo, category_repo, user_id),
+        task_repo.list_by_user_id(user_id),
+    );
+    Ok(TasksSnapshot {
+        taxonomy: taxonomy?,
+        tasks: tasks?,
+    })
 }
 
 /// Response envelope for the classify endpoint. The status line states
@@ -674,10 +707,12 @@ fn files_to(title: &str, category: &TaskCategory, matchers: &[CategoryWithPatter
 /// (`NoHole`), or a defensive non-match (`NoMatch`) all degrade to no chrome
 /// with the title itself as the display value.
 fn split_affixes(title: &str, matcher: &CategoryWithPatterns) -> (String, String, String) {
-    let Some(pattern) = first_matching_pattern(title, CalendarScope::Ignore, matcher) else {
+    let Some(index) = first_matching_index(title, CalendarScope::Ignore, matcher) else {
         return (String::new(), String::new(), title.to_string());
     };
-    match split_hole(&pattern.regex, title) {
+    // Cached per pattern on the matcher: the HIR parse + anchored regexes are
+    // built once per request, not once per task.
+    match matcher.split_hole_at(index, title) {
         Ok(split) => (split.prefix, split.suffix, split.hole),
         Err(_) => (String::new(), String::new(), title.to_string()),
     }
@@ -2460,10 +2495,20 @@ async fn load_taxonomy_seeded(
     category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
 ) -> Result<Taxonomy, TasksError> {
-    let lists = list_repo.list_by_user_id(user_id).await?;
-    let categories = category_repo.list_by_user_id(user_id).await?;
-    ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id).await?;
-    load_taxonomy(category_repo, user_id).await.map_err(TasksError::from)
+    // Lists, categories and patterns are independent reads: one round trip
+    // deep. `ensure_taxonomy` only writes when lists or categories are empty
+    // (first visit); only then is the taxonomy re-read.
+    let (lists, categories, patterns) = futures::join!(
+        list_repo.list_by_user_id(user_id),
+        category_repo.list_by_user_id(user_id),
+        category_repo.list_patterns_by_user_id(user_id),
+    );
+    let (lists, categories, patterns) = (lists?, categories?, patterns?);
+    if lists.is_empty() || categories.is_empty() {
+        ensure_taxonomy(list_repo, category_repo, &lists, &categories, user_id).await?;
+        return load_taxonomy(category_repo, user_id).await.map_err(TasksError::from);
+    }
+    Ok(taxonomy_from(categories, patterns))
 }
 
 /// Resolves the Google calendar a started event lands on (locked rule):
@@ -2683,18 +2728,25 @@ fn resolve_category(title: &str, taxonomy: &Taxonomy) -> Result<String, TasksErr
     }
 }
 
-/// Loads living categories and their patterns in two queries (list + bulk
-/// patterns), matching `list_categories`.
+/// Loads living categories and their patterns in two concurrent queries
+/// (list + bulk patterns), matching `list_categories`.
 async fn load_taxonomy(
     category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
 ) -> Result<Taxonomy, RepoError> {
-    let categories = category_repo.list_by_user_id(user_id).await?;
+    let (categories, patterns) = futures::join!(
+        category_repo.list_by_user_id(user_id),
+        category_repo.list_patterns_by_user_id(user_id),
+    );
+    Ok(taxonomy_from(categories?, patterns?))
+}
 
-    // Every living category's patterns in one query, grouped by category
-    // (kills the old per-category N+1: one patterns SELECT per category).
+/// Builds the [`Taxonomy`] from already-loaded rows: every living category's
+/// patterns grouped by category (one bulk query, no per-category N+1), each
+/// category's regexes compiled once into its matcher.
+fn taxonomy_from(categories: Vec<TaskCategory>, patterns: Vec<TaskCategoryPattern>) -> Taxonomy {
     let mut patterns_by_category: HashMap<String, Vec<TaskCategoryPattern>> = HashMap::new();
-    for pattern in category_repo.list_patterns_by_user_id(user_id).await? {
+    for pattern in patterns {
         patterns_by_category
             .entry(pattern.category_id.clone())
             .or_default()
@@ -2704,13 +2756,13 @@ async fn load_taxonomy(
     let mut matchers = Vec::with_capacity(categories.len());
     for category in &categories {
         let patterns = patterns_by_category.remove(&category.id).unwrap_or_default();
-        matchers.push(CategoryWithPatterns {
-            category_id: category.id.clone(),
-            parent_id: category.parent_id.clone(),
+        matchers.push(CategoryWithPatterns::new(
+            category.id.clone(),
+            category.parent_id.clone(),
             patterns,
-        });
+        ));
     }
-    Ok(Taxonomy { categories, matchers })
+    Taxonomy { categories, matchers }
 }
 
 #[cfg(test)]
@@ -4241,6 +4293,64 @@ mod tests {
             0,
             "load_taxonomy must never fall back to per-category pattern queries"
         );
+    }
+
+    #[test]
+    fn list_tasks_reads_taxonomy_once_when_already_seeded() {
+        let (lists, categories, tasks) = seeded();
+        *categories.list_by_user_id_calls.lock().unwrap() = 0;
+        *categories.list_patterns_by_user_id_calls.lock().unwrap() = 0;
+
+        pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
+
+        // `ensure_taxonomy` inserted nothing, so there is no re-read.
+        assert_eq!(*categories.list_by_user_id_calls.lock().unwrap(), 1);
+        assert_eq!(*categories.list_patterns_by_user_id_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn list_tasks_rereads_taxonomy_only_after_a_first_visit_seed() {
+        let lists = FakeTaskListRepo::new();
+        let categories = FakeTaskCategoryRepo::new();
+        let tasks = FakeTaskRepo::new();
+
+        let response =
+            pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
+
+        assert!(response.tasks.is_empty());
+        assert_eq!(
+            *categories.list_by_user_id_calls.lock().unwrap(),
+            2,
+            "initial read + one re-read after the seed inserted rows"
+        );
+        // The seed really happened: a second list needs no re-read.
+        *categories.list_by_user_id_calls.lock().unwrap() = 0;
+        pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
+        assert_eq!(*categories.list_by_user_id_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn list_tasks_splits_display_titles_for_many_tasks_with_shared_splitters() {
+        let (lists, categories, tasks) = seeded();
+        for n in 0..60 {
+            let title = match n % 3 {
+                0 => format!("Review {n} | Work"),
+                1 => "Work".to_string(),
+                _ => format!("Run {n} | Fitness"),
+            };
+            pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input(&title)))
+                .unwrap();
+        }
+        let response =
+            pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
+        assert_eq!(response.tasks.len(), 60);
+        for view in &response.tasks {
+            let expected = match view.title.split_once(" | ") {
+                Some((hole, _)) => hole.to_string(),
+                None => view.title.clone(),
+            };
+            assert_eq!(view.display_title, expected, "{}", view.title);
+        }
     }
 
     // ──────────────────────────────────────────

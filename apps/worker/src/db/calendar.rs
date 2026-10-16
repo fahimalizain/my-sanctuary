@@ -30,7 +30,8 @@ use api_core::repo::{
     OPERATION_UPDATE_STATUS_SQL, REPLICA_SEEN_INSERT_CHUNK_SIZE,
     WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
     WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_ALL_SQL,
-    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_BY_USER_ID_SQL,
+    WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1Type};
@@ -983,6 +984,15 @@ impl WatchChannelRepo for D1WatchChannelRepo {
             .db
             .prepare(WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL)
             .bind_refs(&[D1Type::Text(calendar_id)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<WatchChannel>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(WATCH_CHANNEL_LIST_BY_USER_ID_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
             .map_err(backend)?;
         query_vec(stmt).await
     }

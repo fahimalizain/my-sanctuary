@@ -27,7 +27,9 @@ export async function catchUpCalendarQueries(
 /**
  * Same-origin WebSocket to `/api/realtime` while the user is logged in.
  * On open/reconnect and on `calendar.changed`, catch up calendar queries
- * (cancel in-flight events GETs, then invalidate events + calendars).
+ * (cancel in-flight events GETs, then invalidate events + calendars). The one
+ * exception is the first open while the mount-time events GET is still in
+ * flight: that request is the catch-up, so it is left alone.
  * Optimistic overlays in CalendarEventsProvider still win for in-flight edits.
  */
 export function useCalendarRealtime(): void {
@@ -44,6 +46,7 @@ export function useCalendarRealtime(): void {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let pingTimer: ReturnType<typeof setInterval> | null = null;
     let backoffMs = BACKOFF_INITIAL_MS;
+    let opens = 0;
 
     const clearPing = () => {
       if (pingTimer !== null) {
@@ -91,7 +94,13 @@ export function useCalendarRealtime(): void {
             ws.send('ping');
           }
         }, PING_INTERVAL_MS);
-        if (shouldInvalidateCalendarOnOpen()) {
+        const { events } = calendarCatchupQueryKeys();
+        if (
+          shouldInvalidateCalendarOnOpen({
+            firstOpen: opens++ === 0,
+            eventsInFlight: queryClient.isFetching({ queryKey: events }) > 0,
+          })
+        ) {
           void catchUpCalendarQueries(queryClient);
         }
       };

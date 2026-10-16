@@ -26,7 +26,9 @@
 
 use std::collections::HashMap;
 
+use crate::pattern_gen::{ExtractError, HoleSplit, HoleSplitter};
 use regex::Regex;
+use std::cell::OnceCell;
 use thiserror::Error;
 
 use crate::google_color::{canonicalize_hex, is_event_label_hex};
@@ -100,14 +102,84 @@ pub struct CategoryView {
 
 /// One living category plus its stored patterns, the unit of classification.
 ///
-/// Built by the caller (slice 3's task service) from `task_categories` rows
-/// and `list_patterns_by_category_id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Built by the caller from `task_categories` rows and the user's patterns via
+/// [`CategoryWithPatterns::new`], which compiles every stored regex **once**
+/// (trimmed, like the stored value is read). Classification then only runs
+/// `is_match`; building the matcher is the per-request cost, not per title.
+/// Invalid stored regexes compile to `None` and are skipped on read.
+///
+/// `patterns` stays public for reads and for scope fields
+/// (`google_calendar_id`); the compiled regexes are keyed by position, so
+/// replacing a pattern's `regex` after construction needs a fresh `new`.
+#[derive(Debug, Clone)]
 pub struct CategoryWithPatterns {
     pub category_id: String,
     pub parent_id: Option<String>,
     pub patterns: Vec<TaskCategoryPattern>,
+    /// Parallel to `patterns`: the compiled regex, `None` when invalid.
+    compiled: Vec<Option<Regex>>,
+    /// Parallel to `patterns`: [`HoleSplitter`]s, built on first use (only
+    /// matched categories' patterns are ever split) and then reused for every
+    /// title in the request.
+    splitters: Vec<OnceCell<HoleSplitter>>,
 }
+
+impl CategoryWithPatterns {
+    /// Compiles every pattern's regex once; invalid ones are kept as `None`.
+    pub fn new(
+        category_id: String,
+        parent_id: Option<String>,
+        patterns: Vec<TaskCategoryPattern>,
+    ) -> Self {
+        let compiled = patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern.regex.trim()).ok())
+            .collect();
+        let splitters = patterns.iter().map(|_| OnceCell::new()).collect();
+        Self {
+            category_id,
+            parent_id,
+            patterns,
+            compiled,
+            splitters,
+        }
+    }
+
+    /// [`crate::pattern_gen::split_hole`] for the pattern at `index`, with the
+    /// parsed hole split and anchored prefix/suffix regexes built once.
+    pub(crate) fn split_hole_at(&self, index: usize, s: &str) -> Result<HoleSplit, ExtractError> {
+        self.splitters[index]
+            .get_or_init(|| HoleSplitter::new(&self.patterns[index].regex))
+            .split(s)
+    }
+
+    /// Whether `pattern` (the one at `index`) applies under `scope` and its
+    /// regex matches `title`. Rule 2 of [`classify`]: only an Event scope with
+    /// a different pattern calendar skips the pattern.
+    fn pattern_matches(&self, index: usize, title: &str, scope: &CalendarScope<'_>) -> bool {
+        if let CalendarScope::Event { google_calendar_id } = scope {
+            if let Some(scoped) = self.patterns[index].google_calendar_id.as_deref() {
+                if scoped != *google_calendar_id {
+                    return false;
+                }
+            }
+        }
+        match &self.compiled[index] {
+            Some(regex) => regex.is_match(title),
+            None => false, // skip invalid stored regexes on read
+        }
+    }
+}
+
+impl PartialEq for CategoryWithPatterns {
+    fn eq(&self, other: &Self) -> bool {
+        self.category_id == other.category_id
+            && self.parent_id == other.parent_id
+            && self.patterns == other.patterns
+    }
+}
+
+impl Eq for CategoryWithPatterns {}
 
 /// Result of classifying a title against the category set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,22 +230,8 @@ pub(crate) fn reduced_matches<'a>(
 ) -> Vec<&'a CategoryWithPatterns> {
     let mut matched: Vec<&CategoryWithPatterns> = Vec::new();
     for category in categories {
-        let matches = category.patterns.iter().any(|pattern| {
-            // Rule 2: only an Event scope with a different pattern calendar
-            // skips the pattern. Ignore (tasks) never looks at the field, and
-            // unscoped patterns match under any scope.
-            if let CalendarScope::Event { google_calendar_id } = scope {
-                if let Some(scoped) = pattern.google_calendar_id.as_deref() {
-                    if scoped != google_calendar_id {
-                        return false;
-                    }
-                }
-            }
-            match Regex::new(pattern.regex.trim()) {
-                Ok(regex) => regex.is_match(title),
-                Err(_) => false, // skip invalid stored regexes on read
-            }
-        });
+        let matches = (0..category.patterns.len())
+            .any(|index| category.pattern_matches(index, title, &scope));
         if matches {
             matched.push(category);
         }
@@ -205,22 +263,17 @@ pub(crate) fn first_matching_pattern<'a>(
     scope: CalendarScope<'_>,
     category: &'a CategoryWithPatterns,
 ) -> Option<&'a TaskCategoryPattern> {
-    category.patterns.iter().find(|pattern| {
-        // Rule 2: only an Event scope with a different pattern calendar
-        // skips the pattern. Ignore (tasks) never looks at the field, and
-        // unscoped patterns match under any scope.
-        if let CalendarScope::Event { google_calendar_id } = scope {
-            if let Some(scoped) = pattern.google_calendar_id.as_deref() {
-                if scoped != google_calendar_id {
-                    return false;
-                }
-            }
-        }
-        match Regex::new(pattern.regex.trim()) {
-            Ok(regex) => regex.is_match(title),
-            Err(_) => false, // skip invalid stored regexes on read
-        }
-    })
+    first_matching_index(title, scope, category).map(|index| &category.patterns[index])
+}
+
+/// Index form of [`first_matching_pattern`], for callers that also want the
+/// category's cached per-pattern state ([`CategoryWithPatterns::split_hole_at`]).
+pub(crate) fn first_matching_index(
+    title: &str,
+    scope: CalendarScope<'_>,
+    category: &CategoryWithPatterns,
+) -> Option<usize> {
+    (0..category.patterns.len()).find(|&index| category.pattern_matches(index, title, &scope))
 }
 
 /// Classifies a title (task title or event summary) into exactly one
@@ -1236,10 +1289,10 @@ mod tests {
         parent_id: Option<&str>,
         patterns: &[&str],
     ) -> CategoryWithPatterns {
-        CategoryWithPatterns {
-            category_id: category_id.to_string(),
-            parent_id: parent_id.map(str::to_string),
-            patterns: patterns
+        CategoryWithPatterns::new(
+            category_id.to_string(),
+            parent_id.map(str::to_string),
+            patterns
                 .iter()
                 .enumerate()
                 .map(|(i, regex)| TaskCategoryPattern {
@@ -1252,7 +1305,7 @@ mod tests {
                     updated_at: "2026-08-18T00:00:00Z".to_string(),
                 })
                 .collect(),
-        }
+        )
     }
 
     fn input(title: &str, color: &str) -> NewTaskCategoryInput {
@@ -1461,6 +1514,101 @@ mod tests {
         assert!(
             first_matching_pattern("Work", CalendarScope::Ignore, &only_bad).is_none(),
             "a category with only invalid stored regexes has no matching pattern"
+        );
+    }
+
+    /// Reference implementation: the pre-compile-once semantics (a fresh
+    /// `Regex::new` per pattern per call). The precompiled matcher must agree
+    /// with it on every title/scope.
+    fn reference_reduced(
+        title: &str,
+        scope: &CalendarScope<'_>,
+        categories: &[CategoryWithPatterns],
+    ) -> Vec<String> {
+        let mut matched: Vec<&CategoryWithPatterns> = categories
+            .iter()
+            .filter(|category| {
+                category.patterns.iter().any(|pattern| {
+                    if let CalendarScope::Event { google_calendar_id } = scope {
+                        if let Some(scoped) = pattern.google_calendar_id.as_deref() {
+                            if scoped != *google_calendar_id {
+                                return false;
+                            }
+                        }
+                    }
+                    Regex::new(pattern.regex.trim())
+                        .map(|regex| regex.is_match(title))
+                        .unwrap_or(false)
+                })
+            })
+            .collect();
+        let parents: std::collections::HashSet<&str> =
+            matched.iter().filter_map(|c| c.parent_id.as_deref()).collect();
+        matched.retain(|c| !parents.contains(c.category_id.as_str()));
+        matched.iter().map(|c| c.category_id.clone()).collect()
+    }
+
+    #[test]
+    fn precompiled_matchers_agree_with_per_call_compilation() {
+        let mut scoped = cat_with_patterns("scoped", None, &["^Gym$", " ^Run\\b "]);
+        scoped.patterns[0].google_calendar_id = Some("a@example.com".to_string());
+        let categories = vec![
+            cat_with_patterns("work", None, &["^Work$", "^.* [|] Work$"]),
+            cat_with_patterns("deep", Some("work"), &["^Deep Work$", "^.* [|] Deep Work$"]),
+            cat_with_patterns("broken", None, &["[unclosed", "(", "^Broken$"]),
+            cat_with_patterns("empty", None, &[]),
+            cat_with_patterns("twin_a", None, &["^Twin$"]),
+            cat_with_patterns("twin_b", None, &["^Twin$"]),
+            scoped,
+        ];
+        let titles = [
+            "Work", "Deep Work", "x | Work", "x | Deep Work", "Broken", "[unclosed", "Twin",
+            "Gym", "Run now", "Running", "", "nothing",
+        ];
+        let scopes = [
+            CalendarScope::Ignore,
+            CalendarScope::Event { google_calendar_id: "a@example.com" },
+            CalendarScope::Event { google_calendar_id: "b@example.com" },
+            CalendarScope::Event { google_calendar_id: "" },
+        ];
+        for title in titles {
+            for scope in &scopes {
+                let expected = reference_reduced(title, scope, &categories);
+                let got: Vec<String> = classify_detailed(title, scope.clone(), &categories)
+                    .matched;
+                assert_eq!(got, expected, "title {title:?} scope {scope:?}");
+            }
+        }
+    }
+
+    /// Micro-benchmark note: classification over a production-sized taxonomy
+    /// (104 categories, ~148 patterns) used to recompile ~148 regexes per
+    /// title; with precompiled matchers 2k titles must finish quickly even in
+    /// a debug build. Generous bound so it only fails on a regression back to
+    /// per-title compilation.
+    #[test]
+    fn classify_many_titles_does_not_recompile_regexes() {
+        let categories: Vec<CategoryWithPatterns> = (0..104)
+            .map(|i| {
+                let id = format!("cat{i}");
+                let patterns: Vec<String> = if i < 44 {
+                    vec![format!("^Cat{i}$"), format!("^.* [|] Cat{i}$")]
+                } else {
+                    vec![format!("^Cat{i}$")]
+                };
+                let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
+                cat_with_patterns(&id, None, &refs)
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        for n in 0..2_000 {
+            let title = format!("meeting {n}");
+            let _ = classify(&title, CalendarScope::Event { google_calendar_id: "a" }, &categories);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "2k classifications took {:?}",
+            start.elapsed()
         );
     }
 

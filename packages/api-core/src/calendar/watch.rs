@@ -226,6 +226,34 @@ pub async fn ensure_watch(
     create_watch(http, watches, access, cal, callback_url, now_unix).await
 }
 
+/// [`ensure_watch`] against channel rows the caller already loaded (all of
+/// `cal`'s channels, any expiry), so GET events pays one channel query for
+/// every calendar instead of one per calendar.
+///
+/// Returns `Ok(true)` when a new channel was created (the caller's `existing`
+/// snapshot is then stale for `cal`), `Ok(false)` when an unexpired channel
+/// already covers it.
+pub(crate) async fn ensure_watch_with_channels(
+    http: &dyn HttpClient,
+    watches: &dyn WatchChannelRepo,
+    access: &GoogleAccess,
+    cal: &GoogleCalendar,
+    callback_url: &str,
+    now_unix: i64,
+    existing: &[&WatchChannel],
+) -> Result<bool, CalendarError> {
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    // RFC 3339 UTC strings compare lexicographically (same as the SQL).
+    if existing
+        .iter()
+        .any(|channel| channel.expiration.as_str() > now_rfc3339.as_str())
+    {
+        return Ok(false);
+    }
+    create_watch(http, watches, access, cal, callback_url, now_unix).await?;
+    Ok(true)
+}
+
 /// POSTs `channels.stop` for one channel; HTTP 404 counts as success (the
 /// channel is already gone). Any other non-2xx is an error.
 async fn stop_channel(

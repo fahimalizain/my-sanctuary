@@ -377,6 +377,9 @@ pub trait WatchChannelRepo: Send + Sync {
     /// All channels for `calendar_id`. Many rows per calendar are expected:
     /// renewal overlaps two channels briefly (ADR 0001).
     async fn list_by_calendar_id(&self, calendar_id: &str) -> Result<Vec<WatchChannel>, RepoError>;
+    /// Every channel across the user's calendars (any expiry), oldest first.
+    /// One query replaces a `list_by_calendar_id` per calendar on GET events.
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<WatchChannel>, RepoError>;
     /// Every watch channel row (all calendars). Small table; personal app.
     /// Cron uses this to find leftover channels on disabled/soft-deleted
     /// calendars after a best-effort `channels.stop` failed.
@@ -756,6 +759,14 @@ pub const EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL: &str =
 /// unmodified (`original_start` empty or equal to `start_time`, same title).
 /// Modified exceptions (moved start or different title) stay visible. When no
 /// master exists (window-only never-init), instances stay visible.
+///
+/// Index: the unary `+` on `e.start_time` keeps SQLite off
+/// `idx_events_calendar_start`, which only bounds `start_time < ?` and so walks
+/// every event since the beginning of history. The planner then uses
+/// `idx_events_calendar_end (calendar_id, end_time, start_time)` (migration
+/// 0017), bounding the scan at `end_time > window_start`; `start_time < ?` is
+/// checked from the index before the row is fetched. Without the migration it
+/// degrades to the old scan, never to an error.
 pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
     SELECT e.* FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
@@ -764,7 +775,7 @@ pub const EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL: &str = "
       AND c.sync_enabled = 1
       AND e.deleted_at IS NULL
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
-      AND e.start_time < ? AND e.end_time > ?
+      AND +e.start_time < ? AND e.end_time > ?
       AND NOT (
         e.recurring_event_id IS NOT NULL AND e.recurring_event_id != ''
         AND (e.original_start IS NULL OR e.original_start = '' OR e.original_start = e.start_time)
@@ -801,7 +812,7 @@ pub const EVENT_LIST_RUNNING_BY_USER_ID_SQL: &str = "
       AND e.is_all_day = 0
       AND (e.status IS NULL OR e.status = '' OR e.status != 'cancelled')
       AND e.task_id IS NOT NULL AND e.task_id != ''
-      AND e.start_time <= ? AND e.end_time > ?
+      AND +e.start_time <= ? AND e.end_time > ?
       AND NOT (
         e.recurring_event_id IS NOT NULL AND e.recurring_event_id != ''
         AND (e.original_start IS NULL OR e.original_start = '' OR e.original_start = e.start_time)
@@ -1175,6 +1186,16 @@ pub const WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL: &str =
 
 pub const WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL: &str =
     "SELECT * FROM google_calendars_watch_channels WHERE calendar_id = ? ORDER BY created_at ASC";
+
+/// Every channel row of the user's calendars in one query (GET events needs
+/// all of them for ensure-watch + coverage). Soft-deleted calendars are not
+/// filtered here; callers group by their own loaded calendar ids.
+pub const WATCH_CHANNEL_LIST_BY_USER_ID_SQL: &str = "
+    SELECT w.* FROM google_calendars_watch_channels w
+    JOIN google_calendars c ON c.id = w.calendar_id
+    WHERE c.user_id = ?
+    ORDER BY w.created_at ASC
+";
 
 /// Every channel row. Small personal-app table; cron leftover-stop pass.
 pub const WATCH_CHANNEL_LIST_ALL_SQL: &str =
@@ -1554,7 +1575,7 @@ mod tests {
     #[test]
     fn event_range_query_uses_overlap_semantics() {
         let sql = EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL;
-        assert!(sql.contains("e.start_time < ?"), "{sql}");
+        assert!(sql.contains("+e.start_time < ?"), "{sql}");
         assert!(sql.contains("e.end_time > ?"), "{sql}");
         assert!(sql.contains("c.user_id = ?"), "{sql}");
         assert!(sql.contains("ORDER BY e.start_time ASC"), "{sql}");
@@ -2284,6 +2305,7 @@ mod tests {
             WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
             WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
             WATCH_CHANNEL_LIST_ALL_SQL,
+            WATCH_CHANNEL_LIST_BY_USER_ID_SQL,
             WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
         ] {
             assert!(!sql.contains("deleted_at"), "{sql}");
@@ -2310,7 +2332,7 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("e.task_id IS NOT NULL AND e.task_id != ''"), "{sql}");
-        assert!(sql.contains("e.start_time <= ? AND e.end_time > ?"), "{sql}");
+        assert!(sql.contains("+e.start_time <= ? AND e.end_time > ?"), "{sql}");
         assert!(sql.contains("JOIN google_calendars c ON c.id = e.calendar_id"), "{sql}");
     }
 

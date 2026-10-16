@@ -1,16 +1,17 @@
 use super::catalog::refresh_calendar_list;
 use super::cron::stamp_auth_revoked_for_user;
-use super::sync::{
-    classify_watch_coverage, events_sync_envelope, refresh_watch_coverage, EventsSyncEnvelope,
+use super::sync::{classify_watch_coverage, events_sync_envelope, EventsSyncEnvelope};
+use super::watch::{
+    ensure_watch_with_channels, is_public_https_callback, stop_watches_for_calendar,
 };
-use super::watch::{ensure_watch, is_public_https_callback, stop_watches_for_calendar};
 use super::window::fetch_and_apply_window;
 use super::CalendarError;
-use crate::models::CalendarEvent;
+use crate::models::{CalendarEvent, GoogleCalendar, WatchChannel};
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventRepo, CalendarRepo, WatchChannelRepo};
 use crate::time::{add_months_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 use crate::token::{is_refresh_auth_revoked, GoogleAccess, TokenError};
+use std::collections::{HashMap, HashSet};
 
 /// Result of [`list_events`]: the cached (and/or window) events, per-calendar
 /// sync errors for the caller to log (failures never fail the whole listing),
@@ -26,6 +27,40 @@ pub struct CalendarListOutput {
     /// `"cache"` | `"window"` | `"mixed"` — how the event set was produced.
     /// See [`list_events`] for the rules.
     pub source: String,
+    /// The user's calendars as of the end of the request (re-read only when
+    /// the request mutated them), so paint can map local → Google calendar
+    /// ids without another read. `watch_coverage` is stamped in memory.
+    pub calendars: Vec<GoogleCalendar>,
+}
+
+/// The reads every `GET /events` starts with, issued concurrently: the
+/// user's calendars and all of their watch channels (one query, not one per
+/// calendar). The worker runs this alongside the token read.
+///
+/// A channel-list failure is not fatal (listing must keep working): it is
+/// carried as `Err` so [`list_events_with_snapshot`] skips ensure-watch and
+/// coverage stamping and reports it in `sync_errors`.
+#[derive(Debug, Clone)]
+pub struct ListSnapshot {
+    pub calendars: Vec<GoogleCalendar>,
+    pub channels: Result<Vec<WatchChannel>, String>,
+}
+
+/// Loads a [`ListSnapshot`]; a calendar-list failure fails the request, a
+/// channel-list failure is carried inside the snapshot.
+pub async fn load_list_snapshot(
+    calendars: &dyn CalendarRepo,
+    watches: &dyn WatchChannelRepo,
+    user_id: &str,
+) -> Result<ListSnapshot, CalendarError> {
+    let (cals, channels) = futures::join!(
+        calendars.list_by_user_id(user_id),
+        watches.list_by_user_id(user_id)
+    );
+    Ok(ListSnapshot {
+        calendars: cals?,
+        channels: channels.map_err(|err| err.to_string()),
+    })
 }
 
 /// Resolves the event time window from optional `time_min`/`time_max` query
@@ -87,16 +122,86 @@ pub async fn list_events(
     now_unix: i64,
     watch_callback_url: Option<&str>,
 ) -> Result<CalendarListOutput, CalendarError> {
+    let snapshot = load_list_snapshot(calendars, watches, user_id).await?;
+    list_events_with_snapshot(
+        http,
+        calendars,
+        events,
+        watches,
+        access,
+        user_id,
+        start_rfc3339,
+        end_rfc3339,
+        now_unix,
+        watch_callback_url,
+        snapshot,
+    )
+    .await
+}
+
+/// [`list_events`] over a pre-loaded [`ListSnapshot`] (the worker loads it
+/// concurrently with the token read). On a pure cache hit this issues exactly
+/// one query — the range read — and no writes:
+///
+/// - calendars and channels come from `snapshot`; ensure-watch and the
+///   coverage classification share the one channel list (re-listed for a
+///   calendar only if this request created/stopped its channels);
+/// - calendars are re-read only when the request mutated them (first-contact
+///   import, dirty bump, sync disable, window fetch);
+/// - `watch_coverage` is stamped in memory on every GET and persisted only
+///   when it differs from the stored value (cron/webhook paths keep it fresh
+///   otherwise), so steady-state GETs do not write.
+pub async fn list_events_with_snapshot(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    events: &dyn CalendarEventRepo,
+    watches: &dyn WatchChannelRepo,
+    access: &GoogleAccess,
+    user_id: &str,
+    start_rfc3339: &str,
+    end_rfc3339: &str,
+    now_unix: i64,
+    watch_callback_url: Option<&str>,
+    snapshot: ListSnapshot,
+) -> Result<CalendarListOutput, CalendarError> {
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let mut cals = calendars.list_by_user_id(user_id).await?;
+    let ListSnapshot {
+        calendars: mut cals,
+        channels: mut channels_result,
+    } = snapshot;
+    // Set whenever this request may have changed calendar rows or channels,
+    // so the envelope is built from a re-read instead of the stale snapshot.
+    let mut calendars_mutated = false;
     if cals.is_empty() {
         // First contact with Google: import the calendar list, then re-read.
         refresh_calendar_list(http, calendars, Some(watches), access, user_id, &now_rfc3339)
             .await?;
-        cals = calendars.list_by_user_id(user_id).await?;
+        let reloaded = load_list_snapshot(calendars, watches, user_id).await?;
+        cals = reloaded.calendars;
+        channels_result = reloaded.channels;
     }
 
     let mut sync_errors: Vec<String> = Vec::new();
+    let mut channels_by_calendar: HashMap<String, Vec<WatchChannel>> = HashMap::new();
+    let mut channels_available = true;
+    match channels_result {
+        Ok(rows) => {
+            for channel in rows {
+                channels_by_calendar
+                    .entry(channel.calendar_id.clone())
+                    .or_default()
+                    .push(channel);
+            }
+        }
+        Err(err) => {
+            channels_available = false;
+            sync_errors.push(format!("failed to list watch channels for user {user_id}: {err}"));
+        }
+    }
+    // Calendars whose channel rows changed during this request (created or
+    // stopped): their snapshot entry is stale, coverage re-lists them.
+    let mut channels_stale: HashSet<String> = HashSet::new();
+
     let mut window_fetched = false;
     let mut cache_only_initialized = false;
     let mut ephemeral: Vec<CalendarEvent> = Vec::new();
@@ -107,15 +212,35 @@ pub async fn list_events(
         }
         // Ensure-watch before the first-paint window (ADR 0001): a sync-enabled
         // calendar with no unexpired channel gets `events.watch`. Skipped
-        // entirely when WATCH_CALLBACK_URL is unset or not public HTTPS.
-        if let Some(callback_url) = watch_callback_url {
-            match ensure_watch(http, watches, access, cal, callback_url, now_unix).await {
-                Ok(()) => {}
+        // entirely when WATCH_CALLBACK_URL is unset or not public HTTPS (or
+        // when the channel list failed — never create blind).
+        if let Some(callback_url) = watch_callback_url.filter(|_| channels_available) {
+            let existing: Vec<&WatchChannel> = channels_by_calendar
+                .get(&cal.id)
+                .map(|rows| rows.iter().collect())
+                .unwrap_or_default();
+            match ensure_watch_with_channels(
+                http,
+                watches,
+                access,
+                cal,
+                callback_url,
+                now_unix,
+                &existing,
+            )
+            .await
+            {
+                Ok(created) => {
+                    if created {
+                        channels_stale.insert(cal.id.clone());
+                    }
+                }
                 Err(CalendarError::GoogleNotFound) => {
                     sync_errors.push(format!(
                         "calendar {} ({}) returned 404 for events.watch — disabling sync",
                         cal.id, cal.google_calendar_id
                     ));
+                    calendars_mutated = true;
                     if let Err(err) = calendars.set_sync_enabled(&cal.id, false, &now_rfc3339).await {
                         sync_errors.push(format!(
                             "failed to disable sync for calendar {}: {err}",
@@ -124,6 +249,7 @@ pub async fn list_events(
                     }
                     // A prior channel may exist for this calendar (e.g. the
                     // calendar became unavailable): stop + hard-delete them.
+                    channels_stale.insert(cal.id.clone());
                     if let Err(err) =
                         stop_watches_for_calendar(http, watches, access, &cal.id).await
                     {
@@ -132,21 +258,8 @@ pub async fn list_events(
                             cal.id
                         ));
                     }
-                    // Best-effort: stamp missing / leftover coverage after stop.
-                    if let Err(err) = refresh_watch_coverage(
-                        calendars,
-                        watches,
-                        &cal.id,
-                        now_unix,
-                        &now_rfc3339,
-                    )
-                    .await
-                    {
-                        sync_errors.push(format!(
-                            "failed to refresh watch coverage for calendar {}: {err}",
-                            cal.id
-                        ));
-                    }
+                    // Missing / leftover coverage after the stop is stamped by
+                    // the coverage pass below (this calendar is marked stale).
                     continue;
                 }
                 Err(err) => {
@@ -174,6 +287,7 @@ pub async fn list_events(
         }
 
         // Hint cron/webhook Path B; do not await the replica on first paint.
+        calendars_mutated = true;
         if let Err(err) = calendars.bump_dirty_requested(&cal.id, &now_rfc3339).await {
             sync_errors.push(format!(
                 "failed to bump dirty for calendar {} ({}): {err}",
@@ -210,25 +324,12 @@ pub async fn list_events(
                 }
                 // The calendar is gone from Google's side: stop its channels
                 // so stale subscriptions do not push at a dead calendar.
+                channels_stale.insert(cal.id.clone());
                 if let Err(err) =
                     stop_watches_for_calendar(http, watches, access, &cal.id).await
                 {
                     sync_errors.push(format!(
                         "failed to stop watch channels for calendar {}: {err}",
-                        cal.id
-                    ));
-                }
-                if let Err(err) = refresh_watch_coverage(
-                    calendars,
-                    watches,
-                    &cal.id,
-                    now_unix,
-                    &now_rfc3339,
-                )
-                .await
-                {
-                    sync_errors.push(format!(
-                        "failed to refresh watch coverage for calendar {}: {err}",
                         cal.id
                     ));
                 }
@@ -247,38 +348,65 @@ pub async fn list_events(
     // Lease-miss path: merge ephemeral window rows the D1 write-through skipped.
     merge_ephemeral_window_events(&mut cached, ephemeral, start_rfc3339, end_rfc3339);
 
-    // Re-read calendars so the health envelope reflects dirty bumps / disables
-    // from this request. On re-read failure, fall back to the in-memory
-    // snapshot from the start of the request. Window path must not flip
+    // Health envelope: reuse the start-of-request calendars unless this
+    // request mutated them (dirty bump / disable / window fetch / import), in
+    // which case re-read so it reflects those writes. On re-read failure, fall
+    // back to the in-memory snapshot. Window path must not flip
     // ready / initial_sync_complete / sync_token.
-    let mut fresh = match calendars.list_by_user_id(user_id).await {
-        Ok(rows) => rows,
-        Err(_) => cals,
+    let mut fresh = if calendars_mutated {
+        match calendars.list_by_user_id(user_id).await {
+            Ok(rows) => rows,
+            Err(_) => cals,
+        }
+    } else {
+        cals
     };
     // Stamp sanitized watch coverage from live channel rows so GET is accurate
-    // after deploy (column defaults to `missing`). Best-effort persist; always
-    // stamp the in-memory row so the envelope is correct even if D1 write fails.
-    for cal in &mut fresh {
-        let channels = match watches.list_by_calendar_id(&cal.id).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                sync_errors.push(format!(
-                    "failed to list watch channels for calendar {}: {err}",
-                    cal.id
-                ));
-                continue;
+    // after deploy (column defaults to `missing`). The in-memory row is always
+    // stamped so the envelope is correct; D1 is written only when the value
+    // changed from what is stored (best-effort), so a steady-state GET does no
+    // writes. Cron / webhook paths persist coverage on their own schedule.
+    if channels_available {
+        let mut changed: Vec<(usize, &'static str)> = Vec::new();
+        for (index, cal) in fresh.iter_mut().enumerate() {
+            let relisted;
+            let channels: &[WatchChannel] = if channels_stale.contains(&cal.id) {
+                match watches.list_by_calendar_id(&cal.id).await {
+                    Ok(rows) => {
+                        relisted = rows;
+                        &relisted
+                    }
+                    Err(err) => {
+                        sync_errors.push(format!(
+                            "failed to list watch channels for calendar {}: {err}",
+                            cal.id
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                channels_by_calendar
+                    .get(&cal.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            };
+            let coverage = classify_watch_coverage(channels, now_unix).as_str();
+            if cal.watch_coverage != coverage {
+                cal.watch_coverage = coverage.to_string();
+                changed.push((index, coverage));
             }
-        };
-        let coverage = classify_watch_coverage(&channels, now_unix);
-        cal.watch_coverage = coverage.as_str().to_string();
-        if let Err(err) = calendars
-            .set_watch_coverage(&cal.id, coverage.as_str(), &now_rfc3339)
-            .await
-        {
-            sync_errors.push(format!(
-                "failed to persist watch coverage for calendar {}: {err}",
-                cal.id
-            ));
+        }
+        let persisted = futures::future::join_all(changed.iter().map(|(index, coverage)| {
+            calendars.set_watch_coverage(&fresh[*index].id, coverage, &now_rfc3339)
+        }))
+        .await;
+        for ((index, _), result) in changed.iter().zip(persisted) {
+            if let Err(err) = result {
+                sync_errors.push(format!(
+                    "failed to persist watch coverage for calendar {}: {err}",
+                    fresh[*index].id
+                ));
+            }
         }
     }
     let sync = events_sync_envelope(&fresh, now_unix);
@@ -295,6 +423,7 @@ pub async fn list_events(
         sync_errors,
         sync,
         source,
+        calendars: fresh,
     })
 }
 
@@ -324,17 +453,14 @@ pub async fn list_events_after_refresh_failure(
         );
     }
 
-    // Post-stamp snapshot for the envelope fallback.
-    let cals = calendars.list_by_user_id(user_id).await?;
+    // Post-stamp read: nothing mutates calendars after this, so it serves
+    // the envelope as well (no second read).
+    let fresh = calendars.list_by_user_id(user_id).await?;
 
     let cached = events
         .list_by_user_id_and_time_range(user_id, start_rfc3339, end_rfc3339)
         .await?;
 
-    let fresh = match calendars.list_by_user_id(user_id).await {
-        Ok(rows) => rows,
-        Err(_) => cals,
-    };
     let sync = events_sync_envelope(&fresh, now_unix);
 
     Ok(CalendarListOutput {
@@ -342,6 +468,7 @@ pub async fn list_events_after_refresh_failure(
         sync_errors,
         sync,
         source: "cache".to_string(),
+        calendars: fresh,
     })
 }
 

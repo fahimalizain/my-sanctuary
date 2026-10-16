@@ -45,6 +45,26 @@ test('shouldInvalidateCalendarOnOpen: always true', () => {
   assert.equal(shouldInvalidateCalendarOnOpen(), true);
 });
 
+test('shouldInvalidateCalendarOnOpen: first open skips only while events are in flight', () => {
+  assert.equal(
+    shouldInvalidateCalendarOnOpen({ firstOpen: true, eventsInFlight: true }),
+    false,
+  );
+  assert.equal(
+    shouldInvalidateCalendarOnOpen({ firstOpen: true, eventsInFlight: false }),
+    true,
+  );
+  // Reconnects always catch up, in flight or not.
+  assert.equal(
+    shouldInvalidateCalendarOnOpen({ firstOpen: false, eventsInFlight: true }),
+    true,
+  );
+  assert.equal(
+    shouldInvalidateCalendarOnOpen({ firstOpen: false, eventsInFlight: false }),
+    true,
+  );
+});
+
 test('shouldInvalidateCalendarOnMessage: calendar.changed with calendar_id', () => {
   const msg = parseRealtimeMessage(
     JSON.stringify({ type: 'calendar.changed', calendar_id: 'cal-1' }),

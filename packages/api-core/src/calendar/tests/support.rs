@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::calendar::apply::row_from_new_event;
@@ -253,6 +254,10 @@ pub(crate) struct FakeCalendarRepo {
     pub(crate) bump_dirty_by: Mutex<i64>,
     /// History of `expires_rfc3339` values passed to [`CalendarRepo::renew_lease`].
     pub(crate) renew_expiries: Mutex<Vec<String>>,
+    /// Count of `list_by_user_id` calls (GET round-trip budget tests).
+    pub(crate) list_by_user_id_calls: AtomicUsize,
+    /// Count of `set_watch_coverage` writes (GET must not write when unchanged).
+    pub(crate) watch_coverage_writes: AtomicUsize,
 }
 
 impl FakeCalendarRepo {
@@ -287,6 +292,8 @@ impl FakeCalendarRepo {
             bump_dirty_after_get_by_id: Mutex::new(None),
             bump_dirty_by: Mutex::new(1),
             renew_expiries: Mutex::new(Vec::new()),
+            list_by_user_id_calls: AtomicUsize::new(0),
+            watch_coverage_writes: AtomicUsize::new(0),
         }
     }
 
@@ -335,6 +342,7 @@ impl FakeCalendarRepo {
 #[async_trait::async_trait(?Send)]
 impl CalendarRepo for FakeCalendarRepo {
     async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
+        self.list_by_user_id_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .stored
             .lock()
@@ -777,6 +785,7 @@ impl CalendarRepo for FakeCalendarRepo {
         coverage: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
+        self.watch_coverage_writes.fetch_add(1, Ordering::SeqCst);
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
             if cal.deleted_at.is_none() {
@@ -1450,6 +1459,11 @@ pub(crate) struct FakeWatchChannelRepo {
     pub(crate) inserted: Mutex<Vec<NewWatchChannel>>,
     pub(crate) deleted_by_id: Mutex<Vec<String>>,
     pub(crate) deleted_by_calendar_id: Mutex<Vec<String>>,
+    /// Per-calendar list calls (`list_by_calendar_id` / `list_unexpired_*`):
+    /// GET events must use the one per-user query instead.
+    pub(crate) per_calendar_list_calls: AtomicUsize,
+    /// Count of `list_by_user_id` calls.
+    pub(crate) list_by_user_id_calls: AtomicUsize,
 }
 
 impl FakeWatchChannelRepo {
@@ -1459,6 +1473,8 @@ impl FakeWatchChannelRepo {
             inserted: Mutex::new(Vec::new()),
             deleted_by_id: Mutex::new(Vec::new()),
             deleted_by_calendar_id: Mutex::new(Vec::new()),
+            per_calendar_list_calls: AtomicUsize::new(0),
+            list_by_user_id_calls: AtomicUsize::new(0),
         }
     }
 
@@ -1468,6 +1484,8 @@ impl FakeWatchChannelRepo {
             inserted: Mutex::new(Vec::new()),
             deleted_by_id: Mutex::new(Vec::new()),
             deleted_by_calendar_id: Mutex::new(Vec::new()),
+            per_calendar_list_calls: AtomicUsize::new(0),
+            list_by_user_id_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -1507,6 +1525,7 @@ impl WatchChannelRepo for FakeWatchChannelRepo {
         &self,
         calendar_id: &str,
     ) -> Result<Vec<WatchChannel>, RepoError> {
+        self.per_calendar_list_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .stored
             .lock()
@@ -1515,6 +1534,12 @@ impl WatchChannelRepo for FakeWatchChannelRepo {
             .filter(|channel| channel.calendar_id == calendar_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_by_user_id(&self, _user_id: &str) -> Result<Vec<WatchChannel>, RepoError> {
+        // Fixtures are single-user; callers group by their own calendar ids.
+        self.list_by_user_id_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.stored.lock().unwrap().clone())
     }
 
     async fn list_all(&self) -> Result<Vec<WatchChannel>, RepoError> {
@@ -1526,6 +1551,7 @@ impl WatchChannelRepo for FakeWatchChannelRepo {
         calendar_id: &str,
         now_rfc3339: &str,
     ) -> Result<Vec<WatchChannel>, RepoError> {
+        self.per_calendar_list_calls.fetch_add(1, Ordering::SeqCst);
         // RFC 3339 UTC strings compare lexicographically (fixed width).
         Ok(self
             .stored
