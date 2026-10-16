@@ -15,7 +15,9 @@ import {
   isTapCreatePointer,
   resolveChipGesture,
   touchHandleGeometry,
+  type HandleRect,
   TOUCH_HANDLE_HIT_PX,
+  TOUCH_HANDLE_KNOB_PX,
   movedAllDayRange,
   movedEnough,
   movedRange,
@@ -585,23 +587,48 @@ test('resolveChipGesture: mouse/pen keep edge zones and body move', () => {
   }
 });
 
-test('touchHandleGeometry: tall chips straddle the edge symmetrically', () => {
-  const g = touchHandleGeometry(200);
-  assert.equal(g.hitInto, TOUCH_HANDLE_HIT_PX / 2);
-  assert.equal(g.knobShift, 0);
+function intersects(a: HandleRect, b: HandleRect): boolean {
+  return (
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+  );
+}
+
+test('touchHandleGeometry: no hit-box overlap, knobs belong to the chip', () => {
+  const half = TOUCH_HANDLE_KNOB_PX / 2;
+  for (const w of [45, 60, 110, 200]) {
+    for (const h of [15, 30, 45, 90]) {
+      const g = touchHandleGeometry(w, h);
+      const label = `w=${w} h=${h}`;
+      assert.ok(!intersects(g.start, g.end), `start/end ${label}`);
+      assert.ok(!intersects(g.start, g.move), `start/move ${label}`);
+      assert.ok(!intersects(g.end, g.move), `end/move ${label}`);
+      const chip = { x: 0, y: 0, w, h };
+      for (const [name, [cx, cy]] of Object.entries(g.knobs)) {
+        const knob = { x: cx - half, y: cy - half, w: half * 2, h: half * 2 };
+        assert.ok(intersects(knob, chip), `${name} knob touches chip ${label}`);
+        assert.ok(cx >= -half && cx <= w, `${name} knob x ${label}`);
+      }
+      // Top/bottom knobs sit at the horizontal middle of the chip.
+      assert.equal(g.knobs.start[0], w / 2);
+      assert.equal(g.knobs.end[0], w / 2);
+      // Each knob centre is inside its own hit box.
+      const inside = (r: HandleRect, [x, y]: [number, number]) =>
+        x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+      assert.ok(inside(g.start, g.knobs.start), `start knob in box ${label}`);
+      assert.ok(inside(g.end, g.knobs.end), `end knob in box ${label}`);
+      assert.ok(inside(g.move, g.knobs.move), `move knob in box ${label}`);
+    }
+  }
 });
 
-test('touchHandleGeometry: short chips never overlap top and bottom hits', () => {
-  for (const h of [15, 20, 30, 43, 44, 90]) {
-    const g = touchHandleGeometry(h);
-    // top hit ends at hitInto, bottom hit starts at h - hitInto.
-    assert.ok(g.hitInto <= h / 2);
-    assert.ok(h - g.hitInto >= g.hitInto);
-    assert.ok(g.knobShift >= 0);
-  }
-  assert.ok(touchHandleGeometry(15).knobShift > 0);
+test('touchHandleGeometry: tall wide chips straddle the edge symmetrically', () => {
+  const g = touchHandleGeometry(200, 200);
+  assert.equal(g.start.y + g.start.h, TOUCH_HANDLE_HIT_PX / 2);
+  assert.equal(Math.abs(g.knobs.start[1]), 0);
+  assert.equal(g.move.x + g.move.w, 18);
 });
 
 test('touchHandleGeometry: bad input is safe', () => {
-  assert.deepEqual(touchHandleGeometry(NaN).hitInto, 0);
+  const g = touchHandleGeometry(NaN, NaN);
+  assert.ok(Number.isFinite(g.start.x) && Number.isFinite(g.move.y));
 });

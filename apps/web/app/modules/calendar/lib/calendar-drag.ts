@@ -146,22 +146,66 @@ export function resolveChipGesture(
   return { kind, claimImmediately: isTouch, tapOnly: false };
 }
 
+export interface HandleRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface TouchHandleGeometry {
+  /** Hit boxes in chip-local px (origin = chip top-left). */
+  start: HandleRect;
+  end: HandleRect;
+  move: HandleRect;
+  /** Knob centres in chip-local px. */
+  knobs: {
+    start: [number, number];
+    end: [number, number];
+    move: [number, number];
+  };
+}
+
 /**
- * Vertical geometry of the top/bottom touch handles for a chip of
- * `chipHeight`. Each hit box reaches `hitInto` px inside the chip (never past
- * the midline, so short chips push them outward instead of overlapping), and
- * the knob centre sits `knobShift` px outside the edge (clamped so it still
- * straddles the edge).
+ * Chip-local geometry of the three touch handles.
+ * - start/end: centred on the chip's horizontal middle; each hit box reaches
+ *   at most to the chip midline, so short chips push knobs outward instead of
+ *   overlapping.
+ * - move: left edge, vertically centred. Where it could meet the start/end
+ *   boxes (short or narrow chips) it slides outside the left edge instead.
  */
-export function touchHandleGeometry(chipHeight: number): {
-  hitInto: number;
-  knobShift: number;
-} {
+export function touchHandleGeometry(
+  chipWidth: number,
+  chipHeight: number,
+): TouchHandleGeometry {
+  const w = Number.isFinite(chipWidth) ? Math.max(0, chipWidth) : 0;
   const h = Number.isFinite(chipHeight) ? Math.max(0, chipHeight) : 0;
-  const half = TOUCH_HANDLE_HIT_PX / 2;
-  const hitInto = Math.min(half, h / 2);
-  const knobShift = Math.min(half - hitInto, TOUCH_HANDLE_KNOB_PX / 2 - 4);
-  return { hitInto, knobShift };
+  const hit = TOUCH_HANDLE_HIT_PX;
+  const half = hit / 2;
+  const knob = TOUCH_HANDLE_KNOB_PX;
+  const into = Math.min(half, h / 2);
+  const shift = Math.min(half - into, knob / 2 - 4);
+
+  const midX = w / 2;
+  const start = { x: midX - half, y: into - hit, w: hit, h: hit };
+  const end = { x: midX - half, y: h - into, w: hit, h: hit };
+
+  // On tall chips the move box's vertical range clears start/end already.
+  const mayMeet = h < hit * 2;
+  const moveRight = mayMeet ? Math.min(18, start.x) : 18;
+  const move = { x: moveRight - hit, y: h / 2 - half, w: hit, h: hit };
+
+  return {
+    start,
+    end,
+    move,
+    knobs: {
+      start: [midX, -shift],
+      end: [midX, h + shift],
+      // Keep the knob straddling the left edge even when the hit box slid out.
+      move: [Math.max(moveRight - half, -(knob / 2 - 4)), h / 2],
+    },
+  };
 }
 
 /**

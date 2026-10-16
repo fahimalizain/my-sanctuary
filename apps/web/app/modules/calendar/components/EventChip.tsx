@@ -1,9 +1,16 @@
-import { memo, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  memo,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+} from 'react';
 import type { CalendarEvent } from '@/app/types';
 import { GripVertical } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import {
-  TOUCH_HANDLE_HIT_PX,
+  type HandleRect,
   TOUCH_HANDLE_KNOB_PX,
   touchHandleGeometry,
 } from '../lib/calendar-drag';
@@ -36,77 +43,70 @@ function TouchHandles({
   color: string;
   ink: string;
 }) {
-  const { hitInto, knobShift } = touchHandleGeometry(height);
-  const hit = TOUCH_HANDLE_HIT_PX;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const measure = () => setWidth(el.offsetWidth);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const g = touchHandleGeometry(width, height);
   const knob = TOUCH_HANDLE_KNOB_PX;
   const knobStyle = { backgroundColor: color, color: ink };
-  // Top/bottom sit right of the move handle so their hit boxes never overlap it.
-  const xStyle = { left: 'max(50%, 68px)', width: hit, marginLeft: -hit / 2 };
-  return (
-    <>
-      <div
-        data-resize="start"
-        className={cn('absolute z-[3] touch-none hidden', COARSE_BLOCK)}
-        style={{ ...xStyle, top: hitInto - hit, height: hit }}
-        aria-hidden
-      >
-        <span
-          className={knobClassName}
-          style={{
-            ...knobStyle,
-            width: knob,
-            height: knob,
-            left: (hit - knob) / 2,
-            top: hit - hitInto - knobShift - knob / 2,
-          }}
-        >
-          <span className="h-0.5 w-2.5 rounded-full bg-current" />
-        </span>
-      </div>
-      <div
-        data-resize="end"
-        className={cn('absolute z-[3] touch-none hidden', COARSE_BLOCK)}
-        style={{ ...xStyle, top: height - hitInto, height: hit }}
-        aria-hidden
-      >
-        <span
-          className={knobClassName}
-          style={{
-            ...knobStyle,
-            width: knob,
-            height: knob,
-            left: (hit - knob) / 2,
-            top: hitInto + knobShift - knob / 2,
-          }}
-        >
-          <span className="h-0.5 w-2.5 rounded-full bg-current" />
-        </span>
-      </div>
-      <div
-        data-move-handle
-        className={cn('absolute z-[3] touch-none hidden', COARSE_BLOCK)}
+  const handle = (
+    r: HandleRect,
+    [cx, cy]: [number, number],
+    attrs: Record<string, string | boolean>,
+    icon: ReactNode,
+  ) => (
+    <div
+      {...attrs}
+      className="pointer-events-auto absolute z-[3] touch-none"
+      style={{ left: r.x, top: r.y, width: r.w, height: r.h }}
+      aria-hidden
+    >
+      <span
+        className={knobClassName}
         style={{
-          left: -hit / 2 - 4,
-          top: height / 2 - hit / 2,
-          width: hit,
-          height: hit,
+          ...knobStyle,
+          width: knob,
+          height: knob,
+          left: cx - knob / 2 - r.x,
+          top: cy - knob / 2 - r.y,
         }}
-        aria-hidden
       >
-        <span
-          className={knobClassName}
-          style={{
-            ...knobStyle,
-            width: knob,
-            height: knob,
-            left: (hit - knob) / 2,
-            top: (hit - knob) / 2,
-          }}
-        >
-          <GripVertical className="h-3.5 w-3.5" />
-        </span>
-      </div>
-    </>
+        {icon}
+      </span>
+    </div>
+  );
+  const bar = <span className="h-0.5 w-2.5 rounded-full bg-current" />;
+  // Overlay matching the chip box; only the handles take pointers.
+  return (
+    <div
+      ref={rootRef}
+      className={cn(
+        'pointer-events-none absolute inset-0 hidden',
+        COARSE_BLOCK,
+      )}
+    >
+      {width > 0 && (
+        <>
+          {handle(g.start, g.knobs.start, { 'data-resize': 'start' }, bar)}
+          {handle(g.end, g.knobs.end, { 'data-resize': 'end' }, bar)}
+          {handle(
+            g.move,
+            g.knobs.move,
+            { 'data-move-handle': true },
+            <GripVertical className="h-3.5 w-3.5" />,
+          )}
+        </>
+      )}
+    </div>
   );
 }
 
