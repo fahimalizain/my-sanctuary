@@ -40,12 +40,13 @@ pub use agenda::{
 pub use calendar::{
     classify_operator_warning, create_event, decide_webhook, delete_event, delete_event_for_user,
     ensure_watch, is_public_https_callback, list_calendars, list_calendars_after_refresh_failure,
-    list_events, list_events_after_refresh_failure, mint_run_id, operator_warning_record,
+    list_events, list_events_after_refresh_failure, list_events_with_snapshot, load_list_snapshot,
+    mint_run_id, operator_warning_record,
     parse_event_time_range, patch_event, patch_event_fields, persist_webhook_decision,
     renew_watch_if_needed, repair_inflight_operations, replica_due, request_calendar_repair,
     run_fallback_cron, run_fallback_cron_with_clock, run_queue_sync, stop_watches_for_calendar,
     sync_calendar, sync_calendar_traced, tokens_match, update_event_for_user, CalendarError,
-    CalendarEventsResponse, CalendarListOutput, CalendarRepairResponse, CalendarRepairStatus,
+    CalendarEventsResponse, CalendarListOutput, ListSnapshot, CalendarRepairResponse, CalendarRepairStatus,
     CalendarSyncMessage, CalendarView, CalendarsResponse, CheckpointResult, CreateEventOutput,
     CreateEventResponse, CronReport, DeleteEventResponse, OperatorWarningLevel,
     OperatorWarningRecord, OperatorWarningThresholds, QueueSyncAction, QueueSyncReport,
@@ -64,7 +65,8 @@ pub use calendar_sync::{
 };
 pub use calendar_color::{
     calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
-    paint_events_for_user, CalendarEventView,
+    load_paint_taxonomy, paint_events_for_user, paint_events_with_taxonomy, CalendarEventView,
+    PaintTaxonomy,
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
@@ -143,7 +145,7 @@ pub use repo::{
     TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
     TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL,
-    WATCH_CHANNEL_LIST_ALL_SQL,
+    WATCH_CHANNEL_LIST_ALL_SQL, WATCH_CHANNEL_LIST_BY_USER_ID_SQL,
 };
 pub use tasks::{
     classify_title, complete_task, create_task, delete_task, delete_focus, discard_task,

@@ -606,3 +606,110 @@ fn list_events_envelope_json_never_leaks_channel_secrets() {
     assert!(!json.contains("lease_owner"), "{json}");
     assert!(json.contains("\"watch_coverage\""), "{json}");
 }
+
+// ──────────────────────────────────────────
+// GET events round-trip budget (perf)
+// ──────────────────────────────────────────
+
+/// Pure cache hit with a covered channel on every calendar: one calendars
+/// read, one channel read, the range query, and **zero writes** — no
+/// per-calendar channel lists, no coverage persist, no second calendars read.
+#[test]
+fn cache_hit_uses_one_read_per_table_and_no_writes() {
+    use std::sync::atomic::Ordering;
+
+    let covered_exp = unix_secs_to_rfc3339(NOW_UNIX + WATCH_RENEW_HORIZON_SECS + 60);
+    let mut cals = Vec::new();
+    let mut channels = Vec::new();
+    for n in 1..=3 {
+        let id = format!("cal-{n}");
+        let mut cal = calendar(&id, &format!("c{n}@example.com"), true);
+        cal.initial_sync_complete = true;
+        cal.last_synced_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+        cal.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+        cal.sync_status = "ready".to_string();
+        cal.watch_coverage = "covered".to_string(); // already persisted
+        cals.push(cal);
+        channels.push(watch_channel(&id, &covered_exp));
+    }
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(cals);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::with(channels);
+
+    let output = pollster::block_on(list_events(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        Some(CALLBACK_URL),
+    ))
+    .unwrap();
+
+    assert_eq!(output.source, "cache");
+    assert_eq!(output.calendars.len(), 3);
+    assert!(output
+        .sync
+        .calendars
+        .iter()
+        .all(|view| view.watch_coverage == WatchCoverage::Covered));
+    assert_eq!(calendars.list_by_user_id_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(watches.list_by_user_id_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(watches.per_calendar_list_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calendars.watch_coverage_writes.load(Ordering::SeqCst), 0);
+    assert_eq!(events.ranged.lock().unwrap().len(), 1);
+    assert!(
+        http.gets.lock().unwrap().is_empty() && http.posts.lock().unwrap().is_empty(),
+        "no Google HTTP on a cache hit"
+    );
+}
+
+/// Changed coverage is stamped in memory and persisted once; a second GET
+/// finds it already stored and writes nothing.
+#[test]
+fn coverage_is_persisted_only_when_it_changes() {
+    use std::sync::atomic::Ordering;
+
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.initial_sync_complete = true;
+    cal.last_synced_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.last_success_at = Some(unix_secs_to_rfc3339(NOW_UNIX - 60));
+    cal.sync_status = "ready".to_string();
+    let covered_exp = unix_secs_to_rfc3339(NOW_UNIX + WATCH_RENEW_HORIZON_SECS + 60);
+
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::with(vec![watch_channel("cal-1", &covered_exp)]);
+    let run = || {
+        pollster::block_on(list_events(
+            &http,
+            &calendars,
+            &events,
+            &watches,
+            &access(),
+            "u-1",
+            "2026-08-01T00:00:00Z",
+            "2026-09-01T00:00:00Z",
+            NOW_UNIX,
+            None,
+        ))
+        .unwrap()
+    };
+
+    let first = run();
+    assert_eq!(first.sync.calendars[0].watch_coverage, WatchCoverage::Covered);
+    assert_eq!(calendars.watch_coverage_writes.load(Ordering::SeqCst), 1);
+    let second = run();
+    assert_eq!(second.sync.calendars[0].watch_coverage, WatchCoverage::Covered);
+    assert_eq!(
+        calendars.watch_coverage_writes.load(Ordering::SeqCst),
+        1,
+        "unchanged coverage must not be rewritten on GET"
+    );
+}

@@ -377,6 +377,9 @@ pub trait WatchChannelRepo: Send + Sync {
     /// All channels for `calendar_id`. Many rows per calendar are expected:
     /// renewal overlaps two channels briefly (ADR 0001).
     async fn list_by_calendar_id(&self, calendar_id: &str) -> Result<Vec<WatchChannel>, RepoError>;
+    /// Every channel across the user's calendars (any expiry), oldest first.
+    /// One query replaces a `list_by_calendar_id` per calendar on GET events.
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<WatchChannel>, RepoError>;
     /// Every watch channel row (all calendars). Small table; personal app.
     /// Cron uses this to find leftover channels on disabled/soft-deleted
     /// calendars after a best-effort `channels.stop` failed.
@@ -1175,6 +1178,16 @@ pub const WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL: &str =
 
 pub const WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL: &str =
     "SELECT * FROM google_calendars_watch_channels WHERE calendar_id = ? ORDER BY created_at ASC";
+
+/// Every channel row of the user's calendars in one query (GET events needs
+/// all of them for ensure-watch + coverage). Soft-deleted calendars are not
+/// filtered here; callers group by their own loaded calendar ids.
+pub const WATCH_CHANNEL_LIST_BY_USER_ID_SQL: &str = "
+    SELECT w.* FROM google_calendars_watch_channels w
+    JOIN google_calendars c ON c.id = w.calendar_id
+    WHERE c.user_id = ?
+    ORDER BY w.created_at ASC
+";
 
 /// Every channel row. Small personal-app table; cron leftover-stop pass.
 pub const WATCH_CHANNEL_LIST_ALL_SQL: &str =
@@ -2284,6 +2297,7 @@ mod tests {
             WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL,
             WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
             WATCH_CHANNEL_LIST_ALL_SQL,
+            WATCH_CHANNEL_LIST_BY_USER_ID_SQL,
             WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
         ] {
             assert!(!sql.contains("deleted_at"), "{sql}");

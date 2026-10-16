@@ -34,7 +34,8 @@ use api_core::repo::{
     REPLICA_SEEN_INSERT_CHUNK_SIZE, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
     WATCH_CHANNEL_DELETE_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_DELETE_BY_ID_SQL,
     WATCH_CHANNEL_GET_BY_CHANNEL_ID_SQL, WATCH_CHANNEL_INSERT_SQL, WATCH_CHANNEL_LIST_ALL_SQL,
-    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
+    WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL, WATCH_CHANNEL_LIST_BY_USER_ID_SQL,
+    WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -873,6 +874,11 @@ impl WatchChannelRepo for SqliteWatchChannelRepo {
             WATCH_CHANNEL_LIST_BY_CALENDAR_ID_SQL,
             &[&calendar_id],
         )
+    }
+
+    async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<WatchChannel>, RepoError> {
+        let conn = lock(&self.db)?;
+        query_vec(&conn, WATCH_CHANNEL_LIST_BY_USER_ID_SQL, &[&user_id])
     }
 
     async fn list_all(&self) -> Result<Vec<WatchChannel>, RepoError> {

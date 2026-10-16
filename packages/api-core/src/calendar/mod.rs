@@ -225,7 +225,8 @@ pub struct CalendarsResponse {
 
 
 pub use list::{
-    list_events, list_events_after_refresh_failure, parse_event_time_range, CalendarListOutput,
+    list_events, list_events_after_refresh_failure, list_events_with_snapshot, load_list_snapshot,
+    ListSnapshot, parse_event_time_range, CalendarListOutput,
 };
 pub use write::{
     create_event, delete_event, delete_event_for_user, patch_event, patch_event_fields,
