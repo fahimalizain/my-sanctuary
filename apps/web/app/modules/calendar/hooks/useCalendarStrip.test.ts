@@ -71,6 +71,39 @@ function stubClientWidth(el: HTMLElement, width: number): void {
   });
 }
 
+/** jsdom has no Element.scrollTo; mirror the browser's write to scrollLeft. */
+function stubScrollTo(el: HTMLElement): number[] {
+  const calls: number[] = [];
+  Object.defineProperty(el, 'scrollTo', {
+    configurable: true,
+    value: (options: ScrollToOptions) => {
+      if (typeof options.left !== 'number') return;
+      calls.push(options.left);
+      el.scrollLeft = options.left;
+    },
+  });
+  return calls;
+}
+
+/**
+ * Real jsdom TouchEvent, so the hook's `e.touches.length` / `touches[0]` reads
+ * behave as they do in a browser. jsdom has no `Touch` constructor, so the
+ * points stay plain objects.
+ */
+function touchEvent(
+  type: 'touchstart' | 'touchmove' | 'touchend',
+  points: { clientX: number; clientY: number }[],
+): Event {
+  return new window.TouchEvent(type, {
+    touches: points as unknown as Touch[],
+  });
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
 /** Harness attaches strip refs and stubs a measured grid width before paint. */
 function StripHarness({
   onStrip,
@@ -209,4 +242,263 @@ test('useCalendarStrip: onScrollerScroll before measured park does not clobber v
   assert.ok(
     isSameDay(after.visibleStart, fitPeriodStart(new Date(), DAYS_PER_PERIOD)),
   );
+});
+
+// ── Touch axis lock ─────────────────────────────────────────────────────
+// A vertical swipe through the hours carries a small horizontal component.
+// With no axis lock the mandatory day snap pages to the neighbour column, so
+// the day is frozen for the gesture and corrected once it settles.
+
+test('useCalendarStrip: a vertical touch gesture holds the day, then restores it', async () => {
+  let latest: CalendarStrip | null = null;
+  const getLatest = (): CalendarStrip | null => latest;
+
+  await act(async () => {
+    render(
+      createElement(StripHarness, {
+        gridWidth: GRID_WIDTH,
+        onStrip: (s) => {
+          latest = s;
+        },
+      }),
+    );
+  });
+  // Let the init park land (measured colW).
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
+  const strip = getLatest();
+  assert.ok(strip);
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollToCalls = stubScrollTo(scroller!);
+
+  const left0 = scroller!.scrollLeft;
+  assert.ok(left0 > 0, 'init park should have scrolled the strip');
+  assert.equal(scroller!.style.scrollSnapType, '');
+
+  // One finger down, then a mostly-vertical drag: dy 60px, dx -6px. The
+  // sideways part is what used to page the day on iOS.
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 200, clientY: 300 }]),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 194, clientY: 360 }]),
+    );
+  });
+  assert.equal(
+    scroller!.style.scrollSnapType,
+    'none',
+    'a vertical gesture must suspend the day snap',
+  );
+
+  // The thumb drifts a whole column sideways while the finger is down.
+  scroller!.scrollLeft = left0 + strip.colW;
+  await act(async () => {
+    strip.onScrollerScroll();
+  });
+  const held = getLatest();
+  assert.ok(held);
+  assert.equal(
+    held.visibleStart.getTime(),
+    strip.visibleStart.getTime(),
+    'the visible day stays frozen at left0 while the axis lock holds',
+  );
+
+  // Finger up, then the scroll settles.
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', []));
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(new window.Event('scrollend'));
+  });
+
+  assert.deepEqual(scrollToCalls, [left0], 'restore exactly left0');
+  assert.equal(scroller!.scrollLeft, left0);
+  assert.equal(
+    scroller!.style.scrollSnapType,
+    '',
+    'snap re-engages once the drift is gone',
+  );
+});
+
+test('useCalendarStrip: settle falls back to the quiet period without scrollend', async () => {
+  // iOS Safari only recently shipped `scrollend`; the quiet timer must finish
+  // the gesture on its own.
+  let latest: CalendarStrip | null = null;
+  const getLatest = (): CalendarStrip | null => latest;
+
+  await act(async () => {
+    render(
+      createElement(StripHarness, {
+        gridWidth: GRID_WIDTH,
+        onStrip: (s) => {
+          latest = s;
+        },
+      }),
+    );
+  });
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
+  const strip = getLatest();
+  assert.ok(strip);
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollToCalls = stubScrollTo(scroller!);
+  const left0 = scroller!.scrollLeft;
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 200, clientY: 300 }]),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 198, clientY: 340 }]),
+    );
+  });
+  scroller!.scrollLeft = left0 + 40;
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', []));
+  });
+
+  // No restore while the settle is pending...
+  assert.deepEqual(scrollToCalls, []);
+  assert.equal(scroller!.style.scrollSnapType, 'none');
+
+  // ...and each scroll event restarts the quiet period (momentum).
+  await act(async () => {
+    scroller!.dispatchEvent(new window.Event('scroll'));
+  });
+  await act(async () => {
+    await sleep(250);
+  });
+
+  assert.deepEqual(scrollToCalls, [left0]);
+  assert.equal(scroller!.scrollLeft, left0);
+  assert.equal(scroller!.style.scrollSnapType, '');
+});
+
+test('useCalendarStrip: a horizontal touch gesture leaves native day paging alone', async () => {
+  let latest: CalendarStrip | null = null;
+  const getLatest = (): CalendarStrip | null => latest;
+
+  await act(async () => {
+    render(
+      createElement(StripHarness, {
+        gridWidth: GRID_WIDTH,
+        onStrip: (s) => {
+          latest = s;
+        },
+      }),
+    );
+  });
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
+  const strip = getLatest();
+  assert.ok(strip);
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollToCalls = stubScrollTo(scroller!);
+  const left0 = scroller!.scrollLeft;
+
+  // Clearly horizontal: dx 100px, dy 20px (5:1) → the browser pages the days.
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 200, clientY: 300 }]),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 300, clientY: 320 }]),
+    );
+  });
+  assert.equal(
+    scroller!.style.scrollSnapType,
+    '',
+    'a horizontal swipe must keep the day snap',
+  );
+
+  // The browser snapped onto the next column; no restore on lift.
+  scroller!.scrollLeft = left0 + strip.colW;
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', []));
+  });
+  await act(async () => {
+    await sleep(200);
+  });
+
+  assert.deepEqual(scrollToCalls, []);
+  assert.equal(scroller!.scrollLeft, left0 + strip.colW);
+});
+
+test('useCalendarStrip: drag taking the strip drops the axis lock without restoring', async () => {
+  let latest: CalendarStrip | null = null;
+  const getLatest = (): CalendarStrip | null => latest;
+
+  await act(async () => {
+    render(
+      createElement(StripHarness, {
+        gridWidth: GRID_WIDTH,
+        onStrip: (s) => {
+          latest = s;
+        },
+      }),
+    );
+  });
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+  });
+
+  const strip = getLatest();
+  assert.ok(strip);
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const scrollToCalls = stubScrollTo(scroller!);
+  const left0 = scroller!.scrollLeft;
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 200, clientY: 300 }]),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 196, clientY: 380 }]),
+    );
+  });
+  assert.equal(scroller!.style.scrollSnapType, 'none');
+  scroller!.scrollLeft = left0 + strip.colW;
+
+  // Drag claims the strip (long-press on a chip): the axis gesture is dropped,
+  // with no restore, so drag auto-scroll owns scrollLeft.
+  await act(async () => {
+    strip.lockStrip('drag');
+  });
+  await act(async () => {
+    await sleep(200);
+  });
+  assert.deepEqual(scrollToCalls, [], 'no restore under the drag owner');
+  assert.equal(scroller!.scrollLeft, left0 + strip.colW);
+
+  await act(async () => {
+    strip.unlockStrip('drag');
+  });
+  assert.equal(scroller!.style.scrollSnapType, '');
 });

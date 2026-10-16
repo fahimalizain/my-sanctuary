@@ -363,6 +363,37 @@ export function stripRebaseSuppressed(
   return held.has('drag') || held.has('pinch');
 }
 
+// ── Touch scroll axis ───────────────────────────────────────────────────
+
+/**
+ * Movement (px) a touch gesture must exceed before it commits to an axis.
+ * Below it the gesture stays `pending`, so a tap never claims a lock.
+ */
+export const SCROLL_AXIS_SLOP = 8;
+
+/** Committed gesture axis; `pending` until the slop is crossed. */
+export type ScrollAxis = 'pending' | 'x' | 'y';
+
+/**
+ * Dominant axis of a touch gesture from its displacement. iOS does not
+ * directional-lock a 2D overflow scroller, so a "vertical" swipe through the
+ * hours carries a little horizontal velocity and the mandatory day snap pages
+ * to a neighbouring column. This is the input to holding the day still.
+ *
+ * X is claimed only past 2:1 — a diagonal time-scroll must never change the
+ * day, while a clear horizontal swipe still pages.
+ */
+export function classifyScrollAxis(
+  dx: number,
+  dy: number,
+  slop: number = SCROLL_AXIS_SLOP,
+): ScrollAxis {
+  const adx = Math.abs(dx);
+  const ady = Math.abs(dy);
+  if (adx <= slop && ady <= slop) return 'pending';
+  return adx > ady * 2 ? 'x' : 'y';
+}
+
 /**
  * Notion-style day-range title (inclusive first…last):
  *   same day   → "Tue, Sep 8, 2026"

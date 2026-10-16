@@ -11,12 +11,14 @@ import {
   HOUR_H_BASE,
   HOUR_H_MAX,
   HOUR_H_MIN,
+  SCROLL_AXIS_SLOP,
   STRIP_OVERSCAN,
   STRIP_REBASE_THRESHOLD,
   TIME_GUTTER_W,
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
+  classifyScrollAxis,
   parseStoredPeriodLength,
   colWidth,
   dayIndexFromScroll,
@@ -423,6 +425,60 @@ test('strip lock: empty set means snap enabled and no suppression', () => {
   const held: ReadonlySet<StripLockReason> = new Set();
   assert.equal(stripSnapDisabled(held), false);
   assert.equal(stripRebaseSuppressed(held), false);
+});
+
+// ── classifyScrollAxis ──────────────────────────────────────────────────
+
+test('classifyScrollAxis: pending until the slop is exceeded', () => {
+  assert.equal(classifyScrollAxis(0, 0), 'pending');
+  assert.equal(classifyScrollAxis(4, -3), 'pending');
+  // Exactly at the slop is still pending: the gesture has not moved enough.
+  assert.equal(classifyScrollAxis(SCROLL_AXIS_SLOP, 0), 'pending');
+  assert.equal(classifyScrollAxis(0, SCROLL_AXIS_SLOP), 'pending');
+  assert.equal(
+    classifyScrollAxis(SCROLL_AXIS_SLOP, SCROLL_AXIS_SLOP),
+    'pending',
+  );
+});
+
+test('classifyScrollAxis: pure vertical commits to y', () => {
+  assert.equal(classifyScrollAxis(0, 24), 'y');
+  assert.equal(classifyScrollAxis(0, -24), 'y');
+});
+
+test('classifyScrollAxis: diagonal 1:1 commits to y', () => {
+  assert.equal(classifyScrollAxis(12, 12), 'y');
+  assert.equal(classifyScrollAxis(40, 40), 'y');
+});
+
+test('classifyScrollAxis: just under 2:1 stays vertical, past it goes x', () => {
+  assert.equal(classifyScrollAxis(19, 10), 'y');
+  assert.equal(classifyScrollAxis(21, 10), 'x');
+});
+
+test('classifyScrollAxis: an exact 2:1 tie stays vertical', () => {
+  // 2:1 is the boundary; `>` keeps the tie on the day-preserving side.
+  assert.equal(classifyScrollAxis(20, 10), 'y');
+  assert.equal(classifyScrollAxis(160, 80), 'y');
+});
+
+test('classifyScrollAxis: negative deltas are symmetric', () => {
+  assert.equal(classifyScrollAxis(-21, -10), 'x');
+  assert.equal(classifyScrollAxis(-19, -10), 'y');
+  assert.equal(classifyScrollAxis(21, -10), 'x');
+  assert.equal(classifyScrollAxis(-21, 10), 'x');
+  assert.equal(classifyScrollAxis(-12, 12), 'y');
+  assert.equal(classifyScrollAxis(0, -30), 'y');
+});
+
+test('classifyScrollAxis: custom slop', () => {
+  // Smaller slop: below it still pending, above it classified as usual.
+  assert.equal(classifyScrollAxis(2, 2, 2), 'pending');
+  assert.equal(classifyScrollAxis(3, 3, 2), 'y');
+  // Larger slop keeps a small move pending.
+  assert.equal(classifyScrollAxis(3, 3, 8), 'pending');
+  assert.equal(classifyScrollAxis(5, 2, 4), 'x');
+  assert.equal(classifyScrollAxis(2, 8, 6), 'y');
 });
 
 // ── clampMinutesToDay ───────────────────────────────────────────────────
