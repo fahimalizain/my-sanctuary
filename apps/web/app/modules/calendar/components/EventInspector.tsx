@@ -16,7 +16,7 @@ import {
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
-import { eventChipSelector } from '../lib/inspector-anchor';
+import { DESKTOP_MQ, eventChipSelector } from '../lib/inspector-anchor';
 import {
   allDayRangeToTimed,
   applyAllDayStartDate,
@@ -27,12 +27,11 @@ import {
   formatEventDateLine,
   formatEventDuration,
   formatEventTime,
+  formatEventTimeRange,
   timedRangeToAllDay,
   toDateInputValue,
   toTimeInputValue,
 } from '../lib/week-layout';
-
-const DESKTOP_MQ = '(min-width: 768px)';
 
 const FALLBACK_TIME_ZONES = [
   'UTC',
@@ -119,6 +118,12 @@ type ChipRect = {
   width: number;
   height: number;
 };
+
+/** Peek sheet height: ~10% of the viewport, never below a readable minimum. */
+const PEEK_HEIGHT = 'max(76px, 10dvh)';
+const PEEK_SWIPE_PX = 32;
+/** Room kept below the selected chip for its bottom touch handle. */
+const PEEK_HANDLE_CLEARANCE_PX = 32;
 
 function useIsDesktop(): boolean {
   const [isDesktop, setIsDesktop] = useState(
@@ -644,6 +649,11 @@ export function EventInspector({
   const isDesktop = useIsDesktop();
   const rect = useChipRect(event.id);
   const hidden = isDragging;
+  // Mobile drawer: new drafts open expanded (title focus); taps peek.
+  const [expanded, setExpanded] = useState(focusTitle);
+  const sheetRef = useRef<HTMLDivElement>(null);
+  const swipeStartYRef = useRef<number | null>(null);
+  const swipedRef = useRef(false);
   const writable = isCalendarWritable(calendar);
 
   // Sync local title when the selected event changes — but keep a dirty
@@ -670,6 +680,30 @@ export function EventInspector({
       titleRef.current?.select();
     }
   }, [focusTitle, event.id, writable]);
+
+  useEffect(() => {
+    setExpanded(focusTitle);
+  }, [event.id, focusTitle]);
+
+  // Keep the selected chip clear of the peek sheet (and its handles).
+  useEffect(() => {
+    if (isDesktop || expanded) return;
+    const raf = requestAnimationFrame(() => {
+      const chip = document.querySelector(eventChipSelector(event.id));
+      const scroller = document.querySelector('[data-calendar-scroller]');
+      const sheet = sheetRef.current;
+      if (!chip || !(scroller instanceof HTMLElement) || !sheet) return;
+      const c = chip.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      const overlap =
+        c.bottom + PEEK_HANDLE_CLEARANCE_PX - sheet.getBoundingClientRect().top;
+      if (overlap <= 0) return;
+      // Never scroll the chip's top out of view.
+      const room = Math.max(0, c.top - s.top - 8);
+      scroller.scrollTop += Math.min(overlap, room);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [isDesktop, expanded, event.id]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -867,26 +901,116 @@ export function EventInspector({
     );
   }
 
+  const isAllDay = event.is_all_day === true;
+  const peekWhen = isAllDay
+    ? formatEventDateLine(
+        civilDateFromAllDayIso(event.start_time) ?? new Date(event.start_time),
+        civilDateFromAllDayIso(event.end_time) ?? new Date(event.end_time),
+      )
+    : formatEventTimeRange(
+        new Date(event.start_time),
+        new Date(event.end_time),
+      );
+
+  // Wrapper ignores pointers so the calendar stays live above the peek; only
+  // the sheet (and, expanded, the backdrop) take them.
   return createPortal(
     <div
       className={cn(
-        'fixed inset-0 z-[60]',
-        hidden && 'invisible pointer-events-none',
+        'pointer-events-none fixed inset-0 z-[60]',
+        hidden && 'invisible',
       )}
       data-event-inspector
     >
       <button
         type="button"
-        className="absolute inset-0 bg-black/40"
-        aria-label="Close event details"
-        onClick={onClose}
+        tabIndex={expanded ? 0 : -1}
+        aria-hidden={!expanded}
+        className={cn(
+          'absolute inset-0 bg-black/40 transition-opacity motion-reduce:transition-none',
+          expanded ? 'pointer-events-auto opacity-100' : 'opacity-0',
+        )}
+        aria-label="Collapse event details"
+        onClick={() => setExpanded(false)}
       />
       <div
+        ref={sheetRef}
         role="dialog"
         aria-label="Event details"
-        className="absolute inset-x-0 bottom-0 max-h-[85dvh] rounded-t-2xl border-t border-border bg-cream shadow-lg flex flex-col"
+        className="pointer-events-auto absolute inset-x-0 bottom-0 flex flex-col overflow-hidden rounded-t-2xl border-t border-border bg-cream shadow-lg transition-[max-height] duration-200 ease-out motion-reduce:transition-none"
+        style={{
+          maxHeight: expanded
+            ? '85dvh'
+            : `calc(${PEEK_HEIGHT} + env(safe-area-inset-bottom))`,
+        }}
       >
-        {form}
+        {!expanded && (
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              aria-label="Expand event details"
+              aria-expanded={false}
+              className="flex w-full touch-none flex-col items-stretch px-4 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-2 pr-12 text-left"
+              style={{
+                minHeight: `calc(${PEEK_HEIGHT} + env(safe-area-inset-bottom))`,
+              }}
+              onPointerDown={(e) => {
+                swipeStartYRef.current = e.clientY;
+                swipedRef.current = false;
+              }}
+              onPointerUp={(e) => {
+                const start = swipeStartYRef.current;
+                swipeStartYRef.current = null;
+                if (start === null) return;
+                const dy = e.clientY - start;
+                if (dy < -PEEK_SWIPE_PX) {
+                  swipedRef.current = true;
+                  setExpanded(true);
+                } else if (dy > PEEK_SWIPE_PX) {
+                  swipedRef.current = true;
+                  onClose();
+                }
+              }}
+              onClick={() => {
+                if (swipedRef.current) {
+                  swipedRef.current = false;
+                  return;
+                }
+                setExpanded(true);
+              }}
+            >
+              <span
+                className="mx-auto mb-2 h-1 w-10 shrink-0 rounded-full bg-muted-foreground/40"
+                aria-hidden
+              />
+              <span className="truncate text-sm font-semibold text-foreground">
+                {title.trim() || 'New event'}
+              </span>
+              <span className="truncate text-xs tabular-nums text-muted-foreground">
+                {peekWhen}
+              </span>
+            </button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="absolute right-1 top-2 h-8 w-8"
+              onClick={onClose}
+              aria-label="Close event details"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
+        {/* Stays mounted while peeking so unsaved edits and focus survive. */}
+        <div
+          className={cn(
+            'min-h-0 flex-1 flex-col',
+            expanded ? 'flex' : 'hidden',
+          )}
+        >
+          {form}
+        </div>
       </div>
     </div>,
     document.body,

@@ -603,6 +603,8 @@ test('read-only reader and freeBusyReader: static title/description/when, no Del
         description: 'Secret notes',
       }),
       calendar: makeCalendar({ access_role: role }),
+      // Expanded drawer: the peek bar would repeat the title text.
+      focusTitle: true,
     });
     // Title text visible, no Title input.
     assert.ok(screen.getByText('Locked event'));
@@ -645,4 +647,35 @@ test('data-event-inspector present on mobile and desktop shells', () => {
   setMatchMediaDesktop(true);
   mount({ event: makeEvent({ id: 'desktop-shell' }) });
   assert.ok(document.querySelector('[data-event-inspector]'));
+});
+
+// ── Mobile peek drawer ──────────────────────────────────────────────────
+
+test('mobile: taps open a peek with no backdrop capture; expand, collapse, close', () => {
+  const spies = makeSpies();
+  mount({ focusTitle: false }, spies);
+  const peek = screen.getByLabelText('Expand event details');
+  assert.equal(peek.getAttribute('aria-expanded'), 'false');
+  const wrapper = document.querySelector('[data-event-inspector]');
+  assert.ok(wrapper?.className.includes('pointer-events-none'));
+
+  fireEvent.click(peek);
+  assert.equal(screen.queryByLabelText('Expand event details'), null);
+
+  // Backdrop collapses back to peek; it does not close.
+  fireEvent.click(screen.getByLabelText('Collapse event details'));
+  assert.equal(spies.closeCalls.length, 0);
+  assert.ok(screen.getByLabelText('Expand event details'));
+
+  fireEvent.click(screen.getByLabelText('Close event details'));
+  assert.equal(spies.closeCalls.length, 1);
+
+  fireEvent.click(peek);
+  fireEvent.click(screen.getByLabelText('Close inspector'));
+  assert.equal(spies.closeCalls.length, 2);
+});
+
+test('mobile: new drafts (focusTitle) open expanded', () => {
+  mount({ focusTitle: true });
+  assert.equal(screen.queryByLabelText('Expand event details'), null);
 });

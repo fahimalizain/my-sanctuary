@@ -31,6 +31,7 @@ import {
 } from '../lib/calendar-model';
 import { hourLabelStep } from '../lib/calendar-zoom';
 import { isPersistableDraftTitle } from '../lib/event-draft';
+import { DESKTOP_MQ } from '../lib/inspector-anchor';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
 import { repairCalendar } from '@/lib/api/calendar';
 import {
@@ -1083,10 +1084,21 @@ export function useCalendarSession({
     }
   }, [discardUnpersistedDraft]);
 
+  // Mobile drawer peeks without a backdrop, so the first empty tap closes the
+  // selection instead of creating (the next tap with nothing selected creates).
+  const closeSelectionOnMobile = () => {
+    if (!selectedEventId || window.matchMedia(DESKTOP_MQ).matches) return false;
+    closeInspector();
+    return true;
+  };
+
   const drag = useCalendarDrag({
     hourH,
     setStripLocked,
-    onClickCreate: (slot) => beginDraft(clickCreateTimesFromSlot(slot)),
+    onClickCreate: (slot) => {
+      if (closeSelectionOnMobile()) return;
+      beginDraft(clickCreateTimesFromSlot(slot));
+    },
     onDragCreate: beginDraft,
     onMove: handleMoveOrResize,
     onResize: handleMoveOrResize,
