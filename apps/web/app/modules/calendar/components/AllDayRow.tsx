@@ -6,6 +6,8 @@ import {
   contrastingInk,
   isWeekend,
   hexToRgba,
+  formatEventDateLine,
+  lastOccupiedCivilDate,
 } from '../lib/week-layout';
 import { cn } from '@/lib/utils';
 
@@ -47,6 +49,8 @@ export interface AllDayPreview {
   endDay: number;
   color?: string;
   title?: string;
+  /** Previewed range, for the date label. */
+  range?: { start: Date; end: Date } | null;
 }
 
 export interface AllDayRowProps {
@@ -230,6 +234,17 @@ export function AllDayRow({
                 >
                   <div className="truncate text-[11px] font-medium leading-[17px]">
                     {preview.title ?? ''}
+                    {preview.range && (
+                      <span className="ml-1.5 text-[10px] font-normal tabular-nums opacity-80">
+                        {formatEventDateLine(
+                          preview.range.start,
+                          lastOccupiedCivilDate(
+                            preview.range.start,
+                            preview.range.end,
+                          ),
+                        )}
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>

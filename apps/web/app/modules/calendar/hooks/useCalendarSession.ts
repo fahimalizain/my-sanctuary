@@ -21,6 +21,7 @@ import { useCalendarEventsQueue } from '../events-context';
 import {
   allDayPreviewIndices,
   timedPreviewSegments,
+  type DragPreviewInfo,
   type TimedRange,
 } from '../lib/calendar-drag';
 import {
@@ -31,7 +32,14 @@ import {
 } from '../lib/calendar-model';
 import { hourLabelStep } from '../lib/calendar-zoom';
 import { isPersistableDraftTitle } from '../lib/event-draft';
+import { DESKTOP_MQ } from '../lib/inspector-anchor';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
+import {
+  buildDraftFlushPatch,
+  EventPatchQueue,
+  revertFailedPatch,
+  type EventPatchQueueHandlers,
+} from '../lib/event-patch-queue';
 import { repairCalendar } from '@/lib/api/calendar';
 import {
   repairTargetCalendarId,
@@ -180,6 +188,60 @@ export function useCalendarSession({
     setWriteError(base);
   }, []);
 
+  // Per-event PATCH chain shared by inspector edits, drag move/resize and the
+  // temp-id create flush. Handlers are re-bound each render through a ref so
+  // the queue instance (and its pending state) outlives renders.
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
+  const patchSyncRef = useRef<EventPatchQueueHandlers | null>(null);
+  patchSyncRef.current = {
+    send: async (id, input) => {
+      const result = await updateEvent.mutateAsync({ id, input });
+      return result.event;
+    },
+    onSuccess: (id, _sent, event, idle) => {
+      upsertCalendarEventInCache(event);
+      // Later patches are still queued: keep the overlay painted over them.
+      if (!idle) return;
+      const latest = queue.getOverlay(id);
+      if (
+        !latest ||
+        (latest.op === 'upsert' &&
+          overlayMatchesServerEvent(latest.event, event))
+      ) {
+        queue.clear(id);
+      }
+    },
+    onError: (id, sent, err, idle) => {
+      const latest = queue.getOverlay(id);
+      if (latest?.op === 'upsert') {
+        // Revert only the failed fields, and only those not superseded by a
+        // newer edit, back to the last known server row.
+        const base = eventsRef.current.find((e) => e.id === id);
+        if (!base) {
+          if (idle) queue.clear(id);
+        } else {
+          const reverted = revertFailedPatch(latest.event, base, sent);
+          if (idle && overlayMatchesServerEvent(reverted, base)) {
+            queue.clear(id);
+          } else if (!overlayMatchesServerEvent(reverted, latest.event)) {
+            queue.upsert(reverted);
+          }
+        }
+      }
+      reportWriteError("Couldn't save event", err);
+    },
+  };
+  const patchQueueRef = useRef<EventPatchQueue | null>(null);
+  if (!patchQueueRef.current) {
+    patchQueueRef.current = new EventPatchQueue({
+      send: (id, input) => patchSyncRef.current!.send(id, input),
+      onSuccess: (...args) => patchSyncRef.current!.onSuccess(...args),
+      onError: (...args) => patchSyncRef.current!.onError(...args),
+    });
+  }
+  const patchQueue = patchQueueRef.current;
+
   const writableCalendar = useMemo(
     () => defaultWritableCalendar(calendars),
     [calendars],
@@ -293,9 +355,6 @@ export function useCalendarSession({
     const postedDescription = event.description ?? '';
     const startIso = event.start_time;
     const endIso = event.end_time;
-    // Create API is timed dateTimes only; all-day / zone flush after create.
-    const postedAllDay = false;
-    const postedZone = '';
 
     draftPersistStartedRef.current.add(tempId);
     clearWriteError();
@@ -343,27 +402,19 @@ export function useCalendarSession({
           // field PATCH first, then calendar MOVE (cannot combine).
           if (after.op === 'upsert') {
             const local = after.event;
-            const titleDiffers = local.title !== postedSummary;
-            const descriptionDiffers =
-              (local.description ?? '') !== postedDescription;
-            const startDiffers = local.start_time !== startIso;
-            const endDiffers = local.end_time !== endIso;
-            const allDayDiffers = Boolean(local.is_all_day) !== postedAllDay;
-            const zoneDiffers =
-              (local.start_time_zone?.trim() || '') !== postedZone;
-            const calendarDiffers =
-              local.calendar_id !== result.event.calendar_id;
+            const flush = buildDraftFlushPatch({
+              posted: {
+                summary: postedSummary,
+                description: postedDescription,
+                start: startIso,
+                end: endIso,
+              },
+              local,
+              serverCalendarId: result.event.calendar_id,
+            });
 
-            if (
-              titleDiffers ||
-              descriptionDiffers ||
-              startDiffers ||
-              endDiffers ||
-              allDayDiffers ||
-              zoneDiffers ||
-              calendarDiffers
-            ) {
-              const merged: CalendarEvent = {
+            if (flush) {
+              queue.upsert({
                 ...result.event,
                 title: local.title,
                 description: local.description,
@@ -374,137 +425,10 @@ export function useCalendarSession({
                 end_time_zone: local.end_time_zone,
                 calendar_id: local.calendar_id,
                 color: local.color ?? colorForCalendar(local.calendar_id),
-              };
-              queue.upsert(merged);
-
-              const fieldInput: {
-                summary?: string;
-                description?: string;
-                start?: string;
-                end?: string;
-                is_all_day?: boolean;
-                start_time_zone?: string;
-              } = {};
-              if (titleDiffers) fieldInput.summary = local.title;
-              if (descriptionDiffers) {
-                fieldInput.description = local.description ?? '';
-              }
-              // All-day conversion always needs start/end + flag together.
-              if (allDayDiffers || startDiffers || endDiffers || zoneDiffers) {
-                fieldInput.start = local.start_time;
-                fieldInput.end = local.end_time;
-                if (allDayDiffers || local.is_all_day) {
-                  fieldInput.is_all_day = Boolean(local.is_all_day);
-                }
-                const zone = local.start_time_zone?.trim() || '';
-                if (zone && !local.is_all_day) {
-                  fieldInput.start_time_zone = zone;
-                }
-              }
-
-              const serverId = result.event.id;
-              const hasFieldPatch = Object.keys(fieldInput).length > 0;
-
-              const overlayMatchesLocal = (ev: CalendarEvent) =>
-                ev.title === local.title &&
-                ev.description === local.description &&
-                ev.start_time === local.start_time &&
-                ev.end_time === local.end_time &&
-                Boolean(ev.is_all_day) === Boolean(local.is_all_day) &&
-                (ev.start_time_zone?.trim() || '') ===
-                  (local.start_time_zone?.trim() || '') &&
-                ev.calendar_id === local.calendar_id;
-
-              const overlayMatchesServer = (
-                ev: CalendarEvent,
-                server: CalendarEvent,
-              ) =>
-                ev.title === server.title &&
-                ev.description === server.description &&
-                ev.start_time === server.start_time &&
-                ev.end_time === server.end_time &&
-                Boolean(ev.is_all_day) === Boolean(server.is_all_day) &&
-                (ev.start_time_zone?.trim() || '') ===
-                  (server.start_time_zone?.trim() || '') &&
-                ev.calendar_id === server.calendar_id;
-
-              const flushMove = () => {
-                if (!calendarDiffers) {
-                  const patchAfter = queue.getOverlay(serverId);
-                  if (
-                    !patchAfter ||
-                    (patchAfter.op === 'upsert' &&
-                      overlayMatchesLocal(patchAfter.event))
-                  ) {
-                    // Fields already match server after create; clear if no move.
-                    if (!hasFieldPatch) queue.clear(serverId);
-                  }
-                  return;
-                }
-                void updateEvent
-                  .mutateAsync({
-                    id: serverId,
-                    input: { calendar_id: local.calendar_id },
-                  })
-                  .then((moveResult) => {
-                    upsertCalendarEventInCache(moveResult.event);
-                    const patchAfter = queue.getOverlay(serverId);
-                    if (
-                      !patchAfter ||
-                      (patchAfter.op === 'upsert' &&
-                        overlayMatchesServer(
-                          patchAfter.event,
-                          moveResult.event,
-                        ))
-                    ) {
-                      queue.clear(serverId);
-                    }
-                  })
-                  .catch((err: unknown) => {
-                    const patchAfter = queue.getOverlay(serverId);
-                    if (
-                      patchAfter?.op === 'upsert' &&
-                      overlayMatchesLocal(patchAfter.event)
-                    ) {
-                      queue.clear(serverId);
-                    }
-                    reportWriteError("Couldn't save event", err);
-                  });
-              };
-
-              if (hasFieldPatch) {
-                void updateEvent
-                  .mutateAsync({ id: serverId, input: fieldInput })
-                  .then((patchResult) => {
-                    upsertCalendarEventInCache(patchResult.event);
-                    const patchAfter = queue.getOverlay(serverId);
-                    // Keep overlay if calendar still differs or newer edits.
-                    if (
-                      !calendarDiffers &&
-                      (!patchAfter ||
-                        (patchAfter.op === 'upsert' &&
-                          overlayMatchesServer(
-                            patchAfter.event,
-                            patchResult.event,
-                          )))
-                    ) {
-                      queue.clear(serverId);
-                    }
-                    flushMove();
-                  })
-                  .catch((err: unknown) => {
-                    const patchAfter = queue.getOverlay(serverId);
-                    if (
-                      patchAfter?.op === 'upsert' &&
-                      overlayMatchesLocal(patchAfter.event)
-                    ) {
-                      queue.clear(serverId);
-                    }
-                    reportWriteError("Couldn't save event", err);
-                  });
-              } else {
-                flushMove();
-              }
+              });
+              // Same per-event chain as inspector edits: field PATCH first,
+              // then calendar MOVE, ahead of any later edit.
+              patchQueue.enqueue(result.event.id, flush);
             }
           }
         },
@@ -530,13 +454,13 @@ export function useCalendarSession({
     createEvent,
     deleteEvent,
     queue,
+    patchQueue,
     reportWriteError,
-    updateEvent,
     setDraftId,
   ]);
 
   const handleSaveTitle = useCallback(
-    async (summary: string) => {
+    (summary: string) => {
       if (!selectedEventId) return;
       const current = overlaidEvents.find((e) => e.id === selectedEventId);
       if (!current) return;
@@ -558,43 +482,21 @@ export function useCalendarSession({
       // Temp id with POST in flight — create onSuccess will flush the title.
       if (isTempEventId(selectedEventId)) return;
 
-      try {
-        const result = await updateEvent.mutateAsync({
-          id: selectedEventId,
-          input: { summary },
-        });
-        upsertCalendarEventInCache(result.event);
-        const latest = queue.getOverlay(selectedEventId);
-        if (
-          !latest ||
-          (latest.op === 'upsert' &&
-            overlayMatchesServerEvent(latest.event, result.event))
-        ) {
-          queue.clear(selectedEventId);
-        }
-      } catch (err) {
-        // Revert only if overlay was not superseded by a newer edit.
-        const latest = queue.getOverlay(selectedEventId);
-        if (latest?.op === 'upsert' && latest.event.title === summary) {
-          queue.clear(selectedEventId);
-        }
-        reportWriteError("Couldn't save event", err);
-      }
+      patchQueue.enqueue(selectedEventId, { summary });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      updateEvent,
+      patchQueue,
       persistDraft,
       clearWriteError,
-      reportWriteError,
     ],
   );
 
   const handleSaveDescription = useCallback(
-    async (description: string) => {
+    (description: string) => {
       if (!selectedEventId) return;
       const current = overlaidEvents.find((e) => e.id === selectedEventId);
       if (!current) return;
@@ -618,46 +520,21 @@ export function useCalendarSession({
       // Temp id with POST in flight — create onSuccess will flush description.
       if (isTempEventId(selectedEventId)) return;
 
-      try {
-        const result = await updateEvent.mutateAsync({
-          id: selectedEventId,
-          input: { description },
-        });
-        upsertCalendarEventInCache(result.event);
-        const latest = queue.getOverlay(selectedEventId);
-        if (
-          !latest ||
-          (latest.op === 'upsert' &&
-            overlayMatchesServerEvent(latest.event, result.event))
-        ) {
-          queue.clear(selectedEventId);
-        }
-      } catch (err) {
-        // Revert only if overlay was not superseded by a newer edit.
-        const latest = queue.getOverlay(selectedEventId);
-        if (
-          latest?.op === 'upsert' &&
-          latest.event.description === description
-        ) {
-          queue.clear(selectedEventId);
-        }
-        reportWriteError("Couldn't save event", err);
-      }
+      patchQueue.enqueue(selectedEventId, { description });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      updateEvent,
+      patchQueue,
       persistDraft,
       clearWriteError,
-      reportWriteError,
     ],
   );
 
   const handleSaveCalendar = useCallback(
-    async (calendarId: string) => {
+    (calendarId: string) => {
       if (!selectedEventId) return;
       const current = overlaidEvents.find((e) => e.id === selectedEventId);
       if (!current) return;
@@ -690,40 +567,15 @@ export function useCalendarSession({
         return;
       }
 
-      try {
-        const result = await updateEvent.mutateAsync({
-          id: selectedEventId,
-          input: { calendar_id: calendarId },
-        });
-        upsertCalendarEventInCache(result.event);
-        const latest = queue.getOverlay(selectedEventId);
-        if (
-          !latest ||
-          (latest.op === 'upsert' &&
-            overlayMatchesServerEvent(latest.event, result.event))
-        ) {
-          queue.clear(selectedEventId);
-        }
-      } catch (err) {
-        // Revert only if overlay still matches this move.
-        const latest = queue.getOverlay(selectedEventId);
-        if (
-          latest?.op === 'upsert' &&
-          latest.event.calendar_id === calendarId
-        ) {
-          queue.clear(selectedEventId);
-        }
-        reportWriteError("Couldn't save event", err);
-      }
+      patchQueue.enqueue(selectedEventId, { calendar_id: calendarId });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      updateEvent,
+      patchQueue,
       clearWriteError,
-      reportWriteError,
     ],
   );
 
@@ -740,6 +592,7 @@ export function useCalendarSession({
       id === unpersistedDraftIdRef.current ||
       id === unpersistedDraftId
     ) {
+      patchQueue.cancel(id);
       queue.clear(id);
       if (unpersistedDraftIdRef.current === id || unpersistedDraftId === id) {
         setDraftId(null);
@@ -749,7 +602,9 @@ export function useCalendarSession({
       return;
     }
 
-    // Chip gone now; close inspector immediately.
+    // Chip gone now; close inspector immediately. Cancel queued/in-flight
+    // PATCHes so they neither 404 nor resurrect the row in the cache.
+    patchQueue.cancel(id);
     queue.remove(id);
     setSelectedEventId(null);
     setFocusTitleOnOpen(false);
@@ -767,6 +622,7 @@ export function useCalendarSession({
     selectedEventId,
     unpersistedDraftId,
     queue,
+    patchQueue,
     deleteEvent,
     setDraftId,
     clearWriteError,
@@ -867,45 +723,12 @@ export function useCalendarSession({
       // Temp events have no server row — create onSuccess will flush times.
       if (isTempEventId(eventId)) return;
 
-      void updateEvent
-        .mutateAsync({
-          id: eventId,
-          input: { start: next.start_time, end: next.end_time },
-        })
-        .then((result) => {
-          upsertCalendarEventInCache(result.event);
-          // Reconcile THIS event only: drop overlay if it still matches the
-          // response (a newer upsert for the same id must stay).
-          const latest = queue.getOverlay(eventId);
-          if (
-            !latest ||
-            (latest.op === 'upsert' &&
-              overlayMatchesServerEvent(latest.event, result.event))
-          ) {
-            queue.clear(eventId);
-          }
-        })
-        .catch((err: unknown) => {
-          // Revert only if overlay was not superseded by a newer drag.
-          const latest = queue.getOverlay(eventId);
-          if (
-            latest?.op === 'upsert' &&
-            latest.event.start_time === next.start_time &&
-            latest.event.end_time === next.end_time
-          ) {
-            queue.clear(eventId);
-          }
-          reportWriteError("Couldn't save event", err);
-        });
+      patchQueue.enqueue(eventId, {
+        start: next.start_time,
+        end: next.end_time,
+      });
     },
-    [
-      overlaidEvents,
-      events,
-      queue,
-      updateEvent,
-      clearWriteError,
-      reportWriteError,
-    ],
+    [overlaidEvents, events, queue, patchQueue, clearWriteError],
   );
 
   /** Inspector time/date edits — same overlay + PATCH path as drag/resize. */
@@ -948,47 +771,19 @@ export function useCalendarSession({
         return;
       }
 
-      void updateEvent
-        .mutateAsync({
-          id: selectedEventId,
-          input: {
-            is_all_day: next.isAllDay,
-            start: next.startIso,
-            end: next.endIso,
-          },
-        })
-        .then((result) => {
-          upsertCalendarEventInCache(result.event);
-          const latest = queue.getOverlay(selectedEventId);
-          if (
-            !latest ||
-            (latest.op === 'upsert' &&
-              overlayMatchesServerEvent(latest.event, result.event))
-          ) {
-            queue.clear(selectedEventId);
-          }
-        })
-        .catch((err: unknown) => {
-          const latest = queue.getOverlay(selectedEventId);
-          if (
-            latest?.op === 'upsert' &&
-            Boolean(latest.event.is_all_day) === next.isAllDay &&
-            latest.event.start_time === next.startIso &&
-            latest.event.end_time === next.endIso
-          ) {
-            queue.clear(selectedEventId);
-          }
-          reportWriteError("Couldn't save event", err);
-        });
+      patchQueue.enqueue(selectedEventId, {
+        is_all_day: next.isAllDay,
+        start: next.startIso,
+        end: next.endIso,
+      });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      updateEvent,
+      patchQueue,
       clearWriteError,
-      reportWriteError,
     ],
   );
 
@@ -1019,56 +814,21 @@ export function useCalendarSession({
         return;
       }
 
-      const input: {
-        start: string;
-        end: string;
-        start_time_zone?: string;
-      } = {
+      // Empty zone = Local: queue keeps '' so it supersedes an earlier pending
+      // zone, and the wire request omits timeZone on Google.
+      patchQueue.enqueue(selectedEventId, {
         start: startIso,
         end: endIso,
-      };
-      // Empty zone = Local: send start+end only (omit timeZone on Google).
-      if (zone) {
-        input.start_time_zone = zone;
-      }
-
-      void updateEvent
-        .mutateAsync({
-          id: selectedEventId,
-          input,
-        })
-        .then((result) => {
-          upsertCalendarEventInCache(result.event);
-          const latest = queue.getOverlay(selectedEventId);
-          if (
-            !latest ||
-            (latest.op === 'upsert' &&
-              overlayMatchesServerEvent(latest.event, result.event))
-          ) {
-            queue.clear(selectedEventId);
-          }
-        })
-        .catch((err: unknown) => {
-          const latest = queue.getOverlay(selectedEventId);
-          if (
-            latest?.op === 'upsert' &&
-            (latest.event.start_time_zone?.trim() || '') === zone &&
-            latest.event.start_time === startIso &&
-            latest.event.end_time === endIso
-          ) {
-            queue.clear(selectedEventId);
-          }
-          reportWriteError("Couldn't save event", err);
-        });
+        start_time_zone: zone,
+      });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      updateEvent,
+      patchQueue,
       clearWriteError,
-      reportWriteError,
     ],
   );
 
@@ -1083,14 +843,29 @@ export function useCalendarSession({
     }
   }, [discardUnpersistedDraft]);
 
+  // Mobile drawer peeks without a backdrop, so the first empty tap closes the
+  // selection instead of creating (the next tap with nothing selected creates).
+  const closeSelectionOnMobile = () => {
+    if (!selectedEventId || window.matchMedia(DESKTOP_MQ).matches) return false;
+    closeInspector();
+    return true;
+  };
+
   const drag = useCalendarDrag({
     hourH,
     setStripLocked,
-    onClickCreate: (slot) => beginDraft(clickCreateTimesFromSlot(slot)),
+    onClickCreate: (slot) => {
+      if (closeSelectionOnMobile()) return;
+      beginDraft(clickCreateTimesFromSlot(slot));
+    },
     onDragCreate: beginDraft,
     onMove: handleMoveOrResize,
     onResize: handleMoveOrResize,
     onAllDayCreate: beginDraft,
+    onAllDayTapCreate: (range) => {
+      if (closeSelectionOnMobile()) return;
+      beginDraft(range);
+    },
     onChipTap: selectEvent,
     onEmptyClick: handleEmptyClick,
   });
@@ -1135,6 +910,18 @@ export function useCalendarSession({
     [drag.preview, drag.previewZone, days, hourH],
   );
 
+  const previewInfo = useMemo<DragPreviewInfo | null>(
+    () =>
+      drag.preview && drag.previewKind && drag.previewPointerType
+        ? {
+            range: drag.preview,
+            kind: drag.previewKind,
+            pointerType: drag.previewPointerType,
+          }
+        : null,
+    [drag.preview, drag.previewKind, drag.previewPointerType],
+  );
+
   const activeDragEvent = drag.activeEventId
     ? overlaidEvents.find((e) => e.id === drag.activeEventId)
     : undefined;
@@ -1148,7 +935,12 @@ export function useCalendarSession({
   const allDayPreview = useMemo(() => {
     const idx = allDayPreviewIndices(drag.preview, drag.previewZone, days);
     if (!idx) return null;
-    return { ...idx, color: previewColor, title: previewTitle };
+    return {
+      ...idx,
+      color: previewColor,
+      title: previewTitle,
+      range: drag.preview,
+    };
   }, [drag.preview, drag.previewZone, days, previewColor, previewTitle]);
 
   // Tick "now" so the now-line creeps forward while the page is open.
@@ -1225,6 +1017,7 @@ export function useCalendarSession({
     onAllDayPointerDown: drag.onAllDayPointerDown,
     onAllDayChipPointerDown: handleAllDayChipPointerDown,
     timedPreviewByDay,
+    previewInfo,
     previewColor,
     previewTitle,
     allDayPreview,
@@ -1241,7 +1034,6 @@ export function useCalendarSession({
     handleSaveTimeZone,
     handleSaveCalendar,
     handleDeleteEvent,
-    isSaving: updateEvent.isPending,
     isDeleting: deleteEvent.isPending,
   };
 }

@@ -30,7 +30,6 @@ type EventInspectorProps = {
   ) => void | Promise<void>;
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
-  isSaving?: boolean;
   isDeleting?: boolean;
   isDragging?: boolean;
 };
@@ -248,9 +247,9 @@ test('timed when-block: end time change keeps start', () => {
   assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
 });
 
-test('timed when-block: end before start clamps to start+15min', () => {
+test('timed when-block: end before start clamps to start (0-min)', () => {
   const spies = makeSpies();
-  // Longer initial end so clamp (start+15) is a real change vs current.
+  // Longer initial end so the clamp to start is a real change vs current.
   const start = new Date(2026, 8, 13, 5, 15);
   const end = new Date(2026, 8, 13, 7, 0);
   mount(
@@ -267,9 +266,30 @@ test('timed when-block: end before start clamps to start+15min', () => {
   fireEvent.change(endInput, { target: { value: '04:00' } });
   assert.equal(spies.saveTimesCalls.length, 1);
   const expectedStart = new Date(2026, 8, 13, 5, 15);
-  const expectedEnd = new Date(2026, 8, 13, 5, 30);
+  const expectedEnd = new Date(2026, 8, 13, 5, 15);
   assert.equal(spies.saveTimesCalls[0][0], expectedStart.toISOString());
   assert.equal(spies.saveTimesCalls[0][1], expectedEnd.toISOString());
+});
+
+test('timed when-block: end equal to start is allowed (0-min)', () => {
+  const spies = makeSpies();
+  const start = new Date(2026, 8, 13, 5, 15);
+  const end = new Date(2026, 8, 13, 7, 0);
+  mount(
+    {
+      event: makeEvent({
+        id: 'e-zero',
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+      }),
+    },
+    spies,
+  );
+  const endInput = screen.getByLabelText('End time') as HTMLInputElement;
+  fireEvent.change(endInput, { target: { value: '05:15' } });
+  assert.equal(spies.saveTimesCalls.length, 1);
+  assert.equal(spies.saveTimesCalls[0][0], start.toISOString());
+  assert.equal(spies.saveTimesCalls[0][1], start.toISOString());
 });
 
 test('timed when-block: date change shifts both instants by one day', () => {
@@ -591,6 +611,87 @@ test('overflow Delete calls onDelete; available for owner/writer/omitted', () =>
   assert.ok(screen.getByLabelText('More actions'));
 });
 
+// ── 7b. Saves never disable the form ────────────────────────────────────
+
+test('fields stay enabled and editable while earlier saves are pending', () => {
+  const spies = makeSpies();
+  // Handlers that never settle: a save stays "in flight" for the whole test.
+  const pending = new Promise<void>(() => {});
+  spies.onSaveTitle = (...args) => {
+    spies.saveCalls.push(args);
+    return pending;
+  };
+  spies.onSaveTimes = (...args) => {
+    spies.saveTimesCalls.push(args);
+    return pending;
+  };
+  spies.onSaveCalendar = (...args) => {
+    spies.saveCalendarCalls.push(args);
+    return pending;
+  };
+  mount({ focusTitle: true }, spies);
+
+  const title = screen.getByLabelText('Title') as HTMLInputElement;
+  fireEvent.change(title, { target: { value: 'First' } });
+  fireEvent.blur(title);
+  fireEvent.change(screen.getByLabelText('Start time'), {
+    target: { value: '06:00' },
+  });
+  fireEvent.change(screen.getByLabelText('Calendar'), {
+    target: { value: 'cal-2' },
+  });
+
+  const labels = [
+    'Title',
+    'Description',
+    'Start time',
+    'End time',
+    'Date',
+    'All-day',
+    'Time zone',
+    'Calendar',
+    'More actions',
+  ];
+  for (const label of labels) {
+    const el = screen.getByLabelText(label) as HTMLInputElement;
+    assert.equal(el.disabled, false, `${label} should stay enabled`);
+  }
+
+  // The same field can be edited again while the first save is pending.
+  fireEvent.change(title, { target: { value: 'Second' } });
+  fireEvent.blur(title);
+  assert.equal(spies.saveCalls.length, 2);
+  assert.equal(spies.saveCalls[1][0], 'Second');
+});
+
+test('deleting disables only the delete action', () => {
+  const noop = () => {};
+  render(
+    createElement(EventInspector, {
+      event: makeEvent({ id: 'e-del' }),
+      calendar: makeCalendar(),
+      calendars: defaultCalendars(),
+      onClose: noop,
+      onSaveTitle: noop,
+      onSaveDescription: noop,
+      onSaveTimes: noop,
+      onSaveAllDay: noop,
+      onSaveTimeZone: noop,
+      onSaveCalendar: noop,
+      onDelete: noop,
+      isDeleting: true,
+      focusTitle: true,
+    }),
+  );
+  for (const label of ['Title', 'Start time', 'Calendar', 'All-day']) {
+    const el = screen.getByLabelText(label) as HTMLInputElement;
+    assert.equal(el.disabled, false, `${label} should stay enabled`);
+  }
+  fireEvent.click(screen.getByLabelText('More actions'));
+  const del = screen.getByLabelText('Delete event') as HTMLButtonElement;
+  assert.equal(del.disabled, true);
+});
+
 // ── 8. Read-only ────────────────────────────────────────────────────────
 
 test('read-only reader and freeBusyReader: static title/description/when, no Delete', () => {
@@ -603,6 +704,8 @@ test('read-only reader and freeBusyReader: static title/description/when, no Del
         description: 'Secret notes',
       }),
       calendar: makeCalendar({ access_role: role }),
+      // Expanded drawer: the peek bar would repeat the title text.
+      focusTitle: true,
     });
     // Title text visible, no Title input.
     assert.ok(screen.getByText('Locked event'));
@@ -645,4 +748,43 @@ test('data-event-inspector present on mobile and desktop shells', () => {
   setMatchMediaDesktop(true);
   mount({ event: makeEvent({ id: 'desktop-shell' }) });
   assert.ok(document.querySelector('[data-event-inspector]'));
+});
+
+// ── Mobile peek drawer ──────────────────────────────────────────────────
+
+test('mobile: taps open a peek with no backdrop capture; expand, collapse, close', () => {
+  const spies = makeSpies();
+  mount({ focusTitle: false }, spies);
+  const peek = screen.getByLabelText('Expand event details');
+  assert.equal(peek.getAttribute('aria-expanded'), 'false');
+  const wrapper = document.querySelector('[data-event-inspector]');
+  assert.ok(wrapper?.className.includes('pointer-events-none'));
+
+  fireEvent.click(peek);
+  assert.equal(screen.queryByLabelText('Expand event details'), null);
+
+  // Backdrop collapses back to peek; it does not close.
+  fireEvent.click(screen.getByLabelText('Collapse event details'));
+  assert.equal(spies.closeCalls.length, 0);
+  assert.ok(screen.getByLabelText('Expand event details'));
+
+  fireEvent.click(screen.getByLabelText('Close event details'));
+  assert.equal(spies.closeCalls.length, 1);
+
+  fireEvent.click(peek);
+  fireEvent.click(screen.getByLabelText('Close inspector'));
+  assert.equal(spies.closeCalls.length, 2);
+});
+
+test('mobile: new drafts (focusTitle) open expanded', () => {
+  mount({ focusTitle: true });
+  assert.equal(screen.queryByLabelText('Expand event details'), null);
+});
+
+test('mobile: expanded sheet has a grabber that collapses to peek', () => {
+  const spies = makeSpies();
+  mount({ focusTitle: true }, spies);
+  fireEvent.click(screen.getByLabelText('Collapse drawer'));
+  assert.equal(spies.closeCalls.length, 0);
+  assert.ok(screen.getByLabelText('Expand event details'));
 });

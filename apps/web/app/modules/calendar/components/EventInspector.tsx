@@ -3,6 +3,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
@@ -16,7 +17,8 @@ import {
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
-import { eventChipSelector } from '../lib/inspector-anchor';
+import { isTempEventId } from '../lib/event-overlays';
+import { DESKTOP_MQ, eventChipSelector } from '../lib/inspector-anchor';
 import {
   allDayRangeToTimed,
   applyAllDayStartDate,
@@ -27,12 +29,11 @@ import {
   formatEventDateLine,
   formatEventDuration,
   formatEventTime,
+  formatEventTimeRange,
   timedRangeToAllDay,
   toDateInputValue,
   toTimeInputValue,
 } from '../lib/week-layout';
-
-const DESKTOP_MQ = '(min-width: 768px)';
 
 const FALLBACK_TIME_ZONES = [
   'UTC',
@@ -104,7 +105,6 @@ export interface EventInspectorProps {
   /** Move event to another calendar (local calendar id). */
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
-  isSaving?: boolean;
   isDeleting?: boolean;
   /**
    * While a drag is in progress, hide the inspector visually without
@@ -119,6 +119,51 @@ type ChipRect = {
   width: number;
   height: number;
 };
+
+/** Peek sheet height: ~10% of the viewport, never below a readable minimum. */
+const PEEK_HEIGHT = 'max(76px, 10dvh)';
+const PEEK_SHEET_HEIGHT = `calc(${PEEK_HEIGHT} + env(safe-area-inset-bottom))`;
+const PEEK_SWIPE_PX = 32;
+/** Room kept below the selected chip for its bottom touch handle. */
+const PEEK_HANDLE_CLEARANCE_PX = 32;
+
+/**
+ * Pointer handlers for a sheet grabber: tap, or a vertical swipe past
+ * PEEK_SWIPE_PX. A swipe suppresses the click that follows it.
+ */
+function useGrabber(cb: {
+  onTap: () => void;
+  onUp?: () => void;
+  onDown?: () => void;
+}) {
+  const startY = useRef<number | null>(null);
+  const swiped = useRef(false);
+  return {
+    onPointerDown: (e: ReactPointerEvent<HTMLElement>) => {
+      startY.current = e.clientY;
+      swiped.current = false;
+    },
+    onPointerUp: (e: ReactPointerEvent<HTMLElement>) => {
+      const start = startY.current;
+      startY.current = null;
+      if (start === null) return;
+      const dy = e.clientY - start;
+      const handler =
+        dy < -PEEK_SWIPE_PX ? cb.onUp : dy > PEEK_SWIPE_PX ? cb.onDown : null;
+      if (handler) {
+        swiped.current = true;
+        handler();
+      }
+    },
+    onClick: () => {
+      if (swiped.current) {
+        swiped.current = false;
+        return;
+      }
+      cb.onTap();
+    },
+  };
+}
 
 function useIsDesktop(): boolean {
   const [isDesktop, setIsDesktop] = useState(
@@ -244,19 +289,18 @@ interface InspectorFormProps {
   onClose: () => void;
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
-  isSaving: boolean;
   isDeleting: boolean;
   writable: boolean;
 }
 
 const timeInputClassName =
-  'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+  'border-0 bg-transparent p-0 text-sm tabular-nums text-foreground focus:outline-none focus:ring-0';
 const dateInputClassName =
-  'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50';
+  'border-0 bg-transparent p-0 text-sm text-muted-foreground focus:outline-none focus:ring-0';
 const chipClassName =
   'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground';
 const chipToggleClassName =
-  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 aria-pressed:border-foreground/40 aria-pressed:bg-muted/40 aria-pressed:text-foreground disabled:opacity-50';
+  'rounded-full border border-border/70 px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 aria-pressed:border-foreground/40 aria-pressed:bg-muted/40 aria-pressed:text-foreground';
 
 function InspectorForm({
   event,
@@ -276,7 +320,6 @@ function InspectorForm({
   onClose,
   onSaveCalendar,
   onDelete,
-  isSaving,
   isDeleting,
   writable,
 }: InspectorFormProps) {
@@ -313,7 +356,6 @@ function InspectorForm({
   const descriptionDisplay = description.trim();
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
-  const inputsDisabled = isSaving || isDeleting;
 
   const writableCalendars = calendars.filter(isWritableCalendar);
   const currentInWritable = writableCalendars.some(
@@ -344,7 +386,6 @@ function InspectorForm({
               className="h-8 w-8 shrink-0"
               onClick={() => setMenuOpen((open) => !open)}
               aria-label="More actions"
-              disabled={isDeleting || isSaving}
             >
               <MoreHorizontal className="h-4 w-4" />
             </Button>
@@ -358,7 +399,7 @@ function InspectorForm({
                   <button
                     type="button"
                     aria-label="Delete event"
-                    disabled={isDeleting || isSaving}
+                    disabled={isDeleting}
                     onClick={() => {
                       setMenuOpen(false);
                       void onDelete();
@@ -400,9 +441,8 @@ function InspectorForm({
                 (e.target as HTMLInputElement).blur();
               }
             }}
-            disabled={isSaving || isDeleting}
             aria-label="Title"
-            className="w-full border-0 bg-transparent p-0 text-lg font-semibold text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
+            className="w-full border-0 bg-transparent p-0 text-lg font-semibold text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0"
           />
         ) : (
           <p className="text-lg font-semibold text-foreground">{title}</p>
@@ -423,7 +463,6 @@ function InspectorForm({
                     step={60}
                     aria-label="Start time"
                     value={toTimeInputValue(start)}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       commitTimes(applyStartTime(start, end, e.target.value));
                     }}
@@ -438,7 +477,6 @@ function InspectorForm({
                     step={60}
                     aria-label="End time"
                     value={toTimeInputValue(end)}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       commitTimes(applyEndTime(start, end, e.target.value));
                     }}
@@ -456,7 +494,6 @@ function InspectorForm({
                     type="date"
                     aria-label="Date"
                     value={toDateInputValue(start)}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       commitTimes(applyStartDate(start, end, e.target.value));
                     }}
@@ -478,7 +515,6 @@ function InspectorForm({
                   type="date"
                   aria-label="Date"
                   value={allDayDateValue}
-                  disabled={inputsDisabled}
                   onChange={(e) => {
                     commitAllDayDate(e.target.value);
                   }}
@@ -503,7 +539,6 @@ function InspectorForm({
                     type="button"
                     aria-label="All-day"
                     aria-pressed={isAllDay}
-                    disabled={inputsDisabled}
                     onClick={onToggleAllDay}
                     className={chipToggleClassName}
                   >
@@ -516,11 +551,10 @@ function InspectorForm({
                   <select
                     aria-label="Time zone"
                     value={timeZone}
-                    disabled={inputsDisabled}
                     onChange={(e) => {
                       onChangeTimeZone(e.target.value);
                     }}
-                    className="max-w-[12rem] truncate rounded-full border border-border/70 bg-transparent px-2 py-0.5 text-xs text-muted-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+                    className="max-w-[12rem] truncate rounded-full border border-border/70 bg-transparent px-2 py-0.5 text-xs text-muted-foreground focus:outline-none focus:ring-0"
                   >
                     <option value="">
                       {browserZone ? browserZone : 'Local'}
@@ -555,11 +589,10 @@ function InspectorForm({
                 (e.target as HTMLTextAreaElement).blur();
               }
             }}
-            disabled={isSaving || isDeleting}
             aria-label="Description"
             placeholder="Description"
             rows={3}
-            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0 disabled:opacity-50"
+            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0"
           />
         ) : descriptionDisplay ? (
           <p className="whitespace-pre-wrap text-sm text-foreground">
@@ -580,13 +613,12 @@ function InspectorForm({
             <select
               aria-label="Calendar"
               value={event.calendar_id}
-              disabled={inputsDisabled}
               onChange={(e) => {
                 const next = e.target.value;
                 if (next === event.calendar_id) return;
                 void onSaveCalendar(next);
               }}
-              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-sm text-foreground focus:outline-none focus:ring-0 disabled:opacity-50"
+              className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-sm text-foreground focus:outline-none focus:ring-0"
             >
               {calendarSelectOptions.map((cal) => {
                 const label =
@@ -630,7 +662,6 @@ export function EventInspector({
   onSaveTimeZone,
   onSaveCalendar,
   onDelete,
-  isSaving = false,
   isDeleting = false,
   isDragging = false,
 }: EventInspectorProps) {
@@ -644,6 +675,18 @@ export function EventInspector({
   const isDesktop = useIsDesktop();
   const rect = useChipRect(event.id);
   const hidden = isDragging;
+  // Mobile drawer: new drafts open expanded (title focus); taps peek.
+  const [expanded, setExpanded] = useState(focusTitle);
+  const sheetRef = useRef<HTMLDivElement>(null);
+  const peekGrab = useGrabber({
+    onTap: () => setExpanded(true),
+    onUp: () => setExpanded(true),
+    onDown: () => onClose(),
+  });
+  const sheetGrab = useGrabber({
+    onTap: () => setExpanded(false),
+    onDown: () => setExpanded(false),
+  });
   const writable = isCalendarWritable(calendar);
 
   // Sync local title when the selected event changes — but keep a dirty
@@ -670,6 +713,53 @@ export function EventInspector({
       titleRef.current?.select();
     }
   }, [focusTitle, event.id, writable]);
+
+  // Reset on a new selection or a focusTitle flip, but not when a draft's
+  // temp id is remapped to its server id (same logical event).
+  const prevIdRef = useRef(event.id);
+  const prevFocusRef = useRef(focusTitle);
+  useEffect(() => {
+    const prevId = prevIdRef.current;
+    const remap =
+      prevId !== event.id &&
+      isTempEventId(prevId) &&
+      prevFocusRef.current === focusTitle;
+    prevIdRef.current = event.id;
+    prevFocusRef.current = focusTitle;
+    if (!remap) setExpanded(focusTitle);
+  }, [event.id, focusTitle]);
+
+  // While peeking, let the grid scroll past the sheet so late events stay reachable.
+  useEffect(() => {
+    if (isDesktop || expanded) return;
+    const scroller = document.querySelector('[data-calendar-scroller]');
+    if (!(scroller instanceof HTMLElement)) return;
+    const prev = scroller.style.paddingBottom;
+    scroller.style.paddingBottom = PEEK_SHEET_HEIGHT;
+    return () => {
+      scroller.style.paddingBottom = prev;
+    };
+  }, [isDesktop, expanded]);
+
+  // Keep the selected chip clear of the peek sheet (and its handles).
+  useEffect(() => {
+    if (isDesktop || expanded) return;
+    const raf = requestAnimationFrame(() => {
+      const chip = document.querySelector(eventChipSelector(event.id));
+      const scroller = document.querySelector('[data-calendar-scroller]');
+      const sheet = sheetRef.current;
+      if (!chip || !(scroller instanceof HTMLElement) || !sheet) return;
+      const c = chip.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      const overlap =
+        c.bottom + PEEK_HANDLE_CLEARANCE_PX - sheet.getBoundingClientRect().top;
+      if (overlap <= 0) return;
+      // Never scroll the chip's top out of view.
+      const room = Math.max(0, c.top - s.top - 8);
+      scroller.scrollTop += Math.min(overlap, room);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [isDesktop, expanded, event.id]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -802,7 +892,6 @@ export function EventInspector({
       onClose={onClose}
       onSaveCalendar={onSaveCalendar}
       onDelete={onDelete}
-      isSaving={isSaving}
       isDeleting={isDeleting}
       writable={writable}
     />
@@ -867,26 +956,102 @@ export function EventInspector({
     );
   }
 
+  const isAllDay = event.is_all_day === true;
+  const peekWhen = isAllDay
+    ? formatEventDateLine(
+        civilDateFromAllDayIso(event.start_time) ?? new Date(event.start_time),
+        civilDateFromAllDayIso(event.end_time) ?? new Date(event.end_time),
+      )
+    : formatEventTimeRange(
+        new Date(event.start_time),
+        new Date(event.end_time),
+      );
+
+  // Wrapper ignores pointers so the calendar stays live above the peek; only
+  // the sheet (and, expanded, the backdrop) take them.
   return createPortal(
     <div
       className={cn(
-        'fixed inset-0 z-[60]',
-        hidden && 'invisible pointer-events-none',
+        'pointer-events-none fixed inset-0 z-[60]',
+        hidden && 'invisible',
       )}
       data-event-inspector
     >
       <button
         type="button"
-        className="absolute inset-0 bg-black/40"
-        aria-label="Close event details"
-        onClick={onClose}
+        tabIndex={expanded ? 0 : -1}
+        aria-hidden={!expanded}
+        className={cn(
+          'absolute inset-0 bg-black/40 transition-opacity motion-reduce:transition-none',
+          expanded ? 'pointer-events-auto opacity-100' : 'opacity-0',
+        )}
+        aria-label="Collapse event details"
+        onClick={() => setExpanded(false)}
       />
       <div
+        ref={sheetRef}
         role="dialog"
         aria-label="Event details"
-        className="absolute inset-x-0 bottom-0 max-h-[85dvh] rounded-t-2xl border-t border-border bg-cream shadow-lg flex flex-col"
+        className="pointer-events-auto absolute inset-x-0 bottom-0 flex flex-col overflow-hidden rounded-t-2xl border-t border-border bg-cream shadow-lg transition-[max-height] duration-200 ease-out motion-reduce:transition-none"
+        style={{
+          maxHeight: expanded ? '85dvh' : PEEK_SHEET_HEIGHT,
+        }}
       >
-        {form}
+        {!expanded && (
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              aria-label="Expand event details"
+              aria-expanded={false}
+              className="flex w-full touch-none flex-col items-stretch px-4 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-2 pr-12 text-left"
+              style={{ minHeight: PEEK_SHEET_HEIGHT }}
+              {...peekGrab}
+            >
+              <span
+                className="mx-auto mb-2 h-1 w-10 shrink-0 rounded-full bg-muted-foreground/40"
+                aria-hidden
+              />
+              <span className="truncate text-sm font-semibold text-foreground">
+                {title.trim() || 'New event'}
+              </span>
+              <span className="truncate text-xs tabular-nums text-muted-foreground">
+                {peekWhen}
+              </span>
+            </button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="absolute right-1 top-2 h-8 w-8"
+              onClick={onClose}
+              aria-label="Close event details"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
+        {expanded && (
+          <button
+            type="button"
+            aria-label="Collapse drawer"
+            className="flex h-6 w-full shrink-0 touch-none items-center justify-center"
+            {...sheetGrab}
+          >
+            <span
+              className="h-1 w-10 rounded-full bg-muted-foreground/40"
+              aria-hidden
+            />
+          </button>
+        )}
+        {/* Stays mounted while peeking so unsaved edits and focus survive. */}
+        <div
+          className={cn(
+            'min-h-0 flex-1 flex-col',
+            expanded ? 'flex' : 'hidden',
+          )}
+        >
+          {form}
+        </div>
       </div>
     </div>,
     document.body,

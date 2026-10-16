@@ -31,8 +31,6 @@ export const SNAP_MINUTES = 15;
 export const RESIZE_SNAP_MINUTES = 1;
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
-/** Inspector floor when end is moved to ≤ start (do not reuse DEFAULT_EVENT_DURATION_MIN). */
-export const INSPECTOR_MIN_DURATION_MIN = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -119,8 +117,11 @@ export function clampMinutesToDay(
   const dayStartMs = dayStart.getTime();
   const dayEndMs = dayEnd.getTime();
 
-  // No overlap with [dayStart, dayEnd).
-  if (endMs <= dayStartMs || startMs >= dayEndMs) {
+  // No overlap with [dayStart, dayEnd). A zero-length event is a point: it
+  // belongs to the day containing it (so 00:00–00:00 stays on that day).
+  if (startMs === endMs) {
+    if (startMs < dayStartMs || startMs >= dayEndMs) return null;
+  } else if (endMs <= dayStartMs || startMs >= dayEndMs) {
     return null;
   }
 
@@ -530,7 +531,7 @@ export function applyStartTime(
 
 /**
  * Apply an end-time edit on end's civil date (overnight-safe). Start unchanged.
- * If newEnd ≤ start, clamp to start + INSPECTOR_MIN_DURATION_MIN.
+ * newEnd === start is allowed (0-min); newEnd < start clamps to start.
  * Invalid `hhmm` → null.
  */
 export function applyEndTime(
@@ -542,11 +543,8 @@ export function applyEndTime(
   if (!parsed) return null;
   const newEnd = new Date(end.getTime());
   newEnd.setHours(parsed.hours, parsed.minutes, 0, 0);
-  if (newEnd.getTime() <= start.getTime()) {
-    return {
-      start: new Date(start.getTime()),
-      end: new Date(start.getTime() + INSPECTOR_MIN_DURATION_MIN * 60_000),
-    };
+  if (newEnd.getTime() < start.getTime()) {
+    return { start: new Date(start.getTime()), end: new Date(start.getTime()) };
   }
   return { start: new Date(start.getTime()), end: newEnd };
 }

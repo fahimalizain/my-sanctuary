@@ -30,7 +30,6 @@ import {
   formatEventDateLine,
   formatEventDuration,
   formatWeekTitle,
-  INSPECTOR_MIN_DURATION_MIN,
   toDateInputValue,
   toTimeInputValue,
   gutterWithRemainder,
@@ -58,6 +57,7 @@ import {
   weekRangeIso,
   snapMinutes,
   RESIZE_SNAP_MINUTES,
+  SNAP_MINUTES,
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
@@ -415,6 +415,18 @@ test('eventHeightPx: 15 min gets CHIP_MIN_H', () => {
   assert.equal(eventHeightPx(100, 100, 88), CHIP_MIN_H);
 });
 
+test('clampMinutesToDay: zero-length event at midnight stays on that day', () => {
+  const day = new Date(2026, 8, 8);
+  const t = new Date(2026, 8, 8, 0, 0, 0, 0);
+  assert.deepEqual(clampMinutesToDay(t, t, day), { startMin: 0, endMin: 0 });
+  assert.equal(clampMinutesToDay(t, t, new Date(2026, 8, 7)), null);
+  const noon = new Date(2026, 8, 8, 12, 0, 0, 0);
+  assert.deepEqual(clampMinutesToDay(noon, noon, day), {
+    startMin: 720,
+    endMin: 720,
+  });
+});
+
 // ── packDayEvents (Notion cascade — notion-event-packing.md examples 1–6) ─
 
 const PACK_EPS = 1e-9;
@@ -575,6 +587,83 @@ test('packDayEvents: example 6 — touching endpoints → separate full-width cl
     { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
     'b',
   );
+});
+
+test('packDayEvents: two 0-min events at the same instant sit side by side', () => {
+  const packed = packDayEvents(
+    [
+      { id: 'a', startMin: 600, endMin: 600 },
+      { id: 'b', startMin: 600, endMin: 600 },
+    ],
+    22.5,
+    SNAP_MINUTES,
+  );
+  assert.equal(packed.length, 2);
+  for (const p of packed) {
+    assert.ok(
+      Number.isFinite(p.leftPercent) && Number.isFinite(p.widthPercent),
+    );
+    assert.ok(p.widthPercent > 0);
+  }
+  assert.notEqual(packed[0].leftPercent, packed[1].leftPercent);
+});
+
+test('packDayEvents: 0-min at start of another event overlaps; at its end does not', () => {
+  const atStart = packDayEvents(
+    [
+      { id: 'a', startMin: 540, endMin: 600 },
+      { id: 'z', startMin: 540, endMin: 540 },
+    ],
+    22.5,
+  );
+  const byStart = Object.fromEntries(atStart.map((p) => [p.id, p]));
+  assert.ok(byStart.a.widthPercent < 1 + 1e-9);
+  assert.notEqual(byStart.a.leftPercent, byStart.z.leftPercent);
+
+  const atEnd = packDayEvents(
+    [
+      { id: 'a', startMin: 540, endMin: 600 },
+      { id: 'z', startMin: 600, endMin: 600 },
+    ],
+    22.5,
+  );
+  for (const p of atEnd) {
+    assert.equal(p.leftPercent, 0);
+    assert.equal(p.widthPercent, 1);
+  }
+});
+
+test('packDayEvents: min painted height makes nearby 0-min events collide', () => {
+  const items = [
+    { id: 'a', startMin: 600, endMin: 600 },
+    { id: 'b', startMin: 610, endMin: 610 },
+  ];
+  // True durations: ε only → no overlap, both full width.
+  assert.equal(
+    packDayEvents(items).every((p) => p.widthPercent === 1),
+    true,
+  );
+  // Painted height 22.5 min covers b → they share the row.
+  const packed = packDayEvents(items, 22.5);
+  assert.equal(
+    packed.some((p) => p.widthPercent < 1 + 1e-9 && p.leftPercent > 0),
+    true,
+  );
+});
+
+test('packDayEvents: back-to-back 15-min events keep full width at hourH=48', () => {
+  const packed = packDayEvents(
+    [
+      { id: 'a', startMin: 600, endMin: 615 },
+      { id: 'b', startMin: 615, endMin: 630 },
+    ],
+    (CHIP_MIN_H / 48) * 60,
+    SNAP_MINUTES,
+  );
+  for (const p of packed) {
+    assert.equal(p.leftPercent, 0);
+    assert.equal(p.widthPercent, 1);
+  }
 });
 
 // ── nowLineY ────────────────────────────────────────────────────────────
@@ -887,7 +976,7 @@ test('applyStartTime: preserves duration; invalid → null', () => {
   assert.equal(applyStartTime(start, end, '25:00'), null);
 });
 
-test('applyEndTime: keeps start; clamps when end ≤ start; invalid → null', () => {
+test('applyEndTime: keeps start; end === start → 0-min; end < start clamps to start; invalid → null', () => {
   const start = new Date(2026, 8, 13, 5, 15);
   const end = new Date(2026, 8, 13, 5, 30);
 
@@ -900,12 +989,12 @@ test('applyEndTime: keeps start; clamps when end ≤ start; invalid → null', (
   const clamped = applyEndTime(start, end, '04:00');
   assert.ok(clamped);
   assert.equal(clamped.start.getTime(), start.getTime());
-  assert.equal(
-    clamped.end.getTime(),
-    start.getTime() + INSPECTOR_MIN_DURATION_MIN * 60_000,
-  );
-  assert.equal(clamped.end.getHours(), 5);
-  assert.equal(clamped.end.getMinutes(), 30);
+  assert.equal(clamped.end.getTime(), start.getTime());
+
+  const equal = applyEndTime(start, end, '05:15');
+  assert.ok(equal);
+  assert.equal(equal.start.getTime(), start.getTime());
+  assert.equal(equal.end.getTime(), start.getTime());
 
   // Overnight: end civil date kept when editing end clock.
   const nightStart = new Date(2026, 8, 13, 23, 0);

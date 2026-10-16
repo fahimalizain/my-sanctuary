@@ -7,6 +7,8 @@ import type { AllDayChip } from '../components/AllDayRow';
 import { toTimedRange, type DragSlot, type TimedRange } from './calendar-drag';
 import type { PositionedEvent } from '../components/EventChip';
 import {
+  CHIP_MIN_H,
+  SNAP_MINUTES,
   WEEK_DAYS,
   addDays,
   allDaySectionHeight,
@@ -170,6 +172,10 @@ export function buildEventsByDay(
         startMin: d.startMin,
         endMin: d.endMin,
       })),
+      (CHIP_MIN_H / hourH) * 60,
+      // Only sub-snap events (reachable via 0-min / fine resize) widen;
+      // 15 min and longer pack exactly as before.
+      SNAP_MINUTES,
     );
     const packById = new Map(packed.map((p) => [p.id, p]));
 

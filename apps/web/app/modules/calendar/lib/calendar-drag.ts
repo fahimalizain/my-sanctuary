@@ -57,20 +57,172 @@ export function isTapCreatePointer(pointerType: string): boolean {
   return pointerType === 'touch';
 }
 
+/**
+ * Tracks active touch pointers and a multi-touch latch. The latch is set when
+ * 2+ touches are down and cleared only once ALL touches have lifted, so a
+ * pinch can never leak into create/move/resize/tap handling.
+ */
+export interface TouchTracker {
+  /** A primary touch means no other touch is active: drops stale ids. */
+  down: (pointerId: number, pointerType: string, isPrimary?: boolean) => void;
+  up: (pointerId: number) => void;
+  /** Forget all touches (page hidden / window blur). */
+  reset: () => void;
+  /** True from the 2nd touch landing until every touch has lifted. */
+  readonly latched: boolean;
+  readonly count: number;
+}
+
+export function createTouchTracker(): TouchTracker {
+  const ids = new Set<number>();
+  let latched = false;
+  return {
+    down(pointerId, pointerType, isPrimary = false) {
+      if (pointerType !== 'touch') return;
+      if (isPrimary) {
+        ids.clear();
+        latched = false;
+      }
+      ids.add(pointerId);
+      if (ids.size >= 2) latched = true;
+    },
+    up(pointerId) {
+      if (!ids.delete(pointerId)) return;
+      if (ids.size === 0) latched = false;
+    },
+    reset() {
+      ids.clear();
+      latched = false;
+    },
+    get latched() {
+      return latched;
+    },
+    get count() {
+      return ids.size;
+    },
+  };
+}
+
 export type TouchGestureIntent = 'pending' | 'scroll' | 'drag';
+
+/** Touch target of the fat selected-chip handles (visual knob is smaller). */
+export const TOUCH_HANDLE_HIT_PX = 44;
+export const TOUCH_HANDLE_KNOB_PX = 20;
+
+export type ChipHandle = 'start' | 'end' | 'move';
+
+export interface ChipGesture {
+  kind: 'move' | 'resize-start' | 'resize-end';
+  /** Touch only: claim at pointerdown (no scroll-vs-drag ambiguity). */
+  claimImmediately: boolean;
+  /** Touch body press: a tap selects, a pan scrolls; it never moves. */
+  tapOnly: boolean;
+}
+
+/**
+ * What a pointerdown on a chip means.
+ * - touch on a handle: that handle's action, claimed immediately
+ * - touch elsewhere: tap-only (scroll natively; no body move, no edge resize)
+ * - mouse/pen: explicit handle, else the 6px edge zones, else move
+ */
+export function resolveChipGesture(
+  pointerType: string,
+  handle: ChipHandle | null,
+  localY: number,
+  chipHeight: number,
+): ChipGesture {
+  const isTouch = pointerType === 'touch';
+  if (isTouch && !handle) {
+    return { kind: 'move', claimImmediately: false, tapOnly: true };
+  }
+  const edge =
+    handle === 'start' || handle === 'end'
+      ? handle
+      : handle === 'move'
+        ? null
+        : resizeEdgeAt(localY, chipHeight);
+  const kind =
+    edge === 'start' ? 'resize-start' : edge === 'end' ? 'resize-end' : 'move';
+  return { kind, claimImmediately: isTouch, tapOnly: false };
+}
+
+export interface HandleRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface TouchHandleGeometry {
+  /** Hit boxes in chip-local px (origin = chip top-left). */
+  start: HandleRect;
+  end: HandleRect;
+  move: HandleRect;
+  /** Knob centres in chip-local px. */
+  knobs: {
+    start: [number, number];
+    end: [number, number];
+    move: [number, number];
+  };
+}
+
+/**
+ * Chip-local geometry of the three touch handles.
+ * - start/end: centred on the chip's horizontal middle; each hit box reaches
+ *   at most to the chip midline, so short chips push knobs outward instead of
+ *   overlapping.
+ * - move: left edge, vertically centred. Where it could meet the start/end
+ *   boxes (short or narrow chips) it slides outside the left edge instead.
+ */
+export function touchHandleGeometry(
+  chipWidth: number,
+  chipHeight: number,
+): TouchHandleGeometry {
+  const w = Number.isFinite(chipWidth) ? Math.max(0, chipWidth) : 0;
+  const h = Number.isFinite(chipHeight) ? Math.max(0, chipHeight) : 0;
+  const hit = TOUCH_HANDLE_HIT_PX;
+  const half = hit / 2;
+  const knob = TOUCH_HANDLE_KNOB_PX;
+  const into = Math.min(half, h / 2);
+  const shift = Math.min(half - into, knob / 2 - 4);
+
+  const midX = w / 2;
+  const start = { x: midX - half, y: into - hit, w: hit, h: hit };
+  const end = { x: midX - half, y: h - into, w: hit, h: hit };
+
+  // On tall chips the move box's vertical range clears start/end already.
+  const mayMeet = h < hit * 2;
+  const moveRight = mayMeet ? Math.min(18, start.x) : 18;
+  const move = { x: moveRight - hit, y: h / 2 - half, w: hit, h: hit };
+
+  return {
+    start,
+    end,
+    move,
+    knobs: {
+      start: [midX, -shift],
+      end: [midX, h + shift],
+      // Keep the knob straddling the left edge even when the hit box slid out.
+      move: [Math.max(moveRight - half, -(knob / 2 - 4)), h / 2],
+    },
+  };
+}
 
 /**
  * Classify a touch pan before claiming the gesture.
  * Create: horizontal-dominant past threshold → scroll; else → drag.
  * Chip: any movement past threshold → drag (cancel lets flicks scroll).
+ * Chip-body: any movement past threshold → scroll (tap-only press).
  */
 export function classifyTouchGesture(
   dx: number,
   dy: number,
-  mode: 'create' | 'chip',
+  mode: 'create' | 'chip' | 'chip-body',
   allowHorizontalDrag = false,
 ): TouchGestureIntent {
   if (!movedEnough(dx, dy)) return 'pending';
+  // Chip body never drags on touch: any pan hands off to native scroll.
+  if (mode === 'chip-body') return 'scroll';
   if (
     mode === 'create' &&
     Math.abs(dx) > Math.abs(dy) &&
@@ -139,7 +291,8 @@ function slotInstant(slot: DragSlot, step = SNAP_MINUTES): Date {
 
 /**
  * Drag-create / all-day-create: order the two slots and enforce min duration.
- * - timed: snapped instants; equal slots → SNAP_MINUTES duration
+ * - timed: snapped instants; equal slots → SNAP_MINUTES duration (drag-create
+ *   never yields a 0-min event; only resize / inspector edits do)
  * - allday: earlier day 00:00 → later day + 1 day 00:00 (exclusive end)
  */
 export function rangeFromSlots(
@@ -263,7 +416,8 @@ export function movedRange(
 }
 
 /**
- * Resize one edge; keep the other fixed. Min duration is SNAP_MINUTES.
+ * Resize one edge; keep the other fixed. Min duration is 0: dragging past
+ * the fixed edge clamps onto it (start === end), never inverts.
  * The active edge snaps to RESIZE_SNAP_MINUTES (may cross days).
  * The fixed edge is not re-snapped.
  */
@@ -273,24 +427,34 @@ export function resizedRange(
   edge: 'start' | 'end',
   slot: DragSlot,
 ): TimedRange {
-  const minMs = SNAP_MINUTES * 60_000;
   const slotTime = slotInstant(slot, RESIZE_SNAP_MINUTES);
 
   if (edge === 'start') {
     const end = originalEnd;
-    let start = slotTime;
-    if (end.getTime() - start.getTime() < minMs) {
-      start = new Date(end.getTime() - minMs);
-    }
+    const start = slotTime.getTime() > end.getTime() ? end : slotTime;
     return { start, end };
   }
 
   const start = originalStart;
-  let end = slotTime;
-  if (end.getTime() - start.getTime() < minMs) {
-    end = new Date(start.getTime() + minMs);
-  }
+  const end = slotTime.getTime() < start.getTime() ? start : slotTime;
   return { start, end };
+}
+
+/** What the drag ghost needs to label itself (kept out of DayColumn props). */
+export interface DragPreviewInfo {
+  range: TimedRange;
+  kind: DragKind;
+  pointerType: string;
+}
+
+/** True when `nextMs` sits in a different `stepMin` bucket than `prevMs`. */
+export function crossedTickBoundary(
+  prevMs: number,
+  nextMs: number,
+  stepMin: number,
+): boolean {
+  const stepMs = stepMin * 60_000;
+  return Math.floor(prevMs / stepMs) !== Math.floor(nextMs / stepMs);
 }
 
 /** Per-day ghost geometry for a timed preview range. */

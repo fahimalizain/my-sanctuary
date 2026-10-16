@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { AllDayRow, type AllDayChip, type AllDayPreview } from './AllDayRow';
+import type { DragPreviewInfo } from '../lib/calendar-drag';
 import { dayNameShort } from '../lib/calendar-model';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
 import { type PositionedEvent } from './EventChip';
@@ -55,6 +56,7 @@ export interface CalendarWeekGridProps {
   onChipSelect: (eventId: string) => void;
   isDragging: boolean;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
+  previewInfo: DragPreviewInfo | null;
   previewColor: string;
   previewTitle: string;
   allDayPreview: AllDayPreview | null;
@@ -93,6 +95,7 @@ export function CalendarWeekGrid({
   onChipSelect,
   isDragging,
   timedPreviewByDay,
+  previewInfo,
   previewColor,
   previewTitle,
   allDayPreview,
@@ -234,6 +237,7 @@ export function CalendarWeekGrid({
               trackWidth={trackWidth}
               totalHoursH={totalHoursH}
               timedPreviewByDay={timedPreviewByDay}
+              previewInfo={previewInfo}
               previewColor={previewColor}
               previewTitle={previewTitle}
             />

@@ -17,17 +17,21 @@ import {
   allDayGrabOffsetDays,
   autoscrollDelta,
   classifyTouchGesture,
+  createTouchTracker,
+  crossedTickBoundary,
   isTapCreatePointer,
   movedAllDayRange,
   movedEnough,
   movedRange,
   rangeFromSlots,
-  resizeEdgeAt,
+  resolveChipGesture,
   resizedRange,
   toAllDayRange,
   toTimedRange,
 } from '../lib/calendar-drag';
+import { tick } from '../lib/haptics';
 import {
+  dateOnDay,
   minutesFromY,
   RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
@@ -45,6 +49,8 @@ export interface UseCalendarDragOptions {
   onMove: (eventId: string, range: TimedRange) => void;
   onResize: (eventId: string, range: TimedRange) => void;
   onAllDayCreate: (range: TimedRange) => void;
+  /** All-day tap without drag; defaults to `onAllDayCreate`. */
+  onAllDayTapCreate?: (range: TimedRange) => void;
   /** Chip tap without drag — open inspector. */
   onChipTap: (eventId: string) => void;
   /**
@@ -69,6 +75,7 @@ export interface CalendarDragApi {
   ) => void;
   preview: TimedRange | null;
   previewKind: DragKind | null;
+  previewPointerType: string | null;
   previewZone: DragZone | null;
   /** Event being moved/resized (null for create gestures). */
   activeEventId: string | null;
@@ -98,6 +105,8 @@ interface Session {
   pointerId: number;
   /** touch waits for classify; mouse/pen is claimed immediately. */
   pointerType: string;
+  /** Touch chip-body press: tap selects, pan scrolls, never moves. */
+  tapOnly?: boolean;
 }
 
 function parseDayAttr(value: string | null | undefined): Date | null {
@@ -220,6 +229,22 @@ function computePreview(session: Session): TimedRange | null {
   }
 }
 
+/**
+ * The instant whose 15-minute bucket drives haptic ticks: the dragged edge
+ * for resizes (1-min snap, so the slot alone is too fine), else the slot.
+ */
+function tickInstantMs(session: Session): number | null {
+  if (session.kind === 'resize-start' || session.kind === 'resize-end') {
+    const range = computePreview(session);
+    if (!range) return null;
+    return (
+      session.kind === 'resize-start' ? range.start : range.end
+    ).getTime();
+  }
+  const { day, minutes } = session.currentSlot;
+  return dateOnDay(day, minutes).getTime();
+}
+
 function nextSlotFromPoint(
   session: Session,
   clientX: number,
@@ -254,6 +279,8 @@ export function useCalendarDrag(
   const captureTargetRef = useRef<HTMLElement | null>(null);
   const lastPtrRef = useRef({ x: 0, y: 0 });
   const autoScrollRafRef = useRef(0);
+  /** Active touches + multi-touch latch (pinch must never start a session). */
+  const touchesRef = useRef(createTouchTracker());
 
   const [session, setSession] = useState<Session | null>(null);
   const [didDrag, setDidDrag] = useState(false);
@@ -268,6 +295,17 @@ export function useCalendarDrag(
       currentSlot: hit.slot,
       currentZone: hit.zone,
     };
+    if (s.pointerType === 'touch' && claimedRef.current) {
+      const prevMs = tickInstantMs(s);
+      const nextMs = tickInstantMs(updated);
+      if (
+        prevMs !== null &&
+        nextMs !== null &&
+        crossedTickBoundary(prevMs, nextMs, SNAP_MINUTES)
+      ) {
+        tick();
+      }
+    }
     sessionRef.current = updated;
     setSession(updated);
   }, []);
@@ -303,6 +341,7 @@ export function useCalendarDrag(
     (pointerId: number) => {
       if (claimedRef.current) return;
       claimedRef.current = true;
+      tick();
       optsRef.current.setStripLocked(true);
       document.body.style.userSelect = 'none';
       const target = captureTargetRef.current;
@@ -319,7 +358,14 @@ export function useCalendarDrag(
   );
 
   const beginSession = useCallback(
-    (next: Session, target: HTMLElement, e: ReactPointerEvent<HTMLElement>) => {
+    (
+      next: Session,
+      target: HTMLElement,
+      e: ReactPointerEvent<HTMLElement>,
+      claimImmediately = false,
+    ) => {
+      // Pinch / multi-touch: never start a session (React runs after capture).
+      if (touchesRef.current.latched) return;
       sessionRef.current = next;
       didDragRef.current = false;
       setSession(next);
@@ -328,11 +374,12 @@ export function useCalendarDrag(
       lastPtrRef.current = { x: e.clientX, y: e.clientY };
 
       const isTouch = e.pointerType === 'touch';
-      if (isTouch) {
+      if (isTouch && !claimImmediately) {
         // Leave unclaimed so native scroll on [data-calendar-scroller] works.
         claimedRef.current = false;
       } else {
         claimedRef.current = true;
+        if (isTouch) tick();
         optsRef.current.setStripLocked(true);
         try {
           target.setPointerCapture(e.pointerId);
@@ -358,6 +405,34 @@ export function useCalendarDrag(
     document.body.style.userSelect = '';
   }, [stopAutoScroll]);
 
+  // Track touches at window capture (ahead of React's delegated handlers).
+  // A 2nd finger latches multi-touch: drop any session and block new ones
+  // until every finger lifts, whatever order native/React handlers run in.
+  useEffect(() => {
+    const touches = touchesRef.current;
+    const onDown = (e: PointerEvent) => {
+      touches.down(e.pointerId, e.pointerType, e.isPrimary);
+      if (touches.latched && sessionRef.current) endSession();
+    };
+    const onEnd = (e: PointerEvent) => touches.up(e.pointerId);
+    const onReset = () => touches.reset();
+    const onHidden = () => {
+      if (document.visibilityState === 'hidden') touches.reset();
+    };
+    window.addEventListener('blur', onReset);
+    document.addEventListener('visibilitychange', onHidden);
+    window.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('pointerup', onEnd, true);
+    window.addEventListener('pointercancel', onEnd, true);
+    return () => {
+      window.removeEventListener('blur', onReset);
+      document.removeEventListener('visibilitychange', onHidden);
+      window.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('pointerup', onEnd, true);
+      window.removeEventListener('pointercancel', onEnd, true);
+    };
+  }, [endSession]);
+
   // Window-level move / up while a session is active.
   useEffect(() => {
     if (!session) return;
@@ -373,8 +448,11 @@ export function useCalendarDrag(
 
       // Unclaimed touch: classify before stealing the gesture.
       if (!claimedRef.current && s.pointerType === 'touch') {
-        const mode =
-          s.kind === 'create' || s.kind === 'allday-create' ? 'create' : 'chip';
+        const mode = s.tapOnly
+          ? 'chip-body'
+          : s.kind === 'create' || s.kind === 'allday-create'
+            ? 'create'
+            : 'chip';
         const held =
           s.kind === 'allday-create' &&
           performance.now() - s.originTime >= ALLDAY_CREATE_HOLD_MS;
@@ -410,6 +488,7 @@ export function useCalendarDrag(
         onMove: moveCb,
         onResize: resizeCb,
         onAllDayCreate: allDayCreate,
+        onAllDayTapCreate: allDayTapCreate,
         onChipTap: chipTap,
         onEmptyClick: emptyClick,
       } = optsRef.current;
@@ -431,7 +510,9 @@ export function useCalendarDrag(
       } else if (s.kind === 'allday-create') {
         if (!dragged) {
           if (isTapCreatePointer(e.pointerType)) {
-            allDayCreate(rangeFromSlots(s.originSlot, s.originSlot, 'allday'));
+            (allDayTapCreate ?? allDayCreate)(
+              rangeFromSlots(s.originSlot, s.originSlot, 'allday'),
+            );
           } else {
             emptyClick?.();
           }
@@ -531,17 +612,25 @@ export function useCalendarDrag(
 
       const rect = chipEl.getBoundingClientRect();
       const localY = e.clientY - rect.top;
-      const resizeAttr = (e.target as HTMLElement | null)
-        ?.closest?.('[data-resize]')
+      const handleAttr = (e.target as HTMLElement | null)
+        ?.closest?.('[data-resize], [data-move-handle]')
         ?.getAttribute('data-resize');
-      const edge: 'start' | 'end' | null =
-        resizeAttr === 'start' || resizeAttr === 'end'
-          ? resizeAttr
-          : resizeEdgeAt(localY, rect.height);
-
-      let kind: DragKind = 'move';
-      if (edge === 'start') kind = 'resize-start';
-      else if (edge === 'end') kind = 'resize-end';
+      const isMoveHandle = Boolean(
+        (e.target as HTMLElement | null)?.closest?.('[data-move-handle]'),
+      );
+      const handle =
+        handleAttr === 'start' || handleAttr === 'end'
+          ? handleAttr
+          : isMoveHandle
+            ? 'move'
+            : null;
+      const gesture = resolveChipGesture(
+        e.pointerType,
+        handle,
+        localY,
+        rect.height,
+      );
+      const kind: DragKind = gesture.kind;
 
       const step =
         kind === 'resize-start' || kind === 'resize-end'
@@ -591,9 +680,11 @@ export function useCalendarDrag(
           originTime: performance.now(),
           pointerId: e.pointerId,
           pointerType: e.pointerType,
+          tapOnly: gesture.tapOnly,
         },
         chipEl,
         e,
+        gesture.claimImmediately,
       );
     },
     [hourH, beginSession],
@@ -688,6 +779,7 @@ export function useCalendarDrag(
     onAllDayChipPointerDown,
     preview,
     previewKind: preview && session ? session.kind : null,
+    previewPointerType: preview && session ? session.pointerType : null,
     previewZone: preview && session ? session.currentZone : null,
     activeEventId: session?.eventId ?? null,
     isDragging: session !== null && didDrag,

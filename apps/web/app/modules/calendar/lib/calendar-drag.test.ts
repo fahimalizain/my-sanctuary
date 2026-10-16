@@ -11,7 +11,14 @@ import {
   allDayPreviewIndices,
   autoscrollDelta,
   classifyTouchGesture,
+  createTouchTracker,
+  crossedTickBoundary,
   isTapCreatePointer,
+  resolveChipGesture,
+  touchHandleGeometry,
+  type HandleRect,
+  TOUCH_HANDLE_HIT_PX,
+  TOUCH_HANDLE_KNOB_PX,
   movedAllDayRange,
   movedEnough,
   movedRange,
@@ -292,26 +299,47 @@ test('movedRange: grab 15 min in, drop at 14:00 → 13:45–14:45', () => {
 
 // ── resizedRange ────────────────────────────────────────────────────────
 
-test('resizedRange: end dragged earlier than start+15 → clamped', () => {
+test('resizedRange: end dragged onto start → 0-min (start === end)', () => {
   const start = new Date(2024, 0, 1, 10, 0, 0, 0);
   const end = new Date(2024, 0, 1, 12, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // Drag end to 10:00 (same as start) → clamp to 10:15
   const r = resizedRange(start, end, 'end', slot(day, 10 * 60));
   assert.equal(r.start.getTime(), start.getTime());
-  assert.equal(r.end.getHours(), 10);
-  assert.equal(r.end.getMinutes(), 15);
+  assert.equal(r.end.getTime(), start.getTime());
 });
 
-test('resizedRange: start dragged later than end-15 → clamped', () => {
+test('resizedRange: end dragged past start clamps at start, never inverts', () => {
   const start = new Date(2024, 0, 1, 10, 0, 0, 0);
   const end = new Date(2024, 0, 1, 12, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // Drag start to 12:00 → clamp to 11:45
+  const r = resizedRange(start, end, 'end', slot(day, 9 * 60));
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getTime(), start.getTime());
+});
+
+test('resizedRange: start dragged onto end → 0-min (start === end)', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 12, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
   const r = resizedRange(start, end, 'start', slot(day, 12 * 60));
   assert.equal(r.end.getTime(), end.getTime());
-  assert.equal(r.start.getHours(), 11);
-  assert.equal(r.start.getMinutes(), 45);
+  assert.equal(r.start.getTime(), end.getTime());
+});
+
+test('resizedRange: start dragged past end clamps at end, never inverts', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 12, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(start, end, 'start', slot(day, 13 * 60));
+  assert.equal(r.end.getTime(), end.getTime());
+  assert.equal(r.start.getTime(), end.getTime());
+});
+
+test('resizedRange: a 0-min event can be resized back out', () => {
+  const t = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  const r = resizedRange(t, t, 'end', slot(day, 10 * 60 + 5));
+  assert.equal(r.end.getTime() - r.start.getTime(), 5 * 60_000);
 });
 
 test('resizedRange: end extended freely', () => {
@@ -364,16 +392,15 @@ test('resizedRange: fixed edge is not re-snapped', () => {
   assert.equal(r.end.getMinutes(), 23);
 });
 
-test('resizedRange: clamp still 15 min with non-quarter fixed edge', () => {
+test('resizedRange: clamps to a non-quarter fixed edge (0-min)', () => {
   const start = new Date(2024, 0, 1, 10, 7, 0, 0);
   const end = new Date(2024, 0, 1, 11, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // Drag end to 10:10 → clamp to start + 15 = 10:22
-  const r = resizedRange(start, end, 'end', slot(day, 10 * 60 + 10));
+  // Drag end to 10:03 (before start) → clamp to start = 10:07
+  const r = resizedRange(start, end, 'end', slot(day, 10 * 60 + 3));
   assert.equal(r.start.getHours(), 10);
   assert.equal(r.start.getMinutes(), 7);
-  assert.equal(r.end.getHours(), 10);
-  assert.equal(r.end.getMinutes(), 22);
+  assert.equal(r.end.getTime(), start.getTime());
 });
 
 test('resizedRange: overnight end snaps to 1 minute', () => {
@@ -457,4 +484,201 @@ test('allDayPreviewIndices: null for timed zone', () => {
   const days = [mon];
   const preview = { start: mon, end: addDays(mon, 1) };
   assert.equal(allDayPreviewIndices(preview, 'timed', days), null);
+});
+
+test('touch tracker: single touch never latches', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  assert.equal(t.latched, false);
+  t.up(1);
+  assert.equal(t.count, 0);
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: 2nd touch latches until ALL lift', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'touch');
+  assert.equal(t.latched, true);
+  t.up(1);
+  assert.equal(t.latched, true); // one finger still down
+  t.up(2);
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: new touch after pinch while one finger remains stays latched', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'touch');
+  t.up(2);
+  t.down(3, 'touch');
+  assert.equal(t.latched, true);
+  t.up(1);
+  t.up(3);
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: mouse/pen pointers are ignored', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'mouse');
+  t.down(3, 'pen');
+  assert.equal(t.latched, false);
+  assert.equal(t.count, 1);
+  t.up(2); // unknown id: no-op
+  assert.equal(t.count, 1);
+});
+
+test('touch tracker: fresh touch after a full pinch is not latched', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch');
+  t.down(2, 'touch');
+  t.up(1);
+  t.up(2);
+  t.down(5, 'touch');
+  assert.equal(t.latched, false);
+});
+
+test('touch tracker: stale id then new primary touch is not latched', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch', true);
+  // pointerup for 1 missed
+  t.down(7, 'touch', true);
+  assert.equal(t.latched, false);
+  assert.equal(t.count, 1);
+});
+
+test('touch tracker: non-primary second touch still latches', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch', true);
+  t.down(2, 'touch', false);
+  assert.equal(t.latched, true);
+});
+
+test('touch tracker: reset clears ids and latch', () => {
+  const t = createTouchTracker();
+  t.down(1, 'touch', true);
+  t.down(2, 'touch', false);
+  t.reset();
+  assert.equal(t.latched, false);
+  assert.equal(t.count, 0);
+});
+
+test('classifyTouchGesture: chip-body pans hand off to scroll', () => {
+  assert.equal(classifyTouchGesture(0, 0, 'chip-body'), 'pending');
+  assert.equal(
+    classifyTouchGesture(0, DRAG_THRESHOLD_PX, 'chip-body'),
+    'scroll',
+  );
+  assert.equal(
+    classifyTouchGesture(DRAG_THRESHOLD_PX, 0, 'chip-body'),
+    'scroll',
+  );
+});
+
+test('resolveChipGesture: touch body is tap-only, even on an edge', () => {
+  const g = resolveChipGesture('touch', null, 1, 60);
+  assert.deepEqual(g, { kind: 'move', claimImmediately: false, tapOnly: true });
+});
+
+test('resolveChipGesture: touch handles claim immediately', () => {
+  assert.deepEqual(resolveChipGesture('touch', 'start', 30, 60), {
+    kind: 'resize-start',
+    claimImmediately: true,
+    tapOnly: false,
+  });
+  assert.equal(resolveChipGesture('touch', 'end', 30, 60).kind, 'resize-end');
+  assert.deepEqual(resolveChipGesture('touch', 'move', 1, 60), {
+    kind: 'move',
+    claimImmediately: true,
+    tapOnly: false,
+  });
+});
+
+test('resolveChipGesture: mouse/pen keep edge zones and body move', () => {
+  for (const type of ['mouse', 'pen']) {
+    assert.equal(resolveChipGesture(type, null, 2, 60).kind, 'resize-start');
+    assert.equal(resolveChipGesture(type, null, 58, 60).kind, 'resize-end');
+    assert.deepEqual(resolveChipGesture(type, null, 30, 60), {
+      kind: 'move',
+      claimImmediately: false,
+      tapOnly: false,
+    });
+    assert.equal(resolveChipGesture(type, 'end', 30, 60).kind, 'resize-end');
+  }
+});
+
+function intersects(a: HandleRect, b: HandleRect): boolean {
+  return (
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+  );
+}
+
+test('touchHandleGeometry: no hit-box overlap, knobs belong to the chip', () => {
+  const half = TOUCH_HANDLE_KNOB_PX / 2;
+  for (const w of [45, 60, 110, 200]) {
+    for (const h of [15, 30, 45, 90]) {
+      const g = touchHandleGeometry(w, h);
+      const label = `w=${w} h=${h}`;
+      assert.ok(!intersects(g.start, g.end), `start/end ${label}`);
+      assert.ok(!intersects(g.start, g.move), `start/move ${label}`);
+      assert.ok(!intersects(g.end, g.move), `end/move ${label}`);
+      const chip = { x: 0, y: 0, w, h };
+      for (const [name, [cx, cy]] of Object.entries(g.knobs)) {
+        const knob = { x: cx - half, y: cy - half, w: half * 2, h: half * 2 };
+        assert.ok(intersects(knob, chip), `${name} knob touches chip ${label}`);
+        assert.ok(cx >= -half && cx <= w, `${name} knob x ${label}`);
+      }
+      // Top/bottom knobs sit at the horizontal middle of the chip.
+      assert.equal(g.knobs.start[0], w / 2);
+      assert.equal(g.knobs.end[0], w / 2);
+      // Each knob centre is inside its own hit box.
+      const inside = (r: HandleRect, [x, y]: [number, number]) =>
+        x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+      assert.ok(inside(g.start, g.knobs.start), `start knob in box ${label}`);
+      assert.ok(inside(g.end, g.knobs.end), `end knob in box ${label}`);
+      assert.ok(inside(g.move, g.knobs.move), `move knob in box ${label}`);
+    }
+  }
+});
+
+test('touchHandleGeometry: tall wide chips straddle the edge symmetrically', () => {
+  const g = touchHandleGeometry(200, 200);
+  assert.equal(g.start.y + g.start.h, TOUCH_HANDLE_HIT_PX / 2);
+  assert.equal(Math.abs(g.knobs.start[1]), 0);
+  assert.equal(g.move.x + g.move.w, 18);
+});
+
+test('touchHandleGeometry: bad input is safe', () => {
+  const g = touchHandleGeometry(NaN, NaN);
+  assert.ok(Number.isFinite(g.start.x) && Number.isFinite(g.move.y));
+});
+
+// ── haptic tick boundaries ──────────────────────────────────────────────
+
+test('crossedTickBoundary: same 15-min bucket does not tick', () => {
+  const base = Date.UTC(2026, 0, 5, 10, 0);
+  assert.equal(crossedTickBoundary(base, base, 15), false);
+  assert.equal(
+    crossedTickBoundary(base + 60_000, base + 14 * 60_000, 15),
+    false,
+  );
+});
+
+test('crossedTickBoundary: crossing a boundary ticks in either direction', () => {
+  const base = Date.UTC(2026, 0, 5, 10, 0);
+  assert.equal(
+    crossedTickBoundary(base + 14 * 60_000, base + 15 * 60_000, 15),
+    true,
+  );
+  assert.equal(
+    crossedTickBoundary(base + 15 * 60_000, base + 14 * 60_000, 15),
+    true,
+  );
+  assert.equal(crossedTickBoundary(base, base + 45 * 60_000, 15), true);
+});
+
+test('crossedTickBoundary: works before the epoch', () => {
+  assert.equal(crossedTickBoundary(-60_000, 60_000, 15), true);
+  assert.equal(crossedTickBoundary(-120_000, -60_000, 15), false);
 });

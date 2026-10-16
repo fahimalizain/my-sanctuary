@@ -133,6 +133,7 @@ export function CalendarPage() {
           onChipSelect={session.handleSelectChip}
           isDragging={session.isDragging}
           timedPreviewByDay={session.timedPreviewByDay}
+          previewInfo={session.previewInfo}
           previewColor={session.previewColor}
           previewTitle={session.previewTitle}
           allDayPreview={session.allDayPreview}
@@ -156,7 +157,6 @@ export function CalendarPage() {
             onSaveTimeZone={session.handleSaveTimeZone}
             onSaveCalendar={session.handleSaveCalendar}
             onDelete={session.handleDeleteEvent}
-            isSaving={session.isSaving}
             isDeleting={session.isDeleting}
             isDragging={session.isDragging}
           />
