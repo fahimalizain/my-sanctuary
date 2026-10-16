@@ -445,6 +445,16 @@ export function resizedRange(
   return { start, end };
 }
 
+/** True when `nextMs` sits in a different `stepMin` bucket than `prevMs`. */
+export function crossedTickBoundary(
+  prevMs: number,
+  nextMs: number,
+  stepMin: number,
+): boolean {
+  const stepMs = stepMin * 60_000;
+  return Math.floor(prevMs / stepMs) !== Math.floor(nextMs / stepMs);
+}
+
 /** Per-day ghost geometry for a timed preview range. */
 export function timedPreviewSegments(
   preview: TimedRange | null,

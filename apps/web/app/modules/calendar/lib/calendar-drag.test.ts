@@ -12,6 +12,7 @@ import {
   autoscrollDelta,
   classifyTouchGesture,
   createTouchTracker,
+  crossedTickBoundary,
   isTapCreatePointer,
   resolveChipGesture,
   touchHandleGeometry,
@@ -631,4 +632,33 @@ test('touchHandleGeometry: tall wide chips straddle the edge symmetrically', () 
 test('touchHandleGeometry: bad input is safe', () => {
   const g = touchHandleGeometry(NaN, NaN);
   assert.ok(Number.isFinite(g.start.x) && Number.isFinite(g.move.y));
+});
+
+// ── haptic tick boundaries ──────────────────────────────────────────────
+
+test('crossedTickBoundary: same 15-min bucket does not tick', () => {
+  const base = Date.UTC(2026, 0, 5, 10, 0);
+  assert.equal(crossedTickBoundary(base, base, 15), false);
+  assert.equal(
+    crossedTickBoundary(base + 60_000, base + 14 * 60_000, 15),
+    false,
+  );
+});
+
+test('crossedTickBoundary: crossing a boundary ticks in either direction', () => {
+  const base = Date.UTC(2026, 0, 5, 10, 0);
+  assert.equal(
+    crossedTickBoundary(base + 14 * 60_000, base + 15 * 60_000, 15),
+    true,
+  );
+  assert.equal(
+    crossedTickBoundary(base + 15 * 60_000, base + 14 * 60_000, 15),
+    true,
+  );
+  assert.equal(crossedTickBoundary(base, base + 45 * 60_000, 15), true);
+});
+
+test('crossedTickBoundary: works before the epoch', () => {
+  assert.equal(crossedTickBoundary(-60_000, 60_000, 15), true);
+  assert.equal(crossedTickBoundary(-120_000, -60_000, 15), false);
 });

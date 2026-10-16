@@ -18,6 +18,7 @@ import {
   autoscrollDelta,
   classifyTouchGesture,
   createTouchTracker,
+  crossedTickBoundary,
   isTapCreatePointer,
   movedAllDayRange,
   movedEnough,
@@ -28,7 +29,9 @@ import {
   toAllDayRange,
   toTimedRange,
 } from '../lib/calendar-drag';
+import { tick } from '../lib/haptics';
 import {
+  dateOnDay,
   minutesFromY,
   RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
@@ -225,6 +228,22 @@ function computePreview(session: Session): TimedRange | null {
   }
 }
 
+/**
+ * The instant whose 15-minute bucket drives haptic ticks: the dragged edge
+ * for resizes (1-min snap, so the slot alone is too fine), else the slot.
+ */
+function tickInstantMs(session: Session): number | null {
+  if (session.kind === 'resize-start' || session.kind === 'resize-end') {
+    const range = computePreview(session);
+    if (!range) return null;
+    return (
+      session.kind === 'resize-start' ? range.start : range.end
+    ).getTime();
+  }
+  const { day, minutes } = session.currentSlot;
+  return dateOnDay(day, minutes).getTime();
+}
+
 function nextSlotFromPoint(
   session: Session,
   clientX: number,
@@ -275,6 +294,17 @@ export function useCalendarDrag(
       currentSlot: hit.slot,
       currentZone: hit.zone,
     };
+    if (s.pointerType === 'touch' && claimedRef.current) {
+      const prevMs = tickInstantMs(s);
+      const nextMs = tickInstantMs(updated);
+      if (
+        prevMs !== null &&
+        nextMs !== null &&
+        crossedTickBoundary(prevMs, nextMs, SNAP_MINUTES)
+      ) {
+        tick();
+      }
+    }
     sessionRef.current = updated;
     setSession(updated);
   }, []);
@@ -310,6 +340,7 @@ export function useCalendarDrag(
     (pointerId: number) => {
       if (claimedRef.current) return;
       claimedRef.current = true;
+      tick();
       optsRef.current.setStripLocked(true);
       document.body.style.userSelect = 'none';
       const target = captureTargetRef.current;
@@ -347,6 +378,7 @@ export function useCalendarDrag(
         claimedRef.current = false;
       } else {
         claimedRef.current = true;
+        if (isTouch) tick();
         optsRef.current.setStripLocked(true);
         try {
           target.setPointerCapture(e.pointerId);
