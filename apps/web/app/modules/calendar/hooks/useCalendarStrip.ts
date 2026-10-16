@@ -171,6 +171,11 @@ export function useCalendarStrip(): CalendarStrip {
 
   const setStripLocked = useCallback((locked: boolean) => {
     suppressRebaseRef.current = locked;
+    // CSS scroll-snap re-snaps on every programmatic scrollLeft write, which
+    // would fight drag auto-scroll. Suspend it while locked; clearing the
+    // inline override re-engages snap and settles on the nearest column.
+    const scroller = scrollerRef.current;
+    if (scroller) scroller.style.scrollSnapType = locked ? 'none' : '';
   }, []);
 
   const releaseSuppressRebase = () => {
