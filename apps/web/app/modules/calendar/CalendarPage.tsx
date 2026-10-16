@@ -58,8 +58,9 @@ export function CalendarPage() {
     strip.scrollerRef,
   ]);
 
+  // Calendar view is non-selectable; text fields opt back in (user-select + callout inherit).
   return (
-    <div className="h-[100dvh] bg-cream flex flex-col">
+    <div className="h-[100dvh] bg-cream flex flex-col select-none [-webkit-touch-callout:none] [&_input]:select-text [&_textarea]:select-text [&_input]:[-webkit-touch-callout:default] [&_textarea]:[-webkit-touch-callout:default]">
       <CalendarHeader
         rangeTitle={strip.rangeTitle}
         isRefreshing={session.isRefreshing}
