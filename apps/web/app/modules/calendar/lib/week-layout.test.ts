@@ -8,16 +8,23 @@ import {
   ALLDAY_MIN,
   CHIP_MIN_H,
   DAYS_PER_PERIOD,
+  EMPTY_WHEEL_BURST,
   HOUR_H_BASE,
   HOUR_H_MAX,
   HOUR_H_MIN,
+  SCROLL_AXIS_SLOP,
   STRIP_OVERSCAN,
   STRIP_REBASE_THRESHOLD,
   TIME_GUTTER_W,
+  WHEEL_BURST_IDLE_MS,
+  WHEEL_LINE_PX,
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
+  classifyScrollAxis,
+  nextWheelBurst,
   parseStoredPeriodLength,
+  wheelDeltaPx,
   colWidth,
   dayIndexFromScroll,
   eventHeightPx,
@@ -53,6 +60,8 @@ import {
   shouldRebase,
   startOfWeek,
   stripDayCount,
+  stripRebaseSuppressed,
+  stripSnapDisabled,
   visibleStartIndex,
   weekRangeIso,
   snapMinutes,
@@ -65,6 +74,8 @@ import {
   timedRangeToAllDay,
   allDayRangeToTimed,
   applyAllDayStartDate,
+  type StripLockReason,
+  type WheelBurst,
 } from './week-layout';
 
 // ── startOfWeek ─────────────────────────────────────────────────────────
@@ -354,6 +365,248 @@ test('shiftWindowStart: period 3 → ±3 days', () => {
   assert.equal(right.getFullYear(), 2026);
   assert.equal(right.getMonth(), 8);
   assert.equal(right.getDate(), 10); // Thu Sep 10
+});
+
+// ── Strip lock ownership ────────────────────────────────────────────────
+
+test('stripSnapDisabled: true while any owner is held', () => {
+  assert.equal(stripSnapDisabled(new Set<StripLockReason>()), false);
+  for (const reason of ['drag', 'pinch', 'axis'] as const) {
+    assert.equal(stripSnapDisabled(new Set<StripLockReason>([reason])), true);
+  }
+  assert.equal(
+    stripSnapDisabled(new Set<StripLockReason>(['drag', 'pinch'])),
+    true,
+  );
+});
+
+test('stripRebaseSuppressed: drag / pinch yes, axis alone no', () => {
+  assert.equal(stripRebaseSuppressed(new Set<StripLockReason>(['drag'])), true);
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['pinch'])),
+    true,
+  );
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'pinch'])),
+    true,
+  );
+  // axis holds snap off but leaves rebase free (the window may still slide).
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['axis'])),
+    false,
+  );
+  assert.equal(
+    stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'axis'])),
+    true,
+  );
+});
+
+test('strip lock: releasing one owner leaves another owner in effect', () => {
+  const held = new Set<StripLockReason>(['drag', 'axis']);
+  assert.equal(stripSnapDisabled(held), true);
+  assert.equal(stripRebaseSuppressed(held), true);
+
+  // Drag ends while the axis owner still holds.
+  held.delete('drag');
+  assert.equal(stripSnapDisabled(held), true);
+  assert.equal(stripRebaseSuppressed(held), false);
+
+  // Last owner releases → snap re-engages.
+  held.delete('axis');
+  assert.equal(stripSnapDisabled(held), false);
+  assert.equal(stripRebaseSuppressed(held), false);
+});
+
+// Set, not a counter: lock twice + unlock once must release.
+test('strip lock: repeat holds are idempotent', () => {
+  const held = new Set<StripLockReason>();
+  held.add('pinch');
+  held.add('pinch');
+  held.delete('pinch');
+  assert.equal(stripSnapDisabled(held), false);
+  assert.equal(stripRebaseSuppressed(held), false);
+});
+
+test('strip lock: empty set means snap enabled and no suppression', () => {
+  const held: ReadonlySet<StripLockReason> = new Set();
+  assert.equal(stripSnapDisabled(held), false);
+  assert.equal(stripRebaseSuppressed(held), false);
+});
+
+// ── classifyScrollAxis ──────────────────────────────────────────────────
+
+test('classifyScrollAxis: pending until the slop is exceeded', () => {
+  assert.equal(classifyScrollAxis(0, 0), 'pending');
+  assert.equal(classifyScrollAxis(4, -3), 'pending');
+  // Exactly at the slop is still pending: the gesture has not moved enough.
+  assert.equal(classifyScrollAxis(SCROLL_AXIS_SLOP, 0), 'pending');
+  assert.equal(classifyScrollAxis(0, SCROLL_AXIS_SLOP), 'pending');
+  assert.equal(
+    classifyScrollAxis(SCROLL_AXIS_SLOP, SCROLL_AXIS_SLOP),
+    'pending',
+  );
+});
+
+test('classifyScrollAxis: pure vertical commits to y', () => {
+  assert.equal(classifyScrollAxis(0, 24), 'y');
+  assert.equal(classifyScrollAxis(0, -24), 'y');
+});
+
+test('classifyScrollAxis: diagonal 1:1 commits to y', () => {
+  assert.equal(classifyScrollAxis(12, 12), 'y');
+  assert.equal(classifyScrollAxis(40, 40), 'y');
+});
+
+test('classifyScrollAxis: just under 2:1 stays vertical, past it goes x', () => {
+  assert.equal(classifyScrollAxis(19, 10), 'y');
+  assert.equal(classifyScrollAxis(21, 10), 'x');
+});
+
+test('classifyScrollAxis: an exact 2:1 tie stays vertical', () => {
+  // 2:1 is the boundary; `>` keeps the tie on the day-preserving side.
+  assert.equal(classifyScrollAxis(20, 10), 'y');
+  assert.equal(classifyScrollAxis(160, 80), 'y');
+});
+
+test('classifyScrollAxis: negative deltas are symmetric', () => {
+  assert.equal(classifyScrollAxis(-21, -10), 'x');
+  assert.equal(classifyScrollAxis(-19, -10), 'y');
+  assert.equal(classifyScrollAxis(21, -10), 'x');
+  assert.equal(classifyScrollAxis(-21, 10), 'x');
+  assert.equal(classifyScrollAxis(-12, 12), 'y');
+  assert.equal(classifyScrollAxis(0, -30), 'y');
+});
+
+test('classifyScrollAxis: custom slop', () => {
+  // Smaller slop: below it still pending, above it classified as usual.
+  assert.equal(classifyScrollAxis(2, 2, 2), 'pending');
+  assert.equal(classifyScrollAxis(3, 3, 2), 'y');
+  // Larger slop keeps a small move pending.
+  assert.equal(classifyScrollAxis(3, 3, 8), 'pending');
+  assert.equal(classifyScrollAxis(5, 2, 4), 'x');
+  assert.equal(classifyScrollAxis(2, 8, 6), 'y');
+});
+
+// ── wheelDeltaPx ────────────────────────────────────────────────────────
+
+test('wheelDeltaPx: pixel deltas pass through untouched', () => {
+  assert.equal(wheelDeltaPx(12, 0, 600), 12);
+  assert.equal(wheelDeltaPx(-8.5, 0, 600), -8.5);
+  assert.equal(wheelDeltaPx(0, 0, 0), 0, 'px mode needs no viewport size');
+});
+
+test('wheelDeltaPx: line deltas scale by the 16px line box', () => {
+  assert.equal(WHEEL_LINE_PX, 16, 'zoomFactorFromWheel assumes the same box');
+  assert.equal(wheelDeltaPx(3, 1, 600), 48);
+  assert.equal(
+    wheelDeltaPx(-1, 1, 0),
+    -WHEEL_LINE_PX,
+    'lines need no page size',
+  );
+});
+
+test('wheelDeltaPx: page deltas scale by the caller-measured viewport', () => {
+  assert.equal(wheelDeltaPx(2, 2, 600), 1200);
+  assert.equal(wheelDeltaPx(-1, 2, 480), -480);
+  // A page delta on an unmeasured scroller must still move something: the
+  // handler has already preventDefault-ed the event by then.
+  assert.equal(wheelDeltaPx(1, 2, 0), WHEEL_LINE_PX);
+  assert.equal(wheelDeltaPx(1, 2, Number.NaN), WHEEL_LINE_PX);
+});
+
+test('wheelDeltaPx: non-finite deltas never scroll', () => {
+  assert.equal(wheelDeltaPx(Number.NaN, 0, 600), 0);
+  assert.equal(wheelDeltaPx(Number.POSITIVE_INFINITY, 1, 600), 0);
+  assert.equal(wheelDeltaPx(Number.NEGATIVE_INFINITY, 2, 600), 0);
+});
+
+// ── nextWheelBurst ──────────────────────────────────────────────────────
+
+test('nextWheelBurst: an idle gap starts a new burst with fresh sums and axis', () => {
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 0, dy: 40, t: 1000 });
+  assert.equal(first.axis, 'y');
+
+  // Horizontal-heavy within the same burst: the latch must hold — re-deciding
+  // here would hand the strip back to native snap mid-gesture.
+  const latched = nextWheelBurst(first, { dx: 200, dy: 0, t: 1050 });
+  assert.equal(latched.axis, 'y');
+  assert.equal(latched.sumX, 200);
+  assert.equal(latched.sumY, 40);
+
+  // 200ms later: a new gesture, so this event's delta decides the axis.
+  const restarted = nextWheelBurst(latched, { dx: 60, dy: 0, t: 1250 });
+  assert.equal(restarted.axis, 'x');
+  assert.equal(restarted.sumX, 60, 'sums restart with the burst');
+  assert.equal(restarted.sumY, 0);
+  assert.equal(restarted.lastT, 1250);
+});
+
+test('nextWheelBurst: stays pending while the burst is under the slop', () => {
+  let burst: WheelBurst = EMPTY_WHEEL_BURST;
+  for (let i = 0; i < 4; i++) {
+    burst = nextWheelBurst(burst, { dx: 1, dy: 2, t: 1000 + i * 10 });
+  }
+  assert.equal(burst.axis, 'pending', '4× (1, 2) is still under 8px');
+  assert.equal(burst.sumX, 4);
+  assert.equal(burst.sumY, 8);
+
+  // The 5th event crosses the slop on the accumulated delta and commits.
+  burst = nextWheelBurst(burst, { dx: 1, dy: 2, t: 1050 });
+  assert.equal(burst.axis, 'y');
+  assert.equal(burst.sumX, 5);
+  assert.equal(burst.sumY, 10);
+});
+
+test('nextWheelBurst: latches x on a clear horizontal start and keeps it', () => {
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: -60, dy: 4, t: 0 });
+  assert.equal(first.axis, 'x');
+
+  // Vertical-heavy momentum after a horizontal flick must not flip the latch.
+  const later = nextWheelBurst(first, { dx: -10, dy: -80, t: 16 });
+  assert.equal(later.axis, 'x');
+  assert.equal(later.sumY, -76);
+});
+
+test('nextWheelBurst: a gap over WHEEL_BURST_IDLE_MS is the only restart', () => {
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 0, dy: 40, t: 1000 });
+
+  const justUnder = nextWheelBurst(first, {
+    dx: 80,
+    dy: 0,
+    t: 1000 + WHEEL_BURST_IDLE_MS - 1,
+  });
+  assert.equal(justUnder.axis, 'y', 'a slow burst keeps its latch');
+  assert.equal(justUnder.sumY, 40, 'and keeps accumulating its delta');
+
+  const atBoundary = nextWheelBurst(first, {
+    dx: 80,
+    dy: 0,
+    t: 1000 + WHEEL_BURST_IDLE_MS,
+  });
+  assert.equal(
+    atBoundary.axis,
+    'y',
+    'the boundary gap still continues the burst',
+  );
+  assert.equal(atBoundary.sumY, 40);
+
+  const justOver = nextWheelBurst(first, {
+    dx: 80,
+    dy: 0,
+    t: 1000 + WHEEL_BURST_IDLE_MS + 1,
+  });
+  assert.equal(justOver.axis, 'x');
+  assert.equal(justOver.sumY, 0, 'the new burst starts from this event only');
+});
+
+test('nextWheelBurst: is pure, and an unusable timestamp restarts', () => {
+  const seeded = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 1, dy: 2, t: 500 });
+  const snapshot = { ...seeded };
+  // A bad timestamp must start a fresh burst, never continue stale state.
+  const nan = nextWheelBurst(seeded, { dx: 60, dy: 0, t: Number.NaN });
+  assert.equal(nan.axis, 'x');
+  assert.equal(nan.sumY, 0);
+  assert.deepEqual(seeded, snapshot, 'the reducer does not mutate its input');
 });
 
 // ── clampMinutesToDay ───────────────────────────────────────────────────

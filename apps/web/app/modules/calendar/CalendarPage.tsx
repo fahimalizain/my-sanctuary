@@ -22,7 +22,8 @@ export function CalendarPage() {
     dayCount: strip.dayCount,
     scrollerHeight: strip.scrollerHeight,
     scrollerRef: strip.scrollerRef,
-    setStripLocked: strip.setStripLocked,
+    lockStrip: strip.lockStrip,
+    unlockStrip: strip.unlockStrip,
   });
 
   useHideNavOnLateHours(strip.scrollerRef, session.hourH, session.allDayHeight);
