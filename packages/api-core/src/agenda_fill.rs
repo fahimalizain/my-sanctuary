@@ -32,9 +32,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::agenda::{
-    add_civil_days, user_today, AgendaError, AGENDA_KIND_OCCURRENCE, AGENDA_KIND_TASK,
+    add_civil_days, backlog_local_date, planning_horizon_date, user_today, AgendaError,
+    AGENDA_KIND_OCCURRENCE, AGENDA_KIND_TASK,
 };
-use crate::models::{NewAgendaItem, NewRoutineOccurrence, Routine, RoutineOccurrence, Task};
+use crate::models::{
+    AgendaItem, NewAgendaItem, NewRoutineOccurrence, Routine, RoutineOccurrence, Task,
+};
 use crate::repo::{AgendaItemRepo, CalendarRepo, OccurrenceRepo, RoutineRepo, TaskRepo};
 use crate::routines::occurrence_dates;
 use crate::tasks::{TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED};
@@ -212,23 +215,39 @@ pub async fn fill_occurrence_horizon(
 }
 
 // ──────────────────────────────────────────
-// Task backfill
+// Task placement (self-heal, ADR 0007)
 // ──────────────────────────────────────────
 
-/// Backfills one agenda row per still-actionable task that has none, on today.
+/// Puts every living task's single agenda row where its **status** says it
+/// belongs — the `*/15` self-heal and the ADR 0007 migration (existing `OPEN`
+/// rows leave the day stream on the first tick; no SQL migration).
 ///
 /// - Living tasks only (`list_by_user_id` hides soft-deleted rows) and only
 ///   `OPEN | PLANNED | IN_PROGRESS`: `COMPLETED`/`DISCARDED` get nothing.
-/// - `list_by_refs(user, "task", ids)` on **any** date: a task that already
-///   holds a row anywhere is left completely alone (not moved, never a second
-///   row — one row per task is the 0018 invariant).
-/// - The missing ones are appended in **board order**: `IN_PROGRESS` first,
-///   then `PLANNED`, then `OPEN`, each by `tasks.sort_order` with ties broken
-///   by task id ascending. Ranks start at `max_sort_order(today) + 1` (0 when
-///   today's pile is empty) and increase by one in that order.
+/// - `list_by_refs(user, "task", ids)` on **any** date maps each task to the
+///   row it already holds, if any (never a second row — one row per task is
+///   the 0018 invariant). The backlog date is civil today + 50 years
+///   ([`backlog_local_date`]); the 10-year line is civil today + 10 years
+///   ([`planning_horizon_date`]).
+/// - `OPEN` with a row dated `<` the horizon → the row moves to the backlog
+///   date; `OPEN` with no row → one is inserted there. An `OPEN` row already
+///   at `>=` the horizon is left alone, even when its date is not exactly
+///   today's backlog date (yesterday's backlog date is still past the line).
+/// - `PLANNED` / `IN_PROGRESS` with a row dated `>=` the horizon → the row
+///   moves to today; with no row → one is inserted on today. A dated future
+///   row in `[today, horizon)` and a past row are never touched (a past
+///   `PLANNED` row can still pin the anchor). Nothing is rewritten just to
+///   normalize it onto exactly today's backlog date.
+/// - The arrivals are appended in **board order** per destination:
+///   `IN_PROGRESS` first, then `PLANNED`, each by `tasks.sort_order` with ties
+///   broken by task id ascending; `OPEN` by `tasks.sort_order`, ties by id.
+///   Ranks start at `max_sort_order(destination) + 1` (0 when that pile is
+///   empty) and increase by one in that order. Rows already correctly on the
+///   destination keep their ranks — moving and inserting share one counter, so
+///   a healed `PLANNED` row and a rowless `IN_PROGRESS` land as one board.
 ///
-/// This is the migration backfill and the self-heal, not the task lifecycle
-/// hook: `create_task` and friends already maintain the single row.
+/// Idempotent: a second pass with nothing missing or misplaced writes nothing
+/// (no `insert_many`, no `set_local_date`).
 pub async fn ensure_task_items(
     agenda_repo: &dyn AgendaItemRepo,
     task_repo: &dyn TaskRepo,
@@ -237,55 +256,109 @@ pub async fn ensure_task_items(
     now_unix: i64,
 ) -> Result<(), AgendaError> {
     let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
-    let mut missing: Vec<Task> = task_repo
+    let backlog_date = backlog_local_date(&today)?;
+    let horizon = planning_horizon_date(&today)?;
+
+    let tasks: Vec<Task> = task_repo
         .list_by_user_id(user_id)
         .await?
         .into_iter()
         .filter(|task| status_rank(&task.status).is_some())
         .collect();
-    if missing.is_empty() {
+    if tasks.is_empty() {
         return Ok(());
     }
 
-    let ids: Vec<String> = missing.iter().map(|task| task.id.clone()).collect();
-    let memberships = agenda_repo.list_by_refs(user_id, AGENDA_KIND_TASK, &ids).await?;
-    let with_row: HashSet<&str> = memberships.iter().map(|item| item.ref_id.as_str()).collect();
-    missing.retain(|task| !with_row.contains(task.id.as_str()));
-    if missing.is_empty() {
-        return Ok(());
+    let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
+    let memberships = agenda_repo
+        .list_by_refs(user_id, AGENDA_KIND_TASK, &ids)
+        .await?;
+    let rows_by_task: HashMap<&str, &AgendaItem> = memberships
+        .iter()
+        .map(|item| (item.ref_id.as_str(), item))
+        .collect();
+
+    // Destination piles: `Some(row)` is a row that has to travel,
+    // `None` a rowless task. Everything absent here is already correct.
+    let mut today_pile: Vec<(&Task, Option<&AgendaItem>)> = Vec::new();
+    let mut backlog_pile: Vec<(&Task, Option<&AgendaItem>)> = Vec::new();
+    for task in &tasks {
+        let row = rows_by_task.get(task.id.as_str()).copied();
+        match (task.status.as_str(), row) {
+            (TASK_STATUS_OPEN, None) => backlog_pile.push((task, None)),
+            (TASK_STATUS_OPEN, Some(row)) if row.local_date.as_str() < horizon.as_str() => {
+                backlog_pile.push((task, Some(row)));
+            }
+            (TASK_STATUS_OPEN, Some(_)) => {}
+            (_, None) => today_pile.push((task, None)),
+            (_, Some(row)) if row.local_date.as_str() >= horizon.as_str() => {
+                today_pile.push((task, Some(row)));
+            }
+            (_, Some(_)) => {}
+        }
     }
 
-    missing.sort_by(|a, b| {
-        (status_rank(&a.status), a.sort_order, &a.id)
-            .cmp(&(status_rank(&b.status), b.sort_order, &b.id))
+    append_task_pile(agenda_repo, user_id, &today, today_pile).await?;
+    append_task_pile(agenda_repo, user_id, &backlog_date, backlog_pile).await?;
+    Ok(())
+}
+
+/// Appends one destination pile after that date's current max rank, in board
+/// order.
+///
+/// A task that already holds a row travels with
+/// [`AgendaItemRepo::set_local_date`]; the rowless ones are collected and
+/// written with one `insert_many` at the end, using the ranks already assigned
+/// by the shared `max + 1` counter. An empty pile writes nothing.
+async fn append_task_pile(
+    agenda_repo: &dyn AgendaItemRepo,
+    user_id: &str,
+    local_date: &str,
+    mut pile: Vec<(&Task, Option<&AgendaItem>)>,
+) -> Result<(), AgendaError> {
+    if pile.is_empty() {
+        return Ok(());
+    }
+    pile.sort_by(|(a, _), (b, _)| {
+        (status_rank(&a.status), a.sort_order, a.id.as_str()).cmp(&(
+            status_rank(&b.status),
+            b.sort_order,
+            b.id.as_str(),
+        ))
     });
 
     let mut rank = agenda_repo
-        .max_sort_order(user_id, &today)
+        .max_sort_order(user_id, local_date)
         .await?
         .map(|max| max + 1)
         .unwrap_or(0);
-    let rows: Vec<NewAgendaItem> = missing
-        .iter()
-        .map(|task| {
-            let row = NewAgendaItem {
+    let mut inserts: Vec<NewAgendaItem> = Vec::new();
+    for (task, row) in pile {
+        match row {
+            Some(row) => {
+                agenda_repo
+                    .set_local_date(&row.id, local_date, rank)
+                    .await?
+            }
+            None => inserts.push(NewAgendaItem {
                 user_id: user_id.to_string(),
-                local_date: today.clone(),
+                local_date: local_date.to_string(),
                 kind: AGENDA_KIND_TASK.to_string(),
                 ref_id: task.id.clone(),
                 sort_order: rank,
-            };
-            rank += 1;
-            row
-        })
-        .collect();
-    agenda_repo.insert_many(rows).await?;
+            }),
+        }
+        rank += 1;
+    }
+    if !inserts.is_empty() {
+        agenda_repo.insert_many(inserts).await?;
+    }
     Ok(())
 }
 
 /// Board order rank of a still-actionable task status: `IN_PROGRESS`, then
 /// `PLANNED`, then `OPEN`. `None` for terminal statuses — they are never
-/// backfilled.
+/// placed.
 fn status_rank(status: &str) -> Option<u8> {
     match status {
         TASK_STATUS_IN_PROGRESS => Some(0),
@@ -310,8 +383,9 @@ pub struct AgendaFillReport {
 }
 
 /// The agenda fill cron (the `*/15 * * * *` tick): for each affected user,
-/// materialize the occurrence horizon and backfill the open tasks that have no
-/// membership row.
+/// materialize the occurrence horizon and place or repair every living task's
+/// single agenda row (`OPEN` on the backlog date, everything else on today —
+/// [`ensure_task_items`], ADR 0007).
 ///
 /// The work list is the sorted, deduped union of
 /// [`RoutineRepo::list_user_ids_with_living_routines`] and

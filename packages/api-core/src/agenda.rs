@@ -7569,7 +7569,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_task_items_backfills_open_tasks_on_today_in_board_order() {
+    fn ensure_task_items_places_rowless_tasks_in_board_order() {
         let repos = repos();
         let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
         running.sort_order = 1;
@@ -7583,9 +7583,18 @@ mod tests {
         for task in [running, planned, open, completed, placed] {
             repos.tasks.push(task);
         }
-        // A task that already holds a slot (on a past day) is left alone: no
-        // second row, no move.
-        agenda_row(&repos, "ai-placed", "u-1", "2026-08-20", AGENDA_KIND_TASK, "task-placed", 2);
+        // An OPEN row inside the ten-year line is misplaced under ADR 0007:
+        // the fill moves it out to the backlog date (it is no longer "already
+        // placed, leave it alone").
+        agenda_row(
+            &repos,
+            "ai-placed",
+            "u-1",
+            "2026-08-20",
+            AGENDA_KIND_TASK,
+            "task-placed",
+            2,
+        );
 
         ensure_tasks(&repos, "u-1").unwrap();
 
@@ -7595,14 +7604,20 @@ mod tests {
                 .into_iter()
                 .map(|item| (item.ref_id, item.sort_order))
                 .collect();
+        let expected_today = vec![("task-run".to_string(), 0), ("task-plan".to_string(), 1)];
         assert_eq!(
-            today,
+            today, expected_today,
+            "rowless IN_PROGRESS then PLANNED land on today, ranks starting at 0"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
             vec![
-                ("task-run".to_string(), 0),
-                ("task-plan".to_string(), 1),
-                ("task-open".to_string(), 2),
+                ("task-run".to_string(), 0, "2026-08-23".to_string()),
+                ("task-plan".to_string(), 1, "2026-08-23".to_string()),
+                ("task-open".to_string(), 0, "2076-08-23".to_string()),
+                ("task-placed".to_string(), 1, "2076-08-23".to_string()),
             ],
-            "IN_PROGRESS, PLANNED, OPEN — ranks 0, 1, 2"
+            "OPEN lands on the backlog date, appended in board order, never on today"
         );
         assert!(
             membership_triples(&repos, "u-1")
@@ -7610,22 +7625,274 @@ mod tests {
                 .all(|(ref_id, _, _)| ref_id != "task-done"),
             "a COMPLETED task gets nothing"
         );
-        let placed_rows: Vec<(String, i64, String)> = membership_triples(&repos, "u-1")
-            .into_iter()
-            .filter(|(ref_id, _, _)| ref_id == "task-placed")
-            .collect();
         assert_eq!(
-            placed_rows,
-            vec![("task-placed".to_string(), 2, "2026-08-20".to_string())],
-            "an already-placed task keeps its single row where it was"
+            repos.agenda.stored.lock().unwrap().len(),
+            4,
+            "one row per living task — the moved row is the same row"
         );
 
-        // A second pass writes nothing.
-        let before = repos.agenda.stored.lock().unwrap().len();
+        // A second pass with nothing misplaced writes nothing at all. The fake
+        // does not count `set_local_date`, so the snapshot proves no row moved.
+        let before = membership_triples(&repos, "u-1");
         repos.agenda.reset_calls();
         ensure_tasks(&repos, "u-1").unwrap();
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), before);
+        assert_eq!(membership_triples(&repos, "u-1"), before, "idempotent");
         assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn ensure_task_items_moves_an_open_row_before_the_horizon_onto_the_backlog_date() {
+        let repos = repos();
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 3;
+        repos.tasks.push(open);
+        agenda_row(
+            &repos,
+            "ai-open",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "task-open",
+            4,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        let rows = items_of(&repos, "task-open");
+        assert_eq!(rows.len(), 1, "the row travels; no second row is inserted");
+        assert_eq!(rows[0].id, "ai-open", "the same row moved");
+        assert_eq!(
+            rows[0].local_date, "2076-08-23",
+            "the backlog date, not today"
+        );
+        assert_eq!(rows[0].sort_order, 0, "appended on an empty backlog pile");
+    }
+
+    #[test]
+    fn ensure_task_items_moves_a_far_future_planned_and_in_progress_row_onto_today() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 4;
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 9;
+        let mut horizon = task_row("task-horizon", "u-1", "Horizon | Work", "PLANNED");
+        horizon.sort_order = 2;
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 1;
+        for task in [planned, running, horizon, open] {
+            repos.tasks.push(task);
+        }
+        // Both far-future rows sit in the backlog region although their
+        // statuses are real-day statuses; the rowless OPEN must not steal
+        // today's ranks.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            7,
+        );
+        agenda_row(
+            &repos,
+            "ai-run",
+            "u-1",
+            "2076-08-24",
+            AGENDA_KIND_TASK,
+            "task-run",
+            0,
+        );
+        // Exactly ON the horizon: rule (b) is `>=`, so this one moves too.
+        agenda_row(
+            &repos,
+            "ai-horizon",
+            "u-1",
+            "2036-08-23",
+            AGENDA_KIND_TASK,
+            "task-horizon",
+            4,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-run".to_string(), 0, "2026-08-23".to_string()),
+                ("task-horizon".to_string(), 1, "2026-08-23".to_string()),
+                ("task-plan".to_string(), 2, "2026-08-23".to_string()),
+                ("task-open".to_string(), 0, "2076-08-23".to_string()),
+            ],
+            "IN_PROGRESS then PLANNED (by sort_order) appended on today; OPEN stays in the backlog"
+        );
+        let moved =
+            pollster::block_on(repos.agenda.get_by_ref("u-1", AGENDA_KIND_TASK, "task-run"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(moved.id, "ai-run", "the existing row travelled");
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_a_dated_future_planned_row_alone() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 6;
+        repos.tasks.push(planned);
+        // today+8 is inside [today, horizon): a dated future plan.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-31",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            5,
+        );
+
+        repos.agenda.reset_calls();
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![("task-plan".to_string(), 5, "2026-08-31".to_string())],
+            "the date and its rank are untouched"
+        );
+        assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_a_past_planned_row_alone() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 2;
+        repos.tasks.push(planned);
+        // A past pending PLANNED row can still pin the anchor.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-20",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            2,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![("task-plan".to_string(), 2, "2026-08-20".to_string())],
+            "past PLANNED rows are anchor material, never moved to today"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_an_open_row_already_past_the_horizon_alone() {
+        let repos = repos();
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 3;
+        let mut edge = task_row("task-edge", "u-1", "Edge | Work", "OPEN");
+        edge.sort_order = 8;
+        for task in [open, edge] {
+            repos.tasks.push(task);
+        }
+        // 2076-08-22 is still >= 2036-08-23, so it is not "normalized" onto
+        // exactly today's backlog date.
+        agenda_row(
+            &repos,
+            "ai-open",
+            "u-1",
+            "2076-08-22",
+            AGENDA_KIND_TASK,
+            "task-open",
+            3,
+        );
+        // Exactly ON the horizon: rule (a) is `<`, so it does not move either.
+        agenda_row(
+            &repos,
+            "ai-edge",
+            "u-1",
+            "2036-08-23",
+            AGENDA_KIND_TASK,
+            "task-edge",
+            1,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-edge".to_string(), 1, "2036-08-23".to_string()),
+                ("task-open".to_string(), 3, "2076-08-22".to_string()),
+            ],
+            "an OPEN row at >= the horizon is left exactly where it is"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_appends_rowless_open_tasks_by_sort_order_with_id_ties() {
+        let repos = repos();
+        let mut high = task_row("task-high", "u-1", "High | Work", "OPEN");
+        high.sort_order = 5;
+        let mut low = task_row("task-low", "u-1", "Low | Work", "OPEN");
+        low.sort_order = 1;
+        let mut tie_a = task_row("task-a", "u-1", "A | Work", "OPEN");
+        tie_a.sort_order = 3;
+        let mut tie_b = task_row("task-b", "u-1", "B | Work", "OPEN");
+        tie_b.sort_order = 3;
+        // Push the tie in reverse id order: the fill must sort it.
+        for task in [high, low, tie_b, tie_a] {
+            repos.tasks.push(task);
+        }
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-low".to_string(), 0, "2076-08-23".to_string()),
+                ("task-a".to_string(), 1, "2076-08-23".to_string()),
+                ("task-b".to_string(), 2, "2076-08-23".to_string()),
+                ("task-high".to_string(), 3, "2076-08-23".to_string()),
+            ],
+            "sort_order first, task id breaks the tie; distinct append ranks"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_appends_a_rowless_in_progress_after_todays_existing_rows() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 0;
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 4;
+        for task in [planned, running] {
+            repos.tasks.push(task);
+        }
+        // A row already correctly on today at rank 5 keeps that rank; the
+        // rowless IN_PROGRESS is appended after the pile, not reshuffled in.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            5,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-plan".to_string(), 5, "2026-08-23".to_string()),
+                ("task-run".to_string(), 6, "2026-08-23".to_string()),
+            ],
+            "the existing rank stands and the arrival lands after it"
+        );
     }
 
     #[test]
@@ -7869,8 +8136,8 @@ mod tests {
         assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
         assert_eq!(
             membership_triples(&repos, "u-2"),
-            vec![("task-1".to_string(), 0, "2026-08-23".to_string())],
-            "u-2's OPEN task landed on today"
+            vec![("task-1".to_string(), 0, "2076-08-23".to_string())],
+            "u-2's OPEN task landed on the backlog date"
         );
 
         // A living routine whose calendar read fails: one broken user is
@@ -7898,7 +8165,7 @@ mod tests {
         assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
         assert_eq!(
             membership_triples(&repos, "u-2"),
-            vec![("task-1".to_string(), 0, "2026-08-23".to_string())]
+            vec![("task-1".to_string(), 0, "2076-08-23".to_string())]
         );
     }
 }

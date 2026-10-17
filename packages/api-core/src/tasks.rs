@@ -117,8 +117,8 @@
 //! backlog date. Soft delete removes the row. Pause, reorder, an
 //! already-IN_PROGRESS start, an already-OPEN stop, and title edits leave the
 //! row alone. Placement is **best-effort** and runs after the status/log
-//! writes: the `*/15` fill backfills a missing row, while a 500 on an
-//! already-committed transition would make the client retry a write that
+//! writes: the `*/15` fill repairs a missing or misplaced row, while a 500 on
+//! an already-committed transition would make the client retry a write that
 //! landed (and can never repair a half-written Google log).
 
 use std::collections::HashMap;
@@ -904,8 +904,8 @@ pub(crate) async fn place_task_on_backlog(
 /// Placement itself is **best-effort**: the task row is already committed, so
 /// a placement failure must not 500 the create — the client would retry and
 /// insert a **second** task. The `*/15` fill's
-/// [`crate::agenda_fill::ensure_task_items`] backfills a missing row on the
-/// next tick.
+/// [`crate::agenda_fill::ensure_task_items`] backfills a missing or misplaced
+/// row on the next tick.
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -978,8 +978,8 @@ pub async fn create_task(
     {
         // Best-effort: the task is committed, so a 500 would make the client
         // retry and insert a second task. The cron's `ensure_task_items`
-        // backfills a MISSING row; it does not repair a half-written Google
-        // log — a stale row is the lesser evil.
+        // backfills a MISSING OR MISPLACED row; it does not repair a
+        // half-written Google log — a stale row is the lesser evil.
     }
     Ok(TaskResponse {
         task: to_view(&task, &taxonomy, None),
@@ -1302,7 +1302,7 @@ pub async fn start_task(
         // Best-effort: the status and the `started` log are committed, so a
         // 500 would only make the client retry a start that landed (and the
         // retry is an already-IN_PROGRESS no-op). The cron backfills a MISSING
-        // row; it cannot repair a half-written Google log.
+        // OR MISPLACED row; it cannot repair a half-written Google log.
     }
 
     Ok(TaskActionResponse {
@@ -1588,8 +1588,8 @@ async fn stop_or_pause(
             place_task_on_backlog(agenda_repo, calendars, user_id, task_id, now_unix).await
         {
             // A stale row is the least-bad outcome: a 500 would report a
-            // write that already landed. The cron backfills a MISSING row;
-            // it does not repair a half-written Google log.
+            // write that already landed. The cron backfills a MISSING OR
+            // MISPLACED row; it does not repair a half-written Google log.
         }
     }
 
@@ -1739,7 +1739,7 @@ async fn complete_or_discard(
     // board rank are already committed. Only a transition FROM a living
     // status places — `COMPLETED` ⇄ `DISCARDED` is a real change but must not
     // drag an old history row onto today. The cron's task backfill repairs a
-    // MISSING row; it never repairs a half-written Google log.
+    // MISSING OR MISPLACED row; it never repairs a half-written Google log.
     if matches!(
         task.status.as_str(),
         TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS
@@ -1750,7 +1750,7 @@ async fn complete_or_discard(
             // A stale row is the least-bad outcome: a 500 would report a
             // write that already landed — status, terminal log, board rank,
             // and the Google exit all committed. The cron backfills a MISSING
-            // row; it does not repair a half-written Google log.
+            // OR MISPLACED row; it does not repair a half-written Google log.
         }
     }
 
@@ -2123,8 +2123,9 @@ async fn dispatch_matrix_action(
             if let Err(_) =
                 place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
             {
-                // The cron's task backfill repairs a MISSING row; a failed
-                // placement up to 15 minutes late is the accepted window.
+                // The cron's task backfill repairs a MISSING OR MISPLACED row;
+                // a failed placement up to 15 minutes late is the accepted
+                // window.
             }
             Ok(None)
         }
@@ -2161,7 +2162,8 @@ async fn dispatch_matrix_action(
             if let Err(_) = placement {
                 // Best-effort: the status and the `reopened` log are already
                 // committed, so a 500 would only make the client retry a
-                // reopen that landed. The cron backfills a MISSING row.
+                // reopen that landed. The cron backfills a MISSING OR
+                // MISPLACED row.
             }
             Ok(None)
         }
@@ -2296,8 +2298,9 @@ async fn terminal_transition(
             place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
         {
             // Best-effort: the status and the terminal log are committed.
-            // The cron backfills a MISSING row; it does not repair a
-            // half-written Google log, so a stale row is the lesser evil.
+            // The cron backfills a MISSING OR MISPLACED row; it does not
+            // repair a half-written Google log, so a stale row is the lesser
+            // evil.
         }
     }
     Ok(None)
