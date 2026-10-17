@@ -32,6 +32,7 @@ let DAYS_PER_PERIOD: typeof import('../lib/week-layout').DAYS_PER_PERIOD;
 let isSameDay: typeof import('../lib/week-layout').isSameDay;
 let colWidth: typeof import('../lib/week-layout').colWidth;
 let scrollLeftForIndex: typeof import('../lib/week-layout').scrollLeftForIndex;
+let initialStripRange: typeof import('../lib/initial-strip-range').initialStripRange;
 
 const GRID_WIDTH = 800;
 
@@ -48,6 +49,8 @@ before(async () => {
   isSameDay = layout.isSameDay;
   colWidth = layout.colWidth;
   scrollLeftForIndex = layout.scrollLeftForIndex;
+  const stripRange = await import('../lib/initial-strip-range');
+  initialStripRange = stripRange.initialStripRange;
   const mod = await import('./useCalendarStrip');
   useCalendarStrip = mod.useCalendarStrip;
 });
@@ -212,6 +215,13 @@ test('useCalendarStrip: after measure, visibleStart is fitPeriodStart(today), no
   assert.ok(
     !isSameDay(strip.visibleStart, overscanStart),
     `visibleStart must not be the overscan buffer week (${overscanStart.toDateString()})`,
+  );
+
+  // First paint queries exactly the landing window background sync keeps warm:
+  // one helper, one key, so opening Calendar after a period away is a cache hit.
+  assert.deepEqual(
+    strip.range,
+    initialStripRange(new Date(), strip.periodLength),
   );
 
   // Park used measured colW, not the 16px fallback.

@@ -1,7 +1,10 @@
 import { QueryObserver } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { agendaCurrentQueryOptions } from '@/app/queries/agenda';
-import { calendarsQueryOptions } from '@/app/queries/calendar';
+import {
+  calendarEventsQueryOptions,
+  calendarsQueryOptions,
+} from '@/app/queries/calendar';
 import { categoriesQueryOptions } from '@/app/queries/categories';
 import { queryKeys } from '@/app/queries/keys';
 import { listsQueryOptions } from '@/app/queries/lists';
@@ -10,6 +13,15 @@ import {
   TASKS_REFETCH_INTERVAL_MS,
   tasksQueryOptions,
 } from '@/app/queries/tasks';
+import {
+  LOCAL_MIDNIGHT_SKEW_MS,
+  initialStripRange,
+  msUntilLocalMidnight,
+} from '@/app/modules/calendar/lib/initial-strip-range';
+import {
+  getPeriodLength,
+  subscribePeriodLength,
+} from '@/app/modules/calendar/period-length-store';
 import { AGENDA_MIDNIGHT_SKEW_MS, msUntilNextMidnight } from './agenda-clock';
 import { getBoardTasksBusy } from './board-tasks-busy';
 
@@ -53,6 +65,8 @@ function createSession(queryClient: QueryClient): BackgroundSyncSession {
   // applied when the tasks observer is created.
   let tasksBusy = getBoardTasksBusy();
   let midnightTimer: ReturnType<typeof setTimeout> | undefined;
+  // The local-day timer that rolls the strip landing window forward.
+  let eventsMidnightTimer: ReturnType<typeof setTimeout> | undefined;
   // The zone the armed timer belongs to — a refetch that resolves the same
   // zone must not reset it.
   let armedZone: string | null = null;
@@ -104,6 +118,58 @@ function createSession(queryClient: QueryClient): BackgroundSyncSession {
     notifyOnChangeProps: [],
   });
   calendarsObserver.subscribe(() => {});
+
+  // ── Calendar strip landing range ──────────────────────────────────────
+  // Calendar's first paint queries this exact window; observing it here keeps
+  // that key warm after the user leaves the page, so opening Calendar is a cache
+  // hit instead of a blank grid. The factory is spread rather than rebuilt, so
+  // queryFn, key and placeholderData stay identical to the page's.
+  //
+  // Landing window, not the scrolled one: after the user scrolls, the page's key
+  // diverges and this one deliberately does not follow. The strip remounts from
+  // the same helper, so that is the key worth keeping warm.
+  let eventsRange = initialStripRange(new Date(), getPeriodLength());
+  const eventsObserver = new QueryObserver(queryClient, {
+    ...calendarEventsQueryOptions(eventsRange.timeMin, eventsRange.timeMax),
+    notifyOnChangeProps: [],
+  });
+
+  /** Point the events observer at the current landing window. An unchanged
+   *  range is left alone: `setOptions` would re-run the query for nothing. */
+  const retargetEventsObserver = () => {
+    if (stopped) return;
+    const next = initialStripRange(new Date(), getPeriodLength());
+    if (
+      next.timeMin === eventsRange.timeMin &&
+      next.timeMax === eventsRange.timeMax
+    ) {
+      return;
+    }
+    eventsRange = next;
+    eventsObserver.setOptions({
+      ...calendarEventsQueryOptions(next.timeMin, next.timeMax),
+      notifyOnChangeProps: [],
+    });
+  };
+
+  eventsObserver.subscribe(() => {});
+
+  // A period change is a UI preference: follow it here rather than in a React
+  // effect, which would destroy and recreate every observer in this session.
+  const unsubscribePeriodLength = subscribePeriodLength(retargetEventsObserver);
+
+  // The landing window is the browser's civil day, not the agenda's IANA zone,
+  // so this rolls at *local* midnight — `msUntilNextMidnight` would be a day off
+  // across a DST boundary.
+  const armEventsMidnight = () => {
+    eventsMidnightTimer = setTimeout(() => {
+      eventsMidnightTimer = undefined;
+      if (stopped) return;
+      retargetEventsObserver();
+      armEventsMidnight();
+    }, msUntilLocalMidnight() + LOCAL_MIDNIGHT_SKEW_MS);
+  };
+  armEventsMidnight();
 
   // Agenda current must keep its listener: the result carries the IANA
   // `time_zone` that arms the midnight refresh. `notifyOnChangeProps: []` here
@@ -167,11 +233,19 @@ function createSession(queryClient: QueryClient): BackgroundSyncSession {
     tasksObserver?.destroy();
     routinesObserver.destroy();
     calendarsObserver.destroy();
+    eventsObserver.destroy();
+    unsubscribePeriodLength();
     agendaObserver.destroy();
     document.removeEventListener('visibilitychange', onVisibilityChange);
     if (midnightTimer !== undefined) {
       clearTimeout(midnightTimer);
       midnightTimer = undefined;
+    }
+    // `stopped` is what actually keeps a late period callback or timer fire from
+    // recreating the observer; clearing the timer only stops the wait.
+    if (eventsMidnightTimer !== undefined) {
+      clearTimeout(eventsMidnightTimer);
+      eventsMidnightTimer = undefined;
     }
   };
 

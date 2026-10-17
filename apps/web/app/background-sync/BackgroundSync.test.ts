@@ -18,6 +18,11 @@ let queryClient: QueryClient;
 let startBackgroundSync: (client: QueryClient) => BackgroundSyncSession;
 let stopBackgroundSync: () => void;
 let setBoardTasksBusy: (next: boolean) => void;
+let initialStripRange: typeof import('@/app/modules/calendar/lib/initial-strip-range').initialStripRange;
+let getPeriodLength: typeof import('@/app/modules/calendar/period-length-store').getPeriodLength;
+let setPeriodLength: typeof import('@/app/modules/calendar/period-length-store').setPeriodLength;
+let DAYS_PER_PERIOD: number;
+let PERIOD_LENGTH_STORAGE_KEY: string;
 let BackgroundSync: ComponentType;
 let AuthProvider: ComponentType<{ children: ReactNode }>;
 let QueryClientProvider: ComponentType<{
@@ -47,6 +52,9 @@ const DEFAULT_BODIES: Record<string, unknown> = {
   '/api/tasks': { tasks: [] },
   '/api/routines': { routines: [] },
   '/api/calendar/calendars': { calendars: [] },
+  // The session observes the calendar strip's landing range, so this path is
+  // requested on start. A 404 would be retried (retry: 1) and skew the counts.
+  '/api/calendar/events': { events: [] },
   '/api/agenda': { time_zone: 'Asia/Riyadh' },
 };
 
@@ -55,6 +63,13 @@ function defaultRespond(url: string): Response {
   return path in DEFAULT_BODIES
     ? json(DEFAULT_BODIES[path])
     : json({ error: 'unexpected' }, 404);
+}
+
+/** Query params of every `/api/calendar/events` GET, in call order. */
+function eventsParams(): URLSearchParams[] {
+  return fetchCalls
+    .filter((url) => url.split('?')[0] === '/api/calendar/events')
+    .map((url) => new URLSearchParams(url.split('?')[1]));
 }
 
 /** Let the query pipeline drain (a few macrotasks, each after the microtasks). */
@@ -97,6 +112,19 @@ before(async () => {
   const busy = await import('./board-tasks-busy');
   setBoardTasksBusy = busy.setBoardTasksBusy;
 
+  const stripRange =
+    await import('@/app/modules/calendar/lib/initial-strip-range');
+  initialStripRange = stripRange.initialStripRange;
+
+  const periodLength =
+    await import('@/app/modules/calendar/period-length-store');
+  getPeriodLength = periodLength.getPeriodLength;
+  setPeriodLength = periodLength.setPeriodLength;
+
+  const layout = await import('@/app/modules/calendar/lib/week-layout');
+  DAYS_PER_PERIOD = layout.DAYS_PER_PERIOD;
+  PERIOD_LENGTH_STORAGE_KEY = layout.PERIOD_LENGTH_STORAGE_KEY;
+
   const auth = await import('@/lib/auth');
   AuthProvider = auth.AuthProvider;
 
@@ -108,6 +136,10 @@ afterEach(() => {
   cleanup();
   stopBackgroundSync();
   setBoardTasksBusy(false);
+  // The period length is module-level state shared by every test in this file:
+  // reset it, then drop the key so nothing leaks into the next file's store.
+  setPeriodLength(DAYS_PER_PERIOD);
+  window.localStorage.removeItem(PERIOD_LENGTH_STORAGE_KEY);
   queryClient.clear();
   fetchCalls = [];
 });
@@ -149,11 +181,14 @@ test('startBackgroundSync: categories/tasks wait for lists; the rest start at on
   // Seed-gated observers have not fetched while lists is pending.
   assert.equal(called('/api/categories'), false, 'categories gated on lists');
   assert.equal(called('/api/tasks'), false, 'tasks gated on lists');
-  // Never observe calendar events or a history window.
-  assert.equal(
-    fetchCalls.some((url) => url.includes('/api/calendar/events')),
-    false,
-  );
+  // The calendar strip's landing range is observed from the start, so Calendar
+  // opens on a warm cache instead of fetching the window itself.
+  const events = eventsParams();
+  assert.equal(events.length, 1, 'one events request at start');
+  const landing = initialStripRange(new Date(), getPeriodLength());
+  assert.equal(events[0].get('time_min'), landing.timeMin);
+  assert.equal(events[0].get('time_max'), landing.timeMax);
+  // Never a history window.
   assert.equal(
     fetchCalls.some((url) => url.includes('/api/agenda?from=')),
     false,
@@ -197,7 +232,60 @@ test('busy flag toggles the tasks observer interval and focus option', async () 
   session.stop();
 });
 
-// ── 3. Stop while lists is pending ───────────────────────────────────────
+// ── 3. Period length retargets the landing range ─────────────────────────
+
+test('setPeriodLength: retargets the events observer, leaves the others up', async () => {
+  respond = defaultRespond;
+
+  const session = startBackgroundSync(queryClient);
+  await settle();
+
+  const tasksQuery = queryClient
+    .getQueryCache()
+    .find({ queryKey: queryKeys.tasks.all });
+  assert.ok(tasksQuery, 'tasks observed before the change');
+  const listsCalls = fetchCalls.filter((url) => url.endsWith('/api/lists'));
+
+  // A Day-view change: the landing window moves with it, without waiting for a
+  // real midnight.
+  setPeriodLength(1);
+  await settle();
+
+  const landing = initialStripRange(new Date(), 1);
+  const moved = queryClient.getQueryCache().find({
+    queryKey: queryKeys.calendar.events(landing.timeMin, landing.timeMax),
+  });
+  assert.ok(moved, 'the observer moved to the day-view landing range');
+  assert.equal(moved.observers.length, 1, 'exactly one events observer');
+
+  const events = eventsParams();
+  assert.equal(events.length, 2, 'the new range is fetched once');
+  assert.equal(events[1].get('time_min'), landing.timeMin);
+  assert.equal(events[1].get('time_max'), landing.timeMax);
+
+  // A period change is a UI preference: it must not tear down lists, tasks,
+  // routines, calendars or the agenda, nor refetch them.
+  assert.equal(
+    fetchCalls.filter((url) => url.endsWith('/api/lists')).length,
+    listsCalls.length,
+    'lists is not refetched',
+  );
+  assert.equal(
+    queryClient.getQueryCache().find({ queryKey: queryKeys.tasks.all }),
+    tasksQuery,
+    'the same tasks query is still observed',
+  );
+  assert.ok(
+    queryClient
+      .getQueryCache()
+      .find({ queryKey: queryKeys.calendar.calendars() }),
+    'calendars still observed',
+  );
+
+  session.stop();
+});
+
+// ── 4. Stop while lists is pending ───────────────────────────────────────
 
 test('stop while lists is pending prevents the seed-gated fetches', async () => {
   let resolveLists!: (res: Response) => void;
@@ -220,7 +308,7 @@ test('stop while lists is pending prevents the seed-gated fetches', async () => 
   assert.equal(called('/api/tasks'), false);
 });
 
-// ── 4. Visibility refresh ────────────────────────────────────────────────
+// ── 5. Visibility refresh ────────────────────────────────────────────────
 
 test('visibilitychange refetches the agenda only when the tab is visible', async () => {
   respond = defaultRespond;
@@ -246,7 +334,7 @@ test('visibilitychange refetches the agenda only when the tab is visible', async
   session.stop();
 });
 
-// ── 5. Mounted component ─────────────────────────────────────────────────
+// ── 6. Mounted component ─────────────────────────────────────────────────
 
 test('BackgroundSync: no session when /auth/me returns no user', async () => {
   respond = defaultRespond; // /auth/me -> { user: null }
@@ -259,6 +347,11 @@ test('BackgroundSync: no session when /auth/me returns no user', async () => {
 
   assert.equal(called('/api/lists'), false, 'logged out does not start');
   assert.equal(called('/api/routines'), false, 'logged out does not start');
+  assert.equal(
+    eventsParams().length,
+    0,
+    'logged out never observes the landing range',
+  );
 });
 
 test('BackgroundSync: starts the session for a logged-in user', async () => {
