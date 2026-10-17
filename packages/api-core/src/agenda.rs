@@ -571,8 +571,9 @@ fn civil_date(date: &str) -> Result<chrono::NaiveDate, AgendaError> {
 }
 
 /// Adds `days` civil days to a validated `YYYY-MM-DD` date. Overflow only
-/// happens past chrono's date range; it is a 400, never a panic.
-fn add_civil_days(date: &str, days: i64) -> Result<String, AgendaError> {
+/// happens past chrono's date range; it is a 400, never a panic. Shared with
+/// the agenda fill's horizon arithmetic.
+pub(crate) fn add_civil_days(date: &str, days: i64) -> Result<String, AgendaError> {
     civil_date(date)?
         .checked_add_signed(chrono::Duration::days(days))
         .map(|date| date.format("%Y-%m-%d").to_string())
@@ -2054,13 +2055,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::agenda_fill::{
+        ensure_task_items, fill_occurrence_horizon, run_agenda_fill_cron, AgendaFillReport,
+    };
     use crate::models::{
         GoogleCalendar, GoogleOAuthToken, NewAgendaItem, NewCalendar, NewCalendarEvent, NewRoutine,
-        NewRoutineOccurrence, NewTask, NewTaskCategory, NewTaskCategoryPattern, NewTaskList,
-        NewToken, Task, TaskList, UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList,
+        NewRoutineInput, NewRoutineOccurrence, NewTask, NewTaskCategory, NewTaskCategoryPattern,
+        NewTaskList, NewToken, Task, TaskList, UpdateRoutine, UpdateTask, UpdateTaskCategory,
+        UpdateTaskList,
     };
     use crate::oauth::{HttpClient, HttpError};
-    use crate::routines::occurrence_dates;
+    use crate::routines::{
+        create_routine, delete_routine, occurrence_dates, update_routine, DeleteRoutineResponse,
+        RoutineResponse, RoutinesError,
+    };
 
     // ──────────────────────────────────────────
     // Fakes
@@ -2074,6 +2082,7 @@ mod tests {
     struct CallCounters {
         insert: u64,
         insert_many: u64,
+        delete_by_ids: u64,
         get_by_id: u64,
         get_by_ref: u64,
         list_by_refs: u64,
@@ -2467,6 +2476,20 @@ mod tests {
                 .max())
         }
 
+        async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {
+            // Mirrors ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL: distinct living
+            // owners, unordered.
+            let rows = self.stored.lock().unwrap();
+            let mut ids: Vec<String> = rows
+                .iter()
+                .filter(|row| row.deleted_at.is_none())
+                .map(|row| row.user_id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        }
+
         async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError> {
             if ids.is_empty() {
                 return Ok(Vec::new());
@@ -2571,6 +2594,33 @@ mod tests {
             Ok(rows)
         }
 
+        async fn list_by_user_and_date_range(
+            &self,
+            user_id: &str,
+            from: &str,
+            to: &str,
+        ) -> Result<Vec<RoutineOccurrence>, RepoError> {
+            self.calls.lock().unwrap().list_by_user_and_date_range += 1;
+            let mut rows: Vec<RoutineOccurrence> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                // `YYYY-MM-DD` sorts chronologically, so a string window is
+                // the same inclusive range as the SQL comparison.
+                .filter(|row| {
+                    row.user_id == user_id
+                        && row.local_date.as_str() >= from
+                        && row.local_date.as_str() <= to
+                })
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (&a.local_date, &a.created_at, &a.id).cmp(&(&b.local_date, &b.created_at, &b.id))
+            });
+            Ok(rows)
+        }
+
         async fn list_by_ids(&self, ids: &[String]) -> Result<Vec<RoutineOccurrence>, RepoError> {
             self.calls.lock().unwrap().list_by_ids += 1;
             if ids.is_empty() {
@@ -2624,6 +2674,21 @@ mod tests {
             for row in rows {
                 self.insert(row).await?;
             }
+            Ok(())
+        }
+
+        async fn delete_by_ids(&self, ids: &[String]) -> Result<(), RepoError> {
+            // Mirrors build_occurrence_delete_by_ids_sql: HARD, id-scoped,
+            // empty input touches nothing. Agenda rows are the caller's.
+            self.calls.lock().unwrap().delete_by_ids += 1;
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let id_set: HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+            self.stored
+                .lock()
+                .unwrap()
+                .retain(|row| !id_set.contains(row.id.as_str()));
             Ok(())
         }
 
@@ -3059,6 +3124,23 @@ mod tests {
                 .collect())
         }
 
+        async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError> {
+            // Mirrors TASK_LIST_USER_IDS_WITH_OPEN_SQL: distinct living owners
+            // of a still-actionable task.
+            let rows = self.stored.lock().unwrap();
+            let mut ids: Vec<String> = rows
+                .iter()
+                .filter(|row| {
+                    row.deleted_at.is_none()
+                        && matches!(row.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS")
+                })
+                .map(|row| row.user_id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        }
+
         async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
             Ok(self
                 .stored
@@ -3260,22 +3342,35 @@ mod tests {
         }
     }
 
-    /// In-memory `CalendarRepo`: a fixed set of stored calendars.
+    /// In-memory `CalendarRepo`: a fixed set of stored calendars, plus a set
+    /// of user ids whose `list_by_user_id` fails (the agenda fill cron's
+    /// per-user failure path — one broken user must not stop the rest).
     struct FakeCalendarRepo {
         stored: Mutex<Vec<GoogleCalendar>>,
+        failing: Mutex<HashSet<String>>,
     }
 
     impl FakeCalendarRepo {
         fn with(calendars: Vec<GoogleCalendar>) -> Self {
             Self {
                 stored: Mutex::new(calendars),
+                failing: Mutex::new(HashSet::new()),
             }
+        }
+
+        /// Makes `list_by_user_id` fail for `user_id` — off by default, so it
+        /// never disturbs the other tests.
+        fn fail_for(&self, user_id: &str) {
+            self.failing.lock().unwrap().insert(user_id.to_string());
         }
     }
 
     #[async_trait::async_trait(?Send)]
     impl CalendarRepo for FakeCalendarRepo {
         async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
+            if self.failing.lock().unwrap().contains(user_id) {
+                return Err(RepoError::Backend("calendar lookup failed".to_string()));
+            }
             Ok(self
                 .stored
                 .lock()
@@ -6896,6 +6991,574 @@ mod tests {
                 .status,
             OCCURRENCE_STATUS_IN_PROGRESS,
             "the cron never flips status"
+        );
+    }
+
+    // ──────────────────────────────────────────
+    // The agenda fill (slice 4)
+    // ──────────────────────────────────────────
+
+    /// The horizon under `NOW_UNIX`: today … today+6, inclusive.
+    fn horizon_dates() -> Vec<String> {
+        (0..crate::agenda_fill::OCCURRENCE_HORIZON_DAYS)
+            .map(|offset| add_civil_days("2026-08-23", offset).unwrap())
+            .collect()
+    }
+
+    /// `fill_occurrence_horizon` with the shared repos and the test clock.
+    fn fill_horizon(
+        repos: &Repos,
+        user_id: &str,
+        only_routine: Option<&str>,
+    ) -> Result<(), AgendaError> {
+        pollster::block_on(fill_occurrence_horizon(
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            user_id,
+            NOW_UNIX,
+            only_routine,
+        ))
+    }
+
+    /// `ensure_task_items` with the shared repos and the test clock.
+    fn ensure_tasks(repos: &Repos, user_id: &str) -> Result<(), AgendaError> {
+        pollster::block_on(ensure_task_items(
+            &repos.agenda,
+            &repos.tasks,
+            &repos.calendars,
+            user_id,
+            NOW_UNIX,
+        ))
+    }
+
+    /// One `run_agenda_fill_cron` pass over the shared repos.
+    fn fill_cron(repos: &Repos) -> AgendaFillReport {
+        pollster::block_on(run_agenda_fill_cron(
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.tasks,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// `create_routine` over the shared repos (create fills the horizon).
+    fn create(
+        repos: &Repos,
+        user_id: &str,
+        title: &str,
+        rrule: &str,
+    ) -> Result<RoutineResponse, RoutinesError> {
+        pollster::block_on(create_routine(
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            user_id,
+            &NewRoutineInput {
+                title: title.to_string(),
+                estimated_minutes: None,
+                rrule: rrule.to_string(),
+            },
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// `update_routine` over the shared repos.
+    fn update(
+        repos: &Repos,
+        user_id: &str,
+        routine_id: &str,
+        updates: &UpdateRoutine,
+    ) -> Result<RoutineResponse, RoutinesError> {
+        pollster::block_on(update_routine(
+            &repos.categories,
+            &repos.routines,
+            user_id,
+            routine_id,
+            updates,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// `delete_routine` over the shared repos.
+    fn delete(
+        repos: &Repos,
+        user_id: &str,
+        routine_id: &str,
+    ) -> Result<DeleteRoutineResponse, RoutinesError> {
+        pollster::block_on(delete_routine(
+            &repos.routines,
+            user_id,
+            routine_id,
+            &unix_secs_to_rfc3339(NOW_UNIX),
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// The stored occurrence dates of `user_id`, ascending.
+    fn occurrence_dates_in_store(repos: &Repos, user_id: &str) -> Vec<String> {
+        let mut dates: Vec<String> = repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|occ| occ.user_id == user_id)
+            .map(|occ| occ.local_date.clone())
+            .collect();
+        dates.sort();
+        dates
+    }
+
+    /// The stored occurrence of `routine_id` on `date` (panics when absent).
+    fn occurrence_on(repos: &Repos, routine_id: &str, date: &str) -> RoutineOccurrence {
+        pollster::block_on(repos.occurrences.get_by_routine_and_date(routine_id, date))
+            .unwrap()
+            .unwrap_or_else(|| panic!("no occurrence for {routine_id} on {date}"))
+    }
+
+    /// The stored membership rows of one occurrence, on ANY date (the
+    /// "membership anywhere" view).
+    fn items_of(repos: &Repos, occurrence_id: &str) -> Vec<AgendaItem> {
+        let mut rows: Vec<AgendaItem> = repos
+            .agenda
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|item| item.ref_id == occurrence_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.local_date.cmp(&b.local_date));
+        rows
+    }
+
+    /// `(ref_id, sort_order, local_date)` for one user's membership rows, in
+    /// stream order — the append-order assertion shape.
+    fn membership_triples(repos: &Repos, user_id: &str) -> Vec<(String, i64, String)> {
+        let mut rows: Vec<AgendaItem> = repos
+            .agenda
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|item| item.user_id == user_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (&a.local_date, a.sort_order).cmp(&(&b.local_date, b.sort_order)));
+        rows.into_iter()
+            .map(|item| (item.ref_id, item.sort_order, item.local_date))
+            .collect()
+    }
+
+    #[test]
+    fn fill_covers_today_through_today_plus_six_and_writes_nothing_twice() {
+        let repos = repos();
+        // A daily rule whose DTSTART is in January: the past is NOT
+        // backfilled, only the horizon dates the rule covers.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        let expected = horizon_dates();
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            expected,
+            "exactly today … today+6"
+        );
+        assert!(
+            repos
+                .occurrences
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|occ| occ.local_date.as_str() >= "2026-08-23"),
+            "a past DTSTART never writes a past row"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .map(|(_, _, date)| date.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "one agenda row per occurrence, on its rule date"
+        );
+
+        // A second pass with the same data writes nothing at all.
+        let occurrences_before = repos.occurrences.stored.lock().unwrap().len();
+        let agenda_before = repos.agenda.stored.lock().unwrap().len();
+        repos.occurrences.reset_calls();
+        repos.agenda.reset_calls();
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), occurrences_before);
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), agenda_before);
+        assert_eq!(repos.occurrences.call_counts().insert_many, 0, "no occurrence write");
+        assert_eq!(repos.agenda.call_counts().insert_many, 0, "no agenda write");
+    }
+
+    #[test]
+    fn fill_weekly_monday_lands_on_monday_alone() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260105T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+        ));
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        // 2026-08-24 is the one Monday inside today … today+6.
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), ["2026-08-24"]);
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![(
+                occurrence_on(&repos, "rt-1", "2026-08-24").id,
+                0,
+                "2026-08-24".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn fill_never_reattaches_a_rescheduled_occurrence_to_its_rule_date() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        // Snooze today's row two days forward.
+        let today_item = membership_triples(&repos, "u-1")
+            .into_iter()
+            .find(|(_, _, date)| date == "2026-08-23")
+            .map(|(ref_id, _, _)| ref_id)
+            .expect("today's row exists");
+        let item_id = pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-23"))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.ref_id == today_item)
+            .unwrap()
+            .id;
+        let occurrence_id = today_item;
+        let before = occurrence_on(&repos, "rt-1", "2026-08-23");
+        let moved = reschedule(&repos, "u-1", &item_id, "2026-08-25").unwrap();
+        assert_eq!(moved.item.local_date, "2026-08-25");
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        // The rule date gains no second row: the moved row is the only one.
+        let memberships = items_of(&repos, &occurrence_id);
+        assert_eq!(memberships.len(), 1, "no re-attachment to the rule date");
+        assert_eq!(memberships[0].local_date, "2026-08-25");
+        assert_eq!(
+            occurrence_on(&repos, "rt-1", "2026-08-23"),
+            before,
+            "the occurrence keeps its rule date"
+        );
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1").len(),
+            7,
+            "nothing was added or removed"
+        );
+    }
+
+    #[test]
+    fn fill_appends_after_the_existing_pile_in_standing_routine_order() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().extend([
+            FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-2", "u-1", "Salat", 1, "DTSTART:20260101T120000\nRRULE:FREQ=DAILY"),
+        ]);
+        // A pre-existing row at rank 5 on today: the fill appends after it and
+        // never reshuffles it.
+        agenda_row(&repos, "ai-pinned", "u-1", "2026-08-23", AGENDA_KIND_TASK, "task-x", 5);
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        let today: Vec<(String, i64)> =
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-23"))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.ref_id, item.sort_order))
+                .collect();
+        assert_eq!(
+            today,
+            vec![
+                ("task-x".to_string(), 5),
+                (occurrence_on(&repos, "rt-1", "2026-08-23").id, 6),
+                (occurrence_on(&repos, "rt-2", "2026-08-23").id, 7),
+            ],
+            "today's new rows land after the pile's max rank, in routine order"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_backfills_open_tasks_on_today_in_board_order() {
+        let repos = repos();
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 1;
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 0;
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 4;
+        let completed = task_row("task-done", "u-1", "Done | Work", "COMPLETED");
+        let mut placed = task_row("task-placed", "u-1", "Placed | Work", "OPEN");
+        placed.sort_order = 9;
+        for task in [running, planned, open, completed, placed] {
+            repos.tasks.push(task);
+        }
+        // A task that already holds a slot (on a past day) is left alone: no
+        // second row, no move.
+        agenda_row(&repos, "ai-placed", "u-1", "2026-08-20", AGENDA_KIND_TASK, "task-placed", 2);
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        let today: Vec<(String, i64)> =
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-23"))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.ref_id, item.sort_order))
+                .collect();
+        assert_eq!(
+            today,
+            vec![
+                ("task-run".to_string(), 0),
+                ("task-plan".to_string(), 1),
+                ("task-open".to_string(), 2),
+            ],
+            "IN_PROGRESS, PLANNED, OPEN — ranks 0, 1, 2"
+        );
+        assert!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .all(|(ref_id, _, _)| ref_id != "task-done"),
+            "a COMPLETED task gets nothing"
+        );
+        let placed_rows: Vec<(String, i64, String)> = membership_triples(&repos, "u-1")
+            .into_iter()
+            .filter(|(ref_id, _, _)| ref_id == "task-placed")
+            .collect();
+        assert_eq!(
+            placed_rows,
+            vec![("task-placed".to_string(), 2, "2026-08-20".to_string())],
+            "an already-placed task keeps its single row where it was"
+        );
+
+        // A second pass writes nothing.
+        let before = repos.agenda.stored.lock().unwrap().len();
+        repos.agenda.reset_calls();
+        ensure_tasks(&repos, "u-1").unwrap();
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), before);
+        assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn update_routine_reconciles_only_untouched_future_rows() {
+        let repos = repos();
+        let created = create(
+            &repos,
+            "u-1",
+            "Work",
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        )
+        .unwrap();
+        let routine_id = created.routine.id.clone();
+        // Create filled the whole horizon.
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+
+        // One row per "the user touched it" shape, all after today.
+        let done_id = occurrence_on(&repos, &routine_id, "2026-08-26").id;
+        pollster::block_on(repos.occurrences.set_status(&done_id, OCCURRENCE_STATUS_DONE)).unwrap();
+        let renamed_id = occurrence_on(&repos, &routine_id, "2026-08-27").id;
+        pollster::block_on(repos.occurrences.update_title(&renamed_id, Some("Overridden"))).unwrap();
+        let chipped_id = occurrence_on(&repos, &routine_id, "2026-08-28").id;
+        pollster::block_on(repos.occurrences.set_event_ids(&chipped_id, "cal-1", "evt-1")).unwrap();
+        // …and one rescheduled out of its rule date.
+        let moved_id = occurrence_on(&repos, &routine_id, "2026-08-25").id;
+        let moved_item = pollster::block_on(repos.agenda.get_by_ref(
+            "u-1",
+            AGENDA_KIND_OCCURRENCE,
+            &moved_id,
+        ))
+        .unwrap()
+        .unwrap();
+        reschedule(&repos, "u-1", &moved_item.id, "2026-08-28").unwrap();
+        // The untouched pending row the new rule will not cover.
+        let doomed_id = occurrence_on(&repos, &routine_id, "2026-08-29").id;
+
+        let updated = update(
+            &repos,
+            "u-1",
+            &routine_id,
+            &UpdateRoutine {
+                rrule: Some("DTSTART:20260101T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO".to_string()),
+                ..UpdateRoutine::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO");
+
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            [
+                "2026-08-23", // today (a Sunday) is NEVER deleted
+                "2026-08-24", // the one Monday the new rule covers
+                "2026-08-25", // rescheduled: kept
+                "2026-08-26", // done: kept
+                "2026-08-27", // renamed: kept
+                "2026-08-28", // Google chip: kept
+            ],
+            "only the untouched 2026-08-29 row went"
+        );
+        assert!(items_of(&repos, &doomed_id).is_empty(), "its agenda row went with it");
+        assert_eq!(
+            items_of(&repos, &moved_id)
+                .iter()
+                .map(|item| item.local_date.clone())
+                .collect::<Vec<_>>(),
+            ["2026-08-28"],
+            "the rescheduled membership is untouched"
+        );
+
+        // A title-only update does no occurrence work at all.
+        let before = occurrence_dates_in_store(&repos, "u-1");
+        update(
+            &repos,
+            "u-1",
+            &routine_id,
+            &UpdateRoutine {
+                title: Some("Work".to_string()),
+                ..UpdateRoutine::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), before);
+    }
+
+    #[test]
+    fn delete_routine_hard_deletes_only_untouched_future_rows() {
+        let repos = repos();
+        let created = create(
+            &repos,
+            "u-1",
+            "Work",
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        )
+        .unwrap();
+        let routine_id = created.routine.id.clone();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+
+        // One tomorrow-or-later row the user acted on.
+        let done_id = occurrence_on(&repos, &routine_id, "2026-08-25").id;
+        pollster::block_on(repos.occurrences.set_status(&done_id, OCCURRENCE_STATUS_DONE)).unwrap();
+
+        let response = delete(&repos, "u-1", &routine_id).unwrap();
+        assert!(response.success);
+
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            ["2026-08-23", "2026-08-25"],
+            "today's pending row and the done row stay; the untouched future ones are gone"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .map(|(_, _, date)| date.clone())
+                .collect::<Vec<_>>(),
+            ["2026-08-23", "2026-08-25"],
+            "the deleted rows' agenda items went with them"
+        );
+        assert!(
+            repos
+                .routines
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == routine_id && row.deleted_at.is_some()),
+            "the routine itself is soft-deleted"
+        );
+    }
+
+    #[test]
+    fn agenda_fill_cron_fills_every_user_and_reports_per_user_failures() {
+        let repos = repos();
+        // u-1: a daily routine and no open task.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        // u-2: an OPEN task and no routine.
+        let mut open = task_row("task-1", "u-2", "Ship | Work", "OPEN");
+        open.sort_order = 0;
+        repos.tasks.push(open);
+
+        let report = fill_cron(&repos);
+
+        assert_eq!(report.users, 2);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+        assert_eq!(
+            membership_triples(&repos, "u-2"),
+            vec![("task-1".to_string(), 0, "2026-08-23".to_string())],
+            "u-2's OPEN task landed on today"
+        );
+
+        // A living routine whose calendar read fails: one broken user is
+        // recorded and the others still fill.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-b",
+            "u-broken",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        repos.calendars.fail_for("u-broken");
+
+        let report = fill_cron(&repos);
+
+        assert_eq!(report.users, 3, "every affected user is attempted");
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert!(
+            report.errors.iter().all(|error| error.contains("u-broken")),
+            "{:?}",
+            report.errors
+        );
+        assert!(occurrence_dates_in_store(&repos, "u-broken").is_empty());
+        // The healthy users are untouched by the failure (and idempotent).
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+        assert_eq!(
+            membership_triples(&repos, "u-2"),
+            vec![("task-1".to_string(), 0, "2026-08-23".to_string())]
         );
     }
 }

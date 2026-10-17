@@ -180,6 +180,12 @@ pub trait TaskRepo: Send + Sync {
     /// work list (IN_PROGRESS is a column, not a singleton lock, so a
     /// stale/expired event cache neither adds nor drops work here).
     async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError>;
+    /// Distinct `user_id`s holding at least one living, still-actionable task
+    /// (`OPEN | PLANNED | IN_PROGRESS`) — the agenda fill cron's user list:
+    /// `COMPLETED`/`DISCARDED` rows never need an agenda row, so a user whose
+    /// board is done is not a fill candidate. Unordered; the caller sorts and
+    /// dedups (a user may appear once per matching row).
+    async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError>;
     /// Returns the task with local `id`, or `None` when absent or soft-deleted.
     /// NOT user-scoped; callers must verify `row.user_id` (the service does).
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError>;
@@ -247,10 +253,12 @@ pub trait TaskRepo: Send + Sync {
 
 /// Routine persistence (`routines` rows, ADR 0004).
 ///
-/// All deletes are SOFT — the routine is the domain entity, and materialized
-/// `routine_occurrences` are never touched by it. Reads filter
-/// `deleted_at IS NULL`; a missing/soft-deleted/other-user routine is a 404 at
-/// the service layer (ownership checked on the loaded row, like tasks).
+/// All deletes are SOFT — the routine is the domain entity, and the statement
+/// itself never touches `routine_occurrences` (the service hard-deletes this
+/// routine's untouched FUTURE rows around a rule change or a delete; today and
+/// the past always stay). Reads filter `deleted_at IS NULL`; a
+/// missing/soft-deleted/other-user routine is a 404 at the service layer
+/// (ownership checked on the loaded row, like tasks).
 #[async_trait(?Send)]
 pub trait RoutineRepo: Send + Sync {
     /// The user's living routines, ordered by standing `sort_order` then
@@ -272,6 +280,11 @@ pub trait RoutineRepo: Send + Sync {
     /// Highest living `sort_order` for the user's routines, or `None` when the
     /// pile is empty. Used by `create_routine` to append: `max+1`, else 0.
     async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
+    /// Distinct `user_id`s with at least one living routine — the agenda fill
+    /// cron's user list (the fill never needs every routine up front, only the
+    /// owners; the per-user pass loads them). Unordered; the caller sorts and
+    /// dedups.
+    async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError>;
     /// Batch lookup **including soft-deleted rows** — the range read's history
     /// path: a deleted routine's `done`/`skipped` occurrences still render
     /// with its title, estimate, and recurrence blob. Deliberately NO
@@ -307,6 +320,16 @@ pub trait OccurrenceRepo: Send + Sync {
         user_id: &str,
         local_date: &str,
     ) -> Result<Vec<RoutineOccurrence>, RepoError>;
+    /// The user's occurrences whose `local_date` is in the inclusive
+    /// `from..=to` civil-date window, in date order — the agenda fill's ONE
+    /// read of what already exists in the horizon (never a per-routine
+    /// round-trip). No `deleted_at` filter (the table has none).
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RoutineOccurrence>, RepoError>;
     /// **Idempotent ensure**: inserts the row (`title NULL`, `status
     /// 'pending'`, D1 mints id/timestamps) and returns it; when the `UNIQUE
     /// (routine_id, local_date)` already holds a row, loads and returns the
@@ -327,6 +350,13 @@ pub trait OccurrenceRepo: Send + Sync {
     /// to get the surviving ids (a generated UUID can be lost on a concurrent
     /// duplicate). Empty `rows` → `Ok(())` without touching the DB.
     async fn insert_many(&self, rows: Vec<NewRoutineOccurrence>) -> Result<(), RepoError>;
+    /// HARD-deletes the occurrences whose local `id` is in `ids` — the agenda
+    /// fill's reconcile: a rule change (or a routine delete) drops the
+    /// untouched future rows the fill itself materialized. Empty `ids` →
+    /// `Ok(())` without touching the DB; chunked like `list_by_ids`. The
+    /// caller deletes each row's agenda membership separately — this statement
+    /// never touches `agenda_items`.
+    async fn delete_by_ids(&self, ids: &[String]) -> Result<(), RepoError>;
     /// Writes the title override; `None` clears it back to inheritance
     /// (stores NULL). No soft-delete filter — the table has none.
     async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError>;
@@ -701,6 +731,14 @@ pub const TASK_LIST_BY_USER_ID_SQL: &str =
 pub const TASK_LIST_IN_PROGRESS_SQL: &str =
     "SELECT * FROM tasks WHERE status = 'IN_PROGRESS' AND deleted_at IS NULL";
 
+/// The agenda fill cron's user list: distinct owners of a living task that
+/// still needs a place on the agenda. Terminal rows (`COMPLETED`/
+/// `DISCARDED`) are excluded — they are never backfilled.
+pub const TASK_LIST_USER_IDS_WITH_OPEN_SQL: &str = "
+    SELECT DISTINCT user_id FROM tasks
+    WHERE deleted_at IS NULL AND status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')
+";
+
 pub const TASK_GET_BY_ID_SQL: &str =
     "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL";
 
@@ -820,9 +858,10 @@ pub const ROUTINE_INSERT_SQL: &str = "
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
-/// Partial update: NULL binds leave the column unchanged (`COALESCE`). Rule
-/// changes never touch materialized occurrences — they only affect future
-/// ensure. The D1 implementation binds `D1Type::Null` for `None` fields.
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). The
+/// statement itself never touches materialized occurrences; when the service
+/// sees a changed `rrule` it reconciles the future rows around it (untouched
+/// ones only). The D1 implementation binds `D1Type::Null` for `None` fields.
 pub const ROUTINE_UPDATE_SQL: &str = "
     UPDATE routines SET
         title = COALESCE(?, title),
@@ -833,8 +872,9 @@ pub const ROUTINE_UPDATE_SQL: &str = "
     WHERE id = ? AND deleted_at IS NULL
 ";
 
-/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
-/// Materialized `routine_occurrences` are NOT touched.
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit. The
+/// statement never touches `routine_occurrences` — the service hard-deletes
+/// this routine's untouched future rows separately.
 pub const ROUTINE_DELETE_SQL: &str =
     "UPDATE routines SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
@@ -846,6 +886,13 @@ pub const ROUTINE_MAX_SORT_ORDER_SQL: &str = "
     WHERE user_id = ? AND deleted_at IS NULL
     ORDER BY sort_order DESC
     LIMIT 1
+";
+
+/// The agenda fill cron's user list: distinct owners of a living routine.
+/// `DISTINCT` because a user owns many routines; the caller sorts and dedups
+/// against the task-side list.
+pub const ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL: &str = "
+    SELECT DISTINCT user_id FROM routines WHERE deleted_at IS NULL
 ";
 
 /// `list_by_ids_including_deleted` binds 1 id per row → up to 100 ids per
@@ -883,6 +930,16 @@ pub const OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL: &str =
 
 pub const OCCURRENCE_LIST_BY_USER_AND_DATE_SQL: &str =
     "SELECT * FROM routine_occurrences WHERE user_id = ? AND local_date = ?";
+
+/// The agenda fill's one horizon read: every occurrence of the user inside the
+/// inclusive `[from, to]` civil-date window, oldest first. No `deleted_at`
+/// filter (the table has none); `YYYY-MM-DD` sorts chronologically, so the
+/// string comparison *is* the date comparison.
+pub const OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL: &str = "
+    SELECT * FROM routine_occurrences
+    WHERE user_id = ? AND local_date >= ? AND local_date <= ?
+    ORDER BY local_date ASC, created_at ASC
+";
 
 /// Idempotent ensure (seed-on-GET): `OR IGNORE` absorbs the `UNIQUE
 /// (routine_id, local_date)` race — the D1 implementation re-reads the row
@@ -991,6 +1048,22 @@ pub fn build_occurrence_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>)
     );
     let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
     let sql = format!("SELECT * FROM routine_occurrences WHERE id IN ({})", placeholders.join(","));
+    (sql, ids.to_vec())
+}
+
+/// Builds a `DELETE FROM routine_occurrences WHERE id IN (…)` statement for
+/// one chunk of ids (non-empty and ≤ `OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE`) —
+/// the agenda fill's reconcile. `agenda_items` rows are NOT touched here: the
+/// caller deletes each removed occurrence's membership itself. Returns
+/// `(sql, args)` with every arg a string (bound as `D1Type::Text`).
+pub fn build_occurrence_delete_by_ids_sql(ids: &[String]) -> (String, Vec<String>) {
+    assert!(!ids.is_empty(), "occurrence id list must not be empty");
+    assert!(
+        ids.len() <= OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
+        "occurrence id list exceeds {OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE} ids"
+    );
+    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let sql = format!("DELETE FROM routine_occurrences WHERE id IN ({})", placeholders.join(","));
     (sql, ids.to_vec())
 }
 
@@ -1607,6 +1680,14 @@ mod tests {
     }
 
     #[test]
+    fn routine_list_user_ids_scopes_to_living_rows() {
+        let sql = ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL;
+        assert!(sql.contains("SELECT DISTINCT user_id FROM routines"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
+    }
+
+    #[test]
     fn occurrence_reads_have_no_deleted_filter_and_insert_is_idempotent() {
         for sql in [
             OCCURRENCE_GET_BY_ID_SQL,
@@ -1731,6 +1812,43 @@ mod tests {
         assert!(!sql.contains("local_date"), "hydration is by ref_id, never local_date: {sql}");
         assert_eq!(args, vec!["occ-1", "occ-2", "occ-3"]);
         assert_eq!(sql.matches('?').count(), 3, "{sql}");
+    }
+
+    #[test]
+    fn occurrence_range_read_is_inclusive_and_orders_by_date() {
+        let sql = OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("SELECT * FROM routine_occurrences"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(
+            sql.contains("local_date >= ? AND local_date <= ?"),
+            "inclusive window: {sql}"
+        );
+        assert!(sql.contains("ORDER BY local_date ASC"), "{sql}");
+        assert!(!sql.contains("deleted_at"), "no soft-delete on occurrences: {sql}");
+        assert_eq!(sql.matches('?').count(), 3, "{sql}");
+    }
+
+    #[test]
+    fn occurrence_delete_by_ids_is_id_scoped_and_leaves_agenda_rows_alone() {
+        let (sql, args) = build_occurrence_delete_by_ids_sql(&["occ-1".to_string()]);
+        assert!(sql.starts_with("DELETE FROM routine_occurrences"), "{sql}");
+        assert!(sql.contains("id IN (?)"), "{sql}");
+        assert!(!sql.contains("agenda_items"), "memberships are the caller's job: {sql}");
+        assert!(!sql.contains("deleted_at"), "no soft-delete on occurrences: {sql}");
+        assert_eq!(args, vec!["occ-1"]);
+        assert_eq!(sql.matches('?').count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn task_list_user_ids_with_open_tasks_filters_status_and_living_rows() {
+        let sql = TASK_LIST_USER_IDS_WITH_OPEN_SQL;
+        assert!(sql.contains("SELECT DISTINCT user_id FROM tasks"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(
+            sql.contains("status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')"),
+            "terminal rows never need a backfill: {sql}"
+        );
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
     }
 
     #[test]

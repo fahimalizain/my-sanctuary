@@ -5,6 +5,7 @@
 //! inside `apps/worker`.
 
 pub mod agenda;
+pub mod agenda_fill;
 pub mod calendar;
 pub mod calendar_color;
 pub use calendar::apply as calendar_apply;
@@ -35,6 +36,10 @@ pub use agenda::{
     AgendaResponse, MoveDayToTodayResponse, OccurrenceActionResponse, OccurrenceResponse,
     OccurrenceView, AGENDA_KIND_OCCURRENCE, AGENDA_KIND_TASK, OCCURRENCE_STATUS_DONE,
     OCCURRENCE_STATUS_IN_PROGRESS, OCCURRENCE_STATUS_PENDING, OCCURRENCE_STATUS_SKIPPED,
+};
+pub use agenda_fill::{
+    ensure_task_items, fill_occurrence_horizon, run_agenda_fill_cron, AgendaFillReport,
+    OCCURRENCE_HORIZON_DAYS,
 };
 pub use calendar::{
     classify_operator_warning, create_event, decide_webhook, delete_event, delete_event_for_user,
@@ -99,8 +104,8 @@ pub use routines::{
     RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
 };
 pub use repo::{
-    build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_insert_sql,
-    build_occurrence_list_by_ids_sql, build_replica_seen_insert_sql,
+    build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_delete_by_ids_sql,
+    build_occurrence_insert_sql, build_occurrence_list_by_ids_sql, build_replica_seen_insert_sql,
     build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_routine_list_by_ids_sql,
     AgendaItemRepo,
     CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError,
@@ -133,10 +138,12 @@ pub use repo::{
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
     OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_INSERT_COL_COUNT,
     OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE, OCCURRENCE_LIST_BY_USER_AND_DATE_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL,
     OCCURRENCE_LIST_IN_PROGRESS_SQL, OCCURRENCE_CLEAR_EVENT_IDS_SQL, OCCURRENCE_SET_EVENT_IDS_SQL,
     OCCURRENCE_SET_STATUS_SQL, OCCURRENCE_UPDATE_TITLE_SQL,
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
-    ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
+    ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL,
+    ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
     ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
@@ -146,6 +153,7 @@ pub use repo::{
     TASK_GET_BY_ID_SQL, TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_COUNT_BY_USER_ID_SQL,
     TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL, TASK_LIST_GET_BY_ID_SQL,
     TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL, TASK_LIST_UPDATE_SQL,
+    TASK_LIST_USER_IDS_WITH_OPEN_SQL,
     TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
     TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL,

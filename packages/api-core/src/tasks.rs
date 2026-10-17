@@ -3000,6 +3000,26 @@ mod tests {
                 .collect())
         }
 
+        async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError> {
+            // Mirrors TASK_LIST_USER_IDS_WITH_OPEN_SQL: distinct living owners
+            // of a still-actionable task.
+            let rows = self.stored.lock().unwrap();
+            let mut ids: Vec<String> = rows
+                .iter()
+                .filter(|row| {
+                    row.deleted_at.is_none()
+                        && matches!(
+                            row.status.as_str(),
+                            TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS
+                        )
+                })
+                .map(|row| row.user_id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        }
+
         async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
             Ok(self
                 .stored

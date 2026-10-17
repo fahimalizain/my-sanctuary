@@ -18,7 +18,8 @@ use api_core::models::{
     UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
 };
 use api_core::repo::{
-    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_occurrence_insert_sql,
+    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_occurrence_delete_by_ids_sql,
+    build_occurrence_insert_sql,
     build_occurrence_list_by_ids_sql, build_routine_list_by_ids_sql, AgendaItemRepo,
     OccurrenceRepo, RepoError, RoutineRepo,
     TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
@@ -31,10 +32,12 @@ use api_core::repo::{
     AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL, OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL,
     OCCURRENCE_INSERT_SQL, OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
-    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL,
+    OCCURRENCE_LIST_IN_PROGRESS_SQL,
     OCCURRENCE_CLEAR_EVENT_IDS_SQL, OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
     OCCURRENCE_UPDATE_TITLE_SQL, ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
-    ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
+    ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL,
+    ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
     ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL,
     TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL,
@@ -42,6 +45,7 @@ use api_core::repo::{
     TASK_CATEGORY_PATTERNS_INSERT_SQL, TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL, TASK_GET_BY_ID_SQL,
     TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LIST_USER_IDS_WITH_OPEN_SQL,
     TASK_LIST_COUNT_BY_USER_ID_SQL, TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL,
     TASK_LIST_GET_BY_ID_SQL, TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL,
     TASK_LIST_UPDATE_SQL, TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL,
@@ -305,6 +309,13 @@ struct SortOrderRow {
     pub sort_order: i64,
 }
 
+/// Row projection for the `SELECT DISTINCT user_id …` statements behind the
+/// agenda fill cron's work list (one column only).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct UserIdRow {
+    pub user_id: String,
+}
+
 /// Row projection for the agenda stream's `MIN(local_date)` statements. The
 /// aggregate always yields one row; `None` means the matched set was empty
 /// (`MIN()` over zero rows is NULL).
@@ -559,6 +570,13 @@ impl RoutineRepo for D1RoutineRepo {
         Ok(row.map(|row| row.sort_order))
     }
 
+    async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {
+        // The agenda fill cron's routine-side user list: no binds, so
+        // `prepare` returns the statement directly.
+        let rows: Vec<UserIdRow> = query_vec(self.db.prepare(ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL)).await?;
+        Ok(rows.into_iter().map(|row| row.user_id).collect())
+    }
+
     async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError> {
         // Empty IN list → no SQL at all.
         if ids.is_empty() {
@@ -631,6 +649,26 @@ impl OccurrenceRepo for D1OccurrenceRepo {
         query_vec(stmt).await
     }
 
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RoutineOccurrence>, RepoError> {
+        // The agenda fill's one horizon read; no `deleted_at` filter (the
+        // table has none).
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(from),
+                D1Type::Text(to),
+            ])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
     async fn insert(&self, occurrence: NewRoutineOccurrence) -> Result<RoutineOccurrence, RepoError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_rfc3339();
@@ -684,6 +722,26 @@ impl OccurrenceRepo for D1OccurrenceRepo {
         for chunk in rows.chunks(OCCURRENCE_INSERT_CHUNK_SIZE) {
             let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
             let (sql, args) = build_occurrence_insert_sql(chunk, &now, ids);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_by_ids(&self, ids: &[String]) -> Result<(), RepoError> {
+        // Empty IN list → no SQL at all.
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // HARD delete: a rule change / routine delete drops the untouched
+        // future rows the fill materialized. Their `agenda_items` rows are the
+        // caller's separate deletes.
+        for chunk in ids.chunks(OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE) {
+            let (sql, args) = build_occurrence_delete_by_ids_sql(chunk);
             let stmt = self
                 .db
                 .prepare(&sql)
@@ -1291,6 +1349,13 @@ impl TaskRepo for D1TaskRepo {
         // `prepare` returns the statement directly when there is nothing to
         // bind.
         query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
+    }
+
+    async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError> {
+        // The agenda fill cron's task-side user list: no binds, so `prepare`
+        // returns the statement directly.
+        let rows: Vec<UserIdRow> = query_vec(self.db.prepare(TASK_LIST_USER_IDS_WITH_OPEN_SQL)).await?;
+        Ok(rows.into_iter().map(|row| row.user_id).collect())
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
