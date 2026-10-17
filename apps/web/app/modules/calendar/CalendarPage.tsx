@@ -92,8 +92,10 @@ export function CalendarPage() {
     onPaste: () => {
       if (!clipboard) return false;
       const item = clipboard;
-      void session.pasteFromClipboard(item).then((consumed) => {
-        if (!consumed) return;
+      // True only when the cut source was actually deleted; an abandoned or
+      // ordinary paste leaves the clipboard item as-is.
+      void session.pasteFromClipboard(item).then((removedCutSource) => {
+        if (!removedCutSource) return;
         // Only this cut's own item is cleared: a copy that replaced the
         // clipboard while the paste was in flight must keep its cutSourceId.
         setClipboard((prev) =>

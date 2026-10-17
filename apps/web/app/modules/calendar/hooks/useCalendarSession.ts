@@ -654,14 +654,23 @@ export function useCalendarSession({
     const item = clipboardItemFromEvent(event);
     if (!event || !item) return null;
 
-    // No server row to delete later: drop the local chip now. clear (not
-    // remove) keeps the in-flight POST's onSuccess DELETE behaviour.
+    // No server row to delete later: drop that one chip now. clear (not
+    // remove) keeps the in-flight POST's onSuccess DELETE behaviour — the
+    // same discard branch persistDraft uses for a vanished draft. Only this
+    // id is touched, so a different open draft survives the cut.
     if (
       isTempEventId(event.id) ||
       event.id === unpersistedDraftIdRef.current ||
       event.id === unpersistedDraftId
     ) {
-      discardUnpersistedDraft();
+      patchQueue.cancel(event.id);
+      queue.clear(event.id);
+      if (
+        event.id === unpersistedDraftIdRef.current ||
+        event.id === unpersistedDraftId
+      ) {
+        setDraftId(null);
+      }
       setSelectedEventId(null);
       setFocusTitleOnOpen(false);
       return item;
@@ -676,13 +685,20 @@ export function useCalendarSession({
     selectedEvent,
     selectedEventCalendar,
     unpersistedDraftId,
-    discardUnpersistedDraft,
+    queue,
+    patchQueue,
+    setDraftId,
   ]);
 
   /**
    * Create a second one-shot at the item's own times, then remove the cut
-   * source if the create succeeded. Returns whether the caller should consume
-   * the key: a plain copy and a cut whose delete already started return false.
+   * source if the create succeeded.
+   *
+   * The boolean reports whether a cut source was actually deleted, so the
+   * page can clear `cutSourceId` on that clipboard item. It does NOT mean the
+   * key was consumed — the page already claimed the chord before calling.
+   * Plain copies, abandoned pastes, and a cut whose delete already started
+   * all return false.
    */
   const pasteFromClipboard = useCallback(
     async (item: CalendarClipboardItem): Promise<boolean> => {
@@ -730,6 +746,26 @@ export function useCalendarSession({
         const result = await createEvent.mutateAsync(
           pasteCreateInput(item, destinationId),
         );
+
+        // User cut / deleted / discarded the chip while the POST was in
+        // flight — do not cache-write; DELETE the just-created server row so
+        // Google has no ghost. Same discard branch as persistDraft.
+        const after = queue.getOverlay(tempId);
+        if (!after || after.op === 'delete') {
+          queue.clear(tempId);
+          setSelectedEventId((prev) => {
+            if (prev !== tempId) return prev;
+            setFocusTitleOnOpen(false);
+            return null;
+          });
+          void deleteEvent.mutateAsync(result.event.id).then(() => {
+            removeCalendarEventFromCache(result.event.id);
+          });
+          // Abandoned paste: item.cutSourceId is untouched, so a retry can
+          // still remove the cut source.
+          return false;
+        }
+
         // Remap selection before clearing the overlay so selectedEvent never
         // resolves null for the temp id (the effect would close the inspector).
         setSelectedEventId((prev) =>
@@ -750,11 +786,11 @@ export function useCalendarSession({
       }
 
       const cutId = item.cutSourceId;
-      // Not a cut (or a temp source with no persisted row): nothing left for
-      // the page to clear.
+      // Not a cut (or a temp source with no persisted row): no source was
+      // deleted, so the page has nothing to clear.
       if (!cutId || isTempEventId(cutId)) return false;
       // Second paste of the same cut: the first one already started the
-      // delete, so this key is not ours to consume.
+      // delete, so report false rather than claim a second removal.
       if (cutRemovalsStartedRef.current.has(cutId)) return false;
       cutRemovalsStartedRef.current.add(cutId);
 
