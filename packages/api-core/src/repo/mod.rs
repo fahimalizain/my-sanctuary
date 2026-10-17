@@ -272,6 +272,13 @@ pub trait RoutineRepo: Send + Sync {
     /// Highest living `sort_order` for the user's routines, or `None` when the
     /// pile is empty. Used by `create_routine` to append: `max+1`, else 0.
     async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
+    /// Batch lookup **including soft-deleted rows** — the range read's history
+    /// path: a deleted routine's `done`/`skipped` occurrences still render
+    /// with its title, estimate, and recurrence blob. Deliberately NO
+    /// `deleted_at` filter, and NOT user-scoped (callers pass ids already
+    /// resolved from this user's occurrences). Empty `ids` → `Ok(vec![])`
+    /// without touching the DB.
+    async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError>;
 }
 
 /// Occurrence persistence (`routine_occurrences` rows, ADR 0004).
@@ -354,12 +361,38 @@ pub trait OccurrenceRepo: Send + Sync {
 #[async_trait(?Send)]
 pub trait AgendaItemRepo: Send + Sync {
     /// The user's items for `local_date` in pile order (`sort_order`, ties by
-    /// creation) — the response order.
+    /// creation) — the single-day response order.
     async fn list_by_user_and_date(
         &self,
         user_id: &str,
         local_date: &str,
     ) -> Result<Vec<AgendaItem>, RepoError>;
+    /// The user's items whose `local_date` is in the inclusive `from..=to`
+    /// window, in stream order (`local_date`, then the intra-day pile rank) —
+    /// the range read's page.
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<AgendaItem>, RepoError>;
+    /// `MIN(local_date)` over EVERY agenda row of the user — orphans, future
+    /// rows, and deleted-routine leftovers included. This is the stream's
+    /// back-scroll floor, independent of the requested page; `None` when the
+    /// user has no rows at all.
+    async fn min_local_date(&self, user_id: &str) -> Result<Option<String>, RepoError>;
+    /// `MIN(local_date)` strictly before `before` that still holds a
+    /// **pending** item — the stream anchor, in one query (never a history
+    /// load). Pending means: kind `task` with a living
+    /// `OPEN | PLANNED | IN_PROGRESS` task row, or kind `occurrence` with a
+    /// `pending | in_progress` occurrence whose routine is living. Orphan
+    /// rows and terminal states never count. `None` when nothing pends in the
+    /// past.
+    async fn oldest_pending_local_date_before(
+        &self,
+        user_id: &str,
+        before: &str,
+    ) -> Result<Option<String>, RepoError>;
     /// Returns the item with local `id`, or `None`. NOT user-scoped; callers
     /// must verify `row.user_id` (the service does).
     async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError>;
@@ -810,6 +843,28 @@ pub const ROUTINE_MAX_SORT_ORDER_SQL: &str = "
     LIMIT 1
 ";
 
+/// `list_by_ids_including_deleted` binds 1 id per row → up to 100 ids per
+/// statement (the same D1 parameter budget as occurrence `list_by_ids`).
+pub const ROUTINE_LIST_BY_IDS_CHUNK_SIZE: usize = 100;
+
+/// Builds a `SELECT * FROM routines WHERE id IN (…)` statement for one chunk
+/// of ids (non-empty and ≤ `ROUTINE_LIST_BY_IDS_CHUNK_SIZE`) — the range
+/// read's deleted-routine history lookup. Deliberately NO `deleted_at`
+/// filter: the caller only asks for ids already loaded from this user's
+/// occurrences, and a deleted routine must still lend its display fields to
+/// its done/skipped history. Returns `(sql, args)` with every arg a string
+/// (bound as `D1Type::Text`).
+pub fn build_routine_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>) {
+    assert!(!ids.is_empty(), "routine id list must not be empty");
+    assert!(
+        ids.len() <= ROUTINE_LIST_BY_IDS_CHUNK_SIZE,
+        "routine id list exceeds {ROUTINE_LIST_BY_IDS_CHUNK_SIZE} ids"
+    );
+    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let sql = format!("SELECT * FROM routines WHERE id IN ({})", placeholders.join(","));
+    (sql, ids.to_vec())
+}
+
 // ──────────────────────────────────────────
 // Occurrence SQL (ADR 0004)
 // ──────────────────────────────────────────
@@ -942,6 +997,51 @@ pub fn build_occurrence_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>)
 /// creation keep the seed append order deterministic.
 pub const AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL: &str =
     "SELECT * FROM agenda_items WHERE user_id = ? AND local_date = ? ORDER BY sort_order ASC, created_at ASC";
+
+/// The range read's page: an inclusive `[from, to]` civil-date window in
+/// stream order — `local_date` first, then the same intra-day tie-break as
+/// the single-date pile. The stream pages several days at once, so the day is
+/// part of the sort key.
+pub const AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL: &str = "
+    SELECT * FROM agenda_items
+    WHERE user_id = ? AND local_date >= ? AND local_date <= ?
+    ORDER BY local_date ASC, sort_order ASC, created_at ASC
+";
+
+/// The stream's back-scroll floor: `MIN(local_date)` over all of the user's
+/// rows — no kind/pending/orphan filter (whatever exists is what the browser
+/// can scroll back to). An empty set yields one row with NULL.
+pub const AGENDA_ITEM_MIN_LOCAL_DATE_SQL: &str = "
+    SELECT MIN(local_date) AS local_date FROM agenda_items WHERE user_id = ?
+";
+
+/// The stream anchor: the oldest past date that still holds a pending item.
+/// One query, never a history load — the pending predicate is a pair of
+/// `EXISTS` probes (a living task, or a live occurrence of a living routine),
+/// so orphans and terminal states fall out. `MIN()` over no match → NULL.
+pub const AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL: &str = "
+    SELECT MIN(a.local_date) AS local_date
+    FROM agenda_items a
+    WHERE a.user_id = ?
+      AND a.local_date < ?
+      AND (
+        (a.kind = 'task' AND EXISTS (
+          SELECT 1 FROM tasks t
+          WHERE t.id = a.ref_id
+            AND t.user_id = a.user_id
+            AND t.deleted_at IS NULL
+            AND t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')
+        ))
+        OR (a.kind = 'occurrence' AND EXISTS (
+          SELECT 1 FROM routine_occurrences o
+          JOIN routines r ON r.id = o.routine_id
+          WHERE o.id = a.ref_id
+            AND o.user_id = a.user_id
+            AND o.status IN ('pending', 'in_progress')
+            AND r.deleted_at IS NULL
+        ))
+      )
+";
 
 pub const AGENDA_ITEM_GET_BY_ID_SQL: &str = "SELECT * FROM agenda_items WHERE id = ?";
 
@@ -1657,4 +1757,69 @@ mod tests {
         assert_eq!(args, vec!["u-1", "occurrence", "occ-1", "occ-2"]);
     }
 
+    #[test]
+    fn routine_list_by_ids_is_id_scoped_and_includes_soft_deleted() {
+        assert_eq!(ROUTINE_LIST_BY_IDS_CHUNK_SIZE, 100);
+        let (sql, args) = build_routine_list_by_ids_sql(&[
+            "rt-1".to_string(),
+            "rt-2".to_string(),
+        ]);
+        assert!(sql.starts_with("SELECT * FROM routines"), "{sql}");
+        assert!(sql.contains("id IN (?,?)"), "{sql}");
+        assert!(
+            !sql.contains("deleted_at"),
+            "history lookup must include soft-deleted routines: {sql}"
+        );
+        assert!(
+            !sql.contains("user_id"),
+            "not user-scoped, same as get_by_id: {sql}"
+        );
+        assert_eq!(args, vec!["rt-1", "rt-2"]);
+        assert_eq!(sql.matches('?').count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn agenda_item_range_read_is_inclusive_and_ordered_by_day_then_rank() {
+        let sql = AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("SELECT * FROM agenda_items"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(
+            sql.contains("local_date >= ? AND local_date <= ?"),
+            "inclusive window: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY local_date ASC, sort_order ASC, created_at ASC"),
+            "stream order: {sql}"
+        );
+        assert!(!sql.contains("kind"), "the page is every kind: {sql}");
+    }
+
+    #[test]
+    fn agenda_item_min_local_date_and_anchor_are_single_scalar_queries() {
+        let min = AGENDA_ITEM_MIN_LOCAL_DATE_SQL;
+        assert!(min.contains("MIN(local_date)"), "{min}");
+        assert!(min.contains("user_id = ?"), "{min}");
+        assert!(!min.contains("local_date >="), "all rows, no window: {min}");
+        assert!(!min.contains("kind"), "orphans and all kinds count: {min}");
+        assert_eq!(min.matches('?').count(), 1, "{min}");
+
+        let anchor = AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL;
+        assert!(anchor.contains("MIN(a.local_date)"), "{anchor}");
+        assert!(anchor.contains("a.user_id = ?"), "{anchor}");
+        assert!(anchor.contains("a.local_date < ?"), "strictly past: {anchor}");
+        assert!(anchor.contains("a.kind = 'task'"), "{anchor}");
+        assert!(
+            anchor.contains("t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')"),
+            "{anchor}"
+        );
+        assert!(anchor.contains("t.deleted_at IS NULL"), "{anchor}");
+        assert!(anchor.contains("a.kind = 'occurrence'"), "{anchor}");
+        assert!(
+            anchor.contains("o.status IN ('pending', 'in_progress')"),
+            "{anchor}"
+        );
+        assert!(anchor.contains("JOIN routines r ON r.id = o.routine_id"), "{anchor}");
+        assert!(anchor.contains("r.deleted_at IS NULL"), "{anchor}");
+        assert_eq!(anchor.matches('?').count(), 2, "{anchor}");
+    }
 }

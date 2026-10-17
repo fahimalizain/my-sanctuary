@@ -19,18 +19,22 @@ use api_core::models::{
 };
 use api_core::repo::{
     build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_occurrence_insert_sql,
-    build_occurrence_list_by_ids_sql, AgendaItemRepo, OccurrenceRepo, RepoError, RoutineRepo,
+    build_occurrence_list_by_ids_sql, build_routine_list_by_ids_sql, AgendaItemRepo,
+    OccurrenceRepo, RepoError, RoutineRepo,
     TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
     AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
     AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,
     AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
-    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
+    AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL, AGENDA_ITEM_MAX_SORT_ORDER_SQL,
+    AGENDA_ITEM_MIN_LOCAL_DATE_SQL, AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL,
+    AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL, OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL,
     OCCURRENCE_INSERT_SQL, OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
     OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
     OCCURRENCE_CLEAR_EVENT_IDS_SQL, OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
     OCCURRENCE_UPDATE_TITLE_SQL, ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
-    ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
+    ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
+    ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL,
     TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL,
     TASK_CATEGORY_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_DELETE_SQL,
@@ -300,6 +304,14 @@ struct SortOrderRow {
     pub sort_order: i64,
 }
 
+/// Row projection for the agenda stream's `MIN(local_date)` statements. The
+/// aggregate always yields one row; `None` means the matched set was empty
+/// (`MIN()` over zero rows is NULL).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct LocalDateRow {
+    pub local_date: Option<String>,
+}
+
 /// `task_lists` table persistence.
 pub struct D1TaskListRepo {
     db: D1Database,
@@ -545,6 +557,26 @@ impl RoutineRepo for D1RoutineRepo {
         let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.sort_order))
     }
+
+    async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError> {
+        // Empty IN list → no SQL at all.
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Deliberately no `deleted_at` filter: the range read's history path
+        // needs a soft-deleted routine's display fields.
+        let mut rows = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(ROUTINE_LIST_BY_IDS_CHUNK_SIZE) {
+            let (sql, args) = build_routine_list_by_ids_sql(chunk);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            rows.extend(query_vec(stmt).await?);
+        }
+        Ok(rows)
+    }
 }
 
 /// `routine_occurrences` table persistence (ADR 0004).
@@ -746,6 +778,48 @@ impl AgendaItemRepo for D1AgendaItemRepo {
             .bind_refs(&[D1Type::Text(user_id), D1Type::Text(local_date)])
             .map_err(backend)?;
         query_vec(stmt).await
+    }
+
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<AgendaItem>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(from),
+                D1Type::Text(to),
+            ])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn min_local_date(&self, user_id: &str) -> Result<Option<String>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_MIN_LOCAL_DATE_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<LocalDateRow>(None).await.map_err(backend)?;
+        Ok(row.and_then(|row| row.local_date))
+    }
+
+    async fn oldest_pending_local_date_before(
+        &self,
+        user_id: &str,
+        before: &str,
+    ) -> Result<Option<String>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(before)])
+            .map_err(backend)?;
+        let row = stmt.first::<LocalDateRow>(None).await.map_err(backend)?;
+        Ok(row.and_then(|row| row.local_date))
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError> {

@@ -585,7 +585,7 @@ fn append_rank(max: Option<i64>) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     use super::*;
@@ -741,6 +741,26 @@ mod tests {
                 .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
                 .map(|row| row.sort_order)
                 .max())
+        }
+
+        async fn list_by_ids_including_deleted(
+            &self,
+            ids: &[String],
+        ) -> Result<Vec<Routine>, RepoError> {
+            // Mirrors build_routine_list_by_ids_sql: id-scoped, NO deleted
+            // filter, empty input touches nothing.
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let id_set: HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| id_set.contains(row.id.as_str()))
+                .cloned()
+                .collect())
         }
     }
 

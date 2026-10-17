@@ -201,25 +201,36 @@ async fn focused_task_id(
         .and_then(|row| row.focused_task_id)
 }
 
-/// `GET /api/agenda?date=YYYY-MM-DD` → 200
-/// `{"items":[...],"today":"YYYY-MM-DD","time_zone":"IANA"}`.
+/// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` → 200
+/// `{"items":[...],"from":"YYYY-MM-DD","to":"YYYY-MM-DD","today":"YYYY-MM-DD",
+/// "time_zone":"IANA","anchor_date":"YYYY-MM-DD","earliest_date":"YYYY-MM-DD"}`.
 ///
-/// The `date` query is **optional** (missing/blank = civil today — the
-/// primary calendar's IANA `time_zone` via chrono-tz, ADR 0004 amendment);
-/// Home's first load omits it so the server decides "today". Seeds on read
-/// (living routines whose rule covers the date get their occurrence +
-/// membership ensured), then returns the mixed pile with embedded task views
-/// / occurrence views plus the server-computed `today` + `time_zone`.
+/// Both bounds are **optional** and must be set together: omitted reads the
+/// anchor week (the oldest past date that still holds a pending item — civil
+/// today when nothing pends — plus six days). This GET is a **pure range
+/// read**: it seeds nothing and writes no occurrence / agenda row (the old
+/// `?date=` parameter is ignored). The response carries the server-computed
+/// `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
     };
-    let date = {
+    let (from, to) = {
         let url = req.url()?;
-        url.query_pairs()
-            .find(|(key, _)| key == "date")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| !value.is_empty())
+        let mut from = None;
+        let mut to = None;
+        for (key, value) in url.query_pairs() {
+            let value = value.into_owned();
+            if value.is_empty() {
+                continue;
+            }
+            match key.as_ref() {
+                "from" => from = Some(value),
+                "to" => to = Some(value),
+                _ => {}
+            }
+        }
+        (from, to)
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let focused_task_id = focused_task_id(&ctx, &user.id).await;
@@ -233,7 +244,8 @@ pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>
         &agenda_d1(&ctx)?,
         &tasks_d1(&ctx)?,
         &user.id,
-        date.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
         now_unix,
         focused_task_id.as_deref(),
     )
