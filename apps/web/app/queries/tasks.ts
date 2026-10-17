@@ -77,9 +77,13 @@ async function cancelTasksQuery(): Promise<void> {
 }
 
 /** Re-reads Home's agenda stream after a task write that can repoint the
- *  task's single agenda row. Never invalidates `['tasks']` (see above). */
-async function invalidateAgendaQuery(): Promise<void> {
-  await queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
+ *  task's single agenda row (and, for a rename, change the title Home embeds).
+ *  Fired WITHOUT returning a promise: `mutateAsync` must not wait out every
+ *  loaded page's refetch, and on failure the caller's rollback must not run
+ *  after — and overwrite — the fresh server data. Never invalidates
+ *  `['tasks']` (see above). */
+function invalidateAgendaQuery(): void {
+  void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
 }
 
 export function useMoveTask() {
@@ -118,6 +122,9 @@ export function useUpdateTask() {
     mutationFn: ({ id, input }: { id: string; input: UpdateTaskInput }) =>
       updateTask(id, input),
     onMutate: cancelTasksQuery,
+    // A Board rename changes the title Home embeds — re-read the stream so
+    // the agenda row does not show the old one until `staleTime` expires.
+    onSettled: invalidateAgendaQuery,
   });
 }
 

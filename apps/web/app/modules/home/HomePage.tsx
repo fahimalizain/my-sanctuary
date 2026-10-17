@@ -80,6 +80,8 @@ import {
   agendaMoveTargetAt,
   appendRankOnStream,
   applyAgendaMove,
+  crossDaySortOrder,
+  dedupeAgendaItems,
   eachCivilDate,
   groupItemsByDate,
   isAgendaItemPending,
@@ -114,11 +116,41 @@ function dayElementId(date: string): string {
   return `${DAY_ID_PREFIX}${date}`;
 }
 
-/** Home's slim, compact copy of the FocusTimer for below `lg` — same
- *  component, constrained by classes only (heading to screen-readers, digits
- *  and buttons shrunk, session line dropped). */
+/** Milliseconds until the next midnight in `timeZone` (an IANA name), read
+ *  with `hourCycle: 'h23'` so midnight is 00 and never 24. `null` when the
+ *  zone is missing or unreadable (`Intl` throws on an unknown zone) — the
+ *  caller then skips the timer rather than crashing. */
+function msUntilNextMidnight(timeZone: string): number | null {
+  if (!timeZone) return null;
+  try {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(now);
+    const part = (type: string) =>
+      Number(parts.find((entry) => entry.type === type)?.value);
+    const hour = part('hour') % 24;
+    const minute = part('minute');
+    const second = part('second');
+    if (![hour, minute, second].every(Number.isFinite)) return null;
+    const msIntoDay =
+      ((hour * 60 + minute) * 60 + second) * 1000 + now.getMilliseconds();
+    return 24 * 60 * 60 * 1000 - msIntoDay;
+  } catch {
+    return null;
+  }
+}
+
+/** Home's slim, compact constraints for the ONE FocusTimer below `lg` (sticky
+ *  strip above the stream): heading to screen-readers, digits and buttons
+ *  shrunk, session line dropped. Every rule is `max-lg:`-scoped so the `lg`
+ *  breakpoint keeps the untouched card. */
 const COMPACT_TIMER_CLASSES =
-  'p-2.5 [&_h2]:sr-only [&>div:nth-child(2)]:mb-2 [&>div:nth-child(2)>div:first-child]:text-2xl [&>div:nth-child(2)>p]:hidden [&>div:nth-child(3)]:mb-0 [&>div:last-child]:hidden';
+  'max-lg:p-2.5 max-lg:[&_h2]:sr-only max-lg:[&>div:nth-child(2)]:mb-2 max-lg:[&>div:nth-child(2)>div:first-child]:text-2xl max-lg:[&>div:nth-child(2)>p]:hidden max-lg:[&>div:nth-child(3)]:mb-0 max-lg:[&>div:last-child]:hidden';
 
 interface AgendaRowHandlers {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
@@ -304,13 +336,55 @@ export function HomePage() {
   // floor and the Today button.
   const serverToday = firstPage?.today ?? '';
   const anchorDate = firstPage?.anchor_date ?? '';
+  // The zone `today` is computed in — the freshest read of it is the latest
+  // page. Drives the midnight refresh below.
+  const timeZone = pages[pages.length - 1]?.time_zone ?? '';
   const bounds = useMemo(() => streamBounds(pages), [pages]);
   const days = useMemo(
     () => (bounds ? eachCivilDate(bounds.from, bounds.to) : []),
     [bounds],
   );
-  const items = useMemo(() => pages.flatMap((page) => page.items), [pages]);
+  const items = useMemo(
+    // `dedupeAgendaItems` is a backstop against a row stranded in a page whose
+    // window does not hold its `local_date` (see `moveStreamItem`) — grouping
+    // a duplicate id would paint its day twice with duplicate keys.
+    () => dedupeAgendaItems(pages.flatMap((page) => page.items)),
+    [pages],
+  );
   const byDate = useMemo(() => groupItemsByDate(items), [items]);
+
+  // `serverToday` is only as fresh as the last read (`staleTime` is 30s): a
+  // tab left in the foreground overnight would keep yesterday's date, so
+  // Play, the popover's Today and every drop would target a past day and 400.
+  // Re-read the stream at the next midnight in the calendar's own IANA zone
+  // (the server computes `today` there), then arm the next midnight; a missing
+  // / unknown zone just skips the timer.
+  useEffect(() => {
+    if (!timeZone) return;
+    let timer: number | undefined;
+    const schedule = () => {
+      const delay = msUntilNextMidnight(timeZone);
+      if (delay === null) return;
+      timer = window.setTimeout(() => {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
+        schedule();
+      }, delay);
+    };
+    schedule();
+    return () => window.clearTimeout(timer);
+  }, [timeZone]);
+
+  // Coming back to a backgrounded PWA: `today` may have rolled over while the
+  // tab was hidden. Fire and forget — the refetch must not gate the paint.
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () =>
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
 
   // Action failures (move/complete/skip/etc.): a banner above the still-
   // visible stream — rows are never unmounted by an action error.
@@ -413,18 +487,18 @@ export function HomePage() {
       partitionAgendaItems(
         dayItemsOf(itemsNow, dragged.local_date),
       ).living.filter(isAgendaRowDraggable);
-    // A cross-day rank is "the index in the target day's living list" — the
-    // pile as the user reads it (read-only rows included), end of the list
-    // for a drop on the day container itself.
-    const crossDayRank = (day: string, overItemId?: string) => {
-      const living = partitionAgendaItems(dayItemsOf(itemsNow, day)).living;
-      const index = overItemId
-        ? living.findIndex((entry) => entry.id === overItemId)
-        : living.length;
-      return index < 0 ? living.length : index;
-    };
+    // A cross-day drop over a living row carries THAT row's rank — its list
+    // index would land the item in the wrong slot as soon as the pile has
+    // rank gaps or parked rows (see `crossDaySortOrder`). An id outside the
+    // living pile (a Completed row, a stale id) appends.
+    const crossDayRank = (day: string, overItemId: string) =>
+      crossDaySortOrder(
+        partitionAgendaItems(dayItemsOf(itemsNow, day)).living,
+        overItemId,
+      );
 
-    // A drop on a day's own container means "the end of that day's pile".
+    // A drop on a day's own container means "the end of that day's pile":
+    // no rank at all, so the server appends at `max + 1`.
     if (overId.startsWith(DAY_ID_PREFIX)) {
       const day = overId.slice(DAY_ID_PREFIX.length);
       if (day === dragged.local_date) {
@@ -438,7 +512,7 @@ export function HomePage() {
         return;
       }
       if (day < serverToday) return;
-      void handleCrossDayMove(dragged, day, crossDayRank(day));
+      void handleCrossDayMove(dragged, day);
       return;
     }
 
@@ -496,10 +570,11 @@ export function HomePage() {
   };
 
   /** Move a row onto another day (drag across days, or the row's own
-   *  reschedule popover). `sortOrder` is the rank the drop wants (the target
-   *  day's living index); omitted — the popover path — appends at the pile's
-   *  end server-side, exactly like the old "Tomorrow". A failure restores the
-   *  snapshot and banners. */
+   *  reschedule popover). `sortOrder` is the absolute rank the drop wants —
+   *  the target row's own `sort_order` (`crossDaySortOrder`); omitted — the
+   *  popover path, or a drop on the day container — appends at the pile's
+   *  end server-side (`max + 1`), exactly like the old "Tomorrow". A failure
+   *  restores the snapshot and banners. */
   const handleCrossDayMove = async (
     item: AgendaItemRecord,
     targetDate: string,
@@ -1041,6 +1116,12 @@ export function HomePage() {
   } | null>(null);
   const landedOnAnchorRef = useRef(false);
   const [todayVisible, setTodayVisible] = useState(false);
+  // The Today button's scroll waits for React to commit the fetched days
+  // (`fetchNextPage()` resolves before the notify manager's timeout flush, so
+  // the DOM right after the await is still the old one). State, not a ref:
+  // clicking Today while its day is ALREADY loaded (just off screen) fetches
+  // nothing, so nothing else would re-run the layout effect that scrolls.
+  const [scrollTodayPending, setScrollTodayPending] = useState(false);
 
   const hasPreviousPage = stream.hasPreviousPage;
   const hasNextPage = stream.hasNextPage;
@@ -1176,19 +1257,24 @@ export function HomePage() {
   }, [anchorDate, days, maybeFetchMore]);
 
   // A prepend adds height ABOVE the viewport: add exactly that much to
-  // `scrollTop` so the day under the user's eyes does not jump.
+  // `scrollTop` so the day under the user's eyes does not jump. Only a REAL
+  // prepend counts — an optimistic `setQueryData` while a previous-page fetch
+  // is in flight must leave the recorded geometry alone, or the page that
+  // finally arrives gets no correction at all.
   useLayoutEffect(() => {
     const root = scrollRef.current;
     const recorded = prependRef.current;
     if (!root || !recorded) return;
-    prependRef.current = null;
     const firstFrom = pages[0]?.from ?? null;
     if (
       pages.length <= recorded.pageCount ||
       firstFrom === recorded.firstFrom
     ) {
-      return; // an append (or a failure) — the viewport is already right
+      // An append, an optimistic edit, or a failure — the viewport is
+      // already right, and the pending prepend (if any) is still coming.
+      return;
     }
+    prependRef.current = null;
     const delta = root.scrollHeight - recorded.scrollHeight;
     if (delta > 0) {
       root.scrollTop += delta;
@@ -1199,6 +1285,22 @@ export function HomePage() {
       topVisibleRef.current = false;
     }
   }, [pages]);
+
+  // The previous-page fetch settled without growing the stream into a new
+  // `from` (it failed, or the server had nothing older): drop the pending
+  // measurement rather than let it sit across later unrelated page changes.
+  // A passive effect, on purpose — layout effects have already run for this
+  // commit, so a prepend that DID land has been applied above.
+  useEffect(() => {
+    if (isFetchingPreviousPage) return;
+    const recorded = prependRef.current;
+    if (!recorded) return;
+    const firstFrom = pages[0]?.from ?? null;
+    if (pages.length > recorded.pageCount && firstFrom !== recorded.firstFrom) {
+      return; // the layout effect above consumed it
+    }
+    prependRef.current = null;
+  }, [isFetchingPreviousPage, pages]);
 
   // Is today's header on screen? Its absence (today not loaded yet) counts as
   // "not visible", so the Today button shows.
@@ -1223,36 +1325,48 @@ export function HomePage() {
     return () => observer.disconnect();
   }, [serverToday, pageCount, days]);
 
-  /** The floating Today button: walk the stream until today is loaded (capped
-   *  — a crawl, not a loop), then land on its header. */
+  /** The floating Today button: walk the stream's CACHE (page `from`/`to`,
+   *  never the DOM) until today sits inside a loaded window — capped, a crawl
+   *  and not a loop. The scroll itself is placed by the layout effect below:
+   *  `fetchNextPage()` resolves before React has committed the new days (the
+   *  notify manager flushes on a timeout), so the DOM is still the old one
+   *  here. */
   const scrollToToday = async () => {
     const root = scrollRef.current;
     if (!root || !serverToday) return;
     historyArmedRef.current = true;
+    setScrollTodayPending(true);
     for (let step = 0; step < MAX_TODAY_FETCHES; step += 1) {
-      if (document.getElementById(dayElementId(serverToday))) break;
-      const data = readStream();
-      const loaded = data?.pages ?? [];
+      const loaded = readStream()?.pages ?? [];
       const first = loaded[0];
       const last = loaded[loaded.length - 1];
-      if (!first || !last) return;
+      if (!first || !last) break;
+      if (first.from <= serverToday && serverToday <= last.to) break;
       if (serverToday < first.from) {
         // The back-scroll floor is the server's oldest row.
         if (first.from <= first.earliest_date) break;
         rememberPrepend();
         await fetchPreviousPage();
-      } else if (serverToday > last.to) {
-        await fetchNextPage();
       } else {
-        break; // inside the loaded span but not painted (should not happen)
+        await fetchNextPage();
       }
       // A failed / no-op fetch makes no new page — stop rather than spin.
       if ((readStream()?.pages.length ?? 0) <= loaded.length) break;
     }
-    document.getElementById(dayElementId(serverToday))?.scrollIntoView({
-      block: 'start',
-    });
   };
+
+  // Today is in the DOM: place the pending scroll now. Fires on the commit
+  // that painted today's day, and again if the day was already loaded when
+  // the button was clicked (no page fetch, so nothing else would re-run).
+  useLayoutEffect(() => {
+    if (!scrollTodayPending || !serverToday) return;
+    const target = scrollRef.current?.querySelector<HTMLElement>(
+      `#${dayElementId(serverToday)}`,
+    );
+    if (!target) return;
+    target.scrollIntoView({ block: 'start' });
+    setScrollTodayPending(false);
+  }, [scrollTodayPending, serverToday, days]);
 
   // ──────────────────────────────────────────
   // Render
@@ -1321,12 +1435,6 @@ export function HomePage() {
                 Routines
               </Link>
             </header>
-
-            {/* Below lg the focus timer rides above the stream as a compact
-                sticky strip — same component, constrained by classes. */}
-            <div className="sticky top-2 z-20 mb-3 rounded-xl border border-border bg-card/95 shadow-sm backdrop-blur lg:hidden">
-              <FocusTimer className={COMPACT_TIMER_CLASSES} />
-            </div>
 
             {/* Action error banner (move/complete/skip failures) — the stream
                 stays mounted */}
@@ -1453,11 +1561,16 @@ export function HomePage() {
             </div>
           </div>
 
-          {/* Right panel — Focus & Quotes (unchanged, lg and up only: below
-              lg the compact timer sits above the stream instead) */}
-          <div className="hidden space-y-6 lg:block">
-            <FocusTimer />
-            <QuotesSection quotes={quotes} />
+          {/* Right panel — Focus & Quotes. Below lg this panel LEADS the page
+              (`order-first`), so its ONE FocusTimer sits above the stream as a
+              compact strip while the quotes stay hidden; at lg it returns to
+              the right column, timer on top. One instance only: the timer owns
+              its state, so a second mount would reset it on every resize. */}
+          <div className="order-first space-y-6 lg:order-none">
+            <div className="max-lg:sticky max-lg:top-2 max-lg:z-20 max-lg:mb-3 max-lg:rounded-xl max-lg:border max-lg:border-border max-lg:bg-card/95 max-lg:shadow-sm max-lg:backdrop-blur">
+              <FocusTimer className={COMPACT_TIMER_CLASSES} />
+            </div>
+            <QuotesSection quotes={quotes} className="hidden lg:block" />
           </div>
         </div>
       </div>

@@ -162,10 +162,10 @@ export function updateStreamItem(
  *  (`reschedule` with a rank — `place_on_date`): the item leaves whichever
  *  page holds it, every peer ON `toDate` ranked at/after `rank` shifts up one
  *  (the same rule as `applyAgendaMove`), and the item lands on `rank` in the
- *  page whose window covers `toDate`. When no loaded page covers `toDate` the
- *  updated item goes back into the page it came from, so grouping by
- *  `local_date` can still paint it — a move is never silently dropped.
- *  Returns the same reference when the id is missing. */
+ *  page whose window covers `toDate`. When NO loaded page covers `toDate` the
+ *  item leaves the cache entirely: it cannot live in a page whose window does
+ *  not contain its `local_date`, or the day paints it twice once the server's
+ *  real page loads. Returns the same reference when the id is missing. */
 export function moveStreamItem(
   data: AgendaStreamData | undefined,
   id: string,
@@ -183,21 +183,27 @@ export function moveStreamItem(
     local_date: toDate,
     sort_order: rank,
   };
-  const target =
-    data.pages.find((page) => page.from <= toDate && toDate <= page.to) ??
-    source;
+  const target = data.pages.find(
+    (page) => page.from <= toDate && toDate <= page.to,
+  );
   const pages = data.pages.map((page) => {
-    const items = page.items
-      .filter((entry) => entry.id !== id)
-      .map((entry) =>
-        entry.local_date === toDate && entry.sort_order >= rank
-          ? { ...entry, sort_order: entry.sort_order + 1 }
-          : entry,
-      );
-    if (page !== target) {
+    const items = page.items.filter((entry) => entry.id !== id);
+    if (!target) {
+      // Unloaded target day: drop the row (the stream's next read of that
+      // window paints the server's copy). Never re-home it in `source`.
       return items.length === page.items.length ? page : { ...page, items };
     }
-    return { ...page, items: [...items, moved] };
+    const shifted = items.map((entry) =>
+      entry.local_date === toDate && entry.sort_order >= rank
+        ? { ...entry, sort_order: entry.sort_order + 1 }
+        : entry,
+    );
+    if (page !== target) {
+      return shifted.length === page.items.length
+        ? page
+        : { ...page, items: shifted };
+    }
+    return { ...page, items: [...shifted, moved] };
   });
   return { ...data, pages };
 }
@@ -247,6 +253,23 @@ export function agendaMoveTargetAt(
   return toIndex < fromIndex
     ? items[toIndex].sort_order
     : items[toIndex].sort_order + 1;
+}
+
+/** The absolute rank a cross-day drop should send when it lands OVER one of
+ *  the target day's living rows: that row's own `sort_order`, never its list
+ *  index. The server's `place_on_date` shifts every peer ranked at/after the
+ *  number up one and lands the item on it, so an index would land the item in
+ *  the wrong slot whenever the pile has rank gaps or parked (Completed) rows —
+ *  those keep their ranks in the same number space.
+ *  `null` (a drop on the day container itself) or an id that is not in
+ *  `living` returns `undefined`: the caller omits `sort_order` and the server
+ *  appends at `max + 1`. */
+export function crossDaySortOrder(
+  living: AgendaItemRecord[],
+  overItemId: string | null,
+): number | undefined {
+  if (!overItemId) return undefined;
+  return living.find((entry) => entry.id === overItemId)?.sort_order;
 }
 
 /** Optimistic mirror of the server's `shift_sort_order` + `set_sort_order`:
@@ -352,4 +375,20 @@ export function streamItemsOf(
   data: AgendaStreamData | undefined,
 ): AgendaItemRecord[] {
   return streamItems(data);
+}
+
+/** One row per id, keeping the FIRST occurrence (page order). A window read
+ *  can only return each row once, but an optimistic paint that lands on a day
+ *  no page covers, or a re-read racing a write, can leave the same id in two
+ *  pages — grouping that would paint the day twice (duplicate React keys and
+ *  duplicate sortable ids). Home flattens through this before grouping. */
+export function dedupeAgendaItems(
+  items: AgendaItemRecord[],
+): AgendaItemRecord[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
 }

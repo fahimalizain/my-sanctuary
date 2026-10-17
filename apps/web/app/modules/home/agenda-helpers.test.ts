@@ -20,6 +20,8 @@ import {
   appendRankOnStream,
   applyAgendaMove,
   canReschedule,
+  crossDaySortOrder,
+  dedupeAgendaItems,
   eachCivilDate,
   groupItemsByDate,
   isAgendaItemParked,
@@ -389,16 +391,26 @@ test('moveStreamItem: peers on OTHER dates never shift', () => {
   );
 });
 
-test('moveStreamItem: an uncovered target date keeps the row in its page', () => {
+test('moveStreamItem: an uncovered target date drops the row from the stream', () => {
   const data = {
     pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
     pageParams: [undefined],
   };
   const next = moveStreamItem(data, 'a', '2026-09-15', 3);
-  const row = next?.pages[0].items[0];
-  assert.equal(row?.local_date, '2026-09-15');
-  assert.equal(row?.sort_order, 3);
-  assert.equal(next?.pages[0].items.length, 1, 'never dropped');
+  // No loaded window covers 2026-09-15, so the row cannot be painted on a
+  // day this page does not hold: it leaves the cache and the real page will
+  // paint the server's copy when it loads.
+  assert.deepEqual(
+    next?.pages.map((entry) => entry.items.map((row) => row.id)),
+    [[]],
+  );
+  assert.equal(
+    streamItemsOf(next).some((entry) => entry.id === 'a'),
+    false,
+    'gone from every page',
+  );
+  // The input cache object is untouched.
+  assert.equal(data.pages[0].items.length, 1);
 });
 
 test('moveStreamItem: a missing id (or no data) keeps the same reference', () => {
@@ -410,7 +422,7 @@ test('moveStreamItem: a missing id (or no data) keeps the same reference', () =>
   assert.equal(moveStreamItem(undefined, 'a', TODAY, 0), undefined);
 });
 
-// ── appendRankOnStream / streamItemsOf ──────────────────────────────────
+// ── appendRankOnStream / streamItemsOf / dedupeAgendaItems ──────────────
 
 test('appendRankOnStream: max + 1 on the date, 0 on an empty pile', () => {
   const data = {
@@ -439,6 +451,37 @@ test('streamItemsOf: flattens pages in order', () => {
     ['a', 'b'],
   );
   assert.deepEqual(streamItemsOf(undefined), []);
+});
+
+test('dedupeAgendaItems: one survivor per id, the first page wins', () => {
+  // A stranded optimistic row can leave the same id in two pages; grouping
+  // that would paint the day twice (duplicate keys and sortable ids).
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [item('a', 0, '2026-08-20')]),
+      page('2026-08-23', '2026-08-29', [
+        item('a', 4, '2026-08-20'),
+        item('b', 0),
+      ]),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  const deduped = dedupeAgendaItems(streamItemsOf(data));
+  assert.deepEqual(
+    deduped.map((entry) => entry.id),
+    ['a', 'b'],
+  );
+  assert.equal(
+    deduped[0].sort_order,
+    0,
+    'the earlier page\u2019s copy survives',
+  );
+  // A list with no duplicates comes back with the same rows.
+  assert.deepEqual(
+    dedupeAgendaItems([item('b', 0)]).map((entry) => entry.id),
+    ['b'],
+  );
+  assert.deepEqual(dedupeAgendaItems([]), []);
 });
 
 // ── agendaMoveTarget ─────────────────────────────────────────────────────
@@ -498,6 +541,32 @@ test('agendaMoveTargetAt: rank gaps keep working (after an unpin)', () => {
   const items = [item('a', 0), item('c', 2)];
   assert.equal(agendaMoveTargetAt(items, 1, 0), 0);
   assert.equal(agendaMoveTargetAt(items, 0, 1), 3);
+});
+
+// ── crossDaySortOrder ───────────────────────────────────────────────────
+
+test('crossDaySortOrder: a drop over a row sends that row\u2019s rank, not its index', () => {
+  // Rank gaps and parked (Completed) rows keep their ranks in the same number
+  // space, so a living list's index is not the rank the server wants.
+  const living = [
+    item('a', 0, '2026-08-25'),
+    item('c', 5, '2026-08-25'),
+    item('d', 6, '2026-08-25'),
+  ];
+  // D sits at index 2 but holds rank 6: the item must land on D's slot (D
+  // shifts to 7), never at rank 2 (which would land it before C).
+  assert.equal(crossDaySortOrder(living, 'd'), 6);
+  assert.equal(crossDaySortOrder(living, 'c'), 5);
+  assert.equal(crossDaySortOrder(living, 'a'), 0);
+});
+
+test('crossDaySortOrder: the day container and a missing row mean "append"', () => {
+  const living = [item('a', 0, '2026-08-25'), item('c', 5, '2026-08-25')];
+  // `null` = dropped on the day container itself; `undefined` tells the
+  // caller to omit `sort_order` so the server appends at `max + 1`.
+  assert.equal(crossDaySortOrder(living, null), undefined);
+  assert.equal(crossDaySortOrder(living, 'missing'), undefined);
+  assert.equal(crossDaySortOrder([], 'a'), undefined);
 });
 
 // ── applyAgendaMove ──────────────────────────────────────────────────────

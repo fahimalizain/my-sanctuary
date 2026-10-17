@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { useInfiniteQuery, useMutation } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
 import {
@@ -37,7 +38,7 @@ export type AgendaStreamData = InfiniteData<
 const AGENDA_PAGE_DAYS = 7;
 
 export function useAgendaStream() {
-  return useInfiniteQuery({
+  const query = useInfiniteQuery({
     queryKey: queryKeys.agenda.stream(),
     // The anchor page is the API's own default read: no `from`/`to` at all.
     initialPageParam: undefined as AgendaStreamPageParam | undefined,
@@ -59,14 +60,46 @@ export function useAgendaStream() {
       to: addCivilDays(lastPage.to, AGENDA_PAGE_DAYS),
     }),
   });
+  const data = query.data;
+
+  // Pin the anchor page's param once it has actually come back. While it is
+  // still `undefined`, a v5 refetch reuses "the server picks the anchor" and
+  // recomputes `anchor_date`, so any invalidation can slide the whole loaded
+  // span (Oct 10–23 becomes Oct 17–30). Rewriting the param to the window
+  // THAT page answered makes every later refetch re-request it; the loaded
+  // dates then stay put even when `anchor_date` in the payload moves.
+  // Not necessarily index 0 — a prepend moves the anchor page to the right.
+  // Pinned exactly once: with no `undefined` param left there is nothing to
+  // do, so this cannot loop.
+  useEffect(() => {
+    if (!data) return;
+    const current = queryClient.getQueryData<AgendaStreamData>(
+      queryKeys.agenda.stream(),
+    );
+    if (!current) return;
+    const index = current.pageParams.findIndex((param) => param == null);
+    if (index < 0) return;
+    const page = current.pages[index];
+    if (!page?.from || !page?.to) return;
+    queryClient.setQueryData<AgendaStreamData>(queryKeys.agenda.stream(), {
+      ...current,
+      pageParams: current.pageParams.map((param, i) =>
+        i === index ? { from: page.from, to: page.to } : param,
+      ),
+    });
+  }, [data]);
+
+  return query;
 }
 
-// Agenda write mutations — thin wrappers, no optimistic paint, no
-// invalidation (mirrors tasks.ts / occurrences.ts). `onMutate` cancels the
-// stream so an in-flight refetch (window focus, another tab's mutation) can
-// never resolve over the page's optimistic paint mid-write. The page owns the
-// optimistic paint (`agenda-helpers.ts`) and merges the authoritative row on
-// success.
+// Agenda write mutations — thin wrappers, no optimistic paint (mirrors
+// tasks.ts / occurrences.ts). `onMutate` cancels the stream so an in-flight
+// refetch (window focus, another tab's mutation) can never resolve over the
+// page's optimistic paint mid-write. The page owns the optimistic paint
+// (`agenda-helpers.ts`) and merges the authoritative row on success.
+// `reschedule` additionally re-reads the stream on settle: it is the one
+// write that can target a day NO loaded page covers, where Home drops the
+// row from the cache and only the server's page can paint it back.
 
 /** Cancels Home's whole day-stream, wherever it currently spans. */
 export async function cancelAgendaQuery(): Promise<void> {
@@ -91,5 +124,11 @@ export function useRescheduleAgendaItem() {
       input: RescheduleAgendaItemInput;
     }) => rescheduleAgendaItem(id, input),
     onMutate: cancelAgendaQuery,
+    // Fired, never awaited: `mutateAsync` must not wait out every loaded
+    // page's refetch (Home's callers roll back on failure, which would then
+    // write an old snapshot over the fresh server data).
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
+    },
   });
 }
