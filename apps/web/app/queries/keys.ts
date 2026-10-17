@@ -17,10 +17,10 @@ export const queryKeys = {
   },
   agenda: {
     all: ['agenda'] as const,
-    // `undefined` / empty → the 'today' sentinel. Home's first load copies
-    // the server's civil today onto the dated key and then queries that key.
-    byDate: (date?: string) =>
-      [...queryKeys.agenda.all, date ? date : 'today'] as const,
+    // Home's one infinite day-stream (`useAgendaStream`): the only agenda
+    // cache key. Every page of it answers to `agenda.all` — task and routine
+    // writes invalidate the whole stream so the server's row repointing lands.
+    stream: () => [...queryKeys.agenda.all, 'stream'] as const,
   },
   calendar: {
     all: ['calendar'] as const,

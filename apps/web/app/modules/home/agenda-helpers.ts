@@ -1,10 +1,12 @@
-// Pure helpers for the Home agenda (ADR 0004 § Surfaces — Home). Date label,
-// add-task picker filter, the reorder rank math, and the living / Completed
-// dump split (ADR 0004 amendment 2026-08-24) live here so they can be
-// unit-tested without a DOM.
+// Pure helpers for Home's agenda stream (ADR 0004 amendment — slice 5): the
+// day label, the reorder rank math, the living / Completed dump split, the
+// date-window walk, and the optimistic edits over React Query's infinite
+// `{ pages }` cache. Kept React-free so `node:test` can cover them
+// (HomePage.tsx is presentational glue on top).
 
-import type { AgendaItemRecord, TaskRecord, TaskStatus } from '../../types';
-import { addCivilDays } from '../routines/rrule-preview';
+import type { InfiniteData } from '@tanstack/react-query';
+import type { AgendaItemRecord, AgendaResponse, TaskStatus } from '../../types';
+import { addCivilDays, isCivilDateValid } from '../routines/rrule-preview';
 
 const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTH_SHORT = [
@@ -26,10 +28,12 @@ function pad(n: number): string {
   return String(n).padStart(2, '0');
 }
 
-/** Header title for the selected civil date: "Today" / "Tomorrow" /
- *  "Yesterday" relative to `today`, otherwise "Tue 25 Aug" (weekday, day,
- *  month — parsed with the same UTC-carrier trick as `rrule-preview`).
- *  Malformed input returns the input unchanged. */
+/** Day-header title for one civil date: "Today" / "Tomorrow" / "Yesterday"
+ *  relative to `today`, otherwise "Tue 25 Aug" (weekday, day, month — parsed
+ *  with the same UTC-carrier trick as `rrule-preview`). A date in ANOTHER year
+ *  also carries its year ("Fri 1 Jan 2027") so a long stream's history is
+ *  never ambiguous — relative labels never do. Malformed input returns the
+ *  input unchanged. */
 export function agendaDateLabel(date: string, today: string): string {
   if (date === today) return 'Today';
   if (date === addCivilDays(today, 1)) return 'Tomorrow';
@@ -51,40 +55,151 @@ export function agendaDateLabel(date: string, today: string): string {
   ) {
     return date;
   }
-  return `${WEEKDAY_SHORT[carrier.getUTCDay()]} ${Number(d)} ${MONTH_SHORT[Number(mo) - 1]}`;
+  const label = `${WEEKDAY_SHORT[carrier.getUTCDay()]} ${Number(d)} ${MONTH_SHORT[Number(mo) - 1]}`;
+  return y === today.trim().slice(0, 4) ? label : `${label} ${y}`;
 }
 
-// v1 pickable statuses (ADR 0004 § Agenda rules — living OPEN | PLANNED |
-// IN_PROGRESS only; terminal tasks 400 on add).
-const AGENDA_PICKABLE_STATUSES: TaskStatus[] = [
-  'OPEN',
-  'PLANNED',
-  'IN_PROGRESS',
-];
-
-/** The add-task picker's pool: living OPEN/PLANNED/IN_PROGRESS tasks that
- *  are not already on the selected date (`onDateTaskIds` = the ref_ids of
- *  this date's task-kind agenda items). */
-export function filterAgendaPickerTasks(
-  tasks: TaskRecord[],
-  onDateTaskIds: Set<string>,
-): TaskRecord[] {
-  return tasks.filter(
-    (task) =>
-      AGENDA_PICKABLE_STATUSES.includes(task.status) &&
-      !onDateTaskIds.has(task.id),
-  );
+/** Every civil date from `from` through `to`, inclusive and ascending — the
+ *  stream's day spine, which must have no gaps even when a day has no items.
+ *  Empty when either bound is malformed or `to < from`. */
+export function eachCivilDate(from: string, to: string): string[] {
+  const start = from.trim();
+  const end = to.trim();
+  if (!isCivilDateValid(start) || !isCivilDateValid(end) || end < start) {
+    return [];
+  }
+  const dates: string[] = [];
+  for (let date = start; date <= end; date = addCivilDays(date, 1)) {
+    dates.push(date);
+  }
+  return dates;
 }
 
-/** Free-text picker search over the stored title and the computed display
- *  title (case-insensitive substring; blank query matches everything). */
-export function agendaTaskMatches(task: TaskRecord, query: string): boolean {
-  const q = query.trim().toLowerCase();
-  if (!q) return true;
-  return (
-    task.title.toLowerCase().includes(q) ||
-    task.display_title.toLowerCase().includes(q)
+/** The loaded span of the stream: the FIRST page's `from` through the LAST
+ *  page's `to`, or null when nothing is loaded. `pages` is in infinite-query
+ *  order — previous pages are prepended, so index 0 is always the earliest. */
+export function streamBounds(
+  pages: AgendaResponse[],
+): { from: string; to: string } | null {
+  const first = pages[0];
+  const last = pages[pages.length - 1];
+  if (!first || !last) return null;
+  return { from: first.from, to: last.to };
+}
+
+/** All loaded items bucketed by their civil `local_date`, each bucket in the
+ *  order the stream returned it (which is already `sort_order` asc per day). */
+export function groupItemsByDate(
+  items: AgendaItemRecord[],
+): Map<string, AgendaItemRecord[]> {
+  const byDate = new Map<string, AgendaItemRecord[]>();
+  for (const item of items) {
+    const bucket = byDate.get(item.local_date);
+    if (bucket) bucket.push(item);
+    else byDate.set(item.local_date, [item]);
+  }
+  return byDate;
+}
+
+/** The living task statuses (ADR 0004 § Agenda rules): terminal tasks
+ *  (COMPLETED | DISCARDED) are finished. */
+const AGENDA_LIVING_STATUSES: TaskStatus[] = ['OPEN', 'PLANNED', 'IN_PROGRESS'];
+
+/** Work that is still ahead of the user on its day — the amber "N pending"
+ *  count and the "Move all to today" gate. Tasks count while living; an
+ *  occurrence counts while `pending | in_progress` AND its routine is alive
+ *  (a deleted routine's history is read-only). Done / skipped rows, terminal
+ *  tasks, `routine_deleted` rows and orphans do not count. */
+export function isAgendaItemPending(item: AgendaItemRecord): boolean {
+  if (item.kind === 'task' && item.task) {
+    return AGENDA_LIVING_STATUSES.includes(item.task.status);
+  }
+  if (item.kind === 'occurrence' && item.occurrence) {
+    if (item.occurrence.routine_deleted) return false;
+    return (
+      item.occurrence.status === 'pending' ||
+      item.occurrence.status === 'in_progress'
+    );
+  }
+  return false;
+}
+
+/** Home's stream exactly as React Query caches it (see `queries/agenda.ts` —
+ *  the type lives here too so the helpers stay dependency-light). */
+type AgendaStreamData = InfiniteData<
+  AgendaResponse,
+  { from: string; to: string } | undefined
+>;
+
+function streamItems(data: AgendaStreamData | undefined): AgendaItemRecord[] {
+  return (data?.pages ?? []).flatMap((page) => page.items);
+}
+
+/** Maps the ONE item with `id` through `fn`, wherever in the stream it sits,
+ *  and leaves it in that same page. Returns the SAME data reference when the
+ *  id is missing (or there is no data) so React Query skips the re-render. */
+export function updateStreamItem(
+  data: AgendaStreamData | undefined,
+  id: string,
+  fn: (item: AgendaItemRecord) => AgendaItemRecord,
+): AgendaStreamData | undefined {
+  if (!data) return data;
+  let found = false;
+  const pages = data.pages.map((page) => {
+    let changed = false;
+    const items = page.items.map((item) => {
+      if (item.id !== id) return item;
+      found = true;
+      changed = true;
+      return fn(item);
+    });
+    return changed ? { ...page, items } : page;
+  });
+  return found ? { ...data, pages } : data;
+}
+
+/** The optimistic mirror of the server's cross-day placement
+ *  (`reschedule` with a rank — `place_on_date`): the item leaves whichever
+ *  page holds it, every peer ON `toDate` ranked at/after `rank` shifts up one
+ *  (the same rule as `applyAgendaMove`), and the item lands on `rank` in the
+ *  page whose window covers `toDate`. When no loaded page covers `toDate` the
+ *  updated item goes back into the page it came from, so grouping by
+ *  `local_date` can still paint it — a move is never silently dropped.
+ *  Returns the same reference when the id is missing. */
+export function moveStreamItem(
+  data: AgendaStreamData | undefined,
+  id: string,
+  toDate: string,
+  rank: number,
+): AgendaStreamData | undefined {
+  if (!data) return data;
+  const source = data.pages.find((page) =>
+    page.items.some((item) => item.id === id),
   );
+  const item = source?.items.find((entry) => entry.id === id);
+  if (!source || !item) return data;
+  const moved: AgendaItemRecord = {
+    ...item,
+    local_date: toDate,
+    sort_order: rank,
+  };
+  const target =
+    data.pages.find((page) => page.from <= toDate && toDate <= page.to) ??
+    source;
+  const pages = data.pages.map((page) => {
+    const items = page.items
+      .filter((entry) => entry.id !== id)
+      .map((entry) =>
+        entry.local_date === toDate && entry.sort_order >= rank
+          ? { ...entry, sort_order: entry.sort_order + 1 }
+          : entry,
+      );
+    if (page !== target) {
+      return items.length === page.items.length ? page : { ...page, items };
+    }
+    return { ...page, items: [...items, moved] };
+  });
+  return { ...data, pages };
 }
 
 /** The absolute rank `POST /api/agenda/items/:id/move { sort_order }` should
@@ -159,9 +274,11 @@ export function applyAgendaMove(
 /** Reschedule visibility (ADR 0004 amendment): occurrences move only while
  *  `pending | skipped` (in_progress/done → API 400), tasks only while living
  *  — COMPLETED/DISCARDED slots are hidden so Home never invites moving a
- *  finished card (the API would allow it). */
+ *  finished card (the API would allow it). A `routine_deleted` row is
+ *  read-only history: never reschedulable. */
 export function canReschedule(item: AgendaItemRecord): boolean {
   if (item.kind === 'occurrence' && item.occurrence) {
+    if (item.occurrence.routine_deleted) return false;
     return (
       item.occurrence.status === 'pending' ||
       item.occurrence.status === 'skipped'
@@ -212,4 +329,27 @@ export function partitionAgendaItems(items: AgendaItemRecord[]): {
     return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
   });
   return { living, completed };
+}
+
+/** The append rank on `date`'s pile — the server's `max + 1`, else 0. Used by
+ *  HomePage for the optimistic mirror of `place_task_on_today` and of a
+ *  reschedule that omits `sort_order`. */
+export function appendRankOnStream(
+  data: AgendaStreamData | undefined,
+  date: string,
+): number {
+  return streamItems(data).reduce(
+    (rank, entry) =>
+      entry.local_date === date ? Math.max(rank, entry.sort_order + 1) : rank,
+    0,
+  );
+}
+
+/** Every loaded item of the stream, in page order — HomePage's lookups (a
+ *  drag target, a task's one membership row) read this instead of the
+ *  render-time list so an async handler never works on a stale snapshot. */
+export function streamItemsOf(
+  data: AgendaStreamData | undefined,
+): AgendaItemRecord[] {
+  return streamItems(data);
 }

@@ -1,87 +1,83 @@
-import { queryOptions, useMutation, useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation } from '@tanstack/react-query';
+import type { InfiniteData } from '@tanstack/react-query';
 import {
-  createAgendaItem,
-  deleteAgendaItem,
-  getAgenda,
+  getAgendaRange,
   moveAgendaItem,
   rescheduleAgendaItem,
 } from '@/lib/api';
 import type {
-  AgendaItemRecord,
   AgendaResponse,
   MoveAgendaItemInput,
-  NewAgendaItemInput,
   RescheduleAgendaItemInput,
 } from '@/app/types';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';
+import { addCivilDays } from '@/app/modules/routines/rrule-preview';
 
-// Same split as tasks.ts: React-free `queryOptions` factory + hooks. Each
-// viewed date is its own key (`['agenda', date]`); an empty/undefined date
-// maps to the `['agenda', 'today']` sentinel whose GET omits `?date=` so the
-// server reads its own civil today (ADR 0004 — the browser never computes the
-// default Home date). After the first load Home copies the sentinel payload
-// onto the civil-today key and re-queries that key — a cache hit, never a
-// second GET.
+// Home reads ONE infinite stream of day windows (ADR 0004 amendment — slice
+// 5): the first page is the server's anchor week (no query at all, so the
+// browser never computes today), `getPreviousPageParam` walks history in
+// 7-day windows down to `earliest_date`, `getNextPageParam` walks the
+// unbounded future. Every write on the page edits this cache in place
+// (optimistic paint) and `cancelAgendaQuery` protects it from an in-flight
+// refetch — there is no per-date key left.
 
-export function agendaQueryOptions(date?: string) {
-  return queryOptions({
-    queryKey: queryKeys.agenda.byDate(date),
-    queryFn: () => getAgenda(date || undefined), // omit ?date= when empty
-  });
-}
+/** One stream page: 7 inclusive civil days, or `undefined` for the very first
+ *  page (the anchor week — the GET that omits `from`/`to` entirely). */
+export type AgendaStreamPageParam = { from: string; to: string };
 
-export function useAgendaQuery(date: string) {
-  // date === '' → sentinel key ['agenda','today'] + getAgenda() with no date
-  return useQuery(agendaQueryOptions(date || undefined));
-}
+/** The whole stream as React Query caches it (`pages[0]` is the earliest
+ *  loaded window — previous pages are prepended on the left). */
+export type AgendaStreamData = InfiniteData<
+  AgendaResponse,
+  AgendaStreamPageParam | undefined
+>;
 
-/** Writes the viewed date's agenda key as `{ items, today, time_zone }`.
- *  Accepts an array or an updater over the current items. */
-export function setAgendaItems(
-  date: string,
-  updater:
-    | AgendaItemRecord[]
-    | ((prev: AgendaItemRecord[]) => AgendaItemRecord[]),
-): void {
-  const key = queryKeys.agenda.byDate(date || undefined);
-  queryClient.setQueryData<AgendaResponse>(key, (old) => {
-    const prev = old?.items ?? [];
-    const next = typeof updater === 'function' ? updater(prev) : updater;
-    return {
-      items: next,
-      today: old?.today ?? '',
-      time_zone: old?.time_zone ?? '',
-    };
+/** Days per stream window: one week forward and one week back per fetch. */
+const AGENDA_PAGE_DAYS = 7;
+
+export function useAgendaStream() {
+  return useInfiniteQuery({
+    queryKey: queryKeys.agenda.stream(),
+    // The anchor page is the API's own default read: no `from`/`to` at all.
+    initialPageParam: undefined as AgendaStreamPageParam | undefined,
+    queryFn: ({ pageParam }) =>
+      pageParam
+        ? getAgendaRange(pageParam.from, pageParam.to)
+        : getAgendaRange(),
+    // History ends at the oldest row the server knows about.
+    getPreviousPageParam: (firstPage) =>
+      firstPage.from <= firstPage.earliest_date
+        ? undefined
+        : {
+            from: addCivilDays(firstPage.from, -AGENDA_PAGE_DAYS),
+            to: addCivilDays(firstPage.from, -1),
+          },
+    // The future never ends — keep offering the next week.
+    getNextPageParam: (lastPage) => ({
+      from: addCivilDays(lastPage.to, 1),
+      to: addCivilDays(lastPage.to, AGENDA_PAGE_DAYS),
+    }),
   });
 }
 
 // Agenda write mutations — thin wrappers, no optimistic paint, no
-// invalidation (mirrors tasks.ts). `onMutate` cancels the VIEWED date's
-// query so an in-flight refetch (window focus, another tab's mutation) can
-// never resolve over the page's optimistic cache mid-write. The page owns
-// the optimistic paint and merges the authoritative row on success — the
-// `date` passed alongside the input is only used for the cancel.
+// invalidation (mirrors tasks.ts / occurrences.ts). `onMutate` cancels the
+// stream so an in-flight refetch (window focus, another tab's mutation) can
+// never resolve over the page's optimistic paint mid-write. The page owns the
+// optimistic paint (`agenda-helpers.ts`) and merges the authoritative row on
+// success.
 
-// Shared with occurrences.ts — occurrence mutations cancel the agenda query
-// of the viewed date.
-export async function cancelAgendaQuery(date: string): Promise<void> {
-  await queryClient.cancelQueries({
-    queryKey: queryKeys.agenda.byDate(date || undefined),
-  });
+/** Cancels Home's whole day-stream, wherever it currently spans. */
+export async function cancelAgendaQuery(): Promise<void> {
+  await queryClient.cancelQueries({ queryKey: queryKeys.agenda.stream() });
 }
 
 export function useMoveAgendaItem() {
   return useMutation({
-    mutationFn: ({
-      id,
-      input,
-    }: {
-      id: string;
-      input: MoveAgendaItemInput;
-      date: string;
-    }) => moveAgendaItem(id, input),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id, input }: { id: string; input: MoveAgendaItemInput }) =>
+      moveAgendaItem(id, input),
+    onMutate: cancelAgendaQuery,
   });
 }
 
@@ -93,23 +89,7 @@ export function useRescheduleAgendaItem() {
     }: {
       id: string;
       input: RescheduleAgendaItemInput;
-      date: string;
     }) => rescheduleAgendaItem(id, input),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
-  });
-}
-
-export function useCreateAgendaItem() {
-  return useMutation({
-    mutationFn: ({ input }: { input: NewAgendaItemInput; date: string }) =>
-      createAgendaItem(input),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
-  });
-}
-
-export function useDeleteAgendaItem() {
-  return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) => deleteAgendaItem(id),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    onMutate: cancelAgendaQuery,
   });
 }

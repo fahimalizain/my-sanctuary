@@ -1,12 +1,15 @@
-// Unit tests for the Home agenda's pure helpers (date label, add-task picker
-// filter, reorder rank math, living / Completed dump split). The reorder
-// tests pin the exact server semantics of `POST /api/agenda/items/:id/move`:
-// peers at/after the target rank shift up one and the item lands on it.
+// Unit tests for Home's pure stream helpers (day label, date-window walk,
+// stream bounds / grouping, pending predicate, and the optimistic cache
+// edits). The reorder tests pin the exact server semantics of
+// `POST /api/agenda/items/:id/move`: peers at/after the target rank shift up
+// one and the item lands on it; `moveStreamItem` pins the same rule for the
+// cross-day `reschedule`.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type {
   AgendaItemRecord,
+  AgendaResponse,
   OccurrenceRecord,
   TaskRecord,
 } from '../../types';
@@ -14,15 +17,23 @@ import {
   agendaDateLabel,
   agendaMoveTarget,
   agendaMoveTargetAt,
-  agendaTaskMatches,
+  appendRankOnStream,
   applyAgendaMove,
   canReschedule,
-  filterAgendaPickerTasks,
+  eachCivilDate,
+  groupItemsByDate,
   isAgendaItemParked,
+  isAgendaItemPending,
+  moveStreamItem,
   partitionAgendaItems,
+  streamBounds,
+  streamItemsOf,
+  updateStreamItem,
 } from './agenda-helpers';
 
 // ── Fixtures ────────────────────────────────────────────────────────────
+
+const TODAY = '2026-08-23';
 
 function task(
   id: string,
@@ -56,11 +67,11 @@ function task(
   };
 }
 
-function item(id: string, sortOrder: number): AgendaItemRecord {
+function item(id: string, sortOrder: number, date = TODAY): AgendaItemRecord {
   return {
     id,
     user_id: 'u-1',
-    local_date: '2026-08-23',
+    local_date: date,
     kind: 'task',
     ref_id: `task-${id}`,
     sort_order: sortOrder,
@@ -82,7 +93,7 @@ function taskItem(
 function occurrenceItem(
   id: string,
   status: OccurrenceRecord['status'],
-  updatedAt = '2026-08-23T00:00:00Z',
+  options: { updatedAt?: string; routineDeleted?: boolean } = {},
 ): AgendaItemRecord {
   return {
     ...item(id, 0),
@@ -92,7 +103,7 @@ function occurrenceItem(
       id: `occ-${id}`,
       routine_id: 'r-1',
       user_id: 'u-1',
-      local_date: '2026-08-23',
+      local_date: TODAY,
       title: null,
       resolved_title: 'Morning run',
       status,
@@ -101,7 +112,8 @@ function occurrenceItem(
       calendar_id: null,
       google_event_id: null,
       created_at: '2026-08-23T00:00:00Z',
-      updated_at: updatedAt,
+      updated_at: options.updatedAt ?? '2026-08-23T00:00:00Z',
+      routine_deleted: options.routineDeleted ?? false,
       category: {
         id: 'cat-1',
         title: 'Work',
@@ -112,6 +124,23 @@ function occurrenceItem(
         color: '#2a5c8a',
       },
     },
+  };
+}
+
+/** One stream page: `items` in a `from … to` window (server echo included). */
+function page(
+  from: string,
+  to: string,
+  items: AgendaItemRecord[],
+): AgendaResponse {
+  return {
+    items,
+    from,
+    to,
+    today: TODAY,
+    time_zone: 'UTC',
+    anchor_date: from,
+    earliest_date: '2026-08-01',
   };
 }
 
@@ -132,10 +161,17 @@ test('agendaDateLabel: relative labels survive month boundaries', () => {
   assert.equal(agendaDateLabel('2026-01-01', '2025-12-31'), 'Tomorrow');
 });
 
-test('agendaDateLabel: other dates render as "Tue 25 Aug"', () => {
+test('agendaDateLabel: same-year dates render as "Tue 25 Aug"', () => {
   assert.equal(agendaDateLabel('2026-08-25', '2026-08-23'), 'Tue 25 Aug');
   assert.equal(agendaDateLabel('2026-12-01', '2026-08-23'), 'Tue 1 Dec');
-  assert.equal(agendaDateLabel('2027-01-01', '2026-08-23'), 'Fri 1 Jan');
+});
+
+test('agendaDateLabel: another year appends the year, relative labels never do', () => {
+  assert.equal(agendaDateLabel('2027-01-01', '2026-08-23'), 'Fri 1 Jan 2027');
+  assert.equal(agendaDateLabel('2025-12-30', '2026-08-23'), 'Tue 30 Dec 2025');
+  // Yesterday / Today / Tomorrow stay bare even across a year boundary.
+  assert.equal(agendaDateLabel('2025-12-31', '2026-01-01'), 'Yesterday');
+  assert.equal(agendaDateLabel('2026-01-01', '2025-12-31'), 'Tomorrow');
 });
 
 test('agendaDateLabel: malformed input returns it unchanged', () => {
@@ -144,55 +180,265 @@ test('agendaDateLabel: malformed input returns it unchanged', () => {
   assert.equal(agendaDateLabel('2026-13-40', '2026-08-23'), '2026-13-40');
 });
 
-// ── filterAgendaPickerTasks ─────────────────────────────────────────────
+// ── eachCivilDate ───────────────────────────────────────────────────────
 
-test('filterAgendaPickerTasks: keeps living statuses only', () => {
-  const tasks = [
-    task('a', 'OPEN'),
-    task('b', 'PLANNED'),
-    task('c', 'IN_PROGRESS'),
-    task('d', 'COMPLETED'),
-    task('e', 'DISCARDED'),
+test('eachCivilDate: inclusive ascending run', () => {
+  assert.deepEqual(eachCivilDate('2026-08-23', '2026-08-26'), [
+    '2026-08-23',
+    '2026-08-24',
+    '2026-08-25',
+    '2026-08-26',
+  ]);
+  assert.deepEqual(eachCivilDate('2026-08-23', '2026-08-23'), ['2026-08-23']);
+});
+
+test('eachCivilDate: walks a month boundary', () => {
+  assert.deepEqual(eachCivilDate('2026-08-30', '2026-09-02'), [
+    '2026-08-30',
+    '2026-08-31',
+    '2026-09-01',
+    '2026-09-02',
+  ]);
+});
+
+test('eachCivilDate: an inverted or bad range is empty', () => {
+  assert.deepEqual(eachCivilDate('2026-08-24', '2026-08-23'), []);
+  assert.deepEqual(eachCivilDate('not-a-date', '2026-08-23'), []);
+  assert.deepEqual(eachCivilDate('2026-08-23', '2026-13-01'), []);
+  assert.deepEqual(eachCivilDate('', ''), []);
+});
+
+// ── streamBounds ────────────────────────────────────────────────────────
+
+test('streamBounds: no pages yields null', () => {
+  assert.equal(streamBounds([]), null);
+});
+
+test('streamBounds: the first page starts the span, the last ends it', () => {
+  const pages = [
+    page('2026-08-16', '2026-08-22', []),
+    page('2026-08-23', '2026-08-29', []),
+    page('2026-08-30', '2026-09-05', []),
   ];
-  const ids = filterAgendaPickerTasks(tasks, new Set()).map((t) => t.id);
-  assert.deepEqual(ids, ['a', 'b', 'c']);
+  assert.deepEqual(streamBounds(pages), {
+    from: '2026-08-16',
+    to: '2026-09-05',
+  });
+  assert.deepEqual(streamBounds([page('2026-08-23', '2026-08-29', [])]), {
+    from: '2026-08-23',
+    to: '2026-08-29',
+  });
 });
 
-test('filterAgendaPickerTasks: excludes tasks already on the date', () => {
-  const tasks = [task('a', 'OPEN'), task('b', 'PLANNED')];
-  const ids = filterAgendaPickerTasks(tasks, new Set(['a'])).map((t) => t.id);
-  assert.deepEqual(ids, ['b']);
-});
+// ── groupItemsByDate ────────────────────────────────────────────────────
 
-test('filterAgendaPickerTasks: empty pools', () => {
-  assert.deepEqual(filterAgendaPickerTasks([], new Set()), []);
+test('groupItemsByDate: buckets by local_date in input order', () => {
+  const a = item('a', 1, '2026-08-23');
+  const b = item('b', 0, '2026-08-23');
+  const c = item('c', 0, '2026-08-25');
+  const grouped = groupItemsByDate([a, c, b]);
+  assert.deepEqual([...grouped.keys()], ['2026-08-23', '2026-08-25']);
   assert.deepEqual(
-    filterAgendaPickerTasks([task('a', 'COMPLETED')], new Set()),
+    grouped.get('2026-08-23')?.map((entry) => entry.id),
+    ['a', 'b'],
+  );
+  assert.deepEqual(
+    grouped.get('2026-08-25')?.map((entry) => entry.id),
+    ['c'],
+  );
+  assert.equal(grouped.get('2026-08-24'), undefined);
+});
+
+test('groupItemsByDate: empty input yields an empty map', () => {
+  assert.equal(groupItemsByDate([]).size, 0);
+});
+
+// ── isAgendaItemPending ─────────────────────────────────────────────────
+
+test('isAgendaItemPending: living tasks count, terminal tasks do not', () => {
+  assert.equal(isAgendaItemPending(taskItem('a', 'OPEN')), true);
+  assert.equal(isAgendaItemPending(taskItem('b', 'PLANNED')), true);
+  assert.equal(isAgendaItemPending(taskItem('c', 'IN_PROGRESS')), true);
+  assert.equal(isAgendaItemPending(taskItem('d', 'COMPLETED')), false);
+  assert.equal(isAgendaItemPending(taskItem('e', 'DISCARDED')), false);
+});
+
+test('isAgendaItemPending: occurrences count while waiting or running', () => {
+  assert.equal(isAgendaItemPending(occurrenceItem('a', 'pending')), true);
+  assert.equal(isAgendaItemPending(occurrenceItem('b', 'in_progress')), true);
+  assert.equal(isAgendaItemPending(occurrenceItem('c', 'done')), false);
+  assert.equal(isAgendaItemPending(occurrenceItem('d', 'skipped')), false);
+});
+
+test('isAgendaItemPending: a deleted routine\u2019s row is never pending', () => {
+  assert.equal(
+    isAgendaItemPending(
+      occurrenceItem('a', 'pending', { routineDeleted: true }),
+    ),
+    false,
+  );
+  assert.equal(
+    isAgendaItemPending(
+      occurrenceItem('b', 'in_progress', { routineDeleted: true }),
+    ),
+    false,
+  );
+});
+
+test('isAgendaItemPending: an embedless orphan is never pending', () => {
+  assert.equal(isAgendaItemPending(item('orphan', 0)), false);
+  assert.equal(
+    isAgendaItemPending({ ...item('orphan', 0), kind: 'occurrence' }),
+    false,
+  );
+});
+
+// ── updateStreamItem ────────────────────────────────────────────────────
+
+test('updateStreamItem: maps the matching item inside its own page', () => {
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [item('a', 0, '2026-08-20')]),
+      page('2026-08-23', '2026-08-29', [
+        item('b', 0),
+        occurrenceItem('c', 'pending'),
+      ]),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  const next = updateStreamItem(data, 'c', (entry) => ({
+    ...entry,
+    sort_order: 7,
+  }));
+  assert.notEqual(next, data);
+  assert.equal(next?.pages[0], data.pages[0], 'untouched page keeps its ref');
+  assert.equal(next?.pages[1].items.map((entry) => entry.id).join(','), 'b,c');
+  assert.equal(next?.pages[1].items[1].sort_order, 7);
+  assert.equal(data.pages[1].items[1].sort_order, 0, 'input not mutated');
+});
+
+test('updateStreamItem: a missing id (or no data) keeps the same reference', () => {
+  const data = {
+    pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
+    pageParams: [undefined],
+  };
+  assert.equal(
+    updateStreamItem(data, 'missing', (entry) => entry),
+    data,
+  );
+  assert.equal(
+    updateStreamItem(undefined, 'a', (entry) => entry),
+    undefined,
+  );
+});
+
+// ── moveStreamItem ──────────────────────────────────────────────────────
+
+test('moveStreamItem: an item travels between pages and shifts its peer', () => {
+  const leaving = item('a', 0, '2026-08-20');
+  const peerBefore = item('p', 0, '2026-08-24');
+  const peerAtRank = item('q', 1, '2026-08-24');
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [leaving]),
+      page('2026-08-23', '2026-08-29', [peerBefore, peerAtRank]),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  const next = moveStreamItem(data, 'a', '2026-08-24', 1);
+  assert.notEqual(next, data);
+  // Gone from its old page.
+  assert.deepEqual(
+    next?.pages[0].items.map((entry) => entry.id),
     [],
   );
+  // Landed on the target date in the target page…
+  const landed = next?.pages[1].items.find((entry) => entry.id === 'a');
+  assert.equal(landed?.local_date, '2026-08-24');
+  assert.equal(landed?.sort_order, 1);
+  // …with the peer AT the rank shifted up one and the earlier peer untouched.
+  const shifted = next?.pages[1].items.find((entry) => entry.id === 'q');
+  assert.equal(shifted?.sort_order, 2);
+  const untouched = next?.pages[1].items.find((entry) => entry.id === 'p');
+  assert.equal(untouched?.sort_order, 0);
+  // The input cache object is untouched.
+  assert.equal(data.pages[0].items.length, 1);
+  assert.equal(data.pages[1].items[1].sort_order, 1);
 });
 
-// ── agendaTaskMatches ────────────────────────────────────────────────────
-
-test('agendaTaskMatches: blank query matches everything', () => {
-  assert.equal(agendaTaskMatches(task('a', 'OPEN', 'Review Q3'), ''), true);
-  assert.equal(agendaTaskMatches(task('a', 'OPEN', 'Review Q3'), '   '), true);
-});
-
-test('agendaTaskMatches: case-insensitive substring over title', () => {
+test('moveStreamItem: peers on OTHER dates never shift', () => {
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [
+        item('a', 0, '2026-08-23'),
+        item('b', 0, '2026-08-24'),
+      ]),
+    ],
+    pageParams: [undefined],
+  };
+  const next = moveStreamItem(data, 'a', '2026-08-24', 0);
   assert.equal(
-    agendaTaskMatches(task('a', 'OPEN', 'Review Q3'), 'review'),
-    true,
+    next?.pages[0].items.find((entry) => entry.id === 'a')?.sort_order,
+    0,
   );
-  assert.equal(agendaTaskMatches(task('a', 'OPEN', 'Review Q3'), 'q3'), true);
-  assert.equal(agendaTaskMatches(task('a', 'OPEN', 'Review Q3'), 'q4'), false);
+  // The 2026-08-24 peer at rank 0 shifts up even though the rank came from
+  // another day's pile.
+  assert.equal(
+    next?.pages[0].items.find((entry) => entry.id === 'b')?.sort_order,
+    1,
+  );
 });
 
-test('agendaTaskMatches: matches the display title (hole) too', () => {
-  const t = task('a', 'OPEN', 'Work | SpicyHome');
-  t.display_title = 'SpicyHome';
-  assert.equal(agendaTaskMatches(t, 'spicy'), true);
-  assert.equal(agendaTaskMatches(t, 'work'), true);
+test('moveStreamItem: an uncovered target date keeps the row in its page', () => {
+  const data = {
+    pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
+    pageParams: [undefined],
+  };
+  const next = moveStreamItem(data, 'a', '2026-09-15', 3);
+  const row = next?.pages[0].items[0];
+  assert.equal(row?.local_date, '2026-09-15');
+  assert.equal(row?.sort_order, 3);
+  assert.equal(next?.pages[0].items.length, 1, 'never dropped');
+});
+
+test('moveStreamItem: a missing id (or no data) keeps the same reference', () => {
+  const data = {
+    pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
+    pageParams: [undefined],
+  };
+  assert.equal(moveStreamItem(data, 'missing', TODAY, 0), data);
+  assert.equal(moveStreamItem(undefined, 'a', TODAY, 0), undefined);
+});
+
+// ── appendRankOnStream / streamItemsOf ──────────────────────────────────
+
+test('appendRankOnStream: max + 1 on the date, 0 on an empty pile', () => {
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [item('a', 4, '2026-08-20')]),
+      page('2026-08-23', '2026-08-29', [item('b', 0), item('c', 2)]),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  assert.equal(appendRankOnStream(data, TODAY), 3);
+  assert.equal(appendRankOnStream(data, '2026-08-20'), 5);
+  assert.equal(appendRankOnStream(data, '2026-08-25'), 0);
+  assert.equal(appendRankOnStream(undefined, TODAY), 0);
+});
+
+test('streamItemsOf: flattens pages in order', () => {
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [item('a', 0, '2026-08-20')]),
+      page('2026-08-23', '2026-08-29', [item('b', 0)]),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  assert.deepEqual(
+    streamItemsOf(data).map((entry) => entry.id),
+    ['a', 'b'],
+  );
+  assert.deepEqual(streamItemsOf(undefined), []);
 });
 
 // ── agendaMoveTarget ─────────────────────────────────────────────────────
@@ -360,6 +606,13 @@ test('canReschedule: tasks move while living; completed/discarded stay put', () 
   assert.equal(canReschedule(taskItem('e', 'DISCARDED')), false);
 });
 
+test('canReschedule: a deleted routine\u2019s history never moves', () => {
+  assert.equal(
+    canReschedule(occurrenceItem('a', 'skipped', { routineDeleted: true })),
+    false,
+  );
+});
+
 test('canReschedule: an embedless row (orphan) is never reschedulable', () => {
   assert.equal(canReschedule(item('orphan', 0)), false);
 });
@@ -395,7 +648,9 @@ test('partitionAgendaItems: splits a mixed pile; living keeps sort_order', () =>
       sort_order: 1,
     },
     {
-      ...occurrenceItem('o-done', 'done', '2026-08-23T08:00:00Z'),
+      ...occurrenceItem('o-done', 'done', {
+        updatedAt: '2026-08-23T08:00:00Z',
+      }),
       sort_order: 2,
     },
     { ...occurrenceItem('o-skipped', 'skipped'), sort_order: 3 },
@@ -424,7 +679,7 @@ test('partitionAgendaItems: splits a mixed pile; living keeps sort_order', () =>
 
 test('partitionAgendaItems: completed sorts newest embed updated_at first', () => {
   const pile = [
-    occurrenceItem('old', 'done', '2026-08-20T00:00:00Z'),
+    occurrenceItem('old', 'done', { updatedAt: '2026-08-20T00:00:00Z' }),
     taskItem('mid', 'COMPLETED', '2026-08-22T00:00:00Z'),
     taskItem('new', 'COMPLETED', '2026-08-23T00:00:00Z'),
   ];

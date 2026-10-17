@@ -63,10 +63,23 @@ export function setTasksCache(
 // authoritative row on success — `invalidateQueries(['tasks'])` on success
 // would fight applyOptimisticMove's sibling-rank contract, so it is never
 // used here.
+//
+// `['agenda']` is a different story: the server keeps every task's ONE agenda
+// row on civil today across create, a real start, a real complete/discard, a
+// reopen and a delete, so Home's day-stream must re-read after those settle —
+// its optimistic paint cannot know which way the row travelled. `/stop` and
+// `/pause` ride through `useRunTaskAction` as well; they leave the row alone,
+// so that re-read is merely redundant, never wrong.
 // ──────────────────────────────────────────
 
 async function cancelTasksQuery(): Promise<void> {
   await queryClient.cancelQueries({ queryKey: queryKeys.tasks.all });
+}
+
+/** Re-reads Home's agenda stream after a task write that can repoint the
+ *  task's single agenda row. Never invalidates `['tasks']` (see above). */
+async function invalidateAgendaQuery(): Promise<void> {
+  await queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
 }
 
 export function useMoveTask() {
@@ -74,6 +87,7 @@ export function useMoveTask() {
     mutationFn: ({ id, input }: { id: string; input: MoveTaskInput }) =>
       moveTask(id, input),
     onMutate: cancelTasksQuery,
+    onSettled: invalidateAgendaQuery,
   });
 }
 
@@ -95,6 +109,7 @@ export function useCreateTask() {
   return useMutation({
     mutationFn: (input: NewTaskInput) => createTask(input),
     onMutate: cancelTasksQuery,
+    onSettled: invalidateAgendaQuery,
   });
 }
 
@@ -110,6 +125,7 @@ export function useDeleteTask() {
   return useMutation({
     mutationFn: (id: string) => deleteTask(id),
     onMutate: cancelTasksQuery,
+    onSettled: invalidateAgendaQuery,
   });
 }
 
@@ -123,5 +139,6 @@ export function useRunTaskAction() {
       action: 'start' | 'stop' | 'pause' | 'complete' | 'discard';
     }) => runTaskAction(id, action),
     onMutate: cancelTasksQuery,
+    onSettled: invalidateAgendaQuery,
   });
 }

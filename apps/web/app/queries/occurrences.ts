@@ -11,59 +11,51 @@ import type { UpdateOccurrenceInput } from '@/app/types';
 import { cancelAgendaQuery } from './agenda';
 
 // Occurrence write mutations — thin wrappers, no optimistic paint, no
-// invalidation (mirrors tasks.ts / agenda.ts). `onMutate` cancels the VIEWED
-// date's agenda query so an in-flight refetch (window focus, another tab's
+// invalidation (mirrors tasks.ts / agenda.ts). `onMutate` cancels Home's
+// agenda day-stream so an in-flight refetch (window focus, another tab's
 // mutation) can never resolve over the page's optimistic cache mid-write. The
 // page owns the optimistic paint (chip flip) and merges the authoritative
-// occurrence on success — the `date` passed alongside the input is only used
-// for the cancel.
+// occurrence on success.
 
 export function useCompleteOccurrence() {
   return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) =>
-      completeOccurrence(id),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id }: { id: string }) => completeOccurrence(id),
+    onMutate: cancelAgendaQuery,
   });
 }
 
 export function useSkipOccurrence() {
   return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) => skipOccurrence(id),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id }: { id: string }) => skipOccurrence(id),
+    onMutate: cancelAgendaQuery,
   });
 }
 
 export function useReopenOccurrence() {
   return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) => reopenOccurrence(id),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id }: { id: string }) => reopenOccurrence(id),
+    onMutate: cancelAgendaQuery,
   });
 }
 
 export function useStartOccurrence() {
   return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) => startOccurrence(id),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id }: { id: string }) => startOccurrence(id),
+    onMutate: cancelAgendaQuery,
   });
 }
 
 export function usePauseOccurrence() {
   return useMutation({
-    mutationFn: ({ id }: { id: string; date: string }) => pauseOccurrence(id),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id }: { id: string }) => pauseOccurrence(id),
+    onMutate: cancelAgendaQuery,
   });
 }
 
 export function useUpdateOccurrence() {
   return useMutation({
-    mutationFn: ({
-      id,
-      input,
-    }: {
-      id: string;
-      input: UpdateOccurrenceInput;
-      date: string;
-    }) => updateOccurrence(id, input),
-    onMutate: ({ date }) => cancelAgendaQuery(date),
+    mutationFn: ({ id, input }: { id: string; input: UpdateOccurrenceInput }) =>
+      updateOccurrence(id, input),
+    onMutate: cancelAgendaQuery,
   });
 }
