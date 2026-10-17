@@ -913,6 +913,13 @@ async fn reschedule_task_slot(
 /// leftovers, orphans, and unknown kinds. A row that cannot move never fails
 /// the call.
 ///
+/// Hydration is batched, the same shape as `get_agenda`'s: one pile read, one
+/// `list_by_user_id` for living tasks, one `list_by_ids` for the pile's
+/// occurrences, one `list_by_user_id` for living routines — never a
+/// `get_by_id` per row (a missed day of ~30 items would otherwise blow the
+/// Workers free plan's 50-subrequest budget). The moved rows' views are built
+/// from those maps, and each move writes only its own `set_local_date`.
+///
 /// `date` must be in the **past** (`>= today` → 400). Invalid `date` → 400.
 /// Session-only.
 pub async fn move_day_to_today(
@@ -940,42 +947,82 @@ pub async fn move_day_to_today(
 
     // One pile read, in pile order — the moved rows keep their relative order.
     let items = agenda_repo.list_by_user_and_date(user_id, &date).await?;
-    let mut movable = Vec::new();
-    if !items.is_empty() {
-        // Living tasks only (`list_by_user_id` filters soft-deleted rows).
-        let tasks = task_repo.list_by_user_id(user_id).await?;
-        for item in &items {
-            match item.kind.as_str() {
-                AGENDA_KIND_TASK => {
-                    let Some(task) = tasks.iter().find(|task| task.id == item.ref_id) else {
-                        continue; // orphan / soft-deleted task — stays put
-                    };
-                    if matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS") {
-                        movable.push(item);
-                    }
-                }
-                AGENDA_KIND_OCCURRENCE => {
-                    let Some(occurrence) = occurrence_repo.get_by_id(&item.ref_id).await? else {
-                        continue; // orphan — stays put
-                    };
-                    // Never leak another user's occurrence through a
-                    // hand-edited row.
-                    if occurrence.user_id != user_id {
-                        continue;
-                    }
-                    // Only a waiting chip moves: `skipped` is a decline and
-                    // `in_progress`/`done` are already spoken for.
-                    if occurrence.status != OCCURRENCE_STATUS_PENDING {
-                        continue;
-                    }
-                    // A soft-deleted routine's leftover stays where it is.
-                    if routine_repo.get_by_id(&occurrence.routine_id).await?.is_none() {
-                        continue;
-                    }
+    if items.is_empty() {
+        return Ok(MoveDayToTodayResponse { items: Vec::new() });
+    }
+
+    // The pile's embeds in one batched pass, the same shape as `get_agenda`'s
+    // hydration: living tasks, the pile's occurrences by `ref_id`, and the
+    // living routines those occurrences hang off. A read per pile row is what
+    // this replaces — a missed day must fit the free plan's subrequest budget.
+    //
+    // Living tasks only (`list_by_user_id` filters soft-deleted rows).
+    let user_tasks = task_repo.list_by_user_id(user_id).await?;
+    let tasks: HashMap<&str, &Task> =
+        user_tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+
+    let occurrence_ids: Vec<String> = items
+        .iter()
+        .filter(|item| item.kind == AGENDA_KIND_OCCURRENCE)
+        .map(|item| item.ref_id.clone())
+        .collect();
+    // `list_by_ids` no-ops on an empty slice — don't spend the call either.
+    let fetched_occurrences: Vec<RoutineOccurrence> = if occurrence_ids.is_empty() {
+        Vec::new()
+    } else {
+        occurrence_repo.list_by_ids(&occurrence_ids).await?
+    };
+    let occurrences: HashMap<&str, &RoutineOccurrence> = fetched_occurrences
+        .iter()
+        .map(|occurrence| (occurrence.id.as_str(), occurrence))
+        .collect();
+
+    // Living routines only (`list_by_user_id` filters soft-deleted rows): a
+    // soft-deleted routine is simply absent, so its leftover stays put.
+    let living_routines: Vec<Routine> = if occurrence_ids.is_empty() {
+        Vec::new()
+    } else {
+        routine_repo.list_by_user_id(user_id).await?
+    };
+    let routines_by_id: HashMap<&str, &Routine> = living_routines
+        .iter()
+        .map(|routine| (routine.id.as_str(), routine))
+        .collect();
+
+    // The movability pass, in pile order: this decides what moves, nothing
+    // else.
+    let mut movable: Vec<&AgendaItem> = Vec::new();
+    for item in &items {
+        match item.kind.as_str() {
+            AGENDA_KIND_TASK => {
+                let Some(task) = tasks.get(item.ref_id.as_str()) else {
+                    continue; // orphan / soft-deleted task — stays put
+                };
+                if matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS") {
                     movable.push(item);
                 }
-                _ => continue, // unknown kinds stay put
             }
+            AGENDA_KIND_OCCURRENCE => {
+                let Some(occurrence) = occurrences.get(item.ref_id.as_str()) else {
+                    continue; // orphan — stays put
+                };
+                // Never leak another user's occurrence through a
+                // hand-edited row.
+                if occurrence.user_id != item.user_id {
+                    continue;
+                }
+                // Only a waiting chip moves: `skipped` is a decline and
+                // `in_progress`/`done` are already spoken for.
+                if occurrence.status != OCCURRENCE_STATUS_PENDING {
+                    continue;
+                }
+                // A soft-deleted routine's leftover stays where it is.
+                if !routines_by_id.contains_key(occurrence.routine_id.as_str()) {
+                    continue;
+                }
+                movable.push(item);
+            }
+            _ => continue, // unknown kinds stay put
         }
     }
     if movable.is_empty() {
@@ -997,20 +1044,39 @@ pub async fn move_day_to_today(
         moved.local_date = today.clone();
         moved.sort_order = rank;
         rank += 1;
-        // The backing row was verified living a moment ago; a concurrent
-        // delete simply drops it from the answer (the move itself stands).
-        if let Some(view) = embed_item(
-            task_repo,
-            occurrence_repo,
-            routine_repo,
-            &moved,
-            &taxonomy,
-            focused_task_id,
-        )
-        .await?
-        {
-            views.push(view);
-        }
+        // The backing rows were hydrated a moment ago; a concurrent delete
+        // simply drops the row from the answer (the move itself stands). The
+        // embed comes from the maps already in hand — no read per moved row.
+        let (task, occurrence) = match moved.kind.as_str() {
+            AGENDA_KIND_TASK => {
+                let Some(task) = tasks.get(moved.ref_id.as_str()) else {
+                    continue;
+                };
+                (Some(task_view(task, &taxonomy, focused_task_id)), None)
+            }
+            AGENDA_KIND_OCCURRENCE => {
+                let Some(occurrence) = occurrences.get(moved.ref_id.as_str()) else {
+                    continue;
+                };
+                let Some(routine) = routines_by_id.get(occurrence.routine_id.as_str()) else {
+                    continue;
+                };
+                (None, Some(occurrence_view(occurrence, routine, &taxonomy)))
+            }
+            _ => continue,
+        };
+        // `moved` carries the date and rank just written, so the view shows
+        // today's pile, not the past day it left.
+        views.push(AgendaItemView {
+            id: moved.id.clone(),
+            user_id: moved.user_id.clone(),
+            local_date: moved.local_date.clone(),
+            kind: moved.kind.clone(),
+            ref_id: moved.ref_id.clone(),
+            sort_order: moved.sort_order,
+            task,
+            occurrence,
+        });
     }
     Ok(MoveDayToTodayResponse { items: views })
 }
@@ -5642,7 +5708,16 @@ mod tests {
         agenda_row(&repos, "ai-planned", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-planned", 9);
         agenda_row(&repos, "ai-weird", "u-1", "2026-08-22", "weird", "ref-x", 10);
 
+        // Reset after the fixture, so setup work never counts.
+        repos.occurrences.reset_calls();
+
         let response = move_day(&repos, "u-1", "2026-08-22").unwrap();
+        // The sweep hydrates the pile in one batch: the five occurrence rows
+        // resolve through a single `list_by_ids`, never a read per row (the
+        // N+1 that blew the subrequest budget).
+        let occurrences = repos.occurrences.call_counts();
+        assert_eq!(occurrences.list_by_ids, 1, "the occurrence embeds resolve in one batch");
+        assert_eq!(occurrences.get_by_id, 0, "no per-row occurrence read");
         let moved: Vec<(&str, &str)> = response
             .items
             .iter()
