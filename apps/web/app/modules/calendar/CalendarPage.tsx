@@ -9,6 +9,7 @@ import {
   isCalendarWritable,
 } from './components/EventInspector';
 import { useCalendarSession } from './hooks/useCalendarSession';
+import { useCalendarShortcuts } from './hooks/useCalendarShortcuts';
 import { useCalendarStrip } from './hooks/useCalendarStrip';
 import { useHideNavOnLateHours } from './hooks/useHideNavOnLateHours';
 import { COL_HEADER_H, addDays, isSameDay, nowLineY } from './lib/week-layout';
@@ -33,6 +34,16 @@ export function CalendarPage() {
   // The dialog belongs to the selection it was opened for.
   const confirmOpen =
     confirmDeleteId !== null && confirmDeleteId === selectedId;
+
+  // One page-level keymap: the strip no longer listens on its own, and the
+  // delete dialog suspends navigation (its buttons are not editing targets).
+  useCalendarShortcuts({
+    suspended: confirmOpen,
+    onPeriodChange: strip.handlePeriodChange,
+    onToday: strip.goToToday,
+    onShiftPeriod: strip.shiftPeriod,
+  });
+
   const canTouchDelete =
     session.selectedEvent !== null &&
     isCalendarWritable(session.selectedEventCalendar);
