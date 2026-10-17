@@ -5,8 +5,9 @@
 // `POST /api/agenda/items/:id/move`: peers at/after the target rank shift up
 // one and the item lands on it; `moveStreamItem` pins the same rule for the
 // cross-day `reschedule`. The backlog tests pin ADR 0007: a dated backlog row
-// reorders with the agenda, an OPEN row through the Board's `tasks.sort_order`,
-// and a backlog drop appends the row at today+50y.
+// reorders with the agenda, an OPEN row through the Board's own same-status
+// `reorder_in_place` (the hovered rank in both directions, peers shifted), and
+// a backlog drop appends the row at today+50y.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,6 +24,7 @@ import {
   agendaMoveTargetAt,
   appendRankOnStream,
   applyAgendaMove,
+  applyOpenTaskReorder,
   canReschedule,
   crossDaySortOrder,
   dedupeAgendaItems,
@@ -668,7 +670,9 @@ test('moveStreamItem: a backlog row leaves the backlog and lands on a covered da
     ],
     pageParams: [undefined],
   };
-  const next = moveStreamItem(data, 'b', '2026-08-25', 3);
+  // The reschedule path opts in to the one status change: the server plans an
+  // OPEN task it reschedules onto a date.
+  const next = moveStreamItem(data, 'b', '2026-08-25', 3, true);
   const page0 = next?.pages[0];
   // No copy is left behind in the backlog…
   assert.deepEqual(page0?.backlog, []);
@@ -676,9 +680,25 @@ test('moveStreamItem: a backlog row leaves the backlog and lands on a covered da
   const landed = page0?.items.find((entry) => entry.id === 'b');
   assert.equal(landed?.local_date, '2026-08-25');
   assert.equal(landed?.sort_order, 3);
-  // An OPEN task is planned by the server on reschedule; the paint mirrors it.
   assert.equal(landed?.task?.status, 'PLANNED');
   assert.equal(data.pages[0].backlog.length, 1, 'input not mutated');
+});
+
+test('moveStreamItem: only the reschedule path plans an OPEN task', () => {
+  // Move-to-today's sweep and a task's own placement change the DATE only —
+  // an OPEN row stays OPEN (ADR 0007), so the paint must not flash Planned.
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [], {
+        backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 0)],
+      }),
+    ],
+    pageParams: [undefined],
+  };
+  const next = moveStreamItem(data, 'b', '2026-08-24', 0);
+  const landed = next?.pages[0].items.find((entry) => entry.id === 'b');
+  assert.equal(landed?.local_date, '2026-08-24');
+  assert.equal(landed?.task?.status, 'OPEN');
 });
 
 test('moveStreamItem: a PLANNED task and an occurrence keep their status', () => {
@@ -693,12 +713,12 @@ test('moveStreamItem: a PLANNED task and an occurrence keep their status', () =>
     ],
     pageParams: [undefined],
   };
-  const afterTask = moveStreamItem(data, 'p', '2026-08-26', 0);
+  const afterTask = moveStreamItem(data, 'p', '2026-08-26', 0, true);
   assert.equal(
     afterTask?.pages[0].items.find((entry) => entry.id === 'p')?.task?.status,
     'PLANNED',
   );
-  const afterOccurrence = moveStreamItem(data, 'o', '2026-08-27', 1);
+  const afterOccurrence = moveStreamItem(data, 'o', '2026-08-27', 1, true);
   const occurrence = afterOccurrence?.pages[0].items.find(
     (entry) => entry.id === 'o',
   );
@@ -941,11 +961,13 @@ test('agendaMoveTargetAt: rank gaps keep working (after an unpin)', () => {
   assert.equal(agendaMoveTargetAt(items, 0, 1), 3);
 });
 
-// ── openTaskMoveTargetAt ────────────────────────────────────────────────
+// ── openTaskMoveTargetAt / applyOpenTaskReorder ─────────────────────────
 
-test('openTaskMoveTargetAt: the rank is the task\u2019s Board sort_order', () => {
+test('openTaskMoveTargetAt: the hovered row\u2019s Board rank, both directions', () => {
   // The agenda row's own `sort_order` is irrelevant in the OPEN stretch; the
-  // Board's `tasks.sort_order` is the one order Home and Board share.
+  // Board's `tasks.sort_order` is the one order Home and Board share. A
+  // same-status `/move` is `reorder_in_place`, which lands the mover ON the
+  // hovered rank and shifts that row away — no `+ 1` in either direction.
   const items = [
     taskItemAt('a', 'OPEN', BACKLOG_DATE, 0),
     taskItemAt('b', 'OPEN', BACKLOG_DATE, 7),
@@ -953,10 +975,12 @@ test('openTaskMoveTargetAt: the rank is the task\u2019s Board sort_order', () =>
   ];
   // c (index 2) dropped above a (index 0) takes a's Board rank.
   assert.equal(openTaskMoveTargetAt(items, 2, 0), 0);
-  // a dropped below b lands just after b.
-  assert.equal(openTaskMoveTargetAt(items, 0, 1), 8);
-  // a dropped below c lands just after c.
-  assert.equal(openTaskMoveTargetAt(items, 0, 2), 10);
+  // a dropped below b takes b's rank (which then shifts to 1).
+  assert.equal(openTaskMoveTargetAt(items, 0, 1), 7);
+  // a dropped below c takes c's rank (which then shifts to 10).
+  assert.equal(openTaskMoveTargetAt(items, 0, 2), 9);
+  // b dropped below c: same rule downward.
+  assert.equal(openTaskMoveTargetAt(items, 1, 2), 9);
 });
 
 test('openTaskMoveTargetAt: same index, out of range and embedless rows return null', () => {
@@ -971,6 +995,77 @@ test('openTaskMoveTargetAt: same index, out of range and embedless rows return n
   assert.equal(openTaskMoveTargetAt(items, 0, 2), null);
   assert.equal(openTaskMoveTargetAt([], 0, 0), null);
   assert.equal(openTaskMoveTargetAt([item('orphan', 0), items[1]], 0, 1), null);
+});
+
+test('applyOpenTaskReorder: a downward drop shifts the peers it passes down', () => {
+  // ranks [0, 1, 2], drag index 0 onto index 1 → the sent rank is 1 and the
+  // result is A=1, B=0, C=2 (the order [B, A, C]).
+  const tasks = [task('a', 'OPEN'), task('b', 'OPEN'), task('c', 'OPEN')].map(
+    (entry, index) => ({ ...entry, sort_order: index }),
+  );
+  const moved = applyOpenTaskReorder(tasks, 'a', 1);
+  assert.deepEqual(
+    moved.map((entry) => [entry.id, entry.sort_order]),
+    [
+      ['a', 1],
+      ['b', 0],
+      ['c', 2],
+    ],
+  );
+});
+
+test('applyOpenTaskReorder: an upward drop shifts the peers it passes up', () => {
+  const tasks = [task('a', 'OPEN'), task('b', 'OPEN'), task('c', 'OPEN')].map(
+    (entry, index) => ({ ...entry, sort_order: index }),
+  );
+  // c (2) onto a's slot (0): a and b shift up, c lands on 0.
+  const moved = applyOpenTaskReorder(tasks, 'c', 0);
+  assert.deepEqual(
+    moved.map((entry) => [entry.id, entry.sort_order]),
+    [
+      ['a', 1],
+      ['b', 2],
+      ['c', 0],
+    ],
+  );
+});
+
+test('applyOpenTaskReorder: rank gaps shift only the crossed range', () => {
+  // 0, 5, 9 — drag the 0 onto the 9: peers become 4 and 8, the mover 9.
+  const tasks = [task('a', 'OPEN'), task('b', 'OPEN'), task('c', 'OPEN')].map(
+    (entry, index) => ({ ...entry, sort_order: [0, 5, 9][index] }),
+  );
+  const moved = applyOpenTaskReorder(tasks, 'a', 9);
+  assert.deepEqual(
+    moved.map((entry) => [entry.id, entry.sort_order]),
+    [
+      ['a', 9],
+      ['b', 4],
+      ['c', 8],
+    ],
+  );
+});
+
+test('applyOpenTaskReorder: other statuses keep their ranks; no-op refs', () => {
+  const tasks = [
+    { ...task('a', 'OPEN'), sort_order: 0 },
+    { ...task('p', 'PLANNED'), sort_order: 1 },
+    { ...task('b', 'OPEN'), sort_order: 4 },
+  ];
+  const moved = applyOpenTaskReorder(tasks, 'a', 4);
+  assert.deepEqual(
+    moved.map((entry) => [entry.id, entry.sort_order]),
+    [
+      ['a', 4],
+      ['p', 1],
+      ['b', 3],
+    ],
+    'the PLANNED task is not part of the Open pile',
+  );
+  // `new === old` writes nothing → the very same array.
+  assert.equal(applyOpenTaskReorder(tasks, 'a', 0), tasks);
+  // A missing mover leaves the list alone too.
+  assert.equal(applyOpenTaskReorder(tasks, 'missing', 2), tasks);
 });
 
 // ── crossDaySortOrder ───────────────────────────────────────────────────

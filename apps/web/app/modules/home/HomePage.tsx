@@ -90,6 +90,7 @@ import {
   agendaMoveTargetAt,
   appendRankOnStream,
   applyAgendaMove,
+  applyOpenTaskReorder,
   crossDaySortOrder,
   dedupeAgendaItems,
   eachCivilDate,
@@ -752,7 +753,8 @@ export function HomePage() {
    *  popover path, or a drop on the day container — appends at the pile's
    *  end server-side (`max + 1`), exactly like the old "Tomorrow". A failure
    *  restores the snapshot and banners. Landing a task that was still `OPEN`
-   *  plans it server-side, and `moveStreamItem` mirrors that. */
+   *  plans it server-side — this is the ONLY move that does, so it is the one
+   *  caller that asks `moveStreamItem` to paint `PLANNED`. */
   const handleCrossDayMove = async (
     item: AgendaItemRecord,
     targetDate: string,
@@ -776,6 +778,7 @@ export function HomePage() {
         item.id,
         targetDate,
         sortOrder ?? appendRankOnStream(current, targetDate),
+        true,
       ),
     );
     setActionError(null);
@@ -827,10 +830,12 @@ export function HomePage() {
 
   /** Reorder one OPEN-backlog row onto another row's slot (ADR 0007): the
    *  Board's own `POST /api/tasks/:id/move { status: 'OPEN', sort_order }`, so
-   *  Home and the Board never disagree on the Open order. The optimistic
-   *  paint moves the row inside the page's `backlog` (the split keeps server
-   *  order) and stamps the target rank on its task embed; a failure restores
-   *  the snapshot and banners. */
+   *  Home and the Board never disagree on the Open order. The optimistic paint
+   *  mirrors the server's `reorder_in_place` over EVERY OPEN embed in the
+   *  backlog — the mover takes the sent rank and its peers shift one — and
+   *  reorders the list where the user dropped it; the shared `['tasks']` cache
+   *  gets the same peer shift on success, so the Board's Open column follows.
+   *  A failure restores the snapshot and banners. */
   const handleOpenBacklogMove = async (
     item: AgendaItemRecord,
     open: AgendaItemRecord[],
@@ -845,6 +850,16 @@ export function HomePage() {
     const reordered = arrayMove(open, fromIndex, toIndex);
     const order = new Map(reordered.map((entry, index) => [entry.id, index]));
     const openIds = new Set(open.map((entry) => entry.id));
+    // The Board's same-status reorder over the OPEN embeds: without the peer
+    // shift a second drop before the settle refetch would compute its rank
+    // from stale neighbours.
+    const shiftedRanks = new Map(
+      applyOpenTaskReorder(
+        open.flatMap((entry) => (entry.task ? [entry.task] : [])),
+        task.id,
+        target,
+      ).map((entry) => [entry.id, entry.sort_order]),
+    );
     const snapshot = readStream();
     patchStream((current) => {
       if (!current) return current;
@@ -854,16 +869,22 @@ export function HomePage() {
           const backlog = page.backlog ?? [];
           if (!backlog.some((entry) => entry.id === item.id)) return page;
           // Dated rows keep their places ahead of the OPEN stretch; only the
-          // OPEN rows take the new order.
+          // OPEN rows take the new order and the shifted ranks.
           const rest = backlog.filter((entry) => !openIds.has(entry.id));
           const openRows = backlog
             .filter((entry) => openIds.has(entry.id))
             .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
-            .map((entry) =>
-              entry.id === item.id && entry.task
-                ? { ...entry, task: { ...entry.task, sort_order: target } }
-                : entry,
-            );
+            .map((entry) => {
+              const rank = entry.task ? shiftedRanks.get(entry.task.id) : null;
+              if (
+                !entry.task ||
+                rank == null ||
+                rank === entry.task.sort_order
+              ) {
+                return entry;
+              }
+              return { ...entry, task: { ...entry.task, sort_order: rank } };
+            });
           return { ...page, backlog: [...rest, ...openRows] };
         }),
       };
@@ -877,9 +898,12 @@ export function HomePage() {
       mergeRow(item.id, (entry) =>
         entry.task ? { ...entry, task: data.task } : entry,
       );
-      // Patch the shared tasks cache so Board/Lists see the fresh row.
+      // Patch the shared tasks cache: the same peer shift, then the mover's
+      // authoritative row, so Board/Lists never read a stale Open order.
       setTasksCache((prev) =>
-        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+        applyOpenTaskReorder(prev, data.task.id, data.task.sort_order).map(
+          (entry) => (entry.id === data.task.id ? data.task : entry),
+        ),
       );
     } catch (err) {
       patchStream(() => snapshot);
@@ -891,7 +915,9 @@ export function HomePage() {
    *  `POST /api/agenda/days/:date/move-to-today` sweeps, appended to today's
    *  pile in their original order. Painted optimistically, reverted on
    *  failure, and re-read on settle (the sweep has server-side side effects a
-   *  local mirror cannot guess). */
+   *  local mirror cannot guess). The sweep changes DATES only — an `OPEN` row
+   *  it drags onto today stays `OPEN` (ADR 0007), so `moveStreamItem` keeps
+   *  its default "leave the status alone". */
   const handleMoveDayToToday = async (day: string) => {
     const snapshot = readStream();
     const movable = dayItemsOf(streamItemsOf(snapshot), day).filter(

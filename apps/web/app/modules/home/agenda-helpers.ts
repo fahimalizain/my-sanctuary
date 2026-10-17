@@ -6,7 +6,12 @@
 // glue on top).
 
 import type { InfiniteData } from '@tanstack/react-query';
-import type { AgendaItemRecord, AgendaResponse, TaskStatus } from '../../types';
+import type {
+  AgendaItemRecord,
+  AgendaResponse,
+  TaskRecord,
+  TaskStatus,
+} from '../../types';
 import { addCivilDays, isCivilDateValid } from '../routines/rrule-preview';
 
 const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -286,18 +291,24 @@ export function updateStreamItem(
  *  (`reschedule` with a rank — `place_on_date`): the item leaves whichever
  *  array holds it (`items` or `backlog`), every peer ON `toDate` ranked at/after
  *  `rank` shifts up one (the same rule as `applyAgendaMove`), and the item lands
- *  on `rank` in the page whose window covers `toDate`. A task that was still
- *  `OPEN` becomes `PLANNED` (the server plans an `OPEN` task on reschedule);
- *  an already-`PLANNED` task and every occurrence keep their status. When NO
- *  loaded page covers `toDate` the item leaves the cache entirely: it cannot
- *  live in a page whose window does not contain its `local_date`, or the day
- *  paints it twice once the server's real page loads. Returns the same
- *  reference when the id is missing. */
+ *  on `rank` in the page whose window covers `toDate`. When NO loaded page
+ *  covers `toDate` the item leaves the cache entirely: it cannot live in a page
+ *  whose window does not contain its `local_date`, or the day paints it twice
+ *  once the server's real page loads.
+ *
+ *  `planIfOpen` mirrors the one move that changes a task's status: a
+ *  **reschedule** (`/reschedule` with a date) turns an `OPEN` task `PLANNED`,
+ *  so its callers pass `true`. Move-to-today's sweep and a task's own
+ *  placement leave the status alone (ADR 0007 — the sweep is unchanged, an
+ *  `OPEN` row stays `OPEN`), so they keep the default and never flash a
+ *  Planned card. An already-`PLANNED` task and every occurrence are untouched
+ *  either way. Returns the same reference when the id is missing. */
 export function moveStreamItem(
   data: AgendaStreamData | undefined,
   id: string,
   toDate: string,
   rank: number,
+  planIfOpen = false,
 ): AgendaStreamData | undefined {
   if (!data) return data;
   const source = data.pages.find(
@@ -314,7 +325,7 @@ export function moveStreamItem(
     local_date: toDate,
     sort_order: rank,
     task:
-      item.task && item.task.status === 'OPEN'
+      planIfOpen && item.task && item.task.status === 'OPEN'
         ? { ...item.task, status: 'PLANNED' }
         : item.task,
   };
@@ -452,10 +463,15 @@ export function agendaMoveTargetAt(
 
 /** The absolute Board rank `POST /api/tasks/:id/move { status: 'OPEN',
  *  sort_order }` should carry to land an OPEN-backlog row at `fromIndex` on
- *  the slot now held by `toIndex`. Same arithmetic as `agendaMoveTargetAt`,
- *  but the rank is the task's own `tasks.sort_order` (ADR 0007 — Home and the
- *  Board share one Open order), never the agenda row's. `null` when either
- *  index is out of range, they are equal, or either row has no task embed. */
+ *  the slot now held by `toIndex`. The rank is the task's own
+ *  `tasks.sort_order` (ADR 0007 — Home and the Board share one Open order),
+ *  never the agenda row's, and it is the HOVERED row's rank in BOTH
+ *  directions: a same-status `/move` is `reorder_in_place`
+ *  (packages/api-core/src/tasks.rs), which shifts the hovered row away from
+ *  the slot and lands the mover on it — the `+ 1` of the agenda's
+ *  "land after the row" rule would put the mover past the hovered card. `null`
+ *  when either index is out of range, they are equal, or either row has no
+ *  task embed. */
 export function openTaskMoveTargetAt(
   items: AgendaItemRecord[],
   fromIndex: number,
@@ -473,7 +489,37 @@ export function openTaskMoveTargetAt(
   const from = items[fromIndex].task;
   const to = items[toIndex].task;
   if (!from || !to) return null;
-  return toIndex < fromIndex ? to.sort_order : to.sort_order + 1;
+  return to.sort_order;
+}
+
+/** The optimistic mirror of the Board's **same-status** reorder
+ *  (`reorder_in_place`, packages/api-core/src/tasks.rs) over a pile of tasks:
+ *  a drop sends the hovered card's rank, the mover lands on it, and every
+ *  OTHER task in the mover's status shifts away from the vacated slot —
+ *  `[new, old)` up by one when the mover drops above (`new < old`), `(old,
+ *  new]` down by one when it drops below (`new > old`). Tasks in any other
+ *  status keep their ranks. `new === old` writes nothing, and a missing mover
+ *  returns the input array unchanged. */
+export function applyOpenTaskReorder(
+  tasks: TaskRecord[],
+  moverId: string,
+  newSortOrder: number,
+): TaskRecord[] {
+  const mover = tasks.find((entry) => entry.id === moverId);
+  if (!mover || mover.sort_order === newSortOrder) return tasks;
+  const old = mover.sort_order;
+  return tasks.map((entry) => {
+    if (entry.id === moverId) return { ...entry, sort_order: newSortOrder };
+    if (entry.status !== mover.status) return entry;
+    if (newSortOrder < old) {
+      return entry.sort_order >= newSortOrder && entry.sort_order < old
+        ? { ...entry, sort_order: entry.sort_order + 1 }
+        : entry;
+    }
+    return entry.sort_order > old && entry.sort_order <= newSortOrder
+      ? { ...entry, sort_order: entry.sort_order - 1 }
+      : entry;
+  });
 }
 
 /** The absolute rank a cross-day drop should send when it lands OVER one of
