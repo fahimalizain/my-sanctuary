@@ -281,6 +281,51 @@ test('cancel drops pending edits', async () => {
   assert.deepEqual(log, []);
 });
 
+test('cancelAll ignores every in-flight result and drops pending edits', async () => {
+  const { queue, calls, log } = harness();
+  queue.enqueue('e1', { summary: 'A' });
+  queue.enqueue('e1', { summary: 'B' });
+  queue.enqueue('e2', { summary: 'C' });
+  assert.equal(calls.length, 2);
+
+  queue.cancelAll();
+  calls[0].resolve(makeEvent({ title: 'A' }));
+  await tick();
+  // e1's pending B was dropped, so only the (ignored) in-flight A ever went out.
+  assert.equal(calls.length, 2);
+  assert.deepEqual(log, []);
+  calls[1].resolve(makeEvent({ id: 'e2', title: 'C' }));
+  await tick();
+  assert.deepEqual(log, []);
+  assert.equal(queue.isBusy('e1'), false);
+  assert.equal(queue.isBusy('e2'), false);
+
+  // The cancel mark applies to that one request only: e1 sends normally again.
+  queue.enqueue('e1', { summary: 'D' });
+  assert.deepEqual(calls[2].input, { summary: 'D' });
+  calls[2].resolve(makeEvent({ title: 'D' }));
+  await tick();
+  assert.deepEqual(log, ['ok:e1:summary:true']);
+});
+
+test('cancelAll with nothing running is a no-op', () => {
+  const { queue, calls } = harness();
+  queue.cancelAll();
+  queue.enqueue('e1', { summary: 'A' });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].input, { summary: 'A' });
+});
+
+test('cancelAll ignores the in-flight failure too', async () => {
+  const { queue, calls, log } = harness();
+  queue.enqueue('e1', { summary: 'A' });
+  queue.cancelAll();
+  calls[0].reject(new Error('offline'));
+  await tick();
+  assert.deepEqual(log, []);
+  assert.equal(queue.isBusy('e1'), false);
+});
+
 test('enqueue after cancel works normally (in flight and idle)', async () => {
   const { queue, calls, log } = harness();
   queue.enqueue('e1', { summary: 'A' });
