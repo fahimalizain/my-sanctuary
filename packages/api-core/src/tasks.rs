@@ -876,6 +876,131 @@ pub(crate) async fn place_task_on_backlog(
     place_task_on(agenda_repo, user_id, task_id, &backlog).await
 }
 
+/// Plans a task onto the real day a reschedule targets (ADR 0007): the
+/// task-status half of `POST /api/agenda/items/:id/reschedule`, kept here so
+/// it shares the private `/move` machinery ([`local_transition`],
+/// [`place_at`]) instead of re-implementing the transition.
+///
+/// | current status | effect |
+/// | --- | --- |
+/// | `OPEN` | [`local_transition`] to `PLANNED` with a `planned` log, then the Planned-column append (mover-excluded `max + 1` — no client rank) |
+/// | `PLANNED` | `Ok(())`: already planned, no log and no board re-rank |
+/// | `IN_PROGRESS` | 400 `cannot reschedule an in_progress task` (pause first). No write. |
+/// | `COMPLETED` / `DISCARDED` | 400 `cannot reschedule a terminal task`. No write. |
+///
+/// Missing / other-user / soft-deleted → [`TasksError::NotFound`]. The agenda
+/// row itself is the caller's to place: this helper never touches the
+/// membership table.
+pub(crate) async fn plan_task_for_reschedule(
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<(), TasksError> {
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound); // missing / soft-deleted
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    match task.status.as_str() {
+        TASK_STATUS_PLANNED => Ok(()),
+        TASK_STATUS_OPEN => {
+            local_transition(
+                task_repo,
+                logs,
+                user_id,
+                task_id,
+                TASK_STATUS_PLANNED,
+                TASK_LOG_PLANNED,
+                now_unix,
+            )
+            .await?;
+            // The real status change also lands the card in the Planned
+            // column the way an omitted-rank `/move` does: append over the
+            // mover-excluded pile (the mover's leftover OPEN rank never
+            // inflates its own target).
+            let rank = append_rank(
+                task_repo
+                    .max_sort_order(user_id, TASK_STATUS_PLANNED, Some(task_id))
+                    .await?,
+            );
+            place_at(task_repo, user_id, task_id, TASK_STATUS_PLANNED, rank).await?;
+            Ok(())
+        }
+        TASK_STATUS_IN_PROGRESS => Err(TasksError::Invalid(
+            "cannot reschedule an in_progress task".to_string(),
+        )),
+        TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED => Err(TasksError::Invalid(
+            "cannot reschedule a terminal task".to_string(),
+        )),
+        other => Err(TasksError::Invalid(format!(
+            "cannot reschedule a {other} task"
+        ))),
+    }
+}
+
+/// Returns a task to `OPEN` for a backlog drop (ADR 0007): the task-status
+/// half of `POST /api/agenda/items/:id/reschedule { backlog: true }`. Same
+/// shape as [`plan_task_for_reschedule`].
+///
+/// | current status | effect |
+/// | --- | --- |
+/// | `PLANNED` | [`local_transition`] to `OPEN` with an `unplanned` log, then the Open-column append (mover-excluded `max + 1`) |
+/// | `OPEN` | `Ok(())`: already Backlog, no log and no board re-rank |
+/// | `IN_PROGRESS` | 400 `cannot move an in_progress task to the backlog`. No write. |
+/// | `COMPLETED` / `DISCARDED` | 400 `cannot move a terminal task to the backlog`. No write. |
+///
+/// Missing / other-user / soft-deleted → [`TasksError::NotFound`].
+pub(crate) async fn open_task_for_backlog(
+    task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<(), TasksError> {
+    let Some(task) = task_repo.get_by_id(task_id).await? else {
+        return Err(TasksError::NotFound); // missing / soft-deleted
+    };
+    if task.user_id != user_id {
+        return Err(TasksError::NotFound);
+    }
+    match task.status.as_str() {
+        TASK_STATUS_OPEN => Ok(()),
+        TASK_STATUS_PLANNED => {
+            local_transition(
+                task_repo,
+                logs,
+                user_id,
+                task_id,
+                TASK_STATUS_OPEN,
+                TASK_LOG_UNPLANNED,
+                now_unix,
+            )
+            .await?;
+            // A real unplan appends Backlog: `max + 1` over the
+            // mover-excluded Open pile (0 when it is empty).
+            let rank = append_rank(
+                task_repo
+                    .max_sort_order(user_id, TASK_STATUS_OPEN, Some(task_id))
+                    .await?,
+            );
+            place_at(task_repo, user_id, task_id, TASK_STATUS_OPEN, rank).await?;
+            Ok(())
+        }
+        TASK_STATUS_IN_PROGRESS => Err(TasksError::Invalid(
+            "cannot move an in_progress task to the backlog".to_string(),
+        )),
+        TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED => Err(TasksError::Invalid(
+            "cannot move a terminal task to the backlog".to_string(),
+        )),
+        other => Err(TasksError::Invalid(format!(
+            "cannot move a {other} task to the backlog"
+        ))),
+    }
+}
+
 /// Creates a task (always `status = "OPEN"`).
 ///
 /// Validation (all 400):
@@ -10133,5 +10258,304 @@ mod tests {
         .unwrap();
         assert!(response.success);
         assert!(agenda.rows("u-1").is_empty());
+    }
+
+    // ──────────────────────────────────────────
+    // The reschedule / backlog-drop task halves (ADR 0007)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn plan_task_for_reschedule_plans_open_and_appends_the_planned_column() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // The mover's own leftover Backlog rank must not inflate its own
+        // append target: the `planned` transition runs first, then the
+        // mover-excluded Planned pile decides the landing.
+        pollster::block_on(tasks.set_sort_order(&task.id, 9)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        pollster::block_on(plan_task_for_reschedule(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap();
+
+        let stored = pollster::block_on(tasks.get_by_id(&task.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, TASK_STATUS_PLANNED, "OPEN → PLANNED");
+        assert_eq!(stored.sort_order, 0, "an empty Planned pile appends at 0");
+        let inserted = logs.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1, "exactly one log");
+        assert_eq!(inserted[0].r#type, TASK_LOG_PLANNED);
+        assert_eq!(inserted[0].task_id, task.id);
+        assert_eq!(inserted[0].user_id, "u-1");
+    }
+
+    #[test]
+    fn plan_task_for_reschedule_appends_after_the_mover_excluded_planned_pile() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let mover = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, AGENDA_TODAY)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&peer.id, 4)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&mover.id, 9)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        pollster::block_on(plan_task_for_reschedule(
+            &tasks,
+            &logs,
+            "u-1",
+            &mover.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap();
+
+        let stored = pollster::block_on(tasks.get_by_id(&mover.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, TASK_STATUS_PLANNED);
+        assert_eq!(
+            stored.sort_order, 5,
+            "max + 1 over the mover-excluded Planned pile, not the mover's own 9"
+        );
+        // The append rank is always above the pile's max, so no peer can sit
+        // at/after it: the shift is a no-op here and the peer keeps rank 4.
+        let peer = pollster::block_on(tasks.get_by_id(&peer.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.sort_order, 4, "the peer keeps its rank");
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plan_task_for_reschedule_leaves_an_already_planned_task_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_PLANNED, AGENDA_TODAY)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 4)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        pollster::block_on(plan_task_for_reschedule(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap();
+
+        let stored = pollster::block_on(tasks.get_by_id(&task.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, TASK_STATUS_PLANNED,
+            "already planned: stays planned"
+        );
+        assert_eq!(stored.sort_order, 4, "no board re-rank");
+        assert!(logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
+    fn plan_task_for_reschedule_rejects_a_running_or_terminal_task() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let logs = FakeTaskLogRepo::default();
+        for (status, message) in [
+            (
+                TASK_STATUS_IN_PROGRESS,
+                "cannot reschedule an in_progress task",
+            ),
+            (TASK_STATUS_COMPLETED, "cannot reschedule a terminal task"),
+            (TASK_STATUS_DISCARDED, "cannot reschedule a terminal task"),
+        ] {
+            let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+            pollster::block_on(tasks.set_status(&task.id, status, AGENDA_TODAY)).unwrap();
+            pollster::block_on(tasks.set_sort_order(&task.id, 7)).unwrap();
+
+            let err = pollster::block_on(plan_task_for_reschedule(
+                &tasks,
+                &logs,
+                "u-1",
+                &task.id,
+                AGENDA_NOW_UNIX,
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, TasksError::Invalid(ref m) if m == message),
+                "{err:?} for {status}"
+            );
+            let stored = pollster::block_on(tasks.get_by_id(&task.id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, status, "status unchanged");
+            assert_eq!(stored.sort_order, 7, "no board write");
+        }
+        assert!(
+            logs.inserted.lock().unwrap().is_empty(),
+            "nothing was logged"
+        );
+    }
+
+    #[test]
+    fn open_task_for_backlog_unplans_and_appends_the_open_column() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let mover = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_sort_order(&peer.id, 2)).unwrap();
+        pollster::block_on(tasks.set_status(&mover.id, TASK_STATUS_PLANNED, AGENDA_TODAY)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&mover.id, 9)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        pollster::block_on(open_task_for_backlog(
+            &tasks,
+            &logs,
+            "u-1",
+            &mover.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap();
+
+        let stored = pollster::block_on(tasks.get_by_id(&mover.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, TASK_STATUS_OPEN, "PLANNED → OPEN");
+        assert_eq!(stored.sort_order, 3, "the Open column appends at max+1");
+        let peer = pollster::block_on(tasks.get_by_id(&peer.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.sort_order, 2, "the peer keeps its rank");
+        let inserted = logs.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1, "exactly one log");
+        assert_eq!(inserted[0].r#type, TASK_LOG_UNPLANNED);
+        assert_eq!(inserted[0].task_id, mover.id);
+        assert_eq!(inserted[0].user_id, "u-1");
+    }
+
+    #[test]
+    fn open_task_for_backlog_leaves_an_open_task_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_sort_order(&task.id, 4)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        pollster::block_on(open_task_for_backlog(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap();
+
+        let stored = pollster::block_on(tasks.get_by_id(&task.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, TASK_STATUS_OPEN,
+            "already Backlog: stays OPEN"
+        );
+        assert_eq!(stored.sort_order, 4, "no board re-rank");
+        assert!(logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
+    fn open_task_for_backlog_rejects_a_running_or_terminal_task() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let logs = FakeTaskLogRepo::default();
+        for (status, message) in [
+            (
+                TASK_STATUS_IN_PROGRESS,
+                "cannot move an in_progress task to the backlog",
+            ),
+            (
+                TASK_STATUS_COMPLETED,
+                "cannot move a terminal task to the backlog",
+            ),
+            (
+                TASK_STATUS_DISCARDED,
+                "cannot move a terminal task to the backlog",
+            ),
+        ] {
+            let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+            pollster::block_on(tasks.set_status(&task.id, status, AGENDA_TODAY)).unwrap();
+            pollster::block_on(tasks.set_sort_order(&task.id, 7)).unwrap();
+
+            let err = pollster::block_on(open_task_for_backlog(
+                &tasks,
+                &logs,
+                "u-1",
+                &task.id,
+                AGENDA_NOW_UNIX,
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, TasksError::Invalid(ref m) if m == message),
+                "{err:?} for {status}"
+            );
+            let stored = pollster::block_on(tasks.get_by_id(&task.id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, status, "status unchanged");
+            assert_eq!(stored.sort_order, 7, "no board write");
+        }
+        assert!(
+            logs.inserted.lock().unwrap().is_empty(),
+            "nothing was logged"
+        );
+    }
+
+    #[test]
+    fn the_reschedule_helpers_404_a_missing_foreign_or_deleted_task() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let logs = FakeTaskLogRepo::default();
+
+        for id in ["nope".to_string(), task.id.clone()] {
+            // Another user's task is never reachable — a 404, not a leak.
+            let owner = if id == task.id { "u-2" } else { "u-1" };
+            let err = pollster::block_on(plan_task_for_reschedule(
+                &tasks,
+                &logs,
+                owner,
+                &id,
+                AGENDA_NOW_UNIX,
+            ))
+            .unwrap_err();
+            assert!(matches!(err, TasksError::NotFound), "{err:?}");
+            let err = pollster::block_on(open_task_for_backlog(
+                &tasks,
+                &logs,
+                owner,
+                &id,
+                AGENDA_NOW_UNIX,
+            ))
+            .unwrap_err();
+            assert!(matches!(err, TasksError::NotFound), "{err:?}");
+        }
+
+        // A soft-deleted task is gone from both paths too.
+        pollster::block_on(tasks.soft_delete(&task.id, AGENDA_TODAY)).unwrap();
+        let err = pollster::block_on(plan_task_for_reschedule(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::NotFound), "{err:?}");
+        let err = pollster::block_on(open_task_for_backlog(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, TasksError::NotFound), "{err:?}");
+        assert!(logs.inserted.lock().unwrap().is_empty(), "404s never write");
     }
 }
