@@ -3,6 +3,13 @@
 Status: Accepted
 Date: 2026-10-17
 
+> Superseded in part by ADR 0007 (2026-10-17): a living task's single agenda
+> row follows its status — `OPEN` sits on today+50y (the backlog), not on
+> today. The default `GET /api/agenda` is `anchor_date … today+6` plus a
+> `backlog` array, not the anchor week. Reschedule is bounded to
+> `[today, today+10y)` and plans an `OPEN` task. Stop, plan, and unplan move
+> the row. See `docs/adr/0007-agenda-backlog.md`.
+
 ## Context
 
 Home was a **date-scoped page**. `GET /api/agenda?date=` **ensured and seeded**
@@ -77,8 +84,7 @@ and two occurrence rows of the same routine on one day remain legal.
 Every living task in `OPEN | PLANNED | IN_PROGRESS` holds exactly one row. The
 index makes that **at most one**; a backfill (below) gives every rowless open
 task one on today, so in practice it is exactly one. **Backlog (`OPEN`) is
-included.** Backlog's retirement is a separate piece of work and this ADR does
-not rename or remove it.
+included.**
 
 `COMPLETED | DISCARDED` tasks need no agenda row — they reappear when
 reopened. A soft-deleted task **hard-deletes** its agenda row, so no ghost can
