@@ -1,9 +1,12 @@
 // Unit tests for Home's pure stream helpers (day label, date-window walk,
-// stream bounds / grouping, pending predicate, and the optimistic cache
-// edits). The reorder tests pin the exact server semantics of
+// stream bounds / grouping, month-clamped date math, pending predicate, the
+// backlog split, the history window, and the optimistic cache edits). The
+// reorder tests pin the exact server semantics of
 // `POST /api/agenda/items/:id/move`: peers at/after the target rank shift up
 // one and the item lands on it; `moveStreamItem` pins the same rule for the
-// cross-day `reschedule`.
+// cross-day `reschedule`. The backlog tests pin ADR 0007: a dated backlog row
+// reorders with the agenda, an OPEN row through the Board's `tasks.sort_order`,
+// and a backlog drop appends the row at today+50y.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,6 +17,7 @@ import type {
   TaskRecord,
 } from '../../types';
 import {
+  addMonthsClamp,
   agendaDateLabel,
   agendaMoveTarget,
   agendaMoveTargetAt,
@@ -26,8 +30,14 @@ import {
   groupItemsByDate,
   isAgendaItemParked,
   isAgendaItemPending,
+  isOpenBacklogTask,
+  moveItemToBacklog,
   moveStreamItem,
+  openTaskMoveTargetAt,
   partitionAgendaItems,
+  previousHistoryWindow,
+  rescheduleMaxDate,
+  splitBacklogSection,
   streamBounds,
   streamItemsOf,
   updateStreamItem,
@@ -129,20 +139,57 @@ function occurrenceItem(
   };
 }
 
-/** One stream page: `items` in a `from … to` window (server echo included). */
+/** One stream page: `items` in a `from … to` window (server echo included).
+ *  `overrides` pins anything else the case cares about — `backlog`, a moved
+ *  `anchor_date`, a different `earliest_date`. */
 function page(
   from: string,
   to: string,
   items: AgendaItemRecord[],
+  overrides: Partial<AgendaResponse> = {},
 ): AgendaResponse {
   return {
     items,
+    backlog: [],
     from,
     to,
     today: TODAY,
     time_zone: 'UTC',
     anchor_date: from,
     earliest_date: '2026-08-01',
+    ...overrides,
+  };
+}
+
+/** The backlog date for TODAY: civil today + 50 years (ADR 0007). */
+const BACKLOG_DATE = '2076-08-23';
+/** The 10-year line for TODAY: the first date in the backlog region. */
+const HORIZON = '2036-08-23';
+
+/** A task-kind agenda row on `date` whose task carries its own Board rank. */
+function taskItemAt(
+  id: string,
+  status: TaskRecord['status'],
+  date: string,
+  rank = 0,
+): AgendaItemRecord {
+  return {
+    ...item(id, rank, date),
+    task: { ...task(id, status, `Task ${id}`), sort_order: rank },
+  };
+}
+
+/** An occurrence-kind agenda row moved onto `date`. */
+function occurrenceItemAt(
+  id: string,
+  status: OccurrenceRecord['status'],
+  date: string,
+): AgendaItemRecord {
+  const base = occurrenceItem(id, status);
+  return {
+    ...base,
+    local_date: date,
+    occurrence: { ...base.occurrence!, local_date: date },
   };
 }
 
@@ -210,6 +257,35 @@ test('eachCivilDate: an inverted or bad range is empty', () => {
   assert.deepEqual(eachCivilDate('', ''), []);
 });
 
+// ── addMonthsClamp / rescheduleMaxDate ──────────────────────────────────
+
+test('addMonthsClamp: clamps Feb 29 the way chrono checked_add_months does', () => {
+  // The backlog date and the 10-year line are both month adds, so Feb 29 must
+  // land on Feb 28 — never JS setUTCMonth's roll into March.
+  assert.equal(addMonthsClamp('2024-02-29', 120), '2034-02-28');
+  assert.equal(addMonthsClamp('2024-02-29', 600), '2074-02-28');
+  // A day that exists in the target month keeps its day-of-month.
+  assert.equal(addMonthsClamp('2026-08-23', 120), '2036-08-23');
+  assert.equal(addMonthsClamp('2026-08-23', 600), '2076-08-23');
+  // Crosses the year boundary forward and back.
+  assert.equal(addMonthsClamp('2026-11-30', 3), '2027-02-28');
+  assert.equal(addMonthsClamp('2026-03-31', -1), '2026-02-28');
+  assert.equal(addMonthsClamp('2026-01-15', 0), '2026-01-15');
+});
+
+test('addMonthsClamp: malformed input returns the input', () => {
+  assert.equal(addMonthsClamp('', 120), '');
+  assert.equal(addMonthsClamp('not-a-date', 600), 'not-a-date');
+  // A component rollover (month 13) is malformed too.
+  assert.equal(addMonthsClamp('2026-13-01', 120), '2026-13-01');
+  assert.equal(addMonthsClamp('2026-02-30', 120), '2026-02-30');
+});
+
+test('rescheduleMaxDate: today+10y−1 (the API accepts [today, today+10y))', () => {
+  assert.equal(rescheduleMaxDate(TODAY), '2036-08-22');
+  assert.equal(rescheduleMaxDate('2024-02-29'), '2034-02-27');
+});
+
 // ── streamBounds ────────────────────────────────────────────────────────
 
 test('streamBounds: no pages yields null', () => {
@@ -230,6 +306,78 @@ test('streamBounds: the first page starts the span, the last ends it', () => {
     from: '2026-08-23',
     to: '2026-08-29',
   });
+});
+
+// ── previousHistoryWindow ───────────────────────────────────────────────
+
+test('previousHistoryWindow: the default page alone fills the week before the anchor', () => {
+  const pages = [
+    page('2026-08-23', '2026-08-29', [], { anchor_date: '2026-08-23' }),
+  ];
+  assert.deepEqual(previousHistoryWindow(pages), {
+    from: '2026-08-16',
+    to: '2026-08-22',
+  });
+});
+
+test('previousHistoryWindow: the next window steps back from the oldest page', () => {
+  const pages = [
+    page('2026-08-16', '2026-08-22', [], { anchor_date: '2026-08-23' }),
+    page('2026-08-23', '2026-08-29', [], { anchor_date: '2026-08-23' }),
+  ];
+  assert.deepEqual(previousHistoryWindow(pages), {
+    from: '2026-08-09',
+    to: '2026-08-15',
+  });
+});
+
+test('previousHistoryWindow: there is nothing before the anchor eve', () => {
+  assert.equal(
+    previousHistoryWindow([
+      page('2026-08-23', '2026-08-29', [], {
+        anchor_date: '2026-08-23',
+        earliest_date: '2026-08-23',
+      }),
+    ]),
+    undefined,
+  );
+  // The oldest row is the anchor's own eve: no older window exists.
+  assert.equal(
+    previousHistoryWindow([
+      page('2026-08-16', '2026-08-22', [], {
+        anchor_date: '2026-08-23',
+        earliest_date: '2026-08-22',
+      }),
+    ]),
+    undefined,
+  );
+  assert.equal(previousHistoryWindow([]), undefined);
+});
+
+test('previousHistoryWindow: a gap between history and the anchor is filled first', () => {
+  // The anchor jumped forward: a window ending the week before the oldest
+  // page would leave 2026-08-08…19 unpainted forever.
+  const pages = [
+    page('2026-08-01', '2026-08-07', [], { anchor_date: '2026-08-20' }),
+    page('2026-08-20', '2026-08-26', [], { anchor_date: '2026-08-20' }),
+  ];
+  assert.deepEqual(previousHistoryWindow(pages), {
+    from: '2026-08-13',
+    to: '2026-08-19',
+  });
+});
+
+test('previousHistoryWindow: clamps to earliest_date and never reaches the anchor', () => {
+  const pages = [
+    page('2026-08-16', '2026-08-22', [], {
+      anchor_date: '2026-08-23',
+      earliest_date: '2026-08-10',
+    }),
+  ];
+  const window = previousHistoryWindow(pages);
+  assert.deepEqual(window, { from: '2026-08-10', to: '2026-08-15' });
+  assert.ok(window && window.to < '2026-08-23');
+  assert.ok(window && eachCivilDate(window.from, window.to).length <= 7);
 });
 
 // ── groupItemsByDate ────────────────────────────────────────────────────
@@ -295,6 +443,76 @@ test('isAgendaItemPending: an embedless orphan is never pending', () => {
   );
 });
 
+// ── isOpenBacklogTask / splitBacklogSection ─────────────────────────────
+
+test('isOpenBacklogTask: only an OPEN task on/past the 10-year line', () => {
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('a', 'OPEN', BACKLOG_DATE), TODAY),
+    true,
+  );
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('b', 'OPEN', HORIZON), TODAY),
+    true,
+  );
+  // One day under the line is still the dated stretch.
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('c', 'OPEN', '2036-08-22'), TODAY),
+    false,
+  );
+  // The row must sit in the backlog region AND the task be OPEN.
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('d', 'PLANNED', BACKLOG_DATE), TODAY),
+    false,
+  );
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('e', 'IN_PROGRESS', BACKLOG_DATE), TODAY),
+    false,
+  );
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('f', 'COMPLETED', BACKLOG_DATE), TODAY),
+    false,
+  );
+  assert.equal(isOpenBacklogTask(occurrenceItem('g', 'pending'), TODAY), false);
+  assert.equal(isOpenBacklogTask(item('orphan', 0), TODAY), false);
+  // A missing today claims nothing.
+  assert.equal(
+    isOpenBacklogTask(taskItemAt('h', 'OPEN', BACKLOG_DATE), ''),
+    false,
+  );
+});
+
+test('splitBacklogSection: keeps the dated stretch and never re-sorts it', () => {
+  const dated = taskItemAt('d', 'PLANNED', '2026-08-30', 1);
+  const open = taskItemAt('a', 'OPEN', BACKLOG_DATE, 9);
+  const open2 = taskItemAt('b', 'OPEN', BACKLOG_DATE, 2);
+  // The self-heal has not run: a PLANNED row on the backlog date is in
+  // neither stretch — the server omits it, and it is not an OPEN target.
+  const misplaced = taskItemAt('m', 'PLANNED', BACKLOG_DATE, 5);
+  const split = splitBacklogSection([dated, open, open2, misplaced], TODAY);
+  assert.deepEqual(
+    split.dated.map((entry) => entry.id),
+    ['d'],
+  );
+  // Server order (Board order) survives: a and b keep the array's order even
+  // though b's own rank is lower.
+  assert.deepEqual(
+    split.open.map((entry) => entry.id),
+    ['a', 'b'],
+  );
+});
+
+test('splitBacklogSection: a malformed today yields two empty stretches', () => {
+  const split = splitBacklogSection(
+    [
+      taskItemAt('a', 'OPEN', BACKLOG_DATE),
+      taskItemAt('b', 'PLANNED', '2026-08-30'),
+    ],
+    '',
+  );
+  assert.deepEqual(split.dated, []);
+  assert.deepEqual(split.open, []);
+});
+
 // ── updateStreamItem ────────────────────────────────────────────────────
 
 test('updateStreamItem: maps the matching item inside its own page', () => {
@@ -332,6 +550,25 @@ test('updateStreamItem: a missing id (or no data) keeps the same reference', () 
     updateStreamItem(undefined, 'a', (entry) => entry),
     undefined,
   );
+});
+
+test('updateStreamItem: maps a backlog row too', () => {
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [item('a', 0)], {
+        backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 0)],
+      }),
+    ],
+    pageParams: [undefined],
+  };
+  const next = updateStreamItem(data, 'b', (entry) => ({
+    ...entry,
+    sort_order: 9,
+  }));
+  assert.notEqual(next, data);
+  assert.equal(next?.pages[0].backlog[0].sort_order, 9);
+  assert.equal(next?.pages[0].items[0].sort_order, 0, 'items untouched');
+  assert.equal(data.pages[0].backlog[0].sort_order, 0, 'input not mutated');
 });
 
 // ── moveStreamItem ──────────────────────────────────────────────────────
@@ -422,6 +659,147 @@ test('moveStreamItem: a missing id (or no data) keeps the same reference', () =>
   assert.equal(moveStreamItem(undefined, 'a', TODAY, 0), undefined);
 });
 
+test('moveStreamItem: a backlog row leaves the backlog and lands on a covered day', () => {
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [item('a', 0)], {
+        backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 0)],
+      }),
+    ],
+    pageParams: [undefined],
+  };
+  const next = moveStreamItem(data, 'b', '2026-08-25', 3);
+  const page0 = next?.pages[0];
+  // No copy is left behind in the backlog…
+  assert.deepEqual(page0?.backlog, []);
+  // …and the row lands on the target day with its rank.
+  const landed = page0?.items.find((entry) => entry.id === 'b');
+  assert.equal(landed?.local_date, '2026-08-25');
+  assert.equal(landed?.sort_order, 3);
+  // An OPEN task is planned by the server on reschedule; the paint mirrors it.
+  assert.equal(landed?.task?.status, 'PLANNED');
+  assert.equal(data.pages[0].backlog.length, 1, 'input not mutated');
+});
+
+test('moveStreamItem: a PLANNED task and an occurrence keep their status', () => {
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [item('a', 0)], {
+        backlog: [
+          taskItemAt('p', 'PLANNED', '2026-08-30', 0),
+          occurrenceItemAt('o', 'pending', '2026-08-31'),
+        ],
+      }),
+    ],
+    pageParams: [undefined],
+  };
+  const afterTask = moveStreamItem(data, 'p', '2026-08-26', 0);
+  assert.equal(
+    afterTask?.pages[0].items.find((entry) => entry.id === 'p')?.task?.status,
+    'PLANNED',
+  );
+  const afterOccurrence = moveStreamItem(data, 'o', '2026-08-27', 1);
+  const occurrence = afterOccurrence?.pages[0].items.find(
+    (entry) => entry.id === 'o',
+  );
+  assert.equal(occurrence?.occurrence?.status, 'pending');
+  assert.equal(occurrence?.task, null);
+});
+
+// ── moveItemToBacklog ───────────────────────────────────────────────────
+
+test('moveItemToBacklog: a PLANNED row flips OPEN and appends the Board rank', () => {
+  const planned = taskItemAt('p', 'PLANNED', '2026-08-25', 3);
+  const first = taskItemAt('a', 'OPEN', BACKLOG_DATE, 0);
+  const last = taskItemAt('b', 'OPEN', BACKLOG_DATE, 7);
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [planned, item('x', 0)], {
+        backlog: [first, last],
+      }),
+    ],
+    pageParams: [undefined],
+  };
+  const next = moveItemToBacklog(data, 'p', BACKLOG_DATE);
+  const page0 = next?.pages[0];
+  assert.deepEqual(
+    page0?.items.map((entry) => entry.id),
+    ['x'],
+  );
+  assert.deepEqual(
+    page0?.backlog.map((entry) => entry.id),
+    ['a', 'b', 'p'],
+  );
+  const moved = page0?.backlog[2];
+  assert.equal(moved?.local_date, BACKLOG_DATE);
+  assert.equal(moved?.task?.status, 'OPEN');
+  // Append = max(0, 7) + 1 over the OPEN tasks already there.
+  assert.equal(moved?.task?.sort_order, 8);
+  // The input cache is untouched.
+  assert.equal(data.pages[0].items.length, 2);
+  assert.equal(data.pages[0].backlog.length, 2);
+});
+
+test('moveItemToBacklog: an already-OPEN row keeps its Board rank', () => {
+  const open = taskItemAt('o', 'OPEN', '2026-08-25', 4);
+  const data = {
+    pages: [
+      page('2026-08-23', '2026-08-29', [open], {
+        backlog: [taskItemAt('a', 'OPEN', BACKLOG_DATE, 9)],
+      }),
+    ],
+    pageParams: [undefined],
+  };
+  const next = moveItemToBacklog(data, 'o', BACKLOG_DATE);
+  const page0 = next?.pages[0];
+  assert.deepEqual(
+    page0?.items.map((entry) => entry.id),
+    [],
+  );
+  assert.deepEqual(
+    page0?.backlog.map((entry) => entry.id),
+    ['a', 'o'],
+  );
+  assert.equal(page0?.backlog[1].task?.sort_order, 4);
+});
+
+test('moveItemToBacklog: appends on the greatest-to page and drops the old copy', () => {
+  // A row already parked in a history page's backlog (a stale optimistic
+  // paint) must not survive there.
+  const stale = taskItemAt('s', 'PLANNED', '2026-08-30', 1);
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [], { backlog: [stale] }),
+      page('2026-08-23', '2026-08-29', [item('a', 0)], {
+        backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 2)],
+      }),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  const next = moveItemToBacklog(data, 's', BACKLOG_DATE);
+  assert.deepEqual(next?.pages[0].backlog, []);
+  assert.deepEqual(
+    next?.pages[1].backlog.map((entry) => entry.id),
+    ['b', 's'],
+  );
+  assert.equal(
+    next?.pages[1].backlog[1].task?.sort_order,
+    3,
+    'append after the existing OPEN row',
+  );
+});
+
+test('moveItemToBacklog: a missing id (or no data) keeps the same reference', () => {
+  const data = {
+    pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
+    pageParams: [undefined],
+  };
+  assert.equal(moveItemToBacklog(data, 'missing', BACKLOG_DATE), data);
+  assert.equal(moveItemToBacklog(undefined, 'a', BACKLOG_DATE), undefined);
+  const empty = { pages: [], pageParams: [] };
+  assert.equal(moveItemToBacklog(empty, 'a', BACKLOG_DATE), empty);
+});
+
 // ── appendRankOnStream / streamItemsOf / dedupeAgendaItems ──────────────
 
 test('appendRankOnStream: max + 1 on the date, 0 on an empty pile', () => {
@@ -451,6 +829,26 @@ test('streamItemsOf: flattens pages in order', () => {
     ['a', 'b'],
   );
   assert.deepEqual(streamItemsOf(undefined), []);
+});
+
+test('streamItemsOf: each page contributes its items then its backlog', () => {
+  // A backlog row must be reachable from a drag handler, so it is part of the
+  // stream's lookup list — but never part of the day spine.
+  const data = {
+    pages: [
+      page('2026-08-16', '2026-08-22', [item('a', 0, '2026-08-20')], {
+        backlog: [taskItemAt('h', 'OPEN', BACKLOG_DATE, 0)],
+      }),
+      page('2026-08-23', '2026-08-29', [item('b', 0)], {
+        backlog: [taskItemAt('c', 'OPEN', BACKLOG_DATE, 1)],
+      }),
+    ],
+    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+  };
+  assert.deepEqual(
+    streamItemsOf(data).map((entry) => entry.id),
+    ['a', 'h', 'b', 'c'],
+  );
 });
 
 test('dedupeAgendaItems: one survivor per id, the first page wins', () => {
@@ -541,6 +939,38 @@ test('agendaMoveTargetAt: rank gaps keep working (after an unpin)', () => {
   const items = [item('a', 0), item('c', 2)];
   assert.equal(agendaMoveTargetAt(items, 1, 0), 0);
   assert.equal(agendaMoveTargetAt(items, 0, 1), 3);
+});
+
+// ── openTaskMoveTargetAt ────────────────────────────────────────────────
+
+test('openTaskMoveTargetAt: the rank is the task\u2019s Board sort_order', () => {
+  // The agenda row's own `sort_order` is irrelevant in the OPEN stretch; the
+  // Board's `tasks.sort_order` is the one order Home and Board share.
+  const items = [
+    taskItemAt('a', 'OPEN', BACKLOG_DATE, 0),
+    taskItemAt('b', 'OPEN', BACKLOG_DATE, 7),
+    taskItemAt('c', 'OPEN', BACKLOG_DATE, 9),
+  ];
+  // c (index 2) dropped above a (index 0) takes a's Board rank.
+  assert.equal(openTaskMoveTargetAt(items, 2, 0), 0);
+  // a dropped below b lands just after b.
+  assert.equal(openTaskMoveTargetAt(items, 0, 1), 8);
+  // a dropped below c lands just after c.
+  assert.equal(openTaskMoveTargetAt(items, 0, 2), 10);
+});
+
+test('openTaskMoveTargetAt: same index, out of range and embedless rows return null', () => {
+  const items = [
+    taskItemAt('a', 'OPEN', BACKLOG_DATE, 0),
+    taskItemAt('b', 'OPEN', BACKLOG_DATE, 1),
+  ];
+  assert.equal(openTaskMoveTargetAt(items, 0, 0), null);
+  assert.equal(openTaskMoveTargetAt(items, -1, 0), null);
+  assert.equal(openTaskMoveTargetAt(items, 0, -1), null);
+  assert.equal(openTaskMoveTargetAt(items, 2, 0), null);
+  assert.equal(openTaskMoveTargetAt(items, 0, 2), null);
+  assert.equal(openTaskMoveTargetAt([], 0, 0), null);
+  assert.equal(openTaskMoveTargetAt([item('orphan', 0), items[1]], 0, 1), null);
 });
 
 // ── crossDaySortOrder ───────────────────────────────────────────────────
@@ -666,10 +1096,12 @@ test('canReschedule: occurrences move only while pending or skipped', () => {
   assert.equal(canReschedule(occurrenceItem('d', 'done')), false);
 });
 
-test('canReschedule: tasks move while living; completed/discarded stay put', () => {
+test('canReschedule: tasks move while living; a running task or a finished card stays put', () => {
   assert.equal(canReschedule(taskItem('a', 'OPEN')), true);
   assert.equal(canReschedule(taskItem('b', 'PLANNED')), true);
-  assert.equal(canReschedule(taskItem('c', 'IN_PROGRESS')), true);
+  // The API 400s `cannot reschedule an in_progress task` — pause first, so
+  // the control hides instead of inviting a failure banner.
+  assert.equal(canReschedule(taskItem('c', 'IN_PROGRESS')), false);
   // The API would allow these, but Home never invites moving a finished card.
   assert.equal(canReschedule(taskItem('d', 'COMPLETED')), false);
   assert.equal(canReschedule(taskItem('e', 'DISCARDED')), false);

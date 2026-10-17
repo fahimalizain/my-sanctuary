@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import { useInfiniteQuery, useMutation } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
 import {
@@ -13,18 +12,19 @@ import type {
 } from '@/app/types';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';
-import { addCivilDays } from '@/app/modules/routines/rrule-preview';
+import { previousHistoryWindow } from '@/app/modules/home/agenda-helpers';
 
 // Home reads ONE infinite stream of day windows (ADR 0004 amendment — slice
-// 5): the first page is the server's anchor week (no query at all, so the
-// browser never computes today), `getPreviousPageParam` walks history in
-// 7-day windows down to `earliest_date`, `getNextPageParam` walks the
-// unbounded future. Every write on the page edits this cache in place
-// (optimistic paint) and `cancelAgendaQuery` protects it from an in-flight
-// refetch — there is no per-date key left.
+// 5, ADR 0007 — slice 6): the first page is the server's default read (no
+// query at all, so the browser never computes today) — `anchor_date … today+6`
+// plus the `backlog` array. `getPreviousPageParam` walks history in 7-day
+// windows down to `earliest_date`; there is NO forward page, the stream ends
+// at today+6. Every write on the page edits this cache in place (optimistic
+// paint) and `cancelAgendaQuery` protects it from an in-flight refetch — there
+// is no per-date key left.
 
 /** One stream page: 7 inclusive civil days, or `undefined` for the very first
- *  page (the anchor week — the GET that omits `from`/`to` entirely). */
+ *  page (the default read — the GET that omits `from`/`to` entirely). */
 export type AgendaStreamPageParam = { from: string; to: string };
 
 /** The whole stream as React Query caches it (`pages[0]` is the earliest
@@ -34,62 +34,26 @@ export type AgendaStreamData = InfiniteData<
   AgendaStreamPageParam | undefined
 >;
 
-/** Days per stream window: one week forward and one week back per fetch. */
-const AGENDA_PAGE_DAYS = 7;
-
 export function useAgendaStream() {
-  const query = useInfiniteQuery({
+  return useInfiniteQuery({
     queryKey: queryKeys.agenda.stream(),
-    // The anchor page is the API's own default read: no `from`/`to` at all.
+    // The default page is the API's own read: no `from`/`to` at all. Its
+    // param stays `undefined` FOREVER — never rewritten to `{ from, to }`.
+    // Pinning it would turn the next refetch into a history read whose `to`
+    // (today+6) is not `< anchor_date`, which the server 400s. A refetch
+    // recomputes the anchor instead; that slide is correct.
     initialPageParam: undefined as AgendaStreamPageParam | undefined,
     queryFn: ({ pageParam }) =>
       pageParam
         ? getAgendaRange(pageParam.from, pageParam.to)
         : getAgendaRange(),
-    // History ends at the oldest row the server knows about.
-    getPreviousPageParam: (firstPage) =>
-      firstPage.from <= firstPage.earliest_date
-        ? undefined
-        : {
-            from: addCivilDays(firstPage.from, -AGENDA_PAGE_DAYS),
-            to: addCivilDays(firstPage.from, -1),
-          },
-    // The future never ends — keep offering the next week.
-    getNextPageParam: (lastPage) => ({
-      from: addCivilDays(lastPage.to, 1),
-      to: addCivilDays(lastPage.to, AGENDA_PAGE_DAYS),
-    }),
+    // History ends at the oldest row the server knows about, and the window
+    // always ends before the anchor (`previousHistoryWindow`).
+    getPreviousPageParam: (_firstPage, allPages) =>
+      previousHistoryWindow(allPages),
+    // No forward page: today is inside the default window.
+    getNextPageParam: () => undefined,
   });
-  const data = query.data;
-
-  // Pin the anchor page's param once it has actually come back. While it is
-  // still `undefined`, a v5 refetch reuses "the server picks the anchor" and
-  // recomputes `anchor_date`, so any invalidation can slide the whole loaded
-  // span (Oct 10–23 becomes Oct 17–30). Rewriting the param to the window
-  // THAT page answered makes every later refetch re-request it; the loaded
-  // dates then stay put even when `anchor_date` in the payload moves.
-  // Not necessarily index 0 — a prepend moves the anchor page to the right.
-  // Pinned exactly once: with no `undefined` param left there is nothing to
-  // do, so this cannot loop.
-  useEffect(() => {
-    if (!data) return;
-    const current = queryClient.getQueryData<AgendaStreamData>(
-      queryKeys.agenda.stream(),
-    );
-    if (!current) return;
-    const index = current.pageParams.findIndex((param) => param == null);
-    if (index < 0) return;
-    const page = current.pages[index];
-    if (!page?.from || !page?.to) return;
-    queryClient.setQueryData<AgendaStreamData>(queryKeys.agenda.stream(), {
-      ...current,
-      pageParams: current.pageParams.map((param, i) =>
-        i === index ? { from: page.from, to: page.to } : param,
-      ),
-    });
-  }, [data]);
-
-  return query;
 }
 
 // Agenda write mutations — thin wrappers, no optimistic paint (mirrors

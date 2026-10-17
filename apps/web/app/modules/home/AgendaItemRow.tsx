@@ -40,7 +40,7 @@ import type {
 } from '../../types';
 import { TASK_PRIORITY_LABELS } from '../../types';
 import { cn } from '@/lib/utils';
-import { canReschedule } from './agenda-helpers';
+import { canReschedule, rescheduleMaxDate } from './agenda-helpers';
 import { addCivilDays } from '../routines/rrule-preview';
 import {
   Popover,
@@ -255,15 +255,17 @@ function DragHandle({
 }
 
 /** Move-to-another-day control (ADR 0004 amendment — reschedule, slice 5
- *  stream rules): a calendar icon opens a small popover with "Today" and
- *  "Tomorrow" actions plus a compact native date picker for any other day.
- *  Every action fires immediately — no confirm — so the row's optimistic drop
- *  in HomePage is instant; failures revert + banner. "Today" means the
- *  SERVER's civil today (`serverToday`), never the browser's date; "Tomorrow"
- *  is the ROW's own date +1 civil day and hides once that day is past (the
- *  API rejects a reschedule into the past). The picker's floor is
- *  `serverToday`, so a past day can never be offered. The popover closes and
- *  the picker resets after either action so it never reads as a filter. */
+ *  stream rules; ADR 0007 — slice 6 bounds): a calendar icon opens a small
+ *  popover with "Today" and "Tomorrow" actions plus a compact native date
+ *  picker for any other day. Every action fires immediately — no confirm — so
+ *  the row's optimistic drop in HomePage is instant; failures revert + banner.
+ *  "Today" means the SERVER's civil today (`serverToday`), never the browser's
+ *  date; "Tomorrow" is the ROW's own date +1 civil day and hides once that day
+ *  is past (the API rejects a reschedule into the past). The picker is bounded
+ *  `[serverToday, today+10y−1]` — the API's accepted `[today, today+10y)`
+ *  range, with the same month clamp — so neither an impossible past day nor an
+ *  out-of-range future day is ever offered. The popover closes and the picker
+ *  resets after either action so it never reads as a filter. */
 function RescheduleControl({
   item,
   label,
@@ -280,6 +282,9 @@ function RescheduleControl({
   const tomorrow = addCivilDays(item.local_date, 1);
   const showToday = !!serverToday && item.local_date !== serverToday;
   const showTomorrow = !!serverToday && tomorrow >= serverToday;
+  // Computed from the SERVER's today, never the browser's — and only when the
+  // server has told us what today is.
+  const maxDate = serverToday ? rescheduleMaxDate(serverToday) : undefined;
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
@@ -324,6 +329,7 @@ function RescheduleControl({
           type="date"
           value={pickDate}
           min={serverToday || undefined}
+          max={maxDate}
           onChange={(e) => {
             const next = e.target.value;
             // No confirm: picking a day reschedules immediately, then the
