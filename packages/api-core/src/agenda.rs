@@ -19,11 +19,14 @@
 //!   today, plus the `backlog` array holding every row past `today+6`
 //!   (ADR 0007: dated rows in stream order, then `OPEN` tasks in Board order);
 //!   exactly one bound → 400; an explicit window is **history only** — an
-//!   inclusive span above 31 days → 400 and it must end strictly before
-//!   `anchor_date` (400 `history must end before the anchor`) with an empty
-//!   `backlog`. The response carries `from`/`to` (resolved, never the raw
-//!   query), `anchor_date`, and `earliest_date` (`MIN(local_date)` over every
-//!   row, the back-scroll floor).
+//!   inclusive span above 31 days → 400 (checked on the requested dates) and
+//!   its `to` is clamped to `anchor_date - 1`, so the anchor day itself is
+//!   only ever on the default read, and a window that lands entirely past the
+//!   anchor is an empty 200 (`items: []`, `backlog: []`) rather than an
+//!   error. A history page's `backlog` is always empty. The response carries
+//!   `from`/`to` (resolved, never the raw query), `anchor_date`, and
+//!   `earliest_date` (`MIN(local_date)` over every row, the back-scroll
+//!   floor).
 //!   Materializing occurrences is the occurrence fill's job, never a GET's.
 //! - The response omits occurrence items whose routine is missing and task
 //!   items whose task is missing/soft-deleted; the orphan membership rows
@@ -371,10 +374,13 @@ pub(crate) async fn user_today(
 ///   self-heal has not run) is omitted until the next tick — the accepted
 ///   misplacement window, not a third stretch;
 /// - both present → **history only**: the inclusive range; `to < from` is a
-///   400, an inclusive span above 31 days is a 400 (checked before the anchor
-///   rule), and `to >= anchor_date` is a 400 `history must end before the
-///   anchor` — there is no forward page. `backlog` is empty and the backlog
-///   region is never queried;
+///   400 and an inclusive span above 31 days is a 400 (both checked on the
+///   **requested** dates), and `to` is then clamped to `anchor_date - 1` —
+///   the anchor day is in the default stream, never in a history page. A
+///   window that lands entirely past the anchor is an **empty 200** (`items`
+///   and `backlog` empty, and `from > to` is legal in that one response): a
+///   stored history param must not fail because the anchor moved earlier.
+///   `backlog` is empty and the backlog region is never queried;
 /// - exactly one present → 400 "both or neither";
 /// - a non-empty value that is not `YYYY-MM-DD` → 400.
 ///
@@ -425,10 +431,17 @@ pub async fn get_agenda(
     let (from, to, history) = resolve_window(from, to, &anchor_date, &today)?;
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
 
-    // One page read for the whole stream window; the repo owns the order.
-    let items = agenda_repo
-        .list_by_user_and_date_range(user_id, &from, &to)
-        .await?;
+    // One page read for the whole stream window; the repo owns the order. A
+    // clamped-away history window (`from > to`) has nothing to read, so it
+    // skips the query entirely — the one case where a GET issues no range
+    // read at all.
+    let items = if from.as_str() > to.as_str() {
+        Vec::new()
+    } else {
+        agenda_repo
+            .list_by_user_and_date_range(user_id, &from, &to)
+            .await?
+    };
     // The default read also loads the backlog region — everything past
     // today+6 (the stream's end, so the query starts the next day). A history
     // page is strictly before the anchor and never looks there: the backlog
@@ -587,10 +600,14 @@ pub async fn get_agenda(
 /// Both omitted → the **default read** (ADR 0007): `from = anchor_date`, `to
 /// = today + 6` civil days, with **no 31-day cap** (the anchor is always
 /// `<= today`, so `from <= to`). Both present → a **history** window: the
-/// span check runs **before** the anchor check, so an overlong window that
-/// also sticks out past the anchor still reports the span error, and a window
-/// that ends on/after `anchor_date` is a 400 `history must end before the
-/// anchor` — there is no forward page, the stream ends at `today+6`.
+/// reversed-pair and span checks run on the **requested** dates, before the
+/// clamp, so an overlong window that also sticks out past the anchor still
+/// reports the span error; `to` is then clamped to `min(to, anchor_date - 1)`
+/// because the anchor day itself is on the default stream — there is no
+/// forward page, the stream ends at `today+6`. A window that starts at or
+/// after the anchor has nothing left to read: it comes back as `from > to`,
+/// an empty 200 rather than an error, so a stored history param refetched
+/// after the anchor moved earlier never fails.
 ///
 /// The returned flag is `history`: `false` for the default read (which also
 /// loads the `backlog` array), `true` for an explicit window (whose `backlog`
@@ -620,19 +637,24 @@ fn resolve_window(
                 ));
             }
             // Inclusive span is the day difference + 1: 30 → 31 days is valid.
+            // Checked on the requested dates, so an overlong window still
+            // errors even though the clamp below would shorten it.
             if to_date.signed_duration_since(from_date).num_days() > 30 {
                 return Err(AgendaError::Invalid(
                     "date range must not exceed 31 days".to_string(),
                 ));
             }
-            // An explicit window is history only: it may not reach into the
-            // default stream, which already runs through today+6 — and the
-            // anchor day itself is in that stream.
-            if to.as_str() >= anchor_date {
-                return Err(AgendaError::Invalid(
-                    "history must end before the anchor".to_string(),
-                ));
-            }
+            // An explicit window is history only, and the anchor day itself
+            // belongs to the default stream: pull `to` back to the day before
+            // the anchor. A window that starts at or after the anchor day has
+            // nothing left to read — `from > to` is the empty history read,
+            // never a 400.
+            let clamped_to = add_civil_days(anchor_date, -1)?;
+            let to = if to.as_str() < clamped_to.as_str() {
+                to
+            } else {
+                clamped_to
+            };
             Ok((from, to, true))
         }
         _ => Err(AgendaError::Invalid(
@@ -4337,12 +4359,12 @@ mod tests {
     }
 
     /// A single-day read. A day **before the anchor** is a legal one-day
-    /// **history** read (`to < anchor_date`). A stream day or a backlog day is
-    /// filtered out of ONE default read instead — the default read no longer
-    /// 400s for a day after the anchor, so it must not be called with an
-    /// explicit `from`/`to` (that is history only, and `to >= anchor_date`).
-    /// A non-canonical date keeps its 400 from the window parser; a day inside
-    /// the stream with no rows returns empty `items`, never a history 400.
+    /// **history** read. A stream day or a backlog day is filtered out of ONE
+    /// default read instead — an explicit `from`/`to` window is history only,
+    /// clamped to end at `anchor_date - 1`, so it must never be used to fetch
+    /// a stream day. A non-canonical date keeps its 400 from the window parser;
+    /// a day inside the stream with no rows returns empty `items`, never an
+    /// error.
     fn get(repos: &Repos, user_id: &str, date: &str) -> Result<AgendaResponse, AgendaError> {
         let Ok(canonical) = parse_date(date) else {
             return get_range(repos, user_id, Some(date), Some(date));
@@ -5093,7 +5115,7 @@ mod tests {
     }
 
     #[test]
-    fn get_agenda_history_must_end_before_the_anchor_and_returns_no_backlog() {
+    fn get_agenda_history_clamps_at_the_day_before_the_anchor() {
         let repos = repos();
         // A pending PLANNED row on 2026-08-20 pins the anchor.
         repos.tasks.push(task_row("t-past", "u-1", "Past | Work", "PLANNED"));
@@ -5103,12 +5125,29 @@ mod tests {
         repos.tasks.push(task_row("t-later", "u-1", "Later | Work", "PLANNED"));
         agenda_row(&repos, "ai-later", "u-1", "2026-09-01", AGENDA_KIND_TASK, "t-later", 0);
 
-        // The anchor day itself belongs to the default stream: a one-day
-        // history page ending on it is a 400.
-        let err = get_range(&repos, "u-1", Some("2026-08-20"), Some("2026-08-20")).unwrap_err();
+        // The anchor day itself belongs to the default stream, so `to` is
+        // clamped to the day before it. A window that starts at/after the
+        // anchor has nothing left to read: an empty 200 (`from > to` is legal
+        // in this one response), never a 400 — a stored history param must not
+        // fail just because the anchor moved earlier.
+        repos.agenda.reset_calls();
+        let empty = get_range(&repos, "u-1", Some("2026-08-20"), Some("2026-08-20")).unwrap();
+        assert_eq!(empty.from, "2026-08-20", "the requested `from` is echoed");
+        assert_eq!(empty.to, "2026-08-19", "`to` is clamped to anchor_date - 1");
+        assert_eq!(empty.anchor_date, "2026-08-20");
+        assert_eq!(empty.today, "2026-08-23");
         assert!(
-            matches!(err, AgendaError::Invalid(ref m) if m == "history must end before the anchor"),
-            "{err:?}"
+            empty.items.is_empty(),
+            "from > to: no row in the clamped window, the anchor day included"
+        );
+        assert!(
+            empty.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            0,
+            "an empty window issues no range read at all: no page, no backlog query"
         );
 
         // The day before the anchor is a legal one-day history page.
@@ -5129,6 +5168,26 @@ mod tests {
             repos.agenda.call_counts().list_by_user_and_date_range,
             1,
             "the history window is ONE read: the backlog query is never issued"
+        );
+
+        // A window whose `to` is past the anchor is clamped, not rejected.
+        repos.agenda.reset_calls();
+        let clamped = get_range(&repos, "u-1", Some("2026-08-18"), Some("2026-08-25")).unwrap();
+        assert_eq!(clamped.from, "2026-08-18", "the requested `from` is echoed");
+        assert_eq!(clamped.to, "2026-08-19", "`to` is clamped to anchor_date - 1");
+        assert_eq!(clamped.anchor_date, "2026-08-20");
+        assert!(
+            clamped.items.is_empty(),
+            "the 2026-08-20 pending row is the anchor day: never in a history page"
+        );
+        assert!(
+            clamped.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            1,
+            "the clamped history window is ONE read: the backlog query is never issued"
         );
 
         // The default read does issue it: the stream plus the backlog region.
@@ -5438,23 +5497,31 @@ mod tests {
             matches!(err, AgendaError::Invalid(ref m) if m == "date range must not exceed 31 days"),
             "{err:?}"
         );
-        // 31 inclusive days is valid — as long as the window is history, i.e.
-        // it ends strictly before the anchor (2026-08-23 here, nothing pends
-        // in the past).
+        // 31 inclusive days is valid — the span is checked on the requested
+        // dates, before the clamp to `anchor_date - 1` (2026-08-22 here;
+        // 2026-08-23 is the anchor, nothing pends in the past).
         let ok = get_range(&repos, "u-1", Some("2026-07-23"), Some("2026-08-22")).unwrap();
-        assert_eq!(ok.from, "2026-07-23", "the window is echoed, not resolved");
+        assert_eq!(ok.from, "2026-07-23", "the requested `from` is echoed");
         assert_eq!(ok.to, "2026-08-22");
         assert!(
             ok.backlog.is_empty(),
             "a history read never fills the backlog"
         );
 
-        // A history window may not reach the anchor day itself: that day is in
-        // the default stream, not a history page.
-        let err = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-23")).unwrap_err();
+        // A window that reaches the anchor day is clamped to the day before
+        // it — and this one lands entirely past the anchor, so it is an empty
+        // 200, never a 400. The anchor day (2026-08-23 = today, nothing pends)
+        // is in the default stream, not a history page.
+        let empty = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-23")).unwrap();
+        assert_eq!(empty.from, "2026-08-23", "the requested `from` is echoed");
+        assert_eq!(empty.to, "2026-08-22", "`to` is clamped to anchor_date - 1");
         assert!(
-            matches!(err, AgendaError::Invalid(ref m) if m == "history must end before the anchor"),
-            "{err:?}"
+            empty.items.is_empty(),
+            "from > to: there is nothing left to read"
+        );
+        assert!(
+            empty.backlog.is_empty(),
+            "a history read never fills the backlog"
         );
 
         let err = get_range(&repos, "u-1", Some("2026-08-24"), Some("2026-08-23")).unwrap_err();

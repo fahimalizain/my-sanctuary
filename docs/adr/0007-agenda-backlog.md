@@ -183,9 +183,15 @@ as `items`).
   has not run) is omitted until the next tick. That is the accepted
   misplacement window, not a third backlog stretch.
 
-- **`from` and `to` both set** — history only. Both required, `to >= from`,
-  span ≤ 31 inclusive days (unchanged messages), AND `to < anchor_date` or 400
-  `history must end before the anchor`. `backlog` is empty. Still a pure read.
+- **`from` and `to` both set** — history only; `backlog` stays empty. Both
+  required, `to >= from` and span ≤ 31 inclusive days (unchanged messages);
+  both are checked on the **requested** dates, before any clamping, so
+  `2026-08-01 … 2026-09-01` is still the span 400 even though it reaches the
+  anchor. `to` is then pulled back to `anchor_date - 1` — the anchor day
+  itself is on the default read, never in a history page — and if that leaves
+  `from > to`, the window lies entirely past the anchor: **200** with empty
+  `items`, empty `backlog`, and those resolved bounds. Still a pure read, and
+  a stored history param refetched after the anchor moved earlier never fails.
   There is no forward page: the stream ends at today+6.
 
 `from`/`to` in the response are the resolved window (anchor…today+6, or the
@@ -214,7 +220,9 @@ visibility refetch stay. The browser still never computes today.
   cannot pin the anchor and it disappears from "today" immediately on stop. That
   is deliberate.
 - The default read can be long (anchor far in the past). History before the
-  anchor is the only paged read, and it must end before the anchor.
+  anchor is the only paged read; it is clamped to end at `anchor_date - 1`, so
+  a window that lies entirely past the anchor reads as empty rather than
+  failing.
 - Reschedule is now a status transition for `OPEN` tasks, so the Board's
   Planned column and `task_logs` finally agree with a Home drag onto a day.
 - No new table and no migration. The first `*/15` tick relocates existing `OPEN`

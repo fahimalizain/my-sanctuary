@@ -216,8 +216,10 @@ async fn focused_task_id(
 /// `anchor_date … today+6` (the oldest past date that still holds a pending
 /// item — civil today when nothing pends — through six days after today, with
 /// no 31-day cap) plus the `backlog` array of every row past that window. An
-/// explicit window is **history only**: at most 31 inclusive days, ending
-/// strictly before `anchor_date`, with an empty `backlog`. This GET is a
+/// explicit window is **history only**: at most 31 inclusive days, `to` is
+/// clamped to the day before `anchor_date` (the anchor day is on the default
+/// read), and a window that lands entirely past the anchor is an empty 200,
+/// never an error. `backlog` stays empty. This GET is a
 /// **pure range read**: it seeds nothing and writes no occurrence / agenda row
 /// (the old `?date=` parameter is ignored). The response carries the
 /// server-computed `today` + `time_zone`.
