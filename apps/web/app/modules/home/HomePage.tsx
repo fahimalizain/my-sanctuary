@@ -365,10 +365,11 @@ export function HomePage() {
     const schedule = () => {
       const delay = msUntilNextMidnight(timeZone);
       if (delay === null) return;
+      // +30s: a fast clock must not refetch while the server is still on yesterday.
       timer = window.setTimeout(() => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
         schedule();
-      }, delay);
+      }, delay + 30_000);
     };
     schedule();
     return () => window.clearTimeout(timer);
@@ -1352,6 +1353,18 @@ export function HomePage() {
       }
       // A failed / no-op fetch makes no new page — stop rather than spin.
       if ((readStream()?.pages.length ?? 0) <= loaded.length) break;
+    }
+    // The crawl can stop short of today: the fetch cap, a failed fetch, or
+    // `earliest_date` refusing an older page. Disarm in that case — a flag
+    // left set would yank the viewport the next time today's header renders
+    // for an unrelated reason (the user simply scrolling to it). When today
+    // IS loaded, keep it set so the layout effect places the scroll once the
+    // new days are committed.
+    const settled = readStream()?.pages ?? [];
+    const first = settled[0];
+    const last = settled[settled.length - 1];
+    if (!first || !last || serverToday < first.from || serverToday > last.to) {
+      setScrollTodayPending(false);
     }
   };
 
