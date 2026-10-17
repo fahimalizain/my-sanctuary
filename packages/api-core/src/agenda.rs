@@ -1889,15 +1889,27 @@ fn occurrence_view(occurrence: &RoutineOccurrence, routine: &Routine, taxonomy: 
     }
 }
 
-/// Validates a local civil date string (`YYYY-MM-DD`).
+/// Validates a local civil date string (`YYYY-MM-DD`) and returns the
+/// **canonical** spelling.
+///
+/// The parse must round-trip: chrono also accepts unpadded fields
+/// (`2026-9-30`) and a signed year (`+2026-10-01`), and every consumer sorts
+/// these strings lexically against canonical today (`"2026-9-30" >
+/// "2026-10-17"`). A parse that does not re-render as the trimmed input is a
+/// 400 — never a silent rewrite. `" 2026-10-17 "` trims first, so it is
+/// valid and returns `"2026-10-17"`.
 fn parse_date(date: &str) -> Result<String, AgendaError> {
     let date = date.trim();
     if date.is_empty() {
         return Err(AgendaError::Invalid("date must be YYYY-MM-DD".to_string()));
     }
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map(|_| date.to_string())
-        .map_err(|_| AgendaError::Invalid("date must be YYYY-MM-DD".to_string()))
+    let canonical = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|parsed| parsed.format("%Y-%m-%d").to_string())
+        .map_err(|_| AgendaError::Invalid("date must be YYYY-MM-DD".to_string()))?;
+    if canonical != date {
+        return Err(AgendaError::Invalid("date must be YYYY-MM-DD".to_string()));
+    }
+    Ok(canonical)
 }
 
 // ──────────────────────────────────────────
@@ -2749,8 +2761,11 @@ mod tests {
 
     /// In-memory `AgendaItemRepo`: hard-delete semantics; the insert mirrors
     /// `INSERT OR IGNORE` — a duplicate key returns the existing row (stored
-    /// sort_order wins). It also holds `Arc`s of the task/occurrence/routine
-    /// stores so the anchor query can join them like D1 does.
+    /// sort_order wins). A **task** kind collides on `(user_id, ref_id)` on
+    /// **any** date, mirroring the partial index `idx_agenda_items_one_per_task`
+    /// (one row per task; occurrences keep one row per date). It also holds
+    /// `Arc`s of the task/occurrence/routine stores so the anchor query can
+    /// join them like D1 does.
     struct FakeAgendaItemRepo {
         stored: Mutex<Vec<AgendaItem>>,
         tasks: Arc<Mutex<Vec<Task>>>,
@@ -2972,6 +2987,18 @@ mod tests {
         async fn insert(&self, item: NewAgendaItem) -> Result<AgendaItem, RepoError> {
             self.calls.lock().unwrap().insert += 1;
             let mut stored = self.stored.lock().unwrap();
+            // idx_agenda_items_one_per_task is `(user_id, ref_id) WHERE kind =
+            // 'task'`: a task holds ONE row on ANY date, so a second insert for
+            // the same task is ignored too — the stored date and rank win.
+            if item.kind == AGENDA_KIND_TASK {
+                if let Some(existing) = stored.iter().find(|row| {
+                    row.user_id == item.user_id
+                        && row.kind == item.kind
+                        && row.ref_id == item.ref_id
+                }) {
+                    return Ok(existing.clone());
+                }
+            }
             // INSERT OR IGNORE semantics: the UNIQUE key already holds a row →
             // return it unchanged (an add never reshuffles an existing item).
             if let Some(existing) = stored.iter().find(|row| {
@@ -4409,6 +4436,11 @@ mod tests {
             "23-08-2026",
             "2026-08-23T00:00:00",
             "not a date",
+            // chrono parses these, but they are not canonical: storing the raw
+            // string would sort them wrongly against `YYYY-MM-DD` today.
+            "2026-9-30",
+            "2026-10-1",
+            "+2026-10-01",
         ] {
             let err = get(&repos, "u-1", bad).unwrap_err();
             assert!(
@@ -4416,6 +4448,8 @@ mod tests {
                 "{err:?} for {bad:?}"
             );
         }
+        // The canonical spelling still resolves — a padded date is valid.
+        assert!(get(&repos, "u-1", "2026-10-17").is_ok());
     }
 
     #[test]
@@ -5382,7 +5416,18 @@ mod tests {
         materialize_date(&repos, "2026-08-23");
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let item_id = agenda.items[0].id.clone();
-        for bad in ["", "   ", "2026-13-01", "23-08-2026", "not a date"] {
+        for bad in [
+            "",
+            "   ",
+            "2026-13-01",
+            "23-08-2026",
+            "not a date",
+            // chrono accepts these spellings; they must still 400 (the raw
+            // string would sort wrongly against canonical today).
+            "2026-9-30",
+            "2026-10-1",
+            "+2026-10-01",
+        ] {
             let err = reschedule(&repos, "u-1", &item_id, bad).unwrap_err();
             assert!(
                 matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
@@ -5398,6 +5443,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.local_date, "2026-08-23");
+    }
+
+    #[test]
+    fn reschedule_of_a_non_canonical_date_moves_nothing() {
+        let repos = repos();
+        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(&repos, "ai-task", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 3);
+
+        // "2026-9-30" is September as text, so a lexical compare against today
+        // ("2026-08-23") would pass it — but it is not canonical, so the call
+        // is a 400 and the row stays on today at its original rank.
+        let err = reschedule(&repos, "u-1", "ai-task", "2026-9-30").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-task"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "the row did not move");
+        assert_eq!(stored.sort_order, 3, "rank untouched");
+
+        // The canonical spelling of the same day still parses and moves.
+        let moved = reschedule(&repos, "u-1", "ai-task", "2026-10-17").unwrap();
+        assert_eq!(moved.item.local_date, "2026-10-17");
+        assert_eq!(moved.item.id, "ai-task", "the same membership row travelled");
     }
 
     #[test]
@@ -7376,6 +7447,36 @@ mod tests {
         ensure_tasks(&repos, "u-1").unwrap();
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), before);
         assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn insert_ignores_a_second_task_row_on_any_date() {
+        let repos = repos();
+        let insert = |date: &str, kind: &str, ref_id: &str, sort_order: i64| {
+            pollster::block_on(repos.agenda.insert(NewAgendaItem {
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: kind.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order,
+            }))
+            .unwrap()
+        };
+
+        // idx_agenda_items_one_per_task: one row per task on ANY date, so the
+        // second date is IGNORED — the stored row keeps its date and rank.
+        let first = insert("2026-08-23", AGENDA_KIND_TASK, "t-1", 4);
+        let second = insert("2026-08-24", AGENDA_KIND_TASK, "t-1", 0);
+        assert_eq!(second.id, first.id, "the stored row is returned");
+        assert_eq!(second.local_date, "2026-08-23", "the stored date wins");
+        assert_eq!(second.sort_order, 4, "the stored rank wins");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "still one row");
+
+        // The index is task-only: an occurrence holds one row per date.
+        let occ_first = insert("2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-1", 0);
+        let occ_second = insert("2026-08-24", AGENDA_KIND_OCCURRENCE, "occ-1", 0);
+        assert_ne!(occ_first.id, occ_second.id, "two rows, one per date");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 3);
     }
 
     #[test]

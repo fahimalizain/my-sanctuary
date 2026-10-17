@@ -6,12 +6,20 @@
 --   2. collapse the remaining duplicates to the greatest local_date,
 --   3. pin the invariant with a partial unique index.
 
--- 1) Orphans: a task-kind row whose ref_id names no LIVING tasks row.
--- Missing and soft-deleted tasks both go — the range read omits them anyway,
--- and the stream must not keep resurrectable slots around.
+-- 1) Orphans: a task-kind row whose ref_id names no LIVING task row of the
+-- SAME user. Missing, soft-deleted and another user's tasks all go — the
+-- range read omits them anyway, and the stream must not keep resurrectable
+-- slots around. NOT EXISTS (not NOT IN): the correlation pins the owner, and
+-- a NULL anywhere in the subquery can no longer blank the whole predicate the
+-- way NOT IN does.
 DELETE FROM agenda_items
 WHERE kind = 'task'
-  AND ref_id NOT IN (SELECT id FROM tasks WHERE deleted_at IS NULL);
+  AND NOT EXISTS (
+    SELECT 1 FROM tasks t
+    WHERE t.id = agenda_items.ref_id
+      AND t.user_id = agenda_items.user_id
+      AND t.deleted_at IS NULL
+  );
 
 -- 2) Duplicates: keep the greatest local_date per (user_id, ref_id) — the
 -- latest planned day wins — and delete the other task-kind rows. YYYY-MM-DD

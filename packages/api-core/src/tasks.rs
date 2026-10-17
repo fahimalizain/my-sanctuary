@@ -3350,6 +3350,18 @@ mod tests {
             item: NewAgendaItem,
         ) -> Result<crate::models::AgendaItem, RepoError> {
             let mut stored = self.stored.lock().unwrap();
+            // idx_agenda_items_one_per_task is `(user_id, ref_id) WHERE kind =
+            // 'task'`: a task holds ONE row on ANY date, so a second insert for
+            // the same task is ignored too — the stored date and rank win.
+            if item.kind == AGENDA_KIND_TASK {
+                if let Some(existing) = stored.iter().find(|row| {
+                    row.user_id == item.user_id
+                        && row.kind == item.kind
+                        && row.ref_id == item.ref_id
+                }) {
+                    return Ok(existing.clone());
+                }
+            }
             // INSERT OR IGNORE: the UNIQUE key already holds a row → return it
             // unchanged (an append never reshuffles an existing item).
             if let Some(existing) = stored.iter().find(|row| {

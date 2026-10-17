@@ -944,9 +944,24 @@ impl AgendaItemRepo for D1AgendaItemRepo {
         run_stmt(stmt).await?;
         // INSERT OR IGNORE: a duplicate key kept the existing row (stored
         // sort_order wins) — read it back under the UNIQUE key.
-        self.get_by_key(&item.user_id, &item.local_date, &item.kind, &item.ref_id)
+        if let Some(row) = self
+            .get_by_key(&item.user_id, &item.local_date, &item.kind, &item.ref_id)
             .await?
-            .ok_or_else(|| RepoError::Backend("agenda item insert produced no row".to_string()))
+        {
+            return Ok(row);
+        }
+        // A task holds ONE row on ANY date (idx_agenda_items_one_per_task), so
+        // the ignored insert may have collided with that row on another day:
+        // read it back by ref before calling the insert a failure.
+        if item.kind == api_core::AGENDA_KIND_TASK {
+            if let Some(row) = self
+                .get_by_ref(&item.user_id, &item.kind, &item.ref_id)
+                .await?
+            {
+                return Ok(row);
+            }
+        }
+        Err(RepoError::Backend("agenda item insert produced no row".to_string()))
     }
 
     async fn list_by_refs(
