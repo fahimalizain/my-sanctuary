@@ -544,6 +544,10 @@ export interface OccurrenceRecord {
   google_event_id: string | null;
   created_at: string;
   updated_at: string;
+  // Computed by the API: `true` when the backing routine is soft-deleted (or
+  // gone). Such a row is read-only history — no verbs, no reschedule, no
+  // drag; pending/in-progress rows of a deleted routine are never returned.
+  routine_deleted: boolean;
   // Computed from the **resolved** title with the same matcher as tasks.
   category: TaskCategorySummary;
 }
@@ -567,34 +571,42 @@ export interface AgendaItemRecord {
   occurrence: OccurrenceRecord | null;
 }
 
-// The envelope returned by GET /api/agenda?date=YYYY-MM-DD (seeds on read;
-// the date query is optional — missing/blank = civil today). `today` +
+// The envelope returned by GET /api/agenda — one window of the infinite day
+// stream (both bounds omitted → the server's anchor week, `anchor_date …
+// anchor_date + 6`; both set → that inclusive window, max 31 days). `today` +
 // `time_zone` are the server's civil today (ADR 0004 amendment): the civil
-// date of now in the user's primary Google calendar's IANA `time_zone` —
-// the browser must never compute "today" itself.
+// date of now in the user's primary Google calendar's IANA `time_zone` — the
+// browser must never compute "today" itself.
 export interface AgendaResponse {
   items: AgendaItemRecord[];
-  // YYYY-MM-DD — civil today in `time_zone`; Home's "Today" anchor.
+  // `YYYY-MM-DD` — the resolved inclusive window start (never the raw query).
+  from: string;
+  // `YYYY-MM-DD` — the resolved inclusive window end.
+  to: string;
+  // `YYYY-MM-DD` — civil today in `time_zone`; Home's "Today" anchor.
   today: string;
   // IANA name of the zone that produced `today` (the primary calendar's
   // `time_zone`, or "UTC" when the user has no primary calendar).
   time_zone: string;
+  // `YYYY-MM-DD` — the oldest past date that still holds a **pending** item,
+  // else `today`. The anchor-week window starts here; Home lands here.
+  anchor_date: string;
+  // `YYYY-MM-DD` — `MIN(local_date)` over all agenda rows, else `today`.
+  // Independent of the window: the browser's back-scroll floor.
+  earliest_date: string;
 }
 
-// The envelope returned by POST /api/agenda/items,
-// POST /api/agenda/items/:id/move and POST /api/agenda/items/:id/reschedule.
+// The envelope returned by POST /api/agenda/items/:id/move and
+// POST /api/agenda/items/:id/reschedule.
 export interface AgendaItemResponse {
   item: AgendaItemRecord;
 }
 
-// Request body for POST /api/agenda/items — tasks only in v1 (occurrences
-// are auto-seeded); the `date` is required. `sort_order` is optional: the
-// server appends at `max+1` for the date when omitted.
-export interface NewAgendaItemInput {
-  kind: 'task';
-  ref_id: string;
-  date: string;
-  sort_order?: number;
+// The envelope returned by POST /api/agenda/days/:date/move-to-today: only the
+// rows the sweep actually moved, in the order they were appended to today's
+// pile.
+export interface MoveDayToTodayResponse {
+  items: AgendaItemRecord[];
 }
 
 // Request body for POST /api/agenda/items/:id/move — the absolute rank the
@@ -604,12 +616,14 @@ export interface MoveAgendaItemInput {
 }
 
 // Request body for POST /api/agenda/items/:id/reschedule — the local civil
-// date (`YYYY-MM-DD`) the slot relocates to. Occurrences move only while
-// `pending | skipped` (skipped → pending; in_progress/done → 400); tasks
-// move the membership slot only, task status unchanged. Same date → 200
-// no-op.
+// date (`YYYY-MM-DD`) the slot relocates to. `sort_order` is optional: a named
+// rank shifts the target date's peers at/after it up one, an omitted one
+// appends at `max + 1`. Occurrences move only while `pending | skipped`
+// (skipped → pending; in_progress/done → 400); tasks move the membership slot
+// only, task status unchanged. Same date → 200 no-op; a past date 400s.
 export interface RescheduleAgendaItemInput {
   date: string;
+  sort_order?: number;
 }
 
 // The envelope returned by PATCH /api/occurrences/:id,

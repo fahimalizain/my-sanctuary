@@ -4,16 +4,16 @@
 // ADR 0004 `/pause` lands pending + clears chip ids — rename, reschedule
 // popover) and the
 // task variant (checkbox toggles completed ↔ planned, start, pause while
-// in progress — ADR 0002 `/pause` lands PLANNED — remove-from-day,
-// reschedule popover, tap → TaskModal). Living rows lead with a grab handle
-// (ADR 0004 amendment — reorder is a handle, chevrons are gone): the grip is
-// the ONLY drag activator, so a tap on checkbox / title / skip / play /
-// pause / calendar / unpin never starts a drag. Parked rows (the Completed dump —
-// ADR 0004 amendment) render the same card WITHOUT the grip: the dump is not
-// a drop target, so `showHandle={false}` omits the DragHandle and HomePage
-// renders the plain component, never the sortable wrapper. Pure
-// presentational — every mutation lives in HomePage; HomePage owns the verb
-// branch (reopen vs complete/skip).
+// in progress — ADR 0002 `/pause` lands PLANNED — reschedule popover, tap →
+// TaskModal). Living rows lead with a grab handle (ADR 0004 amendment —
+// reorder is a handle): the grip is the ONLY drag activator, so a tap on
+// checkbox / title / skip / play / pause / calendar never starts a drag.
+// Parked rows (the Completed dump — ADR 0004 amendment) render the same card
+// WITHOUT the grip. Occurrence rows of a soft-deleted routine
+// (`routine_deleted`) are read-only history: no checkbox, skip, reschedule,
+// rename, play or grip — just the muted hint. Pure presentational — every
+// mutation lives in HomePage; HomePage owns the verb branch (reopen vs
+// complete/skip).
 
 import { Children, useState, type ReactNode } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
@@ -31,7 +31,6 @@ import {
   Pause,
   Pencil,
   Play,
-  X,
 } from 'lucide-react';
 import type {
   AgendaItemRecord,
@@ -52,17 +51,20 @@ import {
 interface AgendaItemRowProps {
   item: AgendaItemRecord;
   /** dnd-kit activator props for the grip — spread ONLY on the handle so a
-   *  tap on checkbox / title / skip / play / pause / calendar / unpin never starts
-   *  a drag. Present on living rows (the SortableAgendaItemRow wrapper
+   *  tap on checkbox / title / skip / play / pause / calendar never starts
+   *  a drag. Present on draggable rows (the SortableAgendaItemRow wrapper
    *  supplies them); parked rows in the Completed dump render without a
    *  grip and omit them. */
   attributes?: DraggableAttributes;
   listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
   /** Render the grab handle? Defaults to true. HomePage passes
-   *  `showHandle={false}` for parked rows — the Completed dump is not
-   *  sortable, so there is nothing to grab. */
+   *  `showHandle={false}` for parked rows and for living rows a drag may not
+   *  grab (done/skipped occurrences, deleted routines, orphans). */
   showHandle?: boolean;
+  /** The server's civil today — the Play gate (start is today-only on the
+   *  API) and the RescheduleControl's floor. */
+  serverToday: string;
   /** Move the slot to another day (`YYYY-MM-DD`) — HomePage fires
    *  `POST /api/agenda/items/:id/reschedule` optimistically. */
   onReschedule: (item: AgendaItemRecord, date: string) => void;
@@ -70,7 +72,6 @@ interface AgendaItemRowProps {
   onStartTask: (item: AgendaItemRecord) => void;
   /** Pause an in-progress task (ADR 0002 `/pause` → PLANNED). */
   onPauseTask: (item: AgendaItemRecord) => void;
-  onRemoveTask: (item: AgendaItemRecord) => void;
   onOpenTask: (task: TaskRecord) => void;
   onCompleteOccurrence: (item: AgendaItemRecord) => void;
   onSkipOccurrence: (item: AgendaItemRecord) => void;
@@ -78,10 +79,7 @@ interface AgendaItemRowProps {
   /** Pause an in-progress occurrence (ADR 0004 `/pause` → pending + clear
    *  chip ids). No today gate — a civil-day rollover can still be running. */
   onPauseOccurrence: (item: AgendaItemRecord) => void;
-  onRenameOccurrence: (occurrence: OccurrenceRecord) => void;
-  /** Start is today-only (ADR 0004): Home renders Play for pending
-   *  occurrences only when the selected date is the civil today. */
-  showStartOccurrence?: boolean;
+  onRenameOccurrence: (item: AgendaItemRecord) => void;
 }
 
 /** Shared icon-button: 28px circle in the mobile action pill, compact on desktop. */
@@ -223,10 +221,11 @@ function CheckCircle({
 /** The reorder grip — the FIRST control on a LIVING row (before the
  *  checkbox) and the only drag activator: the dnd-kit listeners live here
  *  and nowhere else, so row taps (checkbox, title, skip, play, pause,
- *  calendar, unpin) never start a drag. `touch-none` stops a grab from scrolling the
+ *  calendar) never start a drag. `touch-none` stops a grab from scrolling the
  *  page; the cursor flips to grabbing while the drag is live. Rows in the
- *  Completed dump never render it (`showHandle={false}` in the rows below),
- *  so its props are optional here too. */
+ *  Completed dump and read-only history rows never render it
+ *  (`showHandle={false}` in the rows below), so its props are optional here
+ *  too. */
 function DragHandle({
   attributes,
   listeners,
@@ -255,28 +254,32 @@ function DragHandle({
   );
 }
 
-/** Move-to-another-day control (ADR 0004 amendment — reschedule): a
- *  calendar icon opens a small popover with a primary "Tomorrow" action
- *  plus a compact native date picker for any other day. Both fire
- *  immediately — no confirm — so the row's optimistic drop in HomePage is
- *  instant; failures revert + banner. "Tomorrow" is the ROW's own date +1
- *  civil day (moving from a future day still means "the next day"), never
- *  the browser's today. The popover closes and the picker resets after
- *  either action so it never reads as a filter. Skip stays its own control
- *  (ADR 0004 amendment — the calendar popover is Tomorrow + pick-a-day
- *  only). */
+/** Move-to-another-day control (ADR 0004 amendment — reschedule, slice 5
+ *  stream rules): a calendar icon opens a small popover with "Today" and
+ *  "Tomorrow" actions plus a compact native date picker for any other day.
+ *  Every action fires immediately — no confirm — so the row's optimistic drop
+ *  in HomePage is instant; failures revert + banner. "Today" means the
+ *  SERVER's civil today (`serverToday`), never the browser's date; "Tomorrow"
+ *  is the ROW's own date +1 civil day and hides once that day is past (the
+ *  API rejects a reschedule into the past). The picker's floor is
+ *  `serverToday`, so a past day can never be offered. The popover closes and
+ *  the picker resets after either action so it never reads as a filter. */
 function RescheduleControl({
   item,
   label,
+  serverToday,
   onReschedule,
 }: {
   item: AgendaItemRecord;
   label: string;
+  serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
 }) {
   const [open, setOpen] = useState(false);
   const [pickDate, setPickDate] = useState('');
   const tomorrow = addCivilDays(item.local_date, 1);
+  const showToday = !!serverToday && item.local_date !== serverToday;
+  const showTomorrow = !!serverToday && tomorrow >= serverToday;
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
@@ -287,22 +290,40 @@ function RescheduleControl({
         <Calendar className="h-3.5 w-3.5" />
       </PopoverTrigger>
       <PopoverContent className="w-[min(12rem,calc(100vw-2rem))] flex flex-col gap-1">
-        <button
-          type="button"
-          onClick={() => {
-            setOpen(false);
-            onReschedule(item, tomorrow);
-          }}
-          aria-label={`Move ${label} to tomorrow`}
-          title="Move to tomorrow"
-          className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-        >
-          <CalendarClock className="h-3.5 w-3.5" />
-          Tomorrow
-        </button>
+        {showToday && (
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onReschedule(item, serverToday);
+            }}
+            aria-label={`Move ${label} to today`}
+            title="Move to today"
+            className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+          >
+            <CalendarClock className="h-3.5 w-3.5" />
+            Today
+          </button>
+        )}
+        {showTomorrow && (
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onReschedule(item, tomorrow);
+            }}
+            aria-label={`Move ${label} to tomorrow`}
+            title="Move to tomorrow"
+            className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+          >
+            <CalendarClock className="h-3.5 w-3.5" />
+            Tomorrow
+          </button>
+        )}
         <input
           type="date"
           value={pickDate}
+          min={serverToday || undefined}
           onChange={(e) => {
             const next = e.target.value;
             // No confirm: picking a day reschedules immediately, then the
@@ -396,12 +417,12 @@ function OccurrenceRow({
   listeners,
   isDragging,
   showHandle,
+  serverToday,
   onReschedule,
   onComplete,
   onSkip,
   onStart,
   onPause,
-  showStart,
   onRename,
 }: {
   item: AgendaItemRecord;
@@ -410,22 +431,28 @@ function OccurrenceRow({
   listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
   showHandle: boolean;
+  serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onSkip: () => void;
   onStart: () => void;
   onPause: () => void;
-  showStart: boolean;
   onRename: () => void;
 }) {
   const crossed =
     occurrence.status === 'done' || occurrence.status === 'skipped';
+  // A soft-deleted routine's row is history: no verbs, no grip, no rename.
+  const readOnly = occurrence.routine_deleted;
+  // Start is today-only on the API (it opens a one-shot Google log "now"), so
+  // Play lives on the row whose civil day IS the server's today.
+  const canStart =
+    occurrence.status === 'pending' && item.local_date === serverToday;
   return (
     <AgendaRowShell
       crossed={crossed}
       color={occurrence.category.color}
       handle={
-        showHandle ? (
+        showHandle && !readOnly ? (
           <DragHandle
             attributes={attributes}
             listeners={listeners}
@@ -435,24 +462,32 @@ function OccurrenceRow({
         ) : null
       }
       check={
-        <CheckCircle
-          checked={occurrence.status === 'done'}
-          label={occurrence.resolved_title}
-          onClick={onComplete}
-        />
+        readOnly ? null : (
+          <CheckCircle
+            checked={occurrence.status === 'done'}
+            label={occurrence.resolved_title}
+            onClick={onComplete}
+          />
+        )
       }
       title={
-        <button
-          type="button"
-          onClick={onRename}
-          aria-label={`Rename ${occurrence.resolved_title}`}
-          className="group flex min-w-0 items-center gap-1 text-left sm:flex-1"
-        >
+        readOnly ? (
           <span className={cn(TITLE_TEXT, crossed && 'line-through')}>
             {occurrence.resolved_title}
           </span>
-          <Pencil className="h-3 w-3 flex-shrink-0 text-muted-foreground/50 group-hover:text-muted-foreground [@media(hover:none)]:text-muted-foreground" />
-        </button>
+        ) : (
+          <button
+            type="button"
+            onClick={onRename}
+            aria-label={`Rename ${occurrence.resolved_title}`}
+            className="group flex min-w-0 items-center gap-1 text-left sm:flex-1"
+          >
+            <span className={cn(TITLE_TEXT, crossed && 'line-through')}>
+              {occurrence.resolved_title}
+            </span>
+            <Pencil className="h-3 w-3 flex-shrink-0 text-muted-foreground/50 group-hover:text-muted-foreground [@media(hover:none)]:text-muted-foreground" />
+          </button>
+        )
       }
       meta={
         <AgendaRowMeta>
@@ -475,37 +510,45 @@ function OccurrenceRow({
               }
             />
           )}
-          <AgendaRowActions>
-            <PlayPauseControl
-              label={occurrence.resolved_title}
-              canStart={occurrence.status === 'pending' && showStart}
-              running={occurrence.status === 'in_progress'}
-              onStart={onStart}
-              onPause={onPause}
-            />
-            {occurrence.status !== 'done' && (
-              <button
-                type="button"
-                onClick={onSkip}
-                aria-label={
-                  occurrence.status === 'skipped'
-                    ? `Undo skip ${occurrence.resolved_title}`
-                    : `Skip ${occurrence.resolved_title}`
-                }
-                title={occurrence.status === 'skipped' ? 'Undo skip' : 'Skip'}
-                className={ICON_BTN}
-              >
-                <CalendarX2 className="h-3.5 w-3.5" />
-              </button>
-            )}
-            {canReschedule(item) && (
-              <RescheduleControl
-                item={item}
+          {readOnly && (
+            <span className="flex-shrink-0 text-[11px] italic text-muted-foreground/70">
+              routine deleted
+            </span>
+          )}
+          {!readOnly && (
+            <AgendaRowActions>
+              <PlayPauseControl
                 label={occurrence.resolved_title}
-                onReschedule={onReschedule}
+                canStart={canStart}
+                running={occurrence.status === 'in_progress'}
+                onStart={onStart}
+                onPause={onPause}
               />
-            )}
-          </AgendaRowActions>
+              {occurrence.status !== 'done' && (
+                <button
+                  type="button"
+                  onClick={onSkip}
+                  aria-label={
+                    occurrence.status === 'skipped'
+                      ? `Undo skip ${occurrence.resolved_title}`
+                      : `Skip ${occurrence.resolved_title}`
+                  }
+                  title={occurrence.status === 'skipped' ? 'Undo skip' : 'Skip'}
+                  className={ICON_BTN}
+                >
+                  <CalendarX2 className="h-3.5 w-3.5" />
+                </button>
+              )}
+              {canReschedule(item) && (
+                <RescheduleControl
+                  item={item}
+                  label={occurrence.resolved_title}
+                  serverToday={serverToday}
+                  onReschedule={onReschedule}
+                />
+              )}
+            </AgendaRowActions>
+          )}
         </AgendaRowMeta>
       }
     />
@@ -519,11 +562,11 @@ function TaskRow({
   listeners,
   isDragging,
   showHandle,
+  serverToday,
   onReschedule,
   onComplete,
   onStart,
   onPause,
-  onRemove,
   onOpen,
 }: {
   item: AgendaItemRecord;
@@ -532,14 +575,18 @@ function TaskRow({
   listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
   showHandle: boolean;
+  serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onComplete: () => void;
   onStart: () => void;
   onPause: () => void;
-  onRemove: () => void;
   onOpen: () => void;
 }) {
   const crossed = task.status === 'COMPLETED';
+  // Start is today-only on the API (it opens the running Google event "now").
+  const canStart =
+    (task.status === 'OPEN' || task.status === 'PLANNED') &&
+    item.local_date === serverToday;
   return (
     <AgendaRowShell
       crossed={crossed}
@@ -586,27 +633,16 @@ function TaskRow({
           <AgendaRowActions>
             <PlayPauseControl
               label={task.display_title}
-              canStart={task.status === 'OPEN' || task.status === 'PLANNED'}
+              canStart={canStart}
               running={task.status === 'IN_PROGRESS'}
               onStart={onStart}
               onPause={onPause}
             />
-            <button
-              type="button"
-              onClick={onRemove}
-              aria-label={`Remove ${task.display_title} from this day`}
-              title="Remove from this day"
-              className={cn(
-                ICON_BTN,
-                'hover:bg-destructive/10 hover:text-destructive',
-              )}
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
             {canReschedule(item) && (
               <RescheduleControl
                 item={item}
                 label={task.display_title}
+                serverToday={serverToday}
                 onReschedule={onReschedule}
               />
             )}
@@ -629,13 +665,13 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         listeners={props.listeners}
         isDragging={props.isDragging}
         showHandle={showHandle}
+        serverToday={props.serverToday}
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
         onStart={() => props.onStartOccurrence(item)}
         onPause={() => props.onPauseOccurrence(item)}
-        showStart={props.showStartOccurrence ?? false}
-        onRename={() => props.onRenameOccurrence(item.occurrence!)}
+        onRename={() => props.onRenameOccurrence(item)}
       />
     );
   }
@@ -648,11 +684,11 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         listeners={props.listeners}
         isDragging={props.isDragging}
         showHandle={showHandle}
+        serverToday={props.serverToday}
         onReschedule={props.onReschedule}
         onComplete={() => props.onCompleteTask(item)}
         onStart={() => props.onStartTask(item)}
         onPause={() => props.onPauseTask(item)}
-        onRemove={() => props.onRemoveTask(item)}
         onOpen={() => props.onOpenTask(item.task!)}
       />
     );

@@ -10,17 +10,15 @@ test('queryKeys.tasks.all is ["tasks"]', () => {
   assert.deepEqual(queryKeys.tasks.all, ['tasks']);
 });
 
-test('queryKeys.agenda.byDate() with no/empty/undefined date uses the today sentinel', () => {
-  assert.deepEqual(queryKeys.agenda.byDate(), ['agenda', 'today']);
-  assert.deepEqual(queryKeys.agenda.byDate(''), ['agenda', 'today']);
-  assert.deepEqual(queryKeys.agenda.byDate(undefined), ['agenda', 'today']);
+test('queryKeys.agenda.stream() is ["agenda", "stream"]', () => {
+  assert.deepEqual(queryKeys.agenda.stream(), ['agenda', 'stream']);
 });
 
-test('queryKeys.agenda.byDate("2026-08-23") is ["agenda", "2026-08-23"]', () => {
-  assert.deepEqual(queryKeys.agenda.byDate('2026-08-23'), [
-    'agenda',
-    '2026-08-23',
-  ]);
+test('queryKeys.agenda.stream() starts with queryKeys.agenda.all', () => {
+  assert.deepEqual(
+    queryKeys.agenda.stream().slice(0, queryKeys.agenda.all.length),
+    queryKeys.agenda.all,
+  );
 });
 
 test('queryKeys.calendar.events("a", "b") is ["calendar", "events", "a", "b"]', () => {

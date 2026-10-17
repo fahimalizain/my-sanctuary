@@ -18,25 +18,36 @@ use api_core::models::{
     UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
 };
 use api_core::repo::{
-    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_occurrence_insert_sql,
-    build_occurrence_list_by_ids_sql, AgendaItemRepo, OccurrenceRepo, RepoError, RoutineRepo,
+    build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
+    build_agenda_item_list_by_refs_sql, build_occurrence_delete_by_ids_sql,
+    build_occurrence_insert_sql,
+    build_occurrence_list_by_ids_sql, build_routine_list_by_ids_sql, AgendaItemRepo,
+    OccurrenceRepo, RepoError, RoutineRepo,
     TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
-    AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
-    AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,
-    AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
-    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
+    AGENDA_ITEM_DELETE_BY_REF_SQL, AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE,
+    AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL,
+    AGENDA_ITEM_GET_BY_KEY_SQL, AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL,
+    AGENDA_ITEM_INSERT_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE,
+    AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL,
+    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_MIN_LOCAL_DATE_SQL,
+    AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL,
+    AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL, OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL,
     OCCURRENCE_INSERT_SQL, OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
-    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_IN_PROGRESS_SQL,
+    OCCURRENCE_LIST_BY_USER_AND_DATE_SQL, OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL,
+    OCCURRENCE_LIST_IN_PROGRESS_SQL,
     OCCURRENCE_CLEAR_EVENT_IDS_SQL, OCCURRENCE_SET_EVENT_IDS_SQL, OCCURRENCE_SET_STATUS_SQL,
     OCCURRENCE_UPDATE_TITLE_SQL, ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
-    ROUTINE_LIST_BY_USER_ID_SQL, ROUTINE_MAX_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
+    ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL,
+    ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
+    ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL,
     TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL,
     TASK_CATEGORY_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_DELETE_SQL,
     TASK_CATEGORY_PATTERNS_INSERT_SQL, TASK_CATEGORY_PATTERNS_LIST_BY_USER_ID_SQL,
     TASK_CATEGORY_PATTERNS_LIST_SQL, TASK_CATEGORY_UPDATE_SQL, TASK_DELETE_SQL, TASK_GET_BY_ID_SQL,
     TASK_INSERT_SQL, TASK_LIST_BY_USER_ID_SQL, TASK_LIST_IN_PROGRESS_SQL,
+    TASK_LIST_USER_IDS_WITH_OPEN_SQL,
     TASK_LIST_COUNT_BY_USER_ID_SQL, TASK_LIST_COUNT_ROOT_CATEGORIES_SQL, TASK_LIST_DELETE_SQL,
     TASK_LIST_GET_BY_ID_SQL, TASK_LIST_INSERT_SQL, TASK_LIST_LIST_BY_USER_ID_SQL,
     TASK_LIST_UPDATE_SQL, TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL,
@@ -300,6 +311,21 @@ struct SortOrderRow {
     pub sort_order: i64,
 }
 
+/// Row projection for the `SELECT DISTINCT user_id …` statements behind the
+/// agenda fill cron's work list (one column only).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct UserIdRow {
+    pub user_id: String,
+}
+
+/// Row projection for the agenda stream's `MIN(local_date)` statements. The
+/// aggregate always yields one row; `None` means the matched set was empty
+/// (`MIN()` over zero rows is NULL).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct LocalDateRow {
+    pub local_date: Option<String>,
+}
+
 /// `task_lists` table persistence.
 pub struct D1TaskListRepo {
     db: D1Database,
@@ -545,6 +571,33 @@ impl RoutineRepo for D1RoutineRepo {
         let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.sort_order))
     }
+
+    async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {
+        // The agenda fill cron's routine-side user list: no binds, so
+        // `prepare` returns the statement directly.
+        let rows: Vec<UserIdRow> = query_vec(self.db.prepare(ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL)).await?;
+        Ok(rows.into_iter().map(|row| row.user_id).collect())
+    }
+
+    async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError> {
+        // Empty IN list → no SQL at all.
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Deliberately no `deleted_at` filter: the range read's history path
+        // needs a soft-deleted routine's display fields.
+        let mut rows = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(ROUTINE_LIST_BY_IDS_CHUNK_SIZE) {
+            let (sql, args) = build_routine_list_by_ids_sql(chunk);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            rows.extend(query_vec(stmt).await?);
+        }
+        Ok(rows)
+    }
 }
 
 /// `routine_occurrences` table persistence (ADR 0004).
@@ -594,6 +647,26 @@ impl OccurrenceRepo for D1OccurrenceRepo {
             .db
             .prepare(OCCURRENCE_LIST_BY_USER_AND_DATE_SQL)
             .bind_refs(&[D1Type::Text(user_id), D1Type::Text(local_date)])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RoutineOccurrence>, RepoError> {
+        // The agenda fill's one horizon read; no `deleted_at` filter (the
+        // table has none).
+        let stmt = self
+            .db
+            .prepare(OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(from),
+                D1Type::Text(to),
+            ])
             .map_err(backend)?;
         query_vec(stmt).await
     }
@@ -651,6 +724,26 @@ impl OccurrenceRepo for D1OccurrenceRepo {
         for chunk in rows.chunks(OCCURRENCE_INSERT_CHUNK_SIZE) {
             let ids: Vec<String> = chunk.iter().map(|_| uuid::Uuid::new_v4().to_string()).collect();
             let (sql, args) = build_occurrence_insert_sql(chunk, &now, ids);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_by_ids(&self, ids: &[String]) -> Result<(), RepoError> {
+        // Empty IN list → no SQL at all.
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // HARD delete: a rule change / routine delete drops the untouched
+        // future rows the fill materialized. Their `agenda_items` rows are the
+        // caller's separate deletes.
+        for chunk in ids.chunks(OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE) {
+            let (sql, args) = build_occurrence_delete_by_ids_sql(chunk);
             let stmt = self
                 .db
                 .prepare(&sql)
@@ -748,6 +841,48 @@ impl AgendaItemRepo for D1AgendaItemRepo {
         query_vec(stmt).await
     }
 
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<AgendaItem>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(from),
+                D1Type::Text(to),
+            ])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn min_local_date(&self, user_id: &str) -> Result<Option<String>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_MIN_LOCAL_DATE_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row = stmt.first::<LocalDateRow>(None).await.map_err(backend)?;
+        Ok(row.and_then(|row| row.local_date))
+    }
+
+    async fn oldest_pending_local_date_before(
+        &self,
+        user_id: &str,
+        before: &str,
+    ) -> Result<Option<String>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(before)])
+            .map_err(backend)?;
+        let row = stmt.first::<LocalDateRow>(None).await.map_err(backend)?;
+        Ok(row.and_then(|row| row.local_date))
+    }
+
     async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError> {
         let stmt = self
             .db
@@ -811,9 +946,24 @@ impl AgendaItemRepo for D1AgendaItemRepo {
         run_stmt(stmt).await?;
         // INSERT OR IGNORE: a duplicate key kept the existing row (stored
         // sort_order wins) — read it back under the UNIQUE key.
-        self.get_by_key(&item.user_id, &item.local_date, &item.kind, &item.ref_id)
+        if let Some(row) = self
+            .get_by_key(&item.user_id, &item.local_date, &item.kind, &item.ref_id)
             .await?
-            .ok_or_else(|| RepoError::Backend("agenda item insert produced no row".to_string()))
+        {
+            return Ok(row);
+        }
+        // A task holds ONE row on ANY date (idx_agenda_items_one_per_task), so
+        // the ignored insert may have collided with that row on another day:
+        // read it back by ref before calling the insert a failure.
+        if item.kind == api_core::AGENDA_KIND_TASK {
+            if let Some(row) = self
+                .get_by_ref(&item.user_id, &item.kind, &item.ref_id)
+                .await?
+            {
+                return Ok(row);
+            }
+        }
+        Err(RepoError::Backend("agenda item insert produced no row".to_string()))
     }
 
     async fn list_by_refs(
@@ -868,6 +1018,50 @@ impl AgendaItemRepo for D1AgendaItemRepo {
             .bind_refs(&[D1Type::Text(id)])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    async fn delete_by_ref(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<(), RepoError> {
+        // Every matching row (never `LIMIT 1`); zero rows is a no-op.
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_DELETE_BY_REF_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(kind),
+                D1Type::Text(ref_id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn delete_by_refs(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_ids: &[String],
+    ) -> Result<(), RepoError> {
+        // Empty IN list → no SQL at all.
+        if ref_ids.is_empty() {
+            return Ok(());
+        }
+        // Chunk to stay under D1's 100 bound-parameter limit (2 fixed binds +
+        // 98 ids per statement); each chunk is one D1 subrequest. Every
+        // matching row goes; zero matches is a no-op.
+        for chunk in ref_ids.chunks(AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE) {
+            let (sql, args) = build_agenda_item_delete_by_refs_sql(user_id, kind, chunk);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
     }
 
     async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError> {
@@ -1197,6 +1391,13 @@ impl TaskRepo for D1TaskRepo {
         // `prepare` returns the statement directly when there is nothing to
         // bind.
         query_vec(self.db.prepare(TASK_LIST_IN_PROGRESS_SQL)).await
+    }
+
+    async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError> {
+        // The agenda fill cron's task-side user list: no binds, so `prepare`
+        // returns the statement directly.
+        let rows: Vec<UserIdRow> = query_vec(self.db.prepare(TASK_LIST_USER_IDS_WITH_OPEN_SQL)).await?;
+        Ok(rows.into_iter().map(|row| row.user_id).collect())
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {

@@ -11,6 +11,11 @@ import { queryClient } from '@/lib/queryClient';
 
 // `queryOptions` keeps the factory React-free so the query key/queryFn pair
 // can be reused and tested without a component. Hooks below wrap it.
+//
+// Routine writes also invalidate Home's `['agenda']` day-stream: creating,
+// retitling or deleting a routine changes the auto-seeded occurrences, and a
+// delete turns their history read-only — the optimistic agenda paint cannot
+// know any of that, so the stream re-reads.
 
 export function routinesQueryOptions() {
   return queryOptions({
@@ -31,6 +36,7 @@ export function useCreateRoutine() {
     mutationFn: createRoutine,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.routines.all });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
     },
   });
 }
@@ -41,6 +47,7 @@ export function useUpdateRoutine() {
       updateRoutine(id, input),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.routines.all });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
     },
   });
 }
@@ -50,6 +57,7 @@ export function useDeleteRoutine() {
     mutationFn: (id: string) => deleteRoutine(id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.routines.all });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
     },
   });
 }

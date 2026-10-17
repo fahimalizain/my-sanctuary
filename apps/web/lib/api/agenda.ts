@@ -3,26 +3,24 @@ import type {
   AgendaItemResponse,
   AgendaResponse,
   MoveAgendaItemInput,
-  NewAgendaItemInput,
+  MoveDayToTodayResponse,
   RescheduleAgendaItemInput,
 } from '@/app/types';
 
-/** The day's agenda. `date` is optional on purpose — a first Home load omits
- *  `?date=` so the server reads its own civil today (ADR 0004); an undefined
- *  or empty date never appends the query. */
-export function getAgenda(date?: string): Promise<AgendaResponse> {
+/** One window of the agenda stream (ADR 0004 amendment). Both bounds omitted
+ *  → `GET /api/agenda` with no query at all: the server reads its own civil
+ *  today and returns the anchor week (`anchor_date … anchor_date + 6`). Both
+ *  set → the inclusive `?from=&to=` window (max 31 days; the server 400s an
+ *  inverted or oversized one). Never sends `?date=` — the old single-day read
+ *  is gone, and the browser must never compute "today" itself. */
+export function getAgendaRange(
+  from?: string,
+  to?: string,
+): Promise<AgendaResponse> {
+  if (!from || !to) return fetchJson<AgendaResponse>('/api/agenda');
   return fetchJson<AgendaResponse>(
-    date ? `/api/agenda?date=${encodeURIComponent(date)}` : '/api/agenda',
+    `/api/agenda?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
   );
-}
-
-export function createAgendaItem(
-  input: NewAgendaItemInput,
-): Promise<AgendaItemResponse> {
-  return fetchJson<AgendaItemResponse>('/api/agenda/items', {
-    method: 'POST',
-    body: input,
-  });
 }
 
 export function moveAgendaItem(
@@ -45,6 +43,15 @@ export function rescheduleAgendaItem(
   });
 }
 
-export function deleteAgendaItem(id: string): Promise<void> {
-  return fetchJson<void>(`/api/agenda/items/${id}`, { method: 'DELETE' });
+/** Sweep a **past** day's still-pending rows onto civil today, in one tap
+ *  (`?date >= today` 400s). The response carries only the rows that moved, in
+ *  the order they were appended to today's pile. Rows that cannot move
+ *  (done/skipped/in-progress occurrences, terminal or soft-deleted tasks,
+ *  leftovers of a deleted routine, orphans) never fail the call — they simply
+ *  stay put. */
+export function moveDayToToday(date: string): Promise<MoveDayToTodayResponse> {
+  return fetchJson<MoveDayToTodayResponse>(
+    `/api/agenda/days/${encodeURIComponent(date)}/move-to-today`,
+    { method: 'POST' },
+  );
 }

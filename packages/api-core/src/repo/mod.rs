@@ -180,6 +180,12 @@ pub trait TaskRepo: Send + Sync {
     /// work list (IN_PROGRESS is a column, not a singleton lock, so a
     /// stale/expired event cache neither adds nor drops work here).
     async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError>;
+    /// Distinct `user_id`s holding at least one living, still-actionable task
+    /// (`OPEN | PLANNED | IN_PROGRESS`) — the agenda fill cron's user list:
+    /// `COMPLETED`/`DISCARDED` rows never need an agenda row, so a user whose
+    /// board is done is not a fill candidate. Unordered; the caller sorts and
+    /// dedups (a user may appear once per matching row).
+    async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError>;
     /// Returns the task with local `id`, or `None` when absent or soft-deleted.
     /// NOT user-scoped; callers must verify `row.user_id` (the service does).
     async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError>;
@@ -247,10 +253,12 @@ pub trait TaskRepo: Send + Sync {
 
 /// Routine persistence (`routines` rows, ADR 0004).
 ///
-/// All deletes are SOFT — the routine is the domain entity, and materialized
-/// `routine_occurrences` are never touched by it. Reads filter
-/// `deleted_at IS NULL`; a missing/soft-deleted/other-user routine is a 404 at
-/// the service layer (ownership checked on the loaded row, like tasks).
+/// All deletes are SOFT — the routine is the domain entity, and the statement
+/// itself never touches `routine_occurrences` (the service hard-deletes this
+/// routine's untouched FUTURE rows around a rule change or a delete; today and
+/// the past always stay). Reads filter `deleted_at IS NULL`; a
+/// missing/soft-deleted/other-user routine is a 404 at the service layer
+/// (ownership checked on the loaded row, like tasks).
 #[async_trait(?Send)]
 pub trait RoutineRepo: Send + Sync {
     /// The user's living routines, ordered by standing `sort_order` then
@@ -272,6 +280,18 @@ pub trait RoutineRepo: Send + Sync {
     /// Highest living `sort_order` for the user's routines, or `None` when the
     /// pile is empty. Used by `create_routine` to append: `max+1`, else 0.
     async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
+    /// Distinct `user_id`s with at least one living routine — the agenda fill
+    /// cron's user list (the fill never needs every routine up front, only the
+    /// owners; the per-user pass loads them). Unordered; the caller sorts and
+    /// dedups.
+    async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError>;
+    /// Batch lookup **including soft-deleted rows** — the range read's history
+    /// path: a deleted routine's `done`/`skipped` occurrences still render
+    /// with its title, estimate, and recurrence blob. Deliberately NO
+    /// `deleted_at` filter, and NOT user-scoped (callers pass ids already
+    /// resolved from this user's occurrences). Empty `ids` → `Ok(vec![])`
+    /// without touching the DB.
+    async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError>;
 }
 
 /// Occurrence persistence (`routine_occurrences` rows, ADR 0004).
@@ -300,6 +320,16 @@ pub trait OccurrenceRepo: Send + Sync {
         user_id: &str,
         local_date: &str,
     ) -> Result<Vec<RoutineOccurrence>, RepoError>;
+    /// The user's occurrences whose `local_date` is in the inclusive
+    /// `from..=to` civil-date window, in date order — the agenda fill's ONE
+    /// read of what already exists in the horizon (never a per-routine
+    /// round-trip). No `deleted_at` filter (the table has none).
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<RoutineOccurrence>, RepoError>;
     /// **Idempotent ensure**: inserts the row (`title NULL`, `status
     /// 'pending'`, D1 mints id/timestamps) and returns it; when the `UNIQUE
     /// (routine_id, local_date)` already holds a row, loads and returns the
@@ -320,6 +350,13 @@ pub trait OccurrenceRepo: Send + Sync {
     /// to get the surviving ids (a generated UUID can be lost on a concurrent
     /// duplicate). Empty `rows` → `Ok(())` without touching the DB.
     async fn insert_many(&self, rows: Vec<NewRoutineOccurrence>) -> Result<(), RepoError>;
+    /// HARD-deletes the occurrences whose local `id` is in `ids` — the agenda
+    /// fill's reconcile: a rule change (or a routine delete) drops the
+    /// untouched future rows the fill itself materialized. Empty `ids` →
+    /// `Ok(())` without touching the DB; chunked like `list_by_ids`. The
+    /// caller deletes each row's agenda membership separately — this statement
+    /// never touches `agenda_items`.
+    async fn delete_by_ids(&self, ids: &[String]) -> Result<(), RepoError>;
     /// Writes the title override; `None` clears it back to inheritance
     /// (stores NULL). No soft-delete filter — the table has none.
     async fn update_title(&self, id: &str, title: Option<&str>) -> Result<(), RepoError>;
@@ -354,12 +391,38 @@ pub trait OccurrenceRepo: Send + Sync {
 #[async_trait(?Send)]
 pub trait AgendaItemRepo: Send + Sync {
     /// The user's items for `local_date` in pile order (`sort_order`, ties by
-    /// creation) — the response order.
+    /// creation) — the single-day response order.
     async fn list_by_user_and_date(
         &self,
         user_id: &str,
         local_date: &str,
     ) -> Result<Vec<AgendaItem>, RepoError>;
+    /// The user's items whose `local_date` is in the inclusive `from..=to`
+    /// window, in stream order (`local_date`, then the intra-day pile rank) —
+    /// the range read's page.
+    async fn list_by_user_and_date_range(
+        &self,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<AgendaItem>, RepoError>;
+    /// `MIN(local_date)` over EVERY agenda row of the user — orphans, future
+    /// rows, and deleted-routine leftovers included. This is the stream's
+    /// back-scroll floor, independent of the requested page; `None` when the
+    /// user has no rows at all.
+    async fn min_local_date(&self, user_id: &str) -> Result<Option<String>, RepoError>;
+    /// `MIN(local_date)` strictly before `before` that still holds a
+    /// **pending** item — the stream anchor, in one query (never a history
+    /// load). Pending means: kind `task` with a living
+    /// `OPEN | PLANNED | IN_PROGRESS` task row, or kind `occurrence` with a
+    /// `pending | in_progress` occurrence whose routine is living. Orphan
+    /// rows and terminal states never count. `None` when nothing pends in the
+    /// past.
+    async fn oldest_pending_local_date_before(
+        &self,
+        user_id: &str,
+        before: &str,
+    ) -> Result<Option<String>, RepoError>;
     /// Returns the item with local `id`, or `None`. NOT user-scoped; callers
     /// must verify `row.user_id` (the service does).
     async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError>;
@@ -404,6 +467,22 @@ pub trait AgendaItemRepo: Send + Sync {
     async fn insert_many(&self, rows: Vec<NewAgendaItem>) -> Result<(), RepoError>;
     /// HARD delete (unpin). The referenced task/occurrence is untouched.
     async fn hard_delete(&self, id: &str) -> Result<(), RepoError>;
+    /// HARD deletes **every** row of `kind` referencing `ref_id` for the user
+    /// (deliberately not `LIMIT 1` — a hand-edited duplicate must not
+    /// survive). No error when none match: the referenced task/occurrence
+    /// (already soft-deleted by the caller) is untouched.
+    async fn delete_by_ref(&self, user_id: &str, kind: &str, ref_id: &str) -> Result<(), RepoError>;
+    /// The batched [`AgendaItemRepo::delete_by_ref`]: HARD deletes every row
+    /// of `kind` referencing any id in `ref_ids` for the user, one statement
+    /// per chunk (2 fixed binds + ids, [`AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE`]).
+    /// Empty `ref_ids` → `Ok(())` without touching the DB; no error when none
+    /// match. The reconcile's drop of the pruned occurrences' memberships.
+    async fn delete_by_refs(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_ids: &[String],
+    ) -> Result<(), RepoError>;
     /// Highest `sort_order` in the user's `local_date` pile, or `None` when
     /// empty — the append target (`max+1`, else 0).
     async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError>;
@@ -663,6 +742,14 @@ pub const TASK_LIST_BY_USER_ID_SQL: &str =
 pub const TASK_LIST_IN_PROGRESS_SQL: &str =
     "SELECT * FROM tasks WHERE status = 'IN_PROGRESS' AND deleted_at IS NULL";
 
+/// The agenda fill cron's user list: distinct owners of a living task that
+/// still needs a place on the agenda. Terminal rows (`COMPLETED`/
+/// `DISCARDED`) are excluded — they are never backfilled.
+pub const TASK_LIST_USER_IDS_WITH_OPEN_SQL: &str = "
+    SELECT DISTINCT user_id FROM tasks
+    WHERE deleted_at IS NULL AND status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')
+";
+
 pub const TASK_GET_BY_ID_SQL: &str =
     "SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL";
 
@@ -782,9 +869,10 @@ pub const ROUTINE_INSERT_SQL: &str = "
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
-/// Partial update: NULL binds leave the column unchanged (`COALESCE`). Rule
-/// changes never touch materialized occurrences — they only affect future
-/// ensure. The D1 implementation binds `D1Type::Null` for `None` fields.
+/// Partial update: NULL binds leave the column unchanged (`COALESCE`). The
+/// statement itself never touches materialized occurrences; when the service
+/// sees a changed `rrule` it reconciles the future rows around it (untouched
+/// ones only). The D1 implementation binds `D1Type::Null` for `None` fields.
 pub const ROUTINE_UPDATE_SQL: &str = "
     UPDATE routines SET
         title = COALESCE(?, title),
@@ -795,8 +883,9 @@ pub const ROUTINE_UPDATE_SQL: &str = "
     WHERE id = ? AND deleted_at IS NULL
 ";
 
-/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit.
-/// Materialized `routine_occurrences` are NOT touched.
+/// SOFT delete: stamps `deleted_at`, keeping the row's data for audit. The
+/// statement never touches `routine_occurrences` — the service hard-deletes
+/// this routine's untouched future rows separately.
 pub const ROUTINE_DELETE_SQL: &str =
     "UPDATE routines SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
 
@@ -809,6 +898,35 @@ pub const ROUTINE_MAX_SORT_ORDER_SQL: &str = "
     ORDER BY sort_order DESC
     LIMIT 1
 ";
+
+/// The agenda fill cron's user list: distinct owners of a living routine.
+/// `DISTINCT` because a user owns many routines; the caller sorts and dedups
+/// against the task-side list.
+pub const ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL: &str = "
+    SELECT DISTINCT user_id FROM routines WHERE deleted_at IS NULL
+";
+
+/// `list_by_ids_including_deleted` binds 1 id per row → up to 100 ids per
+/// statement (the same D1 parameter budget as occurrence `list_by_ids`).
+pub const ROUTINE_LIST_BY_IDS_CHUNK_SIZE: usize = 100;
+
+/// Builds a `SELECT * FROM routines WHERE id IN (…)` statement for one chunk
+/// of ids (non-empty and ≤ `ROUTINE_LIST_BY_IDS_CHUNK_SIZE`) — the range
+/// read's deleted-routine history lookup. Deliberately NO `deleted_at`
+/// filter: the caller only asks for ids already loaded from this user's
+/// occurrences, and a deleted routine must still lend its display fields to
+/// its done/skipped history. Returns `(sql, args)` with every arg a string
+/// (bound as `D1Type::Text`).
+pub fn build_routine_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>) {
+    assert!(!ids.is_empty(), "routine id list must not be empty");
+    assert!(
+        ids.len() <= ROUTINE_LIST_BY_IDS_CHUNK_SIZE,
+        "routine id list exceeds {ROUTINE_LIST_BY_IDS_CHUNK_SIZE} ids"
+    );
+    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let sql = format!("SELECT * FROM routines WHERE id IN ({})", placeholders.join(","));
+    (sql, ids.to_vec())
+}
 
 // ──────────────────────────────────────────
 // Occurrence SQL (ADR 0004)
@@ -823,6 +941,16 @@ pub const OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL: &str =
 
 pub const OCCURRENCE_LIST_BY_USER_AND_DATE_SQL: &str =
     "SELECT * FROM routine_occurrences WHERE user_id = ? AND local_date = ?";
+
+/// The agenda fill's one horizon read: every occurrence of the user inside the
+/// inclusive `[from, to]` civil-date window, oldest first. No `deleted_at`
+/// filter (the table has none); `YYYY-MM-DD` sorts chronologically, so the
+/// string comparison *is* the date comparison.
+pub const OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL: &str = "
+    SELECT * FROM routine_occurrences
+    WHERE user_id = ? AND local_date >= ? AND local_date <= ?
+    ORDER BY local_date ASC, created_at ASC
+";
 
 /// Idempotent ensure (seed-on-GET): `OR IGNORE` absorbs the `UNIQUE
 /// (routine_id, local_date)` race — the D1 implementation re-reads the row
@@ -934,6 +1062,22 @@ pub fn build_occurrence_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>)
     (sql, ids.to_vec())
 }
 
+/// Builds a `DELETE FROM routine_occurrences WHERE id IN (…)` statement for
+/// one chunk of ids (non-empty and ≤ `OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE`) —
+/// the agenda fill's reconcile. `agenda_items` rows are NOT touched here: the
+/// caller deletes each removed occurrence's membership itself. Returns
+/// `(sql, args)` with every arg a string (bound as `D1Type::Text`).
+pub fn build_occurrence_delete_by_ids_sql(ids: &[String]) -> (String, Vec<String>) {
+    assert!(!ids.is_empty(), "occurrence id list must not be empty");
+    assert!(
+        ids.len() <= OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
+        "occurrence id list exceeds {OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE} ids"
+    );
+    let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+    let sql = format!("DELETE FROM routine_occurrences WHERE id IN ({})", placeholders.join(","));
+    (sql, ids.to_vec())
+}
+
 // ──────────────────────────────────────────
 // Agenda item SQL (ADR 0004)
 // ──────────────────────────────────────────
@@ -942,6 +1086,51 @@ pub fn build_occurrence_list_by_ids_sql(ids: &[String]) -> (String, Vec<String>)
 /// creation keep the seed append order deterministic.
 pub const AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL: &str =
     "SELECT * FROM agenda_items WHERE user_id = ? AND local_date = ? ORDER BY sort_order ASC, created_at ASC";
+
+/// The range read's page: an inclusive `[from, to]` civil-date window in
+/// stream order — `local_date` first, then the same intra-day tie-break as
+/// the single-date pile. The stream pages several days at once, so the day is
+/// part of the sort key.
+pub const AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL: &str = "
+    SELECT * FROM agenda_items
+    WHERE user_id = ? AND local_date >= ? AND local_date <= ?
+    ORDER BY local_date ASC, sort_order ASC, created_at ASC
+";
+
+/// The stream's back-scroll floor: `MIN(local_date)` over all of the user's
+/// rows — no kind/pending/orphan filter (whatever exists is what the browser
+/// can scroll back to). An empty set yields one row with NULL.
+pub const AGENDA_ITEM_MIN_LOCAL_DATE_SQL: &str = "
+    SELECT MIN(local_date) AS local_date FROM agenda_items WHERE user_id = ?
+";
+
+/// The stream anchor: the oldest past date that still holds a pending item.
+/// One query, never a history load — the pending predicate is a pair of
+/// `EXISTS` probes (a living task, or a live occurrence of a living routine),
+/// so orphans and terminal states fall out. `MIN()` over no match → NULL.
+pub const AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL: &str = "
+    SELECT MIN(a.local_date) AS local_date
+    FROM agenda_items a
+    WHERE a.user_id = ?
+      AND a.local_date < ?
+      AND (
+        (a.kind = 'task' AND EXISTS (
+          SELECT 1 FROM tasks t
+          WHERE t.id = a.ref_id
+            AND t.user_id = a.user_id
+            AND t.deleted_at IS NULL
+            AND t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')
+        ))
+        OR (a.kind = 'occurrence' AND EXISTS (
+          SELECT 1 FROM routine_occurrences o
+          JOIN routines r ON r.id = o.routine_id
+          WHERE o.id = a.ref_id
+            AND o.user_id = a.user_id
+            AND o.status IN ('pending', 'in_progress')
+            AND r.deleted_at IS NULL
+        ))
+      )
+";
 
 pub const AGENDA_ITEM_GET_BY_ID_SQL: &str = "SELECT * FROM agenda_items WHERE id = ?";
 
@@ -966,6 +1155,17 @@ pub const AGENDA_ITEM_INSERT_SQL: &str = "
 
 /// HARD delete (unpin): membership is a subscription, not a domain entity.
 pub const AGENDA_ITEM_DELETE_SQL: &str = "DELETE FROM agenda_items WHERE id = ?";
+
+/// HARD delete by membership identity: **every** row of `kind` referencing
+/// `ref_id` for the user — never `LIMIT 1`. Deleting the task drops its
+/// agenda row(s); no matching row is not an error.
+pub const AGENDA_ITEM_DELETE_BY_REF_SQL: &str =
+    "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ?";
+
+/// `delete_by_refs` binds 2 fixed args (`user_id`, `kind`) plus 1 id per ref →
+/// max 98 refs per statement (2 + 98 = 100), the same budget as
+/// `list_by_refs`.
+pub const AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE: usize = 98;
 
 /// Highest rank in the user's date pile — the append target (`max+1`, else
 /// 0). `LIMIT 1` over `MAX()` so an empty pile reads as `None` via `first()`.
@@ -1070,6 +1270,35 @@ pub fn build_agenda_item_list_by_refs_sql(
     let placeholders: Vec<&str> = ref_ids.iter().map(|_| "?").collect();
     let sql = format!(
         "SELECT * FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id IN ({})",
+        placeholders.join(",")
+    );
+    let mut args = Vec::with_capacity(ref_ids.len() + 2);
+    args.push(user_id.to_string());
+    args.push(kind.to_string());
+    args.extend(ref_ids.iter().cloned());
+    (sql, args)
+}
+
+/// Builds a `DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND
+/// ref_id IN (…)` statement for one chunk of refs (non-empty and ≤
+/// [`AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE`]) — the reconcile's batched drop of
+/// the pruned occurrences' memberships. Deliberately NO `local_date` filter:
+/// the membership row lives on whatever date the occurrence was placed.
+/// Returns `(sql, args)` with every arg a string (bound as `D1Type::Text`);
+/// `args[0]`/`args[1]` are `user_id`/`kind`.
+pub fn build_agenda_item_delete_by_refs_sql(
+    user_id: &str,
+    kind: &str,
+    ref_ids: &[String],
+) -> (String, Vec<String>) {
+    assert!(!ref_ids.is_empty(), "agenda ref list must not be empty");
+    assert!(
+        ref_ids.len() <= AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE,
+        "agenda ref list exceeds {AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE} refs"
+    );
+    let placeholders: Vec<&str> = ref_ids.iter().map(|_| "?").collect();
+    let sql = format!(
+        "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id IN ({})",
         placeholders.join(",")
     );
     let mut args = Vec::with_capacity(ref_ids.len() + 2);
@@ -1496,6 +1725,14 @@ mod tests {
     }
 
     #[test]
+    fn routine_list_user_ids_scopes_to_living_rows() {
+        let sql = ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL;
+        assert!(sql.contains("SELECT DISTINCT user_id FROM routines"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
+    }
+
+    #[test]
     fn occurrence_reads_have_no_deleted_filter_and_insert_is_idempotent() {
         for sql in [
             OCCURRENCE_GET_BY_ID_SQL,
@@ -1547,6 +1784,12 @@ mod tests {
         assert_eq!(AGENDA_ITEM_INSERT_SQL.matches('?').count(), 8, "{}", AGENDA_ITEM_INSERT_SQL);
         assert!(AGENDA_ITEM_DELETE_SQL.starts_with("DELETE FROM"), "{}", AGENDA_ITEM_DELETE_SQL);
         assert!(!AGENDA_ITEM_DELETE_SQL.contains("deleted_at"), "{}", AGENDA_ITEM_DELETE_SQL);
+        assert_eq!(
+            AGENDA_ITEM_DELETE_BY_REF_SQL,
+            "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ?",
+            "every matching row, never LIMIT 1"
+        );
+        assert!(!AGENDA_ITEM_DELETE_BY_REF_SQL.contains("deleted_at"), "{}", AGENDA_ITEM_DELETE_BY_REF_SQL);
         assert!(AGENDA_ITEM_MAX_SORT_ORDER_SQL.contains("LIMIT 1"), "{}", AGENDA_ITEM_MAX_SORT_ORDER_SQL);
     }
 
@@ -1617,12 +1860,51 @@ mod tests {
     }
 
     #[test]
+    fn occurrence_range_read_is_inclusive_and_orders_by_date() {
+        let sql = OCCURRENCE_LIST_BY_USER_AND_DATE_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("SELECT * FROM routine_occurrences"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(
+            sql.contains("local_date >= ? AND local_date <= ?"),
+            "inclusive window: {sql}"
+        );
+        assert!(sql.contains("ORDER BY local_date ASC"), "{sql}");
+        assert!(!sql.contains("deleted_at"), "no soft-delete on occurrences: {sql}");
+        assert_eq!(sql.matches('?').count(), 3, "{sql}");
+    }
+
+    #[test]
+    fn occurrence_delete_by_ids_is_id_scoped_and_leaves_agenda_rows_alone() {
+        let (sql, args) = build_occurrence_delete_by_ids_sql(&["occ-1".to_string()]);
+        assert!(sql.starts_with("DELETE FROM routine_occurrences"), "{sql}");
+        assert!(sql.contains("id IN (?)"), "{sql}");
+        assert!(!sql.contains("agenda_items"), "memberships are the caller's job: {sql}");
+        assert!(!sql.contains("deleted_at"), "no soft-delete on occurrences: {sql}");
+        assert_eq!(args, vec!["occ-1"]);
+        assert_eq!(sql.matches('?').count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn task_list_user_ids_with_open_tasks_filters_status_and_living_rows() {
+        let sql = TASK_LIST_USER_IDS_WITH_OPEN_SQL;
+        assert!(sql.contains("SELECT DISTINCT user_id FROM tasks"), "{sql}");
+        assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(
+            sql.contains("status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')"),
+            "terminal rows never need a backfill: {sql}"
+        );
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
+    }
+
+    #[test]
     fn agenda_item_insert_many_stays_idempotent_and_chunks_to_100_params() {
         assert_eq!(AGENDA_ITEM_INSERT_COL_COUNT, 8);
         assert_eq!(AGENDA_ITEM_INSERT_CHUNK_SIZE, 12);
         assert!(AGENDA_ITEM_INSERT_CHUNK_SIZE * AGENDA_ITEM_INSERT_COL_COUNT <= 100);
         assert_eq!(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, 98);
         assert_eq!(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE + 2, 100, "2 fixed binds + refs");
+        assert_eq!(AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE, 98);
+        assert_eq!(AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE + 2, 100, "2 fixed binds + ids");
 
         let row = NewAgendaItem {
             user_id: "u-1".to_string(),
@@ -1657,4 +1939,88 @@ mod tests {
         assert_eq!(args, vec!["u-1", "occurrence", "occ-1", "occ-2"]);
     }
 
+    #[test]
+    fn agenda_item_delete_by_refs_is_scoped_by_user_kind_and_ref_ids() {
+        let (sql, args) = build_agenda_item_delete_by_refs_sql(
+            "u-1",
+            "occurrence",
+            &["occ-1".to_string(), "occ-2".to_string()],
+        );
+        assert!(sql.starts_with("DELETE FROM agenda_items"), "{sql}");
+        assert!(sql.contains("user_id = ? AND kind = ? AND ref_id IN (?,?)"), "{sql}");
+        assert!(!sql.contains("local_date"), "any date, never a local_date filter: {sql}");
+        assert!(
+            !sql.contains("LIMIT"),
+            "every matching row, so the prune leaves no dangling membership: {sql}"
+        );
+        assert!(!sql.contains("deleted_at"), "no soft-delete column here: {sql}");
+        assert_eq!(sql.matches('?').count(), 4, "{sql}");
+        assert_eq!(args, vec!["u-1", "occurrence", "occ-1", "occ-2"]);
+    }
+
+    #[test]
+    fn routine_list_by_ids_is_id_scoped_and_includes_soft_deleted() {
+        assert_eq!(ROUTINE_LIST_BY_IDS_CHUNK_SIZE, 100);
+        let (sql, args) = build_routine_list_by_ids_sql(&[
+            "rt-1".to_string(),
+            "rt-2".to_string(),
+        ]);
+        assert!(sql.starts_with("SELECT * FROM routines"), "{sql}");
+        assert!(sql.contains("id IN (?,?)"), "{sql}");
+        assert!(
+            !sql.contains("deleted_at"),
+            "history lookup must include soft-deleted routines: {sql}"
+        );
+        assert!(
+            !sql.contains("user_id"),
+            "not user-scoped, same as get_by_id: {sql}"
+        );
+        assert_eq!(args, vec!["rt-1", "rt-2"]);
+        assert_eq!(sql.matches('?').count(), 2, "{sql}");
+    }
+
+    #[test]
+    fn agenda_item_range_read_is_inclusive_and_ordered_by_day_then_rank() {
+        let sql = AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL;
+        assert!(sql.trim_start().starts_with("SELECT * FROM agenda_items"), "{sql}");
+        assert!(sql.contains("user_id = ?"), "{sql}");
+        assert!(
+            sql.contains("local_date >= ? AND local_date <= ?"),
+            "inclusive window: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY local_date ASC, sort_order ASC, created_at ASC"),
+            "stream order: {sql}"
+        );
+        assert!(!sql.contains("kind"), "the page is every kind: {sql}");
+    }
+
+    #[test]
+    fn agenda_item_min_local_date_and_anchor_are_single_scalar_queries() {
+        let min = AGENDA_ITEM_MIN_LOCAL_DATE_SQL;
+        assert!(min.contains("MIN(local_date)"), "{min}");
+        assert!(min.contains("user_id = ?"), "{min}");
+        assert!(!min.contains("local_date >="), "all rows, no window: {min}");
+        assert!(!min.contains("kind"), "orphans and all kinds count: {min}");
+        assert_eq!(min.matches('?').count(), 1, "{min}");
+
+        let anchor = AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL;
+        assert!(anchor.contains("MIN(a.local_date)"), "{anchor}");
+        assert!(anchor.contains("a.user_id = ?"), "{anchor}");
+        assert!(anchor.contains("a.local_date < ?"), "strictly past: {anchor}");
+        assert!(anchor.contains("a.kind = 'task'"), "{anchor}");
+        assert!(
+            anchor.contains("t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')"),
+            "{anchor}"
+        );
+        assert!(anchor.contains("t.deleted_at IS NULL"), "{anchor}");
+        assert!(anchor.contains("a.kind = 'occurrence'"), "{anchor}");
+        assert!(
+            anchor.contains("o.status IN ('pending', 'in_progress')"),
+            "{anchor}"
+        );
+        assert!(anchor.contains("JOIN routines r ON r.id = o.routine_id"), "{anchor}");
+        assert!(anchor.contains("r.deleted_at IS NULL"), "{anchor}");
+        assert_eq!(anchor.matches('?').count(), 2, "{anchor}");
+    }
 }

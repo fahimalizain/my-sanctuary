@@ -55,6 +55,29 @@ fn routines_d1(
     Ok(crate::db::D1RoutineRepo::new(db))
 }
 
+fn occurrences_d1(
+    ctx: &RouteContext<Option<api_core::Config>>,
+) -> Result<crate::db::D1OccurrenceRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1OccurrenceRepo::new(db))
+}
+
+fn agenda_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1AgendaItemRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1AgendaItemRepo::new(db))
+}
+
+fn calendars_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1CalendarRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1CalendarRepo::new(db))
+}
+
 fn lists_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TaskListRepo> {
     let db = ctx
         .d1("DB")
@@ -101,7 +124,8 @@ pub async fn list_routines(
 /// `POST /api/routines` → 200 `{"routine":{...}}`. Body:
 /// `{title, estimated_minutes?, rrule}` — `rrule` is the two-line recurrence
 /// blob (`DTSTART:` line + `RRULE:` line). Invalid rrule or a title that does
-/// not uniquely classify is 400; nothing is persisted then.
+/// not uniquely classify is 400; nothing is persisted then. A successful
+/// create fills the routine's occurrence horizon (today … today+6).
 pub async fn create_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -115,12 +139,17 @@ pub async fn create_routine(
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
 
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     match api_core::create_routine(
         &lists_d1(&ctx)?,
         &categories_d1(&ctx)?,
         &routines_d1(&ctx)?,
         &user.id,
         &input,
+        &occurrences_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
+        &calendars_d1(&ctx)?,
+        now_unix,
     )
     .await
     {
@@ -134,8 +163,8 @@ pub async fn create_routine(
 
 /// `PATCH /api/routines/:id` → 200 `{"routine":{...}}`. Body:
 /// `{title?, estimated_minutes?, rrule?, sort_order?}` — at least one field
-/// required (400 otherwise). Rule changes never touch materialized
-/// occurrences.
+/// required (400 otherwise). A changed `rrule` reconciles the horizon: only
+/// untouched rows from tomorrow through today+6 are rewritten.
 pub async fn update_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -152,12 +181,17 @@ pub async fn update_routine(
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
 
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     match api_core::update_routine(
         &categories_d1(&ctx)?,
         &routines_d1(&ctx)?,
         &user.id,
         id,
         &updates,
+        &occurrences_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
+        &calendars_d1(&ctx)?,
+        now_unix,
     )
     .await
     {
@@ -169,8 +203,9 @@ pub async fn update_routine(
     }
 }
 
-/// `DELETE /api/routines/:id` → 200 `{"success":true}` (soft delete;
-/// materialized occurrences are untouched).
+/// `DELETE /api/routines/:id` → 200 `{"success":true}` (soft delete; the
+/// routine's untouched rows from tomorrow through today+6 are hard-deleted
+/// with their agenda items).
 pub async fn delete_routine(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -185,7 +220,18 @@ pub async fn delete_routine(
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
 
-    match api_core::delete_routine(&routines_d1(&ctx)?, &user.id, id, &now_rfc3339).await {
+    match api_core::delete_routine(
+        &routines_d1(&ctx)?,
+        &user.id,
+        id,
+        &now_rfc3339,
+        &occurrences_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
+        &calendars_d1(&ctx)?,
+        now_unix,
+    )
+    .await
+    {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))

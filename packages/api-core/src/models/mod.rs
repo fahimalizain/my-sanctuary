@@ -576,8 +576,9 @@ pub struct UpdateOccurrence {
 }
 
 /// A date-scoped membership row in the run-of-show (ADR 0004), as stored in
-/// `agenda_items`. Doubles as the D1 row projection. Membership rows are
-/// HARD-deleted on unpin — they are a subscription, not a domain entity.
+/// `agenda_items`. Doubles as the D1 row projection. There is no unpin: a
+/// task holds at most ONE row across all days (the 0018 invariant) and a
+/// reschedule moves that row between days.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaItem {
     pub id: String,
@@ -609,21 +610,6 @@ pub struct NewAgendaItem {
     pub sort_order: i64,
 }
 
-/// Request body for `POST /api/agenda/items`. The `date` is REQUIRED — the
-/// ADR table omits it because GET is date-scoped, but the POST must name the
-/// date (invented per the slice brief; the ADR wins if they ever disagree).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct NewAgendaItemInput {
-    /// `task` only in v1 (occurrences are auto-seeded; anything else 400).
-    pub kind: String,
-    pub ref_id: String,
-    /// Optional placement; default appends at `max+1` for that date (0 when
-    /// empty). A named rank is used as-is (no peer shift — `/move` reorders).
-    pub sort_order: Option<i64>,
-    /// Local civil date `YYYY-MM-DD` the item lands on.
-    pub date: String,
-}
-
 /// Request body for `POST /api/agenda/items/:id/move`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MoveAgendaItemInput {
@@ -634,8 +620,14 @@ pub struct MoveAgendaItemInput {
 /// Request body for `POST /api/agenda/items/:id/reschedule`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RescheduleAgendaItemInput {
-    /// Local civil date `YYYY-MM-DD` the slot moves to.
+    /// Local civil date `YYYY-MM-DD` the slot moves to (today or later — the
+    /// past is a 400).
     pub date: String,
+    /// Optional landing rank inside the target day's pile. Absent/null →
+    /// append at `max+1` (0 when empty); a named rank first shifts that day's
+    /// peers at/after it up one (same gap semantics as `/move`). Never used
+    /// on a same-date call — same-day placement is `/move`.
+    pub sort_order: Option<i64>,
 }
 
 

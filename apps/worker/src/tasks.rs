@@ -132,6 +132,20 @@ fn lists_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D
     Ok(crate::db::D1TaskListRepo::new(db))
 }
 
+fn agenda_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1AgendaItemRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1AgendaItemRepo::new(db))
+}
+
+fn calendars_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1CalendarRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1CalendarRepo::new(db))
+}
+
 fn users_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1UserRepo> {
     let db = ctx
         .d1("DB")
@@ -230,7 +244,21 @@ pub async fn create_task(
         Ok(input) => input,
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
-    match api_core::create_task(&lists_d1(&ctx)?, &categories_d1(&ctx)?, &d1(&ctx)?, &user.id, &input).await {
+    // Today is civil-in-the-primary-calendar: the service reads the calendars
+    // repo, so create needs both the agenda row repo and the clock.
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    match api_core::create_task(
+        &lists_d1(&ctx)?,
+        &categories_d1(&ctx)?,
+        &d1(&ctx)?,
+        &user.id,
+        &input,
+        &agenda_d1(&ctx)?,
+        &calendars_d1(&ctx)?,
+        now_unix,
+    )
+    .await
+    {
         Ok(response) => {
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
@@ -320,6 +348,7 @@ pub async fn delete_task(
         id,
         &now_rfc3339,
         now_unix,
+        &agenda_d1(&ctx)?,
     )
     .await
     {
@@ -417,6 +446,7 @@ pub async fn start_task(
         &user_id,
         id,
         now_unix,
+        &agenda_d1(&ctx)?,
     )
     .await;
     respond_action(&ctx, result)
@@ -455,6 +485,7 @@ macro_rules! timer_action {
                 &user_id,
                 id,
                 now_unix,
+                &agenda_d1(&ctx)?,
             )
             .await;
             respond_action(&ctx, result)
@@ -581,6 +612,7 @@ pub async fn move_task(
         id,
         now_unix,
         &input,
+        &agenda_d1(&ctx)?,
     )
     .await;
     match result {
