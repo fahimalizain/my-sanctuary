@@ -352,7 +352,7 @@ export function shiftWindowStart(
 // ── Strip lock ownership ────────────────────────────────────────────────
 
 /** Gesture owners that can hold the horizontal strip's scroll-snap off. */
-export type StripLockReason = 'drag' | 'pinch' | 'axis';
+export type StripLockReason = 'drag' | 'pinch' | 'swipe';
 
 /**
  * Scroll-snap stays `none` while any owner holds the lock.
@@ -364,45 +364,153 @@ export function stripSnapDisabled(held: ReadonlySet<StripLockReason>): boolean {
 }
 
 /**
- * Rebase is suppressed only for owners that write `scrollLeft` themselves.
- * `axis` holds snap off but not rebase, so the window may still slide to stay
- * infinite during a vertical gesture.
+ * Rebase is suppressed for every owner: each one writes `scrollLeft` itself
+ * (drag auto-scroll, pinch zoom, touch swipe), and a rebase write would fight
+ * those. A future owner that only holds snap off must be added explicitly.
  */
 export function stripRebaseSuppressed(
   held: ReadonlySet<StripLockReason>,
 ): boolean {
-  return held.has('drag') || held.has('pinch');
+  return held.has('drag') || held.has('pinch') || held.has('swipe');
 }
 
 // ── Touch scroll axis ───────────────────────────────────────────────────
 
 /**
- * Movement (px) a touch gesture must exceed before it commits to an axis.
- * Below it the gesture stays `pending`, so a tap never claims a lock.
+ * Sideways travel (px) a touch must make before the strip follows the finger.
+ * Deliberately high: a horizontal day swipe is always intentional, and the
+ * strip only moves once the gesture is unambiguously sideways. Tune this to
+ * make day swipes easier (lower) or safer (higher).
  */
-export const SCROLL_AXIS_SLOP = 8;
+export const SCROLL_X_THRESHOLD_PX = 48;
 
-/** Committed gesture axis; `pending` until the slop is crossed. */
+/**
+ * Vertical travel (px) that commits a gesture to `y`, locking it out of
+ * horizontal for the rest of its life. Small, so a time scroll stops touching
+ * the day as soon as it is clearly vertical.
+ */
+export const SCROLL_Y_SLOP_PX = 10;
+
+/** Committed gesture axis; `pending` while the gesture is in the dead zone. */
 export type ScrollAxis = 'pending' | 'x' | 'y';
 
 /**
- * Dominant axis of a touch gesture from its displacement. iOS does not
- * directional-lock a 2D overflow scroller, so a "vertical" swipe through the
- * hours carries a little horizontal velocity and the mandatory day snap pages
- * to a neighbouring column. This is the input to holding the day still.
+ * Axis of a touch gesture from its displacement:
  *
- * X is claimed only past 2:1 — a diagonal time-scroll must never change the
- * day, while a clear horizontal swipe still pages.
+ *   x        |dx| ≥ `xThreshold` and clearly horizontal-dominant (> 2:1)
+ *   y        |dy| > `ySlop` and not horizontal-dominant
+ *   pending  the dead zone — the strip must not move sideways
+ *
+ * The scroller pans vertically natively (`touch-action: pan-y`), so a vertical
+ * gesture needs no JS. A horizontal one is driven by hand: the browser would
+ * otherwise move the strip from the first pixel, which makes a dead zone
+ * impossible and lets a vertical swipe drift onto the next day.
  */
 export function classifyScrollAxis(
   dx: number,
   dy: number,
-  slop: number = SCROLL_AXIS_SLOP,
+  xThreshold: number = SCROLL_X_THRESHOLD_PX,
+  ySlop: number = SCROLL_Y_SLOP_PX,
 ): ScrollAxis {
   const adx = Math.abs(dx);
   const ady = Math.abs(dy);
-  if (adx <= slop && ady <= slop) return 'pending';
-  return adx > ady * 2 ? 'x' : 'y';
+  // A swipe needs both distance and direction: the 2:1 ratio keeps a diagonal
+  // time scroll from paging the day.
+  if (adx >= xThreshold && adx > ady * 2) return 'x';
+  // Vertical or diagonal: commit to y and never look sideways again.
+  if (ady > ySlop && adx <= ady * 2) return 'y';
+  return 'pending';
+}
+
+// ── Touch swipe release ─────────────────────────────────────────────────
+
+/** How far ahead (ms) release velocity is projected to pick a column. */
+export const SWIPE_PROJECTION_MS = 250;
+
+/** Finger speed (px/ms) at or above which a release counts as a flick. */
+export const SWIPE_FLICK_VELOCITY = 0.3;
+
+/** Only samples this recent (ms) contribute to the release velocity. */
+export const SWIPE_VELOCITY_WINDOW_MS = 100;
+
+/** Finger sample: event timestamp (ms) and `clientX` (px). */
+export interface SwipeSample {
+  t: number;
+  x: number;
+}
+
+/**
+ * Finger velocity (px/ms, positive = moving right) at release.
+ *
+ * Only the last `windowMs` of movement counts: the release speed is what the
+ * user felt at the end of the gesture, not the average over a slow drag that
+ * happened to finish with a flick. A finger that stopped before lifting keeps
+ * its newest sample at the same `x`, so it reads as 0 speed rather than as its
+ * last fast burst.
+ */
+export function swipeVelocity(
+  samples: readonly SwipeSample[],
+  windowMs: number = SWIPE_VELOCITY_WINDOW_MS,
+): number {
+  if (samples.length < 2) return 0;
+  const last = samples[samples.length - 1];
+  let firstIdx = samples.length - 1;
+  while (firstIdx > 0 && last.t - samples[firstIdx - 1].t <= windowMs) {
+    firstIdx -= 1;
+  }
+  const first = samples[firstIdx];
+  const dt = last.t - first.t;
+  if (!(dt > 0)) return 0;
+  const velocity = (last.x - first.x) / dt;
+  return Number.isFinite(velocity) ? velocity : 0;
+}
+
+export interface SwipeRelease {
+  /** Index of the column the finger landed on. */
+  startIdx: number;
+  /** `scrollLeft` when the finger lifted. */
+  scrollLeft: number;
+  /** Finger velocity in px/ms; positive = moving right (towards earlier days). */
+  velocity: number;
+  colW: number;
+  periodLength: number;
+  /** Highest index at which a full period still fits. */
+  maxIdx: number;
+}
+
+/**
+ * Column the strip should settle on after a horizontal swipe.
+ *
+ * A slow drag lands on the nearest column to where the finger left the strip.
+ * A flick also projects the release velocity forward, but a projected column
+ * equal to the starting one would make Day view (a full-width column) feel
+ * dead — so a flick steps one column the way the finger moved.
+ */
+export function swipeTargetIndex({
+  startIdx,
+  scrollLeft,
+  velocity,
+  colW,
+  periodLength,
+  maxIdx,
+}: SwipeRelease): number {
+  const width = Number.isFinite(colW) && colW > 0 ? colW : 16;
+  const left = Number.isFinite(scrollLeft) ? scrollLeft : 0;
+  const speed = Number.isFinite(velocity) ? velocity : 0;
+  const projected = Math.round((left - speed * SWIPE_PROJECTION_MS) / width);
+
+  // Finger right drags the content right, i.e. towards earlier days.
+  const settled =
+    Math.abs(speed) >= SWIPE_FLICK_VELOCITY && projected === startIdx
+      ? projected + (speed > 0 ? -1 : 1)
+      : projected;
+
+  // One gesture may cross at most one period: a fling must not skip a week.
+  const span = Number.isFinite(periodLength)
+    ? Math.max(1, Math.trunc(periodLength))
+    : 1;
+  const limit = Number.isFinite(maxIdx) ? Math.max(0, Math.trunc(maxIdx)) : 0;
+  return clamp(clamp(settled, startIdx - span, startIdx + span), 0, limit);
 }
 
 // ── Wheel scroll axis ───────────────────────────────────────────────────
@@ -444,7 +552,7 @@ export function wheelDeltaPx(
 
 /** Latched wheel burst: committed axis, accumulated px, last event time. */
 export interface WheelBurst {
-  /** `pending` until the burst's accumulated delta crosses the slop. */
+  /** `pending` until the accumulated delta leaves the dead zone. */
   axis: ScrollAxis;
   sumX: number;
   sumY: number;
@@ -464,10 +572,16 @@ export const EMPTY_WHEEL_BURST: WheelBurst = {
  * Fold one wheel event (px deltas + `timeStamp`) into the burst latch.
  *
  * A Mac trackpad puts a little horizontal delta on a nominally vertical
- * two-finger scroll. The axis is decided from the *accumulated* burst — one
- * event alone is noisy — and then latched: momentum keeps arriving after the
- * fingers lift, so a vertical burst that later turns horizontal-heavy must not
- * hand the strip back to native snap mid-gesture.
+ * two-finger scroll. The burst is classified with the same dead-zone rules as
+ * a touch gesture (`classifyScrollAxis`), against its *accumulated* delta — one
+ * event alone is noisy. It therefore stays `pending` until it has accumulated
+ * a deliberate, horizontal-dominant swipe (`SCROLL_X_THRESHOLD_PX`, better than
+ * 2:1) or is clearly vertical (`SCROLL_Y_SLOP_PX`), and the sideways drift of a
+ * `pending` or `y` burst never reaches the scroller.
+ *
+ * The axis is then latched: momentum keeps arriving after the fingers lift, so
+ * a vertical burst that later turns horizontal-heavy must not hand the strip
+ * back to native snap mid-gesture.
  *
  * A gap over `WHEEL_BURST_IDLE_MS` starts a fresh burst (sums and axis reset).
  * The comparison is NaN-safe: an unusable timestamp counts as a new burst,

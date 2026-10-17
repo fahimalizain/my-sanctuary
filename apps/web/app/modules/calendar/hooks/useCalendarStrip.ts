@@ -11,6 +11,7 @@ import {
   DAYS_PER_PERIOD,
   EMPTY_WHEEL_BURST,
   PERIOD_LENGTH_STORAGE_KEY,
+  SCROLL_X_THRESHOLD_PX,
   STRIP_OVERSCAN,
   addDays,
   clampPeriodLength,
@@ -31,31 +32,43 @@ import {
   stripDayCount,
   stripRebaseSuppressed,
   stripSnapDisabled,
+  swipeTargetIndex,
+  swipeVelocity,
   visibleStartIndex as computeVisibleStartIndex,
   wheelDeltaPx,
   type ScrollAxis,
   type StripLockReason,
+  type SwipeSample,
   type WheelBurst,
 } from '../lib/week-layout';
 
-/**
- * Quiet period (ms) with no `scroll` event that counts a finger-up gesture as
- * settled. Fallback for `scrollend`, which only recent Safari ships.
- */
-const AXIS_SETTLE_MS = 150;
+/** Release tween duration (ms): a short ease-out that reads as a snap. */
+const SWIPE_SETTLE_MS = 220;
+
+/** Samples kept per gesture (≈ a second of 60Hz moves); velocity reads the tail. */
+const SWIPE_SAMPLE_LIMIT = 24;
 
 /**
- * In-flight touch gesture, tracked to decide whether it may page the strip.
- * `left0` is the horizontal position the strip must return to when a vertical
- * gesture settles; null when no gesture holds one.
+ * In-flight horizontal swipe. Pan-y means native touch never moves the strip
+ * sideways, so a horizontal gesture is entirely ours: `left0` is where it
+ * started, and every move writes `left0` minus the finger travel past the
+ * dead zone.
  */
-interface AxisGesture {
+interface SwipeGesture {
   /** First finger position, or null while no gesture is tracked. */
   origin: { x: number; y: number } | null;
-  /** Committed axis for this gesture; `pending` until the slop is crossed. */
+  /** Committed axis; `pending` while the gesture is in the dead zone. */
   intent: ScrollAxis;
-  /** Frozen `scrollLeft` for the gesture (see `classifyScrollAxis`). */
-  left0: number | null;
+  /** `scrollLeft` when the finger landed. */
+  left0: number;
+  /** Column the finger landed on (flick stepping + clamp centre). */
+  startIdx: number;
+  /** Sign of dx when the gesture resolved to `x`; 0 until then. */
+  lockSign: number;
+  /** Last finger x, for the release velocity sample. */
+  lastX: number;
+  /** Recent finger samples (t, x) for the release velocity. */
+  samples: SwipeSample[];
 }
 
 function readStoredPeriodLength(): number {
@@ -202,7 +215,7 @@ export function useCalendarStrip(): CalendarStrip {
   const contentWidth = gutterW + trackWidth;
 
   // ── Strip lock ownership ──────────────────────────────────────────────
-  // Lock owners (drag / pinch / axis) that hold the scroller's snap override.
+  // Lock owners (drag / pinch / swipe) that hold the scroller's snap override.
   // A Set, not a counter: repeat holds are idempotent and releasing one owner
   // cannot clear another owner's `scroll-snap-type: none`.
   const stripLockReasonsRef = useRef<Set<StripLockReason>>(new Set());
@@ -210,9 +223,9 @@ export function useCalendarStrip(): CalendarStrip {
   /** Apply the scroller's snap override from the currently held owners. */
   const applyStripLock = useCallback(() => {
     // CSS scroll-snap re-snaps on every programmatic scrollLeft write, which
-    // would fight drag auto-scroll. Suspend it while any owner holds the lock;
-    // clearing the inline override re-engages snap and settles on the nearest
-    // column.
+    // would fight the owner's own writes (drag auto-scroll, the swipe tween).
+    // Suspend it while any owner holds the lock; clearing the inline override
+    // re-engages snap and settles on the nearest column.
     const scroller = scrollerRef.current;
     if (scroller) {
       scroller.style.scrollSnapType = stripSnapDisabled(
@@ -223,50 +236,95 @@ export function useCalendarStrip(): CalendarStrip {
     }
   }, []);
 
-  // ── Touch axis gesture ────────────────────────────────────────────────
-  // iOS does not directional-lock a 2D overflow scroller: a vertical swipe
-  // through the hours carries a little horizontal velocity, and the mandatory
-  // day snap then pages to the neighbouring column. Track the gesture's
-  // dominant axis and, for a Y gesture, hold the day until the finger lifts.
-  const axisGestureRef = useRef<AxisGesture>({
+  // ── Horizontal scroll publishing ──────────────────────────────────────
+  // Update the visible start; request a rebase near the edges. Called from the
+  // scroller's own `scroll` event and, for a hand-driven swipe, once the
+  // release tween has landed.
+  const onScrollerScroll = useCallback(() => {
+    // Ignore until init park has run with a measured width. Otherwise a mount
+    // scrollLeft write (or scrollLeft ≈ 0) sets visibleStartIdx to 0 and the
+    // title flashes / sticks on the overscan buffer week.
+    if (!didInitScrollRef.current) return;
+
+    const scroller = scrollerRef.current;
+    if (!scroller || colW <= 0) return;
+
+    const idx = computeVisibleStartIndex(
+      scroller.scrollLeft,
+      colW,
+      dayCount,
+      periodLength,
+    );
+    setVisibleStartIdx((prev) => (prev === idx ? prev : idx));
+
+    if (suppressRebaseRef.current) return;
+    // Every lock owner writes `scrollLeft` itself, so no rebase while one is
+    // held: the window would shift out from under the write.
+    if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
+
+    const dir = shouldRebase(idx, dayCount, periodLength);
+    if (dir !== 0 && pendingRebaseRef.current === 0) {
+      pendingRebaseRef.current = dir;
+      setScrollNonce((n) => n + 1);
+    }
+  }, [colW, dayCount, periodLength]);
+
+  // ── Touch swipe gesture ───────────────────────────────────────────────
+  // The scroller is `touch-action: pan-y`: the browser pans the hours
+  // vertically and never touches `scrollLeft`. A horizontal swipe is therefore
+  // ours to drive, which is the only way to have a dead zone — under native 2D
+  // panning the strip moves from the first sideways pixel.
+  const swipeRef = useRef<SwipeGesture>({
     origin: null,
     intent: 'pending',
-    left0: null,
+    left0: 0,
+    startIdx: 0,
+    lockSign: 0,
+    lastX: 0,
+    samples: [],
   });
-  const axisSettleTimerRef = useRef<number | null>(null);
+  // rAF handle for the release tween; null when the strip is idle.
+  const settleRafRef = useRef<number | null>(null);
 
-  const clearAxisSettle = useCallback(() => {
-    if (axisSettleTimerRef.current !== null) {
-      clearTimeout(axisSettleTimerRef.current);
-      axisSettleTimerRef.current = null;
+  const resetSwipeGesture = () => {
+    const gesture = swipeRef.current;
+    gesture.origin = null;
+    gesture.intent = 'pending';
+    gesture.left0 = 0;
+    gesture.startIdx = 0;
+    gesture.lockSign = 0;
+    gesture.lastX = 0;
+    gesture.samples = [];
+  };
+
+  const cancelSettle = useCallback(() => {
+    if (settleRafRef.current !== null) {
+      cancelAnimationFrame(settleRafRef.current);
+      settleRafRef.current = null;
     }
   }, []);
 
   /**
-   * Drop the tracked gesture without restoring `scrollLeft`. Used when another
-   * owner takes the scroller (drag / pinch / a second finger) and when the
-   * window is re-parked: their moves invalidate the frozen `left0`.
+   * Drop the gesture without moving the strip: another owner took the scroller
+   * (drag / pinch / a second finger) or the window was re-parked, so `left0` is
+   * stale. Also cancels a release tween and releases the snap lock.
    */
-  const dropAxisGesture = useCallback(() => {
-    clearAxisSettle();
-    const gesture = axisGestureRef.current;
-    gesture.origin = null;
-    gesture.intent = 'pending';
-    gesture.left0 = null;
-    if (stripLockReasonsRef.current.delete('axis')) applyStripLock();
-  }, [applyStripLock, clearAxisSettle]);
+  const dropSwipe = useCallback(() => {
+    cancelSettle();
+    resetSwipeGesture();
+    if (stripLockReasonsRef.current.delete('swipe')) applyStripLock();
+  }, [applyStripLock, cancelSettle]);
 
   const lockStrip = useCallback(
     (reason: StripLockReason) => {
-      // Drag / pinch scroll the strip on both axes themselves (drag auto-scroll,
-      // zoom `scrollTop`). Their programmatic writes must never start or finish
-      // a touch axis gesture, so an in-flight one is dropped here — with no
-      // restore, or the restore would fight their writes.
-      if (reason !== 'axis') dropAxisGesture();
+      // Drag / pinch write `scrollLeft` themselves (auto-scroll, zoom). A touch
+      // swipe in flight would fight those writes, and so would its tween, so it
+      // is dropped here — no tween, no restore.
+      if (reason !== 'swipe') dropSwipe();
       stripLockReasonsRef.current.add(reason);
       applyStripLock();
     },
-    [applyStripLock, dropAxisGesture],
+    [applyStripLock, dropSwipe],
   );
 
   const unlockStrip = useCallback(
@@ -278,143 +336,215 @@ export function useCalendarStrip(): CalendarStrip {
   );
 
   /**
-   * A Y gesture is over: put the strip back on the day the finger started on,
-   * then release the lock. The restore must happen while snap is still off —
-   * re-engaging snap first lets the browser pick the nearest column instead.
+   * Let go of the strip: the gesture is over (or was taken over), so drop the
+   * tween and the snap lock, then publish the day the strip landed on. The
+   * tween ends exactly on a column, so re-engaging snap has nothing to correct;
+   * a rebase the lock suppressed runs from this scroll.
    */
-  const finishAxisGesture = useCallback(() => {
-    clearAxisSettle();
-    const scroller = scrollerRef.current;
-    const left0 = axisGestureRef.current.left0;
-    if (scroller && left0 !== null && scroller.scrollLeft !== left0) {
-      // Restore exactly `left0`, not "nearest column": day columns are ~46px
-      // wide on a phone, so a ~23px drift would flip the visible day.
-      scroller.scrollTo({ left: left0, behavior: 'instant' });
-    }
-    unlockStrip('axis');
-    const gesture = axisGestureRef.current;
-    gesture.origin = null;
-    gesture.intent = 'pending';
-    gesture.left0 = null;
-  }, [clearAxisSettle, unlockStrip]);
+  const finishSwipe = useCallback(() => {
+    cancelSettle();
+    resetSwipeGesture();
+    unlockStrip('swipe');
+    onScrollerScroll();
+  }, [cancelSettle, onScrollerScroll, unlockStrip]);
 
   /**
-   * Wait for the gesture to settle before restoring: iOS keeps applying
-   * momentum after the last finger lifts, and a restore mid-momentum would be
-   * scrolled away again. `scrollend` where supported, else a quiet period
-   * re-armed by every `scroll` event.
+   * Ease `scrollLeft` onto column `target` with snap still off. Snap must stay
+   * off until the strip is exactly on the column: re-engaging it mid-flight
+   * would let the browser pick its own column and fight the tween.
    */
-  const armAxisSettle = useCallback(() => {
-    clearAxisSettle();
-    axisSettleTimerRef.current = window.setTimeout(() => {
-      axisSettleTimerRef.current = null;
-      finishAxisGesture();
-    }, AXIS_SETTLE_MS);
-  }, [clearAxisSettle, finishAxisGesture]);
+  const startSettle = useCallback(
+    (target: number) => {
+      const scroller = scrollerRef.current;
+      cancelSettle();
+      // The gesture itself is over; the lock stays held until the tween lands.
+      resetSwipeGesture();
+      if (!scroller || colW <= 0) {
+        finishSwipe();
+        return;
+      }
+
+      const from = scroller.scrollLeft;
+      const to = scrollLeftForIndex(target, colW);
+      const delta = to - from;
+      if (Math.abs(delta) < 0.5) {
+        scroller.scrollLeft = to;
+        finishSwipe();
+        return;
+      }
+
+      // Baseline on the first frame rather than on performance.now(): the two
+      // clocks are the same, but not necessarily phase-aligned.
+      let startedAt: number | null = null;
+      const step = (now: number) => {
+        if (startedAt === null) startedAt = now;
+        const t = Math.min(1, (now - startedAt) / SWIPE_SETTLE_MS);
+        const eased = 1 - (1 - t) ** 3;
+        scroller.scrollLeft = from + delta * eased;
+        if (t < 1) {
+          settleRafRef.current = requestAnimationFrame(step);
+          return;
+        }
+        settleRafRef.current = null;
+        // Land exactly on the column, not on a float.
+        scroller.scrollLeft = to;
+        finishSwipe();
+      };
+      settleRafRef.current = requestAnimationFrame(step);
+    },
+    [cancelSettle, colW, finishSwipe],
+  );
 
   // Touch events, not pointer events: the browser fires `pointercancel` the
   // moment native panning starts, so pointer events cannot follow a finger
   // through a native scroll. All listeners stay passive — never preventDefault,
-  // or the gesture stops being native.
+  // or the vertical pan stops being native.
   const onTouchStart = useCallback(
     (e: TouchEvent) => {
-      const gesture = axisGestureRef.current;
       if (e.touches.length !== 1) {
-        // A second finger: pinch owns the scroller now (it writes `scrollTop`),
-        // so drop the axis lock with no restore and stop tracking.
-        dropAxisGesture();
+        // A second finger: pinch owns the scroller now (it writes `scrollTop`).
+        // Drop the swipe with no tween and unlock, so it never fights the zoom.
+        dropSwipe();
         return;
       }
       // Drag (long-press on a chip) owns the scroller: never co-track it.
-      if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
+      const held = stripLockReasonsRef.current;
+      if (held.has('drag') || held.has('pinch')) return;
 
+      const scroller = scrollerRef.current;
+      if (!scroller || colW <= 0) return;
+
+      // A new touch mid-tween grabs the strip where it is. Cancel the tween but
+      // keep the snap lock: re-engaging snap under the finger would jump.
+      cancelSettle();
       const touch = e.touches[0];
+      const gesture = swipeRef.current;
       gesture.origin = { x: touch.clientX, y: touch.clientY };
       gesture.intent = 'pending';
-      if (stripLockReasonsRef.current.has('axis')) {
-        // A previous flick is still settling: keep its lock and `left0` so this
-        // touch re-classifies against the same frozen day, and cancel the
-        // settle that would otherwise restore under the new finger.
-        clearAxisSettle();
-        return;
-      }
-      gesture.left0 = scrollerRef.current?.scrollLeft ?? 0;
+      gesture.left0 = scroller.scrollLeft;
+      gesture.startIdx = Math.round(scroller.scrollLeft / colW);
+      gesture.lockSign = 0;
+      gesture.lastX = touch.clientX;
+      gesture.samples = [{ t: e.timeStamp, x: touch.clientX }];
     },
-    [clearAxisSettle, dropAxisGesture],
+    [cancelSettle, colW, dropSwipe],
   );
 
   const onTouchMove = useCallback(
     (e: TouchEvent) => {
-      const gesture = axisGestureRef.current;
-      // Classify once per gesture: a resolved axis is never revisited.
-      if (gesture.origin === null || gesture.intent !== 'pending') return;
-
+      const gesture = swipeRef.current;
+      const scroller = scrollerRef.current;
       const touch = e.touches[0];
-      const axis = classifyScrollAxis(
-        touch.clientX - gesture.origin.x,
-        touch.clientY - gesture.origin.y,
-      );
-      if (axis === 'pending') return;
-      gesture.intent = axis;
+      if (gesture.origin === null || !scroller || !touch) return;
 
-      if (axis === 'y') {
-        // Hold the day still. No scrollLeft write here: the finger owns the
-        // position, and a write shimmies and kills iOS momentum.
-        lockStrip('axis');
-        return;
+      const dx = touch.clientX - gesture.origin.x;
+      const dy = touch.clientY - gesture.origin.y;
+
+      if (gesture.intent === 'pending') {
+        const axis = classifyScrollAxis(dx, dy);
+        // Dead zone: nothing moves sideways until the swipe is deliberate.
+        if (axis === 'pending') return;
+        gesture.intent = axis;
+        if (axis === 'x') {
+          // Horizontal: take the strip off the browser. Snap off, or every
+          // write would be re-snapped to a column under the finger. The
+          // direction is fixed here and kept for the whole gesture, so travel
+          // stays continuous if the finger reverses past its origin.
+          gesture.lockSign = dx > 0 ? 1 : -1;
+          lockStrip('swipe');
+        }
       }
-      // Horizontal: native snap pages the days. A lock left over from a
-      // still-settling flick has to go now — with no restore — or it would
-      // fight the snap.
-      if (stripLockReasonsRef.current.has('axis')) dropAxisGesture();
+      // Only a horizontal gesture ever moves the strip. A resolved y must not
+      // fall through to the write below: that would page the day on every
+      // vertical move, which is the bug this whole gesture exists to fix.
+      if (gesture.intent !== 'x') return;
+
+      // Subtract the dead zone so the strip starts at `left0` on the threshold
+      // and then follows the finger 1:1, with no jump at the origin.
+      const travel = dx - gesture.lockSign * SCROLL_X_THRESHOLD_PX;
+      const maxLeft = scrollLeftForIndex(dayCount - periodLength, colW);
+      scroller.scrollLeft = Math.min(
+        maxLeft,
+        Math.max(0, gesture.left0 - travel),
+      );
+      gesture.lastX = touch.clientX;
+      gesture.samples.push({ t: e.timeStamp, x: touch.clientX });
+      if (gesture.samples.length > SWIPE_SAMPLE_LIMIT) gesture.samples.shift();
     },
-    [dropAxisGesture, lockStrip],
+    [colW, dayCount, lockStrip, periodLength],
   );
 
   const onTouchEnd = useCallback(
     (e: TouchEvent) => {
       // Other fingers are still down: wait for the real last lift.
       if (e.touches.length > 0) return;
-      if (!stripLockReasonsRef.current.has('axis')) {
-        // A tap, or a horizontal swipe handed to native snap: nothing to undo.
-        dropAxisGesture();
+      const gesture = swipeRef.current;
+      if (gesture.origin === null) return;
+      const scroller = scrollerRef.current;
+      if (!scroller) {
+        dropSwipe();
         return;
       }
-      // Arm now too, so a gesture that ends without further scrolling settles
-      // on the timer instead of holding the lock forever.
-      armAxisSettle();
+
+      const wasSwipe = gesture.intent === 'x';
+      const swipeHeld = stripLockReasonsRef.current.has('swipe');
+      // Close the velocity window at release with the finger's last position: a
+      // finger that stopped before lifting must not read as a flick from its
+      // last fast samples.
+      gesture.samples.push({ t: e.timeStamp, x: gesture.lastX });
+
+      if (wasSwipe) {
+        startSettle(
+          swipeTargetIndex({
+            startIdx: gesture.startIdx,
+            scrollLeft: scroller.scrollLeft,
+            velocity: swipeVelocity(gesture.samples),
+            colW,
+            periodLength,
+            maxIdx: dayCount - periodLength,
+          }),
+        );
+        return;
+      }
+      if (swipeHeld) {
+        // This touch interrupted a tween and lifted without committing to an
+        // axis: land on the nearest column instead of leaving the strip
+        // stranded between two days.
+        startSettle(
+          computeVisibleStartIndex(
+            scroller.scrollLeft,
+            colW,
+            dayCount,
+            periodLength,
+          ),
+        );
+        return;
+      }
+      // A tap, or a vertical gesture that native pan-y already owns.
+      dropSwipe();
     },
-    [armAxisSettle, dropAxisGesture],
+    [colW, dayCount, dropSwipe, periodLength, startSettle],
   );
 
-  // A scroll while a settle is armed restarts the quiet period. The timer is
-  // only ever armed with every finger up, so this cannot re-arm a live gesture.
-  const onAxisSettleScroll = useCallback(() => {
-    if (axisSettleTimerRef.current === null) return;
-    armAxisSettle();
-  }, [armAxisSettle]);
-
-  const onAxisScrollEnd = useCallback(() => {
-    if (axisSettleTimerRef.current === null) return;
-    finishAxisGesture();
-  }, [finishAxisGesture]);
-
   // ── Wheel axis gesture ────────────────────────────────────────────────
-  // Same failure as the touch axis lock, with no finger to lift: a Mac
+  // The same sideways dead zone as touch, with no finger to lift: a Mac
   // trackpad adds a little horizontal delta to a vertical two-finger scroll,
-  // the mandatory day snap walks the strip sideways, and there is no settle to
-  // restore on. So the sideways component must never reach the scroller at
-  // all: latch the burst's axis, then drop the horizontal part for a vertical
-  // burst — re-applying its vertical delta by hand, since preventing the
-  // default would otherwise swallow the scroll the user asked for.
+  // the mandatory day snap walks the strip sideways, and there is no release to
+  // settle on. A touch gets its dead zone from `touch-action: pan-y`; a wheel
+  // has no such property, so the handler must drop the sideways part itself:
+  // the delta never reaches the scroller until the burst has accumulated a
+  // deliberate, horizontal-dominant swipe. Until then only the vertical part
+  // applies — re-applied by hand, since preventing the default would otherwise
+  // swallow the scroll the user asked for. Sideways travel dropped in the dead
+  // zone is simply lost, never caught up.
   const wheelBurstRef = useRef<WheelBurst>(EMPTY_WHEEL_BURST);
 
   const onWheel = useCallback((e: WheelEvent) => {
     // Ctrl/meta wheel is pinch-zoom, owned by useCalendarZoom: that handler
     // preventDefaults and rewrites `scrollTop`. Leave it entirely alone.
     if (e.ctrlKey || e.metaKey) return;
-    // Drag / pinch write `scrollLeft` themselves (auto-scroll, zoom); a wheel
-    // burst must not be classified against, or fight, those writes.
+    // Any lock owner writes `scrollLeft` itself (auto-scroll, zoom, swipe); a
+    // wheel burst must not be classified against, or fight, those writes.
     if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
 
     const scroller = scrollerRef.current;
@@ -429,20 +559,19 @@ export function useCalendarStrip(): CalendarStrip {
     });
     wheelBurstRef.current = burst;
 
-    // `pending` (under the slop, so at most half a column of drift — mandatory
-    // snap settles back on the same day) and `x` (native horizontal scroll and
-    // day paging) both stay native.
-    if (burst.axis !== 'y') return;
+    // `x`: a deliberate sideways swipe, so native horizontal scroll takes it and
+    // mandatory snap pages the days as before.
+    if (burst.axis === 'x') return;
     // deltaX 0 is an ordinary mouse wheel: exactly the pre-fix behaviour.
     if (e.deltaX === 0) return;
 
-    // Vertical burst carrying sideways drift: consume the event and apply the
-    // vertical part ourselves, so `scrollLeft` never moves under the day snap.
+    // `pending` (dead zone) or `y`: consume the event and apply the vertical
+    // part only, so `scrollLeft` never moves under the day snap.
     e.preventDefault();
-    scroller.scrollBy({ top: dyPx, behavior: 'instant' });
+    if (dyPx !== 0) scroller.scrollBy({ top: dyPx, behavior: 'instant' });
   }, []);
 
-  // The scroller is always mounted, so this attaches once.
+  // The scroller is always mounted, so this attaches once per layout change.
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
@@ -452,8 +581,6 @@ export function useCalendarStrip(): CalendarStrip {
     scroller.addEventListener('touchmove', onTouchMove, opts);
     scroller.addEventListener('touchend', onTouchEnd, opts);
     scroller.addEventListener('touchcancel', onTouchEnd, opts);
-    scroller.addEventListener('scroll', onAxisSettleScroll, opts);
-    scroller.addEventListener('scrollend', onAxisScrollEnd, opts);
     // Non-passive, unlike the touch listeners: a vertical burst has to cancel
     // the sideways component before native snap sees it.
     scroller.addEventListener('wheel', onWheel, { passive: false });
@@ -463,20 +590,11 @@ export function useCalendarStrip(): CalendarStrip {
       scroller.removeEventListener('touchmove', onTouchMove);
       scroller.removeEventListener('touchend', onTouchEnd);
       scroller.removeEventListener('touchcancel', onTouchEnd);
-      scroller.removeEventListener('scroll', onAxisSettleScroll);
-      scroller.removeEventListener('scrollend', onAxisScrollEnd);
       scroller.removeEventListener('wheel', onWheel);
-      clearAxisSettle();
+      // Unmount / relayout: never leave a tween or the snap lock running.
+      dropSwipe();
     };
-  }, [
-    clearAxisSettle,
-    onAxisScrollEnd,
-    onAxisSettleScroll,
-    onTouchEnd,
-    onTouchMove,
-    onTouchStart,
-    onWheel,
-  ]);
+  }, [dropSwipe, onTouchEnd, onTouchMove, onTouchStart, onWheel]);
 
   const releaseSuppressRebase = () => {
     // scroll events from programmatic scrollLeft can be sync or rAF-deferred.
@@ -501,18 +619,13 @@ export function useCalendarStrip(): CalendarStrip {
         shiftWindowStart(startOfDay(prev), dir, periodLength),
       );
       scroller.scrollLeft = scroller.scrollLeft + compensation;
-      // An in-flight axis gesture pins a day in `left0`: shift it with the
-      // content, or the end-of-gesture restore would land a period away.
-      const gesture = axisGestureRef.current;
-      if (gesture.left0 !== null) gesture.left0 += compensation;
-      // The axis lock holds the visible day, so publish from `left0` and not
-      // from the drifting scrollLeft.
-      const idxScrollLeft =
-        stripLockReasonsRef.current.has('axis') && gesture.left0 !== null
-          ? gesture.left0
-          : scroller.scrollLeft;
       setVisibleStartIdx(
-        computeVisibleStartIndex(idxScrollLeft, colW, dayCount, periodLength),
+        computeVisibleStartIndex(
+          scroller.scrollLeft,
+          colW,
+          dayCount,
+          periodLength,
+        ),
       );
       releaseSuppressRebase();
       return;
@@ -545,51 +658,12 @@ export function useCalendarStrip(): CalendarStrip {
     }
   }, [colW, dayCount, mainWidth, periodLength, windowStart, scrollNonce]);
 
-  // Horizontal scroll: update visible start; request rebase near the edges.
-  const onScrollerScroll = useCallback(() => {
-    // Ignore until init park has run with a measured width. Otherwise a mount
-    // scrollLeft write (or scrollLeft ≈ 0) sets visibleStartIdx to 0 and the
-    // title flashes / sticks on the overscan buffer week.
-    if (!didInitScrollRef.current) return;
-
-    const scroller = scrollerRef.current;
-    if (!scroller || colW <= 0) return;
-
-    // While the Y lock holds, the visible day is frozen at `left0`: the
-    // scrollLeft drifts sideways under the finger, and reading it would flash
-    // the next day's title / sidebar before the end-of-gesture restore.
-    const axisLeft0 = axisGestureRef.current.left0;
-    const idxScrollLeft =
-      stripLockReasonsRef.current.has('axis') && axisLeft0 !== null
-        ? axisLeft0
-        : scroller.scrollLeft;
-
-    const idx = computeVisibleStartIndex(
-      idxScrollLeft,
-      colW,
-      dayCount,
-      periodLength,
-    );
-    setVisibleStartIdx((prev) => (prev === idx ? prev : idx));
-
-    if (suppressRebaseRef.current) return;
-    // Drag / pinch own the strip lock: no rebase while they are held. 'axis'
-    // is exempt — it disables snap only, so the window may still slide.
-    if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
-
-    const dir = shouldRebase(idx, dayCount, periodLength);
-    if (dir !== 0 && pendingRebaseRef.current === 0) {
-      pendingRebaseRef.current = dir;
-      setScrollNonce((n) => n + 1);
-    }
-  }, [colW, dayCount, periodLength]);
-
   /** Park the strip so `firstVisible` is the left edge of the viewport. */
   const jumpToVisibleStart = useCallback(
     (firstVisible: Date, scrollToNow: boolean) => {
-      // The window is re-parked from scratch: any tracked axis gesture holds a
-      // `left0` from the old window, which must not be restored afterwards.
-      dropAxisGesture();
+      // The window is re-parked from scratch: a swipe in flight holds a `left0`
+      // from the old window, and its tween targets an index in it.
+      dropSwipe();
       shouldScrollToNowRef.current = scrollToNow;
       pendingRebaseRef.current = 0;
       const origin = addDays(startOfDay(firstVisible), -STRIP_OVERSCAN);
@@ -599,7 +673,7 @@ export function useCalendarStrip(): CalendarStrip {
       pendingScrollLeftRef.current = 0; // non-null sentinel
       setScrollNonce((n) => n + 1);
     },
-    [dropAxisGesture],
+    [dropSwipe],
   );
 
   const shiftPeriod = useCallback(
