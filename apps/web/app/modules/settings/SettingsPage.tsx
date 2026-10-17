@@ -5,14 +5,13 @@ import {
   HelpCircle,
   LogOut,
   ChevronRight,
-  Moon,
-  Sun,
-  Monitor,
   Repeat,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
+import { useTheme } from '@/lib/theme-context';
+import { ThemePreferenceControl } from './ThemePreferenceControl';
 import { useNavigate } from '@tanstack/react-router';
 
 interface SettingsSectionProps {
@@ -71,6 +70,7 @@ function SettingsItem({
 
 export function SettingsPage() {
   const { user, logout } = useAuth();
+  const { preference, setPreference } = useTheme();
   const navigate = useNavigate();
 
   const handleLogout = async () => {
@@ -156,20 +156,10 @@ export function SettingsPage() {
           <div className="space-y-4">
             <div>
               <p className="text-sm font-medium text-foreground mb-3">Theme</p>
-              <div className="flex gap-3">
-                <button className="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary/10 text-primary border-2 border-primary">
-                  <Sun className="h-4 w-4" />
-                  <span className="text-sm font-medium">Light</span>
-                </button>
-                <button className="flex items-center gap-2 px-4 py-2 rounded-lg bg-muted text-muted-foreground border-2 border-transparent">
-                  <Moon className="h-4 w-4" />
-                  <span className="text-sm font-medium">Dark</span>
-                </button>
-                <button className="flex items-center gap-2 px-4 py-2 rounded-lg bg-muted text-muted-foreground border-2 border-transparent">
-                  <Monitor className="h-4 w-4" />
-                  <span className="text-sm font-medium">System</span>
-                </button>
-              </div>
+              <ThemePreferenceControl
+                preference={preference}
+                onChange={setPreference}
+              />
             </div>
 
             <div>

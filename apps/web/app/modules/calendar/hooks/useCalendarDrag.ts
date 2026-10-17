@@ -32,6 +32,7 @@ import {
 import { tick } from '../lib/haptics';
 import {
   dateOnDay,
+  HAPTIC_TICK_MINUTES,
   minutesFromY,
   RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
@@ -232,8 +233,10 @@ function computePreview(session: Session): TimedRange | null {
 }
 
 /**
- * The instant whose 15-minute bucket drives haptic ticks: the dragged edge
- * for resizes (1-min snap, so the slot alone is too fine), else the slot.
+ * The instant whose `HAPTIC_TICK_MINUTES` bucket drives haptic ticks: the
+ * dragged edge for resizes (the clamped commit, not the raw slot), else the
+ * current slot. The bucket is 15 minutes on purpose — the 1-minute snap is
+ * too fine to buzz on.
  */
 function tickInstantMs(session: Session): number | null {
   if (session.kind === 'resize-start' || session.kind === 'resize-end') {
@@ -303,7 +306,7 @@ export function useCalendarDrag(
       if (
         prevMs !== null &&
         nextMs !== null &&
-        crossedTickBoundary(prevMs, nextMs, SNAP_MINUTES)
+        crossedTickBoundary(prevMs, nextMs, HAPTIC_TICK_MINUTES)
       ) {
         tick();
       }

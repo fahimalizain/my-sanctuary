@@ -6,6 +6,8 @@
 
 @layer base {
   :root {
+    color-scheme: light;
+
     /* Base colors */
     --background: 55 20% 95%;
     --foreground: 100 10% 11%;
@@ -26,12 +28,42 @@
     --border: 94 66% 12%;
     --input: 94 66% 12%;
     --ring: 94 75% 18%;
+    --cream: 60 23% 95%; /* #f5f5ef */
     --radius: 0.75rem;
 
     /* Sanctuary specific tokens (opacity variants) */
     --border-opacity: 0.16;
     --text-muted-opacity: 0.62;
     --text-faint-opacity: 0.4;
+  }
+
+  /* Applied to <html> by the theme engine. Same specificity as :root, but
+     declared later so these win while the class is present. */
+  .dark {
+    color-scheme: dark;
+    --background: 100 14% 7%; /* #11140f */
+    --foreground: 60 20% 92%; /* #efefe7 */
+    --cream: 100 14% 7%; /* same canvas as --background */
+    --card: 90 8% 15%; /* #262923 */
+    --card-foreground: 60 20% 92%;
+    --popover: 90 8% 15%;
+    --popover-foreground: 60 20% 92%;
+    --primary: 94 45% 46%; /* #6eaa41 — readable as text-primary on the dark canvas */
+    --primary-foreground: 100 20% 8%; /* #131810 — readable on the lifted primary */
+    --secondary: 100 8% 18%;
+    --secondary-foreground: 60 20% 92%;
+    --muted: 100 8% 18%;
+    --muted-foreground: 60 10% 70%;
+    --accent: 94 45% 46%;
+    --accent-foreground: 100 20% 8%;
+    --destructive: 0 72% 48%; /* #d32222, ~5:1 with near-white foreground */
+    --destructive-foreground: 0 0% 98%;
+    --border: 80 12% 72%;
+    --input: 80 12% 72%;
+    --ring: 94 45% 46%;
+    --border-opacity: 0.28;
+    --text-muted-opacity: 0.72;
+    --text-faint-opacity: 0.5;
   }
 }
 

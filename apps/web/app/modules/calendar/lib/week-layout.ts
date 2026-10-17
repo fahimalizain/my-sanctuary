@@ -25,12 +25,23 @@ export const CHIP_Z_SELECTED = 40;
 export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
-/** Snap click-to-create / drag start times to this many minutes. */
-export const SNAP_MINUTES = 15;
+/** Snap click-to-create, drag-create, and move times to this many minutes. */
+export const SNAP_MINUTES = 1;
 /** Snap resize active-edge times to this many minutes. */
 export const RESIZE_SNAP_MINUTES = 1;
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
+/**
+ * Packing widens only events shorter than this many minutes up to the painted
+ * chip height. This is the layout contract from 58d443a (15 min and longer
+ * pack exactly). It is not the drag grid.
+ */
+export const PACK_WIDEN_BELOW_MIN = 15;
+/**
+ * Touch-drag haptics fire when the relevant instant crosses this many minutes.
+ * Coarser than the 1-minute snap so a drag does not buzz every minute.
+ */
+export const HAPTIC_TICK_MINUTES = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -668,6 +679,14 @@ export function formatEventDuration(start: Date, end: Date): string {
   if (hours === 0) return `${minutes}min`;
   if (minutes === 0) return `${hours}h`;
   return `${hours}h ${minutes}min`;
+}
+
+/**
+ * Range + duration detail line: "5 AM – 6:30 AM · 1h 30min".
+ * Single source of truth for the tall chip's second line and the drag ghost.
+ */
+export function formatEventTimeDetail(start: Date, end: Date): string {
+  return `${formatEventTimeRange(start, end)} · ${formatEventDuration(start, end)}`;
 }
 
 /** Sun-first weekday labels for civil date lines (not WEEK_DAYS, which is Mon-first). */

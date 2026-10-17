@@ -42,6 +42,7 @@ import {
   applyStartTime,
   formatEventDateLine,
   formatEventDuration,
+  formatEventTimeDetail,
   formatWeekTitle,
   toDateInputValue,
   toTimeInputValue,
@@ -71,6 +72,7 @@ import {
   visibleStartIndex,
   weekRangeIso,
   snapMinutes,
+  PACK_WIDEN_BELOW_MIN,
   RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
   minutesFromY,
@@ -1043,7 +1045,7 @@ test('packDayEvents: two 0-min events at the same instant sit side by side', () 
       { id: 'b', startMin: 600, endMin: 600 },
     ],
     22.5,
-    SNAP_MINUTES,
+    PACK_WIDEN_BELOW_MIN,
   );
   assert.equal(packed.length, 2);
   for (const p of packed) {
@@ -1105,9 +1107,44 @@ test('packDayEvents: back-to-back 15-min events keep full width at hourH=48', ()
       { id: 'b', startMin: 615, endMin: 630 },
     ],
     (CHIP_MIN_H / 48) * 60,
-    SNAP_MINUTES,
+    PACK_WIDEN_BELOW_MIN,
   );
   for (const p of packed) {
+    assert.equal(p.leftPercent, 0);
+    assert.equal(p.widthPercent, 1);
+  }
+});
+
+test('packDayEvents: widen threshold is 15 min, not the 1-min snap', () => {
+  assert.equal(PACK_WIDEN_BELOW_MIN, 15);
+
+  // 14 min → widened to the 22.5-min painted height, so it collides with a
+  // neighbour that starts inside that height.
+  const widened = packDayEvents(
+    [
+      { id: 'a', startMin: 600, endMin: 614 },
+      { id: 'b', startMin: 620, endMin: 640 },
+    ],
+    22.5,
+    PACK_WIDEN_BELOW_MIN,
+  );
+  // Overlap signal from example 2: the later chip peeks, so a widened 14-min
+  // event must leave at least one chip shifted right and narrower than full.
+  assert.ok(
+    widened.some((p) => p.leftPercent > 0 && p.widthPercent < 1),
+    'the 14-min event must widen and collide with its neighbour',
+  );
+
+  // 15 min → not widened; it packs exactly and the 620 neighbour clears it.
+  const exact = packDayEvents(
+    [
+      { id: 'a', startMin: 600, endMin: 615 },
+      { id: 'b', startMin: 620, endMin: 640 },
+    ],
+    22.5,
+    PACK_WIDEN_BELOW_MIN,
+  );
+  for (const p of exact) {
     assert.equal(p.leftPercent, 0);
     assert.equal(p.widthPercent, 1);
   }
@@ -1291,11 +1328,16 @@ test('isCompactChip: Notion threshold (inner < timeLine + timeMarginTop)', () =>
 
 // ── snapMinutes / minutesFromY / dateOnDay ──────────────────────────────
 
-test('snapMinutes: nearest 15, clamp 0..1440', () => {
-  assert.equal(snapMinutes(7), 0);
-  assert.equal(snapMinutes(8), 15);
-  assert.equal(snapMinutes(22), 15);
-  assert.equal(snapMinutes(23), 30);
+test('snapMinutes: nearest 1 minute, clamp 0..1440', () => {
+  assert.equal(SNAP_MINUTES, 1);
+  assert.equal(snapMinutes(7), 7);
+  assert.equal(snapMinutes(8), 8);
+  assert.equal(snapMinutes(22), 22);
+  assert.equal(snapMinutes(23), 23);
+  // Half-up: fractional minutes round to the nearest minute.
+  assert.equal(snapMinutes(7.4), 7);
+  assert.equal(snapMinutes(7.5), 8);
+  assert.equal(snapMinutes(7.6), 8);
   assert.equal(snapMinutes(1440), 1440);
   assert.equal(snapMinutes(-5), 0);
   assert.equal(snapMinutes(0), 0);
@@ -1306,16 +1348,19 @@ test('snapMinutes: optional 1-minute step (resize)', () => {
   // nearest 1-minute
   assert.equal(snapMinutes(10 * 60 + 7.4, RESIZE_SNAP_MINUTES), 607);
   assert.equal(snapMinutes(10 * 60 + 7.6, RESIZE_SNAP_MINUTES), 608);
-  // contrast with default 15
   assert.equal(snapMinutes(7, 1), 7);
   assert.equal(snapMinutes(8, 1), 8);
-  // default arity still 15
-  assert.equal(snapMinutes(7), 0);
-  assert.equal(snapMinutes(8), 15);
   // clamp
   assert.equal(snapMinutes(-5, 1), 0);
   assert.equal(snapMinutes(1440, 1), 1440);
   assert.equal(snapMinutes(1440.2, 1), 1440);
+});
+
+test('snapMinutes: explicit 15-minute step still quantizes', () => {
+  assert.equal(snapMinutes(7, 15), 0);
+  assert.equal(snapMinutes(8, 15), 15);
+  assert.equal(snapMinutes(22, 15), 15);
+  assert.equal(snapMinutes(23, 15), 30);
 });
 
 test('minutesFromY: 88px at hourH=88 → 60', () => {
@@ -1370,6 +1415,26 @@ test('formatEventDuration: inverted range clamps to "0min"', () => {
   const start = new Date(2026, 8, 13, 6, 0);
   const end = new Date(2026, 8, 13, 5, 0);
   assert.equal(formatEventDuration(start, end), '0min');
+});
+
+// ── formatEventTimeDetail ───────────────────────────────────────────────
+
+test('formatEventTimeDetail: 5:00–6:30 → range + duration', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 30);
+  assert.equal(formatEventTimeDetail(start, end), '5 AM – 6:30 AM · 1h 30min');
+});
+
+test('formatEventTimeDetail: exactly 60 minutes on the hour → "5 AM – 6 AM · 1h"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 0);
+  assert.equal(formatEventTimeDetail(start, end), '5 AM – 6 AM · 1h');
+});
+
+test('formatEventTimeDetail: inverted range still formats (duration 0min)', () => {
+  const start = new Date(2026, 8, 13, 6, 0);
+  const end = new Date(2026, 8, 13, 5, 0);
+  assert.equal(formatEventTimeDetail(start, end), '6 AM – 5 AM · 0min');
 });
 
 // ── formatEventDateLine ─────────────────────────────────────────────────

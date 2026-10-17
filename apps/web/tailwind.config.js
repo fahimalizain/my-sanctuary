@@ -5,7 +5,7 @@ export default {
   theme: {
     extend: {
       colors: {
-        cream: '#f5f5ef',
+        cream: 'hsl(var(--cream) / <alpha-value>)',
         'sanctuary-green': '#204f0a',
         'work-blue': '#2a5c8a',
         'gym-terracotta': '#c45a2c',
