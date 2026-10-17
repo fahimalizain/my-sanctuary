@@ -22,11 +22,12 @@ use api_core::repo::{
     build_occurrence_list_by_ids_sql, build_routine_list_by_ids_sql, AgendaItemRepo,
     OccurrenceRepo, RepoError, RoutineRepo,
     TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
-    AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL, AGENDA_ITEM_GET_BY_KEY_SQL,
-    AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL, AGENDA_ITEM_INSERT_CHUNK_SIZE,
-    AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL,
-    AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL, AGENDA_ITEM_MAX_SORT_ORDER_SQL,
-    AGENDA_ITEM_MIN_LOCAL_DATE_SQL, AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL,
+    AGENDA_ITEM_DELETE_BY_REF_SQL, AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL,
+    AGENDA_ITEM_GET_BY_KEY_SQL, AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL,
+    AGENDA_ITEM_INSERT_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE,
+    AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL,
+    AGENDA_ITEM_MAX_SORT_ORDER_SQL, AGENDA_ITEM_MIN_LOCAL_DATE_SQL,
+    AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL,
     AGENDA_ITEM_SET_LOCAL_DATE_SQL, AGENDA_ITEM_SET_SORT_ORDER_SQL,
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL, OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL,
     OCCURRENCE_INSERT_SQL, OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_LIST_BY_IDS_CHUNK_SIZE,
@@ -940,6 +941,25 @@ impl AgendaItemRepo for D1AgendaItemRepo {
             .db
             .prepare(AGENDA_ITEM_DELETE_SQL)
             .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)?;
+        run_stmt(stmt).await
+    }
+
+    async fn delete_by_ref(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<(), RepoError> {
+        // Every matching row (never `LIMIT 1`); zero rows is a no-op.
+        let stmt = self
+            .db
+            .prepare(AGENDA_ITEM_DELETE_BY_REF_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(kind),
+                D1Type::Text(ref_id),
+            ])
             .map_err(backend)?;
         run_stmt(stmt).await
     }

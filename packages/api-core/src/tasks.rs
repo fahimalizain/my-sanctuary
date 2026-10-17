@@ -104,11 +104,20 @@
 //! prepends, Done/Discarded/In Progress prepend; same-status omit is a no-op.
 //! A same-status cross-card drag (including IN_PROGRESS → IN_PROGRESS with a
 //! rank) is a pure reorder — In Progress is a real pile, not a singleton.
+//!
+//! Agenda (ADR 0004 amendment): a task owns **one** agenda row, and its civil
+//! day follows the task's real lifecycle — create, a real start, a real
+//! complete/discard, and reopen put that row on **civil today** (the primary
+//! calendar's date via [`crate::agenda::user_today`], appended at the pile's
+//! `max + 1`; an existing row travels, today's ranks never reshuffle). Soft
+//! delete removes the row. Stop, pause, reorder, an already-IN_PROGRESS start,
+//! and title edits leave the day alone.
 
 use std::collections::HashMap;
 
 use thiserror::Error;
 
+use crate::agenda::{user_today, AgendaError, AGENDA_KIND_TASK};
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{
     classify, classify_detailed, ensure_taxonomy, first_matching_index, first_matching_pattern,
@@ -117,14 +126,14 @@ use crate::categories::{
 };
 use crate::config::OAuthConfig;
 use crate::models::{
-    CalendarEvent, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task, TaskCategory,
-    TaskCategoryPattern, UpdateTask,
+    CalendarEvent, NewAgendaItem, NewEventInput, NewTask, NewTaskInput, NewTaskLog, Task,
+    TaskCategory, TaskCategoryPattern, UpdateTask,
 };
 use crate::oauth::HttpClient;
 use crate::pattern_gen::{emit_affixes, fill_regex, split_hole};
 use crate::repo::{
-    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
-    TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
+    AgendaItemRepo, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError,
+    TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
 };
 use crate::time::{
     ceil_5min_unix_in_zone, nearest_minute_unix, rfc3339_to_unix_secs, unix_secs_to_rfc3339,
@@ -744,6 +753,70 @@ fn untracked_with(
     }
 }
 
+// ──────────────────────────────────────────
+// Agenda placement: one row per task, on civil today
+// ──────────────────────────────────────────
+
+/// Puts the task's single agenda row on **civil today** (ADR 0004 amendment).
+///
+/// Today is the user's ONE today — the civil date of `now_unix` in the
+/// primary Google calendar's IANA `time_zone` ([`crate::agenda::user_today`]),
+/// never a UTC computation here and never the browser.
+///
+/// - No row → insert one on today at the pile's append rank (`max + 1`, else
+///   0). `insert` is `INSERT OR IGNORE`: a racing duplicate returns the
+///   stored row, whose rank stands.
+/// - A row already on today → `Ok(())` with `local_date` and `sort_order`
+///   untouched (appending never reshuffles today's existing ranks).
+/// - A row on any other date → [`AgendaItemRepo::set_local_date`] to today at
+///   `max + 1`: the row itself travels (one row per task, migration 0018), no
+///   second row is inserted, and today's peers keep their ranks.
+///
+/// Called on **real** lifecycle transitions only (create, a real start, a
+/// real complete/discard, reopen). Idempotent, so a caller that cannot be
+/// sure the transition was real may still call it.
+pub(crate) async fn place_task_on_today(
+    agenda_repo: &dyn AgendaItemRepo,
+    calendars: &dyn CalendarRepo,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<(), TasksError> {
+    let (today, _time_zone) = user_today(calendars, user_id, now_unix)
+        .await
+        .map_err(|err| match err {
+            AgendaError::Repo(err) => TasksError::Repo(err),
+            // Every other agenda-layer surprise (a calendar read above all) is
+            // a caller-side failure on this path: the agenda's own 400/404/502
+            // mapping belongs to its endpoints.
+            other => TasksError::Invalid(other.to_string()),
+        })?;
+    let Some(item) = agenda_repo
+        .get_by_ref(user_id, AGENDA_KIND_TASK, task_id)
+        .await?
+    else {
+        let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &today).await?);
+        agenda_repo
+            .insert(NewAgendaItem {
+                user_id: user_id.to_string(),
+                local_date: today,
+                kind: AGENDA_KIND_TASK.to_string(),
+                ref_id: task_id.to_string(),
+                sort_order,
+            })
+            .await?;
+        return Ok(());
+    };
+    if item.local_date == today {
+        return Ok(());
+    }
+    let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &today).await?);
+    agenda_repo
+        .set_local_date(&item.id, &today, sort_order)
+        .await?;
+    Ok(())
+}
+
 /// Creates a task (always `status = "OPEN"`).
 ///
 /// Validation (all 400):
@@ -763,12 +836,20 @@ fn untracked_with(
 /// `max(sort_order)+1` for the user's living OPEN rows (0 when the pile is
 /// empty). Peers are left in place: create is unranked capture, so rank 0
 /// stays the task that has waited longest (migration 0005 backfill).
+///
+/// The task's single agenda row is placed on **civil today** right after the
+/// insert ([`place_task_on_today`]): create is one of the four real lifecycle
+/// transitions that relocate the row. A validation 400 returns before the
+/// insert and therefore never writes an agenda row.
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     task_repo: &dyn TaskRepo,
     user_id: &str,
     input: &NewTaskInput,
+    agenda_repo: &dyn AgendaItemRepo,
+    calendars: &dyn CalendarRepo,
+    now_unix: i64,
 ) -> Result<TaskResponse, TasksError> {
     let title = input.title.trim().to_string();
     if title.is_empty() {
@@ -824,6 +905,9 @@ pub async fn create_task(
             sort_order: append_rank(max),
         })
         .await?;
+    // Every create puts the task's one agenda row on civil today (appended).
+    // The validation 400s above returned before the insert — no task, no row.
+    place_task_on_today(agenda_repo, calendars, user_id, &task.id, now_unix).await?;
     Ok(TaskResponse {
         task: to_view(&task, &taxonomy, None),
     })
@@ -926,6 +1010,12 @@ pub async fn update_task(
 /// deletes keep working. The pointer is cleared **even without Google**
 /// (`http`/`access` `None`) — we never want to point at a ghost — but the
 /// snap itself needs the refreshable token.
+///
+/// Agenda (ADR 0004 amendment): only after `soft_delete` succeeds is the
+/// task's agenda row removed — **every** matching row, not `LIMIT 1`
+/// ([`AgendaItemRepo::delete_by_ref`]). A missing row is fine. The 404 paths
+/// and a focused delete whose Google snap failed return before the delete and
+/// never drop the row.
 pub async fn delete_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -939,6 +1029,7 @@ pub async fn delete_task(
     id: &str,
     now_rfc3339: &str,
     now_unix: i64,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<DeleteTaskResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(id).await? else {
         return Err(TasksError::NotFound);
@@ -961,6 +1052,11 @@ pub async fn delete_task(
         users.set_focused_task_id(user_id, None, now_rfc3339).await?;
     }
     task_repo.soft_delete(id, now_rfc3339).await?;
+    // The row is gone only after the soft delete succeeded: a focused delete
+    // whose Google snap failed above returned early with the row intact.
+    agenda_repo
+        .delete_by_ref(user_id, AGENDA_KIND_TASK, id)
+        .await?;
     Ok(DeleteTaskResponse { success: true })
 }
 
@@ -1034,6 +1130,11 @@ fn task_segment_input(
 ///    task carrier attached).
 /// 6. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
 ///    request.
+///
+/// Agenda (ADR 0004 amendment): a **real** start also puts the task's single
+/// agenda row on civil today ([`place_task_on_today`]). The already-IN_PROGRESS
+/// 200 no-op returns above and never moves the row, even when it sits on
+/// another day.
 pub async fn start_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1047,6 +1148,7 @@ pub async fn start_task(
     user_id: &str,
     task_id: &str,
     now_unix: i64,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -1103,6 +1205,9 @@ pub async fn start_task(
     else {
         return Err(TasksError::NotFound);
     };
+    // Real transition only (the IN_PROGRESS no-op returned above): the one
+    // agenda row lands on civil today, appended.
+    place_task_on_today(agenda_repo, calendars, user_id, &task.id, now_unix).await?;
     logs.insert(
         NewTaskLog {
             task_id: task.id.clone(),
@@ -1131,6 +1236,10 @@ pub async fn start_task(
 /// (IN_PROGRESS → OPEN) the task **appends Backlog** — `max(sort_order)+1`
 /// of the living OPEN pile excluding itself, so its leftover IN_PROGRESS
 /// rank never inflates the append target. Already OPEN → no re-rank.
+///
+/// Agenda: stop never moves the task's agenda row. `_agenda_repo` exists only
+/// so the worker's shared `timer_action!` macro can pass the same argument
+/// list to all four exit verbs (complete/discard do place).
 pub async fn stop_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1144,6 +1253,7 @@ pub async fn stop_task(
     user_id: &str,
     task_id: &str,
     now_unix: i64,
+    _agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, operations, category_repo, task_repo, logs, users, access,
@@ -1161,6 +1271,9 @@ pub async fn stop_task(
 /// Ranking (ADR 0002 § Timer verb landings): on a real transition
 /// (IN_PROGRESS → PLANNED) the task **prepends Planned** (rank 0 — peers
 /// shift up). Already PLANNED → no re-rank.
+///
+/// Agenda: pause never moves the task's agenda row (the `_agenda_repo` is the
+/// timer macro's shared argument list only).
 pub async fn pause_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1174,6 +1287,7 @@ pub async fn pause_task(
     user_id: &str,
     task_id: &str,
     now_unix: i64,
+    _agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, operations, category_repo, task_repo, logs, users, access,
@@ -1188,6 +1302,9 @@ pub async fn pause_task(
 ///
 /// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
 /// **prepends Done** (rank 0 — peers shift up). Already COMPLETED → no re-rank.
+///
+/// Agenda (ADR 0004 amendment): a real complete puts the task's single agenda
+/// row on civil today; the idempotent no-op does not.
 pub async fn complete_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1201,10 +1318,11 @@ pub async fn complete_task(
     user_id: &str,
     task_id: &str,
     now_unix: i64,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-        user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true,
+        user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true, agenda_repo,
     )
     .await
 }
@@ -1216,6 +1334,9 @@ pub async fn complete_task(
 /// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
 /// **prepends Discarded** (rank 0 — peers shift up). Already DISCARDED → no
 /// re-rank.
+///
+/// Agenda (ADR 0004 amendment): a real discard puts the task's single agenda
+/// row on civil today; the idempotent no-op does not.
 pub async fn discard_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1229,10 +1350,11 @@ pub async fn discard_task(
     user_id: &str,
     task_id: &str,
     now_unix: i64,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-        user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true,
+        user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true, agenda_repo,
     )
     .await
 }
@@ -1371,6 +1493,11 @@ async fn stop_or_pause(
 /// idempotent no-op above returns the row unchanged. `false` from
 /// [`dispatch_matrix_action`] / [`terminal_transition`] — `/move` places
 /// exactly once afterwards.
+///
+/// Agenda (ADR 0004 amendment): the idempotent no-op returns above, so a
+/// status write here is always a **real** transition — its single agenda row
+/// moves onto civil today (both the raw `/complete` `/discard` path and a
+/// `/move` into a terminal status).
 async fn complete_or_discard(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1387,6 +1514,7 @@ async fn complete_or_discard(
     target_status: &str,
     log_type: &str,
     place: bool,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -1465,6 +1593,9 @@ async fn complete_or_discard(
     else {
         return Err(TasksError::NotFound);
     };
+    // Real transition only (the idempotent no-op returned above): the task's
+    // single agenda row lands on civil today, appended.
+    place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await?;
     logs.insert(
         NewTaskLog {
             task_id: task_id.to_string(),
@@ -1783,6 +1914,7 @@ async fn dispatch_matrix_action(
     from: &str,
     to: &str,
     now_unix: i64,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<Option<CalendarEvent>, TasksError> {
     // `to == IN_PROGRESS` is always start. Same-status cells never dispatch
     // here — the caller runs them as no-ops/reorders — so `from` is never
@@ -1792,7 +1924,7 @@ async fn dispatch_matrix_action(
             let (http, access) = require_google(http, access)?;
             start_task(
                 http, calendars, events, operations, list_repo, category_repo, task_repo, logs,
-                access, user_id, task_id, now_unix,
+                access, user_id, task_id, now_unix, agenda_repo,
             )
             .await
             .map(|response| response.event)
@@ -1823,6 +1955,7 @@ async fn dispatch_matrix_action(
             complete_or_discard(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
+                agenda_repo,
             )
             .await
             .map(|response| response.event)
@@ -1832,6 +1965,7 @@ async fn dispatch_matrix_action(
             complete_or_discard(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
+                agenda_repo,
             )
             .await
             .map(|response| response.event)
@@ -1856,20 +1990,24 @@ async fn dispatch_matrix_action(
         (TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED, TASK_STATUS_OPEN | TASK_STATUS_PLANNED) => {
             local_transition(task_repo, logs, user_id, task_id, to, TASK_LOG_REOPENED, now_unix)
                 .await?;
+            // Reopen is a real lifecycle transition, so the task's one agenda
+            // row comes back onto civil today. Called unconditionally: the
+            // helper no-ops when the row already sits there.
+            place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await?;
             Ok(None)
         }
         // complete / discard from any non-running status: no Google writes.
         (_, TASK_STATUS_COMPLETED) => {
             terminal_transition(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-                user_id, task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix,
+                user_id, task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix, agenda_repo,
             )
             .await
         }
         (_, TASK_STATUS_DISCARDED) => {
             terminal_transition(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-                user_id, task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix,
+                user_id, task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix, agenda_repo,
             )
             .await
         }
@@ -1924,6 +2062,11 @@ async fn local_transition(
 /// Google auto-stop here. (The matrix already routes true IN_PROGRESS →
 /// COMPLETED/DISCARDED to the inner unplaced [`complete_or_discard`]; this
 /// arm is a backstop only — it never places, `/move` owns the rank.)
+///
+/// Agenda (ADR 0004 amendment): both branches are real complete/discard
+/// transitions. The IN_PROGRESS branch delegates to
+/// [`complete_or_discard`], which places the row itself; the local branch
+/// places after the status write.
 async fn terminal_transition(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1939,6 +2082,7 @@ async fn terminal_transition(
     target_status: &str,
     log_type: &str,
     now_unix: i64,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<Option<CalendarEvent>, TasksError> {
     // Status is the lock: a non-IN_PROGRESS row has no living timer, even if
     // a stale event window lingers in the cache — no Google writes.
@@ -1965,11 +2109,15 @@ async fn terminal_transition(
             target_status,
             log_type,
             false,
+            agenda_repo,
         )
         .await?;
         return Ok(response.event);
     }
     local_transition(task_repo, logs, user_id, task_id, target_status, log_type, now_unix).await?;
+    // The local branch is still a real complete/discard: put the one agenda
+    // row on civil today (the helper no-ops when it is already there).
+    place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await?;
     Ok(None)
 }
 
@@ -2057,6 +2205,13 @@ async fn reorder_in_place(
 ///
 /// Validation: unknown `status` → 400; negative `sort_order` → 400 (`None`
 /// is not negative); missing/other-user/soft-deleted task → 404.
+///
+/// Agenda (ADR 0004 amendment): the same real lifecycle transitions move the
+/// task's single agenda row onto civil today — a real start (via
+/// [`start_task`]), a move into a terminal status (via
+/// [`complete_or_discard`]/[`terminal_transition`]), and reopen from a
+/// terminal status. Stop, pause, reorder, plan/unplan, and the terminal →
+/// IN_PROGRESS start arm never place twice.
 pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -2072,6 +2227,7 @@ pub async fn move_task(
     task_id: &str,
     now_unix: i64,
     input: &MoveTaskInput,
+    agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<MoveTaskResponse, TasksError> {
     if !is_valid_task_status(&input.status) {
         return Err(TasksError::Invalid("unknown task status".to_string()));
@@ -2146,7 +2302,7 @@ pub async fn move_task(
         };
         let event = dispatch_matrix_action(
             http, calendars, events, operations, list_repo, category_repo, task_repo, logs, users,
-            access, user_id, task_id, &task.status, &input.status, now_unix,
+            access, user_id, task_id, &task.status, &input.status, now_unix, agenda_repo,
         )
         .await?;
         let row = place_at(task_repo, user_id, task_id, &input.status, rank).await?;
@@ -3013,6 +3169,297 @@ mod tests {
         }
     }
 
+    /// In-memory `AgendaItemRepo` with the membership semantics the placement
+    /// verbs rely on: `insert` is `INSERT OR IGNORE` on the per-date unique
+    /// key, `set_local_date` moves the row itself, and `delete_by_ref` drops
+    /// **every** matching row. The remaining reads are honest in-memory
+    /// filters (the tasks service only uses the placement verbs).
+    struct FakeAgendaItemRepo {
+        stored: Mutex<Vec<crate::models::AgendaItem>>,
+        next_id: Mutex<u64>,
+    }
+
+    impl FakeAgendaItemRepo {
+        fn new() -> Self {
+            Self {
+                stored: Mutex::new(Vec::new()),
+                next_id: Mutex::new(1),
+            }
+        }
+
+        /// Every row of `user_id` in insertion order — the tests' direct
+        /// window into the membership table.
+        fn rows(&self, user_id: &str) -> Vec<crate::models::AgendaItem> {
+            self.stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id)
+                .cloned()
+                .collect()
+        }
+
+        /// Directly relocates a stored row (the "the row sits on another day"
+        /// setup — the service verbs only ever move onto today).
+        fn move_row(&self, id: &str, local_date: &str, sort_order: i64) {
+            let mut stored = self.stored.lock().unwrap();
+            let row = stored.iter_mut().find(|row| row.id == id).expect("agenda row");
+            row.local_date = local_date.to_string();
+            row.sort_order = sort_order;
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AgendaItemRepo for FakeAgendaItemRepo {
+        async fn list_by_user_and_date(
+            &self,
+            user_id: &str,
+            local_date: &str,
+        ) -> Result<Vec<crate::models::AgendaItem>, RepoError> {
+            let mut rows: Vec<crate::models::AgendaItem> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.local_date == local_date)
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| (a.sort_order, &a.created_at).cmp(&(b.sort_order, &b.created_at)));
+            Ok(rows)
+        }
+
+        async fn list_by_user_and_date_range(
+            &self,
+            user_id: &str,
+            from: &str,
+            to: &str,
+        ) -> Result<Vec<crate::models::AgendaItem>, RepoError> {
+            let mut rows: Vec<crate::models::AgendaItem> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.user_id == user_id
+                        && row.local_date.as_str() >= from
+                        && row.local_date.as_str() <= to
+                })
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (&a.local_date, a.sort_order, &a.created_at)
+                    .cmp(&(&b.local_date, b.sort_order, &b.created_at))
+            });
+            Ok(rows)
+        }
+
+        async fn min_local_date(&self, user_id: &str) -> Result<Option<String>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id)
+                .map(|row| row.local_date.as_str())
+                .min()
+                .map(str::to_string))
+        }
+
+        async fn oldest_pending_local_date_before(
+            &self,
+            _user_id: &str,
+            _before: &str,
+        ) -> Result<Option<String>, RepoError> {
+            // Not on any path the tasks service takes (the range read owns it).
+            Ok(None)
+        }
+
+        async fn get_by_id(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::models::AgendaItem>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == id)
+                .cloned())
+        }
+
+        async fn get_by_key(
+            &self,
+            user_id: &str,
+            local_date: &str,
+            kind: &str,
+            ref_id: &str,
+        ) -> Result<Option<crate::models::AgendaItem>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row.user_id == user_id
+                        && row.local_date == local_date
+                        && row.kind == kind
+                        && row.ref_id == ref_id
+                })
+                .cloned())
+        }
+
+        async fn get_by_ref(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_id: &str,
+        ) -> Result<Option<crate::models::AgendaItem>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row.user_id == user_id && row.kind == kind && row.ref_id == ref_id
+                })
+                .cloned())
+        }
+
+        async fn insert(
+            &self,
+            item: NewAgendaItem,
+        ) -> Result<crate::models::AgendaItem, RepoError> {
+            let mut stored = self.stored.lock().unwrap();
+            // INSERT OR IGNORE: the UNIQUE key already holds a row → return it
+            // unchanged (an append never reshuffles an existing item).
+            if let Some(existing) = stored.iter().find(|row| {
+                row.user_id == item.user_id
+                    && row.local_date == item.local_date
+                    && row.kind == item.kind
+                    && row.ref_id == item.ref_id
+            }) {
+                return Ok(existing.clone());
+            }
+            let mut next = self.next_id.lock().unwrap();
+            let row = crate::models::AgendaItem {
+                id: format!("ai-{next}"),
+                user_id: item.user_id,
+                local_date: item.local_date,
+                kind: item.kind,
+                ref_id: item.ref_id,
+                sort_order: item.sort_order,
+                created_at: "2026-08-23T00:00:00Z".to_string(),
+                updated_at: "2026-08-23T00:00:00Z".to_string(),
+            };
+            *next += 1;
+            stored.push(row.clone());
+            Ok(row)
+        }
+
+        async fn list_by_refs(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_ids: &[String],
+        ) -> Result<Vec<crate::models::AgendaItem>, RepoError> {
+            if ref_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.user_id == user_id
+                        && row.kind == kind
+                        && ref_ids.iter().any(|id| id == &row.ref_id)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn insert_many(&self, rows: Vec<NewAgendaItem>) -> Result<(), RepoError> {
+            for row in rows {
+                self.insert(row).await?;
+            }
+            Ok(())
+        }
+
+        async fn hard_delete(&self, id: &str) -> Result<(), RepoError> {
+            self.stored.lock().unwrap().retain(|row| row.id != id);
+            Ok(())
+        }
+
+        async fn delete_by_ref(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_id: &str,
+        ) -> Result<(), RepoError> {
+            // Mirrors AGENDA_ITEM_DELETE_BY_REF_SQL: EVERY matching row.
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id && row.kind == kind && row.ref_id == ref_id)
+            });
+            Ok(())
+        }
+
+        async fn max_sort_order(
+            &self,
+            user_id: &str,
+            local_date: &str,
+        ) -> Result<Option<i64>, RepoError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.local_date == local_date)
+                .map(|row| row.sort_order)
+                .max())
+        }
+
+        async fn set_sort_order(&self, id: &str, sort_order: i64) -> Result<(), RepoError> {
+            if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
+                row.sort_order = sort_order;
+            }
+            Ok(())
+        }
+
+        async fn set_local_date(
+            &self,
+            id: &str,
+            local_date: &str,
+            sort_order: i64,
+        ) -> Result<(), RepoError> {
+            // Mirrors AGENDA_ITEM_SET_LOCAL_DATE_SQL: the row travels, ranks
+            // are not shifted.
+            if let Some(row) = self.stored.lock().unwrap().iter_mut().find(|row| row.id == id) {
+                row.local_date = local_date.to_string();
+                row.sort_order = sort_order;
+            }
+            Ok(())
+        }
+
+        async fn shift_sort_order(
+            &self,
+            user_id: &str,
+            local_date: &str,
+            from_rank: i64,
+            delta: i64,
+        ) -> Result<(), RepoError> {
+            for row in self.stored.lock().unwrap().iter_mut() {
+                if row.user_id == user_id
+                    && row.local_date == local_date
+                    && row.sort_order >= from_rank
+                {
+                    row.sort_order += delta;
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// In-memory `UserRepo` mirroring the focus pointer (task-focus, slice 3):
     /// the `focused_task_id` lock lives here, exactly like the D1 row.
     #[derive(Default)]
@@ -3372,12 +3819,25 @@ mod tests {
 
     /// Seeds a fresh user's taxonomy (4 lists, 4 roots + untracked, 8
     /// patterns) through the exact path the app uses, returning the repos.
-    fn seeded() -> (FakeTaskListRepo, FakeTaskCategoryRepo, FakeTaskRepo) {
+    /// Seeds a fresh user's taxonomy (4 lists, 4 roots + untracked, 8
+    /// patterns) through the exact path the app uses, returning the repos, the
+    /// agenda membership fake, and a calendar fake with **no primary** (so
+    /// civil today is UTC in these tests).
+    #[allow(clippy::type_complexity)]
+    fn seeded() -> (
+        FakeTaskListRepo,
+        FakeTaskCategoryRepo,
+        FakeTaskRepo,
+        FakeAgendaItemRepo,
+        FakeCalendarRepo,
+    ) {
         let lists = FakeTaskListRepo::new();
         let categories = FakeTaskCategoryRepo::new();
         let tasks = FakeTaskRepo::new();
+        let agenda = FakeAgendaItemRepo::new();
+        let calendars = FakeCalendarRepo::with(Vec::new());
         pollster::block_on(crate::list_lists(&lists, &categories, "u-1")).unwrap();
-        (lists, categories, tasks)
+        (lists, categories, tasks, agenda, calendars)
     }
 
     fn category_ids_by_slug(repo: &FakeTaskCategoryRepo) -> HashMap<String, String> {
@@ -3396,9 +3856,9 @@ mod tests {
 
     #[test]
     fn create_matches_root_exact_title_and_pipe_suffix() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let work = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(work.task.status, "OPEN");
@@ -3415,6 +3875,7 @@ mod tests {
 
         let review = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Review Q3 | Work"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(review.task.category.title, "Work");
@@ -3428,11 +3889,11 @@ mod tests {
 
     #[test]
     fn create_carries_display_title() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
 
         // Exact root match: no hole, so display == title.
         let work = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(work.task.title, "Work");
@@ -3440,7 +3901,7 @@ mod tests {
 
         // Pipe suffix on a root: the `.*` hole absorbs the prefix.
         let test = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Test | Work"),
+            &lists, &categories, &tasks, "u-1", &input("Test | Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(test.task.title, "Test | Work", "title stays the stored full string");
@@ -3451,6 +3912,7 @@ mod tests {
         spicyhome_child(&lists, &categories, None, None);
         let child = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Hello! | SpicyHome"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(child.task.category.title, "SpicyHome");
@@ -3460,10 +3922,10 @@ mod tests {
 
     #[test]
     fn create_task_appends_backlog_sort_order() {
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
-        let second = work_task(&lists, &categories, &tasks);
-        let third = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let second = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let third = work_task(&lists, &categories, &tasks, &agenda, &calendars);
 
         // The first task lands at the front of the Backlog pile (0); every
         // later create appends at max(sort_order)+1 without touching peers.
@@ -3480,22 +3942,25 @@ mod tests {
 
     #[test]
     fn create_append_rank_ignores_other_users_open_tasks() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         // Another user's living OPEN pile must not inflate this user's
         // append rank (max_sort_order is user-scoped).
-        pollster::block_on(create_task(&lists, &categories, &tasks, "u-2", &input("Work")))
-            .unwrap();
-        let first = work_task(&lists, &categories, &tasks);
+        pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-2", &input("Work"),
+            &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         assert_eq!(first.sort_order, 0, "u-1's first task still ranks 0");
     }
 
     #[test]
     fn create_append_rank_ignores_non_open_living_rows() {
-        let (lists, categories, tasks) = seeded();
-        let planned = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let planned = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // A living non-OPEN row must not inflate the OPEN max.
         pollster::block_on(tasks.set_status(&planned.id, TASK_STATUS_PLANNED, NOW)).unwrap();
-        let first = work_task(&lists, &categories, &tasks);
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         assert_eq!(first.sort_order, 0, "OPEN pile was empty, new task ranks 0");
         let stored = tasks.stored.lock().unwrap();
         assert_eq!(
@@ -3507,10 +3972,10 @@ mod tests {
 
     #[test]
     fn create_append_rank_ignores_soft_deleted_open_rows() {
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(tasks.soft_delete(&first.id, "2026-08-18T02:00:00Z")).unwrap();
-        let second = work_task(&lists, &categories, &tasks);
+        let second = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         assert_eq!(second.sort_order, 0, "soft-deleted OPEN row does not inflate the max");
         let stored = tasks.stored.lock().unwrap();
         assert_eq!(stored.iter().find(|row| row.id == second.id).unwrap().sort_order, 0);
@@ -3518,9 +3983,9 @@ mod tests {
 
     #[test]
     fn create_unmatched_title_is_invalid() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let err = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("asdf"),
+            &lists, &categories, &tasks, "u-1", &input("asdf"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "title does not match a category"));
@@ -3529,7 +3994,7 @@ mod tests {
 
     #[test]
     fn create_title_matching_two_roots_is_invalid() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         // Give Fitness the same pattern as Work so "Work" matches two roots.
         let ids = category_ids_by_slug(&categories);
         pollster::block_on(categories.replace_patterns(
@@ -3538,7 +4003,7 @@ mod tests {
         ))
         .unwrap();
         let err = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "title matches multiple categories"));
@@ -3546,7 +4011,7 @@ mod tests {
 
     #[test]
     fn create_title_matching_untracked_is_invalid() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         // The sink normally has no patterns; give it one to prove the guard.
         let untracked_id = categories.ids("u-1", true).pop().unwrap();
         pollster::block_on(categories.replace_patterns(
@@ -3555,7 +4020,7 @@ mod tests {
         ))
         .unwrap();
         let err = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Untracked"),
+            &lists, &categories, &tasks, "u-1", &input("Untracked"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "title matches untracked"));
@@ -3563,7 +4028,7 @@ mod tests {
 
     #[test]
     fn create_parent_remainder_is_allowed() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         // A child whose own pattern does not match the parent's title.
         let ids = category_ids_by_slug(&categories);
         let child = pollster::block_on(crate::categories::create_category(
@@ -3588,7 +4053,7 @@ mod tests {
 
         // "Work" matches only the root (parent remainder) → allowed, root.
         let work = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(work.task.category.id, ids["work"]);
@@ -3597,7 +4062,7 @@ mod tests {
         // "Code" matches only the child → allowed, child (inherits the root's
         // list).
         let code = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Code"),
+            &lists, &categories, &tasks, "u-1", &input("Code"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(code.task.category.id, child.id);
@@ -3606,7 +4071,7 @@ mod tests {
 
     #[test]
     fn create_validates_duration_and_priority() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let zero_duration = NewTaskInput {
             title: "Work".to_string(),
             description: None,
@@ -3615,7 +4080,7 @@ mod tests {
             difficulty: None,
         };
         let err = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &zero_duration,
+            &lists, &categories, &tasks, "u-1", &zero_duration, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "duration must be at least 1 minute"));
@@ -3628,7 +4093,7 @@ mod tests {
             difficulty: None,
         };
         let err = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &bad_priority,
+            &lists, &categories, &tasks, "u-1", &bad_priority, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "priority must be one of high, medium, low"));
@@ -3643,7 +4108,7 @@ mod tests {
                 difficulty: Some(difficulty.to_string()),
             };
             let err = pollster::block_on(create_task(
-                &lists, &categories, &tasks, "u-1", &bad_difficulty,
+                &lists, &categories, &tasks, "u-1", &bad_difficulty, &agenda, &calendars, NOW_UNIX,
             ))
             .unwrap_err();
             assert!(
@@ -3656,7 +4121,7 @@ mod tests {
 
     #[test]
     fn create_stores_explicit_difficulty() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let input = NewTaskInput {
             title: "Work".to_string(),
             description: None,
@@ -3665,7 +4130,7 @@ mod tests {
             difficulty: Some("medium".to_string()),
         };
         let response = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input,
+            &lists, &categories, &tasks, "u-1", &input, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(
@@ -3676,9 +4141,9 @@ mod tests {
 
     #[test]
     fn create_blank_title_is_invalid() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let err = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("   "),
+            &lists, &categories, &tasks, "u-1", &input("   "), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "title must not be empty"));
@@ -3689,9 +4154,11 @@ mod tests {
         let lists = FakeTaskListRepo::new();
         let categories = FakeTaskCategoryRepo::new();
         let tasks = FakeTaskRepo::new();
+        let agenda = FakeAgendaItemRepo::new();
+        let calendars = FakeCalendarRepo::with(Vec::new());
         // No prior visit to /api/lists — create must seed internally.
         let response = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap();
         assert_eq!(response.task.category.title, "Work");
@@ -3708,7 +4175,7 @@ mod tests {
 
     #[test]
     fn classify_title_blank_title_is_invalid_without_a_lock() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         for title in ["", "   "] {
             let err = pollster::block_on(classify_title(&lists, &categories, "u-1", title, None))
                 .unwrap_err();
@@ -3721,7 +4188,7 @@ mod tests {
 
     #[test]
     fn classify_title_unique_match_returns_the_category_summary() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let response =
             pollster::block_on(classify_title(&lists, &categories, "u-1", "Work", None)).unwrap();
         match response {
@@ -3747,7 +4214,7 @@ mod tests {
 
     #[test]
     fn classify_title_no_match_reports_untracked_without_conflict() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let response =
             pollster::block_on(classify_title(&lists, &categories, "u-1", "asdf", None)).unwrap();
         assert_eq!(
@@ -3765,7 +4232,7 @@ mod tests {
 
     #[test]
     fn classify_title_two_roots_conflict_names_both_categories() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         // Give Fitness the same pattern as Work so "Work" matches two roots
         // (mirrors create_title_matching_two_roots_is_invalid).
         let ids = category_ids_by_slug(&categories);
@@ -3798,7 +4265,7 @@ mod tests {
 
     #[test]
     fn classify_title_unlocked_pipe_suffix_reports_chrome_and_hole() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let response =
             pollster::block_on(classify_title(&lists, &categories, "u-1", "Test | Work", None))
                 .unwrap();
@@ -3823,7 +4290,7 @@ mod tests {
 
     #[test]
     fn classify_title_unlocked_keeps_the_children_actual_suffix() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let child = spicyhome_child(&lists, &categories, None, None);
         let response = pollster::block_on(classify_title(
             &lists,
@@ -3854,7 +4321,7 @@ mod tests {
 
     #[test]
     fn classify_title_locked_other_title_fills_the_hole() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let child = spicyhome_child(&lists, &categories, None, None);
         // "Work" files to Work, not to the locked SpicyHome: it is filled into
         // the child's hole — and it must NOT snap back to Work.
@@ -3889,7 +4356,7 @@ mod tests {
 
     #[test]
     fn classify_title_locked_blank_previews_the_chrome() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let child = spicyhome_child(&lists, &categories, None, None);
         let response = pollster::block_on(classify_title(
             &lists,
@@ -3920,7 +4387,7 @@ mod tests {
 
     #[test]
     fn classify_title_locked_identity_keeps_compact_suffix() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         let child = spicyhome_child(&lists, &categories, None, None);
         let response = pollster::block_on(classify_title(
             &lists,
@@ -3950,7 +4417,7 @@ mod tests {
 
     #[test]
     fn classify_title_locked_unknown_category_is_invalid() {
-        let (lists, categories, _tasks) = seeded();
+        let (lists, categories, _tasks, _agenda, _calendars) = seeded();
         for id in ["missing-category", ""] {
             let err = pollster::block_on(classify_title(
                 &lists,
@@ -3973,9 +4440,9 @@ mod tests {
 
     #[test]
     fn update_title_to_unmatched_is_invalid() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -3995,9 +4462,10 @@ mod tests {
 
     #[test]
     fn update_title_to_another_category_recomputes_category() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Review | Work"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -4016,9 +4484,9 @@ mod tests {
 
     #[test]
     fn update_without_title_preserves_category_and_applies_fields() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -4042,9 +4510,9 @@ mod tests {
 
     #[test]
     fn update_rejects_empty_body_bad_duration_and_bad_priority() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -4082,9 +4550,9 @@ mod tests {
 
     #[test]
     fn update_is_not_found_for_missing_and_other_users_task() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -4108,9 +4576,9 @@ mod tests {
 
     #[test]
     fn delete_soft_deletes_and_404s_on_second_try() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -4120,7 +4588,7 @@ mod tests {
         let users = FakeUserRepo::default();
         let response = pollster::block_on(delete_task(
             None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &created.id,
-            "2026-08-18T02:00:00Z", NOW_UNIX,
+            "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert!(response.success);
@@ -4132,7 +4600,7 @@ mod tests {
         assert!(matches!(
             pollster::block_on(delete_task(
                 None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &created.id,
-                "2026-08-18T02:00:00Z", NOW_UNIX,
+                "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
@@ -4140,9 +4608,9 @@ mod tests {
 
     #[test]
     fn delete_is_not_found_for_missing_and_other_users_task() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let created = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -4153,14 +4621,14 @@ mod tests {
         assert!(matches!(
             pollster::block_on(delete_task(
                 None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-2", &created.id,
-                "2026-08-18T02:00:00Z", NOW_UNIX,
+                "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(delete_task(
                 None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", "nope",
-                "2026-08-18T02:00:00Z", NOW_UNIX,
+                "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
@@ -4172,9 +4640,17 @@ mod tests {
 
     #[test]
     fn list_includes_computed_category_per_task() {
-        let (lists, categories, tasks) = seeded();
-        pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
-        pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Dinner | Family"))).unwrap();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap();
+        pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Dinner | Family"),
+            &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap();
 
         let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
         assert_eq!(response.tasks.len(), 2);
@@ -4186,8 +4662,12 @@ mod tests {
 
     #[test]
     fn list_keeps_tasks_that_no_longer_match_under_untracked() {
-        let (lists, categories, tasks) = seeded();
-        pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap();
         // The user deletes Work's patterns: the task still lists, as untracked.
         let ids = category_ids_by_slug(&categories);
         pollster::block_on(categories.replace_patterns(&ids["work"], vec![])).unwrap();
@@ -4214,16 +4694,24 @@ mod tests {
 
     #[test]
     fn list_is_scoped_to_the_user() {
-        let (lists, categories, tasks) = seeded();
-        pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap();
         let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-2", None)).unwrap();
         assert!(response.tasks.is_empty());
     }
 
     #[test]
     fn list_focus_is_false_without_a_pointer() {
-        let (lists, categories, tasks) = seeded();
-        pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input("Work"))).unwrap();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Work"),
+            &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap();
         let response = pollster::block_on(list_tasks(&lists, &categories, &tasks, "u-1", None)).unwrap();
         assert_eq!(response.tasks.len(), 1);
         assert!(
@@ -4234,9 +4722,9 @@ mod tests {
 
     #[test]
     fn list_focus_paints_the_pointed_in_progress_task() {
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
-        let second = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let second = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // Make `first` the running (IN_PROGRESS) task via the repo directly —
         // the focus rule needs a living IN_PROGRESS row, not a Google event.
         pollster::block_on(tasks.set_status(&first.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
@@ -4257,9 +4745,9 @@ mod tests {
 
     #[test]
     fn list_focus_ignores_a_pointer_at_a_non_running_task() {
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
-        work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // The pointer names an OPEN task (never IN_PROGRESS): the pointer is
         // dangling, so every row paints false — and the read must not write.
         let response = pollster::block_on(list_tasks(
@@ -4279,7 +4767,7 @@ mod tests {
 
     #[test]
     fn list_tasks_loads_taxonomy_patterns_in_one_query() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, _agenda, _calendars) = seeded();
         // Seed path already queried; isolate the list_tasks call.
         *categories.list_by_user_id_calls.lock().unwrap() = 0;
         *categories.list_patterns_by_user_id_calls.lock().unwrap() = 0;
@@ -4297,7 +4785,7 @@ mod tests {
 
     #[test]
     fn list_tasks_reads_taxonomy_once_when_already_seeded() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, _agenda, _calendars) = seeded();
         *categories.list_by_user_id_calls.lock().unwrap() = 0;
         *categories.list_patterns_by_user_id_calls.lock().unwrap() = 0;
 
@@ -4331,14 +4819,17 @@ mod tests {
 
     #[test]
     fn list_tasks_splits_display_titles_for_many_tasks_with_shared_splitters() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         for n in 0..60 {
             let title = match n % 3 {
                 0 => format!("Review {n} | Work"),
                 1 => "Work".to_string(),
                 _ => format!("Run {n} | Fitness"),
             };
-            pollster::block_on(create_task(&lists, &categories, &tasks, "u-1", &input(&title)))
+            pollster::block_on(create_task(
+                &lists, &categories, &tasks, "u-1", &input(&title),
+                &agenda, &calendars, NOW_UNIX,
+            ))
                 .unwrap();
         }
         let response =
@@ -4444,6 +4935,14 @@ mod tests {
 
     const NOW_UNIX: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z (the raw clock)
     const NOW: &str = "2023-11-14T22:13:20Z";
+    /// The agenda-placement tests' fixed clock: `2026-08-23T10:00:00Z`. The
+    /// seeded calendar fake has no primary calendar, so civil today is UTC —
+    /// `AGENDA_TODAY` — exactly as `user_today` computes it.
+    const AGENDA_NOW_UNIX: i64 = 1_787_479_200;
+    const AGENDA_TODAY: &str = "2026-08-23";
+    /// Civil dates strictly before / after [`AGENDA_TODAY`].
+    const AGENDA_PAST: &str = "2026-08-20";
+    const AGENDA_FUTURE: &str = "2026-08-26";
     /// `NOW_UNIX` snapped to the nearest minute — every timer Google write
     /// lands here (22:13:20 → 22:13:00).
     const NOW_SNAPPED: &str = "2023-11-14T22:13:00Z";
@@ -5129,10 +5628,14 @@ mod tests {
         lists: &FakeTaskListRepo,
         categories: &FakeTaskCategoryRepo,
         tasks: &FakeTaskRepo,
+        agenda: &FakeAgendaItemRepo,
+        calendars: &FakeCalendarRepo,
     ) -> TaskView {
-        pollster::block_on(create_task(lists, categories, tasks, "u-1", &input("Work")))
-            .unwrap()
-            .task
+        pollster::block_on(create_task(
+            lists, categories, tasks, "u-1", &input("Work"), agenda, calendars, NOW_UNIX,
+        ))
+        .unwrap()
+        .task
     }
 
     /// Creates the SpicyHome child under the seeded Work root for `u-1` with
@@ -5278,8 +5781,8 @@ mod tests {
 
     #[test]
     fn start_opens_event_with_carrier_and_marks_in_progress() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -5292,7 +5795,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5359,12 +5862,12 @@ mod tests {
 
     #[test]
     fn start_snapshots_custom_priority_and_difficulty_onto_the_insert_body() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let mut high_input = input("Work");
         high_input.priority = Some("high".to_string());
         high_input.difficulty = Some("hard".to_string());
         let task = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &high_input,
+            &lists, &categories, &tasks, "u-1", &high_input, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5380,7 +5883,7 @@ mod tests {
 
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5399,11 +5902,11 @@ mod tests {
 
     #[test]
     fn start_carries_task_notes_onto_the_insert_body() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let mut notes_input = input("Work");
         notes_input.description = Some("Deep focus session".to_string());
         let task = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &notes_input,
+            &lists, &categories, &tasks, "u-1", &notes_input, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5419,7 +5922,7 @@ mod tests {
 
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5431,8 +5934,8 @@ mod tests {
 
     #[test]
     fn start_omits_description_when_task_has_no_notes() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -5445,7 +5948,7 @@ mod tests {
 
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5457,8 +5960,8 @@ mod tests {
 
     #[test]
     fn start_opens_fixed_15min_window_regardless_of_duration() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // A 45-minute plan must NOT size the event: the live block is a fixed
         // marker the elongate cron grows, not a reservation of the estimate.
         pollster::block_on(update_task(
@@ -5484,7 +5987,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5503,8 +6006,8 @@ mod tests {
 
     #[test]
     fn start_uses_category_calendar_when_writable() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // Point the Work category at a non-primary calendar (direct store
         // mutation — the fake's `update` is a stub).
         {
@@ -5530,7 +6033,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5548,7 +6051,7 @@ mod tests {
         // The SpicyHome case: the child has no category calendar, the parent
         // root names one, and the matching pattern carries the destination.
         // The pattern slot wins the inheritance chain.
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         {
             let mut stored = categories.stored.lock().unwrap();
             stored
@@ -5560,6 +6063,7 @@ mod tests {
         spicyhome_child(&lists, &categories, Some("spicy@example.com"), None);
         let task = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5581,7 +6085,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5598,7 +6102,7 @@ mod tests {
     fn start_uses_category_calendar_when_matching_pattern_has_none() {
         // The matching pattern names no calendar (its None is taken as-is),
         // so the chain falls to the child category.
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         {
             let mut stored = categories.stored.lock().unwrap();
             stored
@@ -5610,6 +6114,7 @@ mod tests {
         spicyhome_child(&lists, &categories, None, Some("child@example.com"));
         let task = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5629,7 +6134,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5646,7 +6151,7 @@ mod tests {
     fn start_uses_parent_calendar_when_child_and_pattern_have_none() {
         // Neither the matching pattern nor the child category names a
         // calendar, so the chain falls to the parent root.
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         {
             let mut stored = categories.stored.lock().unwrap();
             stored
@@ -5658,6 +6163,7 @@ mod tests {
         spicyhome_child(&lists, &categories, None, None);
         let task = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5676,7 +6182,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5694,7 +6200,7 @@ mod tests {
         // Two patterns both match "Work": sort 0 names no calendar, sort 1
         // names one. The first MATCH wins — its None falls through to the
         // category, never ahead to sort 1.
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let ids = category_ids_by_slug(&categories);
         pollster::block_on(categories.replace_patterns(
             &ids["work"],
@@ -5718,7 +6224,7 @@ mod tests {
                 .unwrap()
                 .google_calendar_id = Some("cat@example.com".to_string());
         }
-        let task = work_task(&lists, &categories, &tasks);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
 
         let calendars = FakeCalendarRepo::with(vec![
             calendar("primary@example.com", true),
@@ -5735,7 +6241,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5754,10 +6260,11 @@ mod tests {
         // a writable one. The named destination is used as-is or NOT AT ALL:
         // a read-only pattern calendar goes to primary, never walking on to
         // the category slot.
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         spicyhome_child(&lists, &categories, Some("spicy@example.com"), Some("child@example.com"));
         let task = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &input("Test | SpicyHome"),
+            &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5780,7 +6287,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5795,8 +6302,8 @@ mod tests {
 
     #[test]
     fn start_omits_event_label_when_category_has_no_color() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // Erase the stored color (direct store mutation — the fake's update
         // is a stub), same pattern as the writable-calendar test.
         {
@@ -5819,7 +6326,7 @@ mod tests {
 
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5843,8 +6350,8 @@ mod tests {
     #[test]
     fn start_falls_back_to_primary_when_category_calendar_missing_or_readonly() {
         // Missing: the category names a calendar we never imported.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         {
             let mut stored = categories.stored.lock().unwrap();
             stored
@@ -5863,7 +6370,7 @@ mod tests {
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
@@ -5891,7 +6398,7 @@ mod tests {
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
@@ -5901,8 +6408,8 @@ mod tests {
 
     #[test]
     fn start_without_any_writable_calendar_is_invalid() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![GoogleCalendar {
             access_role: "reader".to_string(),
             ..calendar("primary@example.com", true)
@@ -5913,7 +6420,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
         let err = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "no writable calendar"));
@@ -5929,10 +6436,10 @@ mod tests {
     fn start_while_another_task_runs_opens_a_second_event() {
         // IN_PROGRESS is a column, not a singleton lock: a second start while
         // `first` runs opens its own event and both tasks stay IN_PROGRESS.
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let second = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Fitness"),
+            &lists, &categories, &tasks, "u-1", &input("Fitness"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -5948,7 +6455,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &first.id, NOW_UNIX,
+            &access(), "u-1", &first.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -5960,7 +6467,7 @@ mod tests {
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &second.id, NOW_UNIX,
+            &access(), "u-1", &second.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.id, second.id);
@@ -5983,8 +6490,8 @@ mod tests {
     fn start_while_same_task_runs_is_a_200_noop() {
         // Starting a task that is already IN_PROGRESS is an idempotent 200:
         // no new event, no log, no re-rank — even with other tasks running.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -5996,14 +6503,14 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
         let http = FakeHttp::new(vec![]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.id, task.id);
@@ -6021,10 +6528,10 @@ mod tests {
         // IN_PROGRESS is a status column, never a gate: a task whose status
         // says IN_PROGRESS but that has no living timed event (stale/missing
         // cache) does NOT block a second start — it simply starts too.
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let second = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Fitness"),
+            &lists, &categories, &tasks, "u-1", &input("Fitness"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -6041,7 +6548,7 @@ mod tests {
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &second.id, NOW_UNIX,
+            &access(), "u-1", &second.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
@@ -6058,8 +6565,8 @@ mod tests {
     fn start_completed_task_opens_a_new_event() {
         // ADR 0002: nothing is terminal — starting a COMPLETED task opens a
         // NEW event (the reopen-by-start chapter); history stays.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6075,7 +6582,7 @@ mod tests {
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6089,8 +6596,8 @@ mod tests {
 
     #[test]
     fn start_discarded_task_opens_a_new_event() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6103,7 +6610,7 @@ mod tests {
         )]);
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6116,8 +6623,8 @@ mod tests {
 
     #[test]
     fn start_missing_or_other_users_task_is_not_found() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6126,14 +6633,14 @@ mod tests {
         assert!(matches!(
             pollster::block_on(start_task(
                 &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-                &access(), "u-2", &task.id, NOW_UNIX,
+                &access(), "u-2", &task.id, NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(start_task(
                 &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-                &access(), "u-1", "nope", NOW_UNIX,
+                &access(), "u-1", "nope", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
@@ -6141,8 +6648,8 @@ mod tests {
 
     #[test]
     fn start_google_error_surfaces_as_google_api_error() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6150,7 +6657,7 @@ mod tests {
         let http = FakeHttp::new(vec![("/events", 400, r#"{"error":"invalid"}"#)]);
         let err = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::GoogleApi(_)), "got {err:?}");
@@ -6168,8 +6675,8 @@ mod tests {
 
     #[test]
     fn stop_patches_end_and_returns_open() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6181,7 +6688,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6194,7 +6701,7 @@ mod tests {
         )]);
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, stop_unix,
+            &access(), "u-1", &task.id, stop_unix, &agenda,
         ))
         .unwrap();
 
@@ -6217,8 +6724,8 @@ mod tests {
 
     #[test]
     fn stop_when_now_equals_start_clamps_end_to_start_plus_60s() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6230,7 +6737,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6244,7 +6751,7 @@ mod tests {
         )]);
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6261,8 +6768,8 @@ mod tests {
 
     #[test]
     fn stop_without_open_event_still_flips_status_to_open() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6272,7 +6779,7 @@ mod tests {
 
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6292,8 +6799,8 @@ mod tests {
         // PATCH. The exit now resolves the event through the task's latest
         // `started` log — the run closes even when the cached end is in the
         // past.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6305,7 +6812,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6325,7 +6832,7 @@ mod tests {
         )]);
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6343,8 +6850,8 @@ mod tests {
 
     #[test]
     fn pause_patches_end_and_logs_paused() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6356,7 +6863,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6369,7 +6876,7 @@ mod tests {
         )]);
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, pause_unix,
+            &access(), "u-1", &task.id, pause_unix, &agenda,
         ))
         .unwrap();
 
@@ -6387,7 +6894,7 @@ mod tests {
         )]);
         let restarted = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, pause_unix,
+            &access(), "u-1", &task.id, pause_unix, &agenda,
         ))
         .unwrap();
         assert_eq!(restarted.task.status, TASK_STATUS_IN_PROGRESS);
@@ -6395,8 +6902,8 @@ mod tests {
 
     #[test]
     fn stop_on_terminal_task_is_invalid() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6406,7 +6913,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
         let err = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(_)), "got {err:?}");
@@ -6417,11 +6924,11 @@ mod tests {
         // A real stop (IN_PROGRESS → OPEN) appends Backlog: the leftover
         // IN_PROGRESS rank 0 must not win, and the living OPEN peer keeps
         // its rank — the stopped task lands at max+1 = 2.
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
-        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 1
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
+            start_running(&lists, &categories, &tasks, &agenda, &a.id);
         drop(_start_http);
 
         let stop_unix = NOW_UNIX + 300;
@@ -6433,7 +6940,7 @@ mod tests {
         let users = FakeUserRepo::default();
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &a.id, stop_unix,
+            &access(), "u-1", &a.id, stop_unix, &agenda,
         ))
         .unwrap();
 
@@ -6450,9 +6957,9 @@ mod tests {
     fn stop_already_open_does_not_rerank() {
         // Stop on an already-OPEN task keeps its rank (the log behavior on
         // this path is unchanged — only placement is skipped).
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
-        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 1
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6461,7 +6968,7 @@ mod tests {
 
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &b.id, NOW_UNIX,
+            &access(), "u-1", &b.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6477,15 +6984,15 @@ mod tests {
     fn pause_prepends_planned_on_transition() {
         // A real pause (IN_PROGRESS → PLANNED) prepends: rank 0, and the
         // old PLANNED peer shifts to 1.
-        let (lists, categories, tasks) = seeded();
-        let peer = work_task(&lists, &categories, &tasks);
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // Seed a PLANNED peer at 0 (dummy row: set_status + rank).
         pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, NOW)).unwrap();
         pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
 
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &task.id);
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
         drop(_start_http);
 
         let pause_unix = NOW_UNIX + 600;
@@ -6497,7 +7004,7 @@ mod tests {
         let users = FakeUserRepo::default();
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, pause_unix,
+            &access(), "u-1", &task.id, pause_unix, &agenda,
         ))
         .unwrap();
 
@@ -6514,9 +7021,9 @@ mod tests {
     fn pause_already_planned_does_not_rerank() {
         // Pause on an already-PLANNED task keeps its rank (no prepend, the
         // peer stays put — only placement is skipped).
-        let (lists, categories, tasks) = seeded();
-        let peer = work_task(&lists, &categories, &tasks);
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_PLANNED, NOW)).unwrap();
         pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_PLANNED, NOW)).unwrap();
@@ -6529,7 +7036,7 @@ mod tests {
 
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6548,8 +7055,8 @@ mod tests {
 
     #[test]
     fn complete_while_running_patches_then_completes_with_both_logs() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6561,7 +7068,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6573,7 +7080,7 @@ mod tests {
         )]);
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, complete_unix,
+            &access(), "u-1", &task.id, complete_unix, &agenda,
         ))
         .unwrap();
 
@@ -6591,8 +7098,8 @@ mod tests {
 
     #[test]
     fn complete_while_not_running_completes_without_google_call() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6602,7 +7109,7 @@ mod tests {
 
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6616,8 +7123,8 @@ mod tests {
 
     #[test]
     fn complete_already_completed_is_idempotent_200() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6626,13 +7133,13 @@ mod tests {
         let http = FakeHttp::new(vec![]);
         pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         // Second complete: no-op, still 200.
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
@@ -6643,9 +7150,9 @@ mod tests {
     fn complete_prepends_on_transition() {
         // A real complete (OPEN → COMPLETED) prepends Done: rank 0, and the
         // old COMPLETED peer shifts to 1.
-        let (lists, categories, tasks) = seeded();
-        let peer = work_task(&lists, &categories, &tasks);
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // Seed a COMPLETED peer at 0 (dummy row: set_status + rank).
         pollster::block_on(tasks.set_status(&peer.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
         pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
@@ -6657,7 +7164,7 @@ mod tests {
 
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6674,8 +7181,8 @@ mod tests {
     fn complete_already_completed_is_still_noop() {
         // The idempotent no-op never re-ranks: a COMPLETED row sitting at
         // rank 3 stays at 3 through a second complete.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
         pollster::block_on(tasks.set_sort_order(&task.id, 3)).unwrap();
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
@@ -6686,7 +7193,7 @@ mod tests {
 
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
@@ -6702,8 +7209,8 @@ mod tests {
 
     #[test]
     fn discard_while_running_patches_then_discards_with_both_logs() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6715,7 +7222,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6727,7 +7234,7 @@ mod tests {
         )]);
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, discard_unix,
+            &access(), "u-1", &task.id, discard_unix, &agenda,
         ))
         .unwrap();
 
@@ -6740,8 +7247,8 @@ mod tests {
 
     #[test]
     fn discard_while_not_running_discards_without_google_call() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6750,7 +7257,7 @@ mod tests {
 
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6761,8 +7268,8 @@ mod tests {
 
     #[test]
     fn complete_and_discard_are_not_found_for_other_users() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6773,17 +7280,17 @@ mod tests {
         let ops = ops();
         let complete_other = complete_task(
             &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-2",
-            &task.id, NOW_UNIX,
+            &task.id, NOW_UNIX, &agenda,
         );
         assert!(matches!(pollster::block_on(complete_other), Err(TasksError::NotFound)));
         let discard_other = discard_task(
             &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-2",
-            &task.id, NOW_UNIX,
+            &task.id, NOW_UNIX, &agenda,
         );
         assert!(matches!(pollster::block_on(discard_other), Err(TasksError::NotFound)));
         let complete_missing = complete_task(
             &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-1",
-            "nope", NOW_UNIX,
+            "nope", NOW_UNIX, &agenda,
         );
         assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
     }
@@ -6799,10 +7306,11 @@ mod tests {
         lists: &FakeTaskListRepo,
         categories: &FakeTaskCategoryRepo,
         tasks: &FakeTaskRepo,
+        agenda: &FakeAgendaItemRepo,
         task_id: &str,
     ) -> (FakeHttp, FakeCalendarRepo, FakeEventRepo, FakeTaskLogRepo, FakeUserRepo) {
         let (_start_http, calendars, events, logs) =
-            start_running(lists, categories, tasks, task_id);
+            start_running(lists, categories, tasks, agenda, task_id);
         let focus_unix = NOW_UNIX + 300;
         let http = FakeHttp::new(vec![
             (
@@ -6832,8 +7340,8 @@ mod tests {
 
     #[test]
     fn focus_open_task_is_invalid() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6854,8 +7362,8 @@ mod tests {
 
     #[test]
     fn focus_missing_or_other_users_task_is_not_found() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6880,8 +7388,8 @@ mod tests {
 
     #[test]
     fn focus_first_time_snaps_the_old_chip_and_opens_a_flagged_segment() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -6892,7 +7400,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_start, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -6983,11 +7491,11 @@ mod tests {
 
     #[test]
     fn focus_segment_carries_task_notes_onto_the_insert_body() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let mut notes_input = input("Work");
         notes_input.description = Some("Deep focus session".to_string());
         let task = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &notes_input,
+            &lists, &categories, &tasks, "u-1", &notes_input, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
@@ -7001,7 +7509,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_start, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &task.id, NOW_UNIX,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -7043,10 +7551,10 @@ mod tests {
 
     #[test]
     fn focus_already_focused_with_living_chip_is_a_noop() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_focus_http, calendars, events, logs, users) =
-            focus_first(&lists, &categories, &tasks, &task.id);
+            focus_first(&lists, &categories, &tasks, &agenda, &task.id);
         assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
 
         // Focus again while the flagged chip is alive: 200 no-op, no Google.
@@ -7067,10 +7575,10 @@ mod tests {
 
     #[test]
     fn focus_already_focused_without_a_living_chip_repairs() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_focus_http, calendars, events, logs, users) =
-            focus_first(&lists, &categories, &tasks, &task.id);
+            focus_first(&lists, &categories, &tasks, &agenda, &task.id);
 
         // The flagged chip vanishes from the store (synced away): the newest
         // event-bearing log still names it, but the cached row is gone.
@@ -7125,9 +7633,9 @@ mod tests {
 
     #[test]
     fn focus_switch_a_to_b_snaps_a_and_opens_both_continuations() {
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -7139,7 +7647,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_a, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &a.id, NOW_UNIX,
+            &access(), "u-1", &a.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         let http_b = FakeHttp::new(vec![(
@@ -7149,7 +7657,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &b.id, NOW_UNIX,
+            &access(), "u-1", &b.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
 
@@ -7248,9 +7756,9 @@ mod tests {
 
     #[test]
     fn focus_switch_google_failure_leaves_the_pointer_unchanged() {
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -7261,7 +7769,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_a, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &a.id, NOW_UNIX,
+            &access(), "u-1", &a.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         let http_b = FakeHttp::new(vec![(
@@ -7271,7 +7779,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &b.id, NOW_UNIX,
+            &access(), "u-1", &b.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         let users = FakeUserRepo::focused(&a.id);
@@ -7300,10 +7808,10 @@ mod tests {
 
     #[test]
     fn delete_focus_when_focused_snaps_and_opens_an_unprefixed_continuation() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_focus_http, calendars, events, logs, users) =
-            focus_first(&lists, &categories, &tasks, &task.id);
+            focus_first(&lists, &categories, &tasks, &agenda, &task.id);
         assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
 
         let delete_unix = NOW_UNIX + 600;
@@ -7359,16 +7867,16 @@ mod tests {
 
     #[test]
     fn delete_focus_continuation_carries_task_notes_onto_the_insert_body() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         let mut notes_input = input("Work");
         notes_input.description = Some("Deep focus session".to_string());
         let task = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &notes_input,
+            &lists, &categories, &tasks, "u-1", &notes_input, &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
         let (_focus_http, calendars, events, logs, users) =
-            focus_first(&lists, &categories, &tasks, &task.id);
+            focus_first(&lists, &categories, &tasks, &agenda, &task.id);
         assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
 
         let delete_unix = NOW_UNIX + 600;
@@ -7409,7 +7917,7 @@ mod tests {
 
     #[test]
     fn delete_focus_with_empty_pointer_is_a_200_noop() {
-        let (_lists, categories, tasks) = seeded();
+        let (_lists, categories, tasks, _agenda, _calendars) = seeded();
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -7432,10 +7940,10 @@ mod tests {
 
     #[test]
     fn stop_of_the_focused_task_clears_focus_without_a_continuation() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_focus_http, calendars, events, logs, users) =
-            focus_first(&lists, &categories, &tasks, &task.id);
+            focus_first(&lists, &categories, &tasks, &agenda, &task.id);
         assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
 
         let stop_unix = NOW_UNIX + 600;
@@ -7446,7 +7954,7 @@ mod tests {
         )]);
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, stop_unix,
+            &access(), "u-1", &task.id, stop_unix, &agenda,
         ))
         .unwrap();
 
@@ -7465,13 +7973,13 @@ mod tests {
 
     #[test]
     fn stop_of_an_unfocused_task_keeps_the_focus_pointer() {
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars);
 
         // Focus A (shared stores), then start B against the same cache/logs.
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
+            start_running(&lists, &categories, &tasks, &agenda, &a.id);
         let focus_unix = NOW_UNIX + 300;
         let focus_http = FakeHttp::new(vec![
             (
@@ -7500,7 +8008,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &b.id, focus_unix,
+            &access(), "u-1", &b.id, focus_unix, &agenda,
         ))
         .unwrap();
 
@@ -7513,7 +8021,7 @@ mod tests {
         )]);
         let response = pollster::block_on(stop_task(
             &stop_http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &b.id, stop_unix,
+            &access(), "u-1", &b.id, stop_unix, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -7529,10 +8037,10 @@ mod tests {
 
     #[test]
     fn delete_of_the_focused_task_snaps_clears_pointer_and_soft_deletes() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_focus_http, calendars, events, logs, users) =
-            focus_first(&lists, &categories, &tasks, &task.id);
+            focus_first(&lists, &categories, &tasks, &agenda, &task.id);
         assert_eq!(users.pointer().as_deref(), Some(task.id.as_str()));
 
         let delete_unix = NOW_UNIX + 600;
@@ -7552,7 +8060,7 @@ mod tests {
             "u-1",
             &task.id,
             "2023-11-14T22:23:20Z",
-            delete_unix,
+            delete_unix, &agenda,
         ))
         .unwrap();
 
@@ -7620,8 +8128,8 @@ mod tests {
     fn elongate_patches_end_when_event_fell_behind_the_target() {
         // A 15-minute event started 20 minutes ago (end 22:08:00 is past)
         // while the task stayed IN_PROGRESS: the cron extends it.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:08:00Z");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7654,8 +8162,8 @@ mod tests {
     fn elongate_skips_when_event_end_still_covers_target() {
         // First minutes of a 15-minute task: the planned end (22:28:00) is
         // still ahead of the target (22:20:00) — nothing to extend.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:28:00Z");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7678,8 +8186,8 @@ mod tests {
     fn elongate_never_shrinks_a_previously_elongated_end() {
         // A previous elongation pushed the end to 23:30:00 (far beyond the
         // current target) — the cron must not pull it back.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T23:30:00Z");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7701,8 +8209,8 @@ mod tests {
     fn elongate_skips_task_without_started_log() {
         // The task never started (no `started` log, no event): skip — do not
         // recreate the event, do not flip status.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
         let calendars = FakeCalendarRepo::with(vec![]);
         let events = FakeEventRepo::new();
@@ -7727,8 +8235,8 @@ mod tests {
     fn elongate_skips_when_cached_event_is_missing() {
         // The `started` log names an event that is gone from the cache (the
         // user deleted it in Google): skip, never recreate.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
         let calendars = FakeCalendarRepo::with(vec![]);
         let events = FakeEventRepo::new(); // no cached row
@@ -7751,8 +8259,8 @@ mod tests {
 
     #[test]
     fn elongate_skips_unparseable_end_time() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "UTC", "not-a-date");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7770,8 +8278,8 @@ mod tests {
     fn elongate_skips_on_google_404_and_keeps_status() {
         // The event vanished on Google's side: 404 → skip (never recreate,
         // never flip status).
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "UTC", "2023-11-14T22:08:00Z");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7794,8 +8302,8 @@ mod tests {
         // minutes, so the IST 5-minute grid is numerically the same set of
         // instants as UTC's — the zone path (offset → local ceil → convert
         // back) must not shift the target.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "Asia/Kolkata", "2023-11-14T22:08:00Z");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7819,8 +8327,8 @@ mod tests {
 
     #[test]
     fn elongate_target_with_empty_calendar_tz_falls_back_to_utc() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (calendars, events, logs) =
             elongate_setup(&tasks, &task.id, "", "2023-11-14T22:08:00Z");
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
@@ -7840,8 +8348,8 @@ mod tests {
 
     #[test]
     fn elongate_token_failure_for_one_user_does_not_abort_the_rest() {
-        let (lists, categories, tasks) = seeded();
-        let task_a = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task_a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         // u-2's task inserts straight into the repo (no taxonomy needed).
         let task_b = pollster::block_on(tasks.insert(NewTask {
             user_id: "u-2".to_string(),
@@ -7906,8 +8414,8 @@ mod tests {
     fn elongate_extends_both_dirty_in_progress_tasks() {
         // Two IN_PROGRESS rows at once is normal now (IN_PROGRESS is a
         // column): both elongate.
-        let (lists, categories, tasks) = seeded();
-        let task_a = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task_a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let task_b = pollster::block_on(tasks.insert(NewTask {
             user_id: "u-2".to_string(),
             title: "Fitness".to_string(),
@@ -7979,6 +8487,7 @@ mod tests {
         tasks: &FakeTaskRepo,
         logs: &FakeTaskLogRepo,
         users: &FakeUserRepo,
+        agenda: &FakeAgendaItemRepo,
         access: Option<&GoogleAccess>,
         task_id: &str,
         status: &str,
@@ -8002,6 +8511,7 @@ mod tests {
                 status: status.to_string(),
                 sort_order,
             },
+            agenda,
         ))
     }
 
@@ -8012,6 +8522,7 @@ mod tests {
         lists: &FakeTaskListRepo,
         categories: &FakeTaskCategoryRepo,
         tasks: &FakeTaskRepo,
+        agenda: &FakeAgendaItemRepo,
         task_id: &str,
     ) -> (FakeHttp, FakeCalendarRepo, FakeEventRepo, FakeTaskLogRepo) {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
@@ -8024,7 +8535,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), lists, categories, tasks, &logs,
-            &access(), "u-1", task_id, NOW_UNIX,
+            &access(), "u-1", task_id, NOW_UNIX, agenda,
         ))
         .unwrap();
         (http, calendars, events, logs)
@@ -8032,9 +8543,9 @@ mod tests {
 
     #[test]
     fn move_open_to_planned_is_plan() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
-        let peer = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let peer = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8043,7 +8554,7 @@ mod tests {
 
         // Park the peer in PLANNED first (session-only, no Google).
         let parked = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &peer.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -8051,7 +8562,7 @@ mod tests {
 
         // Plan `task` at the front: the PLANNED peer shifts up to 1.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -8076,8 +8587,8 @@ mod tests {
 
     #[test]
     fn move_planned_to_open_is_unplan() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8085,14 +8596,14 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let planned = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
         assert_eq!(planned.task.status, TASK_STATUS_PLANNED);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &task.id, TASK_STATUS_OPEN, Some(0),
         )
         .unwrap();
@@ -8106,8 +8617,8 @@ mod tests {
 
     #[test]
     fn move_completed_to_planned_is_reopen() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8116,7 +8627,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &task.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -8129,8 +8640,8 @@ mod tests {
 
     #[test]
     fn move_open_to_in_progress_is_start() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8142,7 +8653,7 @@ mod tests {
         )]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda,
             Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
@@ -8157,8 +8668,8 @@ mod tests {
     fn move_to_in_progress_opens_fixed_15min_window() {
         // Board start leg (`to == IN_PROGRESS` → `start_task`) sizes the event
         // from `START_EVENT_MINUTES`, never from the card's estimate.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(update_task(
             &categories,
             &tasks,
@@ -8181,7 +8692,7 @@ mod tests {
         )]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda,
             Some(&access()), &task.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
@@ -8194,10 +8705,10 @@ mod tests {
 
     #[test]
     fn move_in_progress_to_planned_is_pause() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &task.id);
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
         drop(_start_http);
 
         let pause_unix = NOW_UNIX + 600;
@@ -8223,7 +8734,7 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_PLANNED.to_string(),
                 sort_order: Some(0),
-            },
+            }, &agenda,
         ))
         .unwrap();
 
@@ -8237,10 +8748,10 @@ mod tests {
 
     #[test]
     fn move_in_progress_to_open_is_stop() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &task.id);
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
         drop(_start_http);
 
         let stop_unix = NOW_UNIX + 300;
@@ -8266,7 +8777,7 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_OPEN.to_string(),
                 sort_order: Some(4),
-            },
+            }, &agenda,
         ))
         .unwrap();
 
@@ -8281,15 +8792,15 @@ mod tests {
     fn move_to_in_progress_while_another_runs_succeeds() {
         // `/move` to IN_PROGRESS is just `start`: a NEW event opens even while
         // `first` already runs, and both tasks stay IN_PROGRESS. No 409.
-        let (lists, categories, tasks) = seeded();
-        let first = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let second = pollster::block_on(create_task(
-            &lists, &categories, &tasks, "u-1", &input("Fitness"),
+            &lists, &categories, &tasks, "u-1", &input("Fitness"), &agenda, &calendars, NOW_UNIX,
         ))
         .unwrap()
         .task;
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &first.id);
+            start_running(&lists, &categories, &tasks, &agenda, &first.id);
         drop(_start_http);
 
         let http = FakeHttp::new(vec![(
@@ -8314,7 +8825,7 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
                 sort_order: Some(0),
-            },
+            }, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.id, second.id);
@@ -8335,11 +8846,11 @@ mod tests {
 
     #[test]
     fn move_same_column_reorder_shifts_neighbors() {
-        let (lists, categories, tasks) = seeded();
+        let (lists, categories, tasks, agenda, calendars) = seeded();
         // Create A then B then C: create appends, so A=0, B=1, C=2.
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
-        let c = work_task(&lists, &categories, &tasks);
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let c = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8348,7 +8859,7 @@ mod tests {
 
         // Drag A (rank 0) down to rank 2: the peers in (0, 2] shift down one.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &a.id, TASK_STATUS_OPEN, Some(2),
         )
         .unwrap();
@@ -8362,7 +8873,7 @@ mod tests {
 
         // And back up: A (rank 2) to rank 0 — peers in [0, 2) shift up one.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &a.id, TASK_STATUS_OPEN, Some(0),
         )
         .unwrap();
@@ -8383,10 +8894,10 @@ mod tests {
     fn move_in_progress_to_in_progress_omit_is_noop() {
         // IN_PROGRESS → IN_PROGRESS with an OMITTED rank is a same-status
         // no-op: the row returns unchanged, no new event, no re-rank.
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &task.id);
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
         drop(_start_http);
 
         let http = FakeHttp::new(vec![]);
@@ -8407,7 +8918,7 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
                 sort_order: None,
-            },
+            }, &agenda,
         ))
         .unwrap();
         assert_eq!(response.task.id, task.id);
@@ -8423,12 +8934,12 @@ mod tests {
     fn move_in_progress_to_in_progress_with_rank_reorders() {
         // In Progress is a real pile: IN_PROGRESS → IN_PROGRESS with a sent
         // rank reorders within the column (no event, no new log).
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
-        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 1
         // Start both against the SAME calendar/event/log fakes (both may run).
         let (_a_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &a.id);
+            start_running(&lists, &categories, &tasks, &agenda, &a.id);
         drop(_a_http);
         let http_b = FakeHttp::new(vec![(
             "/events",
@@ -8437,7 +8948,7 @@ mod tests {
         )]);
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
-            &access(), "u-1", &b.id, NOW_UNIX,
+            &access(), "u-1", &b.id, NOW_UNIX, &agenda,
         ))
         .unwrap();
         let a = pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap();
@@ -8452,7 +8963,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
         let users = FakeUserRepo::default();
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &b.id, TASK_STATUS_IN_PROGRESS, Some(0),
         )
         .unwrap();
@@ -8476,8 +8987,8 @@ mod tests {
 
     #[test]
     fn move_validates_status_and_rank() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8490,7 +9001,7 @@ mod tests {
         };
         let err = pollster::block_on(move_task(
             Some(&http), &calendars, &events, &ops(), &lists,             &categories, &tasks, &logs, &users, None,
-            "u-1", &task.id, NOW_UNIX, &unknown,
+            "u-1", &task.id, NOW_UNIX, &unknown, &agenda,
         ))
         .unwrap_err();
         let message = match &err {
@@ -8505,7 +9016,7 @@ mod tests {
         };
         let err = pollster::block_on(move_task(
             Some(&http), &calendars, &events, &ops(), &lists,             &categories, &tasks, &logs, &users, None,
-            "u-1", &task.id, NOW_UNIX, &negative,
+            "u-1", &task.id, NOW_UNIX, &negative, &agenda,
         ))
         .unwrap_err();
         let message = match &err {
@@ -8519,8 +9030,8 @@ mod tests {
 
     #[test]
     fn move_missing_or_other_users_task_is_not_found() {
-        let (lists, categories, tasks) = seeded();
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8534,14 +9045,14 @@ mod tests {
         assert!(matches!(
             pollster::block_on(move_task(
                 Some(&http), &calendars, &events, &ops(), &lists,                 &categories, &tasks, &logs, &users,
-                None, "u-2", &task.id, NOW_UNIX, &input,
+                None, "u-2", &task.id, NOW_UNIX, &input, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(move_task(
                 Some(&http), &calendars, &events, &ops(), &lists,                 &categories, &tasks, &logs, &users,
-                None, "u-1", "nope", NOW_UNIX, &input,
+                None, "u-1", "nope", NOW_UNIX, &input, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
@@ -8556,9 +9067,9 @@ mod tests {
         // Unplan / reopen-to-OPEN with no drop position appends: the mover is
         // excluded from the max, so its leftover PLANNED rank never inflates
         // the OPEN append target.
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
-        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 1
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8567,7 +9078,7 @@ mod tests {
 
         // Plan A with an explicit drop (0 is fine).
         let planned = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &a.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -8577,7 +9088,7 @@ mod tests {
         // living OPEN peers (B holds 1), landing at 2 — not at its leftover
         // PLANNED rank and not at the tail of an inflated max.
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &a.id, TASK_STATUS_OPEN, None,
         )
         .unwrap();
@@ -8595,9 +9106,9 @@ mod tests {
         // Plan via move with no drop position: from OPEN (not IN_PROGRESS)
         // the PLANNED default is append, so a fresh pile puts A at 0 and B
         // appends at 1 without shifting A.
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks);
-        let b = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8605,7 +9116,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let first = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &a.id, TASK_STATUS_PLANNED, None,
         )
         .unwrap();
@@ -8616,7 +9127,7 @@ mod tests {
         );
 
         let second = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &b.id, TASK_STATUS_PLANNED, None,
         )
         .unwrap();
@@ -8632,9 +9143,9 @@ mod tests {
     fn move_omit_sort_order_pauses_to_front_of_planned() {
         // Pause (IN_PROGRESS → PLANNED) with no drop position PREPENDS: the
         // paused task takes 0 and the old Planned peer shifts to 1.
-        let (lists, categories, tasks) = seeded();
-        let peer = work_task(&lists, &categories, &tasks);
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8643,7 +9154,7 @@ mod tests {
 
         // Seed a PLANNED peer at 0 (plan via move with an explicit drop).
         let planned = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &peer.id, TASK_STATUS_PLANNED, Some(0),
         )
         .unwrap();
@@ -8651,7 +9162,7 @@ mod tests {
 
         // Start `task`, then pause it to PLANNED with no drop position.
         let (_start_http, calendars, events, logs) =
-            start_running(&lists, &categories, &tasks, &task.id);
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
         drop(_start_http);
         let pause_unix = NOW_UNIX + 600;
         let http = FakeHttp::new(vec![(
@@ -8675,7 +9186,7 @@ mod tests {
             &MoveTaskInput {
                 status: TASK_STATUS_PLANNED.to_string(),
                 sort_order: None,
-            },
+            }, &agenda,
         ))
         .unwrap();
 
@@ -8694,9 +9205,9 @@ mod tests {
     fn move_omit_sort_order_prepends_completed() {
         // Complete via move with no drop position prepends 0; an existing
         // COMPLETED peer shifts to 1.
-        let (lists, categories, tasks) = seeded();
-        let peer = work_task(&lists, &categories, &tasks);
-        let task = work_task(&lists, &categories, &tasks);
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8708,7 +9219,7 @@ mod tests {
         pollster::block_on(tasks.set_sort_order(&peer.id, 0)).unwrap();
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &task.id, TASK_STATUS_COMPLETED, None,
         )
         .unwrap();
@@ -8727,9 +9238,9 @@ mod tests {
     fn move_same_status_omit_is_noop() {
         // Same-status move with no drop position returns the row unchanged —
         // never sent to the tail, no peer shift, no log.
-        let (lists, categories, tasks) = seeded();
-        let a = work_task(&lists, &categories, &tasks); // OPEN rank 0
-        let b = work_task(&lists, &categories, &tasks); // OPEN rank 1
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 0
+        let b = work_task(&lists, &categories, &tasks, &agenda, &calendars); // OPEN rank 1
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
@@ -8737,7 +9248,7 @@ mod tests {
         let http = FakeHttp::new(vec![]);
 
         let response = move_to(
-            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, None,
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
             &b.id, TASK_STATUS_OPEN, None,
         )
         .unwrap();
@@ -8761,5 +9272,458 @@ mod tests {
         let input: MoveTaskInput = serde_json::from_str(r#"{"status":"OPEN"}"#).unwrap();
         assert_eq!(input.status, "OPEN");
         assert!(input.sort_order.is_none(), "omitted sort_order deserializes to None");
+    }
+
+    // ──────────────────────────────────────────
+    // Agenda placement (ADR 0004 amendment): one row per task, on civil today
+    // ──────────────────────────────────────────
+
+    /// Creates a `Work` task at the agenda tests' fixed clock
+    /// ([`AGENDA_NOW_UNIX`] — UTC today `2026-08-23`), so their civil-date
+    /// assertions never depend on the timer tests' 2023 clock. The create
+    /// itself appends the task's first agenda row on today.
+    fn agenda_task(
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        tasks: &FakeTaskRepo,
+        agenda: &FakeAgendaItemRepo,
+        calendars: &FakeCalendarRepo,
+    ) -> TaskView {
+        pollster::block_on(create_task(
+            lists, categories, tasks, "u-1", &input("Work"), agenda, calendars, AGENDA_NOW_UNIX,
+        ))
+        .unwrap()
+        .task
+    }
+
+    #[test]
+    fn create_places_one_agenda_row_on_today_appended() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let first = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let second = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Fitness"), &agenda, &calendars,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap()
+        .task;
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "one row per task, never a date-scoped duplicate");
+        let row_of = |id: &str| rows.iter().find(|row| row.ref_id == id).unwrap().clone();
+        assert_eq!(row_of(&first.id).kind, AGENDA_KIND_TASK);
+        assert_eq!(row_of(&first.id).local_date, AGENDA_TODAY);
+        assert_eq!(row_of(&first.id).sort_order, 0, "first create lands at rank 0");
+        assert_eq!(row_of(&second.id).local_date, AGENDA_TODAY);
+        assert_eq!(row_of(&second.id).sort_order, 1, "second create appends at max+1");
+    }
+
+    #[test]
+    fn complete_moves_the_agenda_row_onto_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // A peer row already on today's pile proves the append rank.
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // The row the create wrote travels back in time (direct fake edit): the
+        // service's own verbs only ever move onto today.
+        let row = agenda.rows("u-1")
+            .into_iter()
+            .find(|row| row.ref_id == task.id)
+            .unwrap();
+        agenda.move_row(&row.id, AGENDA_PAST, 4);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "the same row travelled — no second row");
+        let completed = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(completed.local_date, AGENDA_TODAY);
+        assert_eq!(completed.sort_order, 2, "appended after today's peer (max+1)");
+        let peer_row = rows.iter().find(|row| row.ref_id == peer.id).unwrap();
+        assert_eq!(peer_row.local_date, AGENDA_TODAY);
+        assert_eq!(peer_row.sort_order, 1, "the peer keeps its rank");
+
+        // Idempotent second complete: the clock moved two days on, but the
+        // no-op returns before any placement — the row stays where it is.
+        pollster::block_on(complete_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 2 * 86_400, &agenda,
+        ))
+        .unwrap();
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "no extra row");
+        let completed = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(completed.local_date, AGENDA_TODAY, "the no-op never places");
+        assert_eq!(completed.sort_order, 2, "and never reshuffles");
+    }
+
+    #[test]
+    fn discard_moves_the_agenda_row_onto_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda.move_row(&row.id, AGENDA_PAST, 3);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(discard_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1, "one row, moved — never duplicated");
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(rows[0].local_date, AGENDA_TODAY);
+        assert_eq!(rows[0].sort_order, 0, "today's pile was empty → rank 0");
+    }
+
+    #[test]
+    fn reopen_moves_the_agenda_row_onto_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let open_task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let planned_task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let rows = agenda.rows("u-1");
+        let open_row = rows.iter().find(|row| row.ref_id == open_task.id).unwrap().clone();
+        let planned_row = rows
+            .iter()
+            .find(|row| row.ref_id == planned_task.id)
+            .unwrap()
+            .clone();
+        // Both rows sit off-today before the reopen.
+        agenda.move_row(&open_row.id, AGENDA_PAST, 3);
+        agenda.move_row(&planned_row.id, AGENDA_FUTURE, 5);
+        pollster::block_on(tasks.set_status(&open_task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_status(&planned_task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        // COMPLETED → OPEN.
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &open_task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_OPEN.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_OPEN);
+
+        // COMPLETED → PLANNED.
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &planned_task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "no second row per task");
+        let reopened = rows.iter().find(|row| row.ref_id == open_task.id).unwrap();
+        assert_eq!(reopened.id, open_row.id, "the same row came back");
+        assert_eq!(reopened.local_date, AGENDA_TODAY);
+        assert_eq!(reopened.sort_order, 0, "appended first on the empty pile");
+        let reopened_planned = rows.iter().find(|row| row.ref_id == planned_task.id).unwrap();
+        assert_eq!(reopened_planned.id, planned_row.id);
+        assert_eq!(reopened_planned.local_date, AGENDA_TODAY);
+        assert_eq!(reopened_planned.sort_order, 1, "the second reopen appends after it");
+    }
+
+    #[test]
+    fn start_moves_a_past_agenda_row_onto_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda.move_row(&row.id, AGENDA_PAST, 2);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row.id, "the same row travelled");
+        assert_eq!(rows[0].local_date, AGENDA_TODAY);
+        assert_eq!(rows[0].sort_order, 0, "today's pile was empty → rank 0");
+    }
+
+    #[test]
+    fn start_moves_a_future_agenda_row_onto_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda.move_row(&row.id, AGENDA_FUTURE, 7);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(rows[0].local_date, AGENDA_TODAY, "the future row comes back to today");
+        assert_eq!(rows[0].sort_order, 0);
+    }
+
+    #[test]
+    fn start_while_already_in_progress_never_places_the_agenda_row() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+
+        // The real start put the row on today. Relocate it, then start again:
+        // the already-IN_PROGRESS 200 no-op must leave the row where it is.
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda.move_row(&row.id, AGENDA_FUTURE, 3);
+        let http = FakeHttp::new(vec![]);
+        let response = pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert!(response.event.is_none(), "no second event");
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_date, AGENDA_FUTURE, "the no-op never places");
+        assert_eq!(rows[0].sort_order, 3);
+    }
+
+    #[test]
+    fn plan_reorder_and_title_edits_leave_the_agenda_day_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda.move_row(&row.id, AGENDA_PAST, 2);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        // OPEN → PLANNED (plan) is session-only and never places.
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_PAST);
+        assert_eq!(agenda.rows("u-1")[0].sort_order, 2);
+
+        // Same-status reorder (a PLANNED → PLANNED drop): never places.
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(1),
+            },
+            &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.sort_order, 1);
+        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_PAST);
+        assert_eq!(agenda.rows("u-1")[0].sort_order, 2);
+
+        // A title edit (PATCH) never places either.
+        pollster::block_on(update_task(
+            &categories,
+            &tasks,
+            "u-1",
+            &task.id,
+            &UpdateTask {
+                title: Some("Fitness".to_string()),
+                ..UpdateTask::default()
+            },
+        ))
+        .unwrap();
+        assert_eq!(agenda.rows("u-1").len(), 1);
+        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_PAST);
+        assert_eq!(agenda.rows("u-1")[0].sort_order, 2);
+    }
+
+    #[test]
+    fn stop_leaves_the_agenda_row_where_the_start_put_it() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_TODAY, "the start put it on today");
+
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2026-08-23T10:05:00Z"),
+        )]);
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 300, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_OPEN, "stop still lands OPEN");
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_date, AGENDA_TODAY, "stop never moves the day");
+        assert_eq!(rows[0].sort_order, 0, "and never reshuffles it");
+    }
+
+    #[test]
+    fn pause_never_places_the_agenda_row() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        let row = agenda.rows("u-1").pop().unwrap();
+        // Pause must not be *required* to move the row: park it elsewhere
+        // directly and prove the verb leaves it there.
+        agenda.move_row(&row.id, AGENDA_PAST, 6);
+
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2026-08-23T10:05:00Z"),
+        )]);
+        let response = pollster::block_on(pause_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 300, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED, "pause still lands PLANNED");
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_date, AGENDA_PAST, "pause never places");
+        assert_eq!(rows[0].sort_order, 6);
+    }
+
+    #[test]
+    fn delete_removes_the_agenda_row_and_tolerates_a_missing_row() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        assert!(
+            pollster::block_on(agenda.get_by_ref("u-1", AGENDA_KIND_TASK, &task.id))
+                .unwrap()
+                .is_some()
+        );
+
+        let calendars = FakeCalendarRepo::with(vec![]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let response = pollster::block_on(delete_task(
+            None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &task.id,
+            "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert!(response.success);
+        assert!(
+            pollster::block_on(agenda.get_by_ref("u-1", AGENDA_KIND_TASK, &task.id))
+                .unwrap()
+                .is_none(),
+            "the soft delete takes the membership row with it"
+        );
+
+        // A task with no agenda row still deletes cleanly: dropping nothing is
+        // not an error.
+        let second = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(agenda.delete_by_ref("u-1", AGENDA_KIND_TASK, &second.id)).unwrap();
+        let response = pollster::block_on(delete_task(
+            None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &second.id,
+            "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+        assert!(response.success);
+        assert!(agenda.rows("u-1").is_empty());
     }
 }

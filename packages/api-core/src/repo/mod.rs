@@ -437,6 +437,11 @@ pub trait AgendaItemRepo: Send + Sync {
     async fn insert_many(&self, rows: Vec<NewAgendaItem>) -> Result<(), RepoError>;
     /// HARD delete (unpin). The referenced task/occurrence is untouched.
     async fn hard_delete(&self, id: &str) -> Result<(), RepoError>;
+    /// HARD deletes **every** row of `kind` referencing `ref_id` for the user
+    /// (deliberately not `LIMIT 1` — a hand-edited duplicate must not
+    /// survive). No error when none match: the referenced task/occurrence
+    /// (already soft-deleted by the caller) is untouched.
+    async fn delete_by_ref(&self, user_id: &str, kind: &str, ref_id: &str) -> Result<(), RepoError>;
     /// Highest `sort_order` in the user's `local_date` pile, or `None` when
     /// empty — the append target (`max+1`, else 0).
     async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError>;
@@ -1067,6 +1072,12 @@ pub const AGENDA_ITEM_INSERT_SQL: &str = "
 /// HARD delete (unpin): membership is a subscription, not a domain entity.
 pub const AGENDA_ITEM_DELETE_SQL: &str = "DELETE FROM agenda_items WHERE id = ?";
 
+/// HARD delete by membership identity: **every** row of `kind` referencing
+/// `ref_id` for the user — never `LIMIT 1`. Deleting the task drops its
+/// agenda row(s); no matching row is not an error.
+pub const AGENDA_ITEM_DELETE_BY_REF_SQL: &str =
+    "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ?";
+
 /// Highest rank in the user's date pile — the append target (`max+1`, else
 /// 0). `LIMIT 1` over `MAX()` so an empty pile reads as `None` via `first()`.
 pub const AGENDA_ITEM_MAX_SORT_ORDER_SQL: &str = "
@@ -1647,6 +1658,12 @@ mod tests {
         assert_eq!(AGENDA_ITEM_INSERT_SQL.matches('?').count(), 8, "{}", AGENDA_ITEM_INSERT_SQL);
         assert!(AGENDA_ITEM_DELETE_SQL.starts_with("DELETE FROM"), "{}", AGENDA_ITEM_DELETE_SQL);
         assert!(!AGENDA_ITEM_DELETE_SQL.contains("deleted_at"), "{}", AGENDA_ITEM_DELETE_SQL);
+        assert_eq!(
+            AGENDA_ITEM_DELETE_BY_REF_SQL,
+            "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ?",
+            "every matching row, never LIMIT 1"
+        );
+        assert!(!AGENDA_ITEM_DELETE_BY_REF_SQL.contains("deleted_at"), "{}", AGENDA_ITEM_DELETE_BY_REF_SQL);
         assert!(AGENDA_ITEM_MAX_SORT_ORDER_SQL.contains("LIMIT 1"), "{}", AGENDA_ITEM_MAX_SORT_ORDER_SQL);
     }
 

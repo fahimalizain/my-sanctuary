@@ -2946,6 +2946,20 @@ mod tests {
             Ok(())
         }
 
+        async fn delete_by_ref(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_id: &str,
+        ) -> Result<(), RepoError> {
+            // Mirrors AGENDA_ITEM_DELETE_BY_REF_SQL: EVERY matching row (never
+            // `LIMIT 1`); no error when nothing matches.
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id && row.kind == kind && row.ref_id == ref_id)
+            });
+            Ok(())
+        }
+
         async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError> {
             Ok(self
                 .stored
