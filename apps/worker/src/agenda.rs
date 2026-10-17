@@ -11,20 +11,17 @@
 //!
 //! Status map: 401 unauthorized (missing session, or a Google-touching verb
 //! without a refreshable token), 400 invalid input (invalid date, malformed
-//! body, non-task kind, terminal/foreign task, DELETE on an occurrence item,
-//! empty PATCH body, negative rank, start on a non-today or terminal
-//! occurrence, reschedule of an in_progress/done occurrence or onto a date
-//! already holding the routine, no writable calendar), 404 "not found"
-//! (missing/other-user/soft-deleted task, occurrence, item, or routine —
-//! existence is never leaked), 502 Google write failure, 500 logged database
-//! errors.
+//! body, negative rank, reschedule into the past or of a terminal/
+//! in_progress/done item, move-to-today of a day that is not in the past,
+//! empty PATCH body, start on a non-today or terminal occurrence, no writable
+//! calendar), 404 "not found" (missing/other-user/soft-deleted task,
+//! occurrence, item, or routine — existence is never leaked), 502 Google
+//! write failure, 500 logged database errors.
 
 use worker::*;
 
 use api_core::agenda::AgendaError;
-use api_core::models::{
-    MoveAgendaItemInput, NewAgendaItemInput, RescheduleAgendaItemInput, UpdateOccurrence,
-};
+use api_core::models::{MoveAgendaItemInput, RescheduleAgendaItemInput, UpdateOccurrence};
 use api_core::{GoogleAccess, OccurrenceRepo, OAuthConfig, UserRepo};
 
 /// 401 body for missing/invalid sessions.
@@ -201,25 +198,36 @@ async fn focused_task_id(
         .and_then(|row| row.focused_task_id)
 }
 
-/// `GET /api/agenda?date=YYYY-MM-DD` → 200
-/// `{"items":[...],"today":"YYYY-MM-DD","time_zone":"IANA"}`.
+/// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` → 200
+/// `{"items":[...],"from":"YYYY-MM-DD","to":"YYYY-MM-DD","today":"YYYY-MM-DD",
+/// "time_zone":"IANA","anchor_date":"YYYY-MM-DD","earliest_date":"YYYY-MM-DD"}`.
 ///
-/// The `date` query is **optional** (missing/blank = civil today — the
-/// primary calendar's IANA `time_zone` via chrono-tz, ADR 0004 amendment);
-/// Home's first load omits it so the server decides "today". Seeds on read
-/// (living routines whose rule covers the date get their occurrence +
-/// membership ensured), then returns the mixed pile with embedded task views
-/// / occurrence views plus the server-computed `today` + `time_zone`.
+/// Both bounds are **optional** and must be set together: omitted reads the
+/// anchor week (the oldest past date that still holds a pending item — civil
+/// today when nothing pends — plus six days). This GET is a **pure range
+/// read**: it seeds nothing and writes no occurrence / agenda row (the old
+/// `?date=` parameter is ignored). The response carries the server-computed
+/// `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
     };
-    let date = {
+    let (from, to) = {
         let url = req.url()?;
-        url.query_pairs()
-            .find(|(key, _)| key == "date")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| !value.is_empty())
+        let mut from = None;
+        let mut to = None;
+        for (key, value) in url.query_pairs() {
+            let value = value.into_owned();
+            if value.is_empty() {
+                continue;
+            }
+            match key.as_ref() {
+                "from" => from = Some(value),
+                "to" => to = Some(value),
+                _ => {}
+            }
+        }
+        (from, to)
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let focused_task_id = focused_task_id(&ctx, &user.id).await;
@@ -233,46 +241,9 @@ pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>
         &agenda_d1(&ctx)?,
         &tasks_d1(&ctx)?,
         &user.id,
-        date.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
         now_unix,
-        focused_task_id.as_deref(),
-    )
-    .await
-    {
-        Ok(response) => {
-            let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
-        }
-        Err(err) => map_error(&ctx, err),
-    }
-}
-
-/// `POST /api/agenda/items` → 200 `{"item":{...}}`. Body:
-/// `{kind, ref_id, sort_order?, date}` — the `date` is REQUIRED (the ADR
-/// table omits it because GET is date-scoped, but the POST must name it).
-/// Tasks only in v1; duplicate adds are idempotent 200s with the existing
-/// item.
-pub async fn add_agenda_item(
-    mut req: Request,
-    ctx: RouteContext<Option<api_core::Config>>,
-) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
-        return unauthorized(&ctx);
-    };
-
-    let input: NewAgendaItemInput = match req.json().await {
-        Ok(input) => input,
-        Err(_) => return json_error(&ctx, 400, "invalid body"),
-    };
-    let focused_task_id = focused_task_id(&ctx, &user.id).await;
-
-    match api_core::add_agenda_item(
-        &lists_d1(&ctx)?,
-        &categories_d1(&ctx)?,
-        &agenda_d1(&ctx)?,
-        &tasks_d1(&ctx)?,
-        &user.id,
-        &input,
         focused_task_id.as_deref(),
     )
     .await
@@ -327,35 +298,13 @@ pub async fn move_agenda_item(
     }
 }
 
-/// `DELETE /api/agenda/items/:id` → 200 `{"success":true}`. Unpins a task
-/// item (hard delete; the task stays on the Board). Occurrence-kind items
-/// are 400 — skip is the decline.
-pub async fn delete_agenda_item(
-    req: Request,
-    ctx: RouteContext<Option<api_core::Config>>,
-) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
-        return unauthorized(&ctx);
-    };
-    let Some(id) = ctx.param("id") else {
-        return json_error(&ctx, 404, "not found");
-    };
-
-    match api_core::delete_agenda_item(&agenda_d1(&ctx)?, &user.id, id).await {
-        Ok(response) => {
-            let response = Response::from_json(&response)?;
-            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
-        }
-        Err(err) => map_error(&ctx, err),
-    }
-}
-
 /// `POST /api/agenda/items/:id/reschedule` → 200 `{"item":{...}}`. Body:
-/// `{date}` (`YYYY-MM-DD`, required). Relocates the slot to that day —
-/// occurrences exdate their source date on the routine and move
-/// (`pending | skipped` only), tasks move the membership slot only (task
-/// status unchanged, no `task_logs` row). Session-only: no Google write of
-/// any kind.
+/// `{date, sort_order?}` (`date` is `YYYY-MM-DD` and must be today or later;
+/// `sort_order` is the optional landing rank). Relocates the slot to that
+/// day — the occurrence moves its agenda item only (no exdate anywhere;
+/// `pending | skipped` only), a task moves the membership slot only (task
+/// status unchanged, terminal → 400, no `task_logs` row). Same date is a 200
+/// no-op. Session-only: no Google write of any kind.
 pub async fn reschedule_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -371,6 +320,7 @@ pub async fn reschedule_agenda_item(
         Ok(input) => input,
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let focused_task_id = focused_task_id(&ctx, &user.id).await;
 
     match api_core::reschedule_agenda_item(
@@ -380,9 +330,57 @@ pub async fn reschedule_agenda_item(
         &tasks_d1(&ctx)?,
         &occurrences_d1(&ctx)?,
         &routines_d1(&ctx)?,
+        &calendars_d1(&ctx)?,
+        now_unix,
         &user.id,
         id,
         &input.date,
+        input.sort_order,
+        focused_task_id.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+
+/// `POST /api/agenda/days/:date/move-to-today` → 200 `{"items":[...]}`.
+///
+/// Moves a **past** day's still-pending items (living `OPEN | PLANNED |
+/// IN_PROGRESS` tasks and `pending` occurrences of living routines) onto
+/// civil today in one call, appended to today's pile in their original
+/// order. `done`/`skipped`/`in_progress` occurrences, terminal or
+/// soft-deleted tasks, soft-deleted-routine leftovers and orphans stay where
+/// they are. Today or a future date → 400. No body, session-only — no Google
+/// write of any kind.
+pub async fn move_day_to_today(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+        return unauthorized(&ctx);
+    };
+    let Some(date) = ctx.param("date") else {
+        return json_error(&ctx, 404, "not found");
+    };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let focused_task_id = focused_task_id(&ctx, &user.id).await;
+
+    match api_core::move_day_to_today(
+        &calendars_d1(&ctx)?,
+        &lists_d1(&ctx)?,
+        &categories_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
+        &tasks_d1(&ctx)?,
+        &occurrences_d1(&ctx)?,
+        &routines_d1(&ctx)?,
+        &user.id,
+        date,
+        now_unix,
         focused_task_id.as_deref(),
     )
     .await

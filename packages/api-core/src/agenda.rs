@@ -11,42 +11,46 @@
 //! token refresh on top (`apps/worker/src/agenda.rs`).
 //!
 //! Domain rules (ADR 0004 amendment, locked):
-//! - `GET /api/agenda?date=` **seeds on read** (not a cron): for every living
-//!   routine whose rrule blob covers the date, ensure the occurrence row
-//!   (idempotent via `UNIQUE (routine_id, local_date)`) and append an
-//!   occurrence agenda item **only when this occurrence has no agenda item on
-//!   ANY date** (`list_by_refs`), landing **after** already-present items, in
-//!   standing `routines.sort_order` relative to each other. A list the user
-//!   already reordered is never reshuffled; a rescheduled occurrence is never
-//!   re-attached to its rule date. Tasks never auto-land. The seed is a
-//!   handful of **set reads** (`list_by_user_and_date` + `list_by_refs`) with
-//!   batched `insert_many` of only what is missing — never a per-routine
-//!   `insert`/`get_by_ref` loop.
-//! - The response omits occurrence items whose routine is missing/
-//!   soft-deleted and task items whose task is missing/soft-deleted; the
-//!   orphan membership rows stay in D1 (membership is hard-deleted only by
-//!   unpin).
-//! - `POST /api/agenda/items` is tasks-only in v1 (400 otherwise), living
-//!   `OPEN | PLANNED | IN_PROGRESS` tasks only (404 missing/other-user/
-//!   soft-deleted, 400 terminal), idempotent 200 when already on the date,
-//!   and never touches `tasks.status`. The body **must name the `date`**.
+//! - `GET /api/agenda?from=&to=` is a **pure range read** of the infinite day
+//!   stream (slice 1 of the agenda revamp): it ensures no occurrence and
+//!   writes no agenda row, even when living routines' rules cover the window.
+//!   Both bounds omitted reads the **anchor week** (`anchor_date …
+//!   anchor_date + 6`, 7 inclusive days) where `anchor_date` is the oldest
+//!   past date holding a pending item, else today; exactly one bound → 400;
+//!   an inclusive span above 31 days → 400. The response carries `from`/`to`
+//!   (resolved, never the raw query), `anchor_date`, and `earliest_date`
+//!   (`MIN(local_date)` over every row, the back-scroll floor).
+//!   Materializing occurrences is the occurrence fill's job, never a GET's.
+//! - The response omits occurrence items whose routine is missing and task
+//!   items whose task is missing/soft-deleted; the orphan membership rows
+//!   stay in D1. A soft-deleted routine's `done`/`skipped` history still
+//!   renders (`routine_deleted: true`, borrowing the routine's display
+//!   fields) while its `pending`/`in_progress` leftovers are omitted.
 //! - `POST /api/agenda/items/:id/move` reorders that item's date pile only;
 //!   peers at/after the insert rank shift up (no `updated_at` bump).
-//! - `POST /api/agenda/items/:id/reschedule { date }` relocates a slot to
-//!   another day (ADR 0004 amendment): an occurrence moves its **agenda item
+//! - `POST /api/agenda/items/:id/reschedule { date, sort_order? }` relocates
+//!   a slot **onto today or later** (the past is a 400) with an optional
+//!   landing rank (ADR 0004 amendment): an occurrence moves its **agenda item
 //!   only** — `occurrence.local_date` (the rule date) and `routines.rrule`
-//!   are never touched, there is **no EXDATE anywhere**, and the seed's
+//!   are never touched, there is **no EXDATE anywhere**, and the fill's
 //!   no-membership-anywhere rule keeps the rule date from re-attaching it.
 //!   `pending | skipped` are the only reschedulable statuses (`skipped` →
 //!   `pending` on the new date), `in_progress`/`done` → 400, and a target
 //!   date already holding this routine is allowed (two rows of the same
 //!   routine on one day are legal). A task reschedule moves the
-//!   **membership slot** only — task status unchanged, no `task_logs` row
-//!   (the agenda is an overlay; `task_logs` has no civil-date column) — and
-//!   an already-on-target task unpins the source and returns the existing
-//!   target item. Same date → 200 no-op. Session-only, never a Google write.
-//! - `DELETE` on an occurrence-kind item is refused (400 "skip is the
-//!   decline"); task-kind items are hard-deleted (unpin).
+//!   **membership slot** only — task status unchanged (`COMPLETED`/
+//!   `DISCARDED` → 400 "cannot reschedule a terminal task"), no `task_logs`
+//!   row (the agenda is an overlay; `task_logs` has no civil-date column) —
+//!   and one row per task (0018) means the source row itself moves: there is
+//!   no unpin-and-merge path. Same date → 200 no-op (same-day placement is
+//!   `/move`). Session-only, never a Google write.
+//! - `POST /api/agenda/days/:date/move-to-today` sweeps a **past** day's
+//!   still-pending items onto civil today in one call: living
+//!   `OPEN | PLANNED | IN_PROGRESS` tasks and `pending` occurrences of living
+//!   routines, appended to today's pile in their original order. `done`/
+//!   `skipped`/`in_progress` occurrences, terminal or soft-deleted tasks,
+//!   soft-deleted-routine leftovers, orphans and unknown kinds stay put. A
+//!   call on today or a future date is a 400. Session-only, no Google write.
 //! - `PATCH /api/occurrences/:id { title }` writes the override; `""`/
 //!   whitespace clears it back to inheritance (NULL). When `google_event_id`
 //!   is set and the **resolved** title actually changed, the Google event's
@@ -106,16 +110,14 @@ use crate::categories::{
 };
 use crate::config::OAuthConfig;
 use crate::models::{
-    AgendaItem, CalendarEvent, GoogleCalendar, NewAgendaItem, NewAgendaItemInput,
-    NewEventInput, NewRoutineOccurrence, Routine, RoutineOccurrence, Task, TaskCategory,
-    TaskCategoryPattern, UpdateOccurrence,
+    AgendaItem, CalendarEvent, GoogleCalendar, NewEventInput, Routine, RoutineOccurrence, Task,
+    TaskCategory, TaskCategoryPattern, UpdateOccurrence,
 };
 use crate::oauth::HttpClient;
 use crate::repo::{
     AgendaItemRepo, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo,
     RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskRepo, TokenRepo,
 };
-use crate::routines::occurrence_dates;
 use crate::tasks::{ElongateReport, START_EVENT_MINUTES, TaskCategorySummary, TaskView};
 use crate::time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, rfc3339_to_unix_secs,
@@ -181,31 +183,47 @@ impl From<crate::categories::CategoriesError> for AgendaError {
     }
 }
 
-/// Response envelope for `GET /api/agenda` — the mixed pile plus the
-/// server-computed civil today (ADR 0004 amendment): `today` is the civil
-/// date of now in the user's primary calendar `time_zone` (chrono-tz), the
-/// Home anchor the browser must not compute itself.
+/// Response envelope for `GET /api/agenda` — a window of the infinite day
+/// stream plus the server-computed civil today (ADR 0004 amendment): `today`
+/// is the civil date of now in the user's primary calendar `time_zone`
+/// (chrono-tz), the Home anchor the browser must not compute itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgendaResponse {
+    /// Every item in the window, ordered by `(local_date, sort_order,
+    /// created_at)`.
     pub items: Vec<AgendaItemView>,
+    /// `YYYY-MM-DD` — the resolved inclusive window start (never the raw
+    /// query).
+    pub from: String,
+    /// `YYYY-MM-DD` — the resolved inclusive window end.
+    pub to: String,
     /// `YYYY-MM-DD` — civil today in `time_zone`.
     pub today: String,
     /// IANA name of the zone that produced `today` (the primary calendar's
     /// `time_zone`, or `UTC` when the user has no primary calendar).
     pub time_zone: String,
+    /// `YYYY-MM-DD` — the oldest past date that still holds a **pending**
+    /// item, else `today`. The both-omitted window starts here.
+    pub anchor_date: String,
+    /// `YYYY-MM-DD` — `MIN(local_date)` over all of the user's agenda rows
+    /// (orphans and future rows included), else `today`. Independent of the
+    /// requested window: the browser's back-scroll floor.
+    pub earliest_date: String,
 }
 
-/// Response envelope for `POST /api/agenda/items` and
-/// `POST /api/agenda/items/:id/move`.
+/// Response envelope for `POST /api/agenda/items/:id/move` and
+/// `POST /api/agenda/items/:id/reschedule`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgendaItemResponse {
     pub item: AgendaItemView,
 }
 
-/// Response envelope for `DELETE /api/agenda/items/:id`.
+/// Response envelope for `POST /api/agenda/days/:date/move-to-today`: only
+/// the rows the sweep actually moved, in the order they were appended to
+/// today's pile.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct DeleteAgendaItemResponse {
-    pub success: bool,
+pub struct MoveDayToTodayResponse {
+    pub items: Vec<AgendaItemView>,
 }
 
 /// Response envelope for `PATCH /api/occurrences/:id`,
@@ -263,6 +281,12 @@ pub struct OccurrenceView {
     /// The routine's two-line recurrence blob (`DTSTART:` + `RRULE:`), for
     /// display.
     pub rrule: String,
+    /// `true` only on the range read's **history** rows: the routine was
+    /// soft-deleted and this occurrence is `done`/`skipped`, so the item is
+    /// still shown (with the routine's title/estimate/blob) but must render
+    /// as retired. Living routines always paint `false`, and the occurrence
+    /// verbs never change it.
+    pub routine_deleted: bool,
     /// Local calendar id once started (slice 6); `None` until then.
     pub calendar_id: Option<String>,
     /// Google event id of the one-shot log (slice 6); `None` until then.
@@ -278,7 +302,7 @@ pub struct OccurrenceView {
 }
 
 // ──────────────────────────────────────────
-// GET /api/agenda — ensure-for-date, seed, respond
+// GET /api/agenda — a pure range read of the day stream
 // ──────────────────────────────────────────
 
 /// The user's **one civil today** (ADR 0004 amendment): the civil date of
@@ -287,7 +311,7 @@ pub struct OccurrenceView {
 /// calendars at all) → UTC. "Travel = home base": the primary calendar is the
 /// user's home zone — the hotel's timezone never moves today, and no zone is
 /// ever hardcoded.
-async fn user_today(
+pub(crate) async fn user_today(
     calendars: &dyn CalendarRepo,
     user_id: &str,
     now_unix: i64,
@@ -303,25 +327,39 @@ async fn user_today(
     Ok((date, time_zone))
 }
 
-/// `GET /api/agenda?date=YYYY-MM-DD` → `{"items":[…],"today":…,"time_zone":…}`.
+/// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` →
+/// `{"items":[…],"from":…,"to":…,"today":…,"time_zone":…,"anchor_date":…,
+/// "earliest_date":…}`.
 ///
-/// The `date` query is **optional**: missing/blank reads civil today (the
-/// primary calendar's IANA `time_zone` via chrono-tz) — Home's first load
-/// omits `date` so the server decides "today". The response carries that
-/// `today` + `time_zone` back for the browser to anchor on.
+/// A **pure read** (ADR 0004 amendment, infinite stream): no occurrence is
+/// ensured and no agenda row is written — not even when a living routine's
+/// rule covers the window. Materializing occurrences is the occurrence fill's
+/// job, never a GET's.
 ///
-/// Seeds on read (ADR 0004 amendment): every living routine whose rule covers
-/// `date` gets its occurrence ensured (idempotent). The membership row is
-/// appended only when this occurrence has **no agenda item on ANY date** —
-/// a reschedule moves the item to another day, so a GET on the rule date must
-/// not re-attach it; the item lands **after** already-present items (standing
-/// `routines.sort_order` relative to each other), never reshuffling a list the
-/// user reordered. Tasks never auto-land. The seed is batched: one
-/// `list_by_user_and_date` (occurrences) to find what is missing, one
-/// `insert_many` of the missing occurrences, one `list_by_refs` for the
-/// no-membership-anywhere check, and one `insert_many` of the new agenda rows
-/// — a warm GET (everything already present) performs zero writes and zero
-/// per-routine reads.
+/// Window resolution (trim first; empty/whitespace counts as omitted):
+/// - both omitted → the **anchor week**: `from = anchor_date`, `to =
+///   from + 6` civil days (7 inclusive days);
+/// - both present → the inclusive range; `to < from` is a 400, and an
+///   inclusive span above 31 days is a 400;
+/// - exactly one present → 400 "both or neither";
+/// - a non-empty value that is not `YYYY-MM-DD` → 400.
+///
+/// `anchor_date` is the oldest **past** date that still holds a pending item
+/// (a living `OPEN | PLANNED | IN_PROGRESS` task, or a `pending |
+/// in_progress` occurrence of a living routine), else today. It is computed
+/// by one repo query, never by loading history. `earliest_date` is
+/// `MIN(local_date)` over every agenda row of the user (orphans and future
+/// rows included), else today — the browser's back-scroll floor, independent
+/// of this page.
+///
+/// Hydration is batched: one `list_by_user_and_date_range` page read, one
+/// `list_by_ids` for the page's occurrences, `list_by_user_id` for living
+/// tasks/routines, and `list_by_ids_including_deleted` only for routine ids
+/// missing from the living set. Soft-deleted tasks and orphan/unknown-kind
+/// rows are omitted while their membership rows stay in D1. A deleted
+/// routine's `done | skipped` occurrence still renders (with
+/// `routine_deleted: true`, borrowing the routine's title/estimate/blob);
+/// its `pending | in_progress` leftovers are omitted.
 ///
 /// `focused_task_id` is the caller's pointer into this user's focus lock —
 /// it only paints the embedded tasks' `focused` flag (reads never write the
@@ -335,113 +373,31 @@ pub async fn get_agenda(
     agenda_repo: &dyn AgendaItemRepo,
     task_repo: &dyn TaskRepo,
     user_id: &str,
-    date: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
     now_unix: i64,
     focused_task_id: Option<&str>,
 ) -> Result<AgendaResponse, AgendaError> {
     let (today, time_zone) = user_today(calendars, user_id, now_unix).await?;
-    let date = match date.map(str::trim) {
-        Some(date) if !date.is_empty() => parse_date(date)?,
-        _ => today.clone(),
-    };
+    // The anchor is needed even when the caller names a window — the response
+    // always carries it — and it decides the default window's start.
+    let anchor_date = agenda_repo
+        .oldest_pending_local_date_before(user_id, &today)
+        .await?
+        .unwrap_or_else(|| today.clone());
+    let (from, to) = resolve_window(from, to, &anchor_date)?;
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
 
-    // Living routines in standing order — the seed order.
-    let routines = routine_repo.list_by_user_id(user_id).await?;
+    // One page read for the whole window; the repo owns the stream order.
+    let items = agenda_repo
+        .list_by_user_and_date_range(user_id, &from, &to)
+        .await?;
+    // The back-scroll floor is page-independent: ALL of the user's rows.
+    let earliest_date = agenda_repo
+        .min_local_date(user_id)
+        .await?
+        .unwrap_or_else(|| today.clone());
 
-    // Covering routines (standing order). A stored rule that no longer parses
-    // (hand-edited row) degrades to "no seed" — a read never 400s on
-    // stored-data decay. Zero covering routines (a tasks-only day) skips the
-    // whole occurrence seed path.
-    let covering: Vec<Routine> = routines
-        .iter()
-        .filter(|routine| {
-            occurrence_dates(&routine.rrule, &date, &date)
-                .map(|dates| dates.contains(&date))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-
-    if !covering.is_empty() {
-        // One set read tells us which occurrences already exist for the date.
-        let mut seeded = occurrence_repo.list_by_user_and_date(user_id, &date).await?;
-        let existing_routines: HashSet<&str> =
-            seeded.iter().map(|occ| occ.routine_id.as_str()).collect();
-
-        // Insert only the covering routines with no occurrence on this date.
-        let missing: Vec<NewRoutineOccurrence> = covering
-            .iter()
-            .filter(|routine| !existing_routines.contains(routine.id.as_str()))
-            .map(|routine| NewRoutineOccurrence {
-                routine_id: routine.id.clone(),
-                user_id: user_id.to_string(),
-                local_date: date.clone(),
-            })
-            .collect();
-        if !missing.is_empty() {
-            occurrence_repo.insert_many(missing).await?;
-            // INSERT OR IGNORE can drop a generated UUID on a concurrent
-            // duplicate — re-list so we seed membership from the surviving ids.
-            seeded = occurrence_repo.list_by_user_and_date(user_id, &date).await?;
-        }
-        let seeded_by_routine: HashMap<&str, &RoutineOccurrence> =
-            seeded.iter().map(|occ| (occ.routine_id.as_str(), occ)).collect();
-        let seeded_by_id: HashMap<&str, &RoutineOccurrence> =
-            seeded.iter().map(|occ| (occ.id.as_str(), occ)).collect();
-
-        // The covering routines' occurrence ids, in standing order.
-        let occurrence_ids: Vec<String> = covering
-            .iter()
-            .filter_map(|routine| {
-                seeded_by_routine
-                    .get(routine.id.as_str())
-                    .map(|occ| occ.id.clone())
-            })
-            .collect();
-
-        // Append a membership row only for occurrences with NO item on ANY
-        // date — a rescheduled occurrence keeps its moved row, so the rule
-        // date never re-attaches it (and a list the user reordered keeps its
-        // ranks). `list_by_refs` returns every matching row (not LIMIT 1).
-        let memberships = agenda_repo
-            .list_by_refs(user_id, AGENDA_KIND_OCCURRENCE, &occurrence_ids)
-            .await?;
-        let membership_refs: HashSet<&str> =
-            memberships.iter().map(|item| item.ref_id.as_str()).collect();
-        let to_append: Vec<&RoutineOccurrence> = occurrence_ids
-            .iter()
-            .filter(|id| !membership_refs.contains(id.as_str()))
-            .filter_map(|id| seeded_by_id.get(id.as_str()).copied())
-            .collect();
-        if !to_append.is_empty() {
-            let base = agenda_repo
-                .max_sort_order(user_id, &date)
-                .await?
-                .map(|max| max + 1)
-                .unwrap_or(0);
-            let rows: Vec<NewAgendaItem> = to_append
-                .iter()
-                .enumerate()
-                .map(|(index, occ)| NewAgendaItem {
-                    user_id: user_id.to_string(),
-                    local_date: date.clone(),
-                    kind: AGENDA_KIND_OCCURRENCE.to_string(),
-                    ref_id: occ.id.clone(),
-                    sort_order: base + index as i64,
-                })
-                .collect();
-            agenda_repo.insert_many(rows).await?;
-        }
-    }
-
-    // The response: pile order, omitting orphaned embeds (missing/soft-deleted
-    // task or routine) while their membership rows stay in D1. Hydration is
-    // batched — no per-row `get_by_id`: the pile's occurrence `ref_id`s resolve
-    // in one `list_by_ids` (a row rescheduled onto this date still resolves,
-    // because it matches by ref_id, never by `local_date`), tasks come from the
-    // user's living list, and routines from the living list already loaded.
-    let items = agenda_repo.list_by_user_and_date(user_id, &date).await?;
     let mut views = Vec::with_capacity(items.len());
     if !items.is_empty() {
         let user_tasks = task_repo.list_by_user_id(user_id).await?;
@@ -462,8 +418,44 @@ pub async fn get_agenda(
             .iter()
             .map(|occ| (occ.id.as_str(), occ))
             .collect();
-        let routines_by_id: HashMap<&str, &Routine> =
-            routines.iter().map(|routine| (routine.id.as_str(), routine)).collect();
+
+        // Living routines first; only the ids missing from that set are
+        // fetched again INCLUDING soft-deleted rows — a read never loads
+        // every deleted routine up front.
+        let living_routines = routine_repo.list_by_user_id(user_id).await?;
+        let living_ids: HashSet<&str> = living_routines
+            .iter()
+            .map(|routine| routine.id.as_str())
+            .collect();
+        let mut missing: HashSet<&str> = HashSet::new();
+        for item in &items {
+            if item.kind != AGENDA_KIND_OCCURRENCE {
+                continue;
+            }
+            let Some(occ) = occurrences.get(item.ref_id.as_str()) else {
+                continue;
+            };
+            if occ.user_id != item.user_id {
+                continue;
+            }
+            if !living_ids.contains(occ.routine_id.as_str()) {
+                missing.insert(occ.routine_id.as_str());
+            }
+        }
+        let mut missing_ids: Vec<String> = missing.into_iter().map(str::to_string).collect();
+        missing_ids.sort();
+        let historical_routines: Vec<Routine> = if missing_ids.is_empty() {
+            Vec::new()
+        } else {
+            routine_repo
+                .list_by_ids_including_deleted(&missing_ids)
+                .await?
+        };
+        let routines_by_id: HashMap<&str, &Routine> = living_routines
+            .iter()
+            .chain(historical_routines.iter())
+            .map(|routine| (routine.id.as_str(), routine))
+            .collect();
 
         for item in &items {
             let (task, occurrence) = match item.kind.as_str() {
@@ -485,12 +477,25 @@ pub async fn get_agenda(
                     if occ.user_id != item.user_id {
                         continue;
                     }
-                    // `list_by_user_id` filters soft-deleted routines — a
-                    // soft-deleted routine omits its leftover agenda item.
+                    // Missing entirely (row gone) → omit; a soft-deleted
+                    // routine is still resolvable through the history batch.
                     let Some(routine) = routines_by_id.get(occ.routine_id.as_str()) else {
                         continue;
                     };
-                    (None, Some(occurrence_view(occ, routine, &taxonomy)))
+                    let routine_deleted = routine.deleted_at.is_some();
+                    // A deleted routine's live leftovers are noise; its
+                    // done/skipped history still renders for the record.
+                    if routine_deleted
+                        && !matches!(
+                            occ.status.as_str(),
+                            OCCURRENCE_STATUS_DONE | OCCURRENCE_STATUS_SKIPPED
+                        )
+                    {
+                        continue;
+                    }
+                    let mut view = occurrence_view(occ, routine, &taxonomy);
+                    view.routine_deleted = routine_deleted;
+                    (None, Some(view))
                 }
                 _ => continue,
             };
@@ -508,85 +513,71 @@ pub async fn get_agenda(
     }
     Ok(AgendaResponse {
         items: views,
+        from,
+        to,
         today,
         time_zone,
+        anchor_date,
+        earliest_date,
     })
 }
 
-// ──────────────────────────────────────────
-// POST /api/agenda/items — add a task (v1: tasks only)
-// ──────────────────────────────────────────
-
-/// `POST /api/agenda/items` → `{"item":…}`.
-///
-/// `kind` must be `task` in v1 (occurrences are auto-seeded). The task must
-/// be a living `OPEN | PLANNED | IN_PROGRESS` row of this user. Already on
-/// the date → **idempotent 200** with the existing item (its stored
-/// `sort_order` wins). Otherwise inserts at `sort_order` when named, else
-/// appends at `max+1` for the date (0 when empty). Never changes
-/// `tasks.status` — Home is an overlay, not a sixth column.
-pub async fn add_agenda_item(
-    list_repo: &dyn TaskListRepo,
-    category_repo: &dyn TaskCategoryRepo,
-    agenda_repo: &dyn AgendaItemRepo,
-    task_repo: &dyn TaskRepo,
-    user_id: &str,
-    input: &NewAgendaItemInput,
-    focused_task_id: Option<&str>,
-) -> Result<AgendaItemResponse, AgendaError> {
-    let date = parse_date(&input.date)?;
-    if input.kind != AGENDA_KIND_TASK {
-        return Err(AgendaError::Invalid("kind must be task".to_string()));
-    }
-    let Some(task) = task_repo.get_by_id(&input.ref_id).await? else {
-        return Err(AgendaError::NotFound); // missing / soft-deleted
-    };
-    if task.user_id != user_id {
-        return Err(AgendaError::NotFound); // other user — never leak existence
-    }
-    if !matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS") {
-        return Err(AgendaError::Invalid(
-            "task cannot be added to the agenda".to_string(),
-        ));
-    }
-    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
-
-    // Idempotent 200: already on that date → return the existing item as-is
-    // (never touch its sort_order).
-    if let Some(existing) = agenda_repo
-        .get_by_key(user_id, &date, AGENDA_KIND_TASK, &task.id)
-        .await?
-    {
-        return Ok(AgendaItemResponse {
-            item: task_item_view(&existing, &task, &taxonomy, focused_task_id),
-        });
-    }
-
-    let rank = match input.sort_order {
-        Some(rank) if rank >= 0 => rank,
-        Some(_) => {
-            return Err(AgendaError::Invalid(
-                "sort_order must be a non-negative integer".to_string(),
-            ))
+/// Resolves the requested inclusive window under the stream contract: trim
+/// first, empty/whitespace = omitted, both-or-neither, `YYYY-MM-DD` only,
+/// `to >= from`, and at most 31 inclusive days. Both omitted → the anchor
+/// week (`anchor_date … anchor_date + 6`).
+fn resolve_window(
+    from: Option<&str>,
+    to: Option<&str>,
+    anchor_date: &str,
+) -> Result<(String, String), AgendaError> {
+    let from = from.map(str::trim).filter(|value| !value.is_empty());
+    let to = to.map(str::trim).filter(|value| !value.is_empty());
+    match (from, to) {
+        (None, None) => {
+            let from = parse_date(anchor_date)?;
+            let to = add_civil_days(&from, 6)?;
+            Ok((from, to))
         }
-        None => agenda_repo
-            .max_sort_order(user_id, &date)
-            .await?
-            .map(|max| max + 1)
-            .unwrap_or(0),
-    };
-    let item = agenda_repo
-        .insert(NewAgendaItem {
-            user_id: user_id.to_string(),
-            local_date: date.clone(),
-            kind: AGENDA_KIND_TASK.to_string(),
-            ref_id: task.id.clone(),
-            sort_order: rank,
-        })
-        .await?;
-    Ok(AgendaItemResponse {
-        item: task_item_view(&item, &task, &taxonomy, focused_task_id),
-    })
+        (Some(from), Some(to)) => {
+            let from = parse_date(from)?;
+            let to = parse_date(to)?;
+            let from_date = civil_date(&from)?;
+            let to_date = civil_date(&to)?;
+            if to_date < from_date {
+                return Err(AgendaError::Invalid(
+                    "to must not be before from".to_string(),
+                ));
+            }
+            // Inclusive span is the day difference + 1: 30 → 31 days is valid.
+            if to_date.signed_duration_since(from_date).num_days() > 30 {
+                return Err(AgendaError::Invalid(
+                    "date range must not exceed 31 days".to_string(),
+                ));
+            }
+            Ok((from, to))
+        }
+        _ => Err(AgendaError::Invalid(
+            "from and to must both be set or both be omitted".to_string(),
+        )),
+    }
+}
+
+/// Parses an already-validated `YYYY-MM-DD` into a civil date (window
+/// arithmetic only — [`parse_date`] owns the 400 text).
+fn civil_date(date: &str) -> Result<chrono::NaiveDate, AgendaError> {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| AgendaError::Invalid("date must be YYYY-MM-DD".to_string()))
+}
+
+/// Adds `days` civil days to a validated `YYYY-MM-DD` date. Overflow only
+/// happens past chrono's date range; it is a 400, never a panic. Shared with
+/// the agenda fill's horizon arithmetic.
+pub(crate) fn add_civil_days(date: &str, days: i64) -> Result<String, AgendaError> {
+    civil_date(date)?
+        .checked_add_signed(chrono::Duration::days(days))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .ok_or_else(|| AgendaError::Invalid("date out of range".to_string()))
 }
 
 // ──────────────────────────────────────────
@@ -647,14 +638,16 @@ pub async fn move_agenda_item(
 }
 
 // ──────────────────────────────────────────
-// POST /api/agenda/items/:id/reschedule — relocate a slot to another day
+// POST /api/agenda/items/:id/reschedule — relocate a slot onto today or later
 // ──────────────────────────────────────────
 
-/// `POST /api/agenda/items/:id/reschedule { date }` → `{"item":…}` (the same
-/// embed as add/move).
+/// `POST /api/agenda/items/:id/reschedule { date, sort_order? }` →
+/// `{"item":…}` (the same embed as move).
 ///
-/// Relocates the item's slot to `date` (ADR 0004 amendment). Session-only —
-/// no Google write of any kind, no RRULE anywhere, **no EXDATE anywhere**.
+/// Relocates the item's slot to `date` — **today or later** (the past is a
+/// 400: the day is over) — with an optional landing `sort_order` (ADR 0004
+/// amendment). Session-only — no Google write of any kind, no RRULE anywhere,
+/// **no EXDATE anywhere**.
 ///
 /// **Occurrence** (kind `occurrence`):
 /// 1. Load the item + its occurrence + the living routine (404s as always).
@@ -666,16 +659,22 @@ pub async fn move_agenda_item(
 ///    routine's `rrule` is never touched. A target date that already holds
 ///    another occurrence of this routine is FINE — daily snooze
 ///    today→tomorrow puts two rows of the same routine on tomorrow.
-/// 4. The agenda row lands **appended** (`max+1`) on the target pile. Title
-///    override and any stored google ids travel with the row (never cleared).
+/// 4. Title override and any stored google ids travel with the row (never
+///    cleared).
 ///
 /// **Task** (kind `task`): the **membership slot** moves, not the task —
 /// `tasks.status` is unchanged and **no `task_logs` row is written** (the
-/// agenda is an overlay, and `task_logs` has no civil-date column). A target
-/// date that already has this task **unpins the source** (hard-delete this
-/// item) and returns the **existing** target item — never a duplicate.
+/// agenda is an overlay, and `task_logs` has no civil-date column).
+/// `COMPLETED`/`DISCARDED` → 400. One row per task (0018) means the source
+/// row itself moves: there is no target row to merge into.
 ///
-/// Same date → 200 no-op returning the item unchanged. Missing item /
+/// **Placement** on a different day: `sort_order` omitted → appended at
+/// `max+1` (0 when the target pile is empty); named → the target day's peers
+/// at/after the rank shift up one first (same gap semantics as `/move`), then
+/// the row lands on the rank. The source day's pile is never reshuffled.
+///
+/// Same date → 200 no-op returning the item unchanged, even when a
+/// `sort_order` is named — same-day placement is `/move`. Missing item /
 /// other-user / missing or soft-deleted task / soft-deleted routine → 404.
 /// Missing/invalid `date` → 400.
 pub async fn reschedule_agenda_item(
@@ -685,9 +684,12 @@ pub async fn reschedule_agenda_item(
     task_repo: &dyn TaskRepo,
     occurrence_repo: &dyn OccurrenceRepo,
     routine_repo: &dyn RoutineRepo,
+    calendars: &dyn CalendarRepo,
+    now_unix: i64,
     user_id: &str,
     id: &str,
     date: &str,
+    sort_order: Option<i64>,
     focused_task_id: Option<&str>,
 ) -> Result<AgendaItemResponse, AgendaError> {
     let date = parse_date(date)?;
@@ -697,7 +699,17 @@ pub async fn reschedule_agenda_item(
     if item.user_id != user_id {
         return Err(AgendaError::NotFound);
     }
-    // Same date → 200 no-op: nothing moves, nothing is exdated.
+    // A reschedule only ever moves forward. `YYYY-MM-DD` sorts
+    // chronologically, so the string compare IS the civil-date compare; today
+    // itself is allowed.
+    let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
+    if date < today {
+        return Err(AgendaError::Invalid(
+            "cannot reschedule into the past".to_string(),
+        ));
+    }
+    // Same date → 200 no-op: nothing moves, nothing is shifted (a named
+    // `sort_order` is ignored — same-day placement is `/move`).
     if item.local_date == date {
         let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
         let view = embed_item(
@@ -712,6 +724,14 @@ pub async fn reschedule_agenda_item(
         .ok_or(AgendaError::NotFound)?;
         return Ok(AgendaItemResponse { item: view });
     }
+    // Only validated when the row is actually going to be placed.
+    if let Some(rank) = sort_order {
+        if rank < 0 {
+            return Err(AgendaError::Invalid(
+                "sort_order must be a non-negative integer".to_string(),
+            ));
+        }
+    }
 
     match item.kind.as_str() {
         AGENDA_KIND_OCCURRENCE => {
@@ -722,28 +742,13 @@ pub async fn reschedule_agenda_item(
                 user_id,
                 &item,
                 &date,
+                sort_order,
             )
             .await?;
         }
         AGENDA_KIND_TASK => {
-            // `Some(existing)` when the source was unpinned and the existing
-            // target item is the answer; `None` when the slot moved.
-            if let Some(existing) =
-                reschedule_task_slot(agenda_repo, task_repo, user_id, &item, &date).await?
-            {
-                let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
-                let view = embed_item(
-                    task_repo,
-                    occurrence_repo,
-                    routine_repo,
-                    &existing,
-                    &taxonomy,
-                    focused_task_id,
-                )
-                .await?
-                .ok_or(AgendaError::NotFound)?;
-                return Ok(AgendaItemResponse { item: view });
-            }
+            reschedule_task_slot(agenda_repo, task_repo, user_id, &item, &date, sort_order)
+                .await?;
         }
         _ => return Err(AgendaError::NotFound),
     }
@@ -766,14 +771,40 @@ pub async fn reschedule_agenda_item(
     Ok(AgendaItemResponse { item: view })
 }
 
+/// Places a membership row on another date's pile: a named `sort_order`
+/// shifts that day's peers at/after the rank up one first (the moving row is
+/// not on that date yet, so it is never shifted), an omitted one appends at
+/// `max+1` (0 when the pile is empty). Same gap semantics as `/move`.
+async fn place_on_date(
+    agenda_repo: &dyn AgendaItemRepo,
+    user_id: &str,
+    id: &str,
+    date: &str,
+    sort_order: Option<i64>,
+) -> Result<(), AgendaError> {
+    let rank = match sort_order {
+        Some(rank) => {
+            agenda_repo.shift_sort_order(user_id, date, rank, 1).await?;
+            rank
+        }
+        None => agenda_repo
+            .max_sort_order(user_id, date)
+            .await?
+            .map(|max| max + 1)
+            .unwrap_or(0),
+    };
+    agenda_repo.set_local_date(id, date, rank).await?;
+    Ok(())
+}
+
 /// The occurrence half of a reschedule:
 /// 1. verify the occurrence + its routine are alive and owned (404 otherwise),
 /// 2. gate the status (`pending | skipped` only; `skipped` → `pending`),
-/// 3. move the **agenda item** to the target pile appended (`max+1`).
+/// 3. place the **agenda item** on the target pile ([`place_on_date`]).
 ///
 /// `occurrence.local_date` is deliberately NEVER rewritten — it is the
 /// series-instance key (the rule date), and the "Monday must not come back"
-/// guarantee now comes from the seed's no-membership-anywhere rule, not from
+/// guarantee now comes from the fill's no-membership-anywhere rule, not from
 /// an exdate. The routine's `rrule` is never touched either.
 async fn reschedule_occurrence(
     agenda_repo: &dyn AgendaItemRepo,
@@ -782,6 +813,7 @@ async fn reschedule_occurrence(
     user_id: &str,
     item: &AgendaItem,
     date: &str,
+    sort_order: Option<i64>,
 ) -> Result<(), AgendaError> {
     let Some(occurrence) = occurrence_repo.get_by_id(&item.ref_id).await? else {
         return Err(AgendaError::NotFound);
@@ -826,81 +858,227 @@ async fn reschedule_occurrence(
             .set_status(&occurrence.id, OCCURRENCE_STATUS_PENDING)
             .await?;
     }
-    // The agenda row lands appended on the target pile (the source pile keeps
-    // its ranks — same gap semantics as unpin). `occurrence.local_date` and
-    // `routines.rrule` are untouched.
-    let rank = agenda_repo
-        .max_sort_order(user_id, date)
-        .await?
-        .map(|max| max + 1)
-        .unwrap_or(0);
-    agenda_repo.set_local_date(&item.id, date, rank).await?;
-    Ok(())
+    // The agenda row lands on the target pile (the source pile keeps its
+    // ranks). `occurrence.local_date` and `routines.rrule` are untouched.
+    place_on_date(agenda_repo, user_id, &item.id, date, sort_order).await
 }
 
 /// The task half of a reschedule: the **membership slot** moves, never the
 /// task — no `tasks.status` change, no `task_logs` row (the agenda is an
-/// overlay, and `task_logs` has no civil-date column). Returns:
-/// - `Ok(None)` — the slot moved; the caller re-reads `item.id`.
-/// - `Ok(Some(existing))` — the target date already had this task; the source
-///   was unpinned (hard-delete) and the **existing** target item is the
-///   answer. Never a duplicate: the same task MAY appear on several days at
-///   once (`UNIQUE (user, date, kind, ref_id)` is per date); reschedule
-///   relocates a slot, Add-task clones onto another day.
+/// overlay, and `task_logs` has no civil-date column). A terminal task is a
+/// 400. One row per task (0018): the source row itself moves, so there is no
+/// second row to look up, merge into, or hard-delete.
 async fn reschedule_task_slot(
     agenda_repo: &dyn AgendaItemRepo,
     task_repo: &dyn TaskRepo,
     user_id: &str,
     item: &AgendaItem,
     date: &str,
-) -> Result<Option<AgendaItem>, AgendaError> {
+    sort_order: Option<i64>,
+) -> Result<(), AgendaError> {
     let Some(task) = task_repo.get_by_id(&item.ref_id).await? else {
         return Err(AgendaError::NotFound); // missing / soft-deleted
     };
     if task.user_id != user_id {
         return Err(AgendaError::NotFound);
     }
-    if let Some(existing) = agenda_repo
-        .get_by_key(user_id, date, AGENDA_KIND_TASK, &task.id)
-        .await?
-    {
-        agenda_repo.hard_delete(&item.id).await?;
-        return Ok(Some(existing));
+    if matches!(task.status.as_str(), "COMPLETED" | "DISCARDED") {
+        return Err(AgendaError::Invalid(
+            "cannot reschedule a terminal task".to_string(),
+        ));
     }
-    let rank = agenda_repo
-        .max_sort_order(user_id, date)
-        .await?
-        .map(|max| max + 1)
-        .unwrap_or(0);
-    agenda_repo.set_local_date(&item.id, date, rank).await?;
-    Ok(None)
+    place_on_date(agenda_repo, user_id, &item.id, date, sort_order).await
 }
 
 // ──────────────────────────────────────────
-// DELETE /api/agenda/items/:id — unpin (task-kind only)
+// POST /api/agenda/days/:date/move-to-today — sweep a past day's leftovers
 // ──────────────────────────────────────────
 
-/// `DELETE /api/agenda/items/:id` → `{"success":true}`.
+/// `POST /api/agenda/days/:date/move-to-today` → `{"items":[…]}`.
 ///
-/// Hard-deletes the membership row (unpin). The task stays on the Board.
-/// Occurrence-kind items are refused — **skip is the decline**. Missing /
-/// other-user → 404.
-pub async fn delete_agenda_item(
+/// The one-call catch-up for a skipped past day: every **still-pending** item
+/// of `date` moves onto **civil today**, appended to today's pile in the
+/// order it held on the past day (after whatever is already there). No Google
+/// write, no RRULE anywhere.
+///
+/// Movable rows:
+/// - kind `task` whose living task is `OPEN | PLANNED | IN_PROGRESS` (an
+///   `in_progress` **task** moves);
+/// - kind `occurrence` whose status is `pending` and whose routine is living
+///   (the same gate as a reschedule — `occurrence.local_date` is never
+///   rewritten: it stays the rule date).
+///
+/// Everything else stays put: `done`/`skipped`/`in_progress` occurrences,
+/// `COMPLETED`/`DISCARDED` and soft-deleted tasks, soft-deleted-routine
+/// leftovers, orphans, and unknown kinds. A row that cannot move never fails
+/// the call.
+///
+/// Hydration is batched, the same shape as `get_agenda`'s: one pile read, one
+/// `list_by_user_id` for living tasks, one `list_by_ids` for the pile's
+/// occurrences, one `list_by_user_id` for living routines — never a
+/// `get_by_id` per row (a missed day of ~30 items would otherwise blow the
+/// Workers free plan's 50-subrequest budget). The moved rows' views are built
+/// from those maps, and each move writes only its own `set_local_date`.
+///
+/// `date` must be in the **past** (`>= today` → 400). Invalid `date` → 400.
+/// Session-only.
+pub async fn move_day_to_today(
+    calendars: &dyn CalendarRepo,
+    list_repo: &dyn TaskListRepo,
+    category_repo: &dyn TaskCategoryRepo,
     agenda_repo: &dyn AgendaItemRepo,
+    task_repo: &dyn TaskRepo,
+    occurrence_repo: &dyn OccurrenceRepo,
+    routine_repo: &dyn RoutineRepo,
     user_id: &str,
-    id: &str,
-) -> Result<DeleteAgendaItemResponse, AgendaError> {
-    let Some(item) = agenda_repo.get_by_id(id).await? else {
-        return Err(AgendaError::NotFound);
+    date: &str,
+    now_unix: i64,
+    focused_task_id: Option<&str>,
+) -> Result<MoveDayToTodayResponse, AgendaError> {
+    let date = parse_date(date)?;
+    let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
+    // `YYYY-MM-DD` sorts chronologically: today itself has nothing to catch
+    // up on, and the future is not a "past day".
+    if date >= today {
+        return Err(AgendaError::Invalid(
+            "cannot move a day that is not in the past".to_string(),
+        ));
+    }
+
+    // One pile read, in pile order — the moved rows keep their relative order.
+    let items = agenda_repo.list_by_user_and_date(user_id, &date).await?;
+    if items.is_empty() {
+        return Ok(MoveDayToTodayResponse { items: Vec::new() });
+    }
+
+    // The pile's embeds in one batched pass, the same shape as `get_agenda`'s
+    // hydration: living tasks, the pile's occurrences by `ref_id`, and the
+    // living routines those occurrences hang off. A read per pile row is what
+    // this replaces — a missed day must fit the free plan's subrequest budget.
+    //
+    // Living tasks only (`list_by_user_id` filters soft-deleted rows).
+    let user_tasks = task_repo.list_by_user_id(user_id).await?;
+    let tasks: HashMap<&str, &Task> =
+        user_tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+
+    let occurrence_ids: Vec<String> = items
+        .iter()
+        .filter(|item| item.kind == AGENDA_KIND_OCCURRENCE)
+        .map(|item| item.ref_id.clone())
+        .collect();
+    // `list_by_ids` no-ops on an empty slice — don't spend the call either.
+    let fetched_occurrences: Vec<RoutineOccurrence> = if occurrence_ids.is_empty() {
+        Vec::new()
+    } else {
+        occurrence_repo.list_by_ids(&occurrence_ids).await?
     };
-    if item.user_id != user_id {
-        return Err(AgendaError::NotFound);
+    let occurrences: HashMap<&str, &RoutineOccurrence> = fetched_occurrences
+        .iter()
+        .map(|occurrence| (occurrence.id.as_str(), occurrence))
+        .collect();
+
+    // Living routines only (`list_by_user_id` filters soft-deleted rows): a
+    // soft-deleted routine is simply absent, so its leftover stays put.
+    let living_routines: Vec<Routine> = if occurrence_ids.is_empty() {
+        Vec::new()
+    } else {
+        routine_repo.list_by_user_id(user_id).await?
+    };
+    let routines_by_id: HashMap<&str, &Routine> = living_routines
+        .iter()
+        .map(|routine| (routine.id.as_str(), routine))
+        .collect();
+
+    // The movability pass, in pile order: this decides what moves, nothing
+    // else.
+    let mut movable: Vec<&AgendaItem> = Vec::new();
+    for item in &items {
+        match item.kind.as_str() {
+            AGENDA_KIND_TASK => {
+                let Some(task) = tasks.get(item.ref_id.as_str()) else {
+                    continue; // orphan / soft-deleted task — stays put
+                };
+                if matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS") {
+                    movable.push(item);
+                }
+            }
+            AGENDA_KIND_OCCURRENCE => {
+                let Some(occurrence) = occurrences.get(item.ref_id.as_str()) else {
+                    continue; // orphan — stays put
+                };
+                // Never leak another user's occurrence through a
+                // hand-edited row.
+                if occurrence.user_id != item.user_id {
+                    continue;
+                }
+                // Only a waiting chip moves: `skipped` is a decline and
+                // `in_progress`/`done` are already spoken for.
+                if occurrence.status != OCCURRENCE_STATUS_PENDING {
+                    continue;
+                }
+                // A soft-deleted routine's leftover stays where it is.
+                if !routines_by_id.contains_key(occurrence.routine_id.as_str()) {
+                    continue;
+                }
+                movable.push(item);
+            }
+            _ => continue, // unknown kinds stay put
+        }
     }
-    if item.kind == AGENDA_KIND_OCCURRENCE {
-        return Err(AgendaError::Invalid("skip is the decline".to_string()));
+    if movable.is_empty() {
+        return Ok(MoveDayToTodayResponse { items: Vec::new() });
     }
-    agenda_repo.hard_delete(id).await?;
-    Ok(DeleteAgendaItemResponse { success: true })
+
+    // Each row takes the then-current `max+1` on today's pile, so the moved
+    // rows follow whatever is already on today in their original order.
+    let mut rank = agenda_repo
+        .max_sort_order(user_id, &today)
+        .await?
+        .map(|max| max + 1)
+        .unwrap_or(0);
+    let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+    let mut views = Vec::with_capacity(movable.len());
+    for item in movable {
+        agenda_repo.set_local_date(&item.id, &today, rank).await?;
+        let mut moved = item.clone();
+        moved.local_date = today.clone();
+        moved.sort_order = rank;
+        rank += 1;
+        // The backing rows were hydrated a moment ago; a concurrent delete
+        // simply drops the row from the answer (the move itself stands). The
+        // embed comes from the maps already in hand — no read per moved row.
+        let (task, occurrence) = match moved.kind.as_str() {
+            AGENDA_KIND_TASK => {
+                let Some(task) = tasks.get(moved.ref_id.as_str()) else {
+                    continue;
+                };
+                (Some(task_view(task, &taxonomy, focused_task_id)), None)
+            }
+            AGENDA_KIND_OCCURRENCE => {
+                let Some(occurrence) = occurrences.get(moved.ref_id.as_str()) else {
+                    continue;
+                };
+                let Some(routine) = routines_by_id.get(occurrence.routine_id.as_str()) else {
+                    continue;
+                };
+                (None, Some(occurrence_view(occurrence, routine, &taxonomy)))
+            }
+            _ => continue,
+        };
+        // `moved` carries the date and rank just written, so the view shows
+        // today's pile, not the past day it left.
+        views.push(AgendaItemView {
+            id: moved.id.clone(),
+            user_id: moved.user_id.clone(),
+            local_date: moved.local_date.clone(),
+            kind: moved.kind.clone(),
+            ref_id: moved.ref_id.clone(),
+            sort_order: moved.sort_order,
+            task,
+            occurrence,
+        });
+    }
+    Ok(MoveDayToTodayResponse { items: views })
 }
 
 // ──────────────────────────────────────────
@@ -1736,25 +1914,6 @@ pub async fn run_elongate_occurrences(
     report
 }
 
-/// The task-only embed (add path — the task row is already loaded).
-fn task_item_view(
-    item: &AgendaItem,
-    task: &Task,
-    taxonomy: &Taxonomy,
-    focused_task_id: Option<&str>,
-) -> AgendaItemView {
-    AgendaItemView {
-        id: item.id.clone(),
-        user_id: item.user_id.clone(),
-        local_date: item.local_date.clone(),
-        kind: item.kind.clone(),
-        ref_id: item.ref_id.clone(),
-        sort_order: item.sort_order,
-        task: Some(task_view(task, taxonomy, focused_task_id)),
-        occurrence: None,
-    }
-}
-
 /// Wraps a stored occurrence into its HTTP view. Classification is a read
 /// over the **resolved** title: a title that no longer uniquely matches keeps
 /// the `untracked` summary — listing never 400s on classification.
@@ -1787,6 +1946,7 @@ fn occurrence_view(occurrence: &RoutineOccurrence, routine: &Routine, taxonomy: 
         status: occurrence.status.clone(),
         estimated_minutes: routine.estimated_minutes,
         rrule: routine.rrule.clone(),
+        routine_deleted: false,
         calendar_id: occurrence.calendar_id.clone(),
         google_event_id: occurrence.google_event_id.clone(),
         created_at: occurrence.created_at.clone(),
@@ -1795,15 +1955,27 @@ fn occurrence_view(occurrence: &RoutineOccurrence, routine: &Routine, taxonomy: 
     }
 }
 
-/// Validates a local civil date string (`YYYY-MM-DD`).
+/// Validates a local civil date string (`YYYY-MM-DD`) and returns the
+/// **canonical** spelling.
+///
+/// The parse must round-trip: chrono also accepts unpadded fields
+/// (`2026-9-30`) and a signed year (`+2026-10-01`), and every consumer sorts
+/// these strings lexically against canonical today (`"2026-9-30" >
+/// "2026-10-17"`). A parse that does not re-render as the trimmed input is a
+/// 400 — never a silent rewrite. `" 2026-10-17 "` trims first, so it is
+/// valid and returns `"2026-10-17"`.
 fn parse_date(date: &str) -> Result<String, AgendaError> {
     let date = date.trim();
     if date.is_empty() {
         return Err(AgendaError::Invalid("date must be YYYY-MM-DD".to_string()));
     }
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map(|_| date.to_string())
-        .map_err(|_| AgendaError::Invalid("date must be YYYY-MM-DD".to_string()))
+    let canonical = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|parsed| parsed.format("%Y-%m-%d").to_string())
+        .map_err(|_| AgendaError::Invalid("date must be YYYY-MM-DD".to_string()))?;
+    if canonical != date {
+        return Err(AgendaError::Invalid("date must be YYYY-MM-DD".to_string()));
+    }
+    Ok(canonical)
 }
 
 // ──────────────────────────────────────────
@@ -1958,33 +2130,45 @@ fn split_affixes(title: &str, matcher: &CategoryWithPatterns) -> (String, String
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::agenda_fill::{
+        ensure_task_items, fill_occurrence_horizon, run_agenda_fill_cron, AgendaFillReport,
+    };
     use crate::models::{
-        GoogleCalendar, GoogleOAuthToken, NewCalendar, NewCalendarEvent, NewRoutine, NewTask,
-        NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewToken, Task, TaskList,
-        UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList,
+        GoogleCalendar, GoogleOAuthToken, NewAgendaItem, NewCalendar, NewCalendarEvent, NewRoutine,
+        NewRoutineInput, NewRoutineOccurrence, NewTask, NewTaskCategory, NewTaskCategoryPattern,
+        NewTaskList, NewToken, Task, TaskList, UpdateRoutine, UpdateTask, UpdateTaskCategory,
+        UpdateTaskList,
     };
     use crate::oauth::{HttpClient, HttpError};
+    use crate::routines::{
+        create_routine, delete_routine, occurrence_dates, update_routine, DeleteRoutineResponse,
+        RoutineResponse, RoutinesError,
+    };
 
     // ──────────────────────────────────────────
     // Fakes
     // ──────────────────────────────────────────
 
-    /// Cheap call counters on the occurrence/agenda fakes — the warm-GET test
-    /// snapshots these to prove a second read of an already-seeded date makes
-    /// zero per-row calls (`insert`/`insert_many`/`get_by_ref`/`get_by_id`)
-    /// and uses only the batched set reads.
+    /// Cheap call counters on the occurrence/agenda fakes — the range-read
+    /// test snapshots these to prove a read makes zero writes and uses only
+    /// the batched set reads (the range page, the anchor, the floor, and one
+    /// `list_by_ids`).
     #[derive(Debug, Clone, Default)]
     struct CallCounters {
         insert: u64,
         insert_many: u64,
+        delete_by_ids: u64,
         get_by_id: u64,
         get_by_ref: u64,
         list_by_refs: u64,
         list_by_ids: u64,
         list_by_user_and_date: u64,
+        list_by_user_and_date_range: u64,
+        min_local_date: u64,
+        oldest_pending_local_date_before: u64,
     }
 
     /// In-memory `TaskListRepo` for the taxonomy seed path (same as the
@@ -2237,16 +2421,17 @@ mod tests {
     }
 
     /// In-memory `RoutineRepo` mirroring D1 semantics (same as the routines
-    /// tests): soft-deleted rows are filtered from reads.
+    /// tests): soft-deleted rows are filtered from reads. `stored` is an
+    /// `Arc` because `FakeAgendaItemRepo` joins it for the anchor predicate.
     struct FakeRoutineRepo {
-        stored: Mutex<Vec<Routine>>,
+        stored: Arc<Mutex<Vec<Routine>>>,
         next_id: Mutex<u64>,
     }
 
     impl FakeRoutineRepo {
         fn new() -> Self {
             Self {
-                stored: Mutex::new(Vec::new()),
+                stored: Arc::new(Mutex::new(Vec::new())),
                 next_id: Mutex::new(1),
             }
         }
@@ -2368,13 +2553,43 @@ mod tests {
                 .map(|row| row.sort_order)
                 .max())
         }
+
+        async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {
+            // Mirrors ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL: distinct living
+            // owners, unordered.
+            let rows = self.stored.lock().unwrap();
+            let mut ids: Vec<String> = rows
+                .iter()
+                .filter(|row| row.deleted_at.is_none())
+                .map(|row| row.user_id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        }
+
+        async fn list_by_ids_including_deleted(&self, ids: &[String]) -> Result<Vec<Routine>, RepoError> {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let id_set: HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| id_set.contains(row.id.as_str()))
+                .cloned()
+                .collect())
+        }
     }
 
     /// In-memory `OccurrenceRepo`: no soft-delete (the table has none); the
     /// insert mirrors `INSERT OR IGNORE` — a duplicate `(routine_id,
-    /// local_date)` returns the existing row.
+    /// local_date)` returns the existing row. `stored` is an `Arc` because
+    /// `FakeAgendaItemRepo` joins it for the anchor predicate.
     struct FakeOccurrenceRepo {
-        stored: Mutex<Vec<RoutineOccurrence>>,
+        stored: Arc<Mutex<Vec<RoutineOccurrence>>>,
         next_id: Mutex<u64>,
         calls: Mutex<CallCounters>,
     }
@@ -2382,7 +2597,7 @@ mod tests {
     impl FakeOccurrenceRepo {
         fn new() -> Self {
             Self {
-                stored: Mutex::new(Vec::new()),
+                stored: Arc::new(Mutex::new(Vec::new())),
                 next_id: Mutex::new(1),
                 calls: Mutex::new(CallCounters::default()),
             }
@@ -2457,6 +2672,33 @@ mod tests {
             Ok(rows)
         }
 
+        async fn list_by_user_and_date_range(
+            &self,
+            user_id: &str,
+            from: &str,
+            to: &str,
+        ) -> Result<Vec<RoutineOccurrence>, RepoError> {
+            self.calls.lock().unwrap().list_by_user_and_date_range += 1;
+            let mut rows: Vec<RoutineOccurrence> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                // `YYYY-MM-DD` sorts chronologically, so a string window is
+                // the same inclusive range as the SQL comparison.
+                .filter(|row| {
+                    row.user_id == user_id
+                        && row.local_date.as_str() >= from
+                        && row.local_date.as_str() <= to
+                })
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (&a.local_date, &a.created_at, &a.id).cmp(&(&b.local_date, &b.created_at, &b.id))
+            });
+            Ok(rows)
+        }
+
         async fn list_by_ids(&self, ids: &[String]) -> Result<Vec<RoutineOccurrence>, RepoError> {
             self.calls.lock().unwrap().list_by_ids += 1;
             if ids.is_empty() {
@@ -2510,6 +2752,21 @@ mod tests {
             for row in rows {
                 self.insert(row).await?;
             }
+            Ok(())
+        }
+
+        async fn delete_by_ids(&self, ids: &[String]) -> Result<(), RepoError> {
+            // Mirrors build_occurrence_delete_by_ids_sql: HARD, id-scoped,
+            // empty input touches nothing. Agenda rows are the caller's.
+            self.calls.lock().unwrap().delete_by_ids += 1;
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let id_set: HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+            self.stored
+                .lock()
+                .unwrap()
+                .retain(|row| !id_set.contains(row.id.as_str()));
             Ok(())
         }
 
@@ -2570,17 +2827,31 @@ mod tests {
 
     /// In-memory `AgendaItemRepo`: hard-delete semantics; the insert mirrors
     /// `INSERT OR IGNORE` — a duplicate key returns the existing row (stored
-    /// sort_order wins).
+    /// sort_order wins). A **task** kind collides on `(user_id, ref_id)` on
+    /// **any** date, mirroring the partial index `idx_agenda_items_one_per_task`
+    /// (one row per task; occurrences keep one row per date). It also holds
+    /// `Arc`s of the task/occurrence/routine stores so the anchor query can
+    /// join them like D1 does.
     struct FakeAgendaItemRepo {
         stored: Mutex<Vec<AgendaItem>>,
+        tasks: Arc<Mutex<Vec<Task>>>,
+        occurrences: Arc<Mutex<Vec<RoutineOccurrence>>>,
+        routines: Arc<Mutex<Vec<Routine>>>,
         next_id: Mutex<u64>,
         calls: Mutex<CallCounters>,
     }
 
     impl FakeAgendaItemRepo {
-        fn new() -> Self {
+        fn new(
+            tasks: Arc<Mutex<Vec<Task>>>,
+            occurrences: Arc<Mutex<Vec<RoutineOccurrence>>>,
+            routines: Arc<Mutex<Vec<Routine>>>,
+        ) -> Self {
             Self {
                 stored: Mutex::new(Vec::new()),
+                tasks,
+                occurrences,
+                routines,
                 next_id: Mutex::new(1),
                 calls: Mutex::new(CallCounters::default()),
             }
@@ -2613,6 +2884,97 @@ mod tests {
                 .collect();
             rows.sort_by(|a, b| (a.sort_order, &a.created_at).cmp(&(b.sort_order, &b.created_at)));
             Ok(rows)
+        }
+
+        async fn list_by_user_and_date_range(
+            &self,
+            user_id: &str,
+            from: &str,
+            to: &str,
+        ) -> Result<Vec<AgendaItem>, RepoError> {
+            self.calls.lock().unwrap().list_by_user_and_date_range += 1;
+            let mut rows: Vec<AgendaItem> = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                // `YYYY-MM-DD` sorts chronologically, so a string window is
+                // the same inclusive range as the SQL comparison.
+                .filter(|row| {
+                    row.user_id == user_id
+                        && row.local_date.as_str() >= from
+                        && row.local_date.as_str() <= to
+                })
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                (&a.local_date, a.sort_order, &a.created_at)
+                    .cmp(&(&b.local_date, b.sort_order, &b.created_at))
+            });
+            Ok(rows)
+        }
+
+        async fn min_local_date(&self, user_id: &str) -> Result<Option<String>, RepoError> {
+            self.calls.lock().unwrap().min_local_date += 1;
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id)
+                .map(|row| row.local_date.as_str())
+                .min()
+                .map(str::to_string))
+        }
+
+        async fn oldest_pending_local_date_before(
+            &self,
+            user_id: &str,
+            before: &str,
+        ) -> Result<Option<String>, RepoError> {
+            self.calls.lock().unwrap().oldest_pending_local_date_before += 1;
+            // The fake mirror of AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL:
+            // a task row must exist, live, and be OPEN|PLANNED|IN_PROGRESS; a
+            // occurrence must be pending|in_progress under a living routine.
+            let tasks = self.tasks.lock().unwrap();
+            let occurrences = self.occurrences.lock().unwrap();
+            let routines = self.routines.lock().unwrap();
+            let pending = |item: &AgendaItem| match item.kind.as_str() {
+                AGENDA_KIND_TASK => tasks.iter().any(|task| {
+                    task.id == item.ref_id
+                        && task.user_id == item.user_id
+                        && task.deleted_at.is_none()
+                        && matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS")
+                }),
+                AGENDA_KIND_OCCURRENCE => occurrences
+                    .iter()
+                    .find(|occ| occ.id == item.ref_id)
+                    .map(|occ| {
+                        occ.user_id == item.user_id
+                            && matches!(
+                                occ.status.as_str(),
+                                OCCURRENCE_STATUS_PENDING | OCCURRENCE_STATUS_IN_PROGRESS
+                            )
+                            && routines
+                                .iter()
+                                .any(|routine| routine.id == occ.routine_id && routine.deleted_at.is_none())
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|item| {
+                    item.user_id == user_id
+                        && item.local_date.as_str() < before
+                        && pending(item)
+                })
+                .map(|item| item.local_date.as_str())
+                .min()
+                .map(str::to_string))
         }
 
         async fn get_by_id(&self, id: &str) -> Result<Option<AgendaItem>, RepoError> {
@@ -2691,6 +3053,18 @@ mod tests {
         async fn insert(&self, item: NewAgendaItem) -> Result<AgendaItem, RepoError> {
             self.calls.lock().unwrap().insert += 1;
             let mut stored = self.stored.lock().unwrap();
+            // idx_agenda_items_one_per_task is `(user_id, ref_id) WHERE kind =
+            // 'task'`: a task holds ONE row on ANY date, so a second insert for
+            // the same task is ignored too — the stored date and rank win.
+            if item.kind == AGENDA_KIND_TASK {
+                if let Some(existing) = stored.iter().find(|row| {
+                    row.user_id == item.user_id
+                        && row.kind == item.kind
+                        && row.ref_id == item.ref_id
+                }) {
+                    return Ok(existing.clone());
+                }
+            }
             // INSERT OR IGNORE semantics: the UNIQUE key already holds a row →
             // return it unchanged (an add never reshuffles an existing item).
             if let Some(existing) = stored.iter().find(|row| {
@@ -2727,6 +3101,40 @@ mod tests {
 
         async fn hard_delete(&self, id: &str) -> Result<(), RepoError> {
             self.stored.lock().unwrap().retain(|row| row.id != id);
+            Ok(())
+        }
+
+        async fn delete_by_ref(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_id: &str,
+        ) -> Result<(), RepoError> {
+            // Mirrors AGENDA_ITEM_DELETE_BY_REF_SQL: EVERY matching row (never
+            // `LIMIT 1`); no error when nothing matches.
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id && row.kind == kind && row.ref_id == ref_id)
+            });
+            Ok(())
+        }
+
+        async fn delete_by_refs(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_ids: &[String],
+        ) -> Result<(), RepoError> {
+            // Mirrors build_agenda_item_delete_by_refs_sql: every matching row
+            // of the user's `kind`; empty input touches nothing.
+            if ref_ids.is_empty() {
+                return Ok(());
+            }
+            let ref_set: HashSet<&str> = ref_ids.iter().map(|id| id.as_str()).collect();
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id
+                    && row.kind == kind
+                    && ref_set.contains(row.ref_id.as_str()))
+            });
             Ok(())
         }
 
@@ -2781,16 +3189,17 @@ mod tests {
     }
 
     /// In-memory `TaskRepo`: living filter on reads; soft delete stamps
-    /// `deleted_at`.
+    /// `deleted_at`. `stored` is an `Arc` because `FakeAgendaItemRepo` joins
+    /// it for the anchor predicate.
     struct FakeTaskRepo {
-        stored: Mutex<Vec<Task>>,
+        stored: Arc<Mutex<Vec<Task>>>,
         next_id: Mutex<u64>,
     }
 
     impl FakeTaskRepo {
         fn new() -> Self {
             Self {
-                stored: Mutex::new(Vec::new()),
+                stored: Arc::new(Mutex::new(Vec::new())),
                 next_id: Mutex::new(1),
             }
         }
@@ -2826,6 +3235,23 @@ mod tests {
                 .filter(|row| row.status == "IN_PROGRESS" && row.deleted_at.is_none())
                 .cloned()
                 .collect())
+        }
+
+        async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError> {
+            // Mirrors TASK_LIST_USER_IDS_WITH_OPEN_SQL: distinct living owners
+            // of a still-actionable task.
+            let rows = self.stored.lock().unwrap();
+            let mut ids: Vec<String> = rows
+                .iter()
+                .filter(|row| {
+                    row.deleted_at.is_none()
+                        && matches!(row.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS")
+                })
+                .map(|row| row.user_id.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
         }
 
         async fn get_by_id(&self, id: &str) -> Result<Option<Task>, RepoError> {
@@ -3029,22 +3455,35 @@ mod tests {
         }
     }
 
-    /// In-memory `CalendarRepo`: a fixed set of stored calendars.
+    /// In-memory `CalendarRepo`: a fixed set of stored calendars, plus a set
+    /// of user ids whose `list_by_user_id` fails (the agenda fill cron's
+    /// per-user failure path — one broken user must not stop the rest).
     struct FakeCalendarRepo {
         stored: Mutex<Vec<GoogleCalendar>>,
+        failing: Mutex<HashSet<String>>,
     }
 
     impl FakeCalendarRepo {
         fn with(calendars: Vec<GoogleCalendar>) -> Self {
             Self {
                 stored: Mutex::new(calendars),
+                failing: Mutex::new(HashSet::new()),
             }
+        }
+
+        /// Makes `list_by_user_id` fail for `user_id` — off by default, so it
+        /// never disturbs the other tests.
+        fn fail_for(&self, user_id: &str) {
+            self.failing.lock().unwrap().insert(user_id.to_string());
         }
     }
 
     #[async_trait::async_trait(?Send)]
     impl CalendarRepo for FakeCalendarRepo {
         async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<GoogleCalendar>, RepoError> {
+            if self.failing.lock().unwrap().contains(user_id) {
+                return Err(RepoError::Backend("calendar lookup failed".to_string()));
+            }
             Ok(self
                 .stored
                 .lock()
@@ -3551,13 +3990,23 @@ mod tests {
     }
 
     fn repos() -> Repos {
+        // The agenda fake joins the other three stores (the anchor predicate),
+        // so they must share the SAME `Arc`s, not copies.
+        let routines = FakeRoutineRepo::new();
+        let occurrences = FakeOccurrenceRepo::new();
+        let tasks = FakeTaskRepo::new();
+        let agenda = FakeAgendaItemRepo::new(
+            tasks.stored.clone(),
+            occurrences.stored.clone(),
+            routines.stored.clone(),
+        );
         Repos {
             lists: FakeTaskListRepo::new(),
             categories: FakeTaskCategoryRepo::new(),
-            routines: FakeRoutineRepo::new(),
-            occurrences: FakeOccurrenceRepo::new(),
-            agenda: FakeAgendaItemRepo::new(),
-            tasks: FakeTaskRepo::new(),
+            routines,
+            occurrences,
+            agenda,
+            tasks,
             // The fake primary calendar is UTC (ADR 0004 amendment: the
             // primary calendar's time_zone decides today) — tests that need
             // another zone swap `repos.calendars` for their own fixture.
@@ -3582,64 +4031,125 @@ mod tests {
         }
     }
 
-    fn agenda_input(kind: &str, ref_id: &str, date: &str) -> NewAgendaItemInput {
-        NewAgendaItemInput {
+    /// Pushes a membership row straight into the fake store — the tests that
+    /// place a slot without going through a service call use this.
+    fn agenda_row(
+        repos: &Repos,
+        id: &str,
+        user_id: &str,
+        date: &str,
+        kind: &str,
+        ref_id: &str,
+        sort_order: i64,
+    ) {
+        repos.agenda.stored.lock().unwrap().push(AgendaItem {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            local_date: date.to_string(),
             kind: kind.to_string(),
             ref_id: ref_id.to_string(),
-            sort_order: None,
-            date: date.to_string(),
-        }
+            sort_order,
+            created_at: "2026-08-23T00:00:00Z".to_string(),
+            updated_at: "2026-08-23T00:00:00Z".to_string(),
+        });
     }
 
-    fn get(repos: &Repos, user_id: &str, date: &str) -> Result<AgendaResponse, AgendaError> {
-        pollster::block_on(get_agenda(
-            &repos.calendars,
-            &repos.lists,
-            &repos.categories,
-            &repos.routines,
-            &repos.occurrences,
-            &repos.agenda,
-            &repos.tasks,
-            user_id,
-            Some(date),
-            NOW_UNIX,
-            None,
-        ))
-    }
-
-    /// `GET /api/agenda` with the `date` query **omitted** — the server reads
-    /// civil today (the fake primary calendar is UTC, so `NOW_UNIX` is
-    /// `2026-08-23`).
-    fn get_default(repos: &Repos, user_id: &str) -> Result<AgendaResponse, AgendaError> {
-        pollster::block_on(get_agenda(
-            &repos.calendars,
-            &repos.lists,
-            &repos.categories,
-            &repos.routines,
-            &repos.occurrences,
-            &repos.agenda,
-            &repos.tasks,
-            user_id,
-            None,
-            NOW_UNIX,
-            None,
-        ))
-    }
-
-    fn add(
+    /// `GET /api/agenda` with an explicit inclusive window.
+    fn get_range(
         repos: &Repos,
         user_id: &str,
-        input: &NewAgendaItemInput,
-    ) -> Result<AgendaItemResponse, AgendaError> {
-        pollster::block_on(add_agenda_item(
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<AgendaResponse, AgendaError> {
+        pollster::block_on(get_agenda(
+            &repos.calendars,
             &repos.lists,
             &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
             &repos.agenda,
             &repos.tasks,
             user_id,
-            input,
+            from,
+            to,
+            NOW_UNIX,
             None,
         ))
+    }
+
+    /// A single-day read: the same date on both ends of the window.
+    fn get(repos: &Repos, user_id: &str, date: &str) -> Result<AgendaResponse, AgendaError> {
+        get_range(repos, user_id, Some(date), Some(date))
+    }
+
+    /// `GET /api/agenda` with both bounds **omitted** — the server resolves
+    /// the anchor week (the fake primary calendar is UTC, so `NOW_UNIX` is
+    /// `2026-08-23`).
+    fn get_default(repos: &Repos, user_id: &str) -> Result<AgendaResponse, AgendaError> {
+        get_range(repos, user_id, None, None)
+    }
+
+    /// Test-only stand-in for the retired GET seed: ensures this date's
+    /// occurrences for every living routine the rule covers and appends the
+    /// missing membership rows. Tests for the move/reschedule/delete verbs use
+    /// it to set up rows — a GET never writes any more.
+    fn materialize_date(repos: &Repos, date: &str) {
+        let user_id = "u-1";
+        let routines = pollster::block_on(repos.routines.list_by_user_id(user_id)).unwrap();
+        let covering: Vec<Routine> = routines
+            .into_iter()
+            .filter(|routine| {
+                occurrence_dates(&routine.rrule, date, date)
+                    .map(|dates| dates.contains(&date.to_string()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if covering.is_empty() {
+            return;
+        }
+
+        let existing = pollster::block_on(repos.occurrences.list_by_user_and_date(user_id, date))
+            .unwrap();
+        let mut occurrence_ids = Vec::with_capacity(covering.len());
+        for routine in &covering {
+            let occurrence = match existing.iter().find(|occ| occ.routine_id == routine.id) {
+                Some(occurrence) => occurrence.clone(),
+                None => pollster::block_on(repos.occurrences.insert(NewRoutineOccurrence {
+                    routine_id: routine.id.clone(),
+                    user_id: user_id.to_string(),
+                    local_date: date.to_string(),
+                }))
+                .unwrap(),
+            };
+            occurrence_ids.push(occurrence.id);
+        }
+
+        let memberships = pollster::block_on(repos.agenda.list_by_refs(
+            user_id,
+            AGENDA_KIND_OCCURRENCE,
+            &occurrence_ids,
+        ))
+        .unwrap();
+        let membership_refs: HashSet<&str> =
+            memberships.iter().map(|item| item.ref_id.as_str()).collect();
+        let mut rank = pollster::block_on(repos.agenda.max_sort_order(user_id, date))
+            .unwrap()
+            .map(|max| max + 1)
+            .unwrap_or(0);
+        for ref_id in occurrence_ids {
+            if membership_refs.contains(ref_id.as_str()) {
+                continue;
+            }
+            pollster::block_on(repos.agenda.insert(NewAgendaItem {
+                user_id: user_id.to_string(),
+                local_date: date.to_string(),
+                kind: AGENDA_KIND_OCCURRENCE.to_string(),
+                ref_id,
+                sort_order: rank,
+            }))
+            .unwrap();
+            rank += 1;
+        }
     }
 
     fn move_item(
@@ -3668,6 +4178,17 @@ mod tests {
         id: &str,
         date: &str,
     ) -> Result<AgendaItemResponse, AgendaError> {
+        reschedule_at(repos, user_id, id, date, None)
+    }
+
+    /// The same reschedule with a named landing rank.
+    fn reschedule_at(
+        repos: &Repos,
+        user_id: &str,
+        id: &str,
+        date: &str,
+        sort_order: Option<i64>,
+    ) -> Result<AgendaItemResponse, AgendaError> {
         pollster::block_on(reschedule_agenda_item(
             &repos.lists,
             &repos.categories,
@@ -3675,9 +4196,33 @@ mod tests {
             &repos.tasks,
             &repos.occurrences,
             &repos.routines,
+            &repos.calendars,
+            NOW_UNIX,
             user_id,
             id,
             date,
+            sort_order,
+            None,
+        ))
+    }
+
+    /// `POST /api/agenda/days/:date/move-to-today`.
+    fn move_day(
+        repos: &Repos,
+        user_id: &str,
+        date: &str,
+    ) -> Result<MoveDayToTodayResponse, AgendaError> {
+        pollster::block_on(move_day_to_today(
+            &repos.calendars,
+            &repos.lists,
+            &repos.categories,
+            &repos.agenda,
+            &repos.tasks,
+            &repos.occurrences,
+            &repos.routines,
+            user_id,
+            date,
+            NOW_UNIX,
             None,
         ))
     }
@@ -3977,6 +4522,11 @@ mod tests {
             "23-08-2026",
             "2026-08-23T00:00:00",
             "not a date",
+            // chrono parses these, but they are not canonical: storing the raw
+            // string would sort them wrongly against `YYYY-MM-DD` today.
+            "2026-9-30",
+            "2026-10-1",
+            "+2026-10-01",
         ] {
             let err = get(&repos, "u-1", bad).unwrap_err();
             assert!(
@@ -3984,22 +4534,37 @@ mod tests {
                 "{err:?} for {bad:?}"
             );
         }
+        // The canonical spelling still resolves — a padded date is valid.
+        assert!(get(&repos, "u-1", "2026-10-17").is_ok());
     }
 
     #[test]
-    fn get_agenda_without_date_reads_today_and_returns_today_and_time_zone() {
+    fn get_agenda_without_bounds_reads_the_anchor_week() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
-        // Omitted date → today's pile (2026-08-23 in the UTC primary calendar
-        // at NOW_UNIX), and the response carries today + time_zone for Home.
+        // Both bounds omitted → the anchor week (2026-08-23 in the UTC
+        // primary calendar at NOW_UNIX). Nothing was materialized: a GET is a
+        // pure read, so the window is empty and the anchor falls back to today.
         let response = get_default(&repos, "u-1").unwrap();
-        assert_eq!(response.items.len(), 1, "today's routine seeded");
+        assert!(
+            response.items.is_empty(),
+            "a read never materializes occurrences"
+        );
         assert_eq!(response.today, "2026-08-23");
         assert_eq!(response.time_zone, "UTC");
-        // Blank date means today too (ADR 0004 amendment: missing/blank = today).
-        assert_eq!(get(&repos, "u-1", "").unwrap().today, "2026-08-23");
-        assert_eq!(get(&repos, "u-1", "   ").unwrap().today, "2026-08-23");
+        assert_eq!(response.anchor_date, "2026-08-23");
+        assert_eq!(response.from, "2026-08-23");
+        assert_eq!(response.to, "2026-08-29", "7 inclusive days");
+        assert_eq!(response.earliest_date, "2026-08-23", "no rows → today");
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 0);
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 0);
+
+        // Blank/whitespace bounds count as omitted.
+        let blank_with_from = get_range(&repos, "u-1", Some("   "), Some("")).unwrap();
+        assert_eq!(blank_with_from.from, "2026-08-23");
+        let blank_with_to = get_range(&repos, "u-1", Some(""), Some("  ")).unwrap();
+        assert_eq!(blank_with_to.to, "2026-08-29");
     }
 
     #[test]
@@ -4032,6 +4597,7 @@ mod tests {
             &repos.tasks,
             "u-1",
             None,
+            None,
             evening,
             None,
         ))
@@ -4051,6 +4617,7 @@ mod tests {
             &repos.tasks,
             "u-1",
             None,
+            None,
             evening,
             None,
         ))
@@ -4060,116 +4627,365 @@ mod tests {
     }
 
     #[test]
-    fn get_agenda_seeds_daily_routine_occurrence_and_item() {
+    fn get_agenda_range_read_is_write_free_even_when_a_daily_routine_covers_it() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
-        let response = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(response.items.len(), 1);
-        let item = &response.items[0];
-        assert_eq!(item.kind, AGENDA_KIND_OCCURRENCE);
-        assert_eq!(item.local_date, "2026-08-23");
-        assert_eq!(item.sort_order, 0);
-        assert!(item.task.is_none(), "occurrence items embed no task");
-        let occurrence = item.occurrence.as_ref().expect("occurrence embedded");
-        assert_eq!(occurrence.status, OCCURRENCE_STATUS_PENDING);
-        assert_eq!(occurrence.local_date, "2026-08-23");
-        assert_eq!(occurrence.title, None, "seeding copies no title — inheritance stays live");
-        assert_eq!(occurrence.resolved_title, "Fajr", "resolved = override ?? routine.title");
-        assert_eq!(occurrence.estimated_minutes, 15, "estimate comes from the routine");
+        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-29")).unwrap();
+        assert!(response.items.is_empty(), "no rows were ever written");
+        assert_eq!(response.from, "2026-08-23");
+        assert_eq!(response.to, "2026-08-29");
         assert_eq!(
-            occurrence.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
-            "the recurrence blob is exposed for display"
+            repos.occurrences.stored.lock().unwrap().len(),
+            0,
+            "a GET never ensures occurrences, even for a covering daily rule"
         );
-        assert_eq!(occurrence.calendar_id, None);
-        assert_eq!(occurrence.google_event_id, None);
+        assert_eq!(
+            repos.agenda.stored.lock().unwrap().len(),
+            0,
+            "a GET never appends membership rows"
+        );
+        assert_eq!(response.earliest_date, "2026-08-23", "no rows → today");
+    }
+
+    #[test]
+    fn get_agenda_range_returns_items_ordered_by_date_then_rank() {
+        let repos = repos();
+        repos.tasks.push(task_row("t-1", "u-1", "One", "OPEN"));
+        repos.tasks.push(task_row("t-2", "u-1", "Two", "OPEN"));
+        repos.tasks.push(task_row("t-3", "u-1", "Three", "OPEN"));
+        let push_item = |id: &str, date: &str, ref_id: &str, sort_order: i64| {
+            repos.agenda.stored.lock().unwrap().push(AgendaItem {
+                id: id.to_string(),
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: AGENDA_KIND_TASK.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order,
+                created_at: "2026-08-23T00:00:00Z".to_string(),
+                updated_at: "2026-08-23T00:00:00Z".to_string(),
+            });
+        };
+        // Inserted out of order on purpose.
+        push_item("ai-1", "2026-08-24", "t-2", 0);
+        push_item("ai-2", "2026-08-23", "t-1", 1);
+        push_item("ai-3", "2026-08-23", "t-3", 0);
+
+        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-24")).unwrap();
+        let order: Vec<(&str, i64)> = response
+            .items
+            .iter()
+            .map(|item| (item.ref_id.as_str(), item.sort_order))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("t-3", 0), ("t-1", 1), ("t-2", 0)],
+            "(local_date, sort_order) order across the window"
+        );
+        assert_eq!(response.from, "2026-08-23");
+        assert_eq!(response.to, "2026-08-24");
+        assert_eq!(
+            response.earliest_date, "2026-08-23",
+            "the min row date, not the window start"
+        );
+    }
+
+    #[test]
+    fn get_agenda_anchor_is_the_oldest_past_pending_date() {
+        let repos = repos();
+        // A living routine and a deleted one — the anchor must only count
+        // pending work under a living routine.
+        repos.routines.stored.lock().unwrap().extend([
+            FakeRoutineRepo::row("rt-live", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-gone", "u-1", "Salat", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+        ]);
+        repos.routines.stored.lock().unwrap()[1].deleted_at =
+            Some("2026-08-20T00:00:00Z".to_string());
+        repos.tasks.push(task_row("t-pending", "u-1", "Pending | Work", "OPEN"));
+        repos.tasks.push(task_row("t-done", "u-1", "Done | Work", "COMPLETED"));
+        repos.tasks.push(task_row("t-disc", "u-1", "Disc | Work", "DISCARDED"));
+        repos.tasks.push(task_row("t-today", "u-1", "Today | Work", "PLANNED"));
+        for (id, routine_id, date, status) in [
+            ("occ-done", "rt-live", "2026-08-19", OCCURRENCE_STATUS_DONE),
+            ("occ-skipped", "rt-live", "2026-08-21", OCCURRENCE_STATUS_SKIPPED),
+            ("occ-today", "rt-live", "2026-08-23", OCCURRENCE_STATUS_PENDING),
+            ("occ-gone", "rt-gone", "2026-08-18", OCCURRENCE_STATUS_PENDING),
+            ("occ-gone-running", "rt-gone", "2026-08-22", OCCURRENCE_STATUS_IN_PROGRESS),
+        ] {
+            repos
+                .occurrences
+                .stored
+                .lock()
+                .unwrap()
+                .push(FakeOccurrenceRepo::row(id, routine_id, "u-1", date, status));
+        }
+        let push_item = |id: &str, date: &str, kind: &str, ref_id: &str| {
+            repos.agenda.stored.lock().unwrap().push(AgendaItem {
+                id: id.to_string(),
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: kind.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order: 0,
+                created_at: "2026-08-23T00:00:00Z".to_string(),
+                updated_at: "2026-08-23T00:00:00Z".to_string(),
+            });
+        };
+        // Never pending: an orphan task-kind row.
+        push_item("ai-orphan", "2026-08-18", AGENDA_KIND_TASK, "t-missing");
+        push_item("ai-done", "2026-08-19", AGENDA_KIND_OCCURRENCE, "occ-done");
+        // The oldest past pending row.
+        push_item("ai-pending", "2026-08-20", AGENDA_KIND_TASK, "t-pending");
+        push_item("ai-skipped", "2026-08-21", AGENDA_KIND_OCCURRENCE, "occ-skipped");
+        push_item("ai-completed", "2026-08-22", AGENDA_KIND_TASK, "t-done");
+        push_item("ai-discarded", "2026-08-22", AGENDA_KIND_TASK, "t-disc");
+        // A deleted routine's pending/in_progress leftovers never count.
+        push_item("ai-gone", "2026-08-18", AGENDA_KIND_OCCURRENCE, "occ-gone");
+        push_item("ai-gone-running", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-gone-running");
+        // Today never pulls the anchor into the past.
+        push_item("ai-today", "2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-today");
+        push_item("ai-today-task", "2026-08-23", AGENDA_KIND_TASK, "t-today");
+
+        // Both bounds omitted → the window starts at the anchor.
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.anchor_date, "2026-08-20");
+        assert_eq!(response.from, "2026-08-20");
+        assert_eq!(response.to, "2026-08-26", "anchor + 6 civil days");
+        assert_eq!(response.earliest_date, "2026-08-18");
+    }
+
+    #[test]
+    fn get_agenda_anchor_falls_back_to_today_without_past_pending() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeOccurrenceRepo::row("occ-today", "rt-1", "u-1", "2026-08-23", OCCURRENCE_STATUS_PENDING));
+        repos.agenda.stored.lock().unwrap().push(AgendaItem {
+            id: "ai-today".to_string(),
+            user_id: "u-1".to_string(),
+            local_date: "2026-08-23".to_string(),
+            kind: AGENDA_KIND_OCCURRENCE.to_string(),
+            ref_id: "occ-today".to_string(),
+            sort_order: 0,
+            created_at: "2026-08-23T00:00:00Z".to_string(),
+            updated_at: "2026-08-23T00:00:00Z".to_string(),
+        });
+
+        // A pending item ON today is not "past" — the anchor stays today.
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.anchor_date, "2026-08-23");
+        assert_eq!(response.from, "2026-08-23");
+        assert_eq!(response.items.len(), 1, "today's pending item is in the window");
+    }
+
+    #[test]
+    fn get_agenda_earliest_date_is_the_min_row_date_even_outside_the_window() {
+        // No rows at all → today.
+        let empty = get_default(&repos(), "u-1").unwrap();
+        assert_eq!(empty.earliest_date, "2026-08-23");
+
+        let repos = repos();
+        // An orphan row (no living task) on an old date and a future row: the
+        // floor binds to MIN(local_date) over every row, not to the page.
+        repos.agenda.stored.lock().unwrap().extend([
+            AgendaItem {
+                id: "ai-old".to_string(),
+                user_id: "u-1".to_string(),
+                local_date: "2026-07-01".to_string(),
+                kind: AGENDA_KIND_TASK.to_string(),
+                ref_id: "t-missing".to_string(),
+                sort_order: 0,
+                created_at: "2026-07-01T00:00:00Z".to_string(),
+                updated_at: "2026-07-01T00:00:00Z".to_string(),
+            },
+            AgendaItem {
+                id: "ai-future".to_string(),
+                user_id: "u-1".to_string(),
+                local_date: "2026-09-30".to_string(),
+                kind: AGENDA_KIND_TASK.to_string(),
+                ref_id: "t-missing-too".to_string(),
+                sort_order: 0,
+                created_at: "2026-09-30T00:00:00Z".to_string(),
+                updated_at: "2026-09-30T00:00:00Z".to_string(),
+            },
+        ]);
+
+        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-24")).unwrap();
+        assert!(response.items.is_empty(), "both rows are outside the window");
+        assert_eq!(
+            response.earliest_date, "2026-07-01",
+            "the floor ignores the requested window"
+        );
+    }
+
+    #[test]
+    fn get_agenda_bounds_reject_overlong_reversed_single_sided_and_garbage() {
+        let repos = repos();
+
+        // 32 inclusive days (2026-08-01 … 2026-09-01) is one over the cap.
+        let err = get_range(&repos, "u-1", Some("2026-08-01"), Some("2026-09-01")).unwrap_err();
         assert!(
-            occurrence.category.is_untracked,
-            "no pattern matches Fajr → untracked summary, never a 400"
+            matches!(err, AgendaError::Invalid(ref m) if m == "date range must not exceed 31 days"),
+            "{err:?}"
         );
-        // Both rows exist in the fakes.
-        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 1);
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1);
+        // 31 inclusive days is valid.
+        let ok = get_range(&repos, "u-1", Some("2026-08-01"), Some("2026-08-31")).unwrap();
+        assert_eq!(ok.from, "2026-08-01");
+        assert_eq!(ok.to, "2026-08-31");
+
+        let err = get_range(&repos, "u-1", Some("2026-08-24"), Some("2026-08-23")).unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "to must not be before from"),
+            "{err:?}"
+        );
+
+        for (from, to) in [
+            (Some("2026-08-23"), None),
+            (None, Some("2026-08-23")),
+        ] {
+            let err = get_range(&repos, "u-1", from, to).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "from and to must both be set or both be omitted"),
+                "{err:?} for {from:?}/{to:?}"
+            );
+        }
+
+        for (from, to) in [
+            (Some("not a date"), Some("2026-08-23")),
+            (Some("2026-08-23"), Some("2026-13-01")),
+        ] {
+            let err = get_range(&repos, "u-1", from, to).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
+                "{err:?} for {from:?}/{to:?}"
+            );
+        }
     }
 
     #[test]
-    fn get_agenda_twice_is_idempotent() {
+    fn deleted_routine_history_renders_done_and_skipped_only() {
         let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        // A living routine with a pending occurrence today …
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-live", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        // … and a soft-deleted one whose record must still lend its display
+        // fields to its done/skipped past.
+        let mut gone = FakeRoutineRepo::row("rt-gone", "u-1", "Fajr Qadha", 1, "DTSTART:20260101T054500\nRRULE:FREQ=DAILY");
+        gone.estimated_minutes = 30;
+        gone.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
+        repos.routines.stored.lock().unwrap().push(gone);
+        for (id, routine_id, date, status) in [
+            ("occ-live", "rt-live", "2026-08-23", OCCURRENCE_STATUS_PENDING),
+            ("occ-done", "rt-gone", "2026-08-23", OCCURRENCE_STATUS_DONE),
+            ("occ-skipped", "rt-gone", "2026-08-24", OCCURRENCE_STATUS_SKIPPED),
+            ("occ-pending", "rt-gone", "2026-08-25", OCCURRENCE_STATUS_PENDING),
+            ("occ-running", "rt-gone", "2026-08-26", OCCURRENCE_STATUS_IN_PROGRESS),
+        ] {
+            repos
+                .occurrences
+                .stored
+                .lock()
+                .unwrap()
+                .push(FakeOccurrenceRepo::row(id, routine_id, "u-1", date, status));
+        }
+        let mut deleted_task = task_row("t-gone", "u-1", "Gone | Work", "OPEN");
+        deleted_task.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
+        repos.tasks.push(deleted_task);
+        let push_item = |id: &str, date: &str, kind: &str, ref_id: &str| {
+            repos.agenda.stored.lock().unwrap().push(AgendaItem {
+                id: id.to_string(),
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: kind.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order: 0,
+                created_at: "2026-08-23T00:00:00Z".to_string(),
+                updated_at: "2026-08-23T00:00:00Z".to_string(),
+            });
+        };
+        push_item("ai-live", "2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-live");
+        push_item("ai-done", "2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-done");
+        push_item("ai-skipped", "2026-08-24", AGENDA_KIND_OCCURRENCE, "occ-skipped");
+        push_item("ai-pending", "2026-08-25", AGENDA_KIND_OCCURRENCE, "occ-pending");
+        push_item("ai-running", "2026-08-26", AGENDA_KIND_OCCURRENCE, "occ-running");
+        push_item("ai-task", "2026-08-27", AGENDA_KIND_TASK, "t-gone");
 
-        let first = get(&repos, "u-1", "2026-08-23").unwrap();
-        let second = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(first.items.len(), 1);
-        assert_eq!(second.items.len(), 1);
+        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-29")).unwrap();
+        let ids: Vec<&str> = response.items.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(
-            first.items[0].id, second.items[0].id,
-            "same agenda item id on the second GET"
+            ids,
+            vec!["ai-live", "ai-done", "ai-skipped"],
+            "pending/in_progress leftovers of a deleted routine and the soft-deleted task are omitted"
         );
+
+        let live = response.items[0].occurrence.as_ref().unwrap();
+        assert!(!live.routine_deleted);
+        assert_eq!(live.resolved_title, "Fajr");
+
+        for item in &response.items[1..] {
+            let occurrence = item.occurrence.as_ref().expect("occurrence embedded");
+            assert!(occurrence.routine_deleted, "the routine is soft-deleted");
+            assert_eq!(
+                occurrence.resolved_title, "Fajr Qadha",
+                "the deleted routine still provides the title"
+            );
+            assert_eq!(occurrence.estimated_minutes, 30);
+            assert_eq!(occurrence.rrule, "DTSTART:20260101T054500\nRRULE:FREQ=DAILY");
+        }
         assert_eq!(
-            first.items[0].occurrence.as_ref().unwrap().id,
-            second.items[0].occurrence.as_ref().unwrap().id,
-            "same occurrence id on the second GET"
+            repos.agenda.stored.lock().unwrap().len(),
+            6,
+            "every membership row stays in the store; a read deletes nothing"
         );
-        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 1, "no dupes");
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "no dupes");
     }
 
     #[test]
-    fn second_get_of_seeded_date_is_write_free_and_uses_only_set_reads() {
+    fn range_read_is_write_free_and_uses_batched_reads() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().extend([
             FakeRoutineRepo::row("rt-a", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
             FakeRoutineRepo::row("rt-b", "u-1", "Salat", 1, "DTSTART:20260101T120000\nRRULE:FREQ=DAILY"),
         ]);
+        // The retired GET seed, now done up front by the test.
+        materialize_date(&repos, "2026-08-23");
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 2);
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 2);
 
-        // Cold GET seeds both routines (occurrence + agenda rows).
-        let first = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(first.items.len(), 2);
-
-        // Reset the counters; the warm GET must not write or re-read per row.
+        // Reset the counters; the read must not write or re-read per row.
         repos.occurrences.reset_calls();
         repos.agenda.reset_calls();
-        let second = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(second.items.len(), 2);
+        let response = get(&repos, "u-1", "2026-08-23").unwrap();
+        assert_eq!(response.items.len(), 2);
 
         let occurrences = repos.occurrences.call_counts();
-        assert_eq!(occurrences.insert, 0, "no per-row occurrence insert on a warm GET");
-        assert_eq!(occurrences.insert_many, 0, "no occurrence insert_many on a warm GET");
-        assert_eq!(occurrences.get_by_id, 0, "no per-row occurrence get_by_id on a warm GET");
+        assert_eq!(occurrences.insert, 0, "no per-row occurrence insert on a read");
+        assert_eq!(occurrences.insert_many, 0, "no occurrence insert_many on a read");
+        assert_eq!(occurrences.get_by_id, 0, "no per-row occurrence get_by_id on a read");
         assert_eq!(
-            occurrences.list_by_user_and_date, 1,
-            "one occurrence set read finds nothing missing"
+            occurrences.list_by_user_and_date, 0,
+            "the read never re-lists a single date"
         );
         assert_eq!(occurrences.list_by_ids, 1, "hydrate resolves all refs in one batch");
 
         let agenda = repos.agenda.call_counts();
-        assert_eq!(agenda.insert, 0, "no per-row agenda insert on a warm GET");
-        assert_eq!(agenda.insert_many, 0, "no agenda insert_many on a warm GET");
-        assert_eq!(agenda.get_by_ref, 0, "no per-row get_by_ref on a warm GET");
-        assert_eq!(agenda.list_by_user_and_date, 1, "one pile read");
-        assert_eq!(agenda.list_by_refs, 1, "no-membership check is one set read");
-    }
-
-    #[test]
-    fn weekly_routine_seeds_matching_dates_only() {
-        let repos = repos();
-        // 2026-08-17 is a Monday: BYDAY=MO,WE covers the 17th and the 19th.
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Standup", 0, "DTSTART:20260817T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE"));
-
-        let matching = get(&repos, "u-1", "2026-08-19").unwrap();
-        assert_eq!(matching.items.len(), 1, "Wednesday matches");
-        let non_matching = get(&repos, "u-1", "2026-08-20").unwrap();
-        assert_eq!(non_matching.items.len(), 0, "Thursday does not match");
+        assert_eq!(agenda.insert, 0, "no per-row agenda insert on a read");
+        assert_eq!(agenda.insert_many, 0, "no agenda insert_many on a read");
+        assert_eq!(agenda.get_by_ref, 0, "no per-row get_by_ref on a read");
+        assert_eq!(agenda.list_by_refs, 0, "no membership check on a read");
+        assert_eq!(agenda.list_by_user_and_date, 0, "no single-date pile read");
+        assert_eq!(agenda.list_by_user_and_date_range, 1, "one window read");
+        assert_eq!(agenda.min_local_date, 1, "one earliest-date read");
         assert_eq!(
-            repos.occurrences.stored.lock().unwrap().len(),
-            1,
-            "no occurrence was seeded for the non-matching date"
+            agenda.oldest_pending_local_date_before, 1,
+            "the anchor is one query"
         );
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn soft_deleted_routine_never_seeds_and_leftover_item_is_omitted() {
+    fn soft_deleted_routine_pending_leftover_is_omitted_and_the_read_does_not_write() {
         let repos = repos();
         let mut routine = FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
         routine.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
@@ -4198,7 +5014,7 @@ mod tests {
         assert_eq!(
             repos.occurrences.stored.lock().unwrap().len(),
             1,
-            "no new occurrence seeded for a soft-deleted routine"
+            "the read writes no new occurrence"
         );
         assert_eq!(
             repos.agenda.stored.lock().unwrap().len(),
@@ -4233,215 +5049,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn seeding_after_user_reorder_appends_without_reshuffling() {
-        let repos = repos();
-        repos.routines.stored.lock().unwrap().extend([
-            FakeRoutineRepo::row("rt-a", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
-            FakeRoutineRepo::row("rt-b", "u-1", "Salat", 1, "DTSTART:20260101T120000\nRRULE:FREQ=DAILY"),
-        ]);
-
-        let first = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(first.items.len(), 2);
-        let fajr_occ = first.items[0].occurrence.as_ref().unwrap().id.clone();
-        let salat_occ = first.items[1].occurrence.as_ref().unwrap().id.clone();
-        let salat_item_id = first.items[1].id.clone();
-
-        // The user reorders: Salat to the top of the pile.
-        let moved = move_item(&repos, "u-1", &salat_item_id, 0).unwrap();
-        assert_eq!(moved.item.sort_order, 0);
-        assert_eq!(moved.item.id, salat_item_id);
-
-        // A third routine appears; the next GET must append it AFTER the
-        // reordered pair, leaving their ranks untouched.
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-c", "u-1", "Work", 2, "DTSTART:20260101T090000\nRRULE:FREQ=DAILY"));
-        let second = get(&repos, "u-1", "2026-08-23").unwrap();
-        let ranks: Vec<(String, i64)> = second
-            .items
-            .iter()
-            .map(|item| (item.occurrence.as_ref().unwrap().id.clone(), item.sort_order))
-            .collect();
-        assert_eq!(
-            ranks,
-            vec![
-                (salat_occ.clone(), 0),
-                (fajr_occ.clone(), 1),
-                // New seed appends at max+1.
-                (second.items[2].occurrence.as_ref().unwrap().id.clone(), 2),
-            ],
-            "existing ranks untouched, new occurrence appended"
-        );
-        assert_eq!(ranks[2].0, "occ-3", "third seeded occurrence in standing order");
-    }
-
-    #[test]
-    fn multiple_routines_seed_in_standing_sort_order_when_list_is_empty() {
-        let repos = repos();
-        // Standing order is 0,1,2 regardless of insertion order.
-        repos.routines.stored.lock().unwrap().extend([
-            FakeRoutineRepo::row("rt-a", "u-1", "A", 2, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
-            FakeRoutineRepo::row("rt-b", "u-1", "B", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
-            FakeRoutineRepo::row("rt-c", "u-1", "C", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
-        ]);
-
-        let response = get(&repos, "u-1", "2026-08-23").unwrap();
-        let titles: Vec<(&str, i64)> = response
-            .items
-            .iter()
-            .map(|item| {
-                (
-                    item.occurrence.as_ref().unwrap().resolved_title.as_str(),
-                    item.sort_order,
-                )
-            })
-            .collect();
-        assert_eq!(titles, vec![("B", 0), ("C", 1), ("A", 2)]);
-    }
-
-    // ──────────────────────────────────────────
-    // POST /api/agenda/items
-    // ──────────────────────────────────────────
-
-    #[test]
-    fn add_task_happy_path_and_idempotent_duplicate() {
-        let repos = repos();
-        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
-
-        let response = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
-        assert_eq!(response.item.kind, AGENDA_KIND_TASK);
-        assert_eq!(response.item.ref_id, "t-1");
-        assert_eq!(response.item.sort_order, 0, "empty pile appends at 0");
-        let task = response.item.task.as_ref().expect("task embedded");
-        assert_eq!(task.id, "t-1");
-        assert_eq!(task.status, "OPEN");
-        assert!(!task.focused);
-        assert!(response.item.occurrence.is_none());
-
-        // Duplicate → idempotent 200 with the SAME item id, sort_order kept.
-        let again = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
-        assert_eq!(again.item.id, response.item.id, "same membership row");
-        assert_eq!(again.item.sort_order, 0, "duplicate never reshuffles");
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "no duplicate rows");
-
-        // Second task appends at max+1.
-        repos.tasks.push(task_row("t-2", "u-1", "Deep Work | Work", "PLANNED"));
-        let second = add(&repos, "u-1", &agenda_input("task", "t-2", "2026-08-23")).unwrap();
-        assert_eq!(second.item.sort_order, 1);
-        // tasks.status is untouched by membership.
-        let stored = repos.tasks.stored.lock().unwrap();
-        assert_eq!(stored.iter().find(|t| t.id == "t-2").unwrap().status, "PLANNED");
-    }
-
-    #[test]
-    fn add_task_rejects_terminal_foreign_and_missing_tasks() {
-        let repos = repos();
-        repos.tasks.push(task_row("t-done", "u-1", "Done | Work", "COMPLETED"));
-        repos.tasks.push(task_row("t-disc", "u-1", "Disc | Work", "DISCARDED"));
-        repos.tasks.push(task_row("t-other", "u-2", "Other | Work", "OPEN"));
-
-        // COMPLETED / DISCARDED → 400.
-        for id in ["t-done", "t-disc"] {
-            let err = add(&repos, "u-1", &agenda_input("task", id, "2026-08-23")).unwrap_err();
-            assert!(
-                matches!(err, AgendaError::Invalid(ref m) if m == "task cannot be added to the agenda"),
-                "{err:?}"
-            );
-        }
-        // Missing task → 404.
-        let err = add(&repos, "u-1", &agenda_input("task", "nope", "2026-08-23")).unwrap_err();
-        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
-        // Another user's task → 404 (never leak existence).
-        let err = add(&repos, "u-1", &agenda_input("task", "t-other", "2026-08-23")).unwrap_err();
-        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
-        // Soft-deleted task → 404.
-        let mut deleted = task_row("t-gone", "u-1", "Gone | Work", "OPEN");
-        deleted.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
-        repos.tasks.push(deleted);
-        let err = add(&repos, "u-1", &agenda_input("task", "t-gone", "2026-08-23")).unwrap_err();
-        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
-        // Nothing was persisted for any rejection.
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn add_rejects_non_task_kinds_and_bad_dates_and_ranks() {
-        let repos = repos();
-        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
-
-        let err = add(&repos, "u-1", &agenda_input("occurrence", "occ-1", "2026-08-23")).unwrap_err();
-        assert!(matches!(err, AgendaError::Invalid(ref m) if m == "kind must be task"), "{err:?}");
-        let err = add(&repos, "u-1", &agenda_input("task", "t-1", "nope")).unwrap_err();
-        assert!(matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"), "{err:?}");
-        let err = add(
-            &repos,
-            "u-1",
-            &NewAgendaItemInput {
-                kind: "task".to_string(),
-                ref_id: "t-1".to_string(),
-                sort_order: Some(-1),
-                date: "2026-08-23".to_string(),
-            },
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, AgendaError::Invalid(ref m) if m == "sort_order must be a non-negative integer"),
-            "{err:?}"
-        );
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 0);
-    }
-
-    // ──────────────────────────────────────────
-    // DELETE /api/agenda/items/:id
-    // ──────────────────────────────────────────
-
-    #[test]
-    fn delete_task_item_unpins_but_keeps_the_task_living() {
-        let repos = repos();
-        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
-        let added = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
-
-        let deleted = pollster::block_on(delete_agenda_item(&repos.agenda, "u-1", &added.item.id)).unwrap();
-        assert!(deleted.success);
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 0, "membership row hard-deleted");
-        let stored = pollster::block_on(repos.tasks.get_by_id("t-1")).unwrap();
-        assert_eq!(
-            stored.map(|t| t.status),
-            Some("OPEN".to_string()),
-            "the task itself stays living on the Board"
-        );
-    }
-
-    #[test]
-    fn delete_occurrence_item_is_refused_and_missing_item_is_404() {
-        let repos = repos();
-        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
-        let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
-
-        let err = pollster::block_on(delete_agenda_item(&repos.agenda, "u-1", &agenda.items[0].id))
-            .unwrap_err();
-        assert!(
-            matches!(err, AgendaError::Invalid(ref m) if m == "skip is the decline"),
-            "{err:?}"
-        );
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "occurrence item stays");
-
-        let err = pollster::block_on(delete_agenda_item(&repos.agenda, "u-1", "nope")).unwrap_err();
-        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
-        // Another user's item → 404.
-        repos.agenda.stored.lock().unwrap().push(AgendaItem {
-            id: "ai-x".to_string(),
-            user_id: "u-2".to_string(),
-            local_date: "2026-08-23".to_string(),
-            kind: AGENDA_KIND_TASK.to_string(),
-            ref_id: "t-x".to_string(),
-            sort_order: 0,
-            created_at: "2026-08-23T00:00:00Z".to_string(),
-            updated_at: "2026-08-23T00:00:00Z".to_string(),
-        });
-        let err = pollster::block_on(delete_agenda_item(&repos.agenda, "u-1", "ai-x")).unwrap_err();
-        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
-    }
-
     // ──────────────────────────────────────────
     // POST /api/agenda/items/:id/move
     // ──────────────────────────────────────────
@@ -4454,7 +5061,10 @@ mod tests {
             FakeRoutineRepo::row("rt-b", "u-1", "B", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
             FakeRoutineRepo::row("rt-c", "u-1", "C", 2, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
         ]);
-        // Two dates, same routines — a full pile on each.
+        // Two dates, same routines — a full pile on each (materialized by the
+        // test: a GET never seeds any more).
+        materialize_date(&repos, "2026-08-23");
+        materialize_date(&repos, "2026-08-24");
         let day1 = get(&repos, "u-1", "2026-08-23").unwrap();
         let day2 = get(&repos, "u-1", "2026-08-24").unwrap();
         assert_eq!(day2.items.len(), 3, "second date seeded independently");
@@ -4485,6 +5095,7 @@ mod tests {
     fn move_same_rank_is_a_no_op_and_bad_inputs_are_rejected() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-a", "u-1", "A", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        materialize_date(&repos, "2026-08-23");
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let id = agenda.items[0].id.clone();
 
@@ -4520,12 +5131,13 @@ mod tests {
     // POST /api/agenda/items/:id/reschedule
     // ──────────────────────────────────────────
 
-    /// A weekly-Monday routine (dtstart 2026-08-17, a Monday) + its seeded
-    /// occurrence/item on 2026-08-17. Returns the agenda item id.
+    /// A weekly-Monday routine (dtstart 2026-08-17, a Monday) + its
+    /// materialized occurrence/item on 2026-08-17. Returns the agenda item id.
     fn seed_monday_occurrence(repos: &Repos) -> String {
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260817T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO"));
+        materialize_date(repos, "2026-08-17");
         let agenda = get(repos, "u-1", "2026-08-17").unwrap();
-        assert_eq!(agenda.items.len(), 1, "Monday seeded");
+        assert_eq!(agenda.items.len(), 1, "Monday materialized");
         agenda.items[0].id.clone()
     }
 
@@ -4539,10 +5151,10 @@ mod tests {
             .ref_id
             .clone();
 
-        // Monday → Tuesday.
-        let response = reschedule(&repos, "u-1", &item_id, "2026-08-18").unwrap();
+        // Monday → a future Tuesday (today is 2026-08-23; the past is a 400).
+        let response = reschedule(&repos, "u-1", &item_id, "2026-08-25").unwrap();
         assert_eq!(response.item.id, item_id, "same agenda row, relocated");
-        assert_eq!(response.item.local_date, "2026-08-18");
+        assert_eq!(response.item.local_date, "2026-08-25");
         assert_eq!(response.item.sort_order, 0, "empty Tuesday pile appends at 0");
         let occurrence = response.item.occurrence.as_ref().expect("occurrence embedded");
         assert_eq!(occurrence.id, occ_id, "same occurrence id");
@@ -4562,16 +5174,16 @@ mod tests {
         );
 
         // Monday GET does NOT re-attach: the occurrence exists for the rule
-        // date, but its agenda item now sits on Tuesday, and the seed only
-        // appends when the occurrence has NO membership anywhere.
+        // date, but its agenda item now sits on Tuesday, and a read never
+        // appends membership.
         let monday = get(&repos, "u-1", "2026-08-17").unwrap();
         assert_eq!(monday.items.len(), 0, "Monday stays empty");
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 1, "no new occurrence");
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "no re-attached item");
 
         // Tuesday GET shows the SAME occurrence (the rule does not even cover
-        // Tuesday, so the moved row is the only one).
-        let tuesday = get(&repos, "u-1", "2026-08-18").unwrap();
+        // this Tuesday, so the moved row is the only one).
+        let tuesday = get(&repos, "u-1", "2026-08-25").unwrap();
         assert_eq!(tuesday.items.len(), 1);
         assert_eq!(tuesday.items[0].id, item_id, "same agenda row");
         assert_eq!(
@@ -4580,10 +5192,12 @@ mod tests {
             "same occurrence id"
         );
 
-        // NEXT Monday (2026-08-24) seeds fresh: a new occurrence + item of
-        // its own — the moved instance never blocks the series.
+        // NEXT Monday (2026-08-24) gets a fresh instance of its own (the test
+        // materializes it — a GET is a pure read) — the moved instance never
+        // blocks the series.
+        materialize_date(&repos, "2026-08-24");
         let next_monday = get(&repos, "u-1", "2026-08-24").unwrap();
-        assert_eq!(next_monday.items.len(), 1, "next week's Monday seeds");
+        assert_eq!(next_monday.items.len(), 1, "next week's Monday has its own row");
         assert_ne!(
             next_monday.items[0].occurrence.as_ref().unwrap().id,
             occ_id,
@@ -4595,6 +5209,7 @@ mod tests {
     fn reschedule_daily_occurrence_moves_item_only_and_tomorrow_gets_two_rows() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        materialize_date(&repos, "2026-08-23");
         let today = get(&repos, "u-1", "2026-08-23").unwrap();
         assert_eq!(today.items.len(), 1);
         let item_id = today.items[0].id.clone();
@@ -4618,10 +5233,11 @@ mod tests {
             "no exdate is written"
         );
 
-        // Tomorrow's GET seeds tomorrow's OWN instance (the rule covers it
-        // and the UNIQUE key is (routine_id, local_date) — a different day is
-        // a different slot), then appends its item. The moved row stays too:
-        // TWO rows of the same routine on tomorrow is ALLOWED.
+        // Tomorrow's own instance (the rule covers it and the UNIQUE key is
+        // (routine_id, local_date) — a different day is a different slot) is
+        // materialized by the test; the moved row stays too: TWO rows of the
+        // same routine on tomorrow is ALLOWED.
+        materialize_date(&repos, "2026-08-24");
         let tomorrow = get(&repos, "u-1", "2026-08-24").unwrap();
         assert_eq!(tomorrow.items.len(), 2, "moved instance + tomorrow's own");
         let moved = tomorrow
@@ -4634,14 +5250,13 @@ mod tests {
             .items
             .iter()
             .find(|item| item.id != item_id)
-            .expect("a fresh seed for tomorrow");
+            .expect("a fresh instance for tomorrow");
         assert_eq!(fresh.occurrence.as_ref().unwrap().local_date, "2026-08-24");
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 2, "two instances");
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), 2, "two items");
 
         // Today's GET: the occurrence exists (no duplicate seeded), but its
-        // item lives on tomorrow — the no-membership-anywhere rule keeps
-        // today empty.
+        // item lives on tomorrow — today stays empty and a read writes nothing.
         let today_after = get(&repos, "u-1", "2026-08-23").unwrap();
         assert_eq!(today_after.items.len(), 0, "today stays empty");
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 2, "no new occurrence");
@@ -4652,8 +5267,9 @@ mod tests {
     fn reschedule_allows_target_date_already_holding_the_routine() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
-        // Two dates already seeded by plain GETs — each has its own
-        // occurrence of the same routine.
+        // Two dates already holding their own occurrence of the same routine.
+        materialize_date(&repos, "2026-08-23");
+        materialize_date(&repos, "2026-08-24");
         let day1 = get(&repos, "u-1", "2026-08-23").unwrap();
         let day2 = get(&repos, "u-1", "2026-08-24").unwrap();
         assert_eq!(day2.items.len(), 1);
@@ -4690,8 +5306,9 @@ mod tests {
     fn reschedule_statuses_in_progress_done_are_400_skipped_becomes_pending() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
-        // Seed once so the agenda rows exist, then rewrite the occurrences'
-        // statuses to drive the matrix.
+        // Materialize once so the agenda rows exist, then rewrite the
+        // occurrences' statuses to drive the matrix.
+        materialize_date(&repos, "2026-08-23");
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let item_id = agenda.items[0].id.clone();
         let occ_id = agenda.items[0].occurrence.as_ref().unwrap().id.clone();
@@ -4748,6 +5365,7 @@ mod tests {
     fn reschedule_same_date_is_200_noop_unchanged() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        materialize_date(&repos, "2026-08-23");
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let item_id = agenda.items[0].id.clone();
         let occ_id = agenda.items[0].occurrence.as_ref().unwrap().id.clone();
@@ -4774,14 +5392,25 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "item untouched");
+
+        // A named rank on a same-date call is ignored too: same-day placement
+        // is `/move` (it shifts peers); a reschedule no-ops.
+        let ranked = reschedule_at(&repos, "u-1", &item_id, "2026-08-23", Some(5)).unwrap();
+        assert_eq!(ranked.item.id, item_id);
+        assert_eq!(ranked.item.sort_order, 0, "rank untouched");
+        let stored = pollster::block_on(repos.agenda.get_by_id(&item_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.sort_order, 0, "no peer is ever shifted");
+        assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "no-op writes nothing");
     }
 
     #[test]
     fn reschedule_task_moves_the_slot_only() {
         let repos = repos();
         repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
-        let added = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
-        let item_id = added.item.id.clone();
+        agenda_row(&repos, "ai-1", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
+        let item_id = "ai-1".to_string();
 
         let response = reschedule(&repos, "u-1", &item_id, "2026-08-24").unwrap();
         assert_eq!(response.item.id, item_id, "same membership row, relocated");
@@ -4802,41 +5431,10 @@ mod tests {
     }
 
     #[test]
-    fn reschedule_task_already_on_target_unpins_source_and_returns_existing() {
-        let repos = repos();
-        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
-        let on_today = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
-        let on_tomorrow = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-24")).unwrap();
-        let today_id = on_today.item.id.clone();
-        let tomorrow_id = on_tomorrow.item.id.clone();
-
-        // Move today's slot to tomorrow, where the task already sits.
-        let response = reschedule(&repos, "u-1", &today_id, "2026-08-24").unwrap();
-        assert_eq!(
-            response.item.id, tomorrow_id,
-            "the EXISTING target item is returned — never a duplicate"
-        );
-        assert_eq!(response.item.local_date, "2026-08-24");
-
-        // Source unpinned (hard-deleted), target pile has exactly one slot.
-        assert!(
-            pollster::block_on(repos.agenda.get_by_id(&today_id))
-                .unwrap()
-                .is_none(),
-            "source slot hard-deleted"
-        );
-        let tomorrow = get(&repos, "u-1", "2026-08-24").unwrap();
-        assert_eq!(tomorrow.items.len(), 1, "no duplicate slot");
-        assert_eq!(tomorrow.items[0].id, tomorrow_id);
-        let today = get(&repos, "u-1", "2026-08-23").unwrap();
-        assert_eq!(today.items.len(), 0, "source day emptied");
-    }
-
-    #[test]
     fn reschedule_missing_other_user_and_soft_deleted_backings_are_404() {
         let repos = repos();
         repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
-        add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
+        agenda_row(&repos, "ai-1", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
 
         // Missing item → 404.
         let err = reschedule(&repos, "u-1", "nope", "2026-08-24").unwrap_err();
@@ -4901,9 +5499,21 @@ mod tests {
     fn reschedule_rejects_invalid_dates() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        materialize_date(&repos, "2026-08-23");
         let agenda = get(&repos, "u-1", "2026-08-23").unwrap();
         let item_id = agenda.items[0].id.clone();
-        for bad in ["", "   ", "2026-13-01", "23-08-2026", "not a date"] {
+        for bad in [
+            "",
+            "   ",
+            "2026-13-01",
+            "23-08-2026",
+            "not a date",
+            // chrono accepts these spellings; they must still 400 (the raw
+            // string would sort wrongly against canonical today).
+            "2026-9-30",
+            "2026-10-1",
+            "+2026-10-01",
+        ] {
             let err = reschedule(&repos, "u-1", &item_id, bad).unwrap_err();
             assert!(
                 matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
@@ -4919,6 +5529,311 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.local_date, "2026-08-23");
+    }
+
+    #[test]
+    fn reschedule_of_a_non_canonical_date_moves_nothing() {
+        let repos = repos();
+        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(&repos, "ai-task", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 3);
+
+        // "2026-9-30" is September as text, so a lexical compare against today
+        // ("2026-08-23") would pass it — but it is not canonical, so the call
+        // is a 400 and the row stays on today at its original rank.
+        let err = reschedule(&repos, "u-1", "ai-task", "2026-9-30").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-task"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "the row did not move");
+        assert_eq!(stored.sort_order, 3, "rank untouched");
+
+        // The canonical spelling of the same day still parses and moves.
+        let moved = reschedule(&repos, "u-1", "ai-task", "2026-10-17").unwrap();
+        assert_eq!(moved.item.local_date, "2026-10-17");
+        assert_eq!(moved.item.id, "ai-task", "the same membership row travelled");
+    }
+
+    #[test]
+    fn reschedule_into_the_past_is_rejected_and_nothing_moves() {
+        let repos = repos();
+        // One task slot and one pending occurrence, both on today.
+        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(&repos, "ai-task", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+            "occ-1", "rt-1", "u-1", "2026-08-23", OCCURRENCE_STATUS_PENDING,
+        ));
+        agenda_row(&repos, "ai-occ", "u-1", "2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-1", 1);
+
+        for (id, rank) in [("ai-task", 0), ("ai-occ", 1)] {
+            let err = reschedule(&repos, "u-1", id, "2026-08-22").unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "cannot reschedule into the past"),
+                "{err:?} for {id}"
+            );
+            let stored = pollster::block_on(repos.agenda.get_by_id(id)).unwrap().unwrap();
+            assert_eq!(stored.local_date, "2026-08-23", "a rejected past move writes nothing");
+            assert_eq!(stored.sort_order, rank, "rank untouched");
+            assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "row untouched");
+        }
+        let occurrence = pollster::block_on(repos.occurrences.get_by_id("occ-1")).unwrap().unwrap();
+        assert_eq!(occurrence.status, OCCURRENCE_STATUS_PENDING);
+        assert_eq!(get(&repos, "u-1", "2026-08-23").unwrap().items.len(), 2, "both slots stay");
+        assert!(get(&repos, "u-1", "2026-08-22").unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn reschedule_sort_order_lands_at_the_rank_and_shifts_the_peer() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        materialize_date(&repos, "2026-08-23");
+        materialize_date(&repos, "2026-08-24");
+        let today = get(&repos, "u-1", "2026-08-23").unwrap();
+        let tomorrow = get(&repos, "u-1", "2026-08-24").unwrap();
+        let mover = today.items[0].id.clone();
+        let peer = tomorrow.items[0].id.clone();
+
+        // Rank 0 → the mover lands on top and tomorrow's peer shifts to 1.
+        let response = reschedule_at(&repos, "u-1", &mover, "2026-08-24", Some(0)).unwrap();
+        assert_eq!(response.item.id, mover, "same agenda row");
+        assert_eq!(response.item.local_date, "2026-08-24");
+        assert_eq!(response.item.sort_order, 0, "the named rank is the landing rank");
+        let pile = |date: &str| -> Vec<(String, i64)> {
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", date))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.id, item.sort_order))
+                .collect()
+        };
+        assert_eq!(
+            pile("2026-08-24"),
+            vec![(mover.clone(), 0), (peer.clone(), 1)],
+            "the peer at/after the rank shifts up one"
+        );
+        assert!(pile("2026-08-23").is_empty(), "the source pile is never reshuffled");
+
+        // Absent sort_order still appends at max+1.
+        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(&repos, "ai-task", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
+        let appended = reschedule(&repos, "u-1", "ai-task", "2026-08-24").unwrap();
+        assert_eq!(appended.item.sort_order, 2, "append = max+1");
+        assert_eq!(
+            pile("2026-08-24"),
+            vec![(mover, 0), (peer, 1), ("ai-task".to_string(), 2)],
+            "the appended row lands after the existing pile"
+        );
+    }
+
+    #[test]
+    fn reschedule_terminal_tasks_is_rejected() {
+        let repos = repos();
+        for (id, status) in [("t-done", "COMPLETED"), ("t-disc", "DISCARDED")] {
+            repos.tasks.push(task_row(id, "u-1", "Review | Work", status));
+            let item_id = format!("ai-{id}");
+            agenda_row(&repos, &item_id, "u-1", "2026-08-23", AGENDA_KIND_TASK, id, 0);
+            let err = reschedule(&repos, "u-1", &item_id, "2026-08-24").unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "cannot reschedule a terminal task"),
+                "{err:?} for {status}"
+            );
+            let stored = pollster::block_on(repos.agenda.get_by_id(&item_id)).unwrap().unwrap();
+            assert_eq!(stored.local_date, "2026-08-23", "the slot stays put");
+            let task = pollster::block_on(repos.tasks.get_by_id(id)).unwrap().unwrap();
+            assert_eq!(task.status, status, "tasks.status is never touched");
+        }
+    }
+
+    #[test]
+    fn reschedule_rejects_a_negative_sort_order_on_a_real_move() {
+        let repos = repos();
+        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(&repos, "ai-1", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
+
+        let err = reschedule_at(&repos, "u-1", "ai-1", "2026-08-24", Some(-1)).unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "sort_order must be a non-negative integer"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1")).unwrap().unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "a rejected rank writes nothing");
+        assert_eq!(stored.sort_order, 0);
+    }
+
+    // ──────────────────────────────────────────
+    // POST /api/agenda/days/:date/move-to-today
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn move_day_to_today_moves_the_still_pending_items_in_pile_order() {
+        let repos = repos();
+        // Today already holds an item: the swept pile is appended after it.
+        repos.tasks.push(task_row("t-today", "u-1", "Today | Work", "OPEN"));
+        agenda_row(&repos, "ai-today", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-today", 0);
+
+        // Yesterday mixes every shape the sweep has to sort out.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        let mut gone = FakeRoutineRepo::row("rt-gone", "u-1", "Gone", 1, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY");
+        gone.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
+        repos.routines.stored.lock().unwrap().push(gone);
+
+        repos.tasks.push(task_row("t-open", "u-1", "Open | Work", "OPEN"));
+        repos.tasks.push(task_row("t-running", "u-1", "Running | Work", "IN_PROGRESS"));
+        repos.tasks.push(task_row("t-planned", "u-1", "Planned | Work", "PLANNED"));
+        repos.tasks.push(task_row("t-completed", "u-1", "Done | Work", "COMPLETED"));
+        let mut t_gone = task_row("t-gone", "u-1", "Gone | Work", "OPEN");
+        t_gone.deleted_at = Some("2026-08-20T00:00:00Z".to_string());
+        repos.tasks.push(t_gone);
+
+        repos.occurrences.stored.lock().unwrap().extend([
+            FakeOccurrenceRepo::row("occ-pending", "rt-1", "u-1", "2026-08-22", OCCURRENCE_STATUS_PENDING),
+            FakeOccurrenceRepo::row("occ-skipped", "rt-1", "u-1", "2026-08-22", OCCURRENCE_STATUS_SKIPPED),
+            FakeOccurrenceRepo::row("occ-done", "rt-1", "u-1", "2026-08-22", OCCURRENCE_STATUS_DONE),
+            FakeOccurrenceRepo::row("occ-running", "rt-1", "u-1", "2026-08-22", OCCURRENCE_STATUS_IN_PROGRESS),
+            FakeOccurrenceRepo::row("occ-orphan", "rt-gone", "u-1", "2026-08-22", OCCURRENCE_STATUS_PENDING),
+        ]);
+
+        agenda_row(&repos, "ai-open", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-open", 0);
+        agenda_row(&repos, "ai-pending", "u-1", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-pending", 1);
+        agenda_row(&repos, "ai-running", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-running", 2);
+        agenda_row(&repos, "ai-done-task", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-completed", 3);
+        agenda_row(&repos, "ai-skipped", "u-1", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-skipped", 4);
+        agenda_row(&repos, "ai-done-occ", "u-1", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-done", 5);
+        agenda_row(&repos, "ai-running-occ", "u-1", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-running", 6);
+        agenda_row(&repos, "ai-gone-task", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-gone", 7);
+        agenda_row(&repos, "ai-orphan", "u-1", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-orphan", 8);
+        agenda_row(&repos, "ai-planned", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-planned", 9);
+        agenda_row(&repos, "ai-weird", "u-1", "2026-08-22", "weird", "ref-x", 10);
+
+        // Reset after the fixture, so setup work never counts.
+        repos.occurrences.reset_calls();
+
+        let response = move_day(&repos, "u-1", "2026-08-22").unwrap();
+        // The sweep hydrates the pile in one batch: the five occurrence rows
+        // resolve through a single `list_by_ids`, never a read per row (the
+        // N+1 that blew the subrequest budget).
+        let occurrences = repos.occurrences.call_counts();
+        assert_eq!(occurrences.list_by_ids, 1, "the occurrence embeds resolve in one batch");
+        assert_eq!(occurrences.get_by_id, 0, "no per-row occurrence read");
+        let moved: Vec<(&str, &str)> = response
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item.local_date.as_str()))
+            .collect();
+        assert_eq!(
+            moved,
+            vec![
+                ("ai-open", "2026-08-23"),
+                ("ai-pending", "2026-08-23"),
+                ("ai-running", "2026-08-23"),
+                ("ai-planned", "2026-08-23"),
+            ],
+            "only the still-pending rows move, in their original order"
+        );
+        assert_eq!(
+            response.items.iter().map(|item| item.sort_order).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "each row appends after today's existing item"
+        );
+        // An in-progress TASK moves; the occurrence keeps its rule date.
+        assert_eq!(response.items[0].task.as_ref().unwrap().status, "OPEN");
+        assert_eq!(response.items[2].task.as_ref().unwrap().status, "IN_PROGRESS");
+        assert_eq!(response.items[3].task.as_ref().unwrap().status, "PLANNED");
+        let moved_occurrence = response.items[1].occurrence.as_ref().unwrap();
+        assert_eq!(moved_occurrence.id, "occ-pending");
+        assert_eq!(
+            moved_occurrence.local_date, "2026-08-22",
+            "occurrence.local_date stays the rule date"
+        );
+        assert_eq!(moved_occurrence.status, OCCURRENCE_STATUS_PENDING, "pending stays pending");
+
+        // Today: the existing item first, then the four swept rows in order.
+        let today = get(&repos, "u-1", "2026-08-23").unwrap();
+        let today_ids: Vec<&str> = today.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            today_ids,
+            vec!["ai-today", "ai-open", "ai-pending", "ai-running", "ai-planned"]
+        );
+
+        // The past day keeps exactly the non-movable rows at their old ranks.
+        let left: Vec<(String, i64)> =
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-22"))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.id, item.sort_order))
+                .collect();
+        assert_eq!(
+            left,
+            vec![
+                ("ai-done-task".to_string(), 3),
+                ("ai-skipped".to_string(), 4),
+                ("ai-done-occ".to_string(), 5),
+                ("ai-running-occ".to_string(), 6),
+                ("ai-gone-task".to_string(), 7),
+                ("ai-orphan".to_string(), 8),
+                ("ai-weird".to_string(), 10),
+            ],
+            "terminal, skipped, in_progress, soft-deleted and orphan rows stay put"
+        );
+        // Nothing was created or destroyed: 1 row on today + 11 on yesterday.
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 12);
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn move_day_to_today_rejects_today_the_future_and_a_garbage_date() {
+        let repos = repos();
+        repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(&repos, "ai-1", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
+
+        let err = move_day(&repos, "u-1", "nope").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
+            "{err:?}"
+        );
+        for date in ["2026-08-23", "2026-08-24"] {
+            let err = move_day(&repos, "u-1", date).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "cannot move a day that is not in the past"),
+                "{err:?} for {date}"
+            );
+        }
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1")).unwrap().unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "nothing moved");
+        assert_eq!(stored.sort_order, 0);
+    }
+
+    #[test]
+    fn move_day_to_today_with_nothing_pending_is_an_empty_200() {
+        let repos = repos();
+        // The past day holds only terminal leftovers.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos.occurrences.stored.lock().unwrap().push(FakeOccurrenceRepo::row(
+            "occ-done", "rt-1", "u-1", "2026-08-22", OCCURRENCE_STATUS_DONE,
+        ));
+        agenda_row(&repos, "ai-done", "u-1", "2026-08-22", AGENDA_KIND_OCCURRENCE, "occ-done", 0);
+        repos.tasks.push(task_row("t-done", "u-1", "Done | Work", "COMPLETED"));
+        agenda_row(&repos, "ai-task", "u-1", "2026-08-22", AGENDA_KIND_TASK, "t-done", 1);
+
+        let response = move_day(&repos, "u-1", "2026-08-22").unwrap();
+        assert!(response.items.is_empty(), "nothing pending → nothing moved");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 2, "the store is unchanged");
+        let left: Vec<(String, String)> =
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-22"))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.id, item.local_date))
+                .collect();
+        assert_eq!(
+            left,
+            vec![
+                ("ai-done".to_string(), "2026-08-22".to_string()),
+                ("ai-task".to_string(), "2026-08-22".to_string()),
+            ]
+        );
     }
 
     // ──────────────────────────────────────────
@@ -5253,7 +6168,7 @@ mod tests {
     fn agenda_get_embeds_full_task_view_with_focus_flag() {
         let repos = repos();
         repos.tasks.push(task_row("t-1", "u-1", "Review | Work", "IN_PROGRESS"));
-        let item = add(&repos, "u-1", &agenda_input("task", "t-1", "2026-08-23")).unwrap();
+        agenda_row(&repos, "ai-1", "u-1", "2026-08-23", AGENDA_KIND_TASK, "t-1", 0);
         let focused = pollster::block_on(get_agenda(
             &repos.calendars,
             &repos.lists,
@@ -5263,6 +6178,7 @@ mod tests {
             &repos.agenda,
             &repos.tasks,
             "u-1",
+            Some("2026-08-23"),
             Some("2026-08-23"),
             NOW_UNIX,
             Some("t-1"),
@@ -5279,8 +6195,7 @@ mod tests {
         // The same read without the pointer paints false.
         let unfocused = get(&repos, "u-1", "2026-08-23").unwrap();
         assert!(!unfocused.items[0].task.as_ref().unwrap().focused);
-        // The add response itself carries the same full shape.
-        assert_eq!(item.item.task.as_ref().unwrap().id, "t-1");
+        assert_eq!(focused.items[0].ref_id, "t-1", "the embed is the living task");
     }
 
     // ──────────────────────────────────────────
@@ -5531,11 +6446,9 @@ mod tests {
     fn start_after_reschedule_to_today_works() {
         let repos = repos();
         // Weekly-Monday series: the Monday (2026-08-17) occurrence is
-        // rescheduled to Tuesday (2026-08-18)…
+        // rescheduled onto 2026-08-23 — the civil date of NOW_UNIX — while
+        // `occurrence.local_date` still says 2026-08-17.
         let item_id = seed_monday_occurrence(&repos);
-        reschedule(&repos, "u-1", &item_id, "2026-08-18").unwrap();
-        // …then the user snoozes it again onto 2026-08-23 — the civil date of
-        // NOW_UNIX — while `occurrence.local_date` still says 2026-08-17.
         reschedule(&repos, "u-1", &item_id, "2026-08-23").unwrap();
 
         let response = start(&repos, "u-1", "occ-1").unwrap();
@@ -6244,6 +7157,666 @@ mod tests {
                 .status,
             OCCURRENCE_STATUS_IN_PROGRESS,
             "the cron never flips status"
+        );
+    }
+
+    // ──────────────────────────────────────────
+    // The agenda fill (slice 4)
+    // ──────────────────────────────────────────
+
+    /// The horizon under `NOW_UNIX`: today … today+6, inclusive.
+    fn horizon_dates() -> Vec<String> {
+        (0..crate::agenda_fill::OCCURRENCE_HORIZON_DAYS)
+            .map(|offset| add_civil_days("2026-08-23", offset).unwrap())
+            .collect()
+    }
+
+    /// `fill_occurrence_horizon` with the shared repos and the test clock —
+    /// `include_today: true`, the cron/create window.
+    fn fill_horizon(
+        repos: &Repos,
+        user_id: &str,
+        only_routine: Option<&str>,
+    ) -> Result<(), AgendaError> {
+        pollster::block_on(fill_occurrence_horizon(
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            user_id,
+            NOW_UNIX,
+            only_routine,
+            true,
+        ))
+    }
+
+    /// `ensure_task_items` with the shared repos and the test clock.
+    fn ensure_tasks(repos: &Repos, user_id: &str) -> Result<(), AgendaError> {
+        pollster::block_on(ensure_task_items(
+            &repos.agenda,
+            &repos.tasks,
+            &repos.calendars,
+            user_id,
+            NOW_UNIX,
+        ))
+    }
+
+    /// One `run_agenda_fill_cron` pass over the shared repos.
+    fn fill_cron(repos: &Repos) -> AgendaFillReport {
+        pollster::block_on(run_agenda_fill_cron(
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.tasks,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// `create_routine` over the shared repos (create fills the horizon).
+    fn create(
+        repos: &Repos,
+        user_id: &str,
+        title: &str,
+        rrule: &str,
+    ) -> Result<RoutineResponse, RoutinesError> {
+        pollster::block_on(create_routine(
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            user_id,
+            &NewRoutineInput {
+                title: title.to_string(),
+                estimated_minutes: None,
+                rrule: rrule.to_string(),
+            },
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// `update_routine` over the shared repos.
+    fn update(
+        repos: &Repos,
+        user_id: &str,
+        routine_id: &str,
+        updates: &UpdateRoutine,
+    ) -> Result<RoutineResponse, RoutinesError> {
+        pollster::block_on(update_routine(
+            &repos.categories,
+            &repos.routines,
+            user_id,
+            routine_id,
+            updates,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// `delete_routine` over the shared repos.
+    fn delete(
+        repos: &Repos,
+        user_id: &str,
+        routine_id: &str,
+    ) -> Result<DeleteRoutineResponse, RoutinesError> {
+        pollster::block_on(delete_routine(
+            &repos.routines,
+            user_id,
+            routine_id,
+            &unix_secs_to_rfc3339(NOW_UNIX),
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+    }
+
+    /// The stored occurrence dates of `user_id`, ascending.
+    fn occurrence_dates_in_store(repos: &Repos, user_id: &str) -> Vec<String> {
+        let mut dates: Vec<String> = repos
+            .occurrences
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|occ| occ.user_id == user_id)
+            .map(|occ| occ.local_date.clone())
+            .collect();
+        dates.sort();
+        dates
+    }
+
+    /// The stored occurrence of `routine_id` on `date` (panics when absent).
+    fn occurrence_on(repos: &Repos, routine_id: &str, date: &str) -> RoutineOccurrence {
+        pollster::block_on(repos.occurrences.get_by_routine_and_date(routine_id, date))
+            .unwrap()
+            .unwrap_or_else(|| panic!("no occurrence for {routine_id} on {date}"))
+    }
+
+    /// The stored membership rows of one occurrence, on ANY date (the
+    /// "membership anywhere" view).
+    fn items_of(repos: &Repos, occurrence_id: &str) -> Vec<AgendaItem> {
+        let mut rows: Vec<AgendaItem> = repos
+            .agenda
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|item| item.ref_id == occurrence_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.local_date.cmp(&b.local_date));
+        rows
+    }
+
+    /// `(ref_id, sort_order, local_date)` for one user's membership rows, in
+    /// stream order — the append-order assertion shape.
+    fn membership_triples(repos: &Repos, user_id: &str) -> Vec<(String, i64, String)> {
+        let mut rows: Vec<AgendaItem> = repos
+            .agenda
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|item| item.user_id == user_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (&a.local_date, a.sort_order).cmp(&(&b.local_date, b.sort_order)));
+        rows.into_iter()
+            .map(|item| (item.ref_id, item.sort_order, item.local_date))
+            .collect()
+    }
+
+    #[test]
+    fn fill_covers_today_through_today_plus_six_and_writes_nothing_twice() {
+        let repos = repos();
+        // A daily rule whose DTSTART is in January: the past is NOT
+        // backfilled, only the horizon dates the rule covers.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        let expected = horizon_dates();
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            expected,
+            "exactly today … today+6"
+        );
+        assert!(
+            repos
+                .occurrences
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|occ| occ.local_date.as_str() >= "2026-08-23"),
+            "a past DTSTART never writes a past row"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .map(|(_, _, date)| date.clone())
+                .collect::<Vec<_>>(),
+            expected,
+            "one agenda row per occurrence, on its rule date"
+        );
+
+        // A second pass with the same data writes nothing at all.
+        let occurrences_before = repos.occurrences.stored.lock().unwrap().len();
+        let agenda_before = repos.agenda.stored.lock().unwrap().len();
+        repos.occurrences.reset_calls();
+        repos.agenda.reset_calls();
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        assert_eq!(repos.occurrences.stored.lock().unwrap().len(), occurrences_before);
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), agenda_before);
+        assert_eq!(repos.occurrences.call_counts().insert_many, 0, "no occurrence write");
+        assert_eq!(repos.agenda.call_counts().insert_many, 0, "no agenda write");
+    }
+
+    #[test]
+    fn fill_weekly_monday_lands_on_monday_alone() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260105T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+        ));
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        // 2026-08-24 is the one Monday inside today … today+6.
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), ["2026-08-24"]);
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![(
+                occurrence_on(&repos, "rt-1", "2026-08-24").id,
+                0,
+                "2026-08-24".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn fill_never_reattaches_a_rescheduled_occurrence_to_its_rule_date() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        // Snooze today's row two days forward.
+        let today_item = membership_triples(&repos, "u-1")
+            .into_iter()
+            .find(|(_, _, date)| date == "2026-08-23")
+            .map(|(ref_id, _, _)| ref_id)
+            .expect("today's row exists");
+        let item_id = pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-23"))
+            .unwrap()
+            .into_iter()
+            .find(|item| item.ref_id == today_item)
+            .unwrap()
+            .id;
+        let occurrence_id = today_item;
+        let before = occurrence_on(&repos, "rt-1", "2026-08-23");
+        let moved = reschedule(&repos, "u-1", &item_id, "2026-08-25").unwrap();
+        assert_eq!(moved.item.local_date, "2026-08-25");
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        // The rule date gains no second row: the moved row is the only one.
+        let memberships = items_of(&repos, &occurrence_id);
+        assert_eq!(memberships.len(), 1, "no re-attachment to the rule date");
+        assert_eq!(memberships[0].local_date, "2026-08-25");
+        assert_eq!(
+            occurrence_on(&repos, "rt-1", "2026-08-23"),
+            before,
+            "the occurrence keeps its rule date"
+        );
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1").len(),
+            7,
+            "nothing was added or removed"
+        );
+    }
+
+    #[test]
+    fn fill_appends_after_the_existing_pile_in_standing_routine_order() {
+        let repos = repos();
+        repos.routines.stored.lock().unwrap().extend([
+            FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"),
+            FakeRoutineRepo::row("rt-2", "u-1", "Salat", 1, "DTSTART:20260101T120000\nRRULE:FREQ=DAILY"),
+        ]);
+        // A pre-existing row at rank 5 on today: the fill appends after it and
+        // never reshuffles it.
+        agenda_row(&repos, "ai-pinned", "u-1", "2026-08-23", AGENDA_KIND_TASK, "task-x", 5);
+
+        fill_horizon(&repos, "u-1", None).unwrap();
+
+        let today: Vec<(String, i64)> =
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-23"))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.ref_id, item.sort_order))
+                .collect();
+        assert_eq!(
+            today,
+            vec![
+                ("task-x".to_string(), 5),
+                (occurrence_on(&repos, "rt-1", "2026-08-23").id, 6),
+                (occurrence_on(&repos, "rt-2", "2026-08-23").id, 7),
+            ],
+            "today's new rows land after the pile's max rank, in routine order"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_backfills_open_tasks_on_today_in_board_order() {
+        let repos = repos();
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 1;
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 0;
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 4;
+        let completed = task_row("task-done", "u-1", "Done | Work", "COMPLETED");
+        let mut placed = task_row("task-placed", "u-1", "Placed | Work", "OPEN");
+        placed.sort_order = 9;
+        for task in [running, planned, open, completed, placed] {
+            repos.tasks.push(task);
+        }
+        // A task that already holds a slot (on a past day) is left alone: no
+        // second row, no move.
+        agenda_row(&repos, "ai-placed", "u-1", "2026-08-20", AGENDA_KIND_TASK, "task-placed", 2);
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        let today: Vec<(String, i64)> =
+            pollster::block_on(repos.agenda.list_by_user_and_date("u-1", "2026-08-23"))
+                .unwrap()
+                .into_iter()
+                .map(|item| (item.ref_id, item.sort_order))
+                .collect();
+        assert_eq!(
+            today,
+            vec![
+                ("task-run".to_string(), 0),
+                ("task-plan".to_string(), 1),
+                ("task-open".to_string(), 2),
+            ],
+            "IN_PROGRESS, PLANNED, OPEN — ranks 0, 1, 2"
+        );
+        assert!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .all(|(ref_id, _, _)| ref_id != "task-done"),
+            "a COMPLETED task gets nothing"
+        );
+        let placed_rows: Vec<(String, i64, String)> = membership_triples(&repos, "u-1")
+            .into_iter()
+            .filter(|(ref_id, _, _)| ref_id == "task-placed")
+            .collect();
+        assert_eq!(
+            placed_rows,
+            vec![("task-placed".to_string(), 2, "2026-08-20".to_string())],
+            "an already-placed task keeps its single row where it was"
+        );
+
+        // A second pass writes nothing.
+        let before = repos.agenda.stored.lock().unwrap().len();
+        repos.agenda.reset_calls();
+        ensure_tasks(&repos, "u-1").unwrap();
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), before);
+        assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn insert_ignores_a_second_task_row_on_any_date() {
+        let repos = repos();
+        let insert = |date: &str, kind: &str, ref_id: &str, sort_order: i64| {
+            pollster::block_on(repos.agenda.insert(NewAgendaItem {
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: kind.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order,
+            }))
+            .unwrap()
+        };
+
+        // idx_agenda_items_one_per_task: one row per task on ANY date, so the
+        // second date is IGNORED — the stored row keeps its date and rank.
+        let first = insert("2026-08-23", AGENDA_KIND_TASK, "t-1", 4);
+        let second = insert("2026-08-24", AGENDA_KIND_TASK, "t-1", 0);
+        assert_eq!(second.id, first.id, "the stored row is returned");
+        assert_eq!(second.local_date, "2026-08-23", "the stored date wins");
+        assert_eq!(second.sort_order, 4, "the stored rank wins");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 1, "still one row");
+
+        // The index is task-only: an occurrence holds one row per date.
+        let occ_first = insert("2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-1", 0);
+        let occ_second = insert("2026-08-24", AGENDA_KIND_OCCURRENCE, "occ-1", 0);
+        assert_ne!(occ_first.id, occ_second.id, "two rows, one per date");
+        assert_eq!(repos.agenda.stored.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn update_routine_reconciles_only_untouched_future_rows() {
+        let repos = repos();
+        let created = create(
+            &repos,
+            "u-1",
+            "Work",
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        )
+        .unwrap();
+        let routine_id = created.routine.id.clone();
+        // Create filled the whole horizon.
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+
+        // One row per "the user touched it" shape, all after today.
+        let done_id = occurrence_on(&repos, &routine_id, "2026-08-26").id;
+        pollster::block_on(repos.occurrences.set_status(&done_id, OCCURRENCE_STATUS_DONE)).unwrap();
+        let renamed_id = occurrence_on(&repos, &routine_id, "2026-08-27").id;
+        pollster::block_on(repos.occurrences.update_title(&renamed_id, Some("Overridden"))).unwrap();
+        let chipped_id = occurrence_on(&repos, &routine_id, "2026-08-28").id;
+        pollster::block_on(repos.occurrences.set_event_ids(&chipped_id, "cal-1", "evt-1")).unwrap();
+        // …and one rescheduled out of its rule date.
+        let moved_id = occurrence_on(&repos, &routine_id, "2026-08-25").id;
+        let moved_item = pollster::block_on(repos.agenda.get_by_ref(
+            "u-1",
+            AGENDA_KIND_OCCURRENCE,
+            &moved_id,
+        ))
+        .unwrap()
+        .unwrap();
+        reschedule(&repos, "u-1", &moved_item.id, "2026-08-28").unwrap();
+        // The untouched pending row the new rule will not cover.
+        let doomed_id = occurrence_on(&repos, &routine_id, "2026-08-29").id;
+
+        let updated = update(
+            &repos,
+            "u-1",
+            &routine_id,
+            &UpdateRoutine {
+                rrule: Some("DTSTART:20260101T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO".to_string()),
+                ..UpdateRoutine::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO");
+
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            [
+                "2026-08-23", // today (a Sunday) is NEVER deleted
+                "2026-08-24", // the one Monday the new rule covers
+                "2026-08-25", // rescheduled: kept
+                "2026-08-26", // done: kept
+                "2026-08-27", // renamed: kept
+                "2026-08-28", // Google chip: kept
+            ],
+            "only the untouched 2026-08-29 row went"
+        );
+        assert!(items_of(&repos, &doomed_id).is_empty(), "its agenda row went with it");
+        assert_eq!(
+            items_of(&repos, &moved_id)
+                .iter()
+                .map(|item| item.local_date.clone())
+                .collect::<Vec<_>>(),
+            ["2026-08-28"],
+            "the rescheduled membership is untouched"
+        );
+
+        // A title-only update does no occurrence work at all.
+        let before = occurrence_dates_in_store(&repos, "u-1");
+        update(
+            &repos,
+            "u-1",
+            &routine_id,
+            &UpdateRoutine {
+                title: Some("Work".to_string()),
+                ..UpdateRoutine::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), before);
+    }
+
+    #[test]
+    fn update_routine_rule_edit_never_adds_an_occurrence_on_today() {
+        let repos = repos();
+        // A Monday-only rule whose DTSTART is in the past: create fills the
+        // horizon with the one Monday it covers (2026-08-24; today, the 23rd,
+        // is a Sunday).
+        let created = create(
+            &repos,
+            "u-1",
+            "Work",
+            "DTSTART:20260105T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+        )
+        .unwrap();
+        let routine_id = created.routine.id.clone();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), ["2026-08-24"]);
+
+        update(
+            &repos,
+            "u-1",
+            &routine_id,
+            &UpdateRoutine {
+                rrule: Some("DTSTART:20260105T053000\nRRULE:FREQ=DAILY".to_string()),
+                ..UpdateRoutine::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            pollster::block_on(repos.occurrences.get_by_routine_and_date(&routine_id, "2026-08-23"))
+                .unwrap()
+                .is_none(),
+            "the edit itself never materializes today"
+        );
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            [
+                "2026-08-24", // tomorrow, and the rule's first horizon date
+                "2026-08-25",
+                "2026-08-26",
+                "2026-08-27",
+                "2026-08-28",
+                "2026-08-29", // today+6
+            ],
+            "the edit refills tomorrow … today+6"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .map(|(_, _, date)| date.clone())
+                .collect::<Vec<_>>(),
+            [
+                "2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29"
+            ],
+            "no agenda row is appended on today"
+        );
+        // The cron's next tick owns today: with the new DAILY rule it fills.
+        fill_horizon(&repos, "u-1", Some(&routine_id)).unwrap();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+    }
+
+    #[test]
+    fn delete_routine_hard_deletes_only_untouched_future_rows() {
+        let repos = repos();
+        let created = create(
+            &repos,
+            "u-1",
+            "Work",
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        )
+        .unwrap();
+        let routine_id = created.routine.id.clone();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+
+        // One tomorrow-or-later row the user acted on.
+        let done_id = occurrence_on(&repos, &routine_id, "2026-08-25").id;
+        pollster::block_on(repos.occurrences.set_status(&done_id, OCCURRENCE_STATUS_DONE)).unwrap();
+
+        let response = delete(&repos, "u-1", &routine_id).unwrap();
+        assert!(response.success);
+
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            ["2026-08-23", "2026-08-25"],
+            "today's pending row and the done row stay; the untouched future ones are gone"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .map(|(_, _, date)| date.clone())
+                .collect::<Vec<_>>(),
+            ["2026-08-23", "2026-08-25"],
+            "the deleted rows' agenda items went with them"
+        );
+        assert!(
+            repos
+                .routines
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == routine_id && row.deleted_at.is_some()),
+            "the routine itself is soft-deleted"
+        );
+    }
+
+    #[test]
+    fn agenda_fill_cron_fills_every_user_and_reports_per_user_failures() {
+        let repos = repos();
+        // u-1: a daily routine and no open task.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-1",
+            "u-1",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        // u-2: an OPEN task and no routine.
+        let mut open = task_row("task-1", "u-2", "Ship | Work", "OPEN");
+        open.sort_order = 0;
+        repos.tasks.push(open);
+
+        let report = fill_cron(&repos);
+
+        assert_eq!(report.users, 2);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+        assert_eq!(
+            membership_triples(&repos, "u-2"),
+            vec![("task-1".to_string(), 0, "2026-08-23".to_string())],
+            "u-2's OPEN task landed on today"
+        );
+
+        // A living routine whose calendar read fails: one broken user is
+        // recorded and the others still fill.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-b",
+            "u-broken",
+            "Fajr",
+            0,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        repos.calendars.fail_for("u-broken");
+
+        let report = fill_cron(&repos);
+
+        assert_eq!(report.users, 3, "every affected user is attempted");
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert!(
+            report.errors.iter().all(|error| error.contains("u-broken")),
+            "{:?}",
+            report.errors
+        );
+        assert!(occurrence_dates_in_store(&repos, "u-broken").is_empty());
+        // The healthy users are untouched by the failure (and idempotent).
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
+        assert_eq!(
+            membership_triples(&repos, "u-2"),
+            vec![("task-1".to_string(), 0, "2026-08-23".to_string())]
         );
     }
 }
