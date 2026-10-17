@@ -8,11 +8,7 @@ import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
 import type { DragPreviewInfo } from '../lib/calendar-drag';
-import {
-  formatEventDuration,
-  formatEventTimeRange,
-  nowLineY,
-} from '../lib/week-layout';
+import { formatEventTimeDetail, nowLineY } from '../lib/week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
 
@@ -143,7 +139,7 @@ export const TimedPreviewLayer = memo(function TimedPreviewLayer({
   if (timedPreviewByDay.size === 0) return null;
 
   const label = previewInfo
-    ? `${formatEventTimeRange(previewInfo.range.start, previewInfo.range.end)} · ${formatEventDuration(previewInfo.range.start, previewInfo.range.end)}`
+    ? formatEventTimeDetail(previewInfo.range.start, previewInfo.range.end)
     : null;
   // Label once: on the segment holding the dragged edge, else the first.
   const segmentDays = days.filter((d) =>
