@@ -230,8 +230,9 @@ test('rangeFromSlots timed: same slot → SNAP_MINUTES duration', () => {
   const durMin = (r.end.getTime() - r.start.getTime()) / 60_000;
   assert.equal(durMin, SNAP_MINUTES);
   assert.equal(r.start.getHours(), 9);
+  assert.equal(r.start.getMinutes(), 0);
   assert.equal(r.end.getHours(), 9);
-  assert.equal(r.end.getMinutes(), 15);
+  assert.equal(r.end.getMinutes(), 1);
 });
 
 // ── rangeFromSlots allday ───────────────────────────────────────────────
@@ -426,19 +427,33 @@ test('resizedRange: fractional minutes snap nearest 1', () => {
   assert.equal(r.end.getMinutes(), 8);
 });
 
-test('movedRange: still snaps to 15-minute grid', () => {
+test('movedRange: snaps to the 1-minute grid', () => {
   const originalStart = new Date(2024, 0, 1, 9, 0, 0, 0);
   const originalEnd = new Date(2024, 0, 1, 10, 0, 0, 0);
   const day = localDay(2024, 0, 1);
-  // 10:07 nearest 15 is 10:00
+  // 10:07 is already on the 1-minute grid and keeps its duration.
   const r = movedRange(originalStart, originalEnd, slot(day, 10 * 60 + 7));
   assert.equal(r.start.getHours(), 10);
-  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.start.getMinutes(), 7);
   assert.equal(r.end.getHours(), 11);
-  assert.equal(r.end.getMinutes(), 0);
+  assert.equal(r.end.getMinutes(), 7);
 });
 
-test('rangeFromSlots timed: still snaps to 15-minute grid', () => {
+test('movedRange: fractional minutes snap to the nearest minute', () => {
+  const originalStart = new Date(2024, 0, 1, 9, 0, 0, 0);
+  const originalEnd = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // 10:07.6 → 10:08, duration still 60 min.
+  const r = movedRange(originalStart, originalEnd, slot(day, 10 * 60 + 7.6));
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.start.getMinutes(), 8);
+  assert.equal(r.end.getHours(), 11);
+  assert.equal(r.end.getMinutes(), 8);
+  const durMin = (r.end.getTime() - r.start.getTime()) / 60_000;
+  assert.equal(durMin, 60);
+});
+
+test('rangeFromSlots timed: snaps to the 1-minute grid', () => {
   const day = localDay(2024, 0, 1);
   const r = rangeFromSlots(
     slot(day, 10 * 60 + 7),
@@ -446,9 +461,9 @@ test('rangeFromSlots timed: still snaps to 15-minute grid', () => {
     'timed',
   );
   assert.equal(r.start.getHours(), 10);
-  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.start.getMinutes(), 7);
   assert.equal(r.end.getHours(), 11);
-  assert.equal(r.end.getMinutes(), 0);
+  assert.equal(r.end.getMinutes(), 7);
 });
 
 // ── preview geometry ────────────────────────────────────────────────────
