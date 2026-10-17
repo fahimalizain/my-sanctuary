@@ -20,7 +20,7 @@ import {
   CHIP_Z_SELECTED,
   contrastingInk,
   formatEventTime,
-  formatEventTimeRange,
+  formatEventTimeDetail,
   hexToRgba,
   isCompactChip,
 } from '../lib/week-layout';
@@ -215,7 +215,9 @@ export const EventChip = memo(function EventChip({
   const start = new Date(event.start_time);
   const end = new Date(event.end_time);
   const timeLabel = formatEventTime(start);
-  const rangeLabel = formatEventTimeRange(start, end);
+  // Full "range · duration" detail: the tall chip's second line, and the
+  // tooltip for both layouts (a compact or truncated line hides it otherwise).
+  const timeDetail = formatEventTimeDetail(start, end);
   const compact = isCompactChip(height);
   const ink = contrastingInk(color);
 
@@ -238,7 +240,7 @@ export const EventChip = memo(function EventChip({
         zIndex: selected ? CHIP_Z_SELECTED : CHIP_Z_BASE + layerIndex,
         color: ink,
       }}
-      title={`${event.title} · ${rangeLabel}`}
+      title={`${event.title} · ${timeDetail}`}
       data-event-chip
       data-event-id={event.id}
       data-start-min={startMin}
@@ -326,7 +328,7 @@ export const EventChip = memo(function EventChip({
                 {event.title}
               </div>
               <div className="mt-0.5 truncate text-[9px] leading-[11px] opacity-80">
-                {timeLabel}
+                {timeDetail}
               </div>
             </>
           )}

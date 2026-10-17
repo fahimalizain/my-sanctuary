@@ -36,6 +36,7 @@ import {
   applyStartTime,
   formatEventDateLine,
   formatEventDuration,
+  formatEventTimeDetail,
   formatWeekTitle,
   toDateInputValue,
   toTimeInputValue,
@@ -1220,6 +1221,26 @@ test('formatEventDuration: inverted range clamps to "0min"', () => {
   const start = new Date(2026, 8, 13, 6, 0);
   const end = new Date(2026, 8, 13, 5, 0);
   assert.equal(formatEventDuration(start, end), '0min');
+});
+
+// ── formatEventTimeDetail ───────────────────────────────────────────────
+
+test('formatEventTimeDetail: 5:00–6:30 → range + duration', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 30);
+  assert.equal(formatEventTimeDetail(start, end), '5 AM – 6:30 AM · 1h 30min');
+});
+
+test('formatEventTimeDetail: exactly 60 minutes on the hour → "5 AM – 6 AM · 1h"', () => {
+  const start = new Date(2026, 8, 13, 5, 0);
+  const end = new Date(2026, 8, 13, 6, 0);
+  assert.equal(formatEventTimeDetail(start, end), '5 AM – 6 AM · 1h');
+});
+
+test('formatEventTimeDetail: inverted range still formats (duration 0min)', () => {
+  const start = new Date(2026, 8, 13, 6, 0);
+  const end = new Date(2026, 8, 13, 5, 0);
+  assert.equal(formatEventTimeDetail(start, end), '6 AM – 5 AM · 0min');
 });
 
 // ── formatEventDateLine ─────────────────────────────────────────────────
