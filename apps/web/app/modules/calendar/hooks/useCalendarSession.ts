@@ -17,7 +17,14 @@ import {
   useUpdateCalendarEvent,
 } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
+import { isCalendarWritable } from '../components/EventInspector';
 import { useCalendarEventsQueue } from '../events-context';
+import {
+  clipboardItemFromEvent,
+  pasteCreateInput,
+  pasteDestinationCalendarId,
+  type CalendarClipboardItem,
+} from '../lib/calendar-clipboard';
 import {
   allDayPreviewIndices,
   timedPreviewSegments,
@@ -174,6 +181,9 @@ export function useCalendarSession({
   }, []);
   // Prevent a second title-blur from firing another POST for the same draft.
   const draftPersistStartedRef = useRef<Set<string>>(new Set());
+  // Cut sources whose delete has begun. Two quick pastes of one cut must
+  // DELETE the row once; later pastes just report "nothing to consume".
+  const cutRemovalsStartedRef = useRef<Set<string>>(new Set());
 
   const createEvent = useCreateCalendarEvent();
   const updateEvent = useUpdateCalendarEvent();
@@ -632,6 +642,206 @@ export function useCalendarSession({
     reportWriteError,
   ]);
 
+  /**
+   * Clipboard payload for the selected event, cut-aware.
+   *
+   * A persisted source stays on the grid: the delete happens on paste, so a
+   * cancelled chord never costs the event. A temp / unpersisted draft has no
+   * server row, so it is discarded here and the payload is a plain copy.
+   */
+  const cutForClipboard = useCallback((): CalendarClipboardItem | null => {
+    const event = selectedEvent;
+    const item = clipboardItemFromEvent(event);
+    if (!event || !item) return null;
+
+    // No server row to delete later: drop that one chip now. clear (not
+    // remove) keeps the in-flight POST's onSuccess DELETE behaviour — the
+    // same discard branch persistDraft uses for a vanished draft. Only this
+    // id is touched, so a different open draft survives the cut.
+    if (
+      isTempEventId(event.id) ||
+      event.id === unpersistedDraftIdRef.current ||
+      event.id === unpersistedDraftId
+    ) {
+      patchQueue.cancel(event.id);
+      queue.clear(event.id);
+      if (
+        event.id === unpersistedDraftIdRef.current ||
+        event.id === unpersistedDraftId
+      ) {
+        setDraftId(null);
+      }
+      setSelectedEventId(null);
+      setFocusTitleOnOpen(false);
+      return item;
+    }
+
+    // Read-only calendar: leave the event alone and let the chord through
+    // to the browser rather than pretend it was cut.
+    if (!isCalendarWritable(selectedEventCalendar)) return null;
+
+    return { ...item, cutSourceId: event.id };
+  }, [
+    selectedEvent,
+    selectedEventCalendar,
+    unpersistedDraftId,
+    queue,
+    patchQueue,
+    setDraftId,
+  ]);
+
+  /**
+   * Create a second one-shot at the item's own times, then remove the cut
+   * source if the create succeeded.
+   *
+   * The boolean reports whether a cut source was actually deleted, so the
+   * page can clear `cutSourceId` on that clipboard item. It does NOT mean the
+   * key was consumed — the page already claimed the chord before calling.
+   * Plain copies, abandoned pastes, and a cut whose delete already started
+   * all return false.
+   */
+  const pasteFromClipboard = useCallback(
+    async (item: CalendarClipboardItem): Promise<boolean> => {
+      const destinationId = pasteDestinationCalendarId(
+        item.calendarId,
+        calendars,
+      );
+      if (!destinationId) {
+        setWriteError('No calendar to paste into');
+        return false;
+      }
+
+      clearWriteError();
+
+      const tempId = newTempEventId();
+      const zone = item.timeZone.trim();
+      const optimistic: CalendarEvent = {
+        id: tempId,
+        calendar_id: destinationId,
+        google_event_id: '',
+        title: item.summary.trim(),
+        description: item.description.trim(),
+        start_time: item.start,
+        end_time: item.end,
+        last_synced_at: new Date().toISOString(),
+        // Source color when it had one, else the destination's palette.
+        color: item.color || colorForCalendar(destinationId),
+        // All-day copies pack into the all-day row; timed copies keep the
+        // source zone so the overlay matches what the server stores.
+        ...(item.isAllDay
+          ? { is_all_day: true }
+          : zone
+            ? { start_time_zone: zone, end_time_zone: zone }
+            : {}),
+      };
+
+      // Paint the copy. Never a draft id and never persistDraft: the title is
+      // already real, so Escape / closeInspector must not discard it or
+      // DELETE the in-flight server row.
+      queue.upsert(optimistic);
+      setSelectedEventId(tempId);
+      setFocusTitleOnOpen(false);
+
+      try {
+        const result = await createEvent.mutateAsync(
+          pasteCreateInput(item, destinationId),
+        );
+
+        // User cut / deleted / discarded the chip while the POST was in
+        // flight — do not cache-write; DELETE the just-created server row so
+        // Google has no ghost. Same discard branch as persistDraft.
+        const after = queue.getOverlay(tempId);
+        if (!after || after.op === 'delete') {
+          queue.clear(tempId);
+          setSelectedEventId((prev) => {
+            if (prev !== tempId) return prev;
+            setFocusTitleOnOpen(false);
+            return null;
+          });
+          void deleteEvent.mutateAsync(result.event.id).then(() => {
+            removeCalendarEventFromCache(result.event.id);
+          });
+          // Abandoned paste: item.cutSourceId is untouched, so a retry can
+          // still remove the cut source.
+          return false;
+        }
+
+        // Remap selection before clearing the overlay so selectedEvent never
+        // resolves null for the temp id (the effect would close the inspector).
+        setSelectedEventId((prev) =>
+          prev === tempId ? result.event.id : prev,
+        );
+        queue.clear(tempId);
+        upsertCalendarEventInCache(result.event);
+      } catch (err) {
+        queue.clear(tempId);
+        setSelectedEventId((prev) => {
+          if (prev !== tempId) return prev;
+          setFocusTitleOnOpen(false);
+          return null;
+        });
+        reportWriteError("Couldn't create event", err);
+        // The cut source was never touched, so a failed paste costs nothing.
+        return false;
+      }
+
+      const cutId = item.cutSourceId;
+      // Not a cut (or a temp source with no persisted row): no source was
+      // deleted, so the page has nothing to clear.
+      if (!cutId || isTempEventId(cutId)) return false;
+      // Second paste of the same cut: the first one already started the
+      // delete, so report false rather than claim a second removal.
+      if (cutRemovalsStartedRef.current.has(cutId)) return false;
+      cutRemovalsStartedRef.current.add(cutId);
+
+      // Same steps as the persisted branch of handleDeleteEvent — keep the
+      // two in sync. Only the selection check differs: the paste already
+      // moved it to the new chip, so the source is usually not selected.
+      patchQueue.cancel(cutId);
+      queue.remove(cutId);
+      setSelectedEventId((prev) => {
+        if (prev !== cutId) return prev;
+        setFocusTitleOnOpen(false);
+        return null;
+      });
+
+      try {
+        await deleteEvent.mutateAsync(cutId);
+        removeCalendarEventFromCache(cutId);
+        queue.clear(cutId);
+      } catch (err) {
+        // Clear the delete overlay so the source reappears from the server.
+        queue.clear(cutId);
+        cutRemovalsStartedRef.current.delete(cutId);
+        reportWriteError("Couldn't remove the cut event", err);
+        return false;
+      }
+
+      return true;
+    },
+    [
+      calendars,
+      clearWriteError,
+      createEvent,
+      deleteEvent,
+      patchQueue,
+      queue,
+      reportWriteError,
+    ],
+  );
+
+  /**
+   * Cmd/Ctrl+D: clone the selection through the paste path without touching
+   * the clipboard. True means the key was ours even if the clone later fails.
+   */
+  const duplicateSelected = useCallback((): boolean => {
+    const item = clipboardItemFromEvent(selectedEvent);
+    if (!item) return false;
+    // A duplicate is never a cut: the source stays where it is.
+    void pasteFromClipboard({ ...item, cutSourceId: null });
+    return true;
+  }, [selectedEvent, pasteFromClipboard]);
+
   const knownCalendarIds = useMemo(
     () => new Set(calendars.map((c) => c.id)),
     [calendars],
@@ -1015,6 +1225,7 @@ export function useCalendarSession({
     draggingEventId,
     handleSelectChip,
     selectEvent,
+    beginDraft,
     isDragging: drag.isDragging,
     onColumnPointerDown: drag.onColumnPointerDown,
     onChipPointerDown: drag.onChipPointerDown,
@@ -1039,5 +1250,10 @@ export function useCalendarSession({
     handleSaveCalendar,
     handleDeleteEvent,
     isDeleting: deleteEvent.isPending,
+
+    // In-memory clipboard (Cmd/Ctrl+C / X / V / D)
+    cutForClipboard,
+    pasteFromClipboard,
+    duplicateSelected,
   };
 }

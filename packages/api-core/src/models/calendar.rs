@@ -461,6 +461,18 @@ pub struct NewEventInput {
     /// shared map when `None`. Never patched when the task later changes.
     #[serde(default)]
     pub difficulty: Option<String>,
+    /// When `Some(true)`, `start`/`end` are written as Google all-day `date`
+    /// fields (civil `YYYY-MM-DD`); both must carry an extractable civil date
+    /// (bare `YYYY-MM-DD` or an RFC 3339 date prefix). `Some(false)` or
+    /// omitted is the timed `dateTime` path, identical to `None`.
+    #[serde(default)]
+    pub is_all_day: Option<bool>,
+    /// IANA zone stamped as `timeZone` on both the start and end objects on
+    /// the timed path. Never emitted on all-day date objects. Empty /
+    /// whitespace-only after trim is omitted; the zone is not validated
+    /// against the IANA database.
+    #[serde(default)]
+    pub start_time_zone: Option<String>,
 }
 
 
@@ -600,6 +612,19 @@ mod tests {
         assert_eq!(event.google_etag, "");
         assert_eq!(event.recurrence, "");
         assert_eq!(event.task_id, "", "NULL task_id maps to empty string");
+    }
+
+    #[test]
+    fn new_event_input_defaults_all_day_and_time_zone_to_none() {
+        let input: NewEventInput = serde_json::from_str(
+            r#"{
+                "calendar_id": "cal-1", "summary": "Standup",
+                "start": "2026-08-19T09:00:00Z", "end": "2026-08-19T09:30:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(input.is_all_day, None);
+        assert_eq!(input.start_time_zone, None);
     }
 
 }

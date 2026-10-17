@@ -1118,6 +1118,8 @@ fn task_segment_input(
         // Create-time snapshot of the task's P/D — never patched later.
         priority: Some(task.priority.clone()),
         difficulty: Some(task.difficulty.clone()),
+        is_all_day: None,
+        start_time_zone: None,
     }
 }
 

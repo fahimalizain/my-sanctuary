@@ -17,7 +17,9 @@ import {
   colorForCalendar,
   eventHeightPx,
   eventTopPx,
+  isSameDay,
   lastOccupiedCivilDate,
+  minutesSinceMidnight,
   packAllDayLanes,
   packDayEvents,
   startOfDay,
@@ -35,6 +37,69 @@ export function dayNameShort(date: Date): string {
  */
 export function clickCreateTimesFromSlot(slot: DragSlot): TimedRange {
   return toTimedRange(slot);
+}
+
+/** Keyboard create lands on the next half-hour, not on the 1-minute grid. */
+const KEYBOARD_CREATE_STEP_MIN = 30;
+
+/** Create slot on the first visible day when today is off-screen. */
+const KEYBOARD_CREATE_FALLBACK_MIN = 9 * 60;
+
+export interface KeyboardCreateRangeInput {
+  now: Date;
+  visibleStart: Date;
+  periodLength: number;
+}
+
+/**
+ * Timed create slot for the bare `C` shortcut.
+ *
+ * When the now-line's civil day is visible, start on the next 30-minute
+ * boundary (exact boundaries stay put) and reuse `toTimedRange`, so a late
+ * ceil such as 23:50 → 24:00 is pulled back to 23:30–24:00 instead of
+ * spilling into the next day. Otherwise the first visible day at 09:00.
+ * Invalid dates fall back so a malformed clock can never throw or produce
+ * NaN instants.
+ */
+export function keyboardCreateRange({
+  now,
+  visibleStart,
+  periodLength,
+}: KeyboardCreateRangeInput): TimedRange {
+  if (!Number.isFinite(visibleStart.getTime())) {
+    return toTimedRange({
+      day: new Date(0),
+      minutes: KEYBOARD_CREATE_FALLBACK_MIN,
+    });
+  }
+  if (!Number.isFinite(now.getTime())) {
+    return toTimedRange({
+      day: visibleStart,
+      minutes: KEYBOARD_CREATE_FALLBACK_MIN,
+    });
+  }
+
+  let todayVisible = false;
+  const dayCount = Number.isFinite(periodLength) ? Math.trunc(periodLength) : 0;
+  for (let i = 0; i < dayCount; i += 1) {
+    if (isSameDay(addDays(visibleStart, i), now)) {
+      todayVisible = true;
+      break;
+    }
+  }
+
+  if (!todayVisible) {
+    return toTimedRange({
+      day: visibleStart,
+      minutes: KEYBOARD_CREATE_FALLBACK_MIN,
+    });
+  }
+
+  // Seconds count: 10:30:00 is exact, 10:30:01 rolls to 11:00.
+  const minutes =
+    Math.ceil(minutesSinceMidnight(now) / KEYBOARD_CREATE_STEP_MIN) *
+    KEYBOARD_CREATE_STEP_MIN;
+  return toTimedRange({ day: now, minutes });
 }
 
 /** Category color from the API when present; otherwise hash the calendar id. */

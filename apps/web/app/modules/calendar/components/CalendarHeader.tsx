@@ -36,8 +36,20 @@ export function CalendarHeader({
 
       <ViewSelector periodLength={periodLength} onChange={onPeriodChange} />
 
-      <Button variant="outline" size="sm" onClick={onToday}>
+      <Button
+        variant="outline"
+        size="sm"
+        className="gap-1.5"
+        onClick={onToday}
+        aria-keyshortcuts="T"
+      >
         Today
+        <span
+          className="text-xs text-muted-foreground tabular-nums"
+          aria-hidden
+        >
+          T
+        </span>
       </Button>
       <Button
         variant="outline"
@@ -45,6 +57,7 @@ export function CalendarHeader({
         className="h-8 w-8"
         onClick={onPrevPeriod}
         aria-label="Previous period"
+        aria-keyshortcuts="["
       >
         <ChevronLeft className="h-4 w-4" />
       </Button>
@@ -54,6 +67,7 @@ export function CalendarHeader({
         className="h-8 w-8"
         onClick={onNextPeriod}
         aria-label="Next period"
+        aria-keyshortcuts="]"
       >
         <ChevronRight className="h-4 w-4" />
       </Button>

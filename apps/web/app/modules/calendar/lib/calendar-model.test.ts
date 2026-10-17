@@ -10,6 +10,7 @@ import {
   clickCreateTimesFromSlot,
   dayNameShort,
   eventChipColor,
+  keyboardCreateRange,
 } from './calendar-model';
 import { colorForCalendar } from './week-layout';
 
@@ -80,6 +81,101 @@ test('clickCreateTimesFromSlot: 9:00 slot → 30 min range on that day', () => {
   assert.equal(range.end.getHours(), 9);
   assert.equal(range.end.getMinutes(), 30);
   assert.equal(range.end.getTime() - range.start.getTime(), 30 * 60 * 1000);
+});
+
+// ── keyboardCreateRange ────────────────────────────────────────────────
+
+test('keyboardCreateRange: today visible → next half-hour on today, not visibleStart', () => {
+  const visibleStart = new Date(2026, 8, 7); // Mon Sep 7
+  const now = new Date(2026, 8, 8, 10, 7, 0); // Tue Sep 8 10:07
+  const range = keyboardCreateRange({ now, visibleStart, periodLength: 3 });
+  assert.equal(range.start.getDate(), 8);
+  assert.equal(range.start.getHours(), 10);
+  assert.equal(range.start.getMinutes(), 30);
+  assert.equal(range.end.getHours(), 11);
+  assert.equal(range.end.getMinutes(), 0);
+  assert.equal(range.end.getTime() - range.start.getTime(), 30 * 60_000);
+});
+
+test('keyboardCreateRange: an exact 10:30:00 boundary stays at 10:30', () => {
+  const visibleStart = new Date(2026, 8, 8);
+  const now = new Date(2026, 8, 8, 10, 30, 0);
+  const range = keyboardCreateRange({ now, visibleStart, periodLength: 1 });
+  assert.equal(range.start.getHours(), 10);
+  assert.equal(range.start.getMinutes(), 30);
+  assert.equal(range.end.getHours(), 11);
+  assert.equal(range.end.getMinutes(), 0);
+});
+
+test('keyboardCreateRange: a second past the boundary rolls to the next half-hour', () => {
+  const visibleStart = new Date(2026, 8, 8);
+  const now = new Date(2026, 8, 8, 10, 30, 1);
+  const range = keyboardCreateRange({ now, visibleStart, periodLength: 1 });
+  assert.equal(range.start.getHours(), 11);
+  assert.equal(range.start.getMinutes(), 0);
+  assert.equal(range.end.getHours(), 11);
+  assert.equal(range.end.getMinutes(), 30);
+});
+
+test('keyboardCreateRange: a 23:50 ceil is pulled back to 23:30–24:00', () => {
+  const visibleStart = new Date(2026, 8, 8);
+  const now = new Date(2026, 8, 8, 23, 50, 0);
+  const range = keyboardCreateRange({ now, visibleStart, periodLength: 1 });
+  assert.equal(range.start.getDate(), 8);
+  assert.equal(range.start.getHours(), 23);
+  assert.equal(range.start.getMinutes(), 30);
+  // End is midnight of the next civil day, not 24:00 on this one.
+  assert.equal(range.end.getDate(), 9);
+  assert.equal(range.end.getHours(), 0);
+  assert.equal(range.end.getMinutes(), 0);
+  assert.equal(range.end.getTime() - range.start.getTime(), 30 * 60_000);
+});
+
+test('keyboardCreateRange: today off-screen → 09:00 on visibleStart', () => {
+  const visibleStart = new Date(2026, 8, 1);
+  const now = new Date(2026, 8, 8, 10, 7, 0);
+  const range = keyboardCreateRange({ now, visibleStart, periodLength: 3 });
+  assert.equal(range.start.getDate(), 1);
+  assert.equal(range.start.getMonth(), 8);
+  assert.equal(range.start.getHours(), 9);
+  assert.equal(range.start.getMinutes(), 0);
+  assert.equal(range.end.getHours(), 9);
+  assert.equal(range.end.getMinutes(), 30);
+});
+
+test('keyboardCreateRange: a one-day period uses the clock when that day is today', () => {
+  const visibleStart = new Date(2026, 8, 8);
+  const now = new Date(2026, 8, 8, 14, 7, 0);
+  const range = keyboardCreateRange({ now, visibleStart, periodLength: 1 });
+  assert.equal(range.start.getHours(), 14);
+  assert.equal(range.start.getMinutes(), 30);
+  assert.equal(range.end.getHours(), 15);
+  assert.equal(range.end.getMinutes(), 0);
+});
+
+test('keyboardCreateRange: invalid inputs fall back to a finite 09:00 range', () => {
+  const epoch = new Date(0);
+  const doubledInvalid = keyboardCreateRange({
+    now: new Date(Number.NaN),
+    visibleStart: new Date(Number.NaN),
+    periodLength: 7,
+  });
+  assert.equal(doubledInvalid.start.toDateString(), epoch.toDateString());
+  assert.equal(doubledInvalid.start.getHours(), 9);
+  assert.equal(doubledInvalid.start.getMinutes(), 0);
+  assert.equal(doubledInvalid.end.getHours(), 9);
+  assert.equal(doubledInvalid.end.getMinutes(), 30);
+
+  const visibleStart = new Date(2026, 8, 8);
+  const onlyNowInvalid = keyboardCreateRange({
+    now: new Date(Number.NaN),
+    visibleStart,
+    periodLength: 7,
+  });
+  assert.equal(onlyNowInvalid.start.getDate(), 8);
+  assert.equal(onlyNowInvalid.start.getHours(), 9);
+  assert.equal(onlyNowInvalid.start.getMinutes(), 0);
+  assert.equal(onlyNowInvalid.end.getMinutes(), 30);
 });
 
 // ── buildEventsByDay ────────────────────────────────────────────────────

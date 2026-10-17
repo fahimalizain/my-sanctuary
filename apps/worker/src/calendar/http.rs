@@ -340,7 +340,11 @@ pub async fn repair_calendar(
 
 /// `POST /api/calendar/events` → 200 `{"event":{...},"source":"google"}`.
 ///
-/// Body: `{calendar_id, summary, description?, start, end}`. Journals the
+/// Body: `{calendar_id, summary, description?, start, end, is_all_day?,
+/// start_time_zone?}`. `is_all_day: true` writes civil `start.date` /
+/// `end.date` (both start and end must carry a civil date, else 400); the
+/// default timed path keeps `dateTime` and stamps a non-empty trimmed
+/// `start_time_zone` as `timeZone` on both objects. Journals the
 /// outbound insert, creates the event on Google, then upserts the returned
 /// row into the cache. A cache failure after Google commit is 500
 /// (`CalendarError::Repo`) — never 200 with a phantom local id.

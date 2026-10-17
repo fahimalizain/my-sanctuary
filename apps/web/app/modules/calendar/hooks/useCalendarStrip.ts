@@ -1,6 +1,5 @@
 import {
   useCallback,
-  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -721,37 +720,6 @@ export function useCalendarStrip(): CalendarStrip {
     },
     [visibleStart, today, jumpToVisibleStart],
   );
-
-  // Notion-style period shortcuts (ignore when typing in a field).
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const t = e.target;
-      if (t instanceof HTMLElement) {
-        const tag = t.tagName;
-        if (
-          tag === 'INPUT' ||
-          tag === 'TEXTAREA' ||
-          tag === 'SELECT' ||
-          t.isContentEditable
-        ) {
-          return;
-        }
-      }
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-
-      const key = e.key;
-      let next: number | null = null;
-      if (key === '1' || key === 'd' || key === 'D') next = 1;
-      else if (key === 'w' || key === 'W' || key === '0') next = 7;
-      else if (key >= '2' && key <= '6') next = Number(key);
-
-      if (next === null) return;
-      e.preventDefault();
-      handlePeriodChange(next);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handlePeriodChange]);
 
   return {
     periodLength,

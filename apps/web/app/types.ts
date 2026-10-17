@@ -123,6 +123,10 @@ export interface NewCalendarEventInput {
   start: string;
   /** RFC 3339 dateTime. */
   end: string;
+  /** When true, start/end are civil dates written as Google `date`. */
+  is_all_day?: boolean;
+  /** IANA zone stamped on timed start/end `timeZone`; ignored for all-day. */
+  start_time_zone?: string;
 }
 
 // Envelope for POST /api/calendar/events and PATCH /api/calendar/events/:id

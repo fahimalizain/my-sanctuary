@@ -1300,6 +1300,8 @@ pub async fn start_occurrence(
             sanctuary_focus: false,
             priority: None,
             difficulty: None,
+            is_all_day: None,
+            start_time_zone: None,
         },
         now_unix,
     )
