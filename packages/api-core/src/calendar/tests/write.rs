@@ -179,6 +179,22 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
     assert_eq!(body["description"], "About things");
     assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z");
     assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z");
+    assert!(
+        body["start"].get("timeZone").is_none(),
+        "the default timed path never grows a zone: {body}"
+    );
+    assert!(
+        body["start"].get("date").is_none(),
+        "the default timed path never grows a date key: {body}"
+    );
+    assert!(
+        body["end"].get("timeZone").is_none(),
+        "the default timed path never grows a zone: {body}"
+    );
+    assert!(
+        body["end"].get("date").is_none(),
+        "the default timed path never grows a date key: {body}"
+    );
     assert_eq!(body["id"], output.event.google_event_id);
     assert_eq!(
         body["extendedProperties"]["shared"]["sanctuary_event_id"],
@@ -212,6 +228,174 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
     assert_eq!(op.calendar_id, "cal-1");
     assert!(!op.payload_fingerprint.is_empty());
     assert_eq!(op.google_etag, "e1");
+}
+
+#[test]
+fn create_all_day_posts_civil_dates_not_date_time() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    let mut input = input();
+    input.is_all_day = Some(true);
+    input.start = "2026-09-08T00:00:00Z".to_string();
+    input.end = "2026-09-09T00:00:00Z".to_string();
+
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap();
+
+    let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // Google's exclusive end is already what we store — never shifted.
+    assert_eq!(body["start"]["date"], "2026-09-08", "{body}");
+    assert_eq!(body["end"]["date"], "2026-09-09", "{body}");
+    assert!(body["start"].get("dateTime").is_none(), "{body}");
+    assert!(body["end"].get("dateTime").is_none(), "{body}");
+    assert!(body["start"].get("timeZone").is_none(), "{body}");
+    assert!(body["end"].get("timeZone").is_none(), "{body}");
+}
+
+#[test]
+fn create_all_day_ignores_start_time_zone() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    let mut input = input();
+    input.is_all_day = Some(true);
+    input.start = "2026-09-08T00:00:00Z".to_string();
+    input.end = "2026-09-09T00:00:00Z".to_string();
+    input.start_time_zone = Some("Asia/Riyadh".to_string());
+
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap();
+
+    let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["start"]["date"], "2026-09-08", "{body}");
+    assert_eq!(body["end"]["date"], "2026-09-09", "{body}");
+    assert!(body["start"].get("timeZone").is_none(), "{body}");
+    assert!(body["end"].get("timeZone").is_none(), "{body}");
+    assert!(body["start"].get("dateTime").is_none(), "{body}");
+    assert!(body["end"].get("dateTime").is_none(), "{body}");
+}
+
+#[test]
+fn create_timed_with_time_zone_stamps_both_ends() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    let mut input = input();
+    input.start_time_zone = Some("Asia/Riyadh".to_string());
+
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap();
+
+    let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z", "{body}");
+    assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z", "{body}");
+    assert_eq!(body["start"]["timeZone"], "Asia/Riyadh", "{body}");
+    assert_eq!(body["end"]["timeZone"], "Asia/Riyadh", "{body}");
+}
+
+#[test]
+fn create_timed_with_blank_time_zone_omits_the_key() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    let mut input = input();
+    input.start_time_zone = Some("  ".to_string());
+
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap();
+
+    let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z", "{body}");
+    assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z", "{body}");
+    assert!(body["start"].get("timeZone").is_none(), "{body}");
+    assert!(body["end"].get("timeZone").is_none(), "{body}");
+}
+
+#[test]
+fn create_with_is_all_day_false_stays_timed() {
+    let http = FakeHttp::new(vec![(
+        "/calendars/primary%40example.com/events",
+        200,
+        CREATED_JSON,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    let mut input = input();
+    input.is_all_day = Some(false);
+
+    pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap();
+
+    let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["start"]["dateTime"], "2026-08-19T09:00:00Z", "{body}");
+    assert_eq!(body["end"]["dateTime"], "2026-08-19T10:00:00Z", "{body}");
+    assert!(body["start"].get("date").is_none(), "{body}");
+    assert!(body["end"].get("date").is_none(), "{body}");
+}
+
+#[test]
+fn create_all_day_with_non_civil_start_is_invalid_before_journal() {
+    // Empty route list: any Google call would panic, so reaching Invalid
+    // proves the validation ran before the POST.
+    let http = FakeHttp::new(vec![]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "primary@example.com", true)]);
+    let events = FakeEventRepo::new();
+    let ops = FakeOperationRepo::new();
+    let mut input = input();
+    input.is_all_day = Some(true);
+    input.start = "nope".to_string();
+
+    let err = pollster::block_on(create_event(
+        &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+    ))
+    .unwrap_err();
+
+    assert!(matches!(err, CalendarError::Invalid(_)), "{err:?}");
+    assert!(
+        http.posts.lock().unwrap().is_empty(),
+        "all-day with a non-civil start never reaches Google"
+    );
+    assert!(
+        ops.inserted.lock().unwrap().is_empty(),
+        "no journal row is written for the rejected create"
+    );
 }
 
 #[test]

@@ -28,7 +28,7 @@ pub(crate) const IF_MATCH_MAX_ATTEMPTS: u32 = 3;
 /// Extract a civil `YYYY-MM-DD` from a patch start/end value.
 /// Accepts bare `YYYY-MM-DD` or RFC 3339 (leading date prefix before `T`).
 /// Invalid → None.
-fn civil_date_from_patch_value(value: &str) -> Option<String> {
+pub(crate) fn civil_date_from_patch_value(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.len() < 10 {
         return None;

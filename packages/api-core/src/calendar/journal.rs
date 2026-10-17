@@ -14,6 +14,7 @@ use super::apply::{map_google_event, row_from_new_event, GoogleEvent};
 use super::google::encode_path_segment;
 use super::labels::CachedEventLabel;
 use super::write::{build_shared_properties, CreateEventOutput};
+use super::write_journal::civil_date_from_patch_value;
 use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use crate::google_color::snap_to_event_label_hex;
 use crate::models::{
@@ -56,6 +57,56 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Start/end Google objects for a journaled insert, following the patch rule
+/// in [`super::write_journal::build_patch_payload`]: all-day (`is_all_day:
+/// Some(true)`) emits civil `date` objects and requires both values to yield
+/// a civil date through the shared extractor (end passed through unchanged —
+/// Google's exclusive end is already what we store). Timed emits the given
+/// `dateTime`, plus a non-empty trimmed `start_time_zone` as `timeZone` on
+/// both.
+///
+/// All-day without an extractable civil date on either side is
+/// [`CalendarError::Invalid`] before any journal row or Google POST.
+fn build_insert_times(
+    input: &NewEventInput,
+) -> Result<(serde_json::Value, serde_json::Value), CalendarError> {
+    if input.is_all_day == Some(true) {
+        let start = civil_date_from_patch_value(&input.start).ok_or_else(|| {
+            CalendarError::Invalid(format!(
+                "all-day event start is not a civil date: {}",
+                input.start
+            ))
+        })?;
+        let end = civil_date_from_patch_value(&input.end).ok_or_else(|| {
+            CalendarError::Invalid(format!(
+                "all-day event end is not a civil date: {}",
+                input.end
+            ))
+        })?;
+        return Ok((
+            serde_json::json!({ "date": start }),
+            serde_json::json!({ "date": end }),
+        ));
+    }
+
+    let tz = input
+        .start_time_zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (start, end) = match tz {
+        Some(zone) => (
+            serde_json::json!({ "dateTime": input.start, "timeZone": zone }),
+            serde_json::json!({ "dateTime": input.end, "timeZone": zone }),
+        ),
+        None => (
+            serde_json::json!({ "dateTime": input.start }),
+            serde_json::json!({ "dateTime": input.end }),
+        ),
+    };
+    Ok((start, end))
+}
+
 /// Journaled `events.insert`: persist the outbound op before Google, reuse a
 /// client-supplied event id, treat 409 as success via GET, and return the
 /// V2 persisted local id (never a phantom).
@@ -79,11 +130,14 @@ pub(crate) async fn create_event_with_journal(
     let minted_id = mint_google_event_id();
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
 
+    // Validated before the journal row: an all-day create with a non-civil
+    // start/end never reaches Google and leaves no pending operation.
+    let (start, end) = build_insert_times(input)?;
     let mut payload = serde_json::json!({
         "id": minted_id,
         "summary": input.summary,
-        "start": { "dateTime": input.start },
-        "end": { "dateTime": input.end },
+        "start": start,
+        "end": end,
     });
     // Notes are the event's `description`; absent notes omit the key entirely
     // (never `"description": null`). `Some("")` is an explicit empty string.
