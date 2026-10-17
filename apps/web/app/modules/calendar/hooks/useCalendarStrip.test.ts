@@ -524,9 +524,10 @@ test('useCalendarStrip: drag taking the strip drops the swipe mid-gesture', asyn
 // ── Wheel axis latch ────────────────────────────────────────────────────
 // A Mac trackpad adds a small horizontal delta to a vertical two-finger
 // scroll. Mandatory day snap then walks the strip onto the neighbouring day,
-// and — unlike a touch gesture — there is no finger-up to settle on. The
-// sideways component therefore has to be cancelled before the scroller sees
-// it, so the axis is latched per burst and a Y burst is re-applied vertically.
+// and — unlike a touch gesture — there is no finger-up to settle on. A wheel
+// has no `touch-action`, so the sideways component has to be cancelled by the
+// handler: the burst shares touch's dead zone, and a pending or Y burst is
+// re-applied vertically by hand.
 
 /** jsdom has no Element.scrollBy; mirror the browser's relative vertical write. */
 function stubScrollBy(el: HTMLElement): ScrollToOptions[] {
@@ -583,18 +584,15 @@ test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', 
   const scrollByCalls = stubScrollBy(scroller!);
   const left0 = scroller!.scrollLeft;
 
-  // First event of the burst is under the slop: native, and at most half a
-  // column of drift, so mandatory snap settles back on the same day.
-  const underSlop = wheelEvent({ deltaX: 2, deltaY: 6 });
+  // The first event of the burst is in the dead zone: same rules as touch. It
+  // is still consumed, and only its vertical part is re-applied by hand, so no
+  // sideways delta ever reaches the scroller.
+  const deadZone = wheelEvent({ deltaX: 2, deltaY: 6 });
   await act(async () => {
-    scroller!.dispatchEvent(underSlop);
+    scroller!.dispatchEvent(deadZone);
   });
-  assert.equal(
-    underSlop.defaultPrevented,
-    false,
-    'sub-slop drift stays native',
-  );
-  assert.deepEqual(scrollByCalls, []);
+  assert.equal(deadZone.defaultPrevented, true, 'dead-zone drift is swallowed');
+  assert.deepEqual(scrollByCalls, [{ top: 6, behavior: 'instant' }]);
 
   // The accumulated burst now resolves to Y, so every event that carries
   // sideways drift applies its vertical part only.
@@ -613,6 +611,7 @@ test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', 
     'a vertical burst cancels the sideways component',
   );
   assert.deepEqual(scrollByCalls, [
+    { top: 6, behavior: 'instant' },
     { top: 40, behavior: 'instant' },
     { top: 40, behavior: 'instant' },
     { top: 40, behavior: 'instant' },
@@ -634,28 +633,46 @@ test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', 
     scroller!.dispatchEvent(horizontal);
   });
   assert.equal(horizontal.defaultPrevented, false, 'a new burst re-decides');
-  assert.equal(scrollByCalls.length, 3);
+  assert.equal(scrollByCalls.length, 4);
 });
 
-test('useCalendarStrip: a horizontal wheel burst keeps native day paging', async () => {
+test('useCalendarStrip: a horizontal wheel burst stays native only once deliberate', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
   const scrollByCalls = stubScrollBy(scroller!);
+  const left0 = scroller!.scrollLeft;
 
-  // Clear 15:1 horizontal start, then momentum: both stay native.
-  const events = [
-    wheelEvent({ deltaX: -60, deltaY: 4 }),
+  // Under 48px accumulated: the dead zone drops the sideways delta, and with
+  // no vertical part there is nothing to re-apply.
+  const deadZone = [
+    wheelEvent({ deltaX: -20, deltaY: 0 }),
+    wheelEvent({ deltaX: -20, deltaY: 0 }),
+  ];
+  await act(async () => {
+    for (const ev of deadZone) scroller!.dispatchEvent(ev);
+  });
+  assert.deepEqual(
+    deadZone.map((ev) => ev.defaultPrevented),
+    [true, true],
+    'sideways travel under the threshold must not reach the scroller',
+  );
+  assert.deepEqual(scrollByCalls, []);
+  assert.equal(scroller!.scrollLeft, left0, 'no horizontal movement yet');
+
+  // The third event takes the burst to 48px at 12:1: a deliberate swipe, so
+  // it and the rest of the gesture stay native and snap pages the day.
+  const committed = [
+    wheelEvent({ deltaX: -8, deltaY: 0 }),
     wheelEvent({ deltaX: -30, deltaY: 2 }),
   ];
   await act(async () => {
-    for (const ev of events) scroller!.dispatchEvent(ev);
+    for (const ev of committed) scroller!.dispatchEvent(ev);
   });
-
   assert.deepEqual(
-    events.map((ev) => ev.defaultPrevented),
+    committed.map((ev) => ev.defaultPrevented),
     [false, false],
-    'horizontal scrolling and snap paging must stay native',
+    'a committed horizontal burst scrolls and snaps natively',
   );
   assert.deepEqual(scrollByCalls, []);
 });

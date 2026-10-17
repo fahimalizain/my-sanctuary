@@ -527,14 +527,16 @@ export function useCalendarStrip(): CalendarStrip {
   );
 
   // ── Wheel axis gesture ────────────────────────────────────────────────
-  // The same sideways drift, with no finger to lift: a Mac trackpad adds a
-  // little horizontal delta to a vertical two-finger scroll, the mandatory day
-  // snap walks the strip sideways, and there is no release to settle on. A
-  // touch gets its dead zone from `touch-action: pan-y`; a wheel has no such
-  // property, so the sideways component must never reach the scroller at all:
-  // latch the burst's axis, then drop the horizontal part for a vertical burst
-  // — re-applying its vertical delta by hand, since preventing the default
-  // would otherwise swallow the scroll the user asked for.
+  // The same sideways dead zone as touch, with no finger to lift: a Mac
+  // trackpad adds a little horizontal delta to a vertical two-finger scroll,
+  // the mandatory day snap walks the strip sideways, and there is no release to
+  // settle on. A touch gets its dead zone from `touch-action: pan-y`; a wheel
+  // has no such property, so the handler must drop the sideways part itself:
+  // the delta never reaches the scroller until the burst has accumulated a
+  // deliberate, horizontal-dominant swipe. Until then only the vertical part
+  // applies — re-applied by hand, since preventing the default would otherwise
+  // swallow the scroll the user asked for. Sideways travel dropped in the dead
+  // zone is simply lost, never caught up.
   const wheelBurstRef = useRef<WheelBurst>(EMPTY_WHEEL_BURST);
 
   const onWheel = useCallback((e: WheelEvent) => {
@@ -557,17 +559,16 @@ export function useCalendarStrip(): CalendarStrip {
     });
     wheelBurstRef.current = burst;
 
-    // `pending` (under the slop, so at most half a column of drift — mandatory
-    // snap settles back on the same day) and `x` (native horizontal scroll and
-    // day paging) both stay native.
-    if (burst.axis !== 'y') return;
+    // `x`: a deliberate sideways swipe, so native horizontal scroll takes it and
+    // mandatory snap pages the days as before.
+    if (burst.axis === 'x') return;
     // deltaX 0 is an ordinary mouse wheel: exactly the pre-fix behaviour.
     if (e.deltaX === 0) return;
 
-    // Vertical burst carrying sideways drift: consume the event and apply the
-    // vertical part ourselves, so `scrollLeft` never moves under the day snap.
+    // `pending` (dead zone) or `y`: consume the event and apply the vertical
+    // part only, so `scrollLeft` never moves under the day snap.
     e.preventDefault();
-    scroller.scrollBy({ top: dyPx, behavior: 'instant' });
+    if (dyPx !== 0) scroller.scrollBy({ top: dyPx, behavior: 'instant' });
   }, []);
 
   // The scroller is always mounted, so this attaches once per layout change.

@@ -505,29 +505,6 @@ export function swipeTargetIndex({
 // ── Wheel scroll axis ───────────────────────────────────────────────────
 
 /**
- * Movement (px) a wheel burst must exceed before it commits to an axis.
- * Separate from the touch dead zone: a trackpad burst arrives as many small
- * events and needs a much smaller slop to classify in time.
- */
-export const WHEEL_AXIS_SLOP = 8;
-
-/**
- * Dominant axis of a wheel burst from its accumulated delta: `pending` under
- * the slop, `x` past 2:1, `y` otherwise. This is the pre-swipe classifier,
- * kept for the wheel path only — the touch path has its own dead-zone rules.
- */
-export function classifyWheelAxis(
-  dx: number,
-  dy: number,
-  slop: number = WHEEL_AXIS_SLOP,
-): ScrollAxis {
-  const adx = Math.abs(dx);
-  const ady = Math.abs(dy);
-  if (adx <= slop && ady <= slop) return 'pending';
-  return adx > ady * 2 ? 'x' : 'y';
-}
-
-/**
  * Line box (px) assumed for `deltaMode === 1` (line) wheel deltas.
  * Mirrors `zoomFactorFromWheel` in calendar-zoom so both wheel paths read the
  * same device delta the same way.
@@ -564,7 +541,7 @@ export function wheelDeltaPx(
 
 /** Latched wheel burst: committed axis, accumulated px, last event time. */
 export interface WheelBurst {
-  /** `pending` until the burst's accumulated delta crosses the slop. */
+  /** `pending` until the accumulated delta leaves the dead zone. */
   axis: ScrollAxis;
   sumX: number;
   sumY: number;
@@ -584,10 +561,16 @@ export const EMPTY_WHEEL_BURST: WheelBurst = {
  * Fold one wheel event (px deltas + `timeStamp`) into the burst latch.
  *
  * A Mac trackpad puts a little horizontal delta on a nominally vertical
- * two-finger scroll. The axis is decided from the *accumulated* burst — one
- * event alone is noisy — and then latched: momentum keeps arriving after the
- * fingers lift, so a vertical burst that later turns horizontal-heavy must not
- * hand the strip back to native snap mid-gesture.
+ * two-finger scroll. The burst is classified with the same dead-zone rules as
+ * a touch gesture (`classifyScrollAxis`), against its *accumulated* delta — one
+ * event alone is noisy. It therefore stays `pending` until it has accumulated
+ * a deliberate, horizontal-dominant swipe (`SCROLL_X_THRESHOLD_PX`, better than
+ * 2:1) or is clearly vertical (`SCROLL_Y_SLOP_PX`), and the sideways drift of a
+ * `pending` or `y` burst never reaches the scroller.
+ *
+ * The axis is then latched: momentum keeps arriving after the fingers lift, so
+ * a vertical burst that later turns horizontal-heavy must not hand the strip
+ * back to native snap mid-gesture.
  *
  * A gap over `WHEEL_BURST_IDLE_MS` starts a fresh burst (sums and axis reset).
  * The comparison is NaN-safe: an unusable timestamp counts as a new burst,
@@ -603,7 +586,7 @@ export function nextWheelBurst(
   const sumX = (fresh ? 0 : prev.sumX) + dx;
   const sumY = (fresh ? 0 : prev.sumY) + dy;
   let axis = fresh ? 'pending' : prev.axis;
-  if (axis === 'pending') axis = classifyWheelAxis(sumX, sumY);
+  if (axis === 'pending') axis = classifyScrollAxis(sumX, sumY);
   return { axis, sumX, sumY, lastT: event.t };
 }
 

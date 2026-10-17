@@ -20,14 +20,12 @@ import {
   SWIPE_PROJECTION_MS,
   SWIPE_VELOCITY_WINDOW_MS,
   TIME_GUTTER_W,
-  WHEEL_AXIS_SLOP,
   WHEEL_BURST_IDLE_MS,
   WHEEL_LINE_PX,
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
   classifyScrollAxis,
-  classifyWheelAxis,
   nextWheelBurst,
   parseStoredPeriodLength,
   swipeTargetIndex,
@@ -635,19 +633,6 @@ test('swipeTargetIndex: clamps to the rendered strip edges', () => {
   );
 });
 
-// ── classifyWheelAxis ───────────────────────────────────────────────────
-
-test('classifyWheelAxis: keeps the pre-swipe 8px slop for bursts', () => {
-  assert.equal(WHEEL_AXIS_SLOP, 8);
-  assert.equal(classifyWheelAxis(4, 8), 'pending');
-  assert.equal(classifyWheelAxis(5, 10), 'y');
-  assert.equal(classifyWheelAxis(21, 10), 'x');
-  // A deliberate touch threshold must not leak into the wheel burst.
-  assert.equal(classifyWheelAxis(60, 0), 'x');
-  assert.equal(classifyScrollAxis(60, 0), 'x');
-  assert.equal(classifyWheelAxis(0, 11), 'y', 'wheel commits long before 48px');
-});
-
 // ── wheelDeltaPx ────────────────────────────────────────────────────────
 
 test('wheelDeltaPx: pixel deltas pass through untouched', () => {
@@ -702,45 +687,92 @@ test('nextWheelBurst: an idle gap starts a new burst with fresh sums and axis', 
   assert.equal(restarted.lastT, 1250);
 });
 
-test('nextWheelBurst: stays pending while the burst is under the slop', () => {
+test('nextWheelBurst: stays pending in the sideways dead zone', () => {
   let burst: WheelBurst = EMPTY_WHEEL_BURST;
-  for (let i = 0; i < 4; i++) {
-    burst = nextWheelBurst(burst, { dx: 1, dy: 2, t: 1000 + i * 10 });
+  // A slow trackpad drift: 4px sideways, 1px down per event. Short of the
+  // 48px deliberate swipe and too flat to commit vertical.
+  for (let i = 0; i < 10; i++) {
+    burst = nextWheelBurst(burst, { dx: 4, dy: 1, t: 1000 + i * 8 });
   }
-  assert.equal(burst.axis, 'pending', '4× (1, 2) is still under 8px');
-  assert.equal(burst.sumX, 4);
-  assert.equal(burst.sumY, 8);
+  assert.equal(burst.axis, 'pending');
+  assert.equal(burst.sumX, 40, 'still under the 48px swipe threshold');
+  assert.equal(burst.sumY, 10, 'exactly at the vertical slop commits nothing');
 
-  // The 5th event crosses the slop on the accumulated delta and commits.
-  burst = nextWheelBurst(burst, { dx: 1, dy: 2, t: 1050 });
-  assert.equal(burst.axis, 'y');
-  assert.equal(burst.sumX, 5);
-  assert.equal(burst.sumY, 10);
+  // 44px across and 11px down: vertical travel past the slop, but the sideways
+  // delta is dominant, so it is not a time scroll either. Still the dead zone.
+  burst = nextWheelBurst(burst, { dx: 4, dy: 1, t: 1090 });
+  assert.equal(burst.axis, 'pending');
+  assert.equal(burst.sumX, 44);
+
+  // Under the threshold even with zero vertical: nothing moves sideways yet.
+  let flat: WheelBurst = EMPTY_WHEEL_BURST;
+  flat = nextWheelBurst(flat, { dx: -47, dy: 0, t: 0 });
+  assert.equal(flat.axis, 'pending', '47px is one short of a deliberate swipe');
+  flat = nextWheelBurst(flat, { dx: -1, dy: 0, t: 8 });
+  assert.equal(flat.axis, 'x', 'the burst commits on the accumulated delta');
+  assert.equal(flat.sumX, -48);
 });
 
-test('nextWheelBurst: latches x on a clear horizontal start and keeps it', () => {
-  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: -60, dy: 4, t: 0 });
-  assert.equal(first.axis, 'x');
+test('nextWheelBurst: latches y past the vertical slop and keeps it', () => {
+  // Exactly at the 10px slop claims no axis.
+  const atSlop = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 4, dy: 10, t: 0 });
+  assert.equal(atSlop.axis, 'pending');
+
+  // One more pixel down, with the sideways delta still under 2:1: vertical.
+  const vertical = nextWheelBurst(atSlop, { dx: 4, dy: 1, t: 16 });
+  assert.equal(vertical.axis, 'y');
+
+  // Horizontal-heavy momentum within the same burst would classify as x on its
+  // own; the latch must hold — re-deciding here would hand the strip back to
+  // native snap mid-gesture.
+  const latched = nextWheelBurst(vertical, { dx: 200, dy: 0, t: 32 });
+  assert.equal(latched.axis, 'y');
+  assert.equal(latched.sumX, 208);
+  assert.equal(latched.sumY, 11);
+});
+
+test('nextWheelBurst: latches x only on a deliberate horizontal-dominant swipe', () => {
+  // A fast horizontal burst still has to accumulate the full 48px.
+  let burst = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: -30, dy: 2, t: 0 });
+  assert.equal(burst.axis, 'pending', '30px is short of a deliberate swipe');
+  assert.equal(burst.sumX, -30);
+
+  burst = nextWheelBurst(burst, { dx: -17, dy: 2, t: 8 });
+  assert.equal(burst.axis, 'pending', '47px is still short');
+
+  burst = nextWheelBurst(burst, { dx: -1, dy: 0, t: 16 });
+  assert.equal(burst.axis, 'x', '48px across with 4px down is a swipe');
+  assert.equal(burst.sumX, -48);
+  assert.equal(burst.sumY, 4);
+
+  // Long but diagonal: an exact 2:1 tie stays vertical, not a day pager.
+  const diagonal = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 60, dy: 30, t: 0 });
+  assert.equal(diagonal.axis, 'y');
+  const justPast = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 61, dy: 30, t: 0 });
+  assert.equal(justPast.axis, 'x');
 
   // Vertical-heavy momentum after a horizontal flick must not flip the latch.
-  const later = nextWheelBurst(first, { dx: -10, dy: -80, t: 16 });
+  const later = nextWheelBurst(burst, { dx: 10, dy: -80, t: 24 });
   assert.equal(later.axis, 'x');
   assert.equal(later.sumY, -76);
 });
 
 test('nextWheelBurst: a gap over WHEEL_BURST_IDLE_MS is the only restart', () => {
-  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 0, dy: 40, t: 1000 });
+  const first = nextWheelBurst(EMPTY_WHEEL_BURST, { dx: 0, dy: 12, t: 1000 });
+  assert.equal(first.axis, 'y');
 
+  // 200px sideways inside the same burst would classify as x on its own; the
+  // latch keeps the burst vertical for the rest of the gesture.
   const justUnder = nextWheelBurst(first, {
-    dx: 80,
+    dx: 200,
     dy: 0,
     t: 1000 + WHEEL_BURST_IDLE_MS - 1,
   });
   assert.equal(justUnder.axis, 'y', 'a slow burst keeps its latch');
-  assert.equal(justUnder.sumY, 40, 'and keeps accumulating its delta');
+  assert.equal(justUnder.sumY, 12, 'and keeps accumulating its delta');
 
   const atBoundary = nextWheelBurst(first, {
-    dx: 80,
+    dx: 200,
     dy: 0,
     t: 1000 + WHEEL_BURST_IDLE_MS,
   });
@@ -749,14 +781,15 @@ test('nextWheelBurst: a gap over WHEEL_BURST_IDLE_MS is the only restart', () =>
     'y',
     'the boundary gap still continues the burst',
   );
-  assert.equal(atBoundary.sumY, 40);
+  assert.equal(atBoundary.sumY, 12);
 
   const justOver = nextWheelBurst(first, {
-    dx: 80,
+    dx: 200,
     dy: 0,
     t: 1000 + WHEEL_BURST_IDLE_MS + 1,
   });
   assert.equal(justOver.axis, 'x');
+  assert.equal(justOver.sumX, 200);
   assert.equal(justOver.sumY, 0, 'the new burst starts from this event only');
 });
 
