@@ -14,12 +14,19 @@
 //! - `GET /api/agenda?from=&to=` is a **pure range read** of the infinite day
 //!   stream (slice 1 of the agenda revamp): it ensures no occurrence and
 //!   writes no agenda row, even when living routines' rules cover the window.
-//!   Both bounds omitted reads the **anchor week** (`anchor_date …
-//!   anchor_date + 6`, 7 inclusive days) where `anchor_date` is the oldest
-//!   past date holding a pending item, else today; exactly one bound → 400;
-//!   an inclusive span above 31 days → 400. The response carries `from`/`to`
-//!   (resolved, never the raw query), `anchor_date`, and `earliest_date`
-//!   (`MIN(local_date)` over every row, the back-scroll floor).
+//!   Both bounds omitted reads `anchor_date … today+6` — **no 31-day cap** —
+//!   where `anchor_date` is the oldest past date holding a pending item, else
+//!   today, plus the `backlog` array holding every row past `today+6`
+//!   (ADR 0007: dated rows in stream order, then `OPEN` tasks in Board order);
+//!   exactly one bound → 400; an explicit window is **history only** — an
+//!   inclusive span above 31 days → 400 (checked on the requested dates) and
+//!   its `to` is clamped to `anchor_date - 1`, so the anchor day itself is
+//!   only ever on the default read, and a window that lands entirely past the
+//!   anchor is an empty 200 (`items: []`, `backlog: []`) rather than an
+//!   error. A history page's `backlog` is always empty. The response carries
+//!   `from`/`to` (resolved, never the raw query), `anchor_date`, and
+//!   `earliest_date` (`MIN(local_date)` over every row, the back-scroll
+//!   floor).
 //!   Materializing occurrences is the occurrence fill's job, never a GET's.
 //! - The response omits occurrence items whose routine is missing and task
 //!   items whose task is missing/soft-deleted; the orphan membership rows
@@ -28,22 +35,30 @@
 //!   fields) while its `pending`/`in_progress` leftovers are omitted.
 //! - `POST /api/agenda/items/:id/move` reorders that item's date pile only;
 //!   peers at/after the insert rank shift up (no `updated_at` bump).
-//! - `POST /api/agenda/items/:id/reschedule { date, sort_order? }` relocates
-//!   a slot **onto today or later** (the past is a 400) with an optional
-//!   landing rank (ADR 0004 amendment): an occurrence moves its **agenda item
-//!   only** — `occurrence.local_date` (the rule date) and `routines.rrule`
-//!   are never touched, there is **no EXDATE anywhere**, and the fill's
+//! - `POST /api/agenda/items/:id/reschedule` relocates a slot **onto a real
+//!   day inside `[today, today+10y)`** with an optional landing rank, or —
+//!   carrying `{ "backlog": true }` — drops the task into the backlog
+//!   (ADR 0007). An occurrence still moves its **agenda item only** —
+//!   `occurrence.local_date` (the rule date) and `routines.rrule` are never
+//!   touched, there is **no EXDATE anywhere**, and the fill's
 //!   no-membership-anywhere rule keeps the rule date from re-attaching it.
-//!   `pending | skipped` are the only reschedulable statuses (`skipped` →
-//!   `pending` on the new date), `in_progress`/`done` → 400, and a target
-//!   date already holding this routine is allowed (two rows of the same
-//!   routine on one day are legal). A task reschedule moves the
-//!   **membership slot** only — task status unchanged (`COMPLETED`/
-//!   `DISCARDED` → 400 "cannot reschedule a terminal task"), no `task_logs`
-//!   row (the agenda is an overlay; `task_logs` has no civil-date column) —
-//!   and one row per task (0018) means the source row itself moves: there is
-//!   no unpin-and-merge path. Same date → 200 no-op (same-day placement is
-//!   `/move`). Session-only, never a Google write.
+//!   `pending | skipped` are the only reschedulable occurrence statuses
+//!   (`skipped` → `pending` on the new date), `in_progress`/`done` → 400, and
+//!   a target date already holding this routine is allowed (two rows of the
+//!   same routine on one day are legal); no occurrence can be dropped into
+//!   the backlog. A task reschedule is a **status transition**: `OPEN` →
+//!   `PLANNED` with a `planned` task log plus the Planned-column append,
+//!   `PLANNED` stays `PLANNED` (no log, no re-rank), `IN_PROGRESS` → 400
+//!   `cannot reschedule an in_progress task` (pause first),
+//!   `COMPLETED`/`DISCARDED` → 400 `cannot reschedule a terminal task`. A
+//!   backlog drop returns a `PLANNED` task to `OPEN` with an `unplanned` log
+//!   plus the Open-column append, leaves an already-`OPEN` task alone (no
+//!   log), and refuses a running (`cannot move an in_progress task to the
+//!   backlog`) or terminal (`cannot move a terminal task to the backlog`)
+//!   task. Same date / already on the backlog date → 200 no-op (same-day
+//!   placement is `/move`). One row per task (0018) means the source row
+//!   itself moves: there is no unpin-and-merge path. Session-only, never a
+//!   Google write.
 //! - `POST /api/agenda/days/:date/move-to-today` sweeps a **past** day's
 //!   still-pending items onto civil today in one call: living
 //!   `OPEN | PLANNED | IN_PROGRESS` tasks and `pending` occurrences of living
@@ -116,9 +131,12 @@ use crate::models::{
 use crate::oauth::HttpClient;
 use crate::repo::{
     AgendaItemRepo, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo,
-    RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskRepo, TokenRepo,
+    RepoError, RoutineRepo, TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo,
 };
-use crate::tasks::{ElongateReport, START_EVENT_MINUTES, TaskCategorySummary, TaskView};
+use crate::tasks::{
+    open_task_for_backlog, plan_task_for_reschedule, ElongateReport, TaskCategorySummary, TaskView,
+    TasksError, START_EVENT_MINUTES,
+};
 use crate::time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, rfc3339_to_unix_secs,
     unix_secs_to_rfc3339,
@@ -184,7 +202,8 @@ impl From<crate::categories::CategoriesError> for AgendaError {
 }
 
 /// Response envelope for `GET /api/agenda` — a window of the infinite day
-/// stream plus the server-computed civil today (ADR 0004 amendment): `today`
+/// stream, the backlog past its end (ADR 0007), plus the server-computed
+/// civil today (ADR 0004 amendment): `today`
 /// is the civil date of now in the user's primary calendar `time_zone`
 /// (chrono-tz), the Home anchor the browser must not compute itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -209,6 +228,9 @@ pub struct AgendaResponse {
     /// (orphans and future rows included), else `today`. Independent of the
     /// requested window: the browser's back-scroll floor.
     pub earliest_date: String,
+    /// Rows with `local_date > today+6`. Empty on a history read.
+    /// Dated rows (`< today+10y`) first, then `OPEN` tasks in Board order.
+    pub backlog: Vec<AgendaItemView>,
 }
 
 /// Response envelope for `POST /api/agenda/items/:id/move` and
@@ -305,6 +327,11 @@ pub struct OccurrenceView {
 // GET /api/agenda — a pure range read of the day stream
 // ──────────────────────────────────────────
 
+/// Inclusive ceiling of the backlog range read. Every civil date we store is
+/// `YYYY-MM-DD` with a 4-digit year and the backlog date is today+50y, so this
+/// bound sorts past the whole backlog region (ADR 0007).
+const BACKLOG_RANGE_TO: &str = "9999-12-31";
+
 /// The user's **one civil today** (ADR 0004 amendment): the civil date of
 /// `now_unix` in the **primary Google calendar's IANA `time_zone`**
 /// (chrono-tz, DST-aware), plus that zone name. No primary calendar (or no
@@ -329,7 +356,7 @@ pub(crate) async fn user_today(
 
 /// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` →
 /// `{"items":[…],"from":…,"to":…,"today":…,"time_zone":…,"anchor_date":…,
-/// "earliest_date":…}`.
+/// "earliest_date":…,"backlog":[…]}`.
 ///
 /// A **pure read** (ADR 0004 amendment, infinite stream): no occurrence is
 /// ensured and no agenda row is written — not even when a living routine's
@@ -337,10 +364,23 @@ pub(crate) async fn user_today(
 /// job, never a GET's.
 ///
 /// Window resolution (trim first; empty/whitespace counts as omitted):
-/// - both omitted → the **anchor week**: `from = anchor_date`, `to =
-///   from + 6` civil days (7 inclusive days);
-/// - both present → the inclusive range; `to < from` is a 400, and an
-///   inclusive span above 31 days is a 400;
+/// - both omitted → the **default read** (ADR 0007): `from = anchor_date`,
+///   `to = today + 6` civil days, with **no 31-day cap** — the window runs
+///   back to the anchor even when that is more than 31 days. `backlog`
+///   carries the rows past `today+6` in two stretches: dated rows
+///   (`local_date < today+10y`) in stream order, then `OPEN` tasks at or past
+///   the horizon in **Board order** (`tasks.sort_order`, ties by task id). A
+///   `PLANNED`/`IN_PROGRESS` row still sitting at or past the horizon (the
+///   self-heal has not run) is omitted until the next tick — the accepted
+///   misplacement window, not a third stretch;
+/// - both present → **history only**: the inclusive range; `to < from` is a
+///   400 and an inclusive span above 31 days is a 400 (both checked on the
+///   **requested** dates), and `to` is then clamped to `anchor_date - 1` —
+///   the anchor day is in the default stream, never in a history page. A
+///   window that lands entirely past the anchor is an **empty 200** (`items`
+///   and `backlog` empty, and `from > to` is legal in that one response): a
+///   stored history param must not fail because the anchor moved earlier.
+///   `backlog` is empty and the backlog region is never queried;
 /// - exactly one present → 400 "both or neither";
 /// - a non-empty value that is not `YYYY-MM-DD` → 400.
 ///
@@ -350,13 +390,16 @@ pub(crate) async fn user_today(
 /// by one repo query, never by loading history. `earliest_date` is
 /// `MIN(local_date)` over every agenda row of the user (orphans and future
 /// rows included), else today — the browser's back-scroll floor, independent
-/// of this page.
+/// of this page. A backlog row is never in the past, so it can pin neither
+/// the anchor nor the floor.
 ///
-/// Hydration is batched: one `list_by_user_and_date_range` page read, one
-/// `list_by_ids` for the page's occurrences, `list_by_user_id` for living
-/// tasks/routines, and `list_by_ids_including_deleted` only for routine ids
-/// missing from the living set. Soft-deleted tasks and orphan/unknown-kind
-/// rows are omitted while their membership rows stay in D1. A deleted
+/// Hydration is batched: one `list_by_user_and_date_range` page read for the
+/// stream (plus exactly one more for the backlog region on the default read),
+/// one `list_by_ids` resolving the occurrences of the window AND the backlog
+/// together, `list_by_user_id` for living tasks/routines, and
+/// `list_by_ids_including_deleted` only for routine ids missing from the
+/// living set. Soft-deleted tasks and orphan/unknown-kind rows are omitted
+/// from both arrays while their membership rows stay in D1. A deleted
 /// routine's `done | skipped` occurrence still renders (with
 /// `routine_deleted: true`, borrowing the routine's title/estimate/blob);
 /// its `pending | in_progress` leftovers are omitted.
@@ -385,27 +428,50 @@ pub async fn get_agenda(
         .oldest_pending_local_date_before(user_id, &today)
         .await?
         .unwrap_or_else(|| today.clone());
-    let (from, to) = resolve_window(from, to, &anchor_date)?;
+    let (from, to, history) = resolve_window(from, to, &anchor_date, &today)?;
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
 
-    // One page read for the whole window; the repo owns the stream order.
-    let items = agenda_repo
-        .list_by_user_and_date_range(user_id, &from, &to)
-        .await?;
+    // One page read for the whole stream window; the repo owns the order. A
+    // clamped-away history window (`from > to`) has nothing to read, so it
+    // skips the query entirely — the one case where a GET issues no range
+    // read at all.
+    let items = if from.as_str() > to.as_str() {
+        Vec::new()
+    } else {
+        agenda_repo
+            .list_by_user_and_date_range(user_id, &from, &to)
+            .await?
+    };
+    // The default read also loads the backlog region — everything past
+    // today+6 (the stream's end, so the query starts the next day). A history
+    // page is strictly before the anchor and never looks there: the backlog
+    // query is skipped outright, not filtered out afterwards.
+    let backlog_rows = if history {
+        Vec::new()
+    } else {
+        let backlog_from = add_civil_days(&to, 1)?;
+        agenda_repo
+            .list_by_user_and_date_range(user_id, &backlog_from, BACKLOG_RANGE_TO)
+            .await?
+    };
     // The back-scroll floor is page-independent: ALL of the user's rows.
     let earliest_date = agenda_repo
         .min_local_date(user_id)
         .await?
         .unwrap_or_else(|| today.clone());
 
-    let mut views = Vec::with_capacity(items.len());
-    if !items.is_empty() {
+    let mut views: Vec<AgendaItemView> = Vec::new();
+    let mut backlog: Vec<AgendaItemView> = Vec::new();
+    if !items.is_empty() || !backlog_rows.is_empty() {
         let user_tasks = task_repo.list_by_user_id(user_id).await?;
         let tasks: HashMap<&str, &Task> =
             user_tasks.iter().map(|task| (task.id.as_str(), task)).collect();
 
+        // The window and the backlog resolve their occurrences together:
+        // ONE `list_by_ids` for both arrays, never one batch per array.
         let occurrence_ids: Vec<String> = items
             .iter()
+            .chain(backlog_rows.iter())
             .filter(|item| item.kind == AGENDA_KIND_OCCURRENCE)
             .map(|item| item.ref_id.clone())
             .collect();
@@ -421,14 +487,14 @@ pub async fn get_agenda(
 
         // Living routines first; only the ids missing from that set are
         // fetched again INCLUDING soft-deleted rows — a read never loads
-        // every deleted routine up front.
+        // every deleted routine up front. The sweep covers BOTH arrays.
         let living_routines = routine_repo.list_by_user_id(user_id).await?;
         let living_ids: HashSet<&str> = living_routines
             .iter()
             .map(|routine| routine.id.as_str())
             .collect();
         let mut missing: HashSet<&str> = HashSet::new();
-        for item in &items {
+        for item in items.iter().chain(backlog_rows.iter()) {
             if item.kind != AGENDA_KIND_OCCURRENCE {
                 continue;
             }
@@ -457,31 +523,26 @@ pub async fn get_agenda(
             .map(|routine| (routine.id.as_str(), routine))
             .collect();
 
-        for item in &items {
+        // One row → one view (or none), shared by the stream and the backlog.
+        let hydrate = |item: &AgendaItem| -> Option<AgendaItemView> {
             let (task, occurrence) = match item.kind.as_str() {
                 AGENDA_KIND_TASK => {
                     // `list_by_user_id` filters soft-deleted tasks — a
                     // deleted/missing task omits the whole item (orphan
                     // membership rows stay in D1).
-                    let Some(task) = tasks.get(item.ref_id.as_str()) else {
-                        continue;
-                    };
+                    let task = tasks.get(item.ref_id.as_str())?;
                     (Some(task_view(task, &taxonomy, focused_task_id)), None)
                 }
                 AGENDA_KIND_OCCURRENCE => {
-                    let Some(occ) = occurrences.get(item.ref_id.as_str()) else {
-                        continue;
-                    };
+                    let occ = occurrences.get(item.ref_id.as_str())?;
                     // Never leak another user's occurrence through a
                     // hand-edited row.
                     if occ.user_id != item.user_id {
-                        continue;
+                        return None;
                     }
                     // Missing entirely (row gone) → omit; a soft-deleted
                     // routine is still resolvable through the history batch.
-                    let Some(routine) = routines_by_id.get(occ.routine_id.as_str()) else {
-                        continue;
-                    };
+                    let routine = routines_by_id.get(occ.routine_id.as_str())?;
                     let routine_deleted = routine.deleted_at.is_some();
                     // A deleted routine's live leftovers are noise; its
                     // done/skipped history still renders for the record.
@@ -491,15 +552,15 @@ pub async fn get_agenda(
                             OCCURRENCE_STATUS_DONE | OCCURRENCE_STATUS_SKIPPED
                         )
                     {
-                        continue;
+                        return None;
                     }
                     let mut view = occurrence_view(occ, routine, &taxonomy);
                     view.routine_deleted = routine_deleted;
                     (None, Some(view))
                 }
-                _ => continue,
+                _ => return None,
             };
-            views.push(AgendaItemView {
+            Some(AgendaItemView {
                 id: item.id.clone(),
                 user_id: item.user_id.clone(),
                 local_date: item.local_date.clone(),
@@ -508,8 +569,17 @@ pub async fn get_agenda(
                 sort_order: item.sort_order,
                 task,
                 occurrence,
-            });
-        }
+            })
+        };
+
+        views = items.iter().filter_map(|item| hydrate(item)).collect();
+        backlog = split_backlog(
+            backlog_rows
+                .iter()
+                .filter_map(|item| hydrate(item))
+                .collect(),
+            &today,
+        )?;
     }
     Ok(AgendaResponse {
         items: views,
@@ -519,25 +589,42 @@ pub async fn get_agenda(
         time_zone,
         anchor_date,
         earliest_date,
+        backlog,
     })
 }
 
 /// Resolves the requested inclusive window under the stream contract: trim
 /// first, empty/whitespace = omitted, both-or-neither, `YYYY-MM-DD` only,
-/// `to >= from`, and at most 31 inclusive days. Both omitted → the anchor
-/// week (`anchor_date … anchor_date + 6`).
+/// `to >= from`, and at most 31 inclusive days.
+///
+/// Both omitted → the **default read** (ADR 0007): `from = anchor_date`, `to
+/// = today + 6` civil days, with **no 31-day cap** (the anchor is always
+/// `<= today`, so `from <= to`). Both present → a **history** window: the
+/// reversed-pair and span checks run on the **requested** dates, before the
+/// clamp, so an overlong window that also sticks out past the anchor still
+/// reports the span error; `to` is then clamped to `min(to, anchor_date - 1)`
+/// because the anchor day itself is on the default stream — there is no
+/// forward page, the stream ends at `today+6`. A window that starts at or
+/// after the anchor has nothing left to read: it comes back as `from > to`,
+/// an empty 200 rather than an error, so a stored history param refetched
+/// after the anchor moved earlier never fails.
+///
+/// The returned flag is `history`: `false` for the default read (which also
+/// loads the `backlog` array), `true` for an explicit window (whose `backlog`
+/// stays empty).
 fn resolve_window(
     from: Option<&str>,
     to: Option<&str>,
     anchor_date: &str,
-) -> Result<(String, String), AgendaError> {
+    today: &str,
+) -> Result<(String, String, bool), AgendaError> {
     let from = from.map(str::trim).filter(|value| !value.is_empty());
     let to = to.map(str::trim).filter(|value| !value.is_empty());
     match (from, to) {
         (None, None) => {
             let from = parse_date(anchor_date)?;
-            let to = add_civil_days(&from, 6)?;
-            Ok((from, to))
+            let to = add_civil_days(today, 6)?;
+            Ok((from, to, false))
         }
         (Some(from), Some(to)) => {
             let from = parse_date(from)?;
@@ -550,17 +637,76 @@ fn resolve_window(
                 ));
             }
             // Inclusive span is the day difference + 1: 30 → 31 days is valid.
+            // Checked on the requested dates, so an overlong window still
+            // errors even though the clamp below would shorten it.
             if to_date.signed_duration_since(from_date).num_days() > 30 {
                 return Err(AgendaError::Invalid(
                     "date range must not exceed 31 days".to_string(),
                 ));
             }
-            Ok((from, to))
+            // An explicit window is history only, and the anchor day itself
+            // belongs to the default stream: pull `to` back to the day before
+            // the anchor. A window that starts at or after the anchor day has
+            // nothing left to read — `from > to` is the empty history read,
+            // never a 400.
+            let clamped_to = add_civil_days(anchor_date, -1)?;
+            let to = if to.as_str() < clamped_to.as_str() {
+                to
+            } else {
+                clamped_to
+            };
+            Ok((from, to, true))
         }
         _ => Err(AgendaError::Invalid(
             "from and to must both be set or both be omitted".to_string(),
         )),
     }
+}
+
+/// Splits the **backlog** rows into the response order (ADR 0007): the dated
+/// stretch first — every row before the 10-year line, kept in the range
+/// query's order (`local_date`, `sort_order`, `created_at`, the repo's
+/// contract, never re-sorted here; a not-yet-healed `OPEN` row on a real
+/// future day belongs to this stretch and the self-heal moves it later) —
+/// then the `OPEN` tasks at or past the horizon in **Board order**
+/// (`tasks.sort_order`, ties by task id — deliberately not the agenda row's
+/// rank, so Home and the Board share one order).
+///
+/// Everything else at or past the horizon is dropped: a `PLANNED` /
+/// `IN_PROGRESS` row still sitting on the backlog date (the self-heal has not
+/// run yet) and any occurrence out there are absent until the next tick. That
+/// is the accepted misplacement window, not a third stretch.
+fn split_backlog(
+    rows: Vec<AgendaItemView>,
+    today: &str,
+) -> Result<Vec<AgendaItemView>, AgendaError> {
+    let horizon = planning_horizon_date(today)?;
+    let mut dated: Vec<AgendaItemView> = Vec::new();
+    let mut board: Vec<AgendaItemView> = Vec::new();
+    for row in rows {
+        if row.local_date.as_str() < horizon.as_str() {
+            dated.push(row);
+            continue;
+        }
+        let open_task = row.kind == AGENDA_KIND_TASK
+            && row.task.as_ref().is_some_and(|task| task.status == "OPEN");
+        if open_task {
+            board.push(row);
+        }
+    }
+    board.sort_by(|a, b| {
+        let board_rank = |row: &AgendaItemView| {
+            row.task
+                .as_ref()
+                .map(|task| task.sort_order)
+                .unwrap_or_default()
+        };
+        board_rank(a)
+            .cmp(&board_rank(b))
+            .then_with(|| a.ref_id.cmp(&b.ref_id))
+    });
+    dated.extend(board);
+    Ok(dated)
 }
 
 /// Parses an already-validated `YYYY-MM-DD` into a civil date (window
@@ -578,6 +724,40 @@ pub(crate) fn add_civil_days(date: &str, days: i64) -> Result<String, AgendaErro
         .checked_add_signed(chrono::Duration::days(days))
         .map(|date| date.format("%Y-%m-%d").to_string())
         .ok_or_else(|| AgendaError::Invalid("date out of range".to_string()))
+}
+
+// ──────────────────────────────────────────
+// The backlog date and the 10-year line (ADR 0007)
+// ──────────────────────────────────────────
+
+/// Backlog date offset: today + 50 years, in calendar months.
+pub(crate) const BACKLOG_OFFSET_MONTHS: u32 = 600;
+/// The planning horizon: today + 10 years, in calendar months. A row dated
+/// `>=` this is in the backlog region.
+pub(crate) const PLANNING_HORIZON_MONTHS: u32 = 120;
+
+/// Adds `months` calendar months to a validated `YYYY-MM-DD`.
+///
+/// Uses [`chrono::NaiveDate::checked_add_months`], which **clamps** the day
+/// (2024-02-29 + 12 months = 2025-02-28), never rolls into March. Overflow
+/// past chrono's range is a 400, never a panic.
+pub(crate) fn add_civil_months(date: &str, months: u32) -> Result<String, AgendaError> {
+    civil_date(date)?
+        .checked_add_months(chrono::Months::new(months))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .ok_or_else(|| AgendaError::Invalid("date out of range".to_string()))
+}
+
+/// The backlog date: civil today + 50 years (ADR 0007). Computed at write
+/// time, never a stored constant.
+pub(crate) fn backlog_local_date(today: &str) -> Result<String, AgendaError> {
+    add_civil_months(today, BACKLOG_OFFSET_MONTHS)
+}
+
+/// The 10-year line: civil today + 10 years (ADR 0007). A date `>=` this is
+/// in the backlog region; reschedule's upper bound is exclusive.
+pub(crate) fn planning_horizon_date(today: &str) -> Result<String, AgendaError> {
+    add_civil_months(today, PLANNING_HORIZON_MONTHS)
 }
 
 // ──────────────────────────────────────────
@@ -638,22 +818,29 @@ pub async fn move_agenda_item(
 }
 
 // ──────────────────────────────────────────
-// POST /api/agenda/items/:id/reschedule — relocate a slot onto today or later
+// POST /api/agenda/items/:id/reschedule — onto a real day, or into the backlog
 // ──────────────────────────────────────────
 
-/// `POST /api/agenda/items/:id/reschedule { date, sort_order? }` →
-/// `{"item":…}` (the same embed as move).
+/// `POST /api/agenda/items/:id/reschedule` → `{"item":…}` (the same embed as
+/// move).
 ///
-/// Relocates the item's slot to `date` — **today or later** (the past is a
-/// 400: the day is over) — with an optional landing `sort_order` (ADR 0004
-/// amendment). Session-only — no Google write of any kind, no RRULE anywhere,
-/// **no EXDATE anywhere**.
+/// Body (ADR 0007): `{ date, sort_order? }` relocates the slot onto that
+/// **real day** — inside `[today, today+10y)`, so the past and the backlog
+/// region are 400s — or `{ backlog: true }` drops the task into the backlog.
+/// The two are mutually exclusive; neither → 400. Session-only — no Google
+/// write of any kind, no RRULE anywhere, **no EXDATE anywhere**.
+///
+/// Order matters: the target is parsed/checked before the item is loaded
+/// (a blank `date` stays `date must be YYYY-MM-DD`, a missing one is
+/// `date is required`), and every 400 below returns while the row, the task's
+/// status, and `task_logs` are still untouched.
 ///
 /// **Occurrence** (kind `occurrence`):
 /// 1. Load the item + its occurrence + the living routine (404s as always).
 /// 2. `pending | skipped` are the only reschedulable statuses — `skipped`
 ///    becomes `pending` on the new date (deferred, not declined);
-///    `in_progress`/`done` → 400.
+///    `in_progress`/`done` → 400. An occurrence can never be dropped into the
+///    backlog (`cannot move an occurrence to the backlog`).
 /// 3. The **agenda item moves only**: `occurrence.local_date` is never
 ///    rewritten (it stays the series-instance key — the rule date), and the
 ///    routine's `rrule` is never touched. A target date that already holds
@@ -662,95 +849,172 @@ pub async fn move_agenda_item(
 /// 4. Title override and any stored google ids travel with the row (never
 ///    cleared).
 ///
-/// **Task** (kind `task`): the **membership slot** moves, not the task —
-/// `tasks.status` is unchanged and **no `task_logs` row is written** (the
-/// agenda is an overlay, and `task_logs` has no civil-date column).
-/// `COMPLETED`/`DISCARDED` → 400. One row per task (0018) means the source
-/// row itself moves: there is no target row to merge into.
+/// **Task** (kind `task`): a **status transition** plus the row move
+/// ([`plan_task_for_reschedule`]) — `OPEN` → `PLANNED` with a `planned` task
+/// log and the Planned-column append, `PLANNED` stays `PLANNED` with no log,
+/// `IN_PROGRESS` → 400 `cannot reschedule an in_progress task` (pause first),
+/// `COMPLETED`/`DISCARDED` → 400 `cannot reschedule a terminal task`. One row
+/// per task (0018) means the source row itself moves: there is no target row
+/// to merge into. A backlog drop goes through [`open_task_for_backlog`]
+/// instead: `PLANNED` → `OPEN` with an `unplanned` log and the Open-column
+/// append, an already-`OPEN` task writes nothing, a running/terminal task is
+/// a 400. `sort_order` is **ignored** on this path (Open-column order is the
+/// Board's `tasks.sort_order`).
 ///
-/// **Placement** on a different day: `sort_order` omitted → appended at
+/// **Placement**: on a different day, `sort_order` omitted → appended at
 /// `max+1` (0 when the target pile is empty); named → the target day's peers
 /// at/after the rank shift up one first (same gap semantics as `/move`), then
-/// the row lands on the rank. The source day's pile is never reshuffled.
+/// the row lands on the rank. The source day's pile is never reshuffled, and a
+/// backlog drop of a row already on the backlog date never reshuffles it.
+/// Unlike the lifecycle verbs' best-effort placement, a placement failure
+/// **is** returned here: the row move is the request, and the status write is
+/// already committed and idempotent on retry.
 ///
 /// Same date → 200 no-op returning the item unchanged, even when a
-/// `sort_order` is named — same-day placement is `/move`. Missing item /
-/// other-user / missing or soft-deleted task / soft-deleted routine → 404.
-/// Missing/invalid `date` → 400.
+/// `sort_order` is named — same-day placement is `/move` — and **before** the
+/// 10-year check, so an `OPEN` row parked on the backlog date still no-ops
+/// instead of 400ing. Missing item / other-user / missing or soft-deleted task
+/// / soft-deleted routine → 404.
 pub async fn reschedule_agenda_item(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
     agenda_repo: &dyn AgendaItemRepo,
     task_repo: &dyn TaskRepo,
+    logs: &dyn TaskLogRepo,
     occurrence_repo: &dyn OccurrenceRepo,
     routine_repo: &dyn RoutineRepo,
     calendars: &dyn CalendarRepo,
     now_unix: i64,
     user_id: &str,
     id: &str,
-    date: &str,
+    date: Option<&str>,
     sort_order: Option<i64>,
+    backlog: bool,
     focused_task_id: Option<&str>,
 ) -> Result<AgendaItemResponse, AgendaError> {
-    let date = parse_date(date)?;
+    // The body gate, before anything is loaded or written: a dated reschedule
+    // and a backlog drop are two different requests. A blank `Some` next to
+    // `backlog: true` is NOT exclusive — the drop simply ignores it.
+    if backlog && date.is_some_and(|date| !date.trim().is_empty()) {
+        return Err(AgendaError::Invalid(
+            "date and backlog are mutually exclusive".to_string(),
+        ));
+    }
+    // A dated reschedule parses its target first (a blank `Some` is still a
+    // date: `date must be YYYY-MM-DD`); a backlog drop carries no target.
+    let date = if backlog {
+        None
+    } else {
+        match date {
+            Some(date) => Some(parse_date(date)?),
+            None => return Err(AgendaError::Invalid("date is required".to_string())),
+        }
+    };
+
     let Some(item) = agenda_repo.get_by_id(id).await? else {
         return Err(AgendaError::NotFound);
     };
     if item.user_id != user_id {
         return Err(AgendaError::NotFound);
     }
-    // A reschedule only ever moves forward. `YYYY-MM-DD` sorts
-    // chronologically, so the string compare IS the civil-date compare; today
-    // itself is allowed.
-    let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
-    if date < today {
-        return Err(AgendaError::Invalid(
-            "cannot reschedule into the past".to_string(),
-        ));
-    }
-    // Same date → 200 no-op: nothing moves, nothing is shifted (a named
-    // `sort_order` is ignored — same-day placement is `/move`).
-    if item.local_date == date {
-        let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
-        let view = embed_item(
-            task_repo,
-            occurrence_repo,
-            routine_repo,
-            &item,
-            &taxonomy,
-            focused_task_id,
-        )
-        .await?
-        .ok_or(AgendaError::NotFound)?;
-        return Ok(AgendaItemResponse { item: view });
-    }
-    // Only validated when the row is actually going to be placed.
-    if let Some(rank) = sort_order {
-        if rank < 0 {
+
+    if backlog {
+        // Tasks only, and the status half runs before the row moves: the
+        // status write is idempotent, so returning a placement failure still
+        // leaves the request safe to retry.
+        match item.kind.as_str() {
+            AGENDA_KIND_TASK => {
+                open_task_for_backlog(task_repo, logs, user_id, &item.ref_id, now_unix)
+                    .await
+                    .map_err(reschedule_task_error)?;
+                let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
+                let backlog_date = backlog_local_date(&today)?;
+                // Already there → 200 no-op, never a reshuffle of the rank it
+                // already holds.
+                if item.local_date != backlog_date {
+                    place_on_date(agenda_repo, user_id, &item.id, &backlog_date, None).await?;
+                }
+            }
+            AGENDA_KIND_OCCURRENCE => {
+                return Err(AgendaError::Invalid(
+                    "cannot move an occurrence to the backlog".to_string(),
+                ))
+            }
+            _ => return Err(AgendaError::NotFound),
+        }
+    } else {
+        let Some(date) = date else {
+            // Unreachable: the body gate above 400s a date-less dated call.
+            return Err(AgendaError::Invalid("date is required".to_string()));
+        };
+        // A reschedule only ever moves forward. `YYYY-MM-DD` sorts
+        // chronologically, so the string compare IS the civil-date compare;
+        // today itself is allowed.
+        let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
+        if date < today {
             return Err(AgendaError::Invalid(
-                "sort_order must be a non-negative integer".to_string(),
+                "cannot reschedule into the past".to_string(),
             ));
         }
-    }
-
-    match item.kind.as_str() {
-        AGENDA_KIND_OCCURRENCE => {
-            reschedule_occurrence(
-                agenda_repo,
+        // Same date → 200 no-op: nothing moves, nothing is shifted (a named
+        // `sort_order` is ignored — same-day placement is `/move`), and no
+        // status transition happens even though an `OPEN` row parked on the
+        // backlog date would fail the 10-year check below.
+        if item.local_date == date {
+            let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
+            let view = embed_item(
+                task_repo,
                 occurrence_repo,
                 routine_repo,
-                user_id,
                 &item,
-                &date,
-                sort_order,
+                &taxonomy,
+                focused_task_id,
             )
-            .await?;
+            .await?
+            .ok_or(AgendaError::NotFound)?;
+            return Ok(AgendaItemResponse { item: view });
         }
-        AGENDA_KIND_TASK => {
-            reschedule_task_slot(agenda_repo, task_repo, user_id, &item, &date, sort_order)
+        // The 10-year line is EXCLUSIVE (ADR 0007): `today+10y - 1` is a real
+        // day, `today+10y` itself is already the backlog region.
+        if date >= planning_horizon_date(&today)? {
+            return Err(AgendaError::Invalid(
+                "cannot reschedule more than 10 years ahead".to_string(),
+            ));
+        }
+        // Only validated when the row is actually going to be placed.
+        if let Some(rank) = sort_order {
+            if rank < 0 {
+                return Err(AgendaError::Invalid(
+                    "sort_order must be a non-negative integer".to_string(),
+                ));
+            }
+        }
+
+        match item.kind.as_str() {
+            AGENDA_KIND_OCCURRENCE => {
+                reschedule_occurrence(
+                    agenda_repo,
+                    occurrence_repo,
+                    routine_repo,
+                    user_id,
+                    &item,
+                    &date,
+                    sort_order,
+                )
                 .await?;
+            }
+            AGENDA_KIND_TASK => {
+                // Planning happens before the row moves, and a placement
+                // failure is returned: unlike create/stop, the row move IS
+                // this request. The status write is already committed and a
+                // retry is idempotent.
+                plan_task_for_reschedule(task_repo, logs, user_id, &item.ref_id, now_unix)
+                    .await
+                    .map_err(reschedule_task_error)?;
+                place_on_date(agenda_repo, user_id, &item.id, &date, sort_order).await?;
+            }
+            _ => return Err(AgendaError::NotFound),
         }
-        _ => return Err(AgendaError::NotFound),
     }
 
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
@@ -769,6 +1033,21 @@ pub async fn reschedule_agenda_item(
     .await?
     .ok_or(AgendaError::NotFound)?;
     Ok(AgendaItemResponse { item: view })
+}
+
+/// Maps a [`TasksError`] raised by the reschedule's task helpers onto this
+/// module's error surface: a domain 400 keeps its **exact** message (never a
+/// wrapper), a missing/soft-deleted task is a 404, a repository failure stays
+/// a 500-shaped `Repo`, and anything else (the helpers' Google-free paths
+/// never raise them) is folded onto `Invalid` — the same policy as
+/// `tasks::placement_error`, in the other direction.
+fn reschedule_task_error(err: TasksError) -> AgendaError {
+    match err {
+        TasksError::Invalid(message) => AgendaError::Invalid(message),
+        TasksError::NotFound => AgendaError::NotFound,
+        TasksError::Repo(err) => AgendaError::Repo(err),
+        other => AgendaError::Invalid(other.to_string()),
+    }
 }
 
 /// Places a membership row on another date's pile: a named `sort_order`
@@ -860,33 +1139,6 @@ async fn reschedule_occurrence(
     }
     // The agenda row lands on the target pile (the source pile keeps its
     // ranks). `occurrence.local_date` and `routines.rrule` are untouched.
-    place_on_date(agenda_repo, user_id, &item.id, date, sort_order).await
-}
-
-/// The task half of a reschedule: the **membership slot** moves, never the
-/// task — no `tasks.status` change, no `task_logs` row (the agenda is an
-/// overlay, and `task_logs` has no civil-date column). A terminal task is a
-/// 400. One row per task (0018): the source row itself moves, so there is no
-/// second row to look up, merge into, or hard-delete.
-async fn reschedule_task_slot(
-    agenda_repo: &dyn AgendaItemRepo,
-    task_repo: &dyn TaskRepo,
-    user_id: &str,
-    item: &AgendaItem,
-    date: &str,
-    sort_order: Option<i64>,
-) -> Result<(), AgendaError> {
-    let Some(task) = task_repo.get_by_id(&item.ref_id).await? else {
-        return Err(AgendaError::NotFound); // missing / soft-deleted
-    };
-    if task.user_id != user_id {
-        return Err(AgendaError::NotFound);
-    }
-    if matches!(task.status.as_str(), "COMPLETED" | "DISCARDED") {
-        return Err(AgendaError::Invalid(
-            "cannot reschedule a terminal task".to_string(),
-        ));
-    }
     place_on_date(agenda_repo, user_id, &item.id, date, sort_order).await
 }
 
@@ -2141,14 +2393,15 @@ mod tests {
     use crate::models::{
         GoogleCalendar, GoogleOAuthToken, NewAgendaItem, NewCalendar, NewCalendarEvent, NewRoutine,
         NewRoutineInput, NewRoutineOccurrence, NewTask, NewTaskCategory, NewTaskCategoryPattern,
-        NewTaskList, NewToken, Task, TaskList, UpdateRoutine, UpdateTask, UpdateTaskCategory,
-        UpdateTaskList,
+        NewTaskList, NewTaskLog, NewToken, Task, TaskList, TaskLog, UpdateRoutine, UpdateTask,
+        UpdateTaskCategory, UpdateTaskList,
     };
     use crate::oauth::{HttpClient, HttpError};
     use crate::routines::{
         create_routine, delete_routine, occurrence_dates, update_routine, DeleteRoutineResponse,
         RoutineResponse, RoutinesError,
     };
+    use crate::tasks::{TASK_LOG_PLANNED, TASK_LOG_UNPLANNED};
 
     // ──────────────────────────────────────────
     // Fakes
@@ -2156,7 +2409,8 @@ mod tests {
 
     /// Cheap call counters on the occurrence/agenda fakes — the range-read
     /// test snapshots these to prove a read makes zero writes and uses only
-    /// the batched set reads (the range page, the anchor, the floor, and one
+    /// the batched set reads (the stream page + the backlog page on a default
+    /// read, the anchor, the floor, and one
     /// `list_by_ids`).
     #[derive(Debug, Clone, Default)]
     struct CallCounters {
@@ -3374,6 +3628,29 @@ mod tests {
         }
     }
 
+    /// In-memory `TaskLogRepo` for the reschedule / backlog-drop paths: they
+    /// only ever **insert** a `planned` / `unplanned` row, and the timer
+    /// verbs' event lookups are not exercised here.
+    #[derive(Default)]
+    struct FakeTaskLogRepo {
+        inserted: Mutex<Vec<NewTaskLog>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl TaskLogRepo for FakeTaskLogRepo {
+        async fn insert(&self, log: NewTaskLog, _now_rfc3339: &str) -> Result<String, RepoError> {
+            self.inserted.lock().unwrap().push(log);
+            Ok("log-1".to_string())
+        }
+
+        async fn latest_started_by_task_id(
+            &self,
+            _task_id: &str,
+        ) -> Result<Option<TaskLog>, RepoError> {
+            Ok(None)
+        }
+    }
+
     /// Scripted HTTP fake with POST/PATCH routes — enough for the
     /// occurrence verbs' `events.insert`, `events.patch` and summary PATCH
     /// calls (a copy of the tasks tests' fake).
@@ -3988,6 +4265,7 @@ mod tests {
         occurrences: FakeOccurrenceRepo,
         agenda: FakeAgendaItemRepo,
         tasks: FakeTaskRepo,
+        logs: FakeTaskLogRepo,
         calendars: FakeCalendarRepo,
     }
 
@@ -4009,6 +4287,7 @@ mod tests {
             occurrences,
             agenda,
             tasks,
+            logs: FakeTaskLogRepo::default(),
             // The fake primary calendar is UTC (ADR 0004 amendment: the
             // primary calendar's time_zone decides today) — tests that need
             // another zone swap `repos.calendars` for their own fixture.
@@ -4079,14 +4358,47 @@ mod tests {
         ))
     }
 
-    /// A single-day read: the same date on both ends of the window.
+    /// A single-day read. A day **before the anchor** is a legal one-day
+    /// **history** read. A stream day or a backlog day is filtered out of ONE
+    /// default read instead — an explicit `from`/`to` window is history only,
+    /// clamped to end at `anchor_date - 1`, so it must never be used to fetch
+    /// a stream day. A non-canonical date keeps its 400 from the window parser;
+    /// a day inside the stream with no rows returns empty `items`, never an
+    /// error.
     fn get(repos: &Repos, user_id: &str, date: &str) -> Result<AgendaResponse, AgendaError> {
-        get_range(repos, user_id, Some(date), Some(date))
+        let Ok(canonical) = parse_date(date) else {
+            return get_range(repos, user_id, Some(date), Some(date));
+        };
+        let full = get_default(repos, user_id)?;
+        if canonical.as_str() < full.anchor_date.as_str() {
+            return get_range(repos, user_id, Some(date), Some(date));
+        }
+        let mut items: Vec<AgendaItemView> = full
+            .items
+            .iter()
+            .filter(|item| item.local_date == canonical)
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            // A rescheduled row past today+6 comes back from `backlog`, not
+            // from the stream.
+            items = full
+                .backlog
+                .iter()
+                .filter(|item| item.local_date == canonical)
+                .cloned()
+                .collect();
+        }
+        Ok(AgendaResponse {
+            items,
+            backlog: Vec::new(),
+            ..full
+        })
     }
 
     /// `GET /api/agenda` with both bounds **omitted** — the server resolves
-    /// the anchor week (the fake primary calendar is UTC, so `NOW_UNIX` is
-    /// `2026-08-23`).
+    /// `anchor_date … today+6` (the fake primary calendar is UTC, so
+    /// `NOW_UNIX` is `2026-08-23`, i.e. `today+6` is `2026-08-29`).
     fn get_default(repos: &Repos, user_id: &str) -> Result<AgendaResponse, AgendaError> {
         get_range(repos, user_id, None, None)
     }
@@ -4191,11 +4503,25 @@ mod tests {
         date: &str,
         sort_order: Option<i64>,
     ) -> Result<AgendaItemResponse, AgendaError> {
+        reschedule_body(repos, user_id, id, Some(date), sort_order, false)
+    }
+
+    /// The raw reschedule body (ADR 0007): `date` absent + `backlog: true` is
+    /// a backlog drop; a blank `Some` next to `backlog: true` is one too.
+    fn reschedule_body(
+        repos: &Repos,
+        user_id: &str,
+        id: &str,
+        date: Option<&str>,
+        sort_order: Option<i64>,
+        backlog: bool,
+    ) -> Result<AgendaItemResponse, AgendaError> {
         pollster::block_on(reschedule_agenda_item(
             &repos.lists,
             &repos.categories,
             &repos.agenda,
             &repos.tasks,
+            &repos.logs,
             &repos.occurrences,
             &repos.routines,
             &repos.calendars,
@@ -4204,8 +4530,18 @@ mod tests {
             id,
             date,
             sort_order,
+            backlog,
             None,
         ))
+    }
+
+    /// `{ "backlog": true }` — the drop path (no date, no rank).
+    fn backlog_drop(
+        repos: &Repos,
+        user_id: &str,
+        id: &str,
+    ) -> Result<AgendaItemResponse, AgendaError> {
+        reschedule_body(repos, user_id, id, None, None, true)
     }
 
     /// `POST /api/agenda/days/:date/move-to-today`.
@@ -4512,6 +4848,52 @@ mod tests {
     }
 
     // ──────────────────────────────────────────
+    // Backlog date arithmetic (ADR 0007)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn add_civil_months_clamps_the_day_and_crosses_years() {
+        assert_eq!(add_civil_months("2026-10-17", 600).unwrap(), "2076-10-17");
+        assert_eq!(
+            add_civil_months("2024-02-29", 600).unwrap(),
+            "2074-02-28",
+            "Feb 29 clamps to Feb 28, never rolls into March"
+        );
+        assert_eq!(add_civil_months("2024-02-29", 120).unwrap(), "2034-02-28");
+        assert_eq!(add_civil_months("2026-08-23", 600).unwrap(), "2076-08-23");
+    }
+
+    #[test]
+    fn backlog_and_planning_horizon_dates_use_the_shared_month_math() {
+        assert_eq!(backlog_local_date("2026-08-23").unwrap(), "2076-08-23");
+        assert_eq!(planning_horizon_date("2026-08-23").unwrap(), "2036-08-23");
+        assert_eq!(
+            backlog_local_date("2026-08-23").unwrap(),
+            add_civil_months("2026-08-23", BACKLOG_OFFSET_MONTHS).unwrap()
+        );
+        assert_eq!(
+            planning_horizon_date("2026-08-23").unwrap(),
+            add_civil_months("2026-08-23", PLANNING_HORIZON_MONTHS).unwrap()
+        );
+    }
+
+    #[test]
+    fn civil_month_helpers_reject_a_non_date() {
+        for bad in ["not a date", "2026-13-01", "2026-02-30"] {
+            for err in [
+                add_civil_months(bad, 600).unwrap_err(),
+                backlog_local_date(bad).unwrap_err(),
+                planning_horizon_date(bad).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
+                    "{err:?} for {bad:?}"
+                );
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────
     // GET /api/agenda
     // ──────────────────────────────────────────
 
@@ -4541,23 +4923,32 @@ mod tests {
     }
 
     #[test]
-    fn get_agenda_without_bounds_reads_the_anchor_week() {
+    fn get_agenda_without_bounds_reads_through_today_plus_six() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
-        // Both bounds omitted → the anchor week (2026-08-23 in the UTC
-        // primary calendar at NOW_UNIX). Nothing was materialized: a GET is a
-        // pure read, so the window is empty and the anchor falls back to today.
+        // Both bounds omitted → `anchor_date … today+6` (2026-08-23 in the UTC
+        // primary calendar at NOW_UNIX, and the anchor falls back to today with
+        // nothing pending in the past, so the two coincide here). Nothing was
+        // materialized: a GET is a pure read, so the window is empty.
         let response = get_default(&repos, "u-1").unwrap();
         assert!(
             response.items.is_empty(),
             "a read never materializes occurrences"
         );
+        assert!(
+            response.backlog.is_empty(),
+            "nothing is parked past today+6 either"
+        );
+        // The array is always serialized, even empty (never
+        // `skip_serializing_if`).
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["backlog"], serde_json::json!([]));
         assert_eq!(response.today, "2026-08-23");
         assert_eq!(response.time_zone, "UTC");
         assert_eq!(response.anchor_date, "2026-08-23");
         assert_eq!(response.from, "2026-08-23");
-        assert_eq!(response.to, "2026-08-29", "7 inclusive days");
+        assert_eq!(response.to, "2026-08-29", "today+6, 7 inclusive days");
         assert_eq!(response.earliest_date, "2026-08-23", "no rows → today");
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 0);
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), 0);
@@ -4567,6 +4958,265 @@ mod tests {
         assert_eq!(blank_with_from.from, "2026-08-23");
         let blank_with_to = get_range(&repos, "u-1", Some(""), Some("  ")).unwrap();
         assert_eq!(blank_with_to.to, "2026-08-29");
+    }
+
+    #[test]
+    fn get_agenda_default_window_runs_back_to_the_anchor_with_no_31_day_cap() {
+        let repos = repos();
+        // A living PLANNED task on a real past day pins the anchor. The
+        // default window starts there and runs through today+6 — far more than
+        // the 31 inclusive days a history read is capped at.
+        repos.tasks.push(task_row("t-june", "u-1", "June | Work", "PLANNED"));
+        agenda_row(&repos, "ai-june", "u-1", "2026-06-01", AGENDA_KIND_TASK, "t-june", 0);
+        // An OPEN task parked on the backlog date is past today+6: a backlog
+        // row, never a stream row, and never the anchor.
+        repos.tasks.push(task_row("t-open", "u-1", "Open | Work", "OPEN"));
+        agenda_row(&repos, "ai-open", "u-1", "2076-08-23", AGENDA_KIND_TASK, "t-open", 0);
+
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.today, "2026-08-23");
+        assert_eq!(response.anchor_date, "2026-06-01");
+        assert_eq!(response.from, "2026-06-01");
+        assert_eq!(response.to, "2026-08-29", "today+6, not anchor+6");
+        let span_days = civil_date(&response.to)
+            .unwrap()
+            .signed_duration_since(civil_date(&response.from).unwrap())
+            .num_days();
+        assert_eq!(span_days, 89, "the default window has no 31-day cap");
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-june"],
+            "the June row is inside the stream"
+        );
+        assert_eq!(
+            response
+                .backlog
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-open"],
+            "the parked OPEN task is backlog, not stream"
+        );
+        assert_eq!(
+            response.earliest_date, "2026-06-01",
+            "the floor is the June row, never the backlog date"
+        );
+    }
+
+    #[test]
+    fn get_agenda_backlog_lists_dated_rows_then_open_tasks_in_board_order() {
+        let repos = repos();
+        // Occurrence rows need a living routine, or the embed is omitted.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos.occurrences.stored.lock().unwrap().extend([
+            FakeOccurrenceRepo::row("occ-rank1", "rt-1", "u-1", "2026-08-30", OCCURRENCE_STATUS_PENDING),
+            FakeOccurrenceRepo::row("occ-rank0", "rt-1", "u-1", "2026-08-30", OCCURRENCE_STATUS_PENDING),
+        ]);
+        let push_item = |id: &str, date: &str, kind: &str, ref_id: &str, sort_order: i64, created_at: &str| {
+            repos.agenda.stored.lock().unwrap().push(AgendaItem {
+                id: id.to_string(),
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: kind.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order,
+                created_at: created_at.to_string(),
+                updated_at: "2026-08-23T00:00:00Z".to_string(),
+            });
+        };
+        // today+7 is the first backlog day: the dated stretch keeps the
+        // `(local_date, sort_order, created_at)` query order, so rank 0 comes
+        // back first even though its row was created later.
+        push_item(
+            "ai-occ-rank1",
+            "2026-08-30",
+            AGENDA_KIND_OCCURRENCE,
+            "occ-rank1",
+            1,
+            "2026-08-22T00:00:00Z",
+        );
+        push_item(
+            "ai-occ-rank0",
+            "2026-08-30",
+            AGENDA_KIND_OCCURRENCE,
+            "occ-rank0",
+            0,
+            "2026-08-24T00:00:00Z",
+        );
+        // A rescheduled PLANNED task on a real day, still before the horizon.
+        repos.tasks.push(task_row("t-planned", "u-1", "Planned | Work", "PLANNED"));
+        push_item("ai-planned", "2026-09-15", AGENDA_KIND_TASK, "t-planned", 0, "2026-08-23T00:00:00Z");
+        // The Board order is `tasks.sort_order`, ties by task id; the agenda
+        // rows' ranks are deliberately the reverse of it, and `t-a2`'s task
+        // row is pushed FIRST so a stable sort that forgot the id tie-break
+        // would surface it before `t-a`.
+        let open_task = |id: &str, sort_order: i64| {
+            let mut task = task_row(id, "u-1", "Open | Work", "OPEN");
+            task.sort_order = sort_order;
+            repos.tasks.push(task);
+        };
+        open_task("t-a2", 0);
+        push_item("ai-a2", "2076-08-23", AGENDA_KIND_TASK, "t-a2", 3, "2026-08-23T00:00:00Z");
+        open_task("t-a", 0);
+        push_item("ai-a", "2076-08-23", AGENDA_KIND_TASK, "t-a", 8, "2026-08-23T00:00:00Z");
+        open_task("t-b", 1);
+        push_item("ai-b", "2076-08-23", AGENDA_KIND_TASK, "t-b", 9, "2026-08-23T00:00:00Z");
+        // Exactly on the horizon (today+10y) is `>= horizon`: Board order, not
+        // the dated stretch.
+        open_task("t-horizon", 2);
+        push_item("ai-horizon", "2036-08-23", AGENDA_KIND_TASK, "t-horizon", 0, "2026-08-23T00:00:00Z");
+        // A misplaced PLANNED row on the backlog date: the self-heal has not
+        // run, so it is absent until the next tick.
+        repos.tasks.push(task_row("t-misplaced", "u-1", "Misplaced | Work", "PLANNED"));
+        push_item("ai-misplaced", "2076-08-23", AGENDA_KIND_TASK, "t-misplaced", 1, "2026-08-23T00:00:00Z");
+        // A PLANNED row exactly on today+6 is the stream's last day: `items`,
+        // never `backlog`.
+        repos.tasks.push(task_row("t-last", "u-1", "Last | Work", "PLANNED"));
+        push_item("ai-last", "2026-08-29", AGENDA_KIND_TASK, "t-last", 0, "2026-08-23T00:00:00Z");
+
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.today, "2026-08-23");
+        assert_eq!(response.anchor_date, "2026-08-23", "nothing pends in the past");
+        assert_eq!(response.from, "2026-08-23", "the stream window");
+        assert_eq!(
+            response.to, "2026-08-29",
+            "never the backlog query's bounds"
+        );
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-last"],
+            "today+6 closes the stream: no backlog row joins it"
+        );
+        assert_eq!(
+            response
+                .backlog
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "ai-occ-rank0",
+                "ai-occ-rank1",
+                "ai-planned",
+                "ai-a",
+                "ai-a2",
+                "ai-b",
+                "ai-horizon",
+            ],
+            "dated rows in stream order, then OPEN tasks in Board order"
+        );
+    }
+
+    #[test]
+    fn get_agenda_history_clamps_at_the_day_before_the_anchor() {
+        let repos = repos();
+        // A pending PLANNED row on 2026-08-20 pins the anchor.
+        repos.tasks.push(task_row("t-past", "u-1", "Past | Work", "PLANNED"));
+        agenda_row(&repos, "ai-past", "u-1", "2026-08-20", AGENDA_KIND_TASK, "t-past", 0);
+        // A row past today+6: part of the default backlog, invisible to a
+        // history page.
+        repos.tasks.push(task_row("t-later", "u-1", "Later | Work", "PLANNED"));
+        agenda_row(&repos, "ai-later", "u-1", "2026-09-01", AGENDA_KIND_TASK, "t-later", 0);
+
+        // The anchor day itself belongs to the default stream, so `to` is
+        // clamped to the day before it. A window that starts at/after the
+        // anchor has nothing left to read: an empty 200 (`from > to` is legal
+        // in this one response), never a 400 — a stored history param must not
+        // fail just because the anchor moved earlier.
+        repos.agenda.reset_calls();
+        let empty = get_range(&repos, "u-1", Some("2026-08-20"), Some("2026-08-20")).unwrap();
+        assert_eq!(empty.from, "2026-08-20", "the requested `from` is echoed");
+        assert_eq!(empty.to, "2026-08-19", "`to` is clamped to anchor_date - 1");
+        assert_eq!(empty.anchor_date, "2026-08-20");
+        assert_eq!(empty.today, "2026-08-23");
+        assert!(
+            empty.items.is_empty(),
+            "from > to: no row in the clamped window, the anchor day included"
+        );
+        assert!(
+            empty.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            0,
+            "an empty window issues no range read at all: no page, no backlog query"
+        );
+
+        // The day before the anchor is a legal one-day history page.
+        repos.agenda.reset_calls();
+        let history = get_range(&repos, "u-1", Some("2026-08-19"), Some("2026-08-19")).unwrap();
+        assert_eq!(history.from, "2026-08-19");
+        assert_eq!(history.to, "2026-08-19");
+        assert_eq!(history.anchor_date, "2026-08-20");
+        assert!(
+            history.items.is_empty(),
+            "the 2026-09-01 row is not in the window"
+        );
+        assert!(
+            history.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            1,
+            "the history window is ONE read: the backlog query is never issued"
+        );
+
+        // A window whose `to` is past the anchor is clamped, not rejected.
+        repos.agenda.reset_calls();
+        let clamped = get_range(&repos, "u-1", Some("2026-08-18"), Some("2026-08-25")).unwrap();
+        assert_eq!(clamped.from, "2026-08-18", "the requested `from` is echoed");
+        assert_eq!(clamped.to, "2026-08-19", "`to` is clamped to anchor_date - 1");
+        assert_eq!(clamped.anchor_date, "2026-08-20");
+        assert!(
+            clamped.items.is_empty(),
+            "the 2026-08-20 pending row is the anchor day: never in a history page"
+        );
+        assert!(
+            clamped.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            1,
+            "the clamped history window is ONE read: the backlog query is never issued"
+        );
+
+        // The default read does issue it: the stream plus the backlog region.
+        repos.agenda.reset_calls();
+        let default = get_default(&repos, "u-1").unwrap();
+        assert_eq!(default.from, "2026-08-20");
+        assert_eq!(default.to, "2026-08-29");
+        assert_eq!(
+            default
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-past"]
+        );
+        assert_eq!(
+            default
+                .backlog
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-later"],
+            "the 2026-09-01 row is backlog on the default read"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            2,
+            "the default read adds the backlog query"
+        );
     }
 
     #[test]
@@ -4633,7 +5283,10 @@ mod tests {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-29")).unwrap();
+        // The default read is the read now: an explicit window must end before
+        // the anchor, and nothing pends in the past here, so the anchor is
+        // today and the stream is `2026-08-23 … 2026-08-29`.
+        let response = get_default(&repos, "u-1").unwrap();
         assert!(response.items.is_empty(), "no rows were ever written");
         assert_eq!(response.from, "2026-08-23");
         assert_eq!(response.to, "2026-08-29");
@@ -4673,7 +5326,9 @@ mod tests {
         push_item("ai-2", "2026-08-23", "t-1", 1);
         push_item("ai-3", "2026-08-23", "t-3", 0);
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-24")).unwrap();
+        // The default read (anchor … today+6) covers both days: the stream
+        // order is the repo's contract and is the same for either mode.
+        let response = get_default(&repos, "u-1").unwrap();
         let order: Vec<(&str, i64)> = response
             .items
             .iter()
@@ -4685,7 +5340,7 @@ mod tests {
             "(local_date, sort_order) order across the window"
         );
         assert_eq!(response.from, "2026-08-23");
-        assert_eq!(response.to, "2026-08-24");
+        assert_eq!(response.to, "2026-08-29");
         assert_eq!(
             response.earliest_date, "2026-08-23",
             "the min row date, not the window start"
@@ -4748,11 +5403,12 @@ mod tests {
         push_item("ai-today", "2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-today");
         push_item("ai-today-task", "2026-08-23", AGENDA_KIND_TASK, "t-today");
 
-        // Both bounds omitted → the window starts at the anchor.
+        // Both bounds omitted → the window starts at the anchor and runs
+        // through today+6 (never anchor+6).
         let response = get_default(&repos, "u-1").unwrap();
         assert_eq!(response.anchor_date, "2026-08-20");
         assert_eq!(response.from, "2026-08-20");
-        assert_eq!(response.to, "2026-08-26", "anchor + 6 civil days");
+        assert_eq!(response.to, "2026-08-29", "today+6 civil days");
         assert_eq!(response.earliest_date, "2026-08-18");
     }
 
@@ -4816,8 +5472,15 @@ mod tests {
             },
         ]);
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-24")).unwrap();
-        assert!(response.items.is_empty(), "both rows are outside the window");
+        // The default read (anchor … today+6) contains neither row: the old
+        // one is before `from`, the future one is past `to` and is dropped
+        // from the backlog too (a task-kind orphan has no task to embed).
+        let response = get_default(&repos, "u-1").unwrap();
+        assert!(response.items.is_empty(), "the old row is before the window");
+        assert!(
+            response.backlog.is_empty(),
+            "the future row is an orphan, so the backlog drops it"
+        );
         assert_eq!(
             response.earliest_date, "2026-07-01",
             "the floor ignores the requested window"
@@ -4834,10 +5497,32 @@ mod tests {
             matches!(err, AgendaError::Invalid(ref m) if m == "date range must not exceed 31 days"),
             "{err:?}"
         );
-        // 31 inclusive days is valid.
-        let ok = get_range(&repos, "u-1", Some("2026-08-01"), Some("2026-08-31")).unwrap();
-        assert_eq!(ok.from, "2026-08-01");
-        assert_eq!(ok.to, "2026-08-31");
+        // 31 inclusive days is valid — the span is checked on the requested
+        // dates, before the clamp to `anchor_date - 1` (2026-08-22 here;
+        // 2026-08-23 is the anchor, nothing pends in the past).
+        let ok = get_range(&repos, "u-1", Some("2026-07-23"), Some("2026-08-22")).unwrap();
+        assert_eq!(ok.from, "2026-07-23", "the requested `from` is echoed");
+        assert_eq!(ok.to, "2026-08-22");
+        assert!(
+            ok.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+
+        // A window that reaches the anchor day is clamped to the day before
+        // it — and this one lands entirely past the anchor, so it is an empty
+        // 200, never a 400. The anchor day (2026-08-23 = today, nothing pends)
+        // is in the default stream, not a history page.
+        let empty = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-23")).unwrap();
+        assert_eq!(empty.from, "2026-08-23", "the requested `from` is echoed");
+        assert_eq!(empty.to, "2026-08-22", "`to` is clamped to anchor_date - 1");
+        assert!(
+            empty.items.is_empty(),
+            "from > to: there is nothing left to read"
+        );
+        assert!(
+            empty.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
 
         let err = get_range(&repos, "u-1", Some("2026-08-24"), Some("2026-08-23")).unwrap_err();
         assert!(
@@ -4915,7 +5600,10 @@ mod tests {
         push_item("ai-running", "2026-08-26", AGENDA_KIND_OCCURRENCE, "occ-running");
         push_item("ai-task", "2026-08-27", AGENDA_KIND_TASK, "t-gone");
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-29")).unwrap();
+        // The default read covers 2026-08-23 … 2026-08-29, the old explicit
+        // window. (It is no longer a legal explicit window: it ends after the
+        // anchor.)
+        let response = get_default(&repos, "u-1").unwrap();
         let ids: Vec<&str> = response.items.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -4978,7 +5666,12 @@ mod tests {
         assert_eq!(agenda.get_by_ref, 0, "no per-row get_by_ref on a read");
         assert_eq!(agenda.list_by_refs, 0, "no membership check on a read");
         assert_eq!(agenda.list_by_user_and_date, 0, "no single-date pile read");
-        assert_eq!(agenda.list_by_user_and_date_range, 1, "one window read");
+        // Two range reads now: the stream (anchor … today+6) and the backlog
+        // region (today+7 … the `9999-12-31` ceiling).
+        assert_eq!(
+            agenda.list_by_user_and_date_range, 2,
+            "the stream page + the backlog page"
+        );
         assert_eq!(agenda.min_local_date, 1, "one earliest-date read");
         assert_eq!(
             agenda.oldest_pending_local_date_before, 1,
@@ -5426,10 +6119,61 @@ mod tests {
         assert_eq!(tomorrow.items[0].kind, AGENDA_KIND_TASK);
         let today = get(&repos, "u-1", "2026-08-23").unwrap();
         assert_eq!(today.items.len(), 0, "tasks never re-seed, so today stays empty");
-        // The task itself is untouched — status unchanged, no task_logs row
-        // (the fake task repo has no logs at all).
-        let stored = pollster::block_on(repos.tasks.get_by_id("t-1")).unwrap().unwrap();
-        assert_eq!(stored.status, "OPEN", "task status unchanged");
+        // The task itself is planned (ADR 0007): a reschedule of an OPEN task
+        // is a real status transition and writes exactly one `planned` log.
+        let stored = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, "PLANNED",
+            "an OPEN reschedule plans the task"
+        );
+        let logs = repos.logs.inserted.lock().unwrap();
+        assert_eq!(logs.len(), 1, "exactly one log");
+        assert_eq!(logs[0].r#type, TASK_LOG_PLANNED);
+        assert_eq!(logs[0].task_id, "t-1");
+        assert_eq!(logs[0].user_id, "u-1");
+    }
+
+    #[test]
+    fn reschedule_of_a_planned_task_moves_the_row_without_a_log() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-1", "u-1", "Review | Work", "PLANNED"));
+        // A peer at a different board rank would reveal an accidental Planned
+        // re-rank (the card is already in the destination column).
+        repos
+            .tasks
+            .push(task_row("t-peer", "u-1", "Peer | Work", "PLANNED"));
+        pollster::block_on(repos.tasks.set_sort_order("t-peer", 4)).unwrap();
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            0,
+        );
+
+        let response = reschedule(&repos, "u-1", "ai-1", "2026-08-24").unwrap();
+        assert_eq!(response.item.id, "ai-1", "the row is the same");
+        assert_eq!(response.item.local_date, "2026-08-24");
+
+        let stored = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "PLANNED", "PLANNED stays PLANNED");
+        assert_eq!(stored.sort_order, 0, "the board column is never re-ranked");
+        let peer = pollster::block_on(repos.tasks.get_by_id("t-peer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.sort_order, 4, "and no peer is shifted");
+        assert!(
+            repos.logs.inserted.lock().unwrap().is_empty(),
+            "an already-planned task writes no log"
+        );
     }
 
     #[test]
@@ -5495,6 +6239,24 @@ mod tests {
         });
         let err = reschedule(&repos, "u-1", "ai-gone", "2026-08-24").unwrap_err();
         assert!(matches!(err, AgendaError::NotFound), "{err:?}");
+
+        // The same gates hold on the backlog-drop path, plus the unknown-kind
+        // 404 both paths share.
+        let err = backlog_drop(&repos, "u-1", "nope").unwrap_err();
+        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
+        let err = backlog_drop(&repos, "u-1", "ai-x").unwrap_err();
+        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
+        let err = backlog_drop(&repos, "u-1", "ai-gone-task").unwrap_err();
+        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
+        agenda_row(&repos, "ai-weird", "u-1", "2026-08-23", "widget", "w-1", 0);
+        let err = reschedule(&repos, "u-1", "ai-weird", "2026-08-24").unwrap_err();
+        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
+        let err = backlog_drop(&repos, "u-1", "ai-weird").unwrap_err();
+        assert!(matches!(err, AgendaError::NotFound), "{err:?}");
+        assert!(
+            repos.logs.inserted.lock().unwrap().is_empty(),
+            "404s never write"
+        );
     }
 
     #[test]
@@ -5582,9 +6344,28 @@ mod tests {
             assert_eq!(stored.sort_order, rank, "rank untouched");
             assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "row untouched");
         }
-        let occurrence = pollster::block_on(repos.occurrences.get_by_id("occ-1")).unwrap().unwrap();
+        // The past 400 returns BEFORE any task write: the OPEN task is still
+        // OPEN and no `planned` log was inserted.
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.status, "OPEN",
+            "a rejected past move never plans the task"
+        );
+        assert!(
+            repos.logs.inserted.lock().unwrap().is_empty(),
+            "no log is written on a rejected past move"
+        );
+        let occurrence = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
         assert_eq!(occurrence.status, OCCURRENCE_STATUS_PENDING);
-        assert_eq!(get(&repos, "u-1", "2026-08-23").unwrap().items.len(), 2, "both slots stay");
+        assert_eq!(
+            get(&repos, "u-1", "2026-08-23").unwrap().items.len(),
+            2,
+            "both slots stay"
+        );
         assert!(get(&repos, "u-1", "2026-08-22").unwrap().items.is_empty());
     }
 
@@ -5647,6 +6428,10 @@ mod tests {
             let task = pollster::block_on(repos.tasks.get_by_id(id)).unwrap().unwrap();
             assert_eq!(task.status, status, "tasks.status is never touched");
         }
+        assert!(
+            repos.logs.inserted.lock().unwrap().is_empty(),
+            "a rejected terminal reschedule writes no log"
+        );
     }
 
     #[test]
@@ -5663,6 +6448,619 @@ mod tests {
         let stored = pollster::block_on(repos.agenda.get_by_id("ai-1")).unwrap().unwrap();
         assert_eq!(stored.local_date, "2026-08-23", "a rejected rank writes nothing");
         assert_eq!(stored.sort_order, 0);
+    }
+
+    #[test]
+    fn reschedule_rejects_a_date_on_or_past_the_ten_year_line() {
+        let repos = repos();
+        // One OPEN task and two occurrences (one waiting, one deferred), all
+        // on today.
+        let mut task = task_row("t-1", "u-1", "Review | Work", "OPEN");
+        task.sort_order = 2;
+        repos.tasks.push(task);
+        agenda_row(
+            &repos,
+            "ai-task",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            0,
+        );
+        repos
+            .routines
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeRoutineRepo::row(
+                "rt-1",
+                "u-1",
+                "Fajr",
+                0,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            ));
+        repos.occurrences.stored.lock().unwrap().extend([
+            FakeOccurrenceRepo::row(
+                "occ-1",
+                "rt-1",
+                "u-1",
+                "2026-08-23",
+                OCCURRENCE_STATUS_PENDING,
+            ),
+            FakeOccurrenceRepo::row(
+                "occ-skip",
+                "rt-1",
+                "u-1",
+                "2026-08-23",
+                OCCURRENCE_STATUS_SKIPPED,
+            ),
+        ]);
+        agenda_row(
+            &repos,
+            "ai-occ",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_OCCURRENCE,
+            "occ-1",
+            1,
+        );
+        agenda_row(
+            &repos,
+            "ai-skip",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_OCCURRENCE,
+            "occ-skip",
+            2,
+        );
+
+        // civil today + 10 years, from the same helper the service uses: the
+        // FIRST date in the backlog region.
+        assert_eq!(planning_horizon_date("2026-08-23").unwrap(), "2036-08-23");
+
+        for (id, rank) in [("ai-task", 0), ("ai-occ", 1), ("ai-skip", 2)] {
+            let err = reschedule(&repos, "u-1", id, "2036-08-23").unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "cannot reschedule more than 10 years ahead"),
+                "{err:?} for {id}"
+            );
+            let stored = pollster::block_on(repos.agenda.get_by_id(id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.local_date, "2026-08-23", "the row stays on today");
+            assert_eq!(stored.sort_order, rank, "rank untouched");
+            assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "row untouched");
+        }
+        // Nothing behind the row moved either: the task is still OPEN at its
+        // board rank, both occurrence statuses are intact (a horizon 400 must
+        // not flip `skipped`), and no log was written.
+        let stored = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, "OPEN",
+            "the horizon 400 never plans the task"
+        );
+        assert_eq!(stored.sort_order, 2, "tasks.sort_order untouched");
+        assert_eq!(
+            pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+                .unwrap()
+                .unwrap()
+                .status,
+            OCCURRENCE_STATUS_PENDING
+        );
+        assert_eq!(
+            pollster::block_on(repos.occurrences.get_by_id("occ-skip"))
+                .unwrap()
+                .unwrap()
+                .status,
+            OCCURRENCE_STATUS_SKIPPED,
+            "a horizon 400 must not flip skipped"
+        );
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no logs");
+
+        // today+10y - 1 is a legal real day for both kinds.
+        let moved = reschedule(&repos, "u-1", "ai-occ", "2036-08-22").unwrap();
+        assert_eq!(moved.item.local_date, "2036-08-22");
+        assert_eq!(moved.item.sort_order, 0, "empty target pile appends at 0");
+        let occurrence = pollster::block_on(repos.occurrences.get_by_id("occ-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            occurrence.local_date, "2026-08-23",
+            "the rule date is never rewritten"
+        );
+        assert_eq!(occurrence.status, OCCURRENCE_STATUS_PENDING);
+
+        // The deferred chip on the same legal day flips to pending, as always.
+        let moved = reschedule(&repos, "u-1", "ai-skip", "2036-08-22").unwrap();
+        assert_eq!(
+            moved.item.occurrence.as_ref().unwrap().status,
+            OCCURRENCE_STATUS_PENDING,
+            "a legal reschedule still defers a skipped day"
+        );
+
+        // And a task inside the line plans and moves.
+        let moved = reschedule(&repos, "u-1", "ai-task", "2036-08-22").unwrap();
+        assert_eq!(moved.item.local_date, "2036-08-22");
+        let stored = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, "PLANNED",
+            "a legal reschedule plans an OPEN task"
+        );
+        let logs = repos.logs.inserted.lock().unwrap();
+        assert_eq!(logs.len(), 1, "exactly one log");
+        assert_eq!(logs[0].r#type, TASK_LOG_PLANNED);
+    }
+
+    #[test]
+    fn reschedule_rejects_an_in_progress_task() {
+        let repos = repos();
+        let mut task = task_row("t-1", "u-1", "Review | Work", "IN_PROGRESS");
+        task.sort_order = 3;
+        repos.tasks.push(task);
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            2,
+        );
+
+        let err = reschedule(&repos, "u-1", "ai-1", "2026-08-24").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "cannot reschedule an in_progress task"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.local_date, "2026-08-23",
+            "a running task never moves its row"
+        );
+        assert_eq!(stored.sort_order, 2, "rank untouched");
+        assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "row untouched");
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.status, "IN_PROGRESS",
+            "pause first: the status is never flipped"
+        );
+        assert_eq!(task.sort_order, 3, "board rank untouched");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+        assert!(get(&repos, "u-1", "2026-08-24").unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn reschedule_same_date_on_the_backlog_date_does_not_plan() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            3,
+        );
+        // The target is the row's own date and it is past the 10-year line, so
+        // this no-op proves the same-date check runs BEFORE the horizon check.
+        assert_eq!(backlog_local_date("2026-08-23").unwrap(), "2076-08-23");
+        assert!(
+            backlog_local_date("2026-08-23").unwrap()
+                >= planning_horizon_date("2026-08-23").unwrap()
+        );
+
+        let response = reschedule_at(&repos, "u-1", "ai-1", "2076-08-23", Some(7)).unwrap();
+        assert_eq!(response.item.id, "ai-1");
+        assert_eq!(response.item.local_date, "2076-08-23");
+        assert_eq!(response.item.sort_order, 3, "the named rank is ignored too");
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.updated_at, "2026-08-23T00:00:00Z",
+            "the row is untouched"
+        );
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.status, "OPEN",
+            "an OPEN row on the backlog date is not planned"
+        );
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
+    fn backlog_drop_of_a_planned_task_opens_it_on_the_backlog_date() {
+        let repos = repos();
+        let mut task = task_row("t-1", "u-1", "Review | Work", "PLANNED");
+        task.sort_order = 4;
+        repos.tasks.push(task);
+        // An existing Backlog card: the dropped task appends after it on the
+        // Board, and the agenda's backlog pile was empty.
+        repos
+            .tasks
+            .push(task_row("t-peer", "u-1", "Peer | Work", "OPEN"));
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            0,
+        );
+
+        let response = backlog_drop(&repos, "u-1", "ai-1").unwrap();
+        assert_eq!(response.item.id, "ai-1", "same agenda row, relocated");
+        assert_eq!(response.item.local_date, "2076-08-23");
+        assert_eq!(response.item.sort_order, 0, "the backlog pile was empty");
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.status, "OPEN",
+            "a real unplan returns the task to Backlog"
+        );
+        assert_eq!(task.sort_order, 1, "the Open column appends at max+1");
+        let peer = pollster::block_on(repos.tasks.get_by_id("t-peer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.sort_order, 0, "the peer keeps its rank");
+        let logs = repos.logs.inserted.lock().unwrap();
+        assert_eq!(logs.len(), 1, "exactly one log");
+        assert_eq!(logs[0].r#type, TASK_LOG_UNPLANNED);
+        assert_eq!(logs[0].task_id, "t-1");
+        assert_eq!(logs[0].user_id, "u-1");
+    }
+
+    #[test]
+    fn backlog_drop_of_a_planned_task_already_on_the_backlog_date_still_unplans() {
+        let repos = repos();
+        let mut task = task_row("t-1", "u-1", "Review | Work", "PLANNED");
+        task.sort_order = 4;
+        repos.tasks.push(task);
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            5,
+        );
+
+        let response = backlog_drop(&repos, "u-1", "ai-1").unwrap();
+        assert_eq!(
+            response.item.local_date, "2076-08-23",
+            "the row is already there: not reshuffled"
+        );
+        assert_eq!(response.item.sort_order, 5, "and it keeps its rank");
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.updated_at, "2026-08-23T00:00:00Z",
+            "`place_on_date` is never called"
+        );
+        // The status half still runs — a misplacement does not make the drop a
+        // no-op.
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "OPEN", "still a real unplan");
+        assert_eq!(task.sort_order, 0, "and a real Open-column append");
+        let logs = repos.logs.inserted.lock().unwrap();
+        assert_eq!(logs.len(), 1, "exactly one log");
+        assert_eq!(logs[0].r#type, TASK_LOG_UNPLANNED);
+    }
+
+    #[test]
+    fn backlog_drop_of_an_open_task_already_there_is_a_noop() {
+        let repos = repos();
+        let mut task = task_row("t-1", "u-1", "Review | Work", "OPEN");
+        task.sort_order = 4;
+        repos.tasks.push(task);
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            3,
+        );
+
+        // A named rank is ignored on this path:
+        // `{"backlog":true,"sort_order":7}` parses and changes nothing.
+        let response = reschedule_body(&repos, "u-1", "ai-1", None, Some(7), true).unwrap();
+        assert_eq!(response.item.id, "ai-1");
+        assert_eq!(response.item.local_date, "2076-08-23");
+        assert_eq!(
+            response.item.sort_order, 3,
+            "idempotent: the row is never reshuffled"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z", "row untouched");
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "OPEN");
+        assert_eq!(task.sort_order, 4, "already Backlog: no board re-rank");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
+    fn backlog_drop_of_an_open_task_on_a_real_day_moves_the_row_without_a_log() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            2,
+        );
+
+        let response = backlog_drop(&repos, "u-1", "ai-1").unwrap();
+        assert_eq!(response.item.id, "ai-1", "same agenda row");
+        assert_eq!(response.item.local_date, "2076-08-23");
+        assert_eq!(
+            response.item.sort_order, 0,
+            "appended on the empty backlog pile"
+        );
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "OPEN", "already OPEN: no status write");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+        assert!(
+            get(&repos, "u-1", "2026-08-23").unwrap().items.is_empty(),
+            "the row left the day stream"
+        );
+    }
+
+    #[test]
+    fn backlog_drop_refuses_an_in_progress_task_and_any_occurrence() {
+        let repos = repos();
+        let mut running = task_row("t-run", "u-1", "Running | Work", "IN_PROGRESS");
+        running.sort_order = 2;
+        repos.tasks.push(running);
+        agenda_row(
+            &repos,
+            "ai-run",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-run",
+            3,
+        );
+
+        let err = backlog_drop(&repos, "u-1", "ai-run").unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "cannot move an in_progress task to the backlog"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-run"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "the slot stays put");
+        assert_eq!(stored.sort_order, 3, "rank untouched");
+        let task = pollster::block_on(repos.tasks.get_by_id("t-run"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "IN_PROGRESS", "no status write");
+        assert_eq!(task.sort_order, 2, "no board re-rank");
+
+        // Every occurrence status is refused — even a waiting one.
+        repos
+            .routines
+            .stored
+            .lock()
+            .unwrap()
+            .push(FakeRoutineRepo::row(
+                "rt-1",
+                "u-1",
+                "Fajr",
+                0,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            ));
+        let statuses = [
+            OCCURRENCE_STATUS_PENDING,
+            OCCURRENCE_STATUS_SKIPPED,
+            OCCURRENCE_STATUS_IN_PROGRESS,
+            OCCURRENCE_STATUS_DONE,
+        ];
+        for (index, status) in statuses.into_iter().enumerate() {
+            let occ_id = format!("occ-{index}");
+            let item_id = format!("ai-occ-{index}");
+            let rank = 4 + index as i64;
+            repos
+                .occurrences
+                .stored
+                .lock()
+                .unwrap()
+                .push(FakeOccurrenceRepo::row(
+                    &occ_id,
+                    "rt-1",
+                    "u-1",
+                    "2026-08-23",
+                    status,
+                ));
+            agenda_row(
+                &repos,
+                &item_id,
+                "u-1",
+                "2026-08-23",
+                AGENDA_KIND_OCCURRENCE,
+                &occ_id,
+                rank,
+            );
+
+            let err = backlog_drop(&repos, "u-1", &item_id).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "cannot move an occurrence to the backlog"),
+                "{err:?} for {status}"
+            );
+            let stored = pollster::block_on(repos.agenda.get_by_id(&item_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.local_date, "2026-08-23",
+                "an occurrence never leaves its day"
+            );
+            assert_eq!(stored.sort_order, rank, "rank untouched");
+            let occurrence = pollster::block_on(repos.occurrences.get_by_id(&occ_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(occurrence.status, status, "occurrence status untouched");
+            assert_eq!(
+                occurrence.local_date, "2026-08-23",
+                "the rule date is never rewritten"
+            );
+        }
+        assert!(
+            repos.logs.inserted.lock().unwrap().is_empty(),
+            "nothing was logged"
+        );
+    }
+
+    #[test]
+    fn backlog_drop_refuses_a_terminal_task() {
+        let repos = repos();
+        for (id, status) in [("t-done", "COMPLETED"), ("t-disc", "DISCARDED")] {
+            repos
+                .tasks
+                .push(task_row(id, "u-1", "Review | Work", status));
+            let item_id = format!("ai-{id}");
+            agenda_row(
+                &repos,
+                &item_id,
+                "u-1",
+                "2026-08-23",
+                AGENDA_KIND_TASK,
+                id,
+                0,
+            );
+            let err = backlog_drop(&repos, "u-1", &item_id).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == "cannot move a terminal task to the backlog"),
+                "{err:?} for {status}"
+            );
+            let stored = pollster::block_on(repos.agenda.get_by_id(&item_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.local_date, "2026-08-23", "the slot stays put");
+            assert_eq!(stored.sort_order, 0, "rank untouched");
+            let task = pollster::block_on(repos.tasks.get_by_id(id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.status, status, "tasks.status is never touched");
+        }
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
+    fn reschedule_rejects_date_and_backlog_together() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            0,
+        );
+
+        let err =
+            reschedule_body(&repos, "u-1", "ai-1", Some("2026-08-24"), None, true).unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "date and backlog are mutually exclusive"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "nothing was written");
+        assert_eq!(stored.sort_order, 0);
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "OPEN", "no status transition");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+
+        // A BLANK date next to `backlog: true` is not a conflict —
+        // `{"backlog":true,"date":""}` is just a drop.
+        let response = reschedule_body(&repos, "u-1", "ai-1", Some("  "), None, true).unwrap();
+        assert_eq!(
+            response.item.local_date, "2076-08-23",
+            "a blank date is still a drop"
+        );
+        assert_eq!(response.item.sort_order, 0);
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2076-08-23");
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "OPEN", "the drop never writes a status");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "and no log");
+    }
+
+    #[test]
+    fn reschedule_requires_a_date_when_not_a_backlog_drop() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-1", "u-1", "Review | Work", "OPEN"));
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            0,
+        );
+
+        let err = reschedule_body(&repos, "u-1", "ai-1", None, None, false).unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "date is required"),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "nothing was written");
+        assert_eq!(stored.sort_order, 0);
+        assert_eq!(stored.updated_at, "2026-08-23T00:00:00Z");
+        let task = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "OPEN", "no status transition");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
     }
 
     // ──────────────────────────────────────────
@@ -6180,8 +7578,11 @@ mod tests {
             &repos.agenda,
             &repos.tasks,
             "u-1",
-            Some("2026-08-23"),
-            Some("2026-08-23"),
+            // Both omitted: the default read starts at the anchor, and today
+            // is in it. An explicit one-day window ending on the anchor is a
+            // history 400 now (ADR 0007).
+            None,
+            None,
             NOW_UNIX,
             Some("t-1"),
         ))
@@ -7489,7 +8890,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_task_items_backfills_open_tasks_on_today_in_board_order() {
+    fn ensure_task_items_places_rowless_tasks_in_board_order() {
         let repos = repos();
         let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
         running.sort_order = 1;
@@ -7503,9 +8904,18 @@ mod tests {
         for task in [running, planned, open, completed, placed] {
             repos.tasks.push(task);
         }
-        // A task that already holds a slot (on a past day) is left alone: no
-        // second row, no move.
-        agenda_row(&repos, "ai-placed", "u-1", "2026-08-20", AGENDA_KIND_TASK, "task-placed", 2);
+        // An OPEN row inside the ten-year line is misplaced under ADR 0007:
+        // the fill moves it out to the backlog date (it is no longer "already
+        // placed, leave it alone").
+        agenda_row(
+            &repos,
+            "ai-placed",
+            "u-1",
+            "2026-08-20",
+            AGENDA_KIND_TASK,
+            "task-placed",
+            2,
+        );
 
         ensure_tasks(&repos, "u-1").unwrap();
 
@@ -7515,14 +8925,20 @@ mod tests {
                 .into_iter()
                 .map(|item| (item.ref_id, item.sort_order))
                 .collect();
+        let expected_today = vec![("task-run".to_string(), 0), ("task-plan".to_string(), 1)];
         assert_eq!(
-            today,
+            today, expected_today,
+            "rowless IN_PROGRESS then PLANNED land on today, ranks starting at 0"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
             vec![
-                ("task-run".to_string(), 0),
-                ("task-plan".to_string(), 1),
-                ("task-open".to_string(), 2),
+                ("task-run".to_string(), 0, "2026-08-23".to_string()),
+                ("task-plan".to_string(), 1, "2026-08-23".to_string()),
+                ("task-open".to_string(), 0, "2076-08-23".to_string()),
+                ("task-placed".to_string(), 1, "2076-08-23".to_string()),
             ],
-            "IN_PROGRESS, PLANNED, OPEN — ranks 0, 1, 2"
+            "OPEN lands on the backlog date, appended in board order, never on today"
         );
         assert!(
             membership_triples(&repos, "u-1")
@@ -7530,22 +8946,274 @@ mod tests {
                 .all(|(ref_id, _, _)| ref_id != "task-done"),
             "a COMPLETED task gets nothing"
         );
-        let placed_rows: Vec<(String, i64, String)> = membership_triples(&repos, "u-1")
-            .into_iter()
-            .filter(|(ref_id, _, _)| ref_id == "task-placed")
-            .collect();
         assert_eq!(
-            placed_rows,
-            vec![("task-placed".to_string(), 2, "2026-08-20".to_string())],
-            "an already-placed task keeps its single row where it was"
+            repos.agenda.stored.lock().unwrap().len(),
+            4,
+            "one row per living task — the moved row is the same row"
         );
 
-        // A second pass writes nothing.
-        let before = repos.agenda.stored.lock().unwrap().len();
+        // A second pass with nothing misplaced writes nothing at all. The fake
+        // does not count `set_local_date`, so the snapshot proves no row moved.
+        let before = membership_triples(&repos, "u-1");
         repos.agenda.reset_calls();
         ensure_tasks(&repos, "u-1").unwrap();
-        assert_eq!(repos.agenda.stored.lock().unwrap().len(), before);
+        assert_eq!(membership_triples(&repos, "u-1"), before, "idempotent");
         assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn ensure_task_items_moves_an_open_row_before_the_horizon_onto_the_backlog_date() {
+        let repos = repos();
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 3;
+        repos.tasks.push(open);
+        agenda_row(
+            &repos,
+            "ai-open",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "task-open",
+            4,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        let rows = items_of(&repos, "task-open");
+        assert_eq!(rows.len(), 1, "the row travels; no second row is inserted");
+        assert_eq!(rows[0].id, "ai-open", "the same row moved");
+        assert_eq!(
+            rows[0].local_date, "2076-08-23",
+            "the backlog date, not today"
+        );
+        assert_eq!(rows[0].sort_order, 0, "appended on an empty backlog pile");
+    }
+
+    #[test]
+    fn ensure_task_items_moves_a_far_future_planned_and_in_progress_row_onto_today() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 4;
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 9;
+        let mut horizon = task_row("task-horizon", "u-1", "Horizon | Work", "PLANNED");
+        horizon.sort_order = 2;
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 1;
+        for task in [planned, running, horizon, open] {
+            repos.tasks.push(task);
+        }
+        // Both far-future rows sit in the backlog region although their
+        // statuses are real-day statuses; the rowless OPEN must not steal
+        // today's ranks.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            7,
+        );
+        agenda_row(
+            &repos,
+            "ai-run",
+            "u-1",
+            "2076-08-24",
+            AGENDA_KIND_TASK,
+            "task-run",
+            0,
+        );
+        // Exactly ON the horizon: rule (b) is `>=`, so this one moves too.
+        agenda_row(
+            &repos,
+            "ai-horizon",
+            "u-1",
+            "2036-08-23",
+            AGENDA_KIND_TASK,
+            "task-horizon",
+            4,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-run".to_string(), 0, "2026-08-23".to_string()),
+                ("task-horizon".to_string(), 1, "2026-08-23".to_string()),
+                ("task-plan".to_string(), 2, "2026-08-23".to_string()),
+                ("task-open".to_string(), 0, "2076-08-23".to_string()),
+            ],
+            "IN_PROGRESS then PLANNED (by sort_order) appended on today; OPEN stays in the backlog"
+        );
+        let moved =
+            pollster::block_on(repos.agenda.get_by_ref("u-1", AGENDA_KIND_TASK, "task-run"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(moved.id, "ai-run", "the existing row travelled");
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_a_dated_future_planned_row_alone() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 6;
+        repos.tasks.push(planned);
+        // today+8 is inside [today, horizon): a dated future plan.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-31",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            5,
+        );
+
+        repos.agenda.reset_calls();
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![("task-plan".to_string(), 5, "2026-08-31".to_string())],
+            "the date and its rank are untouched"
+        );
+        assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_a_past_planned_row_alone() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 2;
+        repos.tasks.push(planned);
+        // A past pending PLANNED row can still pin the anchor.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-20",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            2,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![("task-plan".to_string(), 2, "2026-08-20".to_string())],
+            "past PLANNED rows are anchor material, never moved to today"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_an_open_row_already_past_the_horizon_alone() {
+        let repos = repos();
+        let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
+        open.sort_order = 3;
+        let mut edge = task_row("task-edge", "u-1", "Edge | Work", "OPEN");
+        edge.sort_order = 8;
+        for task in [open, edge] {
+            repos.tasks.push(task);
+        }
+        // 2076-08-22 is still >= 2036-08-23, so it is not "normalized" onto
+        // exactly today's backlog date.
+        agenda_row(
+            &repos,
+            "ai-open",
+            "u-1",
+            "2076-08-22",
+            AGENDA_KIND_TASK,
+            "task-open",
+            3,
+        );
+        // Exactly ON the horizon: rule (a) is `<`, so it does not move either.
+        agenda_row(
+            &repos,
+            "ai-edge",
+            "u-1",
+            "2036-08-23",
+            AGENDA_KIND_TASK,
+            "task-edge",
+            1,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-edge".to_string(), 1, "2036-08-23".to_string()),
+                ("task-open".to_string(), 3, "2076-08-22".to_string()),
+            ],
+            "an OPEN row at >= the horizon is left exactly where it is"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_appends_rowless_open_tasks_by_sort_order_with_id_ties() {
+        let repos = repos();
+        let mut high = task_row("task-high", "u-1", "High | Work", "OPEN");
+        high.sort_order = 5;
+        let mut low = task_row("task-low", "u-1", "Low | Work", "OPEN");
+        low.sort_order = 1;
+        let mut tie_a = task_row("task-a", "u-1", "A | Work", "OPEN");
+        tie_a.sort_order = 3;
+        let mut tie_b = task_row("task-b", "u-1", "B | Work", "OPEN");
+        tie_b.sort_order = 3;
+        // Push the tie in reverse id order: the fill must sort it.
+        for task in [high, low, tie_b, tie_a] {
+            repos.tasks.push(task);
+        }
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-low".to_string(), 0, "2076-08-23".to_string()),
+                ("task-a".to_string(), 1, "2076-08-23".to_string()),
+                ("task-b".to_string(), 2, "2076-08-23".to_string()),
+                ("task-high".to_string(), 3, "2076-08-23".to_string()),
+            ],
+            "sort_order first, task id breaks the tie; distinct append ranks"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_appends_a_rowless_in_progress_after_todays_existing_rows() {
+        let repos = repos();
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 0;
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 4;
+        for task in [planned, running] {
+            repos.tasks.push(task);
+        }
+        // A row already correctly on today at rank 5 keeps that rank; the
+        // rowless IN_PROGRESS is appended after the pile, not reshuffled in.
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            5,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-plan".to_string(), 5, "2026-08-23".to_string()),
+                ("task-run".to_string(), 6, "2026-08-23".to_string()),
+            ],
+            "the existing rank stands and the arrival lands after it"
+        );
     }
 
     #[test]
@@ -7789,8 +9457,8 @@ mod tests {
         assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
         assert_eq!(
             membership_triples(&repos, "u-2"),
-            vec![("task-1".to_string(), 0, "2026-08-23".to_string())],
-            "u-2's OPEN task landed on today"
+            vec![("task-1".to_string(), 0, "2076-08-23".to_string())],
+            "u-2's OPEN task landed on the backlog date"
         );
 
         // A living routine whose calendar read fails: one broken user is
@@ -7818,7 +9486,7 @@ mod tests {
         assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
         assert_eq!(
             membership_triples(&repos, "u-2"),
-            vec![("task-1".to_string(), 0, "2026-08-23".to_string())]
+            vec![("task-1".to_string(), 0, "2076-08-23".to_string())]
         );
     }
 }

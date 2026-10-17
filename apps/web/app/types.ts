@@ -572,13 +572,18 @@ export interface AgendaItemRecord {
 }
 
 // The envelope returned by GET /api/agenda — one window of the infinite day
-// stream (both bounds omitted → the server's anchor week, `anchor_date …
-// anchor_date + 6`; both set → that inclusive window, max 31 days). `today` +
-// `time_zone` are the server's civil today (ADR 0004 amendment): the civil
-// date of now in the user's primary Google calendar's IANA `time_zone` — the
-// browser must never compute "today" itself.
+// stream (both bounds omitted → the server's default read, `anchor_date …
+// today + 6` plus `backlog`; both set → that inclusive history window, max 31
+// days, and `backlog` is empty). `today` + `time_zone` are the server's civil
+// today (ADR 0004 amendment): the civil date of now in the user's primary
+// Google calendar's IANA `time_zone` — the browser must never compute "today"
+// itself.
 export interface AgendaResponse {
   items: AgendaItemRecord[];
+  // Rows past the day stream (ADR 0007): the dated stretch `today+6 <
+  // local_date < today+10y`, then `OPEN` tasks whose row date is `≥ today+10y`
+  // in Board order. Empty on a history read.
+  backlog: AgendaItemRecord[];
   // `YYYY-MM-DD` — the resolved inclusive window start (never the raw query).
   from: string;
   // `YYYY-MM-DD` — the resolved inclusive window end.
@@ -589,7 +594,7 @@ export interface AgendaResponse {
   // `time_zone`, or "UTC" when the user has no primary calendar).
   time_zone: string;
   // `YYYY-MM-DD` — the oldest past date that still holds a **pending** item,
-  // else `today`. The anchor-week window starts here; Home lands here.
+  // else `today`. The default window starts here; Home lands here.
   anchor_date: string;
   // `YYYY-MM-DD` — `MIN(local_date)` over all agenda rows, else `today`.
   // Independent of the window: the browser's back-scroll floor.
@@ -615,15 +620,21 @@ export interface MoveAgendaItemInput {
   sort_order: number;
 }
 
-// Request body for POST /api/agenda/items/:id/reschedule — the local civil
-// date (`YYYY-MM-DD`) the slot relocates to. `sort_order` is optional: a named
-// rank shifts the target date's peers at/after it up one, an omitted one
-// appends at `max + 1`. Occurrences move only while `pending | skipped`
-// (skipped → pending; in_progress/done → 400); tasks move the membership slot
-// only, task status unchanged. Same date → 200 no-op; a past date 400s.
+// Request body for POST /api/agenda/items/:id/reschedule (ADR 0007) — either
+// the local civil date (`YYYY-MM-DD`) the slot relocates to, or
+// `{ backlog: true }` to drop it into the backlog (never both). `sort_order`
+// is optional on the date path: a named rank shifts the target date's peers
+// at/after it up one, an omitted one appends at `max + 1`. Occurrences move
+// only while `pending | skipped` (skipped → pending; in_progress/done → 400);
+// a task reschedule is a status transition — `OPEN` becomes `PLANNED`, an
+// `IN_PROGRESS` task 400s (pause first). Same date → 200 no-op; a past date
+// 400s. A backlog drop never carries `date`: occurrences and `IN_PROGRESS`
+// tasks 400, a `PLANNED` task becomes `OPEN`, an already-`OPEN` row on the
+// backlog date is a no-op.
 export interface RescheduleAgendaItemInput {
-  date: string;
+  date?: string;
   sort_order?: number;
+  backlog?: boolean;
 }
 
 // The envelope returned by PATCH /api/occurrences/:id,

@@ -11,12 +11,14 @@
 //!
 //! Status map: 401 unauthorized (missing session, or a Google-touching verb
 //! without a refreshable token), 400 invalid input (invalid date, malformed
-//! body, negative rank, reschedule into the past or of a terminal/
-//! in_progress/done item, move-to-today of a day that is not in the past,
-//! empty PATCH body, start on a non-today or terminal occurrence, no writable
-//! calendar), 404 "not found" (missing/other-user/soft-deleted task,
-//! occurrence, item, or routine — existence is never leaked), 502 Google
-//! write failure, 500 logged database errors.
+//! body, negative rank, reschedule into the past / past today+10y / of a
+//! running or terminal task, a reschedule that sets both `date` and `backlog`
+//! or neither, a backlog drop of a running/terminal task or of an occurrence,
+//! move-to-today of a day that is not in the past, empty PATCH body, start on
+//! a non-today or terminal occurrence, no writable calendar), 404 "not found"
+//! (missing/other-user/soft-deleted task, occurrence, item, or routine —
+//! existence is never leaked), 502 Google write failure, 500 logged database
+//! errors.
 
 use worker::*;
 
@@ -101,6 +103,13 @@ fn categories_d1(
         .d1("DB")
         .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
     Ok(crate::db::D1TaskCategoryRepo::new(db))
+}
+
+fn task_logs_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TaskLogRepo> {
+    let db = ctx
+        .d1("DB")
+        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
+    Ok(crate::db::D1TaskLogRepo::new(db))
 }
 
 fn lists_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TaskListRepo> {
@@ -200,14 +209,20 @@ async fn focused_task_id(
 
 /// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` → 200
 /// `{"items":[...],"from":"YYYY-MM-DD","to":"YYYY-MM-DD","today":"YYYY-MM-DD",
-/// "time_zone":"IANA","anchor_date":"YYYY-MM-DD","earliest_date":"YYYY-MM-DD"}`.
+/// "time_zone":"IANA","anchor_date":"YYYY-MM-DD","earliest_date":"YYYY-MM-DD",
+/// "backlog":[...]}`.
 ///
-/// Both bounds are **optional** and must be set together: omitted reads the
-/// anchor week (the oldest past date that still holds a pending item — civil
-/// today when nothing pends — plus six days). This GET is a **pure range
-/// read**: it seeds nothing and writes no occurrence / agenda row (the old
-/// `?date=` parameter is ignored). The response carries the server-computed
-/// `today` + `time_zone`.
+/// Both bounds are **optional** and must be set together: omitted reads
+/// `anchor_date … today+6` (the oldest past date that still holds a pending
+/// item — civil today when nothing pends — through six days after today, with
+/// no 31-day cap) plus the `backlog` array of every row past that window. An
+/// explicit window is **history only**: at most 31 inclusive days, `to` is
+/// clamped to the day before `anchor_date` (the anchor day is on the default
+/// read), and a window that lands entirely past the anchor is an empty 200,
+/// never an error. `backlog` stays empty. This GET is a
+/// **pure range read**: it seeds nothing and writes no occurrence / agenda row
+/// (the old `?date=` parameter is ignored). The response carries the
+/// server-computed `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
@@ -299,12 +314,16 @@ pub async fn move_agenda_item(
 }
 
 /// `POST /api/agenda/items/:id/reschedule` → 200 `{"item":{...}}`. Body:
-/// `{date, sort_order?}` (`date` is `YYYY-MM-DD` and must be today or later;
-/// `sort_order` is the optional landing rank). Relocates the slot to that
-/// day — the occurrence moves its agenda item only (no exdate anywhere;
-/// `pending | skipped` only), a task moves the membership slot only (task
-/// status unchanged, terminal → 400, no `task_logs` row). Same date is a 200
-/// no-op. Session-only: no Google write of any kind.
+/// `{date, sort_order?}` (`date` is `YYYY-MM-DD`, today … today+10y-1, and
+/// `sort_order` is the optional landing rank) or `{backlog: true}` (drop the
+/// task into the backlog; `date` must be absent, `sort_order` is ignored).
+/// Relocates the slot to that day — the occurrence moves its agenda item only
+/// (no exdate anywhere; `pending | skipped` only, never into the backlog), a
+/// task reschedule plans it (`OPEN` → `PLANNED` + a `planned` task_logs row +
+/// the Planned column; `PLANNED` stays put; running/terminal → 400), and a
+/// backlog drop returns it to `OPEN` on the backlog date (`unplanned` row +
+/// the Open column; an already-`OPEN` task writes nothing). Same date is a
+/// 200 no-op. Session-only: no Google write of any kind.
 pub async fn reschedule_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -328,14 +347,16 @@ pub async fn reschedule_agenda_item(
         &categories_d1(&ctx)?,
         &agenda_d1(&ctx)?,
         &tasks_d1(&ctx)?,
+        &task_logs_d1(&ctx)?,
         &occurrences_d1(&ctx)?,
         &routines_d1(&ctx)?,
         &calendars_d1(&ctx)?,
         now_unix,
         &user.id,
         id,
-        &input.date,
+        input.date.as_deref(),
         input.sort_order,
+        input.backlog,
         focused_task_id.as_deref(),
     )
     .await

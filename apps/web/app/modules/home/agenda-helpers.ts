@@ -1,11 +1,17 @@
-// Pure helpers for Home's agenda stream (ADR 0004 amendment — slice 5): the
-// day label, the reorder rank math, the living / Completed dump split, the
-// date-window walk, and the optimistic edits over React Query's infinite
-// `{ pages }` cache. Kept React-free so `node:test` can cover them
-// (HomePage.tsx is presentational glue on top).
+// Pure helpers for Home's agenda stream (ADR 0004 amendment — slice 5, ADR
+// 0007 — slice 6): the day label, the reorder rank math, the living /
+// Completed dump split, the backlog split, the date-window walk, and the
+// optimistic edits over React Query's infinite `{ pages }` cache. Kept
+// React-free so `node:test` can cover them (HomePage.tsx is presentational
+// glue on top).
 
 import type { InfiniteData } from '@tanstack/react-query';
-import type { AgendaItemRecord, AgendaResponse, TaskStatus } from '../../types';
+import type {
+  AgendaItemRecord,
+  AgendaResponse,
+  TaskRecord,
+  TaskStatus,
+} from '../../types';
 import { addCivilDays, isCivilDateValid } from '../routines/rrule-preview';
 
 const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -75,6 +81,32 @@ export function eachCivilDate(from: string, to: string): string[] {
   return dates;
 }
 
+/** `date` shifted by whole months, CLAMPING the day exactly like chrono's
+ *  `checked_add_months` (ADR 0007): 2024-02-29 + 120 months = 2034-02-28, not
+ *  JS `setUTCMonth`'s roll into March. The server computes the backlog date
+ *  (today+600) and the 10-year line (today+120) this way, so the client must
+ *  match it or the two disagree on Feb 29. Malformed input returns the input
+ *  unchanged. */
+export function addMonthsClamp(date: string, months: number): string {
+  const trimmed = date.trim();
+  if (!isCivilDateValid(trimmed)) return date;
+  const [y, m, d] = trimmed.split('-').map(Number);
+  // Total months from year 0, so a negative offset floors correctly.
+  const total = y * 12 + (m - 1) + months;
+  const year = Math.floor(total / 12);
+  const month = ((total % 12) + 12) % 12; // 0-based
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const day = Math.min(d, lastDay);
+  return `${String(year).padStart(4, '0')}-${pad(month + 1)}-${pad(day)}`;
+}
+
+/** The date picker's upper bound: today + 10 years − 1 day, so the last day
+ *  the API accepts for a reschedule (`target < today+10y`) is selectable. Built
+ *  from the SERVER's civil today with the same month clamp as the API. */
+export function rescheduleMaxDate(today: string): string {
+  return addCivilDays(addMonthsClamp(today, 120), -1);
+}
+
 /** The loaded span of the stream: the FIRST page's `from` through the LAST
  *  page's `to`, or null when nothing is loaded. `pages` is in infinite-query
  *  order — previous pages are prepended, so index 0 is always the earliest. */
@@ -85,6 +117,70 @@ export function streamBounds(
   const last = pages[pages.length - 1];
   if (!first || !last) return null;
   return { from: first.from, to: last.to };
+}
+
+/** The next history window to request (ADR 0007): the default read ends at
+ *  `today+6` and every history page sits strictly before the anchor, so this
+ *  is the ONE read that pages BACK. The window is 7 inclusive days ending the
+ *  day before the oldest loaded date, capped so `from` never falls before
+ *  `earliest_date`, and `undefined` says there is nothing older to ask for.
+ *  A gap between the oldest loaded page and the anchor is filled FIRST: the
+ *  window then ends on the anchor's eve.
+ *  The result always has `to < anchor_date`: the server no longer rejects a
+ *  window that reaches the anchor (it clamps `to` to the anchor's eve), but a
+ *  history page there would overlap the default read. */
+export function previousHistoryWindow(
+  pages: {
+    from: string;
+    to: string;
+    anchor_date: string;
+    earliest_date: string;
+  }[],
+): { from: string; to: string } | undefined {
+  const first = pages[0];
+  if (!first) return undefined;
+  const anchor = first.anchor_date;
+  const earliest = first.earliest_date;
+  if (
+    !isCivilDateValid(anchor) ||
+    !isCivilDateValid(earliest) ||
+    !isCivilDateValid(first.from)
+  ) {
+    return undefined;
+  }
+  const eve = addCivilDays(anchor, -1);
+  if (eve < earliest) return undefined;
+  let to: string;
+  if (!pages.some((page) => page.from <= eve && eve <= page.to)) {
+    to = eve;
+  } else {
+    const oldestFrom = pages.reduce(
+      (min, page) => (page.from < min ? page.from : min),
+      first.from,
+    );
+    to = addCivilDays(oldestFrom, -1);
+    if (to < earliest) return undefined;
+  }
+  let from = addCivilDays(to, -6);
+  if (from < earliest) from = earliest;
+  if (from > to) return undefined;
+  return { from, to };
+}
+
+/** History's page 0 for an anchor: the 7-day window ending the day before
+ *  `anchor`, floored at `earliest` — exactly the window
+ *  `previousHistoryWindow` names for a cache that holds nothing but the
+ *  anchor day. `undefined` when nothing is older than the anchor (`earliest`
+ *  is at or past its eve): there is no page 0, so Home never opens the history
+ *  query at all. The window ends on the anchor's eve, so it ABUTS the default
+ *  read and `getNextPageParam` only ever steps further back. */
+export function historyPageZero(
+  anchor: string,
+  earliest: string,
+): { from: string; to: string } | undefined {
+  return previousHistoryWindow([
+    { from: anchor, to: anchor, anchor_date: anchor, earliest_date: earliest },
+  ]);
 }
 
 /** All loaded items bucketed by their civil `local_date`, each bucket in the
@@ -105,6 +201,45 @@ export function groupItemsByDate(
  *  (COMPLETED | DISCARDED) are finished. */
 const AGENDA_LIVING_STATUSES: TaskStatus[] = ['OPEN', 'PLANNED', 'IN_PROGRESS'];
 
+/** True when the row is part of the Backlog's OPEN stretch (ADR 0007): an
+ *  `OPEN` task whose row sits on/past the 10-year line. Those rows are ordered
+ *  by the Board's `tasks.sort_order`, not by a day pile, and reorder through
+ *  the Board's task `/move`. A malformed/absent `today` claims nothing. */
+export function isOpenBacklogTask(
+  item: AgendaItemRecord,
+  today: string,
+): boolean {
+  if (!today || !isCivilDateValid(today)) return false;
+  if (item.kind !== 'task' || !item.task) return false;
+  return (
+    item.task.status === 'OPEN' && item.local_date >= addMonthsClamp(today, 120)
+  );
+}
+
+/** Splits the server's `backlog` array into its two stretches (ADR 0007)
+ *  WITHOUT re-sorting the dated stretch: `dated` is `local_date` before the
+ *  10-year line (already `local_date`, `sort_order`, `created_at` asc), `open`
+ *  is the rest that reads as an `OPEN` task in Board order. Anything left (a
+ *  `PLANNED` / `IN_PROGRESS` row the self-heal has not pulled back yet) is
+ *  omitted — the server omits it too, and it is not an OPEN reorder target. */
+export function splitBacklogSection(
+  items: AgendaItemRecord[],
+  today: string,
+): { dated: AgendaItemRecord[]; open: AgendaItemRecord[] } {
+  const horizon =
+    today && isCivilDateValid(today) ? addMonthsClamp(today, 120) : '';
+  const dated: AgendaItemRecord[] = [];
+  const open: AgendaItemRecord[] = [];
+  for (const item of items) {
+    if (horizon && item.local_date < horizon) {
+      dated.push(item);
+    } else if (isOpenBacklogTask(item, today)) {
+      open.push(item);
+    }
+  }
+  return { dated, open };
+}
+
 /** Work that is still ahead of the user on its day — the amber "N pending"
  *  count and the "Move all to today" gate. Tasks count while living; an
  *  occurrence counts while `pending | in_progress` AND its routine is alive
@@ -124,20 +259,27 @@ export function isAgendaItemPending(item: AgendaItemRecord): boolean {
   return false;
 }
 
-/** Home's stream exactly as React Query caches it (see `queries/agenda.ts` —
- *  the type lives here too so the helpers stay dependency-light). */
+/** Home's agenda cache as the optimistic edits see it (`readAgendaPages` in
+ *  `queries/agenda.ts` concatenates the two caches into one page list). Only
+ *  `pages` is ever read here; a page's param is its own `from`/`to` window. */
 type AgendaStreamData = InfiniteData<
   AgendaResponse,
-  { from: string; to: string } | undefined
+  { from: string; to: string }
 >;
 
 function streamItems(data: AgendaStreamData | undefined): AgendaItemRecord[] {
   return (data?.pages ?? []).flatMap((page) => page.items);
 }
 
-/** Maps the ONE item with `id` through `fn`, wherever in the stream it sits,
- *  and leaves it in that same page. Returns the SAME data reference when the
- *  id is missing (or there is no data) so React Query skips the re-render. */
+/** Every backlog row the cache holds, in page order. */
+function backlogItems(data: AgendaStreamData | undefined): AgendaItemRecord[] {
+  return (data?.pages ?? []).flatMap((page) => page.backlog ?? []);
+}
+
+/** Maps the ONE item with `id` through `fn`, wherever in the stream it sits
+ *  (`items` or `backlog`), and leaves it in that same array. Returns the SAME
+ *  data reference when the id is missing (or there is no data) so React Query
+ *  skips the re-render. */
 export function updateStreamItem(
   data: AgendaStreamData | undefined,
   id: string,
@@ -153,57 +295,140 @@ export function updateStreamItem(
       changed = true;
       return fn(item);
     });
-    return changed ? { ...page, items } : page;
+    const backlog = (page.backlog ?? []).map((item) => {
+      if (item.id !== id) return item;
+      found = true;
+      changed = true;
+      return fn(item);
+    });
+    return changed ? { ...page, items, backlog } : page;
   });
   return found ? { ...data, pages } : data;
 }
 
 /** The optimistic mirror of the server's cross-day placement
  *  (`reschedule` with a rank — `place_on_date`): the item leaves whichever
- *  page holds it, every peer ON `toDate` ranked at/after `rank` shifts up one
- *  (the same rule as `applyAgendaMove`), and the item lands on `rank` in the
- *  page whose window covers `toDate`. When NO loaded page covers `toDate` the
- *  item leaves the cache entirely: it cannot live in a page whose window does
- *  not contain its `local_date`, or the day paints it twice once the server's
- *  real page loads. Returns the same reference when the id is missing. */
+ *  array holds it (`items` or `backlog`), every peer ON `toDate` ranked at/after
+ *  `rank` shifts up one (the same rule as `applyAgendaMove`), and the item lands
+ *  on `rank` in the page whose window covers `toDate`. When NO loaded page
+ *  covers `toDate` the item leaves the cache entirely: it cannot live in a page
+ *  whose window does not contain its `local_date`, or the day paints it twice
+ *  once the server's real page loads.
+ *
+ *  `planIfOpen` mirrors the one move that changes a task's status: a
+ *  **reschedule** (`/reschedule` with a date) turns an `OPEN` task `PLANNED`,
+ *  so its callers pass `true`. Move-to-today's sweep and a task's own
+ *  placement leave the status alone (ADR 0007 — the sweep is unchanged, an
+ *  `OPEN` row stays `OPEN`), so they keep the default and never flash a
+ *  Planned card. An already-`PLANNED` task and every occurrence are untouched
+ *  either way. Returns the same reference when the id is missing. */
 export function moveStreamItem(
   data: AgendaStreamData | undefined,
   id: string,
   toDate: string,
   rank: number,
+  planIfOpen = false,
 ): AgendaStreamData | undefined {
   if (!data) return data;
-  const source = data.pages.find((page) =>
-    page.items.some((item) => item.id === id),
+  const source = data.pages.find(
+    (page) =>
+      page.items.some((item) => item.id === id) ||
+      (page.backlog ?? []).some((item) => item.id === id),
   );
-  const item = source?.items.find((entry) => entry.id === id);
+  const item =
+    source?.items.find((entry) => entry.id === id) ??
+    source?.backlog?.find((entry) => entry.id === id);
   if (!source || !item) return data;
   const moved: AgendaItemRecord = {
     ...item,
     local_date: toDate,
     sort_order: rank,
+    task:
+      planIfOpen && item.task && item.task.status === 'OPEN'
+        ? { ...item.task, status: 'PLANNED' }
+        : item.task,
   };
   const target = data.pages.find(
     (page) => page.from <= toDate && toDate <= page.to,
   );
   const pages = data.pages.map((page) => {
     const items = page.items.filter((entry) => entry.id !== id);
+    const backlog = (page.backlog ?? []).filter((entry) => entry.id !== id);
+    const removed =
+      items.length !== page.items.length ||
+      backlog.length !== (page.backlog?.length ?? 0);
     if (!target) {
       // Unloaded target day: drop the row (the stream's next read of that
       // window paints the server's copy). Never re-home it in `source`.
-      return items.length === page.items.length ? page : { ...page, items };
+      return removed ? { ...page, items, backlog } : page;
     }
-    const shifted = items.map((entry) =>
-      entry.local_date === toDate && entry.sort_order >= rank
-        ? { ...entry, sort_order: entry.sort_order + 1 }
-        : entry,
+    const needsShift = items.some(
+      (entry) => entry.local_date === toDate && entry.sort_order >= rank,
     );
+    const shifted = needsShift
+      ? items.map((entry) =>
+          entry.local_date === toDate && entry.sort_order >= rank
+            ? { ...entry, sort_order: entry.sort_order + 1 }
+            : entry,
+        )
+      : items;
     if (page !== target) {
-      return shifted.length === page.items.length
-        ? page
-        : { ...page, items: shifted };
+      return removed || needsShift
+        ? { ...page, items: shifted, backlog }
+        : page;
     }
-    return { ...page, items: [...shifted, moved] };
+    return { ...page, items: [...shifted, moved], backlog };
+  });
+  return { ...data, pages };
+}
+
+/** The optimistic mirror of a **backlog drop** (`reschedule
+ *  { backlog: true }`, ADR 0007): the row leaves every `items` and `backlog`
+ *  and lands at the END of the backlog on the page with the greatest `to`
+ *  (the default read — the stream no longer pages forward) with
+ *  `local_date = backlogDate`. A task that is not `OPEN` flips to `OPEN` with
+ *  the appended Board rank (`max + 1` over the `OPEN` tasks already there); an
+ *  already-`OPEN` task keeps its rank. Occurrences have no Board rank, so only
+ *  they keep their embed untouched. Returns the same reference when the id is
+ *  missing (or no page is loaded). */
+export function moveItemToBacklog(
+  data: AgendaStreamData | undefined,
+  id: string,
+  backlogDate: string,
+): AgendaStreamData | undefined {
+  if (!data || data.pages.length === 0) return data;
+  const item = [...streamItems(data), ...backlogItems(data)].find(
+    (entry) => entry.id === id,
+  );
+  if (!item) return data;
+  const target = data.pages.reduce((best, page) =>
+    page.to > best.to ? page : best,
+  );
+  const openRanks = (target.backlog ?? [])
+    .filter((entry) => entry.id !== id && entry.task?.status === 'OPEN')
+    .map((entry) => entry.task?.sort_order ?? 0);
+  const appendRank = openRanks.reduce(
+    (rank, value) => Math.max(rank, value + 1),
+    0,
+  );
+  const moved: AgendaItemRecord = {
+    ...item,
+    local_date: backlogDate,
+    task:
+      item.task && item.task.status !== 'OPEN'
+        ? { ...item.task, status: 'OPEN', sort_order: appendRank }
+        : item.task,
+  };
+  const pages = data.pages.map((page) => {
+    const items = page.items.filter((entry) => entry.id !== id);
+    const backlog = (page.backlog ?? []).filter((entry) => entry.id !== id);
+    if (page !== target) {
+      return items.length !== page.items.length ||
+        backlog.length !== (page.backlog?.length ?? 0)
+        ? { ...page, items, backlog }
+        : page;
+    }
+    return { ...page, items, backlog: [...backlog, moved] };
   });
   return { ...data, pages };
 }
@@ -255,6 +480,83 @@ export function agendaMoveTargetAt(
     : items[toIndex].sort_order + 1;
 }
 
+/** The absolute Board rank `POST /api/tasks/:id/move { status: 'OPEN',
+ *  sort_order }` should carry to land an OPEN-backlog row at `fromIndex` on
+ *  the slot now held by `toIndex`. The rank is the task's own
+ *  `tasks.sort_order` (ADR 0007 — Home and the Board share one Open order),
+ *  never the agenda row's, and it is the HOVERED row's rank in BOTH
+ *  directions: a same-status `/move` is `reorder_in_place`
+ *  (packages/api-core/src/tasks.rs), which shifts the hovered row away from
+ *  the slot and lands the mover on it — the `+ 1` of the agenda's
+ *  "land after the row" rule would put the mover past the hovered card. `null`
+ *  when either index is out of range, they are equal, or either row has no
+ *  task embed. */
+export function openTaskMoveTargetAt(
+  items: AgendaItemRecord[],
+  fromIndex: number,
+  toIndex: number,
+): number | null {
+  if (
+    fromIndex < 0 ||
+    toIndex < 0 ||
+    fromIndex >= items.length ||
+    toIndex >= items.length ||
+    fromIndex === toIndex
+  ) {
+    return null;
+  }
+  const from = items[fromIndex].task;
+  const to = items[toIndex].task;
+  if (!from || !to) return null;
+  return to.sort_order;
+}
+
+/** The optimistic mirror of the Board's **same-status** reorder
+ *  (`reorder_in_place`, packages/api-core/src/tasks.rs) over a pile of tasks:
+ *  a drop sends the hovered card's rank, the mover lands on it, and every
+ *  OTHER task in the mover's status shifts away from the vacated slot —
+ *  `[new, old)` up by one when the mover drops above (`new < old`), `(old,
+ *  new]` down by one when it drops below (`new > old`). Tasks in any other
+ *  status keep their ranks. `new === old` writes nothing, and a missing mover
+ *  returns the input array unchanged. */
+export function applyOpenTaskReorder(
+  tasks: TaskRecord[],
+  moverId: string,
+  newSortOrder: number,
+): TaskRecord[] {
+  const mover = tasks.find((entry) => entry.id === moverId);
+  if (!mover || mover.sort_order === newSortOrder) return tasks;
+  const old = mover.sort_order;
+  return tasks.map((entry) => {
+    if (entry.id === moverId) return { ...entry, sort_order: newSortOrder };
+    if (entry.status !== mover.status) return entry;
+    if (newSortOrder < old) {
+      return entry.sort_order >= newSortOrder && entry.sort_order < old
+        ? { ...entry, sort_order: entry.sort_order + 1 }
+        : entry;
+    }
+    return entry.sort_order > old && entry.sort_order <= newSortOrder
+      ? { ...entry, sort_order: entry.sort_order - 1 }
+      : entry;
+  });
+}
+
+/** Replaces one task inside the shared `['tasks']` cache by its id with the
+ *  server's own row — status AND `sort_order`, so Board/Lists follow a write
+ *  that moved the task to another column. Rows of other ids (and their object
+ *  references) are untouched, and a `fresh` of `null`/`undefined` (the task has
+ *  no row any more) or an id the list does not hold returns the SAME array, so
+ *  React Query can skip the re-render. */
+export function replaceCachedTask(
+  tasks: TaskRecord[],
+  fresh: TaskRecord | null | undefined,
+): TaskRecord[] {
+  if (!fresh) return tasks;
+  const id = fresh.id;
+  if (!tasks.some((entry) => entry.id === id)) return tasks;
+  return tasks.map((entry) => (entry.id === id ? fresh : entry));
+}
+
 /** The absolute rank a cross-day drop should send when it lands OVER one of
  *  the target day's living rows: that row's own `sort_order`, never its list
  *  index. The server's `place_on_date` shifts every peer ranked at/after the
@@ -294,10 +596,12 @@ export function applyAgendaMove(
     .sort((a, b) => a.sort_order - b.sort_order);
 }
 
-/** Reschedule visibility (ADR 0004 amendment): occurrences move only while
- *  `pending | skipped` (in_progress/done → API 400), tasks only while living
- *  — COMPLETED/DISCARDED slots are hidden so Home never invites moving a
- *  finished card (the API would allow it). A `routine_deleted` row is
+/** Reschedule visibility (ADR 0004 amendment, ADR 0007): occurrences move
+ *  only while `pending | skipped` (in_progress/done → API 400), tasks while
+ *  living EXCEPT a running one — an `IN_PROGRESS` task cannot change day (the
+ *  API 400s `cannot reschedule an in_progress task`; pause first), so the
+ *  control hides. COMPLETED/DISCARDED slots are hidden so Home never invites
+ *  moving a finished card (the API would allow it). A `routine_deleted` row is
  *  read-only history: never reschedulable. */
 export function canReschedule(item: AgendaItemRecord): boolean {
   if (item.kind === 'occurrence' && item.occurrence) {
@@ -308,7 +612,11 @@ export function canReschedule(item: AgendaItemRecord): boolean {
     );
   }
   if (item.kind === 'task' && item.task) {
-    return item.task.status !== 'COMPLETED' && item.task.status !== 'DISCARDED';
+    return (
+      item.task.status !== 'COMPLETED' &&
+      item.task.status !== 'DISCARDED' &&
+      item.task.status !== 'IN_PROGRESS'
+    );
   }
   return false;
 }
@@ -368,13 +676,19 @@ export function appendRankOnStream(
   );
 }
 
-/** Every loaded item of the stream, in page order — HomePage's lookups (a
- *  drag target, a task's one membership row) read this instead of the
- *  render-time list so an async handler never works on a stale snapshot. */
+/** Every loaded item the stream cache holds, in page order — each page's
+ *  `items` then its `backlog` (ADR 0007: a backlog row is draggable too).
+ *  HomePage's lookups (a drag source, a drag target, a task's one membership
+ *  row) read this instead of the render-time list so an async handler never
+ *  works on a stale snapshot. The day spine still comes from `page.items`
+ *  only. */
 export function streamItemsOf(
   data: AgendaStreamData | undefined,
 ): AgendaItemRecord[] {
-  return streamItems(data);
+  return (data?.pages ?? []).flatMap((page) => [
+    ...page.items,
+    ...(page.backlog ?? []),
+  ]);
 }
 
 /** One row per id, keeping the FIRST occurrence (page order). A window read

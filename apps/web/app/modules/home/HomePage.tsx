@@ -1,14 +1,25 @@
-// Home — the agenda as an infinite stream of days (ADR 0004 amendment, slice
-// 5). One vertically scrolling run of civil days inside its own scroll
-// container: opening the page lands on the server's `anchor_date` (the oldest
-// past day that still has something pending), scroll UP for history, DOWN for
-// the future. Each day keeps the two piles (ADR 0004 amendment — living rows
-// ranked by `sort_order`, then the muted Completed dump), plus a sticky
-// header; a past day with pending work shows an amber count and a one-tap
-// "Move all to today". Dragging a living row onto today or a later day
-// reschedules it (`/reschedule` with the target rank); a same-day drop is the
-// old `/move` reorder. The date picker, the add-task picker and
-// remove-from-day are gone — tasks are born on the Board, and a task's row
+// Home — the agenda as an infinite run of days, then a Backlog section
+// (ADR 0004 amendment, slice 5; ADR 0007, slice 6). One vertically scrolling
+// run of civil days inside its own scroll container: opening the page lands on
+// the server's `anchor_date` (the oldest past day that still has something
+// pending), scroll UP for history, DOWN to the end of today+6. There is NO
+// future page — each loaded page paints its own `from…to`, so a history page
+// and a later anchor never get gap-filled into a wall of empty days. The cache
+// itself is two reads (`queries/agenda.ts`): the default window
+// (`anchor_date … today+6` plus the backlog) is a plain query, and history is
+// a second, lazy query keyed by the anchor it walks behind — so a refetch can
+// never drop today. Each day keeps the two piles (living rows ranked by
+// `sort_order`, then the muted Completed dump), plus a sticky header; a past
+// day with pending work shows an amber count and a one-tap "Move all to
+// today". Under the last day sits the **Backlog**: the dated future stretch
+// (grouped by day), then the `OPEN` rows one Board-ordered list. Dragging a row
+// onto today or a later stream day reschedules it (`/reschedule` with the
+// target rank — an `OPEN` task becomes `PLANNED`); a same-day drop is the old
+// `/move` reorder; dragging a row into the Backlog drops it (`{ backlog: true
+// }` → `OPEN` on today+50y), and dragging one OPEN row onto another is the
+// Board's task `/move` so Home and Board share one order. Occurrences and
+// running tasks are never dropped there. The date picker, the add-task picker
+// and remove-from-day are gone — tasks are born on the Board, and a task's row
 // follows the task's own lifecycle. Built on the existing task/occurrence
 // actions (complete, skip, reopen, start, pause, rename, TaskModal, error
 // banner, optimistic `['tasks']` patches) and reschedule/complete art.
@@ -35,6 +46,7 @@ import {
 } from '@dnd-kit/core';
 import {
   SortableContext,
+  arrayMove,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { Loader2, Repeat } from 'lucide-react';
@@ -52,10 +64,13 @@ import { TaskModal } from '@/app/components/TaskModal';
 import { quotes } from '@/app/mock-data';
 import { moveDayToToday } from '@/lib/api';
 import {
-  useAgendaStream,
+  readAgendaPages,
+  useAgendaCurrent,
+  useAgendaHistory,
   useMoveAgendaItem,
   useRescheduleAgendaItem,
-  type AgendaStreamData,
+  writeAgendaPages,
+  type AgendaPages,
 } from '@/app/queries/agenda';
 import { queryKeys } from '@/app/queries/keys';
 import {
@@ -76,23 +91,31 @@ import {
 import { queryClient } from '@/lib/queryClient';
 import { AgendaItemRow, SortableAgendaItemRow } from './AgendaItemRow';
 import {
+  addMonthsClamp,
   agendaDateLabel,
   agendaMoveTargetAt,
   appendRankOnStream,
   applyAgendaMove,
+  applyOpenTaskReorder,
   crossDaySortOrder,
   dedupeAgendaItems,
   eachCivilDate,
   groupItemsByDate,
+  historyPageZero,
   isAgendaItemPending,
+  isOpenBacklogTask,
+  moveItemToBacklog,
   moveStreamItem,
+  openTaskMoveTargetAt,
   partitionAgendaItems,
-  streamBounds,
+  replaceCachedTask,
+  splitBacklogSection,
   streamItemsOf,
   updateStreamItem,
 } from './agenda-helpers';
 import type {
   AgendaItemRecord,
+  AgendaResponse,
   MoveTaskInput,
   OccurrenceStatus,
   RescheduleAgendaItemInput,
@@ -106,14 +129,21 @@ import type {
 /** Every day's drop container id (`day-2026-08-23`) — also the day section's
  *  DOM id, which is how the initial scroll and the Today button find a day. */
 const DAY_ID_PREFIX = 'day-';
-/** Consecutive auto-loads of the future allowed while the bottom sentinel
- *  stays in view (the future is unbounded — a scroll re-arms this). */
-const MAX_BOTTOM_AUTOLOADS = 3;
-/** Hard cap on the Today button's crawl to an unloaded today. */
-const MAX_TODAY_FETCHES = 30;
+/** The Backlog section's droppable id — a constant, never a `day-` id. */
+const BACKLOG_DROPPABLE_ID = 'backlog';
 
 function dayElementId(date: string): string {
   return `${DAY_ID_PREFIX}${date}`;
+}
+
+/** The default read's own `anchor_date` as the cache holds it right now — the
+ *  key that names Home's history cache and the split in `writeAgendaPages`.
+ *  Empty until the default read resolves (nothing to read or write then). */
+function currentAnchor(): string {
+  return (
+    queryClient.getQueryData<AgendaResponse>(queryKeys.agenda.current())
+      ?.anchor_date ?? ''
+  );
 }
 
 /** Milliseconds until the next midnight in `timeZone` (an IANA name), read
@@ -324,26 +354,155 @@ function AgendaDay({
   );
 }
 
-export function HomePage() {
-  // The stream: page 0 is the server's anchor week (the GET omits `from`/
-  // `to` entirely, so the browser never computes today), `pages` grows down
-  // for the future and up for history.
-  const stream = useAgendaStream();
-  const pages = useMemo(() => stream.data?.pages ?? [], [stream.data]);
-  const firstPage = pages[0];
-  // The server's civil today (primary calendar time zone) — refreshed from
-  // every read; anchors the day headers, the Play gate, the reschedule
-  // floor and the Today button.
-  const serverToday = firstPage?.today ?? '';
-  const anchorDate = firstPage?.anchor_date ?? '';
-  // The zone `today` is computed in — the freshest read of it is the latest
-  // page. Drives the midnight refresh below.
-  const timeZone = pages[pages.length - 1]?.time_zone ?? '';
-  const bounds = useMemo(() => streamBounds(pages), [pages]);
-  const days = useMemo(
-    () => (bounds ? eachCivilDate(bounds.from, bounds.to) : []),
-    [bounds],
+/** The Backlog (ADR 0007): everything past the day stream, in the two
+ *  stretches the server returns — dated rows grouped by their own day (a
+ *  same-day drop reorders through the agenda `/move`; a drop onto another
+ *  dated day reschedules onto that date, which the server accepts because every
+ *  one of them is `>= today`), then the `OPEN` rows as ONE Board-ordered list
+ *  (reordering them is the Board's task `/move`, never the agenda). The section
+ *  itself is the droppable that sends a row back to the backlog, so an empty
+ *  section still accepts a drop. */
+function BacklogSection({
+  serverToday,
+  dated,
+  open,
+  handlers,
+}: {
+  serverToday: string;
+  dated: AgendaItemRecord[];
+  open: AgendaItemRecord[];
+  handlers: AgendaRowHandlers;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: BACKLOG_DROPPABLE_ID });
+  // Server order already puts the dated stretch first; grouping in encounter
+  // order keeps each day's rows in `sort_order`, and never alphabetizes.
+  const datedGroups = useMemo(() => groupItemsByDate(dated), [dated]);
+  const empty = dated.length === 0 && open.length === 0;
+
+  const renderRow = (entry: AgendaItemRecord) =>
+    isAgendaRowDraggable(entry) ? (
+      <SortableAgendaItemRow
+        key={entry.id}
+        item={entry}
+        serverToday={serverToday}
+        {...handlers}
+      />
+    ) : (
+      <AgendaItemRow
+        key={entry.id}
+        item={entry}
+        isDragging={false}
+        showHandle={false}
+        serverToday={serverToday}
+        {...handlers}
+      />
+    );
+
+  return (
+    <section ref={setNodeRef} aria-label="Backlog">
+      <header className="sticky top-0 z-10 flex items-center gap-2 border-b border-border/60 bg-cream/95 px-1 py-2 backdrop-blur">
+        <h2 className="font-heading text-sm font-semibold text-foreground">
+          Backlog
+        </h2>
+      </header>
+
+      <div
+        className={
+          isOver
+            ? 'min-h-10 rounded-lg bg-primary/5 px-1 py-2 ring-1 ring-primary/20 transition-colors'
+            : 'min-h-10 px-1 py-2 transition-colors'
+        }
+      >
+        {empty && (
+          <p className="px-1 py-1.5 text-sm italic text-muted-foreground/70">
+            Nothing in the backlog
+          </p>
+        )}
+        {[...datedGroups.entries()].map(([date, rows]) => (
+          <div key={date} className="space-y-2 pb-2">
+            <h3 className="px-1 text-xs font-medium tracking-wide text-muted-foreground">
+              {agendaDateLabel(date, serverToday)}
+            </h3>
+            <SortableContext
+              items={rows.filter(isAgendaRowDraggable).map((entry) => entry.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <div className="space-y-2">{rows.map(renderRow)}</div>
+            </SortableContext>
+          </div>
+        ))}
+        {open.length > 0 && (
+          <SortableContext
+            items={open.filter(isAgendaRowDraggable).map((entry) => entry.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className="space-y-2 pt-1">{open.map(renderRow)}</div>
+          </SortableContext>
+        )}
+      </div>
+    </section>
   );
+}
+
+export function HomePage() {
+  // The two agenda reads (ADR 0004 amendment, ADR 0007): the default window —
+  // `anchor_date … today+6` plus the backlog — is a plain query, so an
+  // invalidation always refetches today; history is a second, lazy query keyed
+  // by the anchor it walks behind.
+  const current = useAgendaCurrent();
+  const currentPage = current.data;
+  // The server's civil today (primary calendar time zone) — refreshed from
+  // every read; anchors the day headers, the Play gate, the reschedule floor
+  // and the Today button.
+  const serverToday = currentPage?.today ?? '';
+  const anchorDate = currentPage?.anchor_date ?? '';
+  // The server's oldest row — the floor of the history walk (`earliest_date`),
+  // and what decides whether history has anything to load at all.
+  const earliestDate = currentPage?.earliest_date ?? '';
+  // The zone `today` is computed in. Drives the midnight refresh below.
+  const timeZone = currentPage?.time_zone ?? '';
+  // History never fetches on mount: the user has to reach the top of the
+  // stream first (see `maybeFetchPreviousPage`). State, not a ref — flipping it
+  // is what re-renders the hook into an enabled query.
+  const [historyEnabled, setHistoryEnabled] = useState(false);
+  const history = useAgendaHistory(anchorDate, earliestDate, historyEnabled);
+  // The history pages in query order (page 0 is the anchor's eve week, older
+  // weeks are appended) — the span the top-edge gesture grows.
+  const historyPages = useMemo(() => history.data?.pages ?? [], [history.data]);
+  // The oldest history week loaded, or null while none is. A top-edge fetch
+  // PREPENDS in the rendered spine exactly when this moves back.
+  const historyOldestFrom = useMemo(
+    () =>
+      historyPages.reduce<string | null>(
+        (oldest, page) =>
+          oldest === null || page.from < oldest ? page.from : oldest,
+        null,
+      ),
+    [historyPages],
+  );
+  // The rendered day spine: history weeks (sorted by `from`) then the default
+  // window's own `from…to`, deduped (the first page to claim a date wins).
+  // Deliberately NOT one `eachCivilDate(first.from, last.to)` run — that would
+  // fill the hole between a history page and a later anchor with empty days.
+  // Backlog rows never enter it, so it can never walk out to today+50y.
+  const pages = useMemo(() => {
+    const ordered = [...historyPages].sort((a, b) =>
+      a.from < b.from ? -1 : a.from > b.from ? 1 : 0,
+    );
+    return currentPage ? [...ordered, currentPage] : ordered;
+  }, [historyPages, currentPage]);
+  const days = useMemo(() => {
+    const seen = new Set<string>();
+    const spine: string[] = [];
+    for (const page of pages) {
+      for (const day of eachCivilDate(page.from, page.to)) {
+        if (seen.has(day)) continue;
+        seen.add(day);
+        spine.push(day);
+      }
+    }
+    return spine;
+  }, [pages]);
   const items = useMemo(
     // `dedupeAgendaItems` is a backstop against a row stranded in a page whose
     // window does not hold its `local_date` (see `moveStreamItem`) — grouping
@@ -352,6 +511,17 @@ export function HomePage() {
     [pages],
   );
   const byDate = useMemo(() => groupItemsByDate(items), [items]);
+  // The Backlog (ADR 0007): the DEFAULT read's `backlog` array (a history read
+  // always answers with an empty one), split into the dated stretch (grouped by
+  // day) and the OPEN stretch (server order = Board order).
+  const backlogItems = useMemo(
+    () => dedupeAgendaItems(currentPage?.backlog ?? []),
+    [currentPage],
+  );
+  const backlogSplit = useMemo(
+    () => splitBacklogSection(backlogItems, serverToday),
+    [backlogItems, serverToday],
+  );
 
   // `serverToday` is only as fresh as the last read (`staleTime` is 30s): a
   // tab left in the foreground overnight would keep yesterday's date, so
@@ -405,25 +575,24 @@ export function HomePage() {
   // Cache plumbing
   // ──────────────────────────────────────────
 
-  /** The stream as it is RIGHT NOW (never the render-time snapshot): a drag
-   *  can land after a refetch resolved, and the optimistic paint must build
-   *  on what is actually cached. */
-  const readStream = useCallback(
-    (): AgendaStreamData | undefined =>
-      queryClient.getQueryData<AgendaStreamData>(queryKeys.agenda.stream()),
-    [],
-  );
+  /** Home's whole agenda cache as it is RIGHT NOW (never the render-time
+   *  snapshot): a drag can land after a refetch resolved, and the optimistic
+   *  paint must build on what is actually cached. `anchor` is the default
+   *  read's own `anchor_date` — without a default read there is nothing to
+   *  read or write. */
+  const readStream = useCallback((): AgendaPages | undefined => {
+    const anchor = currentAnchor();
+    if (!anchor) return undefined;
+    return readAgendaPages(anchor);
+  }, []);
 
   const patchStream = useCallback(
     (
-      updater: (
-        current: AgendaStreamData | undefined,
-      ) => AgendaStreamData | undefined,
+      updater: (current: AgendaPages | undefined) => AgendaPages | undefined,
     ) => {
-      queryClient.setQueryData<AgendaStreamData>(
-        queryKeys.agenda.stream(),
-        updater,
-      );
+      const anchor = currentAnchor();
+      if (!anchor) return;
+      writeAgendaPages(anchor, updater(readAgendaPages(anchor)));
     },
     [],
   );
@@ -436,11 +605,11 @@ export function HomePage() {
    *  Completed dump). */
   const placeTaskOnToday = useCallback(
     (
-      current: AgendaStreamData | undefined,
+      data: AgendaPages | undefined,
       itemId: string,
       fn: (item: AgendaItemRecord) => AgendaItemRecord,
-    ): AgendaStreamData | undefined => {
-      const next = updateStreamItem(current, itemId, fn);
+    ): AgendaPages | undefined => {
+      const next = updateStreamItem(data, itemId, fn);
       const row = streamItemsOf(next).find((entry) => entry.id === itemId);
       if (!row || !serverToday || row.local_date === serverToday) return next;
       return moveStreamItem(
@@ -467,10 +636,23 @@ export function HomePage() {
   const moveAgendaItemMutation = useMoveAgendaItem();
   const rescheduleAgendaItemMutation = useRescheduleAgendaItem();
 
+  /** The OPEN stretch of the Backlog as the cache holds it right now (server
+   *  order, which is the Board's `tasks.sort_order` order). */
+  const openBacklogRowsOf = (data: AgendaPages | undefined) =>
+    splitBacklogSection(
+      dedupeAgendaItems(
+        (data?.pages ?? []).flatMap((page) => page.backlog ?? []),
+      ),
+      serverToday,
+    ).open;
+
   /** dnd-kit drop resolution. Same-day → the old `/move` reorder; across days
-   *  → `/reschedule` with the target day's rank. Past days are never drop
-   *  targets (the API 400s), and an `in_progress` occurrence may only reorder
-   *  inside its own day. */
+   *  → `/reschedule` with the target day's rank; the Backlog section (or an
+   *  OPEN-backlog row) → a backlog drop; two OPEN-backlog rows → the Board's
+   *  task `/move`. Past days are never drop targets (the API 400s), an
+   *  `in_progress` occurrence may only reorder inside its own day, and an
+   *  `IN_PROGRESS` task cannot change day at all (the API 400s — pause
+   *  first). */
   const handleDragEnd = (event: DragEndEvent) => {
     setActiveDrag(null);
     const { active, over } = event;
@@ -480,6 +662,10 @@ export function HomePage() {
     const itemsNow = streamItemsOf(readStream());
     const dragged = itemsNow.find((entry) => entry.id === activeId);
     if (!dragged) return;
+
+    const isOpenRow = (entry: AgendaItemRecord) =>
+      isOpenBacklogTask(entry, serverToday);
+    const draggedIsOpen = isOpenRow(dragged);
 
     // The on-screen sortable list holds the DRAGGABLE rows only — dnd-kit
     // resolves a same-day drop index against that, never the full pile
@@ -498,8 +684,36 @@ export function HomePage() {
         overItemId,
       );
 
-    // A drop on a day's own container means "the end of that day's pile":
-    // no rank at all, so the server appends at `max + 1`.
+    const overItem = itemsNow.find((entry) => entry.id === overId) ?? null;
+
+    // 1. Backlog drop: the section itself, or an OPEN-backlog row for a row
+    //    that is not itself in that stretch. Occurrences and a running task
+    //    never go there; an already-OPEN row already sits in the stretch.
+    if (
+      overId === BACKLOG_DROPPABLE_ID ||
+      (overItem !== null && isOpenRow(overItem) && !draggedIsOpen)
+    ) {
+      if (dragged.kind !== 'task' || !dragged.task) return;
+      if (dragged.task.status === 'IN_PROGRESS') return;
+      if (draggedIsOpen) return;
+      void handleBacklogDrop(dragged);
+      return;
+    }
+
+    // 2. Two OPEN-backlog rows: Home and the Board share one Open order, so
+    //    this is the Board's task `/move`, never the agenda reorder.
+    if (draggedIsOpen && overItem && isOpenRow(overItem)) {
+      const open = openBacklogRowsOf(readStream());
+      const fromIndex = open.findIndex((entry) => entry.id === dragged.id);
+      const toIndex = open.findIndex((entry) => entry.id === overItem.id);
+      const target = openTaskMoveTargetAt(open, fromIndex, toIndex);
+      if (target === null) return;
+      void handleOpenBacklogMove(dragged, open, toIndex, target);
+      return;
+    }
+
+    // 3. A drop on a day's own container means "the end of that day's pile":
+    //    no rank at all, so the server appends at `max + 1`.
     if (overId.startsWith(DAY_ID_PREFIX)) {
       const day = overId.slice(DAY_ID_PREFIX.length);
       if (day === dragged.local_date) {
@@ -513,11 +727,14 @@ export function HomePage() {
         return;
       }
       if (day < serverToday) return;
+      if (dragged.task?.status === 'IN_PROGRESS') return;
       void handleCrossDayMove(dragged, day);
       return;
     }
 
-    const overItem = itemsNow.find((entry) => entry.id === overId);
+    // 4. A drop over another row: same civil day → the agenda reorder (the
+    //    Board rank only owns the OPEN stretch, handled above); a different
+    //    day → reschedule onto it.
     if (!overItem) return;
     if (overItem.local_date === dragged.local_date) {
       const sortable = sortableSameDay();
@@ -531,6 +748,7 @@ export function HomePage() {
       return;
     }
     if (overItem.local_date < serverToday) return;
+    if (dragged.task?.status === 'IN_PROGRESS') return;
     void handleCrossDayMove(
       dragged,
       overItem.local_date,
@@ -575,7 +793,12 @@ export function HomePage() {
    *  the target row's own `sort_order` (`crossDaySortOrder`); omitted — the
    *  popover path, or a drop on the day container — appends at the pile's
    *  end server-side (`max + 1`), exactly like the old "Tomorrow". A failure
-   *  restores the snapshot and banners. */
+   *  restores the snapshot and banners. Landing a task that was still `OPEN`
+   *  plans it server-side — this is the ONLY move that does, so it is the one
+   *  caller that asks `moveStreamItem` to paint `PLANNED`. The server also
+   *  appends the task to the Planned column, so the shared `['tasks']` cache
+   *  takes its fresh row (status AND Board rank) — the same patch a backlog
+   *  drop sends. */
   const handleCrossDayMove = async (
     item: AgendaItemRecord,
     targetDate: string,
@@ -583,8 +806,11 @@ export function HomePage() {
   ) => {
     if (!targetDate || targetDate === item.local_date) return;
     if (!serverToday || targetDate < serverToday) return;
-    // `in_progress` occurrences are reorder-only until they are paused.
+    // `in_progress` occurrences are reorder-only until they are paused; an
+    // `IN_PROGRESS` task cannot change day at all (the API 400s — pause
+    // first).
     if (item.occurrence?.status === 'in_progress') return;
+    if (item.task?.status === 'IN_PROGRESS') return;
     const snapshot = readStream();
     const input: RescheduleAgendaItemInput =
       sortOrder === undefined
@@ -596,6 +822,7 @@ export function HomePage() {
         item.id,
         targetDate,
         sortOrder ?? appendRankOnStream(current, targetDate),
+        true,
       ),
     );
     setActionError(null);
@@ -605,6 +832,122 @@ export function HomePage() {
         input,
       });
       mergeRow(data.item.id, () => data.item);
+      // Patch the shared tasks cache so Board/Lists see the flipped status
+      // and the new Planned rank.
+      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+    } catch (err) {
+      patchStream(() => snapshot);
+      setActionError(err instanceof Error ? err.message : 'Move failed');
+    }
+  };
+
+  /** Drop a row into the Backlog (ADR 0007): `{ backlog: true }` returns a
+   *  `PLANNED` task to `OPEN` (+ `unplanned` log), moves the row to today+50y
+   *  and appends it to the Board's Open column. Painted optimistically with
+   *  the SAME month clamp the server uses, then merged with the authoritative
+   *  row (the server's real backlog date and status). A failure restores the
+   *  snapshot and banners. The mutation invalidates the stream on settle —
+   *  never awaited, so the rollback cannot race it. */
+  const handleBacklogDrop = async (item: AgendaItemRecord) => {
+    const task = item.task;
+    if (!task || !serverToday) return;
+    const snapshot = readStream();
+    patchStream((current) =>
+      moveItemToBacklog(current, item.id, addMonthsClamp(serverToday, 600)),
+    );
+    setActionError(null);
+    try {
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: item.id,
+        input: { backlog: true },
+      });
+      mergeRow(data.item.id, () => data.item);
+      // Patch the shared tasks cache so Board/Lists see the flipped status
+      // and the appended Open rank.
+      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+    } catch (err) {
+      patchStream(() => snapshot);
+      setActionError(err instanceof Error ? err.message : 'Move failed');
+    }
+  };
+
+  /** Reorder one OPEN-backlog row onto another row's slot (ADR 0007): the
+   *  Board's own `POST /api/tasks/:id/move { status: 'OPEN', sort_order }`, so
+   *  Home and the Board never disagree on the Open order. The optimistic paint
+   *  mirrors the server's `reorder_in_place` over EVERY OPEN embed in the
+   *  backlog — the mover takes the sent rank and its peers shift one — and
+   *  reorders the list where the user dropped it; the shared `['tasks']` cache
+   *  gets the same peer shift on success, so the Board's Open column follows.
+   *  A failure restores the snapshot and banners. */
+  const handleOpenBacklogMove = async (
+    item: AgendaItemRecord,
+    open: AgendaItemRecord[],
+    toIndex: number,
+    target: number,
+  ) => {
+    const task = item.task;
+    const fromIndex = open.findIndex((entry) => entry.id === item.id);
+    if (!task || fromIndex < 0 || toIndex < 0) return;
+    // The new OPEN order — dnd-kit's own array move, so the row lands where
+    // the user dropped it.
+    const reordered = arrayMove(open, fromIndex, toIndex);
+    const order = new Map(reordered.map((entry, index) => [entry.id, index]));
+    const openIds = new Set(open.map((entry) => entry.id));
+    // The Board's same-status reorder over the OPEN embeds: without the peer
+    // shift a second drop before the settle refetch would compute its rank
+    // from stale neighbours.
+    const shiftedRanks = new Map(
+      applyOpenTaskReorder(
+        open.flatMap((entry) => (entry.task ? [entry.task] : [])),
+        task.id,
+        target,
+      ).map((entry) => [entry.id, entry.sort_order]),
+    );
+    const snapshot = readStream();
+    patchStream((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        pages: current.pages.map((page) => {
+          const backlog = page.backlog ?? [];
+          if (!backlog.some((entry) => entry.id === item.id)) return page;
+          // Dated rows keep their places ahead of the OPEN stretch; only the
+          // OPEN rows take the new order and the shifted ranks.
+          const rest = backlog.filter((entry) => !openIds.has(entry.id));
+          const openRows = backlog
+            .filter((entry) => openIds.has(entry.id))
+            .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+            .map((entry) => {
+              const rank = entry.task ? shiftedRanks.get(entry.task.id) : null;
+              if (
+                !entry.task ||
+                rank == null ||
+                rank === entry.task.sort_order
+              ) {
+                return entry;
+              }
+              return { ...entry, task: { ...entry.task, sort_order: rank } };
+            });
+          return { ...page, backlog: [...rest, ...openRows] };
+        }),
+      };
+    });
+    setActionError(null);
+    try {
+      const data = await moveTaskMutation.mutateAsync({
+        id: task.id,
+        input: { status: 'OPEN', sort_order: target } satisfies MoveTaskInput,
+      });
+      mergeRow(item.id, (entry) =>
+        entry.task ? { ...entry, task: data.task } : entry,
+      );
+      // Patch the shared tasks cache: the same peer shift, then the mover's
+      // authoritative row, so Board/Lists never read a stale Open order.
+      setTasksCache((prev) =>
+        applyOpenTaskReorder(prev, data.task.id, data.task.sort_order).map(
+          (entry) => (entry.id === data.task.id ? data.task : entry),
+        ),
+      );
     } catch (err) {
       patchStream(() => snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
@@ -615,7 +958,9 @@ export function HomePage() {
    *  `POST /api/agenda/days/:date/move-to-today` sweeps, appended to today's
    *  pile in their original order. Painted optimistically, reverted on
    *  failure, and re-read on settle (the sweep has server-side side effects a
-   *  local mirror cannot guess). */
+   *  local mirror cannot guess). The sweep changes DATES only — an `OPEN` row
+   *  it drags onto today stays `OPEN` (ADR 0007), so `moveStreamItem` keeps
+   *  its default "leave the status alone". */
   const handleMoveDayToToday = async (day: string) => {
     const snapshot = readStream();
     const movable = dayItemsOf(streamItemsOf(snapshot), day).filter(
@@ -1003,21 +1348,24 @@ export function HomePage() {
       return err instanceof Error ? err.message : 'Delete failed';
     }
     // The membership row is an orphan after the task dies — the next read
-    // omits it server-side; drop it locally now.
+    // omits it server-side; drop it locally now (the row can sit in a page's
+    // day list or in its backlog).
     patchStream((current) =>
       current
         ? {
             ...current,
-            pages: current.pages.map((page) =>
-              page.items.some((entry) => entry.task?.id === taskId)
-                ? {
-                    ...page,
-                    items: page.items.filter(
-                      (entry) => entry.task?.id !== taskId,
-                    ),
-                  }
-                : page,
-            ),
+            pages: current.pages.map((page) => {
+              const hasTask = (entry: AgendaItemRecord) =>
+                entry.task?.id === taskId;
+              const items = page.items.filter((entry) => !hasTask(entry));
+              const backlog = (page.backlog ?? []).filter(
+                (entry) => !hasTask(entry),
+              );
+              return items.length === page.items.length &&
+                backlog.length === (page.backlog?.length ?? 0)
+                ? page
+                : { ...page, items, backlog };
+            }),
           }
         : current,
     );
@@ -1090,130 +1438,129 @@ export function HomePage() {
   };
 
   // ──────────────────────────────────────────
-  // Stream scrolling: history/future sentinels, anchor landing, Today
+  // Stream scrolling: the history sentinel, anchor landing, Today
   // ──────────────────────────────────────────
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
-  const bottomSentinelRef = useRef<HTMLDivElement>(null);
-  // Last known intersection of each sentinel — the observer only fires on
-  // CHANGES, so a moored sentinel needs these to be re-checked after every
+  // Last known intersection of the top sentinel — the observer only fires on
+  // CHANGES, so a moored sentinel needs this to be re-checked after every
   // fetch settles (see `maybeFetchMore`).
   const topVisibleRef = useRef(false);
-  const bottomVisibleRef = useRef(false);
   // History loads stay off until the anchor landing scroll has been placed:
-  // an auto-prepend during that first paint would fetch a week and shift the
+  // an auto-load during that first paint would fetch a week and shift the
   // stream before the user has seen the anchor. Armed at the end of the
   // landing layout effect (see below).
   const historyArmedRef = useRef(false);
-  // Consecutive future auto-loads while the bottom sentinel stays in view.
-  const bottomAutoloadsRef = useRef(0);
-  // Scroll geometry captured before a prepend, so the extra height can be
-  // added to `scrollTop` afterwards — the anchor must not jump.
+  // Scroll geometry captured before a history week loads, so the extra height
+  // can be added to `scrollTop` afterwards — the anchor must not jump.
   const prependRef = useRef<{
     scrollHeight: number;
-    firstFrom: string | null;
+    // The oldest history week loaded at capture time (null when none was):
+    // history pages are APPENDED, so a new week is a prepend in the rendered
+    // spine exactly when this moves back.
+    oldestFrom: string | null;
     pageCount: number;
   } | null>(null);
   const landedOnAnchorRef = useRef(false);
   const [todayVisible, setTodayVisible] = useState(false);
-  // The Today button's scroll waits for React to commit the fetched days
-  // (`fetchNextPage()` resolves before the notify manager's timeout flush, so
-  // the DOM right after the await is still the old one). State, not a ref:
-  // clicking Today while its day is ALREADY loaded (just off screen) fetches
-  // nothing, so nothing else would re-run the layout effect that scrolls.
+  // The Today button's scroll waits for React to commit the painted day. State,
+  // not a ref: clicking Today while its day is ALREADY loaded (just off screen)
+  // fetches nothing, so nothing else would re-run the layout effect that
+  // scrolls.
   const [scrollTodayPending, setScrollTodayPending] = useState(false);
 
-  const hasPreviousPage = stream.hasPreviousPage;
-  const hasNextPage = stream.hasNextPage;
-  const isFetchingPreviousPage = stream.isFetchingPreviousPage;
-  const isFetchingNextPage = stream.isFetchingNextPage;
-  const fetchPreviousPage = stream.fetchPreviousPage;
-  const fetchNextPage = stream.fetchNextPage;
+  // The history walk's own flags: older weeks APPEND to the history query, so
+  // the top-edge gesture is a `fetchNextPage` while `hasNextPage`.
+  const hasOlderHistory = history.hasNextPage;
+  const isFetchingOlderHistory = history.isFetchingNextPage;
+  const fetchOlderHistory = history.fetchNextPage;
   const pageCount = pages.length;
 
   const rememberPrepend = useCallback(() => {
     const root = scrollRef.current;
     if (!root) return;
-    const data = readStream();
     prependRef.current = {
       scrollHeight: root.scrollHeight,
-      firstFrom: data?.pages[0]?.from ?? null,
-      pageCount: data?.pages.length ?? 0,
+      oldestFrom: historyOldestFrom,
+      pageCount: historyPages.length,
     };
-  }, [readStream]);
+  }, [historyOldestFrom, historyPages.length]);
 
   /** The history gesture: the stream is sitting at its top edge. The anchor
    *  day lands aligned with the top sentinel, so `scrollTop` starts at ~0 —
    *  there is no room left for a "moved up by 4px" delta, and a wheel-up at
    *  the clamped edge fires no scroll event at all. `scrollTop <= 1` catches
    *  the edge itself; `topVisibleRef` catches the approach. Returns true when
-   *  a fetch was started (so the caller can skip the opposite direction). */
+   *  a fetch was started (so the caller can skip the opposite direction).
+   *
+   *  The first hit is what turns the history query on (state, so the hook
+   *  re-renders and page 0 — the anchor's eve week — loads); every later hit
+   *  appends the week before the oldest loaded one. */
   const maybeFetchPreviousPage = useCallback((): boolean => {
     if (!historyArmedRef.current) return false; // still landing on the anchor
     const root = scrollRef.current;
     if (!root) return false;
     if (root.scrollTop > 1 && !topVisibleRef.current) return false;
-    if (!hasPreviousPage || isFetchingPreviousPage) return false;
+    if (!historyEnabled) {
+      // Nothing older than the anchor: there is no page 0, so Home never asks
+      // for an empty week (the query stays off).
+      if (!anchorDate || !historyPageZero(anchorDate, earliestDate)) {
+        return false;
+      }
+      rememberPrepend();
+      setHistoryEnabled(true);
+      return true;
+    }
+    if (!hasOlderHistory || isFetchingOlderHistory) return false;
     rememberPrepend();
-    void fetchPreviousPage();
+    void fetchOlderHistory();
     return true;
   }, [
-    hasPreviousPage,
-    isFetchingPreviousPage,
-    fetchPreviousPage,
+    anchorDate,
+    earliestDate,
+    historyEnabled,
+    hasOlderHistory,
+    isFetchingOlderHistory,
+    fetchOlderHistory,
     rememberPrepend,
   ]);
 
-  /** Fetch the next page in whichever direction the viewport is asking for.
-   *  Called from the sentinel observer and — because an observer only fires
-   *  on intersection CHANGES, and a sentinel can already be moored in view —
-   *  from the scroll listener and after each settle. */
+  /** Load the previous week when the viewport asks for it. Called from the
+   *  sentinel observer and — because an observer only fires on intersection
+   *  CHANGES, and the sentinel can already be moored in view — from the
+   *  scroll listener and after each settle. There is no forward counterpart:
+   *  the stream ends at today+6. */
   const maybeFetchMore = useCallback(() => {
-    if (maybeFetchPreviousPage()) return;
-    if (
-      bottomVisibleRef.current &&
-      hasNextPage &&
-      !isFetchingNextPage &&
-      bottomAutoloadsRef.current < MAX_BOTTOM_AUTOLOADS
-    ) {
-      bottomAutoloadsRef.current += 1;
-      void fetchNextPage();
-    }
-  }, [maybeFetchPreviousPage, hasNextPage, isFetchingNextPage, fetchNextPage]);
+    maybeFetchPreviousPage();
+  }, [maybeFetchPreviousPage]);
 
-  // Any scroll re-arms the future auto-load budget. The same event re-checks
-  // the top edge: after the landing scroll the container is parked at
-  // `scrollTop ≈ 0`, where an upward gesture cannot produce another scroll
-  // event, and the observer already reported the sentinel as intersecting —
-  // this call is what makes sitting at the top load history.
+  // Any scroll re-checks the top edge: after the landing scroll the container
+  // is parked at `scrollTop ≈ 0`, where an upward gesture cannot produce
+  // another scroll event, and the observer already reported the sentinel as
+  // intersecting — this call is what makes sitting at the top load history.
   useEffect(() => {
     const root = scrollRef.current;
     if (!root) return;
     const onScroll = () => {
-      bottomAutoloadsRef.current = 0;
       maybeFetchPreviousPage();
     };
     root.addEventListener('scroll', onScroll, { passive: true });
     return () => root.removeEventListener('scroll', onScroll);
   }, [maybeFetchPreviousPage]);
 
-  // Sentinels inside the stream's own scroll container. The observer is
-  // rebuilt whenever a fetch settles so a still-visible sentinel gets a fresh
-  // initial callback.
+  // The history sentinel inside the stream's own scroll container. The
+  // observer is rebuilt whenever a fetch settles so a still-visible sentinel
+  // gets a fresh initial callback.
   useEffect(() => {
     const root = scrollRef.current;
     const top = topSentinelRef.current;
-    const bottom = bottomSentinelRef.current;
-    if (!root || !top || !bottom || pageCount === 0) return;
+    if (!root || !top || pageCount === 0) return;
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
           if (entry.target === top) {
             topVisibleRef.current = entry.isIntersecting;
-          } else if (entry.target === bottom) {
-            bottomVisibleRef.current = entry.isIntersecting;
-            if (!entry.isIntersecting) bottomAutoloadsRef.current = 0;
           }
         }
         maybeFetchMore();
@@ -1221,16 +1568,8 @@ export function HomePage() {
       { root, rootMargin: '240px 0px' },
     );
     observer.observe(top);
-    observer.observe(bottom);
     return () => observer.disconnect();
-  }, [
-    pageCount,
-    hasPreviousPage,
-    hasNextPage,
-    isFetchingPreviousPage,
-    isFetchingNextPage,
-    maybeFetchMore,
-  ]);
+  }, [pageCount, hasOlderHistory, isFetchingOlderHistory, maybeFetchMore]);
 
   // Land on `anchor_date` once, aligned to the top of the stream. Later
   // prepends must NOT re-run this (the height compensation below keeps the
@@ -1257,22 +1596,24 @@ export function HomePage() {
     return () => cancelAnimationFrame(frame);
   }, [anchorDate, days, maybeFetchMore]);
 
-  // A prepend adds height ABOVE the viewport: add exactly that much to
-  // `scrollTop` so the day under the user's eyes does not jump. Only a REAL
-  // prepend counts — an optimistic `setQueryData` while a previous-page fetch
-  // is in flight must leave the recorded geometry alone, or the page that
-  // finally arrives gets no correction at all.
+  // A history week adds height ABOVE the viewport: add exactly that much to
+  // `scrollTop` so the day under the user's eyes does not jump. History pages
+  // are APPENDED, so a new week is a prepend in the rendered spine exactly
+  // when the oldest loaded `from` moves back. Only a REAL prepend counts — an
+  // optimistic `setQueryData` while a fetch is in flight must leave the
+  // recorded geometry alone, or the week that finally arrives gets no
+  // correction at all.
   useLayoutEffect(() => {
     const root = scrollRef.current;
     const recorded = prependRef.current;
     if (!root || !recorded) return;
-    const firstFrom = pages[0]?.from ?? null;
     if (
-      pages.length <= recorded.pageCount ||
-      firstFrom === recorded.firstFrom
+      historyPages.length <= recorded.pageCount ||
+      historyOldestFrom === recorded.oldestFrom
     ) {
-      // An append, an optimistic edit, or a failure — the viewport is
-      // already right, and the pending prepend (if any) is still coming.
+      // An optimistic edit, a failed fetch, or a quiet refetch that re-read
+      // the same weeks — the viewport is already right, and the pending
+      // prepend (if any) is still coming.
       return;
     }
     prependRef.current = null;
@@ -1285,23 +1626,25 @@ export function HomePage() {
       // observer callback confirms the move.
       topVisibleRef.current = false;
     }
-  }, [pages]);
+  }, [historyPages, historyOldestFrom]);
 
-  // The previous-page fetch settled without growing the stream into a new
-  // `from` (it failed, or the server had nothing older): drop the pending
-  // measurement rather than let it sit across later unrelated page changes.
-  // A passive effect, on purpose — layout effects have already run for this
-  // commit, so a prepend that DID land has been applied above.
+  // The history fetch settled without growing the cache into a new oldest week
+  // (it failed, or the server had nothing older): drop the pending measurement
+  // rather than let it sit across later unrelated page changes. A passive
+  // effect, on purpose — layout effects have already run for this commit, so a
+  // prepend that DID land has been applied above.
   useEffect(() => {
-    if (isFetchingPreviousPage) return;
+    if (history.isFetching) return;
     const recorded = prependRef.current;
     if (!recorded) return;
-    const firstFrom = pages[0]?.from ?? null;
-    if (pages.length > recorded.pageCount && firstFrom !== recorded.firstFrom) {
+    if (
+      historyPages.length > recorded.pageCount &&
+      historyOldestFrom !== recorded.oldestFrom
+    ) {
       return; // the layout effect above consumed it
     }
     prependRef.current = null;
-  }, [isFetchingPreviousPage, pages]);
+  }, [history.isFetching, historyPages, historyOldestFrom]);
 
   // Is today's header on screen? Its absence (today not loaded yet) counts as
   // "not visible", so the Today button shows.
@@ -1326,46 +1669,15 @@ export function HomePage() {
     return () => observer.disconnect();
   }, [serverToday, pageCount, days]);
 
-  /** The floating Today button: walk the stream's CACHE (page `from`/`to`,
-   *  never the DOM) until today sits inside a loaded window — capped, a crawl
-   *  and not a loop. The scroll itself is placed by the layout effect below:
-   *  `fetchNextPage()` resolves before React has committed the new days (the
-   *  notify manager flushes on a timeout), so the DOM is still the old one
-   *  here. */
-  const scrollToToday = async () => {
-    const root = scrollRef.current;
-    if (!root || !serverToday) return;
+  /** The floating Today button: today sits on the default read (`anchor_date
+   *  <= today <= today+6`), which is always loaded once Home paints, so this
+   *  only has to scroll its header into view — no crawling up through history
+   *  to search unloaded days. The scroll itself is placed by the layout effect
+   *  below: the day is not in the DOM until the read commits its days. */
+  const scrollToToday = () => {
+    if (!scrollRef.current || !serverToday) return;
     historyArmedRef.current = true;
     setScrollTodayPending(true);
-    for (let step = 0; step < MAX_TODAY_FETCHES; step += 1) {
-      const loaded = readStream()?.pages ?? [];
-      const first = loaded[0];
-      const last = loaded[loaded.length - 1];
-      if (!first || !last) break;
-      if (first.from <= serverToday && serverToday <= last.to) break;
-      if (serverToday < first.from) {
-        // The back-scroll floor is the server's oldest row.
-        if (first.from <= first.earliest_date) break;
-        rememberPrepend();
-        await fetchPreviousPage();
-      } else {
-        await fetchNextPage();
-      }
-      // A failed / no-op fetch makes no new page — stop rather than spin.
-      if ((readStream()?.pages.length ?? 0) <= loaded.length) break;
-    }
-    // The crawl can stop short of today: the fetch cap, a failed fetch, or
-    // `earliest_date` refusing an older page. Disarm in that case — a flag
-    // left set would yank the viewport the next time today's header renders
-    // for an unrelated reason (the user simply scrolling to it). When today
-    // IS loaded, keep it set so the layout effect places the scroll once the
-    // new days are committed.
-    const settled = readStream()?.pages ?? [];
-    const first = settled[0];
-    const last = settled[settled.length - 1];
-    if (!first || !last || serverToday < first.from || serverToday > last.to) {
-      setScrollTodayPending(false);
-    }
   };
 
   // Today is in the DOM: place the pending scroll now. Fires on the commit
@@ -1385,19 +1697,23 @@ export function HomePage() {
   // Render
   // ──────────────────────────────────────────
 
+  // The default read drives the page: no pages until it resolves, and its
+  // failure is the only one that can wipe the stream.
   const loadError =
-    stream.error instanceof Error
-      ? stream.error.message
-      : stream.error
+    current.error instanceof Error
+      ? current.error.message
+      : current.error
         ? 'Failed to load agenda'
         : null;
   const hasPages = pages.length > 0;
-  // A later read failed (a page fetch or a background refetch): a one-line
-  // notice above the still-mounted days — never a wipe.
-  const pageFetchError =
-    stream.isFetchNextPageError ||
-    stream.isFetchPreviousPageError ||
-    (hasPages && !!loadError);
+  // A history fetch failed: a one-line notice above the still-mounted days —
+  // never a wipe of today. `isFetchNextPageError` covers an appended week; a
+  // history query that errored with no pages at all is the opening eve-week
+  // fetch (an `enabled` flip, which TanStack does not tag as a fetch-more).
+  const historyFetchError =
+    history.isFetchNextPageError ||
+    (historyEnabled && !history.data && history.isError);
+  const pageFetchError = historyFetchError || (hasPages && !!loadError);
 
   // Drag sensors: a vertical list with a dedicated grip means a short move
   // activates — Mouse 8px + Touch 8px, still NO 250ms hold (a long-press
@@ -1471,13 +1787,14 @@ export function HomePage() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (stream.isFetchPreviousPageError) {
+                    // A failed history page retries itself: `fetchNextPage` on
+                    // a query with no pages yet re-reads page 0 from
+                    // `initialPageParam` (the eve week).
+                    if (historyFetchError) {
                       rememberPrepend();
-                      void stream.fetchPreviousPage();
-                    } else if (stream.isFetchNextPageError) {
-                      void stream.fetchNextPage();
+                      void history.fetchNextPage();
                     } else {
-                      void stream.refetch();
+                      void current.refetch();
                     }
                   }}
                   className="text-xs font-medium underline"
@@ -1493,8 +1810,8 @@ export function HomePage() {
               ref={scrollRef}
               className="relative h-[calc(100dvh-17rem)] min-h-[20rem] overflow-y-auto overscroll-contain rounded-xl border border-border/60 bg-cream lg:h-[calc(100dvh-12rem)]"
             >
-              {/* First load — no pages yet */}
-              {!hasPages && stream.isLoading && (
+              {/* First load — the default read has not resolved yet */}
+              {!hasPages && current.isLoading && (
                 <div className="flex items-center justify-center gap-2 py-24 text-muted-foreground">
                   <Loader2 className="h-5 w-5 animate-spin" />
                   Loading agenda…
@@ -1502,13 +1819,13 @@ export function HomePage() {
               )}
 
               {/* First fetch failed and there is nothing to show */}
-              {!hasPages && !stream.isLoading && loadError && (
+              {!hasPages && !current.isLoading && loadError && (
                 <div className="m-2 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
                   <p className="text-sm">{loadError}</p>
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => void stream.refetch()}
+                    onClick={() => void current.refetch()}
                   >
                     Retry
                   </Button>
@@ -1549,6 +1866,17 @@ export function HomePage() {
                       />
                     ))}
 
+                    {/* Under the last stream day: the Backlog (ADR 0007) —
+                        dated rows grouped by day, then the Board-ordered OPEN
+                        stretch. It is its own drop target, so an empty backlog
+                        still accepts a row. */}
+                    <BacklogSection
+                      serverToday={serverToday}
+                      dated={backlogSplit.dated}
+                      open={backlogSplit.open}
+                      handlers={handlers}
+                    />
+
                     {/* Floating title chip while dragging — the source row
                         stays in place, dimmed (opacity-40 on its wrapper) */}
                     <DragOverlay>
@@ -1564,11 +1892,6 @@ export function HomePage() {
                       )}
                     </DragOverlay>
                   </DndContext>
-                  <div
-                    ref={bottomSentinelRef}
-                    aria-hidden
-                    className="h-8 w-full"
-                  />
                 </>
               )}
             </div>

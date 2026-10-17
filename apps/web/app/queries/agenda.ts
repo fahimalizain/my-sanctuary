@@ -1,5 +1,4 @@
-import { useEffect } from 'react';
-import { useInfiniteQuery, useMutation } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
 import {
   getAgendaRange,
@@ -13,97 +12,171 @@ import type {
 } from '@/app/types';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';
-import { addCivilDays } from '@/app/modules/routines/rrule-preview';
+import {
+  historyPageZero,
+  previousHistoryWindow,
+} from '@/app/modules/home/agenda-helpers';
 
-// Home reads ONE infinite stream of day windows (ADR 0004 amendment — slice
-// 5): the first page is the server's anchor week (no query at all, so the
-// browser never computes today), `getPreviousPageParam` walks history in
-// 7-day windows down to `earliest_date`, `getNextPageParam` walks the
-// unbounded future. Every write on the page edits this cache in place
-// (optimistic paint) and `cancelAgendaQuery` protects it from an in-flight
-// refetch — there is no per-date key left.
+// Home reads TWO agenda caches (ADR 0004 amendment — slice 5, ADR 0007 —
+// slice 6), so a library refetch can never drop today:
+//
+//  - `useAgendaCurrent` is the server's default read (no query at all, so the
+//    browser never computes today): `anchor_date … today+6` plus the `backlog`
+//    array. A plain query — nothing about it depends on paging.
+//  - `useAgendaHistory` is the walk back behind the anchor, one 7-day window
+//    per page, keyed by the anchor it walks behind. Page 0 is the anchor's eve
+//    week (`historyPageZero`) and `getNextPageParam` APPENDS older weeks, so
+//    page 0 stays the eve window for the life of this key and TanStack's
+//    refetch loop (page 0 re-read from its stored param, every later page
+//    named by `getNextPageParam`) re-reads every loaded week without ever
+//    dropping the one that abuts the anchor.
+//
+// Every write on the page edits the two caches in place through
+// `readAgendaPages` / `writeAgendaPages` (optimistic paint) and
+// `cancelAgendaQuery` protects them from an in-flight refetch — there is no
+// per-date key.
 
-/** One stream page: 7 inclusive civil days, or `undefined` for the very first
- *  page (the anchor week — the GET that omits `from`/`to` entirely). */
-export type AgendaStreamPageParam = { from: string; to: string };
-
-/** The whole stream as React Query caches it (`pages[0]` is the earliest
- *  loaded window — previous pages are prepended on the left). */
-export type AgendaStreamData = InfiniteData<
-  AgendaResponse,
-  AgendaStreamPageParam | undefined
->;
-
-/** Days per stream window: one week forward and one week back per fetch. */
-const AGENDA_PAGE_DAYS = 7;
-
-export function useAgendaStream() {
-  const query = useInfiniteQuery({
-    queryKey: queryKeys.agenda.stream(),
-    // The anchor page is the API's own default read: no `from`/`to` at all.
-    initialPageParam: undefined as AgendaStreamPageParam | undefined,
-    queryFn: ({ pageParam }) =>
-      pageParam
-        ? getAgendaRange(pageParam.from, pageParam.to)
-        : getAgendaRange(),
-    // History ends at the oldest row the server knows about.
-    getPreviousPageParam: (firstPage) =>
-      firstPage.from <= firstPage.earliest_date
-        ? undefined
-        : {
-            from: addCivilDays(firstPage.from, -AGENDA_PAGE_DAYS),
-            to: addCivilDays(firstPage.from, -1),
-          },
-    // The future never ends — keep offering the next week.
-    getNextPageParam: (lastPage) => ({
-      from: addCivilDays(lastPage.to, 1),
-      to: addCivilDays(lastPage.to, AGENDA_PAGE_DAYS),
-    }),
+/** Home's default read: `anchor_date … today+6` plus the whole backlog. */
+export function useAgendaCurrent() {
+  return useQuery({
+    queryKey: queryKeys.agenda.current(),
+    queryFn: () => getAgendaRange(),
   });
-  const data = query.data;
+}
 
-  // Pin the anchor page's param once it has actually come back. While it is
-  // still `undefined`, a v5 refetch reuses "the server picks the anchor" and
-  // recomputes `anchor_date`, so any invalidation can slide the whole loaded
-  // span (Oct 10–23 becomes Oct 17–30). Rewriting the param to the window
-  // THAT page answered makes every later refetch re-request it; the loaded
-  // dates then stay put even when `anchor_date` in the payload moves.
-  // Not necessarily index 0 — a prepend moves the anchor page to the right.
-  // Pinned exactly once: with no `undefined` param left there is nothing to
-  // do, so this cannot loop.
-  useEffect(() => {
-    if (!data) return;
-    const current = queryClient.getQueryData<AgendaStreamData>(
-      queryKeys.agenda.stream(),
+/** One history page's param — the inclusive window it was read with. */
+type AgendaHistoryPageParam = { from: string; to: string };
+
+/** Home's history walk behind `anchor`: 7-day windows ending the anchor's eve
+ *  and stepping further back. `earliest` is the server's `earliest_date` — the
+ *  back-scroll floor — and `enabled` is the caller's own gate (Home opens
+ *  history only once the user reaches the top of the stream). The query also
+ *  stays off when nothing is older than the anchor. */
+export function useAgendaHistory(
+  anchor: string,
+  earliest: string,
+  enabled: boolean,
+) {
+  const pageZero = historyPageZero(anchor, earliest);
+  return useInfiniteQuery({
+    queryKey: queryKeys.agenda.history(anchor),
+    enabled: enabled && pageZero != null,
+    // Page 0: the week ending the anchor's eve, floored at `earliest`. The
+    // fallback only ever applies while the query is disabled — there is no
+    // valid anchor/earliest yet, so nothing fetches.
+    initialPageParam: pageZero ?? { from: anchor, to: anchor },
+    queryFn: ({ pageParam }) => getAgendaRange(pageParam.from, pageParam.to),
+    // Older weeks are APPENDED (page 0 stays the eve window), each one the
+    // week before the oldest loaded date — `undefined` ends the walk.
+    getNextPageParam: (_lastPage, allPages) => previousHistoryWindow(allPages),
+    // Never prepend. TanStack rebuilds a refetch from `pageParams[0]` and then
+    // `getNextPageParam`: with prepended pages page 0 would be the OLDEST week
+    // and a refetch would keep only that one, dropping the eve window that
+    // abuts the anchor. Appending keeps page 0's param stable for the life of
+    // this key, and the UI still loads older weeks: at the top of the stream it
+    // calls `fetchNextPage`.
+    getPreviousPageParam: () => undefined,
+  });
+}
+
+/** Home's agenda cache as the optimistic edits see it: the history pages and
+ *  the default read in one list, earliest first (`readAgendaPages`).
+ *  `pageParams` mirrors each page's own `from`/`to` — the helpers never read
+ *  them, and `writeAgendaPages` never replaces the history query's stored
+ *  params. */
+export type AgendaPages = {
+  pages: AgendaResponse[];
+  pageParams: AgendaHistoryPageParam[];
+};
+
+function historyCache(
+  anchor: string,
+): InfiniteData<AgendaResponse, AgendaHistoryPageParam> | undefined {
+  return queryClient.getQueryData<
+    InfiniteData<AgendaResponse, AgendaHistoryPageParam>
+  >(queryKeys.agenda.history(anchor));
+}
+
+/** Both agenda caches concatenated for a reader (Home's cache plumbing): the
+ *  history pages (they may be missing — the walk is lazy) and, when it has
+ *  resolved, the default read. Sorted by `from` ascending, so a reader sees
+ *  the days in order whichever cache a page came from. `undefined` when
+ *  neither cache holds anything. */
+export function readAgendaPages(anchor: string): AgendaPages | undefined {
+  const history = historyCache(anchor);
+  const current = queryClient.getQueryData<AgendaResponse>(
+    queryKeys.agenda.current(),
+  );
+  const pages = [...(history?.pages ?? []), ...(current ? [current] : [])];
+  if (pages.length === 0) return undefined;
+  pages.sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  return {
+    pages,
+    pageParams: pages.map((page) => ({ from: page.from, to: page.to })),
+  };
+}
+
+/** Writes an optimistic edit back into the two caches (Home's cache
+ *  plumbing). The page that reaches the anchor (`to >= anchor`) is the default
+ *  read and goes to `agenda.current()`; every other page is one history week
+ *  and is matched back into the history query by its `from`.
+ *
+ *  History is written back in the QUERY's own page order and its `pageParams`
+ *  are left untouched: `pageParams[0]` must stay the eve window, or the next
+ *  refetch would rebuild the walk from the oldest week and lose the week that
+ *  abuts the anchor. Pages the updater left alone stay as they are, and a
+ *  history cache is never created here — an edit can only move rows between
+ *  pages that already exist. */
+export function writeAgendaPages(
+  anchor: string,
+  next: AgendaPages | undefined,
+): void {
+  if (!next) return;
+  const current = queryClient.getQueryData<AgendaResponse>(
+    queryKeys.agenda.current(),
+  );
+  if (!current) return;
+  const freshCurrent = next.pages.find((page) => page.to >= anchor);
+  if (freshCurrent && freshCurrent !== current) {
+    queryClient.setQueryData<AgendaResponse>(
+      queryKeys.agenda.current(),
+      freshCurrent,
     );
-    if (!current) return;
-    const index = current.pageParams.findIndex((param) => param == null);
-    if (index < 0) return;
-    const page = current.pages[index];
-    if (!page?.from || !page?.to) return;
-    queryClient.setQueryData<AgendaStreamData>(queryKeys.agenda.stream(), {
-      ...current,
-      pageParams: current.pageParams.map((param, i) =>
-        i === index ? { from: page.from, to: page.to } : param,
-      ),
-    });
-  }, [data]);
-
-  return query;
+  }
+  const history = historyCache(anchor);
+  if (!history || history.pages.length === 0) return;
+  const touched = new Map(
+    next.pages
+      .filter((page) => page !== freshCurrent)
+      .map((page) => [page.from, page]),
+  );
+  let changed = false;
+  const pages = history.pages.map((page) => {
+    const updated = touched.get(page.from);
+    if (!updated || updated === page) return page;
+    changed = true;
+    return updated;
+  });
+  if (!changed) return;
+  queryClient.setQueryData(queryKeys.agenda.history(anchor), {
+    pages,
+    pageParams: history.pageParams,
+  });
 }
 
 // Agenda write mutations — thin wrappers, no optimistic paint (mirrors
-// tasks.ts / occurrences.ts). `onMutate` cancels the stream so an in-flight
-// refetch (window focus, another tab's mutation) can never resolve over the
-// page's optimistic paint mid-write. The page owns the optimistic paint
-// (`agenda-helpers.ts`) and merges the authoritative row on success.
-// `reschedule` additionally re-reads the stream on settle: it is the one
-// write that can target a day NO loaded page covers, where Home drops the
-// row from the cache and only the server's page can paint it back.
+// tasks.ts / occurrences.ts). `onMutate` cancels both agenda caches so an
+// in-flight refetch (window focus, another tab's mutation) can never resolve
+// over the page's optimistic paint mid-write. The page owns the optimistic
+// paint (`agenda-helpers.ts`) and merges the authoritative row on success.
+// `reschedule` additionally re-reads the agenda on settle: it is the one write
+// that can target a day NO loaded page covers, where Home drops the row from
+// the cache and only the server's page can paint it back.
 
-/** Cancels Home's whole day-stream, wherever it currently spans. */
+/** Cancels Home's whole agenda read: the default window and every loaded
+ *  history week (`agenda.all` is the prefix of both keys). */
 export async function cancelAgendaQuery(): Promise<void> {
-  await queryClient.cancelQueries({ queryKey: queryKeys.agenda.stream() });
+  await queryClient.cancelQueries({ queryKey: queryKeys.agenda.all });
 }
 
 export function useMoveAgendaItem() {

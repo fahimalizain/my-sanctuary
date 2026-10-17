@@ -617,17 +617,27 @@ pub struct MoveAgendaItemInput {
     pub sort_order: i64,
 }
 
-/// Request body for `POST /api/agenda/items/:id/reschedule`.
+/// Request body for `POST /api/agenda/items/:id/reschedule` (ADR 0007): a
+/// dated reschedule (`{ "date": "YYYY-MM-DD", "sort_order"?: n }`) or a
+/// backlog drop (`{ "backlog": true }`). The service rejects both together.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RescheduleAgendaItemInput {
-    /// Local civil date `YYYY-MM-DD` the slot moves to (today or later — the
-    /// past is a 400).
-    pub date: String,
+    /// Local civil date `YYYY-MM-DD` the slot moves to — a real day inside
+    /// `[today, today+10y)`. Absent when `backlog` is true. Present-but-blank
+    /// is still a date and fails `date must be YYYY-MM-DD`.
+    #[serde(default)]
+    pub date: Option<String>,
     /// Optional landing rank inside the target day's pile. Absent/null →
     /// append at `max+1` (0 when empty); a named rank first shifts that day's
     /// peers at/after it up one (same gap semantics as `/move`). Never used
-    /// on a same-date call — same-day placement is `/move`.
+    /// on a same-date call — same-day placement is `/move` — nor on a backlog
+    /// drop (Open-column order is the Board's `tasks.sort_order`).
+    #[serde(default)]
     pub sort_order: Option<i64>,
+    /// Drop the task into the backlog. Mutually exclusive with a non-blank
+    /// `date`.
+    #[serde(default)]
+    pub backlog: bool,
 }
 
 
@@ -941,4 +951,33 @@ mod tests {
         assert_eq!(value["type"], "stopped", "raw identifier serializes as `type`");
     }
 
+    #[test]
+    fn reschedule_agenda_item_input_defaults_and_backlog_flag() {
+        // A dated reschedule without a rank: `date` is the only required
+        // field, and every optional one defaults (ADR 0007).
+        let input: RescheduleAgendaItemInput =
+            serde_json::from_str(r#"{"date":"2026-08-24"}"#).unwrap();
+        assert_eq!(input.date.as_deref(), Some("2026-08-24"));
+        assert_eq!(input.sort_order, None);
+        assert!(!input.backlog);
+
+        let input: RescheduleAgendaItemInput =
+            serde_json::from_str(r#"{"date":"2026-08-24","sort_order":2}"#).unwrap();
+        assert_eq!(input.date.as_deref(), Some("2026-08-24"));
+        assert_eq!(input.sort_order, Some(2));
+        assert!(!input.backlog);
+
+        // The backlog drop carries no date at all.
+        let input: RescheduleAgendaItemInput = serde_json::from_str(r#"{"backlog":true}"#).unwrap();
+        assert_eq!(input.date, None);
+        assert_eq!(input.sort_order, None);
+        assert!(input.backlog);
+
+        // A named rank parses; the service ignores it on this path.
+        let input: RescheduleAgendaItemInput =
+            serde_json::from_str(r#"{"backlog":true,"sort_order":3}"#).unwrap();
+        assert_eq!(input.date, None);
+        assert_eq!(input.sort_order, Some(3));
+        assert!(input.backlog);
+    }
 }

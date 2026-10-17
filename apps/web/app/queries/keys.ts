@@ -17,10 +17,14 @@ export const queryKeys = {
   },
   agenda: {
     all: ['agenda'] as const,
-    // Home's one infinite day-stream (`useAgendaStream`): the only agenda
-    // cache key. Every page of it answers to `agenda.all` — task and routine
-    // writes invalidate the whole stream so the server's row repointing lands.
-    stream: () => [...queryKeys.agenda.all, 'stream'] as const,
+    // Home's two reads (ADR 0004 amendment, ADR 0007): the default window
+    // (`anchor_date … today + 6` plus the backlog) and the history walk keyed
+    // by the anchor it walks behind. `agenda.all` stays the prefix of both, so
+    // one invalidation refetches today together with every loaded history
+    // week.
+    current: () => [...queryKeys.agenda.all, 'current'] as const,
+    history: (anchor: string) =>
+      [...queryKeys.agenda.all, 'history', anchor] as const,
   },
   calendar: {
     all: ['calendar'] as const,
