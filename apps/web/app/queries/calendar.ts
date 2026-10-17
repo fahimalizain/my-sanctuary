@@ -3,6 +3,7 @@ import {
   queryOptions,
   useMutation,
   useQuery,
+  type QueryClient,
 } from '@tanstack/react-query';
 import {
   createCalendarEvent,
@@ -96,6 +97,27 @@ export function removeCalendarEventFromCache(id: string): void {
     { queryKey: calendarEventsQueryKey },
     (old) => applyCalendarEventRemove(old, id),
   );
+}
+
+/**
+ * Last known server row for `id` across every cached events window. The patch
+ * queue outlives the calendar page, so after navigation there is no mounted
+ * `events` array to read from — the range-keyed cache is the durable copy and
+ * may already hold a patch that landed before React re-rendered. First window
+ * that contains the id wins.
+ */
+export function findCachedCalendarEvent(
+  client: QueryClient,
+  id: string,
+): CalendarEvent | undefined {
+  const windows = client.getQueriesData<CalendarEventsResponse>({
+    queryKey: calendarEventsQueryKey,
+  });
+  for (const [, data] of windows) {
+    const event = data?.events.find((e) => e.id === id);
+    if (event) return event;
+  }
+  return undefined;
 }
 
 // Create is thin like update: cancel in-flight events queries on mutate,
