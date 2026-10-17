@@ -23,26 +23,57 @@ export function hourHAfterZoom(current: number, factor: number): number {
 }
 
 /**
- * Delta to add to scroller.scrollTop so the time at `yInHours`
- * (px from the top of the 24-hour area) stays under the same screen point.
- *   delta = yInHours * (newHourH / oldHourH - 1)
- * Non-finite / non-positive hour heights or non-finite y → 0.
+ * Time (hours, fractional) under a pointer / pinch midpoint at the scale
+ * currently painted in the DOM.
+ *   hours = (clientY - scrollerRectTop + scrollTop - headerOffset) / hourH
+ * Deliberately unclamped: above the hours area this is a negative time, which
+ * keeps the anchor math continuous instead of snapping to hour 0.
+ * Non-finite inputs or non-positive hourH → 0.
  */
-export function scrollDeltaForHourZoom(
-  oldHourH: number,
-  newHourH: number,
-  yInHours: number,
+export function anchorHoursAt(
+  clientY: number,
+  scrollerRectTop: number,
+  scrollTop: number,
+  headerOffset: number,
+  hourH: number,
 ): number {
   if (
-    !Number.isFinite(oldHourH) ||
-    !Number.isFinite(newHourH) ||
-    !Number.isFinite(yInHours) ||
-    oldHourH <= 0 ||
-    newHourH <= 0
+    !Number.isFinite(clientY) ||
+    !Number.isFinite(scrollerRectTop) ||
+    !Number.isFinite(scrollTop) ||
+    !Number.isFinite(headerOffset) ||
+    !Number.isFinite(hourH) ||
+    hourH <= 0
   ) {
     return 0;
   }
-  return yInHours * (newHourH / oldHourH - 1);
+  return (
+    yInHoursArea(clientY, scrollerRectTop, scrollTop, headerOffset) / hourH
+  );
+}
+
+/**
+ * Absolute scroller.scrollTop that puts `anchorHours` back under `viewportY`
+ * (px from the scroller's top edge) once the hours area is laid out at `hourH`.
+ * Applied after the commit that changes hourH, so the DOM height matches:
+ *   scrollTop = headerOffset + anchorHours * hourH - viewportY
+ * Clamped at >= 0 (the browser clamps the max). Non-finite inputs → 0.
+ */
+export function scrollTopForAnchor(
+  anchorHours: number,
+  hourH: number,
+  headerOffset: number,
+  viewportY: number,
+): number {
+  if (
+    !Number.isFinite(anchorHours) ||
+    !Number.isFinite(hourH) ||
+    !Number.isFinite(headerOffset) ||
+    !Number.isFinite(viewportY)
+  ) {
+    return 0;
+  }
+  return Math.max(0, headerOffset + anchorHours * hourH - viewportY);
 }
 
 /**

@@ -1,13 +1,13 @@
 import { useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import {
   HOUR_H_STORAGE_KEY,
+  anchorHoursAt,
   hourHAfterZoom,
   parseStoredHourH,
   pinchDistance,
   pinchMidpointY,
   pinchScale,
-  scrollDeltaForHourZoom,
-  yInHoursArea,
+  scrollTopForAnchor,
   zoomFactorFromWheel,
 } from '../lib/calendar-zoom';
 
@@ -45,9 +45,40 @@ export function useCalendarZoom(options: {
   hourHRef.current = hourH;
   headerOffsetRef.current = headerOffset;
 
+  // hourH actually painted in the DOM. Handlers anchor against this, never
+  // against hourHRef, which runs ahead of the commit.
+  const renderedHourHRef = useRef(hourH);
+
+  // Anchor captured by a gesture, consumed by the layout effect below once the
+  // matching hourH is in the DOM: the time under the pointer and its offset
+  // from the scroller's top edge.
+  const pendingAnchorRef = useRef<{
+    hours: number;
+    viewportY: number;
+  } | null>(null);
+
   // Re-bind when the scroller element appears (may be null on first paint).
   // Parent re-renders after measure attach the ref; layout effect re-runs.
   const scrollerEl = scrollerRef.current;
+
+  // Runs before paint, after the new hourH is laid out, so the resize and the
+  // scroll correction land in the same frame — applying the correction in the
+  // event handler instead makes the grid jump for one frame at the old scale.
+  useLayoutEffect(() => {
+    renderedHourHRef.current = hourH;
+
+    const anchor = pendingAnchorRef.current;
+    const scroller = scrollerRef.current;
+    if (!anchor || !scroller) return;
+    pendingAnchorRef.current = null;
+
+    scroller.scrollTop = scrollTopForAnchor(
+      anchor.hours,
+      hourH,
+      headerOffset,
+      anchor.viewportY,
+    );
+  }, [hourH, headerOffset, scrollerRef]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
@@ -61,20 +92,24 @@ export function useCalendarZoom(options: {
       const current = hourHRef.current;
       if (nextHourH === current) return;
 
+      // Measured at the painted scale — the correction lands after the commit,
+      // where the grid is already at the new scale. Every event re-measures so
+      // the anchor follows the pointer; the last one before a commit wins.
+      // (Keeping the first event's hours but the last event's viewportY would
+      // bias the anchor by however far the pointer moved in between.)
       const rect = scroller.getBoundingClientRect();
-      let y = yInHoursArea(
-        clientY,
-        rect.top,
-        scroller.scrollTop,
-        headerOffsetRef.current,
-      );
-      if (y < 0) y = 0;
+      pendingAnchorRef.current = {
+        hours: anchorHoursAt(
+          clientY,
+          rect.top,
+          scroller.scrollTop,
+          headerOffsetRef.current,
+          renderedHourHRef.current,
+        ),
+        viewportY: clientY - rect.top,
+      };
 
-      const delta = scrollDeltaForHourZoom(current, nextHourH, y);
-      scroller.scrollTop += delta;
-
-      // Keep ref in sync before React re-renders so rapid pinch moves
-      // compute incremental scroll deltas from the true current hourH.
+      // Target, not rendered: rapid gestures compound from one another.
       hourHRef.current = nextHourH;
       setUserHourH(nextHourH);
       try {
