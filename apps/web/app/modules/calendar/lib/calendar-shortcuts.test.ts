@@ -91,6 +91,39 @@ test('resolveCalendarShortcut: auto-repeat still steps the period', () => {
   });
 });
 
+// ── Create / delete ─────────────────────────────────────────────────────
+
+test('resolveCalendarShortcut: c and Shift+c create a draft', () => {
+  assert.deepEqual(resolve('c'), { type: 'create' });
+  // Shift+c reports key "C" with shiftKey true.
+  assert.deepEqual(resolve('C', { shiftKey: true }), { type: 'create' });
+});
+
+test('resolveCalendarShortcut: Backspace and Delete request the delete dialog', () => {
+  for (const key of ['Backspace', 'Delete']) {
+    assert.deepEqual(resolve(key), { type: 'requestDelete' }, `key ${key}`);
+  }
+});
+
+test('resolveCalendarShortcut: holding create or delete does not repeat', () => {
+  // A held key must not open a stack of drafts or dialogs.
+  for (const key of ['c', 'C', 'Backspace', 'Delete']) {
+    assert.equal(resolve(key, { repeat: true }), null, `key ${key}`);
+  }
+});
+
+test('resolveCalendarShortcut: chords never create or delete', () => {
+  // Cmd+C must stay free for the clipboard slice.
+  assert.equal(resolve('c', { metaKey: true }), null);
+  assert.equal(resolve('c', { ctrlKey: true }), null);
+  assert.equal(resolve('Backspace', { altKey: true }), null);
+});
+
+test('resolveCalendarShortcut: d is the one-day view, not delete', () => {
+  assert.deepEqual(resolve('d'), { type: 'setPeriod', length: 1 });
+  assert.deepEqual(resolve('D'), { type: 'setPeriod', length: 1 });
+});
+
 // ── Chords and unrelated keys ───────────────────────────────────────────
 
 test('resolveCalendarShortcut: meta/ctrl/alt chords are left to the browser', () => {
@@ -111,8 +144,8 @@ test('resolveCalendarShortcut: meta/ctrl/alt chords are left to the browser', ()
   }
 });
 
-test('resolveCalendarShortcut: navigation and editing keys are not ours', () => {
-  for (const key of ['ArrowLeft', 'Escape', 'c', 'Backspace', 'Delete', '?']) {
+test('resolveCalendarShortcut: navigation and unrelated keys are not ours', () => {
+  for (const key of ['ArrowLeft', 'Escape', '?']) {
     assert.equal(resolve(key), null, `key ${key}`);
   }
 });

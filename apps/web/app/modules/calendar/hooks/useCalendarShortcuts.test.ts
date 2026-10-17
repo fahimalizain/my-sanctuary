@@ -33,18 +33,23 @@ interface ShortcutHarnessProps {
   suspended: boolean;
   /** Callback log, in dispatch order. */
   calls: string[];
+  /** False models no selection / a read-only calendar. */
+  deleteAllowed?: boolean;
 }
 
 /** Records callbacks instead of moving a real strip. */
 function ShortcutHarness({
   suspended,
   calls,
+  deleteAllowed = true,
 }: ShortcutHarnessProps): ReactElement {
   useCalendarShortcuts({
     suspended,
     onPeriodChange: (n) => calls.push(`period:${n}`),
     onToday: () => calls.push('today'),
     onShiftPeriod: (delta) => calls.push(`shift:${delta}`),
+    onCreate: () => calls.push('create'),
+    onRequestDelete: deleteAllowed ? () => calls.push('delete') : null,
   });
   return createElement('div', null, 'harness');
 }
@@ -55,13 +60,21 @@ interface Harness {
   unmount: () => void;
 }
 
-function mountHarness(suspended = false): Harness {
+function mountHarness(suspended = false, deleteAllowed = true): Harness {
   const calls: string[] = [];
-  const view = render(createElement(ShortcutHarness, { suspended, calls }));
+  const view = render(
+    createElement(ShortcutHarness, { suspended, calls, deleteAllowed }),
+  );
   return {
     calls,
     setSuspended: (next) => {
-      view.rerender(createElement(ShortcutHarness, { suspended: next, calls }));
+      view.rerender(
+        createElement(ShortcutHarness, {
+          suspended: next,
+          calls,
+          deleteAllowed,
+        }),
+      );
     },
     unmount: () => {
       view.unmount();
@@ -151,6 +164,66 @@ test('useCalendarShortcuts: keys typed in an input do not navigate', () => {
   try {
     // Dispatch on the input so the window listener sees it as e.target.
     const event = press('t', {}, input);
+    assert.equal(event.target, input);
+    assert.deepEqual(calls, []);
+    assert.equal(event.defaultPrevented, false);
+  } finally {
+    input.remove();
+  }
+});
+
+test('useCalendarShortcuts: c creates a draft and consumes the key', () => {
+  const { calls } = mountHarness();
+
+  const event = press('c');
+
+  assert.deepEqual(calls, ['create']);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('useCalendarShortcuts: Backspace requests delete and consumes the key', () => {
+  const { calls } = mountHarness();
+
+  const event = press('Backspace');
+
+  assert.deepEqual(calls, ['delete']);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('useCalendarShortcuts: Backspace is left alone when delete is not allowed', () => {
+  const { calls } = mountHarness(false, false);
+
+  const event = press('Backspace');
+
+  assert.deepEqual(calls, [], 'no selection / read-only calendar');
+  assert.equal(event.defaultPrevented, false);
+});
+
+test('useCalendarShortcuts: holding c does not create a stack of drafts', () => {
+  const { calls } = mountHarness();
+
+  const event = press('c', { repeat: true });
+
+  assert.deepEqual(calls, []);
+  assert.equal(event.defaultPrevented, false);
+});
+
+test('useCalendarShortcuts: meta+c stays a copy, not a create', () => {
+  const { calls } = mountHarness();
+
+  const event = press('c', { metaKey: true });
+
+  assert.deepEqual(calls, [], 'Cmd+C must stay free for the clipboard');
+  assert.equal(event.defaultPrevented, false);
+});
+
+test('useCalendarShortcuts: c typed in an input does not create', () => {
+  const { calls } = mountHarness();
+  const input = document.createElement('input');
+  document.body.appendChild(input);
+
+  try {
+    const event = press('c', {}, input);
     assert.equal(event.target, input);
     assert.deepEqual(calls, []);
     assert.equal(event.defaultPrevented, false);

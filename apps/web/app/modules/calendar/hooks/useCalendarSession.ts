@@ -1015,6 +1015,7 @@ export function useCalendarSession({
     draggingEventId,
     handleSelectChip,
     selectEvent,
+    beginDraft,
     isDragging: drag.isDragging,
     onColumnPointerDown: drag.onColumnPointerDown,
     onChipPointerDown: drag.onChipPointerDown,

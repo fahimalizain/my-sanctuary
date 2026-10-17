@@ -15,7 +15,9 @@ export interface CalendarShortcutInput {
 export type CalendarShortcutAction =
   | { type: 'setPeriod'; length: number }
   | { type: 'today' }
-  | { type: 'shiftPeriod'; delta: -1 | 1 };
+  | { type: 'shiftPeriod'; delta: -1 | 1 }
+  | { type: 'create' }
+  | { type: 'requestDelete' };
 
 /**
  * True when keystrokes belong to a field rather than the calendar: text
@@ -33,15 +35,27 @@ export function isTextEditingTarget(target: EventTarget | null): boolean {
  * Resolve a keydown to a calendar action, or null when the key is not ours.
  *
  * Chords are deliberately unhandled: Cmd/Ctrl/Alt belong to the browser and
- * the OS (Cmd+T is a new tab, Cmd+[ is Back), so those events fall through
- * untouched. Shift is not a blocker either — `key` is already the shifted
- * character, so `T` is Shift+t. Auto-repeat is also allowed: holding `]` to
- * step periods is useful, and Today is idempotent.
+ * the OS (Cmd+T is a new tab, Cmd+[ is Back, Cmd+C is copy), so those events
+ * fall through untouched. Shift is not a blocker either — `key` is already the
+ * shifted character, so `T` is Shift+t. Auto-repeat is allowed for navigation:
+ * holding `]` to step periods is useful, and Today is idempotent. Create and
+ * delete are different: a held key must not open a stack of drafts or dialogs,
+ * so their repeats are dropped.
  */
 export function resolveCalendarShortcut(
   input: CalendarShortcutInput,
 ): CalendarShortcutAction | null {
   if (input.metaKey || input.ctrlKey || input.altKey) return null;
+
+  if (
+    input.repeat &&
+    (input.key === 'c' ||
+      input.key === 'C' ||
+      input.key === 'Backspace' ||
+      input.key === 'Delete')
+  ) {
+    return null;
+  }
 
   switch (input.key) {
     case '1':
@@ -65,6 +79,12 @@ export function resolveCalendarShortcut(
       return { type: 'shiftPeriod', delta: -1 };
     case ']':
       return { type: 'shiftPeriod', delta: 1 };
+    case 'c':
+    case 'C':
+      return { type: 'create' };
+    case 'Backspace':
+    case 'Delete':
+      return { type: 'requestDelete' };
     default:
       return null;
   }

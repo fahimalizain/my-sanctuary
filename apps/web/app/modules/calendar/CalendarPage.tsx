@@ -12,6 +12,7 @@ import { useCalendarSession } from './hooks/useCalendarSession';
 import { useCalendarShortcuts } from './hooks/useCalendarShortcuts';
 import { useCalendarStrip } from './hooks/useCalendarStrip';
 import { useHideNavOnLateHours } from './hooks/useHideNavOnLateHours';
+import { keyboardCreateRange } from './lib/calendar-model';
 import { COL_HEADER_H, addDays, isSameDay, nowLineY } from './lib/week-layout';
 
 export function CalendarPage() {
@@ -35,15 +36,6 @@ export function CalendarPage() {
   const confirmOpen =
     confirmDeleteId !== null && confirmDeleteId === selectedId;
 
-  // One page-level keymap: the strip no longer listens on its own, and the
-  // delete dialog suspends navigation (its buttons are not editing targets).
-  useCalendarShortcuts({
-    suspended: confirmOpen,
-    onPeriodChange: strip.handlePeriodChange,
-    onToday: strip.goToToday,
-    onShiftPeriod: strip.shiftPeriod,
-  });
-
   const canTouchDelete =
     session.selectedEvent !== null &&
     isCalendarWritable(session.selectedEventCalendar);
@@ -54,6 +46,27 @@ export function CalendarPage() {
     () => setConfirmDeleteId(selectedId),
     [selectedId],
   );
+
+  // One page-level keymap: the strip no longer listens on its own. The delete
+  // dialog and an active pointer drag suspend it (their focused buttons are not
+  // editing targets, so the target check alone would let keys through); Escape
+  // during a drag stays with the capture-phase handler inside useCalendarDrag.
+  useCalendarShortcuts({
+    suspended: confirmOpen || session.isDragging,
+    onPeriodChange: strip.handlePeriodChange,
+    onToday: strip.goToToday,
+    onShiftPeriod: strip.shiftPeriod,
+    onCreate: () => {
+      session.beginDraft(
+        keyboardCreateRange({
+          now: session.now,
+          visibleStart: strip.visibleStart,
+          periodLength: strip.periodLength,
+        }),
+      );
+    },
+    onRequestDelete: canTouchDelete ? requestDelete : null,
+  });
 
   // Scroll so the now line sits ~⅓ down the visible hours area — once per
   // mount / Today jump, and only when the visible period contains today.
