@@ -16,3 +16,9 @@ export const queryClient = new QueryClient({
     },
   },
 });
+
+/** Inactive range/date caches (every calendar events window, agenda history)
+ *  outlive the default 5 min so scrolling back or reopening a loaded week is
+ *  still a hit. Do not put this on the client defaults — lists/tasks/agenda
+ *  current are not range-keyed. gcTime only runs once the last observer leaves. */
+export const RANGE_QUERY_GC_TIME_MS = 30 * 60 * 1000;

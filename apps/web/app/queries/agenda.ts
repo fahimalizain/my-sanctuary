@@ -16,7 +16,7 @@ import type {
   RescheduleAgendaItemInput,
 } from '@/app/types';
 import { queryKeys } from './keys';
-import { queryClient } from '@/lib/queryClient';
+import { queryClient, RANGE_QUERY_GC_TIME_MS } from '@/lib/queryClient';
 import {
   historyPageZero,
   previousHistoryWindow,
@@ -71,6 +71,10 @@ export function useAgendaHistory(
   return useInfiniteQuery({
     queryKey: queryKeys.agenda.history(anchor),
     enabled: enabled && pageZero != null,
+    // The walk is lazy and only ever reopened at the top of the stream:
+    // `gcTime` is per-query (not a client default) so this anchor-keyed cache
+    // survives a scrolled-past Home, unlike the one-key `agenda.current`.
+    gcTime: RANGE_QUERY_GC_TIME_MS,
     // Page 0: the week ending the anchor's eve, floored at `earliest`. The
     // fallback only ever applies while the query is disabled — there is no
     // valid anchor/earliest yet, so nothing fetches.

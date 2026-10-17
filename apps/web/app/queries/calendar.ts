@@ -21,7 +21,7 @@ import {
   applyCalendarEventUpsert,
 } from './calendar-events-cache';
 import { queryKeys } from './keys';
-import { queryClient } from '@/lib/queryClient';
+import { queryClient, RANGE_QUERY_GC_TIME_MS } from '@/lib/queryClient';
 
 export {
   applyCalendarEventRemove,
@@ -33,12 +33,15 @@ export {
 // request for the previous range instead of racing it.
 // placeholderData keeps the prior range painted while a strip rebase
 // fetches the new window — avoids a full-grid "Loading events" flash.
+// `gcTime` is per-query (not a client default): only this range-keyed window
+// is worth keeping warm after its last observer leaves.
 
 export function calendarEventsQueryOptions(timeMin: string, timeMax: string) {
   return queryOptions({
     queryKey: queryKeys.calendar.events(timeMin, timeMax),
     queryFn: ({ signal }) => listCalendarEvents({ timeMin, timeMax, signal }),
     placeholderData: keepPreviousData,
+    gcTime: RANGE_QUERY_GC_TIME_MS,
   });
 }
 
