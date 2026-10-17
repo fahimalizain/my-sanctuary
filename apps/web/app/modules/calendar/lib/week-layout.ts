@@ -556,6 +556,14 @@ export function formatEventDuration(start: Date, end: Date): string {
   return `${hours}h ${minutes}min`;
 }
 
+/**
+ * Range + duration detail line: "5 AM – 6:30 AM · 1h 30min".
+ * Single source of truth for the tall chip's second line and the drag ghost.
+ */
+export function formatEventTimeDetail(start: Date, end: Date): string {
+  return `${formatEventTimeRange(start, end)} · ${formatEventDuration(start, end)}`;
+}
+
 /** Sun-first weekday labels for civil date lines (not WEEK_DAYS, which is Mon-first). */
 const WEEKDAY_SUN_FIRST = [
   'Sun',
