@@ -64,12 +64,14 @@ export function setTasksCache(
 // would fight applyOptimisticMove's sibling-rank contract, so it is never
 // used here.
 //
-// `['agenda']` is a different story: the server keeps every task's ONE agenda
-// row on civil today across create, a real start, a real complete/discard, a
-// reopen and a delete, so Home's day-stream must re-read after those settle —
-// its optimistic paint cannot know which way the row travelled. `/stop` and
-// `/pause` ride through `useRunTaskAction` as well; they leave the row alone,
-// so that re-read is merely redundant, never wrong.
+// `['agenda']` is a different story: a task's ONE agenda row follows the
+// task's status (ADR 0007), so Home's day-stream must re-read after every
+// write that can move it — the page's optimistic paint cannot know which way
+// the row travelled. Create, unplan (`/stop`, a Board drag to Open, or a
+// reopen to `OPEN`) park the row on the **backlog date** (today+50y); plan,
+// start, complete, discard and a reopen to `PLANNED` put it on civil today.
+// `/pause` alone leaves the row where it is, so its re-read is redundant —
+// never wrong.
 // ──────────────────────────────────────────
 
 async function cancelTasksQuery(): Promise<void> {

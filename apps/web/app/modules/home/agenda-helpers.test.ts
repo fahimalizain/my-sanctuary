@@ -1,7 +1,9 @@
 // Unit tests for Home's pure stream helpers (day label, date-window walk,
 // stream bounds / grouping, month-clamped date math, pending predicate, the
-// backlog split, the history window, and the optimistic cache edits). The
-// reorder tests pin the exact server semantics of
+// backlog split, the history window and its forward counterpart —
+// `nextStreamPageParam`, with TanStack's refetch walk mirrored in
+// `refetchAgendaPages` — the shared `['tasks']` patch, and the optimistic
+// cache edits). The reorder tests pin the exact server semantics of
 // `POST /api/agenda/items/:id/move`: peers at/after the target rank shift up
 // one and the item lands on it; `moveStreamItem` pins the same rule for the
 // cross-day `reschedule`. The backlog tests pin ADR 0007: a dated backlog row
@@ -35,15 +37,20 @@ import {
   isOpenBacklogTask,
   moveItemToBacklog,
   moveStreamItem,
+  nextStreamPageParam,
   openTaskMoveTargetAt,
   partitionAgendaItems,
   previousHistoryWindow,
+  refetchAgendaPages,
+  replaceCachedTask,
   rescheduleMaxDate,
   splitBacklogSection,
   streamBounds,
   streamItemsOf,
   updateStreamItem,
+  type AgendaStreamPageParam,
 } from './agenda-helpers';
+import { addCivilDays } from '../routines/rrule-preview';
 
 // ── Fixtures ────────────────────────────────────────────────────────────
 
@@ -161,6 +168,14 @@ function page(
     earliest_date: '2026-08-01',
     ...overrides,
   };
+}
+
+/** The `pageParams` of a cache built in a test: the params the stream stored,
+ *  page order. Typed through this so the fixtures' `kind` stays a literal. */
+function storedParams(
+  ...params: AgendaStreamPageParam[]
+): AgendaStreamPageParam[] {
+  return params;
 }
 
 /** The backlog date for TODAY: civil today + 50 years (ADR 0007). */
@@ -382,6 +397,181 @@ test('previousHistoryWindow: clamps to earliest_date and never reaches the ancho
   assert.ok(window && eachCivilDate(window.from, window.to).length <= 7);
 });
 
+// ── nextStreamPageParam / refetchAgendaPages ────────────────────────────
+
+/** One page as the server answers it (a `refetchAgendaPages` result row). */
+type PageWindow = { from: string; to: string; anchor_date: string };
+
+/** The server's `resolve_window` (packages/api-core/src/agenda.rs) as a mock:
+ *  the default read is `anchor_date … today + 6` plus the backlog; a history
+ *  window that reaches the anchor is CLAMPED to the anchor's eve (`from > to`
+ *  is an empty 200 — never a 400). */
+function serverPage(
+  anchor: string,
+  today: string,
+): (param: AgendaStreamPageParam) => PageWindow {
+  const eve = addCivilDays(anchor, -1);
+  return (param) =>
+    param.kind === 'default'
+      ? { from: anchor, to: addCivilDays(today, 6), anchor_date: anchor }
+      : {
+          from: param.from,
+          to: param.to < eve ? param.to : eve,
+          anchor_date: anchor,
+        };
+}
+
+test('refetchAgendaPages: a stable anchor re-reads the same three windows', () => {
+  const anchor = '2026-08-15';
+  const { params, pages } = refetchAgendaPages(
+    [
+      { kind: 'history', from: '2026-08-01', to: '2026-08-07' },
+      { kind: 'history', from: '2026-08-08', to: '2026-08-14' },
+      { kind: 'default' },
+    ],
+    serverPage(anchor, anchor),
+  );
+  assert.equal(params.length, 3, 'one fetch per old page');
+  assert.deepEqual(
+    pages.map((entry) => [entry.from, entry.to]),
+    [
+      ['2026-08-01', '2026-08-07'],
+      ['2026-08-08', '2026-08-14'],
+      ['2026-08-15', '2026-08-21'],
+    ],
+  );
+  // Day by day, the walk's windows are one unbroken 08-01 … 08-21 run: a
+  // page's `to + 1` is the next page's `from`, with nothing repeated.
+  assert.deepEqual(
+    pages.flatMap((entry) => eachCivilDate(entry.from, entry.to)),
+    eachCivilDate('2026-08-01', '2026-08-21'),
+  );
+  const last = pages[pages.length - 1];
+  assert.equal(last.from, anchor);
+  assert.ok(last.to >= anchor, 'the walk ends on the default read');
+});
+
+test('refetchAgendaPages: an anchor that moved later stretches the penultimate window to its eve', () => {
+  // A past pending day was cleared, so the anchor slid forward: the old cache
+  // is all history below 08-18.
+  const anchor = '2026-08-18';
+  const { pages } = refetchAgendaPages(
+    [
+      { kind: 'history', from: '2026-08-01', to: '2026-08-07' },
+      { kind: 'history', from: '2026-08-08', to: '2026-08-14' },
+      { kind: 'default' },
+    ],
+    serverPage(anchor, anchor),
+  );
+  assert.equal(pages.length, 3, 'the default page survives the walk');
+  const last = pages[pages.length - 1];
+  assert.deepEqual([last.from, last.to], ['2026-08-18', '2026-08-24']);
+  // 08-01 … 08-17 with no hole and no day twice (the penultimate window
+  // stretched to the anchor's eve), then the default read abuts it.
+  assert.deepEqual(
+    pages.flatMap((entry) => eachCivilDate(entry.from, entry.to)),
+    eachCivilDate('2026-08-01', '2026-08-24'),
+  );
+});
+
+test('refetchAgendaPages: an anchor that moved earlier clamps the history page, then re-reads today', () => {
+  // An older pending day appeared: the anchor slid back INTO the window the
+  // cache's first page holds.
+  const anchor = '2026-08-05';
+  const { pages } = refetchAgendaPages(
+    [
+      { kind: 'history', from: '2026-08-01', to: '2026-08-07' },
+      { kind: 'default' },
+    ],
+    serverPage(anchor, anchor),
+  );
+  assert.deepEqual(
+    pages.map((entry) => [entry.from, entry.to]),
+    [
+      // The server clamped the window that used to reach past the anchor…
+      ['2026-08-01', '2026-08-04'],
+      // …and the walk still ends on the no-params read, starting the very
+      // next day: no 400, no overlap.
+      ['2026-08-05', '2026-08-11'],
+    ],
+  );
+  assert.equal(pages[pages.length - 1].from, anchor);
+});
+
+test('nextStreamPageParam: the default page and malformed bounds end the walk', () => {
+  // The default page ends at today+6, always at/past the anchor — nothing
+  // follows it, so `hasNextPage` stays false and Home never grows a forward
+  // spinner.
+  assert.equal(
+    nextStreamPageParam(
+      { from: '2026-08-15', to: '2026-08-21', anchor_date: '2026-08-15' },
+      1,
+      3,
+    ),
+    undefined,
+  );
+  // A clamped-away history page (`from === anchor`, `to === anchor - 1`) is
+  // still history: the next page is the no-params read, never a zero-length
+  // history window.
+  assert.deepEqual(
+    nextStreamPageParam(
+      { from: '2026-08-15', to: '2026-08-14', anchor_date: '2026-08-15' },
+      1,
+      3,
+    ),
+    { kind: 'default' },
+  );
+  // The last slot is always spent on the default read (TanStack stops at
+  // `pageBudget` pages), and a malformed bound names no page at all.
+  assert.deepEqual(
+    nextStreamPageParam(
+      { from: '2026-08-01', to: '2026-08-07', anchor_date: '2026-08-15' },
+      2,
+      3,
+    ),
+    { kind: 'default' },
+  );
+  assert.equal(
+    nextStreamPageParam(
+      { from: '2026-08-01', to: 'not-a-date', anchor_date: '2026-08-15' },
+      1,
+      3,
+    ),
+    undefined,
+  );
+  assert.equal(
+    nextStreamPageParam(
+      { from: '2026-08-01', to: '2026-08-07', anchor_date: '' },
+      1,
+      3,
+    ),
+    undefined,
+  );
+});
+
+test('nextStreamPageParam: a mid-stream page is 7 inclusive days below the anchor', () => {
+  const anchor = '2026-09-30';
+  // Four slots left: no reason to stretch the window.
+  assert.deepEqual(
+    nextStreamPageParam(
+      { from: '2026-08-01', to: '2026-08-07', anchor_date: anchor },
+      1,
+      5,
+    ),
+    { kind: 'history', from: '2026-08-08', to: '2026-08-14' },
+  );
+  // The window never reaches the anchor, even when 7 days would: the day
+  // before the anchor is the cap.
+  assert.deepEqual(
+    nextStreamPageParam(
+      { from: '2026-09-22', to: '2026-09-28', anchor_date: anchor },
+      1,
+      5,
+    ),
+    { kind: 'history', from: '2026-09-29', to: '2026-09-29' },
+  );
+});
+
 // ── groupItemsByDate ────────────────────────────────────────────────────
 
 test('groupItemsByDate: buckets by local_date in input order', () => {
@@ -526,7 +716,10 @@ test('updateStreamItem: maps the matching item inside its own page', () => {
         occurrenceItem('c', 'pending'),
       ]),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   const next = updateStreamItem(data, 'c', (entry) => ({
     ...entry,
@@ -542,7 +735,7 @@ test('updateStreamItem: maps the matching item inside its own page', () => {
 test('updateStreamItem: a missing id (or no data) keeps the same reference', () => {
   const data = {
     pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   assert.equal(
     updateStreamItem(data, 'missing', (entry) => entry),
@@ -561,7 +754,7 @@ test('updateStreamItem: maps a backlog row too', () => {
         backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 0)],
       }),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const next = updateStreamItem(data, 'b', (entry) => ({
     ...entry,
@@ -584,7 +777,10 @@ test('moveStreamItem: an item travels between pages and shifts its peer', () => 
       page('2026-08-16', '2026-08-22', [leaving]),
       page('2026-08-23', '2026-08-29', [peerBefore, peerAtRank]),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   const next = moveStreamItem(data, 'a', '2026-08-24', 1);
   assert.notEqual(next, data);
@@ -615,7 +811,7 @@ test('moveStreamItem: peers on OTHER dates never shift', () => {
         item('b', 0, '2026-08-24'),
       ]),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const next = moveStreamItem(data, 'a', '2026-08-24', 0);
   assert.equal(
@@ -633,7 +829,7 @@ test('moveStreamItem: peers on OTHER dates never shift', () => {
 test('moveStreamItem: an uncovered target date drops the row from the stream', () => {
   const data = {
     pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const next = moveStreamItem(data, 'a', '2026-09-15', 3);
   // No loaded window covers 2026-09-15, so the row cannot be painted on a
@@ -655,7 +851,7 @@ test('moveStreamItem: an uncovered target date drops the row from the stream', (
 test('moveStreamItem: a missing id (or no data) keeps the same reference', () => {
   const data = {
     pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   assert.equal(moveStreamItem(data, 'missing', TODAY, 0), data);
   assert.equal(moveStreamItem(undefined, 'a', TODAY, 0), undefined);
@@ -668,7 +864,7 @@ test('moveStreamItem: a backlog row leaves the backlog and lands on a covered da
         backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 0)],
       }),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   // The reschedule path opts in to the one status change: the server plans an
   // OPEN task it reschedules onto a date.
@@ -693,7 +889,7 @@ test('moveStreamItem: only the reschedule path plans an OPEN task', () => {
         backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 0)],
       }),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const next = moveStreamItem(data, 'b', '2026-08-24', 0);
   const landed = next?.pages[0].items.find((entry) => entry.id === 'b');
@@ -711,7 +907,7 @@ test('moveStreamItem: a PLANNED task and an occurrence keep their status', () =>
         ],
       }),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const afterTask = moveStreamItem(data, 'p', '2026-08-26', 0, true);
   assert.equal(
@@ -738,7 +934,7 @@ test('moveItemToBacklog: a PLANNED row flips OPEN and appends the Board rank', (
         backlog: [first, last],
       }),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const next = moveItemToBacklog(data, 'p', BACKLOG_DATE);
   const page0 = next?.pages[0];
@@ -768,7 +964,7 @@ test('moveItemToBacklog: an already-OPEN row keeps its Board rank', () => {
         backlog: [taskItemAt('a', 'OPEN', BACKLOG_DATE, 9)],
       }),
     ],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   const next = moveItemToBacklog(data, 'o', BACKLOG_DATE);
   const page0 = next?.pages[0];
@@ -794,7 +990,10 @@ test('moveItemToBacklog: appends on the greatest-to page and drops the old copy'
         backlog: [taskItemAt('b', 'OPEN', BACKLOG_DATE, 2)],
       }),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   const next = moveItemToBacklog(data, 's', BACKLOG_DATE);
   assert.deepEqual(next?.pages[0].backlog, []);
@@ -812,7 +1011,7 @@ test('moveItemToBacklog: appends on the greatest-to page and drops the old copy'
 test('moveItemToBacklog: a missing id (or no data) keeps the same reference', () => {
   const data = {
     pages: [page('2026-08-23', '2026-08-29', [item('a', 0)])],
-    pageParams: [undefined],
+    pageParams: storedParams({ kind: 'default' }),
   };
   assert.equal(moveItemToBacklog(data, 'missing', BACKLOG_DATE), data);
   assert.equal(moveItemToBacklog(undefined, 'a', BACKLOG_DATE), undefined);
@@ -828,7 +1027,10 @@ test('appendRankOnStream: max + 1 on the date, 0 on an empty pile', () => {
       page('2026-08-16', '2026-08-22', [item('a', 4, '2026-08-20')]),
       page('2026-08-23', '2026-08-29', [item('b', 0), item('c', 2)]),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   assert.equal(appendRankOnStream(data, TODAY), 3);
   assert.equal(appendRankOnStream(data, '2026-08-20'), 5);
@@ -842,7 +1044,10 @@ test('streamItemsOf: flattens pages in order', () => {
       page('2026-08-16', '2026-08-22', [item('a', 0, '2026-08-20')]),
       page('2026-08-23', '2026-08-29', [item('b', 0)]),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   assert.deepEqual(
     streamItemsOf(data).map((entry) => entry.id),
@@ -863,7 +1068,10 @@ test('streamItemsOf: each page contributes its items then its backlog', () => {
         backlog: [taskItemAt('c', 'OPEN', BACKLOG_DATE, 1)],
       }),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   assert.deepEqual(
     streamItemsOf(data).map((entry) => entry.id),
@@ -882,7 +1090,10 @@ test('dedupeAgendaItems: one survivor per id, the first page wins', () => {
         item('b', 0),
       ]),
     ],
-    pageParams: [undefined, { from: '2026-08-23', to: '2026-08-29' }],
+    pageParams: storedParams(
+      { kind: 'default' },
+      { kind: 'history', from: '2026-08-23', to: '2026-08-29' },
+    ),
   };
   const deduped = dedupeAgendaItems(streamItemsOf(data));
   assert.deepEqual(
@@ -1066,6 +1277,37 @@ test('applyOpenTaskReorder: other statuses keep their ranks; no-op refs', () => 
   assert.equal(applyOpenTaskReorder(tasks, 'a', 0), tasks);
   // A missing mover leaves the list alone too.
   assert.equal(applyOpenTaskReorder(tasks, 'missing', 2), tasks);
+});
+
+// ── replaceCachedTask ───────────────────────────────────────────────────
+
+test('replaceCachedTask: the fresh row lands with its status and Board rank', () => {
+  // A dated reschedule flips OPEN → PLANNED and appends the Planned column —
+  // the shared `['tasks']` cache must follow BOTH.
+  const open = { ...task('a', 'OPEN'), sort_order: 4 };
+  const planned = { ...task('b', 'PLANNED'), sort_order: 0 };
+  const fresh: TaskRecord = { ...task('a', 'PLANNED'), sort_order: 3 };
+  const tasks = [open, planned];
+  const next = replaceCachedTask(tasks, fresh);
+  assert.deepEqual(
+    next.map((entry) => [entry.id, entry.status, entry.sort_order]),
+    [
+      ['a', 'PLANNED', 3],
+      ['b', 'PLANNED', 0],
+    ],
+  );
+  assert.equal(next[0], fresh, 'the server row itself is cached');
+  assert.equal(next[1], planned, 'every other row keeps its reference');
+  assert.equal(tasks[0], open, 'the input array is not mutated');
+});
+
+test('replaceCachedTask: nothing to replace keeps the same reference', () => {
+  const tasks = [task('a', 'OPEN'), task('b', 'PLANNED')];
+  // No fresh row (an occurrence, a deleted task) or an id the cache does not
+  // hold: React Query must be able to skip the re-render.
+  assert.equal(replaceCachedTask(tasks, null), tasks);
+  assert.equal(replaceCachedTask(tasks, undefined), tasks);
+  assert.equal(replaceCachedTask(tasks, task('missing', 'OPEN')), tasks);
 });
 
 // ── crossDaySortOrder ───────────────────────────────────────────────────

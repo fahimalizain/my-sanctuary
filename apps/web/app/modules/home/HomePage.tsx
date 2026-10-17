@@ -101,6 +101,7 @@ import {
   moveStreamItem,
   openTaskMoveTargetAt,
   partitionAgendaItems,
+  replaceCachedTask,
   splitBacklogSection,
   streamItemsOf,
   updateStreamItem,
@@ -754,7 +755,10 @@ export function HomePage() {
    *  end server-side (`max + 1`), exactly like the old "Tomorrow". A failure
    *  restores the snapshot and banners. Landing a task that was still `OPEN`
    *  plans it server-side — this is the ONLY move that does, so it is the one
-   *  caller that asks `moveStreamItem` to paint `PLANNED`. */
+   *  caller that asks `moveStreamItem` to paint `PLANNED`. The server also
+   *  appends the task to the Planned column, so the shared `['tasks']` cache
+   *  takes its fresh row (status AND Board rank) — the same patch a backlog
+   *  drop sends. */
   const handleCrossDayMove = async (
     item: AgendaItemRecord,
     targetDate: string,
@@ -788,6 +792,9 @@ export function HomePage() {
         input,
       });
       mergeRow(data.item.id, () => data.item);
+      // Patch the shared tasks cache so Board/Lists see the flipped status
+      // and the new Planned rank.
+      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
     } catch (err) {
       patchStream(() => snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');
@@ -815,13 +822,9 @@ export function HomePage() {
         input: { backlog: true },
       });
       mergeRow(data.item.id, () => data.item);
-      // Patch the shared tasks cache so Board/Lists see the flipped status.
-      if (data.item.task) {
-        const fresh = data.item.task;
-        setTasksCache((prev) =>
-          prev.map((entry) => (entry.id === fresh.id ? fresh : entry)),
-        );
-      }
+      // Patch the shared tasks cache so Board/Lists see the flipped status
+      // and the appended Open rank.
+      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
     } catch (err) {
       patchStream(() => snapshot);
       setActionError(err instanceof Error ? err.message : 'Move failed');

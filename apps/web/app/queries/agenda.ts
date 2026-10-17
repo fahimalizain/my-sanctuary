@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { useInfiniteQuery, useMutation } from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
 import {
@@ -12,48 +13,80 @@ import type {
 } from '@/app/types';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';
-import { previousHistoryWindow } from '@/app/modules/home/agenda-helpers';
+import {
+  nextStreamPageParam,
+  previousHistoryWindow,
+} from '@/app/modules/home/agenda-helpers';
 
 // Home reads ONE infinite stream of day windows (ADR 0004 amendment — slice
-// 5, ADR 0007 — slice 6): the first page is the server's default read (no
-// query at all, so the browser never computes today) — `anchor_date … today+6`
-// plus the `backlog` array. `getPreviousPageParam` walks history in 7-day
-// windows down to `earliest_date`; there is NO forward page, the stream ends
-// at today+6. Every write on the page edits this cache in place (optimistic
-// paint) and `cancelAgendaQuery` protects it from an in-flight refetch — there
-// is no per-date key left.
+// 5, ADR 0007 — slice 6): page 0 is the server's default read (no query at
+// all, so the browser never computes today) — `anchor_date … today+6` plus the
+// `backlog` array. `getPreviousPageParam` walks history in 7-day windows down
+// to `earliest_date`, and `getNextPageParam` walks FORWARD from page 0 —
+// TanStack re-runs an infinite query page by page from its stored params, so
+// every page must be able to name the one after it (see the param union below)
+// or the walk stops and today's page drops out of the cache. Every write on
+// the page edits this cache in place (optimistic paint) and `cancelAgendaQuery`
+// protects it from an in-flight refetch — there is no per-date key left.
 
-/** One stream page: 7 inclusive civil days, or `undefined` for the very first
- *  page (the default read — the GET that omits `from`/`to` entirely). */
-export type AgendaStreamPageParam = { from: string; to: string };
+/** One stream page's param — the two reads `getAgendaRange` answers to: the
+ *  DEFAULT page (`{ kind: 'default' }` — the GET omits `from`/`to` entirely)
+ *  and a 7-day HISTORY window (`to < anchor_date`). The union exists because a
+ *  refetch walks FORWARD from page 0: it re-reads `pageParams[0]` and then asks
+ *  `getNextPageParam` for each following page, so a history page has to be
+ *  able to name the no-params read. A missing param would end the walk there
+ *  and drop the default page — today, today+6 and the whole backlog — from the
+ *  cache. */
+export type AgendaStreamPageParam =
+  | { kind: 'default' }
+  | { kind: 'history'; from: string; to: string };
+
+/** The no-params read as a param: `initialPageParam`, never `undefined`, so
+ *  the refetch walk always has a page 0 to start from. */
+const DEFAULT_PAGE_PARAM: AgendaStreamPageParam = { kind: 'default' };
 
 /** The whole stream as React Query caches it (`pages[0]` is the earliest
  *  loaded window — previous pages are prepended on the left). */
 export type AgendaStreamData = InfiniteData<
   AgendaResponse,
-  AgendaStreamPageParam | undefined
+  AgendaStreamPageParam
 >;
 
 export function useAgendaStream() {
-  return useInfiniteQuery({
+  // How many pages the NEXT refetch reloads — `oldPages.length` in TanStack's
+  // forward walk. Assigned during render, so during a refetch it still holds
+  // the OLD count (the component has not re-rendered yet): exactly the budget
+  // `nextStreamPageParam` needs. A ref, never `query.data`: the cache is
+  // already in flux while `getNextPageParam` runs.
+  const pageBudgetRef = useRef(1);
+  const query = useInfiniteQuery({
     queryKey: queryKeys.agenda.stream(),
-    // The default page is the API's own read: no `from`/`to` at all. Its
-    // param stays `undefined` FOREVER — never rewritten to `{ from, to }`.
-    // Pinning it would turn the next refetch into a history read whose `to`
-    // (today+6) is not `< anchor_date`, which the server 400s. A refetch
-    // recomputes the anchor instead; that slide is correct.
-    initialPageParam: undefined as AgendaStreamPageParam | undefined,
+    initialPageParam: DEFAULT_PAGE_PARAM,
     queryFn: ({ pageParam }) =>
-      pageParam
+      pageParam.kind === 'history'
         ? getAgendaRange(pageParam.from, pageParam.to)
         : getAgendaRange(),
     // History ends at the oldest row the server knows about, and the window
-    // always ends before the anchor (`previousHistoryWindow`).
-    getPreviousPageParam: (_firstPage, allPages) =>
-      previousHistoryWindow(allPages),
-    // No forward page: today is inside the default window.
-    getNextPageParam: () => undefined,
+    // always ends before the anchor (`previousHistoryWindow`) — so the walk
+    // back down is the server's own paging rule.
+    getPreviousPageParam: (_firstPage, allPages) => {
+      const window = previousHistoryWindow(allPages);
+      if (!window) return undefined;
+      const param: AgendaStreamPageParam = {
+        kind: 'history',
+        from: window.from,
+        to: window.to,
+      };
+      return param;
+    },
+    // A refetch's forward walk: it names every page after page 0 again, the
+    // default read last (`nextStreamPageParam` — never a read past the
+    // anchor, and never a walk that forgets today).
+    getNextPageParam: (lastPage, allPages) =>
+      nextStreamPageParam(lastPage, allPages.length, pageBudgetRef.current),
   });
+  pageBudgetRef.current = query.data?.pages.length ?? pageBudgetRef.current;
+  return query;
 }
 
 // Agenda write mutations — thin wrappers, no optimistic paint (mirrors
