@@ -12,6 +12,10 @@ import { useCalendarSession } from './hooks/useCalendarSession';
 import { useCalendarShortcuts } from './hooks/useCalendarShortcuts';
 import { useCalendarStrip } from './hooks/useCalendarStrip';
 import { useHideNavOnLateHours } from './hooks/useHideNavOnLateHours';
+import {
+  clipboardItemFromEvent,
+  type CalendarClipboardItem,
+} from './lib/calendar-clipboard';
 import { keyboardCreateRange } from './lib/calendar-model';
 import { COL_HEADER_H, addDays, isSameDay, nowLineY } from './lib/week-layout';
 
@@ -31,6 +35,11 @@ export function CalendarPage() {
   useHideNavOnLateHours(strip.scrollerRef, session.hourH, session.allDayHeight);
 
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  // In-memory clipboard for Cmd/Ctrl+C / X / V. Page state on purpose: this is
+  // not the system clipboard, so copying an event never touches the OS.
+  const [clipboard, setClipboard] = useState<CalendarClipboardItem | null>(
+    null,
+  );
   const selectedId = session.selectedEvent?.id ?? null;
   // The dialog belongs to the selection it was opened for.
   const confirmOpen =
@@ -66,6 +75,36 @@ export function CalendarPage() {
       );
     },
     onRequestDelete: canTouchDelete ? requestDelete : null,
+    // Copy and cut fill the page clipboard; paste consumes the key only when
+    // there was something to paste. Duplicate never writes the clipboard.
+    onCopy: () => {
+      const item = clipboardItemFromEvent(session.selectedEvent);
+      if (!item) return false;
+      setClipboard(item);
+      return true;
+    },
+    onCut: () => {
+      const item = session.cutForClipboard();
+      if (!item) return false;
+      setClipboard(item);
+      return true;
+    },
+    onPaste: () => {
+      if (!clipboard) return false;
+      const item = clipboard;
+      void session.pasteFromClipboard(item).then((consumed) => {
+        if (!consumed) return;
+        // Only this cut's own item is cleared: a copy that replaced the
+        // clipboard while the paste was in flight must keep its cutSourceId.
+        setClipboard((prev) =>
+          prev && prev.cutSourceId === item.cutSourceId
+            ? { ...prev, cutSourceId: null }
+            : prev,
+        );
+      });
+      return true;
+    },
+    onDuplicate: () => session.duplicateSelected(),
   });
 
   // Scroll so the now line sits ~⅓ down the visible hours area — once per

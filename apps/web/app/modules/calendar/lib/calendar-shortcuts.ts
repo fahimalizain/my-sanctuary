@@ -17,7 +17,11 @@ export type CalendarShortcutAction =
   | { type: 'today' }
   | { type: 'shiftPeriod'; delta: -1 | 1 }
   | { type: 'create' }
-  | { type: 'requestDelete' };
+  | { type: 'requestDelete' }
+  | { type: 'copy' }
+  | { type: 'cut' }
+  | { type: 'paste' }
+  | { type: 'duplicate' };
 
 /**
  * True when keystrokes belong to a field rather than the calendar: text
@@ -34,18 +38,47 @@ export function isTextEditingTarget(target: EventTarget | null): boolean {
 /**
  * Resolve a keydown to a calendar action, or null when the key is not ours.
  *
- * Chords are deliberately unhandled: Cmd/Ctrl/Alt belong to the browser and
- * the OS (Cmd+T is a new tab, Cmd+[ is Back, Cmd+C is copy), so those events
- * fall through untouched. Shift is not a blocker either — `key` is already the
- * shifted character, so `T` is Shift+t. Auto-repeat is allowed for navigation:
- * holding `]` to step periods is useful, and Today is idempotent. Create and
- * delete are different: a held key must not open a stack of drafts or dialogs,
- * so their repeats are dropped.
+ * Alt is never ours, so AltGr-style chords reach the OS untouched. Cmd/Ctrl
+ * are ours for exactly four clipboard chords (copy, cut, paste, duplicate):
+ * everything else — Cmd+T is a new tab, Cmd+[ is Back, Ctrl+W closes the tab,
+ * Cmd+1–6 change tabs — must fall through rather than land in the bare-key
+ * switch below. Shift chords (Cmd+Shift+D) and auto-repeat stay with the
+ * browser too, so a held Cmd+D cannot stack up clones.
+ *
+ * Bare keys are unchanged: `key` is already the shifted character, so `T` is
+ * Shift+t and Shift is not a blocker; holding `]` keeps paging, while create
+ * and delete drop repeats because a held key must not open a stack of drafts
+ * or dialogs.
  */
 export function resolveCalendarShortcut(
   input: CalendarShortcutInput,
 ): CalendarShortcutAction | null {
-  if (input.metaKey || input.ctrlKey || input.altKey) return null;
+  // Alt is never ours, and a chord that holds both modifiers is ambiguous.
+  if (input.altKey) return null;
+  if (input.metaKey && input.ctrlKey) return null;
+
+  if (input.metaKey || input.ctrlKey) {
+    if (input.shiftKey || input.repeat) return null;
+
+    switch (input.key) {
+      case 'c':
+      case 'C':
+        return { type: 'copy' };
+      case 'x':
+      case 'X':
+        return { type: 'cut' };
+      case 'v':
+      case 'V':
+        return { type: 'paste' };
+      case 'd':
+      case 'D':
+        return { type: 'duplicate' };
+      default:
+        // Cmd+T / Cmd+[ / Cmd+1 / Ctrl+W belong to the browser: never fall
+        // through to the bare-key switch.
+        return null;
+    }
+  }
 
   if (
     input.repeat &&

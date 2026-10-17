@@ -29,12 +29,20 @@ after(() => {
   cleanup();
 });
 
+type ClipboardAction = 'copy' | 'cut' | 'paste' | 'duplicate';
+
 interface ShortcutHarnessProps {
   suspended: boolean;
   /** Callback log, in dispatch order. */
   calls: string[];
   /** False models no selection / a read-only calendar. */
   deleteAllowed?: boolean;
+  /**
+   * Which clipboard callbacks claim the key. Default: none do (nothing is
+   * selected / nothing was copied), so the browser chord stays untouched and
+   * nothing is logged — the log only records handled keys.
+   */
+  clipboardHandled?: Partial<Record<ClipboardAction, boolean>>;
 }
 
 /** Records callbacks instead of moving a real strip. */
@@ -42,7 +50,14 @@ function ShortcutHarness({
   suspended,
   calls,
   deleteAllowed = true,
+  clipboardHandled,
 }: ShortcutHarnessProps): ReactElement {
+  const clipboard = (action: ClipboardAction) => (): boolean => {
+    if (!clipboardHandled?.[action]) return false;
+    calls.push(action);
+    return true;
+  };
+
   useCalendarShortcuts({
     suspended,
     onPeriodChange: (n) => calls.push(`period:${n}`),
@@ -50,6 +65,10 @@ function ShortcutHarness({
     onShiftPeriod: (delta) => calls.push(`shift:${delta}`),
     onCreate: () => calls.push('create'),
     onRequestDelete: deleteAllowed ? () => calls.push('delete') : null,
+    onCopy: clipboard('copy'),
+    onCut: clipboard('cut'),
+    onPaste: clipboard('paste'),
+    onDuplicate: clipboard('duplicate'),
   });
   return createElement('div', null, 'harness');
 }
@@ -60,10 +79,19 @@ interface Harness {
   unmount: () => void;
 }
 
-function mountHarness(suspended = false, deleteAllowed = true): Harness {
+function mountHarness(
+  suspended = false,
+  deleteAllowed = true,
+  clipboardHandled?: Partial<Record<ClipboardAction, boolean>>,
+): Harness {
   const calls: string[] = [];
   const view = render(
-    createElement(ShortcutHarness, { suspended, calls, deleteAllowed }),
+    createElement(ShortcutHarness, {
+      suspended,
+      calls,
+      deleteAllowed,
+      clipboardHandled,
+    }),
   );
   return {
     calls,
@@ -73,6 +101,7 @@ function mountHarness(suspended = false, deleteAllowed = true): Harness {
           suspended: next,
           calls,
           deleteAllowed,
+          clipboardHandled,
         }),
       );
     },
@@ -214,6 +243,84 @@ test('useCalendarShortcuts: meta+c stays a copy, not a create', () => {
   const event = press('c', { metaKey: true });
 
   assert.deepEqual(calls, [], 'Cmd+C must stay free for the clipboard');
+  assert.equal(event.defaultPrevented, false);
+});
+
+test('useCalendarShortcuts: meta+c copies and consumes the key when handled', () => {
+  const { calls } = mountHarness(false, true, { copy: true });
+
+  const event = press('c', { metaKey: true });
+
+  assert.deepEqual(calls, ['copy']);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('useCalendarShortcuts: meta+c leaves the chord alone when nothing is copied', () => {
+  const { calls } = mountHarness(false, true, { copy: false });
+
+  const event = press('c', { metaKey: true });
+
+  assert.deepEqual(calls, []);
+  assert.equal(event.defaultPrevented, false);
+});
+
+test('useCalendarShortcuts: meta+d duplicates and consumes the key', () => {
+  const { calls } = mountHarness(false, true, { duplicate: true });
+
+  const event = press('d', { metaKey: true });
+
+  assert.deepEqual(calls, ['duplicate']);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('useCalendarShortcuts: an unhandled meta+d stays a bookmark', () => {
+  const { calls } = mountHarness();
+
+  const event = press('d', { metaKey: true });
+
+  assert.deepEqual(calls, []);
+  assert.equal(event.defaultPrevented, false);
+});
+
+test('useCalendarShortcuts: ctrl+v pastes when the clipboard has an item', () => {
+  const { calls } = mountHarness(false, true, { paste: true });
+
+  const event = press('v', { ctrlKey: true });
+
+  assert.deepEqual(calls, ['paste']);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('useCalendarShortcuts: meta+x cuts when something is selected', () => {
+  const { calls } = mountHarness(false, true, { cut: true });
+
+  const event = press('x', { metaKey: true });
+
+  assert.deepEqual(calls, ['cut']);
+  assert.equal(event.defaultPrevented, true);
+});
+
+test('useCalendarShortcuts: meta+c typed in an input copies text, not the event', () => {
+  const { calls } = mountHarness(false, true, { copy: true });
+  const input = document.createElement('input');
+  document.body.appendChild(input);
+
+  try {
+    const event = press('c', { metaKey: true }, input);
+    assert.equal(event.target, input);
+    assert.deepEqual(calls, [], 'the field keeps its own clipboard chord');
+    assert.equal(event.defaultPrevented, false);
+  } finally {
+    input.remove();
+  }
+});
+
+test('useCalendarShortcuts: meta+t does not go to today', () => {
+  const { calls } = mountHarness();
+
+  const event = press('t', { metaKey: true });
+
+  assert.deepEqual(calls, []);
   assert.equal(event.defaultPrevented, false);
 });
 

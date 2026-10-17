@@ -112,10 +112,10 @@ test('resolveCalendarShortcut: holding create or delete does not repeat', () => 
   }
 });
 
-test('resolveCalendarShortcut: chords never create or delete', () => {
-  // Cmd+C must stay free for the clipboard slice.
-  assert.equal(resolve('c', { metaKey: true }), null);
-  assert.equal(resolve('c', { ctrlKey: true }), null);
+test('resolveCalendarShortcut: delete chords are never ours', () => {
+  // Cmd/Ctrl/Alt+Backspace stays a browser/OS delete, not our dialog.
+  assert.equal(resolve('Backspace', { metaKey: true }), null);
+  assert.equal(resolve('Backspace', { ctrlKey: true }), null);
   assert.equal(resolve('Backspace', { altKey: true }), null);
 });
 
@@ -148,6 +148,56 @@ test('resolveCalendarShortcut: navigation and unrelated keys are not ours', () =
   for (const key of ['ArrowLeft', 'Escape', '?']) {
     assert.equal(resolve(key), null, `key ${key}`);
   }
+});
+
+// ── Clipboard chords (Cmd / Ctrl) ───────────────────────────────────────
+
+test('resolveCalendarShortcut: meta+c, ctrl+x, meta+v, ctrl+d map to the clipboard actions', () => {
+  assert.deepEqual(resolve('c', { metaKey: true }), { type: 'copy' });
+  assert.deepEqual(resolve('x', { ctrlKey: true }), { type: 'cut' });
+  assert.deepEqual(resolve('v', { metaKey: true }), { type: 'paste' });
+  assert.deepEqual(resolve('d', { ctrlKey: true }), { type: 'duplicate' });
+});
+
+test('resolveCalendarShortcut: a chord reports the shifted letter without shiftKey', () => {
+  // Browsers resolve `key` from the layout, not the chord: Cmd+C can arrive
+  // as "C" while shiftKey stays false. Both cases are the same action.
+  assert.deepEqual(resolve('C', { metaKey: true }), { type: 'copy' });
+  assert.deepEqual(resolve('X', { ctrlKey: true }), { type: 'cut' });
+  assert.deepEqual(resolve('V', { metaKey: true }), { type: 'paste' });
+  assert.deepEqual(resolve('D', { ctrlKey: true }), { type: 'duplicate' });
+});
+
+test('resolveCalendarShortcut: shift, both modifiers, and alt are not our chords', () => {
+  assert.equal(resolve('d', { metaKey: true, shiftKey: true }), null);
+  assert.equal(
+    resolve('c', { metaKey: true, ctrlKey: true }),
+    null,
+    'Cmd+Ctrl+C is ambiguous',
+  );
+  assert.equal(resolve('c', { altKey: true }), null);
+  assert.equal(resolve('x', { metaKey: true, altKey: true }), null);
+});
+
+test('resolveCalendarShortcut: a held chord does not repeat', () => {
+  // Cmd+D held must not stack clones.
+  assert.equal(resolve('d', { metaKey: true, repeat: true }), null);
+  assert.equal(resolve('c', { ctrlKey: true, repeat: true }), null);
+});
+
+test('resolveCalendarShortcut: other Cmd/Ctrl chords stay with the browser', () => {
+  assert.equal(resolve('t', { metaKey: true }), null, 'Cmd+T is a new tab');
+  assert.equal(resolve('[', { metaKey: true }), null, 'Cmd+[ is Back');
+  assert.equal(resolve('w', { ctrlKey: true }), null, 'Ctrl+W closes the tab');
+  assert.equal(resolve('1', { metaKey: true }), null, 'Cmd+1 changes tabs');
+  assert.equal(resolve(']', { ctrlKey: true }), null);
+  assert.equal(resolve('Backspace', { metaKey: true }), null);
+});
+
+test('resolveCalendarShortcut: bare c, d, and t keep their old meanings', () => {
+  assert.deepEqual(resolve('c'), { type: 'create' });
+  assert.deepEqual(resolve('d'), { type: 'setPeriod', length: 1 });
+  assert.deepEqual(resolve('t'), { type: 'today' });
 });
 
 // ── Editing targets ─────────────────────────────────────────────────────

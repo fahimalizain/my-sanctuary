@@ -13,6 +13,15 @@ export interface CalendarShortcutsOptions {
   onCreate: () => void;
   /** Null when nothing deletable is selected (no selection or read-only). */
   onRequestDelete: (() => void) | null;
+  /**
+   * Clipboard chords. Each returns whether it actually handled the key: a
+   * false return leaves the browser chord alone (Cmd+D with nothing selected
+   * still bookmarks, Cmd+C with nothing selected is harmless).
+   */
+  onCopy: () => boolean;
+  onCut: () => boolean;
+  onPaste: () => boolean;
+  onDuplicate: () => boolean;
 }
 
 interface CalendarShortcutHandlers {
@@ -21,13 +30,17 @@ interface CalendarShortcutHandlers {
   onShiftPeriod: (delta: -1 | 1) => void;
   onCreate: () => void;
   onRequestDelete: (() => void) | null;
+  onCopy: () => boolean;
+  onCut: () => boolean;
+  onPaste: () => boolean;
+  onDuplicate: () => boolean;
 }
 
 /**
  * Window-level calendar shortcuts: period length, Today, previous/next
- * period, create, and request-delete. One listener for the whole page — the
- * strip hook no longer listens on its own — so each keydown is resolved
- * exactly once.
+ * period, create, request-delete, and the in-memory clipboard chords. One
+ * listener for the whole page — the strip hook no longer listens on its own —
+ * so each keydown is resolved exactly once.
  */
 export function useCalendarShortcuts({
   suspended,
@@ -36,6 +49,10 @@ export function useCalendarShortcuts({
   onShiftPeriod,
   onCreate,
   onRequestDelete,
+  onCopy,
+  onCut,
+  onPaste,
+  onDuplicate,
 }: CalendarShortcutsOptions): void {
   // Latest callbacks, so the window listener rebinds only when suspension
   // changes rather than on every drag / selection re-render.
@@ -45,6 +62,10 @@ export function useCalendarShortcuts({
     onShiftPeriod,
     onCreate,
     onRequestDelete,
+    onCopy,
+    onCut,
+    onPaste,
+    onDuplicate,
   });
 
   useEffect(() => {
@@ -54,8 +75,22 @@ export function useCalendarShortcuts({
       onShiftPeriod,
       onCreate,
       onRequestDelete,
+      onCopy,
+      onCut,
+      onPaste,
+      onDuplicate,
     };
-  }, [onPeriodChange, onToday, onShiftPeriod, onCreate, onRequestDelete]);
+  }, [
+    onPeriodChange,
+    onToday,
+    onShiftPeriod,
+    onCreate,
+    onRequestDelete,
+    onCopy,
+    onCut,
+    onPaste,
+    onDuplicate,
+  ]);
 
   useEffect(() => {
     // A dialog owns the keyboard while it is open: its focused buttons are not
@@ -103,6 +138,20 @@ export function useCalendarShortcuts({
           requestDelete();
           break;
         }
+        // Clipboard chords own the key only when they did something; a false
+        // return leaves the browser default (bookmark, tab switch) in place.
+        case 'copy':
+          if (handlers.onCopy()) e.preventDefault();
+          break;
+        case 'cut':
+          if (handlers.onCut()) e.preventDefault();
+          break;
+        case 'paste':
+          if (handlers.onPaste()) e.preventDefault();
+          break;
+        case 'duplicate':
+          if (handlers.onDuplicate()) e.preventDefault();
+          break;
       }
     };
 
