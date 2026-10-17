@@ -12,18 +12,26 @@ import {
   HOUR_H_BASE,
   HOUR_H_MAX,
   HOUR_H_MIN,
-  SCROLL_AXIS_SLOP,
+  SCROLL_X_THRESHOLD_PX,
+  SCROLL_Y_SLOP_PX,
   STRIP_OVERSCAN,
   STRIP_REBASE_THRESHOLD,
+  SWIPE_FLICK_VELOCITY,
+  SWIPE_PROJECTION_MS,
+  SWIPE_VELOCITY_WINDOW_MS,
   TIME_GUTTER_W,
+  WHEEL_AXIS_SLOP,
   WHEEL_BURST_IDLE_MS,
   WHEEL_LINE_PX,
   allDaySectionHeight,
   clampMinutesToDay,
   clampPeriodLength,
   classifyScrollAxis,
+  classifyWheelAxis,
   nextWheelBurst,
   parseStoredPeriodLength,
+  swipeTargetIndex,
+  swipeVelocity,
   wheelDeltaPx,
   colWidth,
   dayIndexFromScroll,
@@ -371,7 +379,7 @@ test('shiftWindowStart: period 3 → ±3 days', () => {
 
 test('stripSnapDisabled: true while any owner is held', () => {
   assert.equal(stripSnapDisabled(new Set<StripLockReason>()), false);
-  for (const reason of ['drag', 'pinch', 'axis'] as const) {
+  for (const reason of ['drag', 'pinch', 'swipe'] as const) {
     assert.equal(stripSnapDisabled(new Set<StripLockReason>([reason])), true);
   }
   assert.equal(
@@ -380,39 +388,36 @@ test('stripSnapDisabled: true while any owner is held', () => {
   );
 });
 
-test('stripRebaseSuppressed: drag / pinch yes, axis alone no', () => {
-  assert.equal(stripRebaseSuppressed(new Set<StripLockReason>(['drag'])), true);
-  assert.equal(
-    stripRebaseSuppressed(new Set<StripLockReason>(['pinch'])),
-    true,
-  );
+test('stripRebaseSuppressed: every lock owner writes scrollLeft, so none rebases', () => {
+  for (const reason of ['drag', 'pinch', 'swipe'] as const) {
+    assert.equal(
+      stripRebaseSuppressed(new Set<StripLockReason>([reason])),
+      true,
+      `${reason} must suppress rebase`,
+    );
+  }
   assert.equal(
     stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'pinch'])),
     true,
   );
-  // axis holds snap off but leaves rebase free (the window may still slide).
   assert.equal(
-    stripRebaseSuppressed(new Set<StripLockReason>(['axis'])),
-    false,
-  );
-  assert.equal(
-    stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'axis'])),
+    stripRebaseSuppressed(new Set<StripLockReason>(['drag', 'swipe'])),
     true,
   );
 });
 
 test('strip lock: releasing one owner leaves another owner in effect', () => {
-  const held = new Set<StripLockReason>(['drag', 'axis']);
+  const held = new Set<StripLockReason>(['drag', 'swipe']);
   assert.equal(stripSnapDisabled(held), true);
   assert.equal(stripRebaseSuppressed(held), true);
 
-  // Drag ends while the axis owner still holds.
+  // Drag ends while the swipe owner still holds.
   held.delete('drag');
   assert.equal(stripSnapDisabled(held), true);
-  assert.equal(stripRebaseSuppressed(held), false);
+  assert.equal(stripRebaseSuppressed(held), true);
 
   // Last owner releases → snap re-engages.
-  held.delete('axis');
+  held.delete('swipe');
   assert.equal(stripSnapDisabled(held), false);
   assert.equal(stripRebaseSuppressed(held), false);
 });
@@ -435,56 +440,212 @@ test('strip lock: empty set means snap enabled and no suppression', () => {
 
 // ── classifyScrollAxis ──────────────────────────────────────────────────
 
-test('classifyScrollAxis: pending until the slop is exceeded', () => {
+test('classifyScrollAxis: the dead zone moves nothing sideways', () => {
   assert.equal(classifyScrollAxis(0, 0), 'pending');
   assert.equal(classifyScrollAxis(4, -3), 'pending');
-  // Exactly at the slop is still pending: the gesture has not moved enough.
-  assert.equal(classifyScrollAxis(SCROLL_AXIS_SLOP, 0), 'pending');
-  assert.equal(classifyScrollAxis(0, SCROLL_AXIS_SLOP), 'pending');
-  assert.equal(
-    classifyScrollAxis(SCROLL_AXIS_SLOP, SCROLL_AXIS_SLOP),
-    'pending',
-  );
+  // One pixel under the deliberate threshold: still nothing.
+  assert.equal(classifyScrollAxis(SCROLL_X_THRESHOLD_PX - 1, 0), 'pending');
+  assert.equal(classifyScrollAxis(-(SCROLL_X_THRESHOLD_PX - 1), 0), 'pending');
+  // Exactly at the threshold with no vertical component is a swipe.
+  assert.equal(classifyScrollAxis(SCROLL_X_THRESHOLD_PX, 0), 'x');
 });
 
-test('classifyScrollAxis: pure vertical commits to y', () => {
-  assert.equal(classifyScrollAxis(0, 24), 'y');
+test('classifyScrollAxis: horizontal must also dominate 2:1', () => {
+  // Long but diagonal: a time scroll that drifted, not a day pager.
+  assert.equal(classifyScrollAxis(60, 30), 'y');
+  assert.equal(classifyScrollAxis(-60, 30), 'y');
+  // Just past 2:1 goes x.
+  assert.equal(classifyScrollAxis(60, 29), 'x');
+  assert.equal(classifyScrollAxis(-60, -29), 'x');
+  // An exact 2:1 tie stays on the day-preserving side.
+  assert.equal(classifyScrollAxis(96, 48), 'y');
+  assert.equal(classifyScrollAxis(97, 48), 'x');
+});
+
+test('classifyScrollAxis: vertical commits past the slop', () => {
+  // Exactly at the slop is still pending: no axis has been claimed yet.
+  assert.equal(classifyScrollAxis(0, SCROLL_Y_SLOP_PX), 'pending');
+  assert.equal(classifyScrollAxis(0, SCROLL_Y_SLOP_PX + 1), 'y');
   assert.equal(classifyScrollAxis(0, -24), 'y');
-});
-
-test('classifyScrollAxis: diagonal 1:1 commits to y', () => {
+  // 1:1 and steeper diagonals are vertical.
   assert.equal(classifyScrollAxis(12, 12), 'y');
   assert.equal(classifyScrollAxis(40, 40), 'y');
 });
 
-test('classifyScrollAxis: just under 2:1 stays vertical, past it goes x', () => {
-  assert.equal(classifyScrollAxis(19, 10), 'y');
-  assert.equal(classifyScrollAxis(21, 10), 'x');
-});
-
-test('classifyScrollAxis: an exact 2:1 tie stays vertical', () => {
-  // 2:1 is the boundary; `>` keeps the tie on the day-preserving side.
-  assert.equal(classifyScrollAxis(20, 10), 'y');
-  assert.equal(classifyScrollAxis(160, 80), 'y');
+test('classifyScrollAxis: diagonal under the horizontal threshold stays pending', () => {
+  // Sideways-ish, but not enough to be a deliberate swipe and not vertical
+  // enough to be locked out: the strip waits.
+  assert.equal(classifyScrollAxis(30, 11), 'pending');
+  assert.equal(classifyScrollAxis(-30, -11), 'pending');
+  assert.equal(classifyScrollAxis(40, 9), 'pending');
 });
 
 test('classifyScrollAxis: negative deltas are symmetric', () => {
-  assert.equal(classifyScrollAxis(-21, -10), 'x');
-  assert.equal(classifyScrollAxis(-19, -10), 'y');
-  assert.equal(classifyScrollAxis(21, -10), 'x');
-  assert.equal(classifyScrollAxis(-21, 10), 'x');
-  assert.equal(classifyScrollAxis(-12, 12), 'y');
+  assert.equal(classifyScrollAxis(-SCROLL_X_THRESHOLD_PX, 0), 'x');
+  assert.equal(classifyScrollAxis(SCROLL_X_THRESHOLD_PX, 0), 'x');
+  assert.equal(classifyScrollAxis(-60, 20), 'x');
+  assert.equal(classifyScrollAxis(60, -20), 'x');
+  assert.equal(classifyScrollAxis(60, -30), 'y');
   assert.equal(classifyScrollAxis(0, -30), 'y');
 });
 
-test('classifyScrollAxis: custom slop', () => {
-  // Smaller slop: below it still pending, above it classified as usual.
-  assert.equal(classifyScrollAxis(2, 2, 2), 'pending');
-  assert.equal(classifyScrollAxis(3, 3, 2), 'y');
-  // Larger slop keeps a small move pending.
-  assert.equal(classifyScrollAxis(3, 3, 8), 'pending');
-  assert.equal(classifyScrollAxis(5, 2, 4), 'x');
-  assert.equal(classifyScrollAxis(2, 8, 6), 'y');
+test('classifyScrollAxis: custom thresholds', () => {
+  // A smaller x threshold pages sooner; the y slop is unchanged.
+  assert.equal(classifyScrollAxis(20, 0, 20), 'x');
+  assert.equal(classifyScrollAxis(19, 0, 20), 'pending');
+  // A larger y slop keeps small vertical moves pending.
+  assert.equal(classifyScrollAxis(0, 12, SCROLL_X_THRESHOLD_PX, 20), 'pending');
+  assert.equal(classifyScrollAxis(0, 21, SCROLL_X_THRESHOLD_PX, 20), 'y');
+  // Both custom: 10px across clears a 10px threshold at 3:1.
+  assert.equal(classifyScrollAxis(10, 3, 10, 5), 'x');
+});
+
+// ── swipeVelocity ───────────────────────────────────────────────────────
+
+test('swipeVelocity: only the last window of movement counts', () => {
+  const samples = [
+    { t: 0, x: 0 }, // slow start, outside the 100ms window
+    { t: 400, x: 20 },
+    { t: 460, x: 60 },
+    { t: 500, x: 80 },
+  ];
+  // (400, 20) → (500, 80): 60px over 100ms.
+  assert.ok(Math.abs(swipeVelocity(samples) - 0.6) < 1e-9);
+  assert.equal(SWIPE_VELOCITY_WINDOW_MS, 100);
+});
+
+test('swipeVelocity: needs movement inside the window', () => {
+  assert.equal(swipeVelocity([]), 0);
+  assert.equal(swipeVelocity([{ t: 10, x: 100 }]), 0);
+  // Came to rest before lifting: the newest sample repeats the same x.
+  assert.equal(
+    swipeVelocity([
+      { t: 0, x: 0 },
+      { t: 50, x: 80 },
+      { t: 600, x: 80 },
+    ]),
+    0,
+  );
+  // A single timestamp can never yield a speed.
+  assert.equal(
+    swipeVelocity([
+      { t: 500, x: 0 },
+      { t: 500, x: 40 },
+    ]),
+    0,
+  );
+});
+
+test('swipeVelocity: a short window still uses its oldest included sample', () => {
+  const samples = [
+    { t: 0, x: 0 },
+    { t: 80, x: 10 },
+    { t: 90, x: 30 },
+  ];
+  // 50ms window: (80, 10) → (90, 30) = 20px / 10ms.
+  assert.ok(Math.abs(swipeVelocity(samples, 50) - 2) < 1e-9);
+});
+
+// ── swipeTargetIndex ────────────────────────────────────────────────────
+
+const SWIPE_BASE = {
+  startIdx: 7,
+  scrollLeft: 700,
+  velocity: 0,
+  colW: 100,
+  periodLength: 7,
+  maxIdx: 14,
+};
+
+test('swipeTargetIndex: a slow drag rounds to the nearest column', () => {
+  assert.equal(swipeTargetIndex({ ...SWIPE_BASE, scrollLeft: 740 }), 7);
+  assert.equal(swipeTargetIndex({ ...SWIPE_BASE, scrollLeft: 760 }), 8);
+  assert.equal(swipeTargetIndex({ ...SWIPE_BASE, scrollLeft: 640 }), 6);
+  // Under the flick speed the projection is tiny: still just rounding, no
+  // extra column.
+  assert.equal(
+    swipeTargetIndex({ ...SWIPE_BASE, scrollLeft: 700, velocity: 0.01 }),
+    7,
+  );
+});
+
+test('swipeTargetIndex: a flick steps one column, finger right → earlier day', () => {
+  // Day view: one column fills the viewport, so the projection (250ms of
+  // coasting) can still round back to the start column.
+  const dayView = {
+    startIdx: 7,
+    scrollLeft: 7 * 400,
+    velocity: 0,
+    colW: 400,
+    periodLength: 1,
+    maxIdx: 14,
+  };
+  assert.ok(SWIPE_PROJECTION_MS * SWIPE_FLICK_VELOCITY < 400);
+  assert.equal(
+    swipeTargetIndex({ ...dayView, velocity: SWIPE_FLICK_VELOCITY }),
+    6,
+  );
+  assert.equal(
+    swipeTargetIndex({ ...dayView, velocity: -SWIPE_FLICK_VELOCITY }),
+    8,
+  );
+  // A projected column that already differs is not stepped further.
+  assert.equal(swipeTargetIndex({ ...dayView, scrollLeft: 8 * 400 }), 8);
+});
+
+test('swipeTargetIndex: clamps to one period from the start column', () => {
+  // A hard fling projects 250ms × 5px/ms = 1250px = 12.5 columns.
+  assert.equal(swipeTargetIndex({ ...SWIPE_BASE, velocity: -5 }), 14);
+  assert.equal(swipeTargetIndex({ ...SWIPE_BASE, velocity: 5 }), 0);
+  // Short views move at most their own length.
+  assert.equal(
+    swipeTargetIndex({
+      ...SWIPE_BASE,
+      periodLength: 3,
+      velocity: -5,
+    }),
+    10,
+  );
+});
+
+test('swipeTargetIndex: clamps to the rendered strip edges', () => {
+  // Near the right edge: a fling cannot run past the last full period.
+  assert.equal(
+    swipeTargetIndex({
+      startIdx: 13,
+      scrollLeft: 1300,
+      velocity: -5,
+      colW: 100,
+      periodLength: 7,
+      maxIdx: 14,
+    }),
+    14,
+  );
+  // Near the left edge: nothing before column 0.
+  assert.equal(
+    swipeTargetIndex({
+      startIdx: 2,
+      scrollLeft: 200,
+      velocity: 5,
+      colW: 100,
+      periodLength: 7,
+      maxIdx: 14,
+    }),
+    0,
+  );
+});
+
+// ── classifyWheelAxis ───────────────────────────────────────────────────
+
+test('classifyWheelAxis: keeps the pre-swipe 8px slop for bursts', () => {
+  assert.equal(WHEEL_AXIS_SLOP, 8);
+  assert.equal(classifyWheelAxis(4, 8), 'pending');
+  assert.equal(classifyWheelAxis(5, 10), 'y');
+  assert.equal(classifyWheelAxis(21, 10), 'x');
+  // A deliberate touch threshold must not leak into the wheel burst.
+  assert.equal(classifyWheelAxis(60, 0), 'x');
+  assert.equal(classifyScrollAxis(60, 0), 'x');
+  assert.equal(classifyWheelAxis(0, 11), 'y', 'wheel commits long before 48px');
 });
 
 // ── wheelDeltaPx ────────────────────────────────────────────────────────
