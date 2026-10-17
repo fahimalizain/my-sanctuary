@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  anchorHoursAt,
   clampHourHeight,
   hourHAfterZoom,
   hourLabelStep,
@@ -10,7 +11,7 @@ import {
   pinchDistance,
   pinchMidpointY,
   pinchScale,
-  scrollDeltaForHourZoom,
+  scrollTopForAnchor,
   yInHoursArea,
   zoomFactorFromWheel,
 } from './calendar-zoom';
@@ -56,25 +57,54 @@ test('hourHAfterZoom: factor 0 / NaN → clamp(current)', () => {
   assert.equal(hourHAfterZoom(300, NaN), 208);
 });
 
-// ── scrollDeltaForHourZoom ──────────────────────────────────────────────
+// ── anchorHoursAt ───────────────────────────────────────────────────────
 
-test('scrollDeltaForHourZoom: zoom in doubles scroll under cursor', () => {
-  // old=48, new=96, y=240 → 240 * (2 - 1) = 240
-  assert.equal(scrollDeltaForHourZoom(48, 96, 240), 240);
+test('anchorHoursAt: time under the pointer at the painted hourH', () => {
+  // clientY=200, rectTop=100, scrollTop=50, header=40 → y=110; 110/48 hours
+  assert.equal(anchorHoursAt(200, 100, 50, 40, 48), 110 / 48);
+  // Same point at double the scale → half the hours.
+  assert.equal(anchorHoursAt(200, 100, 50, 40, 96), 110 / 96);
 });
 
-test('scrollDeltaForHourZoom: zoom out halves scroll under cursor', () => {
-  // old=96, new=48, y=240 → 240 * (0.5 - 1) = -120
-  assert.equal(scrollDeltaForHourZoom(96, 48, 240), -120);
+test('anchorHoursAt: above the hours area is a negative time', () => {
+  // Pointer over the sticky headers/all-day band: y=110-140=-30.
+  assert.equal(anchorHoursAt(110, 100, 0, 40, 48), -30 / 48);
 });
 
-test('scrollDeltaForHourZoom: bad inputs → 0', () => {
-  assert.equal(scrollDeltaForHourZoom(0, 96, 240), 0);
-  assert.equal(scrollDeltaForHourZoom(48, 0, 240), 0);
-  assert.equal(scrollDeltaForHourZoom(-1, 96, 240), 0);
-  assert.equal(scrollDeltaForHourZoom(48, NaN, 240), 0);
-  assert.equal(scrollDeltaForHourZoom(48, 96, NaN), 0);
-  assert.equal(scrollDeltaForHourZoom(NaN, 96, 240), 0);
+test('anchorHoursAt: bad inputs → 0', () => {
+  assert.equal(anchorHoursAt(200, 100, 50, 40, 0), 0);
+  assert.equal(anchorHoursAt(200, 100, 50, 40, -48), 0);
+  assert.equal(anchorHoursAt(200, 100, 50, 40, NaN), 0);
+  assert.equal(anchorHoursAt(NaN, 100, 50, 40, 48), 0);
+  assert.equal(anchorHoursAt(200, NaN, 50, 40, 48), 0);
+  assert.equal(anchorHoursAt(200, 100, NaN, 40, 48), 0);
+  assert.equal(anchorHoursAt(200, 100, 50, NaN, 48), 0);
+  assert.equal(anchorHoursAt(200, 100, Infinity, 40, 48), 0);
+});
+
+// ── scrollTopForAnchor ──────────────────────────────────────────────────
+
+test('scrollTopForAnchor: keeps the anchored time under the same offset', () => {
+  // Zoom 48 → 96 under a pointer 100px into the scroller: the anchored time
+  // scales with the grid, so scrollTop grows with it.
+  // 40 + (110/48) * 96 - 100 = 160
+  assert.equal(scrollTopForAnchor(110 / 48, 96, 40, 100), 160);
+  // Round trip: same pointer, new hourH, scrollTop from the helper → same time.
+  const scrollTop = scrollTopForAnchor(110 / 48, 96, 40, 100);
+  assert.equal(anchorHoursAt(200, 100, scrollTop, 40, 96), 110 / 48);
+});
+
+test('scrollTopForAnchor: clamps at 0', () => {
+  // Zoomed out far above the anchor: the browser cannot scroll past the top.
+  assert.equal(scrollTopForAnchor(0, 48, 40, 200), 0);
+});
+
+test('scrollTopForAnchor: bad inputs → 0', () => {
+  assert.equal(scrollTopForAnchor(NaN, 48, 40, 100), 0);
+  assert.equal(scrollTopForAnchor(1, NaN, 40, 100), 0);
+  assert.equal(scrollTopForAnchor(1, 48, NaN, 100), 0);
+  assert.equal(scrollTopForAnchor(1, 48, 40, NaN), 0);
+  assert.equal(scrollTopForAnchor(1, Infinity, 40, 100), 0);
 });
 
 // ── hourLabelStep ───────────────────────────────────────────────────────
