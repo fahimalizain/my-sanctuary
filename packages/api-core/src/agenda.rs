@@ -14,12 +14,16 @@
 //! - `GET /api/agenda?from=&to=` is a **pure range read** of the infinite day
 //!   stream (slice 1 of the agenda revamp): it ensures no occurrence and
 //!   writes no agenda row, even when living routines' rules cover the window.
-//!   Both bounds omitted reads the **anchor week** (`anchor_date …
-//!   anchor_date + 6`, 7 inclusive days) where `anchor_date` is the oldest
-//!   past date holding a pending item, else today; exactly one bound → 400;
-//!   an inclusive span above 31 days → 400. The response carries `from`/`to`
-//!   (resolved, never the raw query), `anchor_date`, and `earliest_date`
-//!   (`MIN(local_date)` over every row, the back-scroll floor).
+//!   Both bounds omitted reads `anchor_date … today+6` — **no 31-day cap** —
+//!   where `anchor_date` is the oldest past date holding a pending item, else
+//!   today, plus the `backlog` array holding every row past `today+6`
+//!   (ADR 0007: dated rows in stream order, then `OPEN` tasks in Board order);
+//!   exactly one bound → 400; an explicit window is **history only** — an
+//!   inclusive span above 31 days → 400 and it must end strictly before
+//!   `anchor_date` (400 `history must end before the anchor`) with an empty
+//!   `backlog`. The response carries `from`/`to` (resolved, never the raw
+//!   query), `anchor_date`, and `earliest_date` (`MIN(local_date)` over every
+//!   row, the back-scroll floor).
 //!   Materializing occurrences is the occurrence fill's job, never a GET's.
 //! - The response omits occurrence items whose routine is missing and task
 //!   items whose task is missing/soft-deleted; the orphan membership rows
@@ -195,7 +199,8 @@ impl From<crate::categories::CategoriesError> for AgendaError {
 }
 
 /// Response envelope for `GET /api/agenda` — a window of the infinite day
-/// stream plus the server-computed civil today (ADR 0004 amendment): `today`
+/// stream, the backlog past its end (ADR 0007), plus the server-computed
+/// civil today (ADR 0004 amendment): `today`
 /// is the civil date of now in the user's primary calendar `time_zone`
 /// (chrono-tz), the Home anchor the browser must not compute itself.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -220,6 +225,9 @@ pub struct AgendaResponse {
     /// (orphans and future rows included), else `today`. Independent of the
     /// requested window: the browser's back-scroll floor.
     pub earliest_date: String,
+    /// Rows with `local_date > today+6`. Empty on a history read.
+    /// Dated rows (`< today+10y`) first, then `OPEN` tasks in Board order.
+    pub backlog: Vec<AgendaItemView>,
 }
 
 /// Response envelope for `POST /api/agenda/items/:id/move` and
@@ -316,6 +324,11 @@ pub struct OccurrenceView {
 // GET /api/agenda — a pure range read of the day stream
 // ──────────────────────────────────────────
 
+/// Inclusive ceiling of the backlog range read. Every civil date we store is
+/// `YYYY-MM-DD` with a 4-digit year and the backlog date is today+50y, so this
+/// bound sorts past the whole backlog region (ADR 0007).
+const BACKLOG_RANGE_TO: &str = "9999-12-31";
+
 /// The user's **one civil today** (ADR 0004 amendment): the civil date of
 /// `now_unix` in the **primary Google calendar's IANA `time_zone`**
 /// (chrono-tz, DST-aware), plus that zone name. No primary calendar (or no
@@ -340,7 +353,7 @@ pub(crate) async fn user_today(
 
 /// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` →
 /// `{"items":[…],"from":…,"to":…,"today":…,"time_zone":…,"anchor_date":…,
-/// "earliest_date":…}`.
+/// "earliest_date":…,"backlog":[…]}`.
 ///
 /// A **pure read** (ADR 0004 amendment, infinite stream): no occurrence is
 /// ensured and no agenda row is written — not even when a living routine's
@@ -348,10 +361,20 @@ pub(crate) async fn user_today(
 /// job, never a GET's.
 ///
 /// Window resolution (trim first; empty/whitespace counts as omitted):
-/// - both omitted → the **anchor week**: `from = anchor_date`, `to =
-///   from + 6` civil days (7 inclusive days);
-/// - both present → the inclusive range; `to < from` is a 400, and an
-///   inclusive span above 31 days is a 400;
+/// - both omitted → the **default read** (ADR 0007): `from = anchor_date`,
+///   `to = today + 6` civil days, with **no 31-day cap** — the window runs
+///   back to the anchor even when that is more than 31 days. `backlog`
+///   carries the rows past `today+6` in two stretches: dated rows
+///   (`local_date < today+10y`) in stream order, then `OPEN` tasks at or past
+///   the horizon in **Board order** (`tasks.sort_order`, ties by task id). A
+///   `PLANNED`/`IN_PROGRESS` row still sitting at or past the horizon (the
+///   self-heal has not run) is omitted until the next tick — the accepted
+///   misplacement window, not a third stretch;
+/// - both present → **history only**: the inclusive range; `to < from` is a
+///   400, an inclusive span above 31 days is a 400 (checked before the anchor
+///   rule), and `to >= anchor_date` is a 400 `history must end before the
+///   anchor` — there is no forward page. `backlog` is empty and the backlog
+///   region is never queried;
 /// - exactly one present → 400 "both or neither";
 /// - a non-empty value that is not `YYYY-MM-DD` → 400.
 ///
@@ -361,13 +384,16 @@ pub(crate) async fn user_today(
 /// by one repo query, never by loading history. `earliest_date` is
 /// `MIN(local_date)` over every agenda row of the user (orphans and future
 /// rows included), else today — the browser's back-scroll floor, independent
-/// of this page.
+/// of this page. A backlog row is never in the past, so it can pin neither
+/// the anchor nor the floor.
 ///
-/// Hydration is batched: one `list_by_user_and_date_range` page read, one
-/// `list_by_ids` for the page's occurrences, `list_by_user_id` for living
-/// tasks/routines, and `list_by_ids_including_deleted` only for routine ids
-/// missing from the living set. Soft-deleted tasks and orphan/unknown-kind
-/// rows are omitted while their membership rows stay in D1. A deleted
+/// Hydration is batched: one `list_by_user_and_date_range` page read for the
+/// stream (plus exactly one more for the backlog region on the default read),
+/// one `list_by_ids` resolving the occurrences of the window AND the backlog
+/// together, `list_by_user_id` for living tasks/routines, and
+/// `list_by_ids_including_deleted` only for routine ids missing from the
+/// living set. Soft-deleted tasks and orphan/unknown-kind rows are omitted
+/// from both arrays while their membership rows stay in D1. A deleted
 /// routine's `done | skipped` occurrence still renders (with
 /// `routine_deleted: true`, borrowing the routine's title/estimate/blob);
 /// its `pending | in_progress` leftovers are omitted.
@@ -396,27 +422,43 @@ pub async fn get_agenda(
         .oldest_pending_local_date_before(user_id, &today)
         .await?
         .unwrap_or_else(|| today.clone());
-    let (from, to) = resolve_window(from, to, &anchor_date)?;
+    let (from, to, history) = resolve_window(from, to, &anchor_date, &today)?;
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
 
-    // One page read for the whole window; the repo owns the stream order.
+    // One page read for the whole stream window; the repo owns the order.
     let items = agenda_repo
         .list_by_user_and_date_range(user_id, &from, &to)
         .await?;
+    // The default read also loads the backlog region — everything past
+    // today+6 (the stream's end, so the query starts the next day). A history
+    // page is strictly before the anchor and never looks there: the backlog
+    // query is skipped outright, not filtered out afterwards.
+    let backlog_rows = if history {
+        Vec::new()
+    } else {
+        let backlog_from = add_civil_days(&to, 1)?;
+        agenda_repo
+            .list_by_user_and_date_range(user_id, &backlog_from, BACKLOG_RANGE_TO)
+            .await?
+    };
     // The back-scroll floor is page-independent: ALL of the user's rows.
     let earliest_date = agenda_repo
         .min_local_date(user_id)
         .await?
         .unwrap_or_else(|| today.clone());
 
-    let mut views = Vec::with_capacity(items.len());
-    if !items.is_empty() {
+    let mut views: Vec<AgendaItemView> = Vec::new();
+    let mut backlog: Vec<AgendaItemView> = Vec::new();
+    if !items.is_empty() || !backlog_rows.is_empty() {
         let user_tasks = task_repo.list_by_user_id(user_id).await?;
         let tasks: HashMap<&str, &Task> =
             user_tasks.iter().map(|task| (task.id.as_str(), task)).collect();
 
+        // The window and the backlog resolve their occurrences together:
+        // ONE `list_by_ids` for both arrays, never one batch per array.
         let occurrence_ids: Vec<String> = items
             .iter()
+            .chain(backlog_rows.iter())
             .filter(|item| item.kind == AGENDA_KIND_OCCURRENCE)
             .map(|item| item.ref_id.clone())
             .collect();
@@ -432,14 +474,14 @@ pub async fn get_agenda(
 
         // Living routines first; only the ids missing from that set are
         // fetched again INCLUDING soft-deleted rows — a read never loads
-        // every deleted routine up front.
+        // every deleted routine up front. The sweep covers BOTH arrays.
         let living_routines = routine_repo.list_by_user_id(user_id).await?;
         let living_ids: HashSet<&str> = living_routines
             .iter()
             .map(|routine| routine.id.as_str())
             .collect();
         let mut missing: HashSet<&str> = HashSet::new();
-        for item in &items {
+        for item in items.iter().chain(backlog_rows.iter()) {
             if item.kind != AGENDA_KIND_OCCURRENCE {
                 continue;
             }
@@ -468,31 +510,26 @@ pub async fn get_agenda(
             .map(|routine| (routine.id.as_str(), routine))
             .collect();
 
-        for item in &items {
+        // One row → one view (or none), shared by the stream and the backlog.
+        let hydrate = |item: &AgendaItem| -> Option<AgendaItemView> {
             let (task, occurrence) = match item.kind.as_str() {
                 AGENDA_KIND_TASK => {
                     // `list_by_user_id` filters soft-deleted tasks — a
                     // deleted/missing task omits the whole item (orphan
                     // membership rows stay in D1).
-                    let Some(task) = tasks.get(item.ref_id.as_str()) else {
-                        continue;
-                    };
+                    let task = tasks.get(item.ref_id.as_str())?;
                     (Some(task_view(task, &taxonomy, focused_task_id)), None)
                 }
                 AGENDA_KIND_OCCURRENCE => {
-                    let Some(occ) = occurrences.get(item.ref_id.as_str()) else {
-                        continue;
-                    };
+                    let occ = occurrences.get(item.ref_id.as_str())?;
                     // Never leak another user's occurrence through a
                     // hand-edited row.
                     if occ.user_id != item.user_id {
-                        continue;
+                        return None;
                     }
                     // Missing entirely (row gone) → omit; a soft-deleted
                     // routine is still resolvable through the history batch.
-                    let Some(routine) = routines_by_id.get(occ.routine_id.as_str()) else {
-                        continue;
-                    };
+                    let routine = routines_by_id.get(occ.routine_id.as_str())?;
                     let routine_deleted = routine.deleted_at.is_some();
                     // A deleted routine's live leftovers are noise; its
                     // done/skipped history still renders for the record.
@@ -502,15 +539,15 @@ pub async fn get_agenda(
                             OCCURRENCE_STATUS_DONE | OCCURRENCE_STATUS_SKIPPED
                         )
                     {
-                        continue;
+                        return None;
                     }
                     let mut view = occurrence_view(occ, routine, &taxonomy);
                     view.routine_deleted = routine_deleted;
                     (None, Some(view))
                 }
-                _ => continue,
+                _ => return None,
             };
-            views.push(AgendaItemView {
+            Some(AgendaItemView {
                 id: item.id.clone(),
                 user_id: item.user_id.clone(),
                 local_date: item.local_date.clone(),
@@ -519,8 +556,17 @@ pub async fn get_agenda(
                 sort_order: item.sort_order,
                 task,
                 occurrence,
-            });
-        }
+            })
+        };
+
+        views = items.iter().filter_map(|item| hydrate(item)).collect();
+        backlog = split_backlog(
+            backlog_rows
+                .iter()
+                .filter_map(|item| hydrate(item))
+                .collect(),
+            &today,
+        )?;
     }
     Ok(AgendaResponse {
         items: views,
@@ -530,25 +576,38 @@ pub async fn get_agenda(
         time_zone,
         anchor_date,
         earliest_date,
+        backlog,
     })
 }
 
 /// Resolves the requested inclusive window under the stream contract: trim
 /// first, empty/whitespace = omitted, both-or-neither, `YYYY-MM-DD` only,
-/// `to >= from`, and at most 31 inclusive days. Both omitted → the anchor
-/// week (`anchor_date … anchor_date + 6`).
+/// `to >= from`, and at most 31 inclusive days.
+///
+/// Both omitted → the **default read** (ADR 0007): `from = anchor_date`, `to
+/// = today + 6` civil days, with **no 31-day cap** (the anchor is always
+/// `<= today`, so `from <= to`). Both present → a **history** window: the
+/// span check runs **before** the anchor check, so an overlong window that
+/// also sticks out past the anchor still reports the span error, and a window
+/// that ends on/after `anchor_date` is a 400 `history must end before the
+/// anchor` — there is no forward page, the stream ends at `today+6`.
+///
+/// The returned flag is `history`: `false` for the default read (which also
+/// loads the `backlog` array), `true` for an explicit window (whose `backlog`
+/// stays empty).
 fn resolve_window(
     from: Option<&str>,
     to: Option<&str>,
     anchor_date: &str,
-) -> Result<(String, String), AgendaError> {
+    today: &str,
+) -> Result<(String, String, bool), AgendaError> {
     let from = from.map(str::trim).filter(|value| !value.is_empty());
     let to = to.map(str::trim).filter(|value| !value.is_empty());
     match (from, to) {
         (None, None) => {
             let from = parse_date(anchor_date)?;
-            let to = add_civil_days(&from, 6)?;
-            Ok((from, to))
+            let to = add_civil_days(today, 6)?;
+            Ok((from, to, false))
         }
         (Some(from), Some(to)) => {
             let from = parse_date(from)?;
@@ -566,12 +625,66 @@ fn resolve_window(
                     "date range must not exceed 31 days".to_string(),
                 ));
             }
-            Ok((from, to))
+            // An explicit window is history only: it may not reach into the
+            // default stream, which already runs through today+6 — and the
+            // anchor day itself is in that stream.
+            if to.as_str() >= anchor_date {
+                return Err(AgendaError::Invalid(
+                    "history must end before the anchor".to_string(),
+                ));
+            }
+            Ok((from, to, true))
         }
         _ => Err(AgendaError::Invalid(
             "from and to must both be set or both be omitted".to_string(),
         )),
     }
+}
+
+/// Splits the **backlog** rows into the response order (ADR 0007): the dated
+/// stretch first — every row before the 10-year line, kept in the range
+/// query's order (`local_date`, `sort_order`, `created_at`, the repo's
+/// contract, never re-sorted here; a not-yet-healed `OPEN` row on a real
+/// future day belongs to this stretch and the self-heal moves it later) —
+/// then the `OPEN` tasks at or past the horizon in **Board order**
+/// (`tasks.sort_order`, ties by task id — deliberately not the agenda row's
+/// rank, so Home and the Board share one order).
+///
+/// Everything else at or past the horizon is dropped: a `PLANNED` /
+/// `IN_PROGRESS` row still sitting on the backlog date (the self-heal has not
+/// run yet) and any occurrence out there are absent until the next tick. That
+/// is the accepted misplacement window, not a third stretch.
+fn split_backlog(
+    rows: Vec<AgendaItemView>,
+    today: &str,
+) -> Result<Vec<AgendaItemView>, AgendaError> {
+    let horizon = planning_horizon_date(today)?;
+    let mut dated: Vec<AgendaItemView> = Vec::new();
+    let mut board: Vec<AgendaItemView> = Vec::new();
+    for row in rows {
+        if row.local_date.as_str() < horizon.as_str() {
+            dated.push(row);
+            continue;
+        }
+        let open_task = row.kind == AGENDA_KIND_TASK
+            && row.task.as_ref().is_some_and(|task| task.status == "OPEN");
+        if open_task {
+            board.push(row);
+        }
+    }
+    board.sort_by(|a, b| {
+        let board_rank = |row: &AgendaItemView| {
+            row.task
+                .as_ref()
+                .map(|task| task.sort_order)
+                .unwrap_or_default()
+        };
+        board_rank(a)
+            .cmp(&board_rank(b))
+            .then_with(|| a.ref_id.cmp(&b.ref_id))
+    });
+    dated.extend(board);
+    Ok(dated)
 }
 
 /// Parses an already-validated `YYYY-MM-DD` into a civil date (window
@@ -2274,7 +2387,8 @@ mod tests {
 
     /// Cheap call counters on the occurrence/agenda fakes — the range-read
     /// test snapshots these to prove a read makes zero writes and uses only
-    /// the batched set reads (the range page, the anchor, the floor, and one
+    /// the batched set reads (the stream page + the backlog page on a default
+    /// read, the anchor, the floor, and one
     /// `list_by_ids`).
     #[derive(Debug, Clone, Default)]
     struct CallCounters {
@@ -4222,14 +4336,47 @@ mod tests {
         ))
     }
 
-    /// A single-day read: the same date on both ends of the window.
+    /// A single-day read. A day **before the anchor** is a legal one-day
+    /// **history** read (`to < anchor_date`). A stream day or a backlog day is
+    /// filtered out of ONE default read instead — the default read no longer
+    /// 400s for a day after the anchor, so it must not be called with an
+    /// explicit `from`/`to` (that is history only, and `to >= anchor_date`).
+    /// A non-canonical date keeps its 400 from the window parser; a day inside
+    /// the stream with no rows returns empty `items`, never a history 400.
     fn get(repos: &Repos, user_id: &str, date: &str) -> Result<AgendaResponse, AgendaError> {
-        get_range(repos, user_id, Some(date), Some(date))
+        let Ok(canonical) = parse_date(date) else {
+            return get_range(repos, user_id, Some(date), Some(date));
+        };
+        let full = get_default(repos, user_id)?;
+        if canonical.as_str() < full.anchor_date.as_str() {
+            return get_range(repos, user_id, Some(date), Some(date));
+        }
+        let mut items: Vec<AgendaItemView> = full
+            .items
+            .iter()
+            .filter(|item| item.local_date == canonical)
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            // A rescheduled row past today+6 comes back from `backlog`, not
+            // from the stream.
+            items = full
+                .backlog
+                .iter()
+                .filter(|item| item.local_date == canonical)
+                .cloned()
+                .collect();
+        }
+        Ok(AgendaResponse {
+            items,
+            backlog: Vec::new(),
+            ..full
+        })
     }
 
     /// `GET /api/agenda` with both bounds **omitted** — the server resolves
-    /// the anchor week (the fake primary calendar is UTC, so `NOW_UNIX` is
-    /// `2026-08-23`).
+    /// `anchor_date … today+6` (the fake primary calendar is UTC, so
+    /// `NOW_UNIX` is `2026-08-23`, i.e. `today+6` is `2026-08-29`).
     fn get_default(repos: &Repos, user_id: &str) -> Result<AgendaResponse, AgendaError> {
         get_range(repos, user_id, None, None)
     }
@@ -4754,23 +4901,32 @@ mod tests {
     }
 
     #[test]
-    fn get_agenda_without_bounds_reads_the_anchor_week() {
+    fn get_agenda_without_bounds_reads_through_today_plus_six() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
-        // Both bounds omitted → the anchor week (2026-08-23 in the UTC
-        // primary calendar at NOW_UNIX). Nothing was materialized: a GET is a
-        // pure read, so the window is empty and the anchor falls back to today.
+        // Both bounds omitted → `anchor_date … today+6` (2026-08-23 in the UTC
+        // primary calendar at NOW_UNIX, and the anchor falls back to today with
+        // nothing pending in the past, so the two coincide here). Nothing was
+        // materialized: a GET is a pure read, so the window is empty.
         let response = get_default(&repos, "u-1").unwrap();
         assert!(
             response.items.is_empty(),
             "a read never materializes occurrences"
         );
+        assert!(
+            response.backlog.is_empty(),
+            "nothing is parked past today+6 either"
+        );
+        // The array is always serialized, even empty (never
+        // `skip_serializing_if`).
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["backlog"], serde_json::json!([]));
         assert_eq!(response.today, "2026-08-23");
         assert_eq!(response.time_zone, "UTC");
         assert_eq!(response.anchor_date, "2026-08-23");
         assert_eq!(response.from, "2026-08-23");
-        assert_eq!(response.to, "2026-08-29", "7 inclusive days");
+        assert_eq!(response.to, "2026-08-29", "today+6, 7 inclusive days");
         assert_eq!(response.earliest_date, "2026-08-23", "no rows → today");
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 0);
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), 0);
@@ -4780,6 +4936,228 @@ mod tests {
         assert_eq!(blank_with_from.from, "2026-08-23");
         let blank_with_to = get_range(&repos, "u-1", Some(""), Some("  ")).unwrap();
         assert_eq!(blank_with_to.to, "2026-08-29");
+    }
+
+    #[test]
+    fn get_agenda_default_window_runs_back_to_the_anchor_with_no_31_day_cap() {
+        let repos = repos();
+        // A living PLANNED task on a real past day pins the anchor. The
+        // default window starts there and runs through today+6 — far more than
+        // the 31 inclusive days a history read is capped at.
+        repos.tasks.push(task_row("t-june", "u-1", "June | Work", "PLANNED"));
+        agenda_row(&repos, "ai-june", "u-1", "2026-06-01", AGENDA_KIND_TASK, "t-june", 0);
+        // An OPEN task parked on the backlog date is past today+6: a backlog
+        // row, never a stream row, and never the anchor.
+        repos.tasks.push(task_row("t-open", "u-1", "Open | Work", "OPEN"));
+        agenda_row(&repos, "ai-open", "u-1", "2076-08-23", AGENDA_KIND_TASK, "t-open", 0);
+
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.today, "2026-08-23");
+        assert_eq!(response.anchor_date, "2026-06-01");
+        assert_eq!(response.from, "2026-06-01");
+        assert_eq!(response.to, "2026-08-29", "today+6, not anchor+6");
+        let span_days = civil_date(&response.to)
+            .unwrap()
+            .signed_duration_since(civil_date(&response.from).unwrap())
+            .num_days();
+        assert_eq!(span_days, 89, "the default window has no 31-day cap");
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-june"],
+            "the June row is inside the stream"
+        );
+        assert_eq!(
+            response
+                .backlog
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-open"],
+            "the parked OPEN task is backlog, not stream"
+        );
+        assert_eq!(
+            response.earliest_date, "2026-06-01",
+            "the floor is the June row, never the backlog date"
+        );
+    }
+
+    #[test]
+    fn get_agenda_backlog_lists_dated_rows_then_open_tasks_in_board_order() {
+        let repos = repos();
+        // Occurrence rows need a living routine, or the embed is omitted.
+        repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
+        repos.occurrences.stored.lock().unwrap().extend([
+            FakeOccurrenceRepo::row("occ-rank1", "rt-1", "u-1", "2026-08-30", OCCURRENCE_STATUS_PENDING),
+            FakeOccurrenceRepo::row("occ-rank0", "rt-1", "u-1", "2026-08-30", OCCURRENCE_STATUS_PENDING),
+        ]);
+        let push_item = |id: &str, date: &str, kind: &str, ref_id: &str, sort_order: i64, created_at: &str| {
+            repos.agenda.stored.lock().unwrap().push(AgendaItem {
+                id: id.to_string(),
+                user_id: "u-1".to_string(),
+                local_date: date.to_string(),
+                kind: kind.to_string(),
+                ref_id: ref_id.to_string(),
+                sort_order,
+                created_at: created_at.to_string(),
+                updated_at: "2026-08-23T00:00:00Z".to_string(),
+            });
+        };
+        // today+7 is the first backlog day: the dated stretch keeps the
+        // `(local_date, sort_order, created_at)` query order, so rank 0 comes
+        // back first even though its row was created later.
+        push_item(
+            "ai-occ-rank1",
+            "2026-08-30",
+            AGENDA_KIND_OCCURRENCE,
+            "occ-rank1",
+            1,
+            "2026-08-22T00:00:00Z",
+        );
+        push_item(
+            "ai-occ-rank0",
+            "2026-08-30",
+            AGENDA_KIND_OCCURRENCE,
+            "occ-rank0",
+            0,
+            "2026-08-24T00:00:00Z",
+        );
+        // A rescheduled PLANNED task on a real day, still before the horizon.
+        repos.tasks.push(task_row("t-planned", "u-1", "Planned | Work", "PLANNED"));
+        push_item("ai-planned", "2026-09-15", AGENDA_KIND_TASK, "t-planned", 0, "2026-08-23T00:00:00Z");
+        // The Board order is `tasks.sort_order`, ties by task id; the agenda
+        // rows' ranks are deliberately the reverse of it, and `t-a2`'s task
+        // row is pushed FIRST so a stable sort that forgot the id tie-break
+        // would surface it before `t-a`.
+        let open_task = |id: &str, sort_order: i64| {
+            let mut task = task_row(id, "u-1", "Open | Work", "OPEN");
+            task.sort_order = sort_order;
+            repos.tasks.push(task);
+        };
+        open_task("t-a2", 0);
+        push_item("ai-a2", "2076-08-23", AGENDA_KIND_TASK, "t-a2", 3, "2026-08-23T00:00:00Z");
+        open_task("t-a", 0);
+        push_item("ai-a", "2076-08-23", AGENDA_KIND_TASK, "t-a", 8, "2026-08-23T00:00:00Z");
+        open_task("t-b", 1);
+        push_item("ai-b", "2076-08-23", AGENDA_KIND_TASK, "t-b", 9, "2026-08-23T00:00:00Z");
+        // Exactly on the horizon (today+10y) is `>= horizon`: Board order, not
+        // the dated stretch.
+        open_task("t-horizon", 2);
+        push_item("ai-horizon", "2036-08-23", AGENDA_KIND_TASK, "t-horizon", 0, "2026-08-23T00:00:00Z");
+        // A misplaced PLANNED row on the backlog date: the self-heal has not
+        // run, so it is absent until the next tick.
+        repos.tasks.push(task_row("t-misplaced", "u-1", "Misplaced | Work", "PLANNED"));
+        push_item("ai-misplaced", "2076-08-23", AGENDA_KIND_TASK, "t-misplaced", 1, "2026-08-23T00:00:00Z");
+        // A PLANNED row exactly on today+6 is the stream's last day: `items`,
+        // never `backlog`.
+        repos.tasks.push(task_row("t-last", "u-1", "Last | Work", "PLANNED"));
+        push_item("ai-last", "2026-08-29", AGENDA_KIND_TASK, "t-last", 0, "2026-08-23T00:00:00Z");
+
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.today, "2026-08-23");
+        assert_eq!(response.anchor_date, "2026-08-23", "nothing pends in the past");
+        assert_eq!(response.from, "2026-08-23", "the stream window");
+        assert_eq!(
+            response.to, "2026-08-29",
+            "never the backlog query's bounds"
+        );
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-last"],
+            "today+6 closes the stream: no backlog row joins it"
+        );
+        assert_eq!(
+            response
+                .backlog
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "ai-occ-rank0",
+                "ai-occ-rank1",
+                "ai-planned",
+                "ai-a",
+                "ai-a2",
+                "ai-b",
+                "ai-horizon",
+            ],
+            "dated rows in stream order, then OPEN tasks in Board order"
+        );
+    }
+
+    #[test]
+    fn get_agenda_history_must_end_before_the_anchor_and_returns_no_backlog() {
+        let repos = repos();
+        // A pending PLANNED row on 2026-08-20 pins the anchor.
+        repos.tasks.push(task_row("t-past", "u-1", "Past | Work", "PLANNED"));
+        agenda_row(&repos, "ai-past", "u-1", "2026-08-20", AGENDA_KIND_TASK, "t-past", 0);
+        // A row past today+6: part of the default backlog, invisible to a
+        // history page.
+        repos.tasks.push(task_row("t-later", "u-1", "Later | Work", "PLANNED"));
+        agenda_row(&repos, "ai-later", "u-1", "2026-09-01", AGENDA_KIND_TASK, "t-later", 0);
+
+        // The anchor day itself belongs to the default stream: a one-day
+        // history page ending on it is a 400.
+        let err = get_range(&repos, "u-1", Some("2026-08-20"), Some("2026-08-20")).unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "history must end before the anchor"),
+            "{err:?}"
+        );
+
+        // The day before the anchor is a legal one-day history page.
+        repos.agenda.reset_calls();
+        let history = get_range(&repos, "u-1", Some("2026-08-19"), Some("2026-08-19")).unwrap();
+        assert_eq!(history.from, "2026-08-19");
+        assert_eq!(history.to, "2026-08-19");
+        assert_eq!(history.anchor_date, "2026-08-20");
+        assert!(
+            history.items.is_empty(),
+            "the 2026-09-01 row is not in the window"
+        );
+        assert!(
+            history.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            1,
+            "the history window is ONE read: the backlog query is never issued"
+        );
+
+        // The default read does issue it: the stream plus the backlog region.
+        repos.agenda.reset_calls();
+        let default = get_default(&repos, "u-1").unwrap();
+        assert_eq!(default.from, "2026-08-20");
+        assert_eq!(default.to, "2026-08-29");
+        assert_eq!(
+            default
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-past"]
+        );
+        assert_eq!(
+            default
+                .backlog
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ai-later"],
+            "the 2026-09-01 row is backlog on the default read"
+        );
+        assert_eq!(
+            repos.agenda.call_counts().list_by_user_and_date_range,
+            2,
+            "the default read adds the backlog query"
+        );
     }
 
     #[test]
@@ -4846,7 +5224,10 @@ mod tests {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-29")).unwrap();
+        // The default read is the read now: an explicit window must end before
+        // the anchor, and nothing pends in the past here, so the anchor is
+        // today and the stream is `2026-08-23 … 2026-08-29`.
+        let response = get_default(&repos, "u-1").unwrap();
         assert!(response.items.is_empty(), "no rows were ever written");
         assert_eq!(response.from, "2026-08-23");
         assert_eq!(response.to, "2026-08-29");
@@ -4886,7 +5267,9 @@ mod tests {
         push_item("ai-2", "2026-08-23", "t-1", 1);
         push_item("ai-3", "2026-08-23", "t-3", 0);
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-24")).unwrap();
+        // The default read (anchor … today+6) covers both days: the stream
+        // order is the repo's contract and is the same for either mode.
+        let response = get_default(&repos, "u-1").unwrap();
         let order: Vec<(&str, i64)> = response
             .items
             .iter()
@@ -4898,7 +5281,7 @@ mod tests {
             "(local_date, sort_order) order across the window"
         );
         assert_eq!(response.from, "2026-08-23");
-        assert_eq!(response.to, "2026-08-24");
+        assert_eq!(response.to, "2026-08-29");
         assert_eq!(
             response.earliest_date, "2026-08-23",
             "the min row date, not the window start"
@@ -4961,11 +5344,12 @@ mod tests {
         push_item("ai-today", "2026-08-23", AGENDA_KIND_OCCURRENCE, "occ-today");
         push_item("ai-today-task", "2026-08-23", AGENDA_KIND_TASK, "t-today");
 
-        // Both bounds omitted → the window starts at the anchor.
+        // Both bounds omitted → the window starts at the anchor and runs
+        // through today+6 (never anchor+6).
         let response = get_default(&repos, "u-1").unwrap();
         assert_eq!(response.anchor_date, "2026-08-20");
         assert_eq!(response.from, "2026-08-20");
-        assert_eq!(response.to, "2026-08-26", "anchor + 6 civil days");
+        assert_eq!(response.to, "2026-08-29", "today+6 civil days");
         assert_eq!(response.earliest_date, "2026-08-18");
     }
 
@@ -5029,8 +5413,15 @@ mod tests {
             },
         ]);
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-24")).unwrap();
-        assert!(response.items.is_empty(), "both rows are outside the window");
+        // The default read (anchor … today+6) contains neither row: the old
+        // one is before `from`, the future one is past `to` and is dropped
+        // from the backlog too (a task-kind orphan has no task to embed).
+        let response = get_default(&repos, "u-1").unwrap();
+        assert!(response.items.is_empty(), "the old row is before the window");
+        assert!(
+            response.backlog.is_empty(),
+            "the future row is an orphan, so the backlog drops it"
+        );
         assert_eq!(
             response.earliest_date, "2026-07-01",
             "the floor ignores the requested window"
@@ -5047,10 +5438,24 @@ mod tests {
             matches!(err, AgendaError::Invalid(ref m) if m == "date range must not exceed 31 days"),
             "{err:?}"
         );
-        // 31 inclusive days is valid.
-        let ok = get_range(&repos, "u-1", Some("2026-08-01"), Some("2026-08-31")).unwrap();
-        assert_eq!(ok.from, "2026-08-01");
-        assert_eq!(ok.to, "2026-08-31");
+        // 31 inclusive days is valid — as long as the window is history, i.e.
+        // it ends strictly before the anchor (2026-08-23 here, nothing pends
+        // in the past).
+        let ok = get_range(&repos, "u-1", Some("2026-07-23"), Some("2026-08-22")).unwrap();
+        assert_eq!(ok.from, "2026-07-23", "the window is echoed, not resolved");
+        assert_eq!(ok.to, "2026-08-22");
+        assert!(
+            ok.backlog.is_empty(),
+            "a history read never fills the backlog"
+        );
+
+        // A history window may not reach the anchor day itself: that day is in
+        // the default stream, not a history page.
+        let err = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-23")).unwrap_err();
+        assert!(
+            matches!(err, AgendaError::Invalid(ref m) if m == "history must end before the anchor"),
+            "{err:?}"
+        );
 
         let err = get_range(&repos, "u-1", Some("2026-08-24"), Some("2026-08-23")).unwrap_err();
         assert!(
@@ -5128,7 +5533,10 @@ mod tests {
         push_item("ai-running", "2026-08-26", AGENDA_KIND_OCCURRENCE, "occ-running");
         push_item("ai-task", "2026-08-27", AGENDA_KIND_TASK, "t-gone");
 
-        let response = get_range(&repos, "u-1", Some("2026-08-23"), Some("2026-08-29")).unwrap();
+        // The default read covers 2026-08-23 … 2026-08-29, the old explicit
+        // window. (It is no longer a legal explicit window: it ends after the
+        // anchor.)
+        let response = get_default(&repos, "u-1").unwrap();
         let ids: Vec<&str> = response.items.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -5191,7 +5599,12 @@ mod tests {
         assert_eq!(agenda.get_by_ref, 0, "no per-row get_by_ref on a read");
         assert_eq!(agenda.list_by_refs, 0, "no membership check on a read");
         assert_eq!(agenda.list_by_user_and_date, 0, "no single-date pile read");
-        assert_eq!(agenda.list_by_user_and_date_range, 1, "one window read");
+        // Two range reads now: the stream (anchor … today+6) and the backlog
+        // region (today+7 … the `9999-12-31` ceiling).
+        assert_eq!(
+            agenda.list_by_user_and_date_range, 2,
+            "the stream page + the backlog page"
+        );
         assert_eq!(agenda.min_local_date, 1, "one earliest-date read");
         assert_eq!(
             agenda.oldest_pending_local_date_before, 1,
@@ -7098,8 +7511,11 @@ mod tests {
             &repos.agenda,
             &repos.tasks,
             "u-1",
-            Some("2026-08-23"),
-            Some("2026-08-23"),
+            // Both omitted: the default read starts at the anchor, and today
+            // is in it. An explicit one-day window ending on the anchor is a
+            // history 400 now (ADR 0007).
+            None,
+            None,
             NOW_UNIX,
             Some("t-1"),
         ))

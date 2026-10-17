@@ -209,14 +209,18 @@ async fn focused_task_id(
 
 /// `GET /api/agenda?from=YYYY-MM-DD&to=YYYY-MM-DD` → 200
 /// `{"items":[...],"from":"YYYY-MM-DD","to":"YYYY-MM-DD","today":"YYYY-MM-DD",
-/// "time_zone":"IANA","anchor_date":"YYYY-MM-DD","earliest_date":"YYYY-MM-DD"}`.
+/// "time_zone":"IANA","anchor_date":"YYYY-MM-DD","earliest_date":"YYYY-MM-DD",
+/// "backlog":[...]}`.
 ///
-/// Both bounds are **optional** and must be set together: omitted reads the
-/// anchor week (the oldest past date that still holds a pending item — civil
-/// today when nothing pends — plus six days). This GET is a **pure range
-/// read**: it seeds nothing and writes no occurrence / agenda row (the old
-/// `?date=` parameter is ignored). The response carries the server-computed
-/// `today` + `time_zone`.
+/// Both bounds are **optional** and must be set together: omitted reads
+/// `anchor_date … today+6` (the oldest past date that still holds a pending
+/// item — civil today when nothing pends — through six days after today, with
+/// no 31-day cap) plus the `backlog` array of every row past that window. An
+/// explicit window is **history only**: at most 31 inclusive days, ending
+/// strictly before `anchor_date`, with an empty `backlog`. This GET is a
+/// **pure range read**: it seeds nothing and writes no occurrence / agenda row
+/// (the old `?date=` parameter is ignored). The response carries the
+/// server-computed `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
         return unauthorized(&ctx);
