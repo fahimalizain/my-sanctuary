@@ -3,6 +3,11 @@
 Status: Accepted
 Date: 2026-08-23
 
+> Superseded in part by ADR 0006 (2026-10-17): the agenda is a stream of
+> days. Seed-on-read, many agenda rows per task, the date-scoped Home, and
+> the add/unpin endpoints no longer hold. See
+> `docs/adr/0006-agenda-stream.md`.
+
 > Amendment (2026-08-25): a dedicated **pause** verb joins the occurrence
 > matrix: `POST /api/occurrences/:id/pause`. `in_progress` → `pending` after
 > the open chip's end is PATCHed closed (same invert guard as complete/skip;
