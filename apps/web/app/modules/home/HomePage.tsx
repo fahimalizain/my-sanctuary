@@ -176,6 +176,9 @@ function AgendaDay({
 }) {
   const { living, completed } = partitionAgendaItems(items);
   const pendingCount = items.filter(isAgendaItemPending).length;
+  // The count above includes a running occurrence, but the sweep leaves it
+  // behind — the button may only appear when something would actually move.
+  const canMoveDay = items.some(canMoveToToday);
   const isPast = !!serverToday && day < serverToday;
   const draggable = living.filter(isAgendaRowDraggable);
   const { setNodeRef, isOver } = useDroppable({
@@ -210,14 +213,16 @@ function AgendaDay({
             <span className="flex-shrink-0 rounded-full bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
               {pendingCount} pending
             </span>
-            <button
-              type="button"
-              onClick={() => onMoveDayToToday(day)}
-              aria-label={`Move all pending items from ${day} to today`}
-              className="ml-auto flex-shrink-0 rounded-full bg-amber-400/15 px-2 py-1 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-400/25"
-            >
-              Move all to today
-            </button>
+            {canMoveDay && (
+              <button
+                type="button"
+                onClick={() => onMoveDayToToday(day)}
+                aria-label={`Move all pending items from ${day} to today`}
+                className="ml-auto flex-shrink-0 rounded-full bg-amber-400/15 px-2 py-1 text-[11px] font-medium text-amber-700 transition-colors hover:bg-amber-400/25"
+              >
+                Move all to today
+              </button>
+            )}
           </>
         )}
       </header>
@@ -1020,9 +1025,11 @@ export function HomePage() {
   // fetch settles (see `maybeFetchMore`).
   const topVisibleRef = useRef(false);
   const bottomVisibleRef = useRef(false);
-  // History loads wait for a deliberate upward scroll (or the Today button):
-  // a mount-time auto-prepend would fetch a week nobody asked for.
-  const historyIntentRef = useRef(false);
+  // History loads stay off until the anchor landing scroll has been placed:
+  // an auto-prepend during that first paint would fetch a week and shift the
+  // stream before the user has seen the anchor. Armed at the end of the
+  // landing layout effect (see below).
+  const historyArmedRef = useRef(false);
   // Consecutive future auto-loads while the bottom sentinel stays in view.
   const bottomAutoloadsRef = useRef(0);
   // Scroll geometry captured before a prepend, so the extra height can be
@@ -1033,9 +1040,6 @@ export function HomePage() {
     pageCount: number;
   } | null>(null);
   const landedOnAnchorRef = useRef(false);
-  // Last observed scroll offset — only an upward move counts as history
-  // intent (see the scroll listener below).
-  const lastScrollTopRef = useRef(0);
   const [todayVisible, setTodayVisible] = useState(false);
 
   const hasPreviousPage = stream.hasPreviousPage;
@@ -1057,20 +1061,34 @@ export function HomePage() {
     };
   }, [readStream]);
 
+  /** The history gesture: the stream is sitting at its top edge. The anchor
+   *  day lands aligned with the top sentinel, so `scrollTop` starts at ~0 —
+   *  there is no room left for a "moved up by 4px" delta, and a wheel-up at
+   *  the clamped edge fires no scroll event at all. `scrollTop <= 1` catches
+   *  the edge itself; `topVisibleRef` catches the approach. Returns true when
+   *  a fetch was started (so the caller can skip the opposite direction). */
+  const maybeFetchPreviousPage = useCallback((): boolean => {
+    if (!historyArmedRef.current) return false; // still landing on the anchor
+    const root = scrollRef.current;
+    if (!root) return false;
+    if (root.scrollTop > 1 && !topVisibleRef.current) return false;
+    if (!hasPreviousPage || isFetchingPreviousPage) return false;
+    rememberPrepend();
+    void fetchPreviousPage();
+    return true;
+  }, [
+    hasPreviousPage,
+    isFetchingPreviousPage,
+    fetchPreviousPage,
+    rememberPrepend,
+  ]);
+
   /** Fetch the next page in whichever direction the viewport is asking for.
-   *  Called from the sentinel observer and, because an observer only fires on
-   *  intersection CHANGES, re-checked after each settle. */
+   *  Called from the sentinel observer and — because an observer only fires
+   *  on intersection CHANGES, and a sentinel can already be moored in view —
+   *  from the scroll listener and after each settle. */
   const maybeFetchMore = useCallback(() => {
-    if (
-      topVisibleRef.current &&
-      historyIntentRef.current &&
-      hasPreviousPage &&
-      !isFetchingPreviousPage
-    ) {
-      rememberPrepend();
-      void fetchPreviousPage();
-      return;
-    }
+    if (maybeFetchPreviousPage()) return;
     if (
       bottomVisibleRef.current &&
       hasNextPage &&
@@ -1080,33 +1098,23 @@ export function HomePage() {
       bottomAutoloadsRef.current += 1;
       void fetchNextPage();
     }
-  }, [
-    hasPreviousPage,
-    hasNextPage,
-    isFetchingPreviousPage,
-    isFetchingNextPage,
-    fetchPreviousPage,
-    fetchNextPage,
-    rememberPrepend,
-  ]);
+  }, [maybeFetchPreviousPage, hasNextPage, isFetchingNextPage, fetchNextPage]);
 
-  // A scroll counts as history intent only when it moved UP: history loads
-  // wait for a deliberate gesture, so landing on the anchor (whose page starts
-  // right under the top sentinel) never fetches a week nobody asked for. The
-  // same scroll re-arms the future auto-load budget.
+  // Any scroll re-arms the future auto-load budget. The same event re-checks
+  // the top edge: after the landing scroll the container is parked at
+  // `scrollTop ≈ 0`, where an upward gesture cannot produce another scroll
+  // event, and the observer already reported the sentinel as intersecting —
+  // this call is what makes sitting at the top load history.
   useEffect(() => {
     const root = scrollRef.current;
     if (!root) return;
-    lastScrollTopRef.current = root.scrollTop;
     const onScroll = () => {
-      const top = root.scrollTop;
-      if (top < lastScrollTopRef.current - 4) historyIntentRef.current = true;
-      lastScrollTopRef.current = top;
       bottomAutoloadsRef.current = 0;
+      maybeFetchPreviousPage();
     };
     root.addEventListener('scroll', onScroll, { passive: true });
     return () => root.removeEventListener('scroll', onScroll);
-  }, []);
+  }, [maybeFetchPreviousPage]);
 
   // Sentinels inside the stream's own scroll container. The observer is
   // rebuilt whenever a fetch settles so a still-visible sentinel gets a fresh
@@ -1146,15 +1154,26 @@ export function HomePage() {
   // prepends must NOT re-run this (the height compensation below keeps the
   // anchor exactly where the user left it).
   useLayoutEffect(() => {
-    if (landedOnAnchorRef.current || !anchorDate) return;
+    if (!anchorDate) return;
     const root = scrollRef.current;
     const target = root?.querySelector<HTMLElement>(
       `#${dayElementId(anchorDate)}`,
     );
     if (!target) return;
-    landedOnAnchorRef.current = true;
-    target.scrollIntoView({ block: 'start' });
-  }, [anchorDate, days]);
+    if (!landedOnAnchorRef.current) {
+      landedOnAnchorRef.current = true;
+      target.scrollIntoView({ block: 'start' });
+    }
+    // The landing scroll is placed: the anchor day now starts at the stream's
+    // top edge, which is exactly where history begins. Only from here on does
+    // "at the top" mean "load the previous week" — the previous code waited
+    // for a >4px upward scroll that this edge never leaves room for. The next
+    // frame re-checks once the scroll has settled, because a wheel gesture at
+    // `scrollTop ≈ 0` cannot move the container and would fire no event.
+    historyArmedRef.current = true;
+    const frame = requestAnimationFrame(() => maybeFetchMore());
+    return () => cancelAnimationFrame(frame);
+  }, [anchorDate, days, maybeFetchMore]);
 
   // A prepend adds height ABOVE the viewport: add exactly that much to
   // `scrollTop` so the day under the user's eyes does not jump.
@@ -1171,7 +1190,14 @@ export function HomePage() {
       return; // an append (or a failure) — the viewport is already right
     }
     const delta = root.scrollHeight - recorded.scrollHeight;
-    if (delta > 0) root.scrollTop += delta;
+    if (delta > 0) {
+      root.scrollTop += delta;
+      // The new height pushes the top sentinel out of view (well past the
+      // observer's 240px margin), but its stale "intersecting" flag would let
+      // the scroll event from this very write start another prepend. The next
+      // observer callback confirms the move.
+      topVisibleRef.current = false;
+    }
   }, [pages]);
 
   // Is today's header on screen? Its absence (today not loaded yet) counts as
@@ -1202,7 +1228,7 @@ export function HomePage() {
   const scrollToToday = async () => {
     const root = scrollRef.current;
     if (!root || !serverToday) return;
-    historyIntentRef.current = true;
+    historyArmedRef.current = true;
     for (let step = 0; step < MAX_TODAY_FETCHES; step += 1) {
       if (document.getElementById(dayElementId(serverToday))) break;
       const data = readStream();
