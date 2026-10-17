@@ -3,7 +3,8 @@ import { QueryClient } from '@tanstack/react-query';
 /**
  * Singleton QueryClient with locked defaults.
  *
- * `refetchInterval` is per-query (Board only) and is not set globally.
+ * `refetchInterval` is per-query (background sync's always-on tasks observer)
+ * and is not set globally.
  */
 export const queryClient = new QueryClient({
   defaultOptions: {

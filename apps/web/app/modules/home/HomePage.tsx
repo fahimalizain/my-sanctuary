@@ -146,35 +146,6 @@ function currentAnchor(): string {
   );
 }
 
-/** Milliseconds until the next midnight in `timeZone` (an IANA name), read
- *  with `hourCycle: 'h23'` so midnight is 00 and never 24. `null` when the
- *  zone is missing or unreadable (`Intl` throws on an unknown zone) — the
- *  caller then skips the timer rather than crashing. */
-function msUntilNextMidnight(timeZone: string): number | null {
-  if (!timeZone) return null;
-  try {
-    const now = new Date();
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hourCycle: 'h23',
-    }).formatToParts(now);
-    const part = (type: string) =>
-      Number(parts.find((entry) => entry.type === type)?.value);
-    const hour = part('hour') % 24;
-    const minute = part('minute');
-    const second = part('second');
-    if (![hour, minute, second].every(Number.isFinite)) return null;
-    const msIntoDay =
-      ((hour * 60 + minute) * 60 + second) * 1000 + now.getMilliseconds();
-    return 24 * 60 * 60 * 1000 - msIntoDay;
-  } catch {
-    return null;
-  }
-}
-
 /** Home's slim, compact constraints for the ONE FocusTimer below `lg` (sticky
  *  strip above the stream): heading to screen-readers, digits and buttons
  *  shrunk, session line dropped. Every rule is `max-lg:`-scoped so the `lg`
@@ -459,8 +430,6 @@ export function HomePage() {
   // The server's oldest row — the floor of the history walk (`earliest_date`),
   // and what decides whether history has anything to load at all.
   const earliestDate = currentPage?.earliest_date ?? '';
-  // The zone `today` is computed in. Drives the midnight refresh below.
-  const timeZone = currentPage?.time_zone ?? '';
   // History never fetches on mount: the user has to reach the top of the
   // stream first (see `maybeFetchPreviousPage`). State, not a ref — flipping it
   // is what re-renders the hook into an enabled query.
@@ -522,40 +491,6 @@ export function HomePage() {
     () => splitBacklogSection(backlogItems, serverToday),
     [backlogItems, serverToday],
   );
-
-  // `serverToday` is only as fresh as the last read (`staleTime` is 30s): a
-  // tab left in the foreground overnight would keep yesterday's date, so
-  // Play, the popover's Today and every drop would target a past day and 400.
-  // Re-read the stream at the next midnight in the calendar's own IANA zone
-  // (the server computes `today` there), then arm the next midnight; a missing
-  // / unknown zone just skips the timer.
-  useEffect(() => {
-    if (!timeZone) return;
-    let timer: number | undefined;
-    const schedule = () => {
-      const delay = msUntilNextMidnight(timeZone);
-      if (delay === null) return;
-      // +30s: a fast clock must not refetch while the server is still on yesterday.
-      timer = window.setTimeout(() => {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
-        schedule();
-      }, delay + 30_000);
-    };
-    schedule();
-    return () => window.clearTimeout(timer);
-  }, [timeZone]);
-
-  // Coming back to a backgrounded PWA: `today` may have rolled over while the
-  // tab was hidden. Fire and forget — the refetch must not gate the paint.
-  useEffect(() => {
-    const onVisibilityChange = () => {
-      if (document.visibilityState !== 'visible') return;
-      void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
-    };
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    return () =>
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-  }, []);
 
   // Action failures (move/complete/skip/etc.): a banner above the still-
   // visible stream — rows are never unmounted by an action error.

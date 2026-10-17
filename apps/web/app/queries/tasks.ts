@@ -22,6 +22,11 @@ import { queryClient } from '@/lib/queryClient';
 // Same split as lists.ts: React-free `queryOptions` factory + hooks. The one
 // `['tasks']` cache is shared by Board, Lists and the Home task picker.
 
+/** Background refetch while the board is idle. Background sync owns the
+ *  interval on its always-on tasks observer and pauses it while the board is
+ *  busy (`setTasksBusy`), so Board must not also pass an interval. */
+export const TASKS_REFETCH_INTERVAL_MS = 60_000;
+
 export function tasksQueryOptions() {
   return queryOptions({
     queryKey: queryKeys.tasks.all,
@@ -31,13 +36,11 @@ export function tasksQueryOptions() {
 
 export function useTasksQuery(opts?: {
   enabled?: boolean;
-  refetchInterval?: number | false;
   refetchOnWindowFocus?: boolean;
 }) {
   return useQuery({
     ...tasksQueryOptions(),
     enabled: opts?.enabled ?? true,
-    refetchInterval: opts?.refetchInterval,
     refetchOnWindowFocus: opts?.refetchOnWindowFocus,
   });
 }

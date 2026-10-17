@@ -1,4 +1,9 @@
-import { useInfiniteQuery, useMutation, useQuery } from '@tanstack/react-query';
+import {
+  queryOptions,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+} from '@tanstack/react-query';
 import type { InfiniteData } from '@tanstack/react-query';
 import {
   getAgendaRange,
@@ -37,11 +42,16 @@ import {
 // per-date key.
 
 /** Home's default read: `anchor_date … today+6` plus the whole backlog. */
-export function useAgendaCurrent() {
-  return useQuery({
+export function agendaCurrentQueryOptions() {
+  return queryOptions({
     queryKey: queryKeys.agenda.current(),
     queryFn: () => getAgendaRange(),
   });
+}
+
+/** Home's default read, as a hook. */
+export function useAgendaCurrent() {
+  return useQuery(agendaCurrentQueryOptions());
 }
 
 /** One history page's param — the inclusive window it was read with. */
