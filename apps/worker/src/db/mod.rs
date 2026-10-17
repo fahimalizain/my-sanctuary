@@ -18,12 +18,14 @@ use api_core::models::{
     UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
 };
 use api_core::repo::{
-    build_agenda_item_insert_sql, build_agenda_item_list_by_refs_sql, build_occurrence_delete_by_ids_sql,
+    build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
+    build_agenda_item_list_by_refs_sql, build_occurrence_delete_by_ids_sql,
     build_occurrence_insert_sql,
     build_occurrence_list_by_ids_sql, build_routine_list_by_ids_sql, AgendaItemRepo,
     OccurrenceRepo, RepoError, RoutineRepo,
     TaskCategoryRepo, TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo,
-    AGENDA_ITEM_DELETE_BY_REF_SQL, AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL,
+    AGENDA_ITEM_DELETE_BY_REF_SQL, AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE,
+    AGENDA_ITEM_DELETE_SQL, AGENDA_ITEM_GET_BY_ID_SQL,
     AGENDA_ITEM_GET_BY_KEY_SQL, AGENDA_ITEM_GET_BY_REF_SQL, AGENDA_ITEM_INSERT_SQL,
     AGENDA_ITEM_INSERT_CHUNK_SIZE, AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE,
     AGENDA_ITEM_LIST_BY_USER_AND_DATE_SQL, AGENDA_ITEM_LIST_BY_USER_AND_DATE_RANGE_SQL,
@@ -1035,6 +1037,31 @@ impl AgendaItemRepo for D1AgendaItemRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    async fn delete_by_refs(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_ids: &[String],
+    ) -> Result<(), RepoError> {
+        // Empty IN list → no SQL at all.
+        if ref_ids.is_empty() {
+            return Ok(());
+        }
+        // Chunk to stay under D1's 100 bound-parameter limit (2 fixed binds +
+        // 98 ids per statement); each chunk is one D1 subrequest. Every
+        // matching row goes; zero matches is a no-op.
+        for chunk in ref_ids.chunks(AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE) {
+            let (sql, args) = build_agenda_item_delete_by_refs_sql(user_id, kind, chunk);
+            let stmt = self
+                .db
+                .prepare(&sql)
+                .bind_refs(&bind_text(&args))
+                .map_err(backend)?;
+            run_stmt(stmt).await?;
+        }
+        Ok(())
     }
 
     async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError> {

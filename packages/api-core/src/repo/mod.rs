@@ -472,6 +472,17 @@ pub trait AgendaItemRepo: Send + Sync {
     /// survive). No error when none match: the referenced task/occurrence
     /// (already soft-deleted by the caller) is untouched.
     async fn delete_by_ref(&self, user_id: &str, kind: &str, ref_id: &str) -> Result<(), RepoError>;
+    /// The batched [`AgendaItemRepo::delete_by_ref`]: HARD deletes every row
+    /// of `kind` referencing any id in `ref_ids` for the user, one statement
+    /// per chunk (2 fixed binds + ids, [`AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE`]).
+    /// Empty `ref_ids` → `Ok(())` without touching the DB; no error when none
+    /// match. The reconcile's drop of the pruned occurrences' memberships.
+    async fn delete_by_refs(
+        &self,
+        user_id: &str,
+        kind: &str,
+        ref_ids: &[String],
+    ) -> Result<(), RepoError>;
     /// Highest `sort_order` in the user's `local_date` pile, or `None` when
     /// empty — the append target (`max+1`, else 0).
     async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError>;
@@ -1151,6 +1162,11 @@ pub const AGENDA_ITEM_DELETE_SQL: &str = "DELETE FROM agenda_items WHERE id = ?"
 pub const AGENDA_ITEM_DELETE_BY_REF_SQL: &str =
     "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id = ?";
 
+/// `delete_by_refs` binds 2 fixed args (`user_id`, `kind`) plus 1 id per ref →
+/// max 98 refs per statement (2 + 98 = 100), the same budget as
+/// `list_by_refs`.
+pub const AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE: usize = 98;
+
 /// Highest rank in the user's date pile — the append target (`max+1`, else
 /// 0). `LIMIT 1` over `MAX()` so an empty pile reads as `None` via `first()`.
 pub const AGENDA_ITEM_MAX_SORT_ORDER_SQL: &str = "
@@ -1254,6 +1270,35 @@ pub fn build_agenda_item_list_by_refs_sql(
     let placeholders: Vec<&str> = ref_ids.iter().map(|_| "?").collect();
     let sql = format!(
         "SELECT * FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id IN ({})",
+        placeholders.join(",")
+    );
+    let mut args = Vec::with_capacity(ref_ids.len() + 2);
+    args.push(user_id.to_string());
+    args.push(kind.to_string());
+    args.extend(ref_ids.iter().cloned());
+    (sql, args)
+}
+
+/// Builds a `DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND
+/// ref_id IN (…)` statement for one chunk of refs (non-empty and ≤
+/// [`AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE`]) — the reconcile's batched drop of
+/// the pruned occurrences' memberships. Deliberately NO `local_date` filter:
+/// the membership row lives on whatever date the occurrence was placed.
+/// Returns `(sql, args)` with every arg a string (bound as `D1Type::Text`);
+/// `args[0]`/`args[1]` are `user_id`/`kind`.
+pub fn build_agenda_item_delete_by_refs_sql(
+    user_id: &str,
+    kind: &str,
+    ref_ids: &[String],
+) -> (String, Vec<String>) {
+    assert!(!ref_ids.is_empty(), "agenda ref list must not be empty");
+    assert!(
+        ref_ids.len() <= AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE,
+        "agenda ref list exceeds {AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE} refs"
+    );
+    let placeholders: Vec<&str> = ref_ids.iter().map(|_| "?").collect();
+    let sql = format!(
+        "DELETE FROM agenda_items WHERE user_id = ? AND kind = ? AND ref_id IN ({})",
         placeholders.join(",")
     );
     let mut args = Vec::with_capacity(ref_ids.len() + 2);
@@ -1858,6 +1903,8 @@ mod tests {
         assert!(AGENDA_ITEM_INSERT_CHUNK_SIZE * AGENDA_ITEM_INSERT_COL_COUNT <= 100);
         assert_eq!(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE, 98);
         assert_eq!(AGENDA_ITEM_LIST_BY_REFS_CHUNK_SIZE + 2, 100, "2 fixed binds + refs");
+        assert_eq!(AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE, 98);
+        assert_eq!(AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE + 2, 100, "2 fixed binds + ids");
 
         let row = NewAgendaItem {
             user_id: "u-1".to_string(),
@@ -1888,6 +1935,25 @@ mod tests {
         assert!(sql.contains("user_id = ? AND kind = ? AND ref_id IN (?,?)"), "{sql}");
         assert!(!sql.contains("local_date"), "any date, never a local_date filter: {sql}");
         assert!(!sql.contains("LIMIT"), "all matching rows, not LIMIT 1: {sql}");
+        assert_eq!(sql.matches('?').count(), 4, "{sql}");
+        assert_eq!(args, vec!["u-1", "occurrence", "occ-1", "occ-2"]);
+    }
+
+    #[test]
+    fn agenda_item_delete_by_refs_is_scoped_by_user_kind_and_ref_ids() {
+        let (sql, args) = build_agenda_item_delete_by_refs_sql(
+            "u-1",
+            "occurrence",
+            &["occ-1".to_string(), "occ-2".to_string()],
+        );
+        assert!(sql.starts_with("DELETE FROM agenda_items"), "{sql}");
+        assert!(sql.contains("user_id = ? AND kind = ? AND ref_id IN (?,?)"), "{sql}");
+        assert!(!sql.contains("local_date"), "any date, never a local_date filter: {sql}");
+        assert!(
+            !sql.contains("LIMIT"),
+            "every matching row, so the prune leaves no dangling membership: {sql}"
+        );
+        assert!(!sql.contains("deleted_at"), "no soft-delete column here: {sql}");
         assert_eq!(sql.matches('?').count(), 4, "{sql}");
         assert_eq!(args, vec!["u-1", "occurrence", "occ-1", "occ-2"]);
     }

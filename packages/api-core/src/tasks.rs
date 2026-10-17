@@ -111,7 +111,10 @@
 //! calendar's date via [`crate::agenda::user_today`], appended at the pile's
 //! `max + 1`; an existing row travels, today's ranks never reshuffle). Soft
 //! delete removes the row. Stop, pause, reorder, an already-IN_PROGRESS start,
-//! and title edits leave the day alone.
+//! and title edits leave the day alone. Placement is **best-effort** and runs
+//! after the status/log writes: the `*/15` fill backfills a missing row, while
+//! a 500 on an already-committed transition would make the client retry a
+//! write that landed (and can never repair a half-written Google log).
 
 use std::collections::HashMap;
 
@@ -765,7 +768,11 @@ fn untracked_with(
 ///
 /// - No row → insert one on today at the pile's append rank (`max + 1`, else
 ///   0). `insert` is `INSERT OR IGNORE`: a racing duplicate returns the
-///   stored row, whose rank stands.
+///   stored row, whose rank stands. The partial unique index
+///   (`idx_agenda_items_one_per_task`) can swallow the insert the same way,
+///   handing back the row that already sits on **another** day — that row
+///   then falls through to the relocate path below, so the result is still
+///   one row, on today.
 /// - A row already on today → `Ok(())` with `local_date` and `sort_order`
 ///   untouched (appending never reshuffles today's existing ranks).
 /// - A row on any other date → [`AgendaItemRepo::set_local_date`] to today at
@@ -774,7 +781,9 @@ fn untracked_with(
 ///
 /// Called on **real** lifecycle transitions only (create, a real start, a
 /// real complete/discard, reopen). Idempotent, so a caller that cannot be
-/// sure the transition was real may still call it.
+/// sure the transition was real may still call it. The callers decide whether
+/// a failure propagates — the lifecycle write is already committed, so they
+/// usually swallow it.
 pub(crate) async fn place_task_on_today(
     agenda_repo: &dyn AgendaItemRepo,
     calendars: &dyn CalendarRepo,
@@ -791,21 +800,25 @@ pub(crate) async fn place_task_on_today(
             // mapping belongs to its endpoints.
             other => TasksError::Invalid(other.to_string()),
         })?;
-    let Some(item) = agenda_repo
+    let item = match agenda_repo
         .get_by_ref(user_id, AGENDA_KIND_TASK, task_id)
         .await?
-    else {
-        let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &today).await?);
-        agenda_repo
-            .insert(NewAgendaItem {
-                user_id: user_id.to_string(),
-                local_date: today,
-                kind: AGENDA_KIND_TASK.to_string(),
-                ref_id: task_id.to_string(),
-                sort_order,
-            })
-            .await?;
-        return Ok(());
+    {
+        Some(item) => item,
+        None => {
+            let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &today).await?);
+            // The returned row is the stored one: an insert the index
+            // swallowed gives back the row on its existing (other) day.
+            agenda_repo
+                .insert(NewAgendaItem {
+                    user_id: user_id.to_string(),
+                    local_date: today.clone(),
+                    kind: AGENDA_KIND_TASK.to_string(),
+                    ref_id: task_id.to_string(),
+                    sort_order,
+                })
+                .await?
+        }
     };
     if item.local_date == today {
         return Ok(());
@@ -840,7 +853,11 @@ pub(crate) async fn place_task_on_today(
 /// The task's single agenda row is placed on **civil today** right after the
 /// insert ([`place_task_on_today`]): create is one of the four real lifecycle
 /// transitions that relocate the row. A validation 400 returns before the
-/// insert and therefore never writes an agenda row.
+/// insert and therefore never writes an agenda row. Placement itself is
+/// **best-effort**: the task row is already committed, so a placement failure
+/// must not 500 the create — the client would retry and insert a **second**
+/// task. The `*/15` fill's [`crate::agenda_fill::ensure_task_items`] backfills
+/// a missing row on the next tick.
 pub async fn create_task(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -907,7 +924,12 @@ pub async fn create_task(
         .await?;
     // Every create puts the task's one agenda row on civil today (appended).
     // The validation 400s above returned before the insert — no task, no row.
-    place_task_on_today(agenda_repo, calendars, user_id, &task.id, now_unix).await?;
+    if let Err(_) = place_task_on_today(agenda_repo, calendars, user_id, &task.id, now_unix).await {
+        // Best-effort: the task is committed, so a 500 would make the client
+        // retry and insert a second task. The cron's `ensure_task_items`
+        // backfills a MISSING row; it does not repair a half-written Google
+        // log — a stale row is the lesser evil.
+    }
     Ok(TaskResponse {
         task: to_view(&task, &taxonomy, None),
     })
@@ -1130,11 +1152,14 @@ fn task_segment_input(
 ///    task carrier attached).
 /// 6. `tasks.status` → IN_PROGRESS and a `started` log row, both in this
 ///    request.
+/// 7. Last, best-effort: the agenda row ([`place_task_on_today`]) moves onto
+///    civil today — after the log, so a placement failure can never skip it.
 ///
 /// Agenda (ADR 0004 amendment): a **real** start also puts the task's single
-/// agenda row on civil today ([`place_task_on_today`]). The already-IN_PROGRESS
-/// 200 no-op returns above and never moves the row, even when it sits on
-/// another day.
+/// agenda row on civil today. The already-IN_PROGRESS 200 no-op returns above
+/// and never moves the row, even when it sits on another day. A placement
+/// failure is swallowed: the status and the `started` log are already
+/// committed, so the request succeeded even if the row is stale.
 pub async fn start_task(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1205,9 +1230,6 @@ pub async fn start_task(
     else {
         return Err(TasksError::NotFound);
     };
-    // Real transition only (the IN_PROGRESS no-op returned above): the one
-    // agenda row lands on civil today, appended.
-    place_task_on_today(agenda_repo, calendars, user_id, &task.id, now_unix).await?;
     logs.insert(
         NewTaskLog {
             task_id: task.id.clone(),
@@ -1220,6 +1242,15 @@ pub async fn start_task(
         &now_rfc3339,
     )
     .await?;
+    // Real transition only (the IN_PROGRESS no-op returned above): the one
+    // agenda row lands on civil today, appended — but only AFTER the status
+    // and the `started` log are written.
+    if let Err(_) = place_task_on_today(agenda_repo, calendars, user_id, &task.id, now_unix).await {
+        // Best-effort: the status and the `started` log are committed, so a
+        // 500 would only make the client retry a start that landed (and the
+        // retry is an already-IN_PROGRESS no-op). The cron backfills a MISSING
+        // row; it cannot repair a half-written Google log.
+    }
 
     Ok(TaskActionResponse {
         task: to_view(&updated, &taxonomy, None),
@@ -1497,7 +1528,12 @@ async fn stop_or_pause(
 /// Agenda (ADR 0004 amendment): the idempotent no-op returns above, so a
 /// status write here is always a **real** transition — its single agenda row
 /// moves onto civil today (both the raw `/complete` `/discard` path and a
-/// `/move` into a terminal status).
+/// `/move` into a terminal status). Placement runs **last**, after the
+/// terminal log and the board rank, and only when the status loaded at the
+/// start was `OPEN`/`PLANNED`/`IN_PROGRESS`: a `COMPLETED` ⇄ `DISCARDED` move
+/// is a real status change but must not pull an old history row onto today.
+/// A placement failure is swallowed — the status, the log, and the rank are
+/// already committed.
 async fn complete_or_discard(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1593,9 +1629,6 @@ async fn complete_or_discard(
     else {
         return Err(TasksError::NotFound);
     };
-    // Real transition only (the idempotent no-op returned above): the task's
-    // single agenda row lands on civil today, appended.
-    place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await?;
     logs.insert(
         NewTaskLog {
             task_id: task_id.to_string(),
@@ -1617,6 +1650,25 @@ async fn complete_or_discard(
     } else {
         updated
     };
+
+    // Placement is last and best-effort: the status, the terminal log, and the
+    // board rank are already committed. Only a transition FROM a living
+    // status places — `COMPLETED` ⇄ `DISCARDED` is a real change but must not
+    // drag an old history row onto today. The cron's task backfill repairs a
+    // MISSING row; it never repairs a half-written Google log.
+    if matches!(
+        task.status.as_str(),
+        TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS
+    ) {
+        if let Err(_) =
+            place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+        {
+            // A stale row is the least-bad outcome: a 500 would report a
+            // write that already landed — status, terminal log, board rank,
+            // and the Google exit all committed. The cron backfills a MISSING
+            // row; it does not repair a half-written Google log.
+        }
+    }
 
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
     Ok(TaskActionResponse {
@@ -1993,7 +2045,13 @@ async fn dispatch_matrix_action(
             // Reopen is a real lifecycle transition, so the task's one agenda
             // row comes back onto civil today. Called unconditionally: the
             // helper no-ops when the row already sits there.
-            place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await?;
+            if let Err(_) =
+                place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+            {
+                // Best-effort: the status and the `reopened` log are already
+                // committed, so a 500 would only make the client retry a
+                // reopen that landed. The cron backfills a MISSING row.
+            }
             Ok(None)
         }
         // complete / discard from any non-running status: no Google writes.
@@ -2066,7 +2124,9 @@ async fn local_transition(
 /// Agenda (ADR 0004 amendment): both branches are real complete/discard
 /// transitions. The IN_PROGRESS branch delegates to
 /// [`complete_or_discard`], which places the row itself; the local branch
-/// places after the status write.
+/// places only when the loaded status was `OPEN`/`PLANNED` — a terminal →
+/// terminal move (`COMPLETED` → `DISCARDED`, or the reverse) is a real status
+/// change but must not pull the old history row onto today.
 async fn terminal_transition(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -2115,9 +2175,20 @@ async fn terminal_transition(
         return Ok(response.event);
     }
     local_transition(task_repo, logs, user_id, task_id, target_status, log_type, now_unix).await?;
-    // The local branch is still a real complete/discard: put the one agenda
-    // row on civil today (the helper no-ops when it is already there).
-    place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await?;
+    // The local branch is still a real complete/discard when it starts from a
+    // living status: put the one agenda row on civil today (the helper no-ops
+    // when it is already there). Terminal → terminal is excluded — that move
+    // must leave the history row where it is — and IN_PROGRESS went through
+    // `complete_or_discard` above, which placed already.
+    if matches!(task.status.as_str(), TASK_STATUS_OPEN | TASK_STATUS_PLANNED) {
+        if let Err(_) =
+            place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+        {
+            // Best-effort: the status and the terminal log are committed.
+            // The cron backfills a MISSING row; it does not repair a
+            // half-written Google log, so a stale row is the lesser evil.
+        }
+    }
     Ok(None)
 }
 
@@ -2208,10 +2279,10 @@ async fn reorder_in_place(
 ///
 /// Agenda (ADR 0004 amendment): the same real lifecycle transitions move the
 /// task's single agenda row onto civil today — a real start (via
-/// [`start_task`]), a move into a terminal status (via
+/// [`start_task`]), a move into a terminal status from a living one (via
 /// [`complete_or_discard`]/[`terminal_transition`]), and reopen from a
-/// terminal status. Stop, pause, reorder, plan/unplan, and the terminal →
-/// IN_PROGRESS start arm never place twice.
+/// terminal status. Stop, pause, reorder, plan/unplan, the terminal →
+/// IN_PROGRESS start arm, and terminal → terminal moves never place.
 pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -3432,6 +3503,25 @@ mod tests {
             // Mirrors AGENDA_ITEM_DELETE_BY_REF_SQL: EVERY matching row.
             self.stored.lock().unwrap().retain(|row| {
                 !(row.user_id == user_id && row.kind == kind && row.ref_id == ref_id)
+            });
+            Ok(())
+        }
+
+        async fn delete_by_refs(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_ids: &[String],
+        ) -> Result<(), RepoError> {
+            // Mirrors build_agenda_item_delete_by_refs_sql: every matching row
+            // of the user's `kind`; empty input touches nothing.
+            if ref_ids.is_empty() {
+                return Ok(());
+            }
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id
+                    && row.kind == kind
+                    && ref_ids.iter().any(|id| id == &row.ref_id))
             });
             Ok(())
         }
@@ -9485,6 +9575,43 @@ mod tests {
         assert_eq!(reopened_planned.id, planned_row.id);
         assert_eq!(reopened_planned.local_date, AGENDA_TODAY);
         assert_eq!(reopened_planned.sort_order, 1, "the second reopen appends after it");
+    }
+
+    #[test]
+    fn terminal_to_terminal_move_never_pulls_the_history_row_onto_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // The task was completed days ago: its single row sits in the past,
+        // where the history renders.
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda.move_row(&row.id, AGENDA_PAST, 3);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_DISCARDED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1, "one row, never duplicated");
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(
+            rows[0].local_date, AGENDA_PAST,
+            "terminal → terminal is a real status change but never drags history onto today"
+        );
+        assert_eq!(rows[0].sort_order, 3, "and never reshuffles it");
     }
 
     #[test]

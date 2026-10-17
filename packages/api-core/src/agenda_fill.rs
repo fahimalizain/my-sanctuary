@@ -12,6 +12,10 @@
 //!   [`OCCURRENCE_HORIZON_DAYS`]). Nothing is ever written before today: a
 //!   routine whose DTSTART lies in the past is not backfilled into the past —
 //!   only the horizon dates its rule actually covers.
+//! - A routine **edit** fills **tomorrow … today+6** instead
+//!   (`include_today: false`): the edit never adds an occurrence (or an agenda
+//!   row) on today — the next `*/15` cron tick fills today if the new rule
+//!   covers it.
 //! - Today is always the user's `user_today` (primary calendar `time_zone`,
 //!   UTC when there is none). The fill never computes a UTC today of its own.
 //! - Everything here is idempotent: a second pass with unchanged data writes
@@ -45,15 +49,23 @@ pub const OCCURRENCE_HORIZON_DAYS: i64 = 7;
 /// Materializes every living routine's occurrences for **today … today+6** and
 /// appends the missing membership rows — one batched pass per user.
 ///
+/// `include_today` picks the window start: `true` (the cron and routine
+/// **create**) fills `today … today+6`; `false` (a routine **edit**) starts at
+/// **tomorrow**, so a rule change never gives today a new occurrence or agenda
+/// row — the next `*/15` cron tick fills today if the new rule covers it. A
+/// window that starts after the horizon end (impossible while
+/// [`OCCURRENCE_HORIZON_DAYS`] ≥ 2, stated anyway) writes nothing.
+///
 /// Steps:
 /// 1. Resolve civil today (primary calendar zone, else UTC) and the horizon
 ///    end (`today + 6`).
 /// 2. Routines: `only_routine` loads that single living routine (missing or
 ///    soft-deleted → `Ok(())`: create/update only ever call this with a living
 ///    id); `None` loads all of the user's living routines in standing order.
-/// 3. Expand each rule over the horizon ([`occurrence_dates`], inclusive).
+/// 3. Expand each rule over the window ([`occurrence_dates`], inclusive).
 ///    A blob that no longer parses skips **that routine** — a fill never fails
-///    the user on one bad row. Dates before today are dropped outright.
+///    the user on one bad row. Dates before the window start are dropped
+///    outright.
 /// 4. ONE `list_by_user_and_date_range` read of the window; only the missing
 ///    `(routine_id, local_date)` pairs are inserted (`insert_many` is
 ///    `INSERT OR IGNORE`), then the window is re-listed so a UUID lost to the
@@ -71,9 +83,18 @@ pub async fn fill_occurrence_horizon(
     user_id: &str,
     now_unix: i64,
     only_routine: Option<&str>,
+    include_today: bool,
 ) -> Result<(), AgendaError> {
     let (today, _time_zone) = user_today(calendars, user_id, now_unix).await?;
     let horizon_end = add_civil_days(&today, OCCURRENCE_HORIZON_DAYS - 1)?;
+    let window_start = if include_today {
+        today
+    } else {
+        add_civil_days(&today, 1)?
+    };
+    if window_start.as_str() > horizon_end.as_str() {
+        return Ok(());
+    }
 
     let routines: Vec<Routine> = match only_routine {
         Some(id) => match routine_repo.get_by_id(id).await? {
@@ -85,17 +106,18 @@ pub async fn fill_occurrence_horizon(
         None => routine_repo.list_by_user_id(user_id).await?,
     };
 
-    // (routine_id, local_date) pairs the rules cover in the horizon, in
+    // (routine_id, local_date) pairs the rules cover in the window, in
     // standing routine order.
     let mut wanted: Vec<(String, String)> = Vec::new();
     for routine in &routines {
-        let Ok(dates) = occurrence_dates(&routine.rrule, &today, &horizon_end) else {
+        let Ok(dates) = occurrence_dates(&routine.rrule, &window_start, &horizon_end) else {
             // A rotten blob never fails the whole user: skip this routine.
             continue;
         };
         for date in dates {
-            // The window already starts at today; the guard states the rule.
-            if date.as_str() < today.as_str() {
+            // The window already starts at `window_start`; the guard states
+            // the rule.
+            if date.as_str() < window_start.as_str() {
                 continue;
             }
             wanted.push((routine.id.clone(), date));
@@ -103,7 +125,7 @@ pub async fn fill_occurrence_horizon(
     }
 
     let mut occurrences = occurrence_repo
-        .list_by_user_and_date_range(user_id, &today, &horizon_end)
+        .list_by_user_and_date_range(user_id, &window_start, &horizon_end)
         .await?;
     let stored: HashSet<(String, String)> = occurrences
         .iter()
@@ -125,7 +147,7 @@ pub async fn fill_occurrence_horizon(
         // Re-list: a row that lost the race kept the winner's UUID, which the
         // in-memory batch never saw.
         occurrences = occurrence_repo
-            .list_by_user_and_date_range(user_id, &today, &horizon_end)
+            .list_by_user_and_date_range(user_id, &window_start, &horizon_end)
             .await?;
     }
 
@@ -337,6 +359,10 @@ pub async fn run_agenda_fill_cron(
             user_id,
             now_unix,
             None,
+            // The cron owns today: a rule edit deliberately starts its refill
+            // tomorrow, and this tick is what fills today when the new rule
+            // covers it.
+            true,
         )
         .await
         {

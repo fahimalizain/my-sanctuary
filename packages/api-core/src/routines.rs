@@ -35,9 +35,12 @@
 //! - A rule change (`rrule`) reconciles the same future window for that
 //!   routine: rows the new rule does not cover and that the user never
 //!   touched are hard-deleted (with their agenda items), then the horizon is
-//!   filled again. Today and every earlier date are never deleted or edited;
-//!   existing rows are never rewritten. A title/estimate/sort-only update
-//!   does no occurrence/agenda work at all.
+//!   filled again. The prune runs **before** the new blob is saved, so a
+//!   failed prune is still retryable; the refill starts at **tomorrow** —
+//!   the edit never gives today a new occurrence, and the next `*/15` cron
+//!   tick fills today if the new rule covers it. Today and every earlier date
+//!   are never deleted or edited; existing rows are never rewritten. A
+//!   title/estimate/sort-only update does no occurrence/agenda work at all.
 
 use std::collections::{HashMap, HashSet};
 
@@ -335,7 +338,10 @@ pub async fn list_routines(
 ///   when the pile is empty. Titles are not unique.
 /// - Once the row is stored, the occurrence horizon (today … today+6) is
 ///   filled for it — so a brand-new routine shows on today's agenda without
-///   any read having to write. A validation failure still writes nothing.
+///   any read having to write. A validation failure still writes nothing, and
+///   a fill failure is swallowed: the routine is committed, so a 500 would
+///   make the client retry and insert a second routine (the `*/15` cron
+///   backfills the missing rows).
 pub async fn create_routine(
     list_repo: &dyn TaskListRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -380,7 +386,7 @@ pub async fn create_routine(
         .await?;
     // The horizon is materialized here, not on a read: fill the new routine's
     // today … today+6 occurrences (and their agenda rows) right away.
-    fill_occurrence_horizon(
+    if let Err(_) = fill_occurrence_horizon(
         routine_repo,
         occurrence_repo,
         agenda_repo,
@@ -388,9 +394,16 @@ pub async fn create_routine(
         user_id,
         now_unix,
         Some(&routine.id),
+        // Create owns today: the new routine shows on today's agenda at once.
+        true,
     )
     .await
-    .map_err(map_agenda_error)?;
+    {
+        // Best-effort: the routine row is already committed, so a 500 would
+        // make the client retry and insert a second routine. The `*/15` cron
+        // backfills every missing row (and never repairs a half-written
+        // Google log).
+    }
     Ok(RoutineResponse {
         routine: to_view(&routine, &taxonomy),
     })
@@ -406,12 +419,18 @@ pub async fn create_routine(
 ///   validated on its own (it carries its own DTSTART).
 /// - A missing, soft-deleted, or another user's routine is 404.
 /// - A **changed** `rrule` (trimmed text differs from the stored blob)
-///   reconciles the horizon: untouched rows from **tomorrow through today+6**
-///   that the new rule no longer covers are hard-deleted with their agenda
-///   items, then the horizon is filled again (which may add a missing today
-///   row the new rule covers). Today and the past are never deleted or
-///   edited, and neither is any row the user touched. A `None`/unchanged blob
-///   does no occurrence or agenda work at all.
+///   reconciles the horizon **before the new blob is saved**: untouched rows
+///   from **tomorrow through today+6** that the new rule no longer covers are
+///   hard-deleted with their agenda rows. A reconcile failure therefore
+///   returns with the old blob still stored — a retry still sees
+///   `changed_rule` and prunes again. After the save the horizon is refilled
+///   for **tomorrow through today+6** (`include_today: false`): the edit never
+///   adds an occurrence or agenda row on today; the next `*/15` cron tick
+///   fills today if the new rule covers it. That refill is best-effort — a
+///   failure must not 500 an edit whose prune already happened. Today and the
+///   past are never deleted or edited, and neither is any row the user
+///   touched. A `None`/unchanged blob does no occurrence or agenda work at
+///   all.
 pub async fn update_routine(
     category_repo: &dyn TaskCategoryRepo,
     routine_repo: &dyn RoutineRepo,
@@ -467,11 +486,6 @@ pub async fn update_routine(
         load_taxonomy(category_repo, user_id).await?
     };
 
-    let Some(updated) = routine_repo.update(id, updates).await? else {
-        // Deleted between the read and the write.
-        return Err(RoutinesError::NotFound);
-    };
-
     // Only a changed rule touches the materialized side. `None` (or a blob
     // that only differs in surrounding whitespace, which the insert already
     // trimmed away) is a title/estimate/sort-only update.
@@ -481,17 +495,29 @@ pub async fn update_routine(
         .map(|rrule| rrule.trim() != existing.rrule.trim())
         .unwrap_or(false);
     if changed_rule {
+        // PRUNE BEFORE SAVING: the new rule text is what decides which
+        // untouched rows survive — and if this fails, the stored blob is
+        // still the old rule, so a retry still sees `changed_rule` and prunes
+        // again. Saving first would make a failed prune unrepeatable.
         reconcile_occurrence_horizon(
             occurrence_repo,
             agenda_repo,
             calendars,
             user_id,
-            &updated.id,
-            &updated.rrule,
+            &existing.id,
+            updates.rrule.as_deref().unwrap_or_default().trim(),
             now_unix,
         )
         .await?;
-        fill_occurrence_horizon(
+    }
+
+    let Some(updated) = routine_repo.update(id, updates).await? else {
+        // Deleted between the read and the write.
+        return Err(RoutinesError::NotFound);
+    };
+
+    if changed_rule {
+        if let Err(_) = fill_occurrence_horizon(
             routine_repo,
             occurrence_repo,
             agenda_repo,
@@ -499,9 +525,16 @@ pub async fn update_routine(
             user_id,
             now_unix,
             Some(&updated.id),
+            // The edit skips today; the cron fills it on its next tick.
+            false,
         )
         .await
-        .map_err(map_agenda_error)?;
+        {
+            // Best-effort refill from tomorrow: the prune already happened,
+            // so a fill failure must not 500 an edit that landed. The next
+            // `*/15` cron tick fills any missing date — including today, which
+            // the edit deliberately leaves alone.
+        }
     }
     Ok(RoutineResponse {
         routine: to_view(&updated, &taxonomy),
@@ -577,9 +610,12 @@ async fn reconcile_window(
 
 /// Rewrites one routine's row for a **changed rule**: every untouched
 /// occurrence in `[tomorrow, today+6]` that the new rule no longer covers is
-/// hard-deleted together with its agenda item. Nothing else is touched —
-/// today, the past, dates outside the horizon (they do not exist), rows the
-/// user acted on, and rows sitting on a date the new rule still covers.
+/// hard-deleted together with its agenda item. `rrule` is the **new** blob —
+/// the caller passes it before the routine row is saved, so a failure here
+/// leaves the old rule stored and the next attempt prunes again. Nothing else
+/// is touched — today, the past, dates outside the horizon (they do not
+/// exist), rows the user acted on, and rows sitting on a date the new rule
+/// still covers.
 async fn reconcile_occurrence_horizon(
     occurrence_repo: &dyn OccurrenceRepo,
     agenda_repo: &dyn AgendaItemRepo,
@@ -612,10 +648,12 @@ async fn reconcile_occurrence_horizon(
 }
 
 /// Hard-deletes a routine's untouched occurrences inside the inclusive
-/// `[from, to]` window, plus their agenda items. `keep_dates` marks the civil
-/// dates the (new) rule still produces: a row on one of them is never a
-/// candidate. `None` deletes every untouched row in the window (the routine
-/// deletion path).
+/// `[from, to]` window, plus their agenda items — the memberships first, so a
+/// failure leaves the occurrences for a retry to prune again (the reverse
+/// order could strand agenda rows; a missing membership is re-attached by the
+/// next fill). `keep_dates` marks the civil dates the (new) rule still
+/// produces: a row on one of them is never a candidate. `None` deletes every
+/// untouched row in the window (the routine deletion path).
 async fn prune_untouched_occurrences(
     occurrence_repo: &dyn OccurrenceRepo,
     agenda_repo: &dyn AgendaItemRepo,
@@ -656,14 +694,15 @@ async fn prune_untouched_occurrences(
     if doomed.is_empty() {
         return Ok(());
     }
+    // The memberships go FIRST: if their delete fails, the occurrences are
+    // still there and a retry prunes again. Deleting occurrences first could
+    // leave their agenda rows dangling forever; this way a failure after the
+    // membership delete just means the next fill re-attaches a missing row —
+    // the acceptable direction.
+    agenda_repo
+        .delete_by_refs(user_id, AGENDA_KIND_OCCURRENCE, &doomed)
+        .await?;
     occurrence_repo.delete_by_ids(&doomed).await?;
-    for occurrence_id in &doomed {
-        // The occurrence is gone, so its membership must go with it — a
-        // dangling item could only render as an orphan.
-        agenda_repo
-            .delete_by_ref(user_id, AGENDA_KIND_OCCURRENCE, occurrence_id)
-            .await?;
-    }
     Ok(())
 }
 
@@ -1931,6 +1970,26 @@ mod tests {
         ) -> Result<(), RepoError> {
             self.stored.lock().unwrap().retain(|row| {
                 !(row.user_id == user_id && row.kind == kind && row.ref_id == ref_id)
+            });
+            Ok(())
+        }
+
+        async fn delete_by_refs(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_ids: &[String],
+        ) -> Result<(), RepoError> {
+            // Mirrors build_agenda_item_delete_by_refs_sql: every matching row
+            // of the user's `kind`; empty input touches nothing.
+            if ref_ids.is_empty() {
+                return Ok(());
+            }
+            let ref_set: HashSet<&str> = ref_ids.iter().map(|id| id.as_str()).collect();
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id
+                    && row.kind == kind
+                    && ref_set.contains(row.ref_id.as_str()))
             });
             Ok(())
         }

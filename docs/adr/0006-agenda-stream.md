@@ -182,10 +182,12 @@ backfilled into the past.
   away. The fill is idempotent: a second pass with unchanged data writes nothing.
 - A changed `rrule` reconciles **tomorrow … today+6** for that routine:
   untouched rows the new rule no longer covers are hard-deleted together with
-  their agenda rows, then the horizon is refilled. **Today and every earlier
-  date are never deleted or edited.** A title/estimate/order-only update does no
-  fill work at all. This replaces 0004's "rule changes never touch materialized
-  occurrences".
+  their agenda rows, then the horizon is refilled — that refill also starts at
+  **tomorrow**, so the edit itself never gives today a new occurrence or
+  agenda row; the next `*/15` cron tick fills today if the new rule covers it.
+  **Today and every earlier date are never deleted or edited.** A
+  title/estimate/order-only update does no fill work at all. This replaces
+  0004's "rule changes never touch materialized occurrences".
 - Deleting a routine hard-deletes that **same untouched future set** and leaves
   today and the past in D1 — where `done`/`skipped` history renders and
   `pending`/`in_progress` leftovers are hidden.

@@ -3052,6 +3052,26 @@ mod tests {
             Ok(())
         }
 
+        async fn delete_by_refs(
+            &self,
+            user_id: &str,
+            kind: &str,
+            ref_ids: &[String],
+        ) -> Result<(), RepoError> {
+            // Mirrors build_agenda_item_delete_by_refs_sql: every matching row
+            // of the user's `kind`; empty input touches nothing.
+            if ref_ids.is_empty() {
+                return Ok(());
+            }
+            let ref_set: HashSet<&str> = ref_ids.iter().map(|id| id.as_str()).collect();
+            self.stored.lock().unwrap().retain(|row| {
+                !(row.user_id == user_id
+                    && row.kind == kind
+                    && ref_set.contains(row.ref_id.as_str()))
+            });
+            Ok(())
+        }
+
         async fn max_sort_order(&self, user_id: &str, local_date: &str) -> Result<Option<i64>, RepoError> {
             Ok(self
                 .stored
@@ -7076,7 +7096,8 @@ mod tests {
             .collect()
     }
 
-    /// `fill_occurrence_horizon` with the shared repos and the test clock.
+    /// `fill_occurrence_horizon` with the shared repos and the test clock —
+    /// `include_today: true`, the cron/create window.
     fn fill_horizon(
         repos: &Repos,
         user_id: &str,
@@ -7090,6 +7111,7 @@ mod tests {
             user_id,
             NOW_UNIX,
             only_routine,
+            true,
         ))
     }
 
@@ -7560,6 +7582,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(occurrence_dates_in_store(&repos, "u-1"), before);
+    }
+
+    #[test]
+    fn update_routine_rule_edit_never_adds_an_occurrence_on_today() {
+        let repos = repos();
+        // A Monday-only rule whose DTSTART is in the past: create fills the
+        // horizon with the one Monday it covers (2026-08-24; today, the 23rd,
+        // is a Sunday).
+        let created = create(
+            &repos,
+            "u-1",
+            "Work",
+            "DTSTART:20260105T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+        )
+        .unwrap();
+        let routine_id = created.routine.id.clone();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), ["2026-08-24"]);
+
+        update(
+            &repos,
+            "u-1",
+            &routine_id,
+            &UpdateRoutine {
+                rrule: Some("DTSTART:20260105T053000\nRRULE:FREQ=DAILY".to_string()),
+                ..UpdateRoutine::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            pollster::block_on(repos.occurrences.get_by_routine_and_date(&routine_id, "2026-08-23"))
+                .unwrap()
+                .is_none(),
+            "the edit itself never materializes today"
+        );
+        assert_eq!(
+            occurrence_dates_in_store(&repos, "u-1"),
+            [
+                "2026-08-24", // tomorrow, and the rule's first horizon date
+                "2026-08-25",
+                "2026-08-26",
+                "2026-08-27",
+                "2026-08-28",
+                "2026-08-29", // today+6
+            ],
+            "the edit refills tomorrow … today+6"
+        );
+        assert_eq!(
+            membership_triples(&repos, "u-1")
+                .iter()
+                .map(|(_, _, date)| date.clone())
+                .collect::<Vec<_>>(),
+            [
+                "2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29"
+            ],
+            "no agenda row is appended on today"
+        );
+        // The cron's next tick owns today: with the new DAILY rule it fills.
+        fill_horizon(&repos, "u-1", Some(&routine_id)).unwrap();
+        assert_eq!(occurrence_dates_in_store(&repos, "u-1"), horizon_dates());
     }
 
     #[test]
