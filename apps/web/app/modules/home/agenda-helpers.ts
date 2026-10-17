@@ -119,13 +119,13 @@ export function streamBounds(
   return { from: first.from, to: last.to };
 }
 
-/** The next history window to request (ADR 0007): the stream ends at
- *  `today+6` and history pages prepend strictly before the anchor, so this is
- *  the ONE read that pages BACK. The window is 7 inclusive days ending the day
- *  before the oldest loaded date, capped so `from` never falls before
+/** The next history window to request (ADR 0007): the default read ends at
+ *  `today+6` and every history page sits strictly before the anchor, so this
+ *  is the ONE read that pages BACK. The window is 7 inclusive days ending the
+ *  day before the oldest loaded date, capped so `from` never falls before
  *  `earliest_date`, and `undefined` says there is nothing older to ask for.
- *  A gap between the oldest loaded page and the anchor (the anchor jumped
- *  forward) is filled FIRST: the window then ends on the anchor's eve.
+ *  A gap between the oldest loaded page and the anchor is filled FIRST: the
+ *  window then ends on the anchor's eve.
  *  The result always has `to < anchor_date`: the server no longer rejects a
  *  window that reaches the anchor (it clamps `to` to the anchor's eve), but a
  *  history page there would overlap the default read. */
@@ -167,96 +167,20 @@ export function previousHistoryWindow(
   return { from, to };
 }
 
-/** One stream page's param — the two reads `queries/agenda.ts` issues: the
- *  DEFAULT page (`{ kind: 'default' }` — the GET omits `from`/`to` entirely)
- *  and a 7-day HISTORY window. Duplicated from `queries/agenda.ts` on purpose:
- *  importing it back would cycle (that module imports this one), and the
- *  helpers stay dependency-light. Must stay structurally identical. */
-export type AgendaStreamPageParam =
-  | { kind: 'default' }
-  | { kind: 'history'; from: string; to: string };
-
-/** The forward counterpart of `previousHistoryWindow` — the param naming the
- *  page AFTER `lastPage` in TanStack's refetch walk (`infiniteQueryBehavior`):
- *  page 0 is re-read from its stored param, then `getNextPageParam` names every
- *  following page. `fetchedCount` is how many pages the refetch has already
- *  produced (the one being handed over included) and `pageBudget` how many it
- *  will produce in total (`oldPages.length`), so `slotsLeft` counts the params
- *  still to be named — this one included.
- *
- *  Rules, in order: a malformed `to`/`anchor_date` ends the walk; the DEFAULT
- *  page (`to >= anchor_date`) is always the last one; the day after a history
- *  page IS the anchor → the no-params read (no zero-length page, no overlap);
- *  the last slot is always spent on the default read, since TanStack stops at
- *  `pageBudget` pages and today plus the whole backlog matter far more than a
- *  possible hole (page 0 is stuck on its stored param and cannot be resized
- *  when the anchor jumps forward); otherwise a history window that never
- *  reaches the anchor — 7 inclusive days, stretched to the anchor's eve on the
- *  penultimate page (at most 31 inclusive days, the server's own cap). */
-export function nextStreamPageParam(
-  lastPage: { from: string; to: string; anchor_date: string },
-  fetchedCount: number,
-  pageBudget: number,
-): AgendaStreamPageParam | undefined {
-  const anchor = lastPage.anchor_date.trim();
-  const to = lastPage.to.trim();
-  if (!isCivilDateValid(anchor) || !isCivilDateValid(to)) return undefined;
-  // The default page ends at `today + 6` — always at/past the anchor — so
-  // nothing follows it. A clamped-away history page can ALSO start at the
-  // anchor (`from === anchor`, `to === anchor - 1`); its `to` keeps it
-  // history, which is why this reads `to` and never `from`.
-  if (to >= anchor) return undefined;
-  const nextFrom = addCivilDays(to, 1);
-  // The next history window would start ON the anchor day: that day and the
-  // six after it belong to the default read.
-  if (nextFrom >= anchor) return { kind: 'default' };
-  const slotsLeft = pageBudget - fetchedCount;
-  if (slotsLeft <= 1) return { kind: 'default' };
-  const eve = addCivilDays(anchor, -1);
-  // The penultimate page may stretch: the slot after it is the default read,
-  // so the window runs to the anchor's eve whenever 31 days are enough.
-  const rawTo =
-    slotsLeft === 2 ? addCivilDays(nextFrom, 30) : addCivilDays(to, 7);
-  const clampedTo = rawTo < eve ? rawTo : eve;
-  if (clampedTo < nextFrom) return { kind: 'default' };
-  return { kind: 'history', from: nextFrom, to: clampedTo };
-}
-
-/** TanStack's refetch walk, mirrored for tests
- *  (`@tanstack/query-core` `infiniteQueryBehavior`, v5): page 0 is fetched
- *  from `oldParams[0]`, every later page from `getNextPageParam` — a param of
- *  `null`/`undefined` ends the walk — and the walk never runs past
- *  `oldParams.length` pages. Returns the params it asked for and the pages it
- *  got, in walk order. */
-export function refetchAgendaPages<
-  T extends { from: string; to: string; anchor_date: string },
->(
-  oldParams: AgendaStreamPageParam[],
-  fetchPage: (param: AgendaStreamPageParam) => T,
-): { params: AgendaStreamPageParam[]; pages: T[] } {
-  const params: AgendaStreamPageParam[] = [];
-  const pages: T[] = [];
-  let currentPage = 0;
-  do {
-    let param: AgendaStreamPageParam;
-    if (currentPage === 0) {
-      // v5: `oldPageParams[0] ?? initialPageParam`.
-      param = oldParams[0] ?? { kind: 'default' };
-    } else {
-      const next = nextStreamPageParam(
-        pages[pages.length - 1],
-        pages.length,
-        oldParams.length,
-      );
-      // v5: `if (currentPage > 0 && param == null) break;`.
-      if (next == null) break;
-      param = next;
-    }
-    pages.push(fetchPage(param));
-    params.push(param);
-    currentPage += 1;
-  } while (currentPage < oldParams.length);
-  return { params, pages };
+/** History's page 0 for an anchor: the 7-day window ending the day before
+ *  `anchor`, floored at `earliest` — exactly the window
+ *  `previousHistoryWindow` names for a cache that holds nothing but the
+ *  anchor day. `undefined` when nothing is older than the anchor (`earliest`
+ *  is at or past its eve): there is no page 0, so Home never opens the history
+ *  query at all. The window ends on the anchor's eve, so it ABUTS the default
+ *  read and `getNextPageParam` only ever steps further back. */
+export function historyPageZero(
+  anchor: string,
+  earliest: string,
+): { from: string; to: string } | undefined {
+  return previousHistoryWindow([
+    { from: anchor, to: anchor, anchor_date: anchor, earliest_date: earliest },
+  ]);
 }
 
 /** All loaded items bucketed by their civil `local_date`, each bucket in the
@@ -335,9 +259,13 @@ export function isAgendaItemPending(item: AgendaItemRecord): boolean {
   return false;
 }
 
-/** Home's stream exactly as React Query caches it (see `queries/agenda.ts` —
- *  the types live here too so the helpers stay dependency-light). */
-type AgendaStreamData = InfiniteData<AgendaResponse, AgendaStreamPageParam>;
+/** Home's agenda cache as the optimistic edits see it (`readAgendaPages` in
+ *  `queries/agenda.ts` concatenates the two caches into one page list). Only
+ *  `pages` is ever read here; a page's param is its own `from`/`to` window. */
+type AgendaStreamData = InfiniteData<
+  AgendaResponse,
+  { from: string; to: string }
+>;
 
 function streamItems(data: AgendaStreamData | undefined): AgendaItemRecord[] {
   return (data?.pages ?? []).flatMap((page) => page.items);

@@ -10,15 +10,46 @@ test('queryKeys.tasks.all is ["tasks"]', () => {
   assert.deepEqual(queryKeys.tasks.all, ['tasks']);
 });
 
-test('queryKeys.agenda.stream() is ["agenda", "stream"]', () => {
-  assert.deepEqual(queryKeys.agenda.stream(), ['agenda', 'stream']);
+test('queryKeys.agenda.current() is ["agenda", "current"]', () => {
+  assert.deepEqual(queryKeys.agenda.current(), ['agenda', 'current']);
 });
 
-test('queryKeys.agenda.stream() starts with queryKeys.agenda.all', () => {
+test('queryKeys.agenda.current() starts with queryKeys.agenda.all', () => {
   assert.deepEqual(
-    queryKeys.agenda.stream().slice(0, queryKeys.agenda.all.length),
+    queryKeys.agenda.current().slice(0, queryKeys.agenda.all.length),
     queryKeys.agenda.all,
   );
+});
+
+test('queryKeys.agenda.history(anchor) is ["agenda", "history", anchor]', () => {
+  assert.deepEqual(queryKeys.agenda.history('2026-08-20'), [
+    'agenda',
+    'history',
+    '2026-08-20',
+  ]);
+});
+
+test('queryKeys.agenda.history() starts with queryKeys.agenda.all', () => {
+  assert.deepEqual(
+    queryKeys.agenda
+      .history('2026-08-20')
+      .slice(0, queryKeys.agenda.all.length),
+    queryKeys.agenda.all,
+  );
+});
+
+test('queryKeys.agenda.history(): each anchor is its own cache', () => {
+  // The anchor IS the history key: a moved anchor must never read the
+  // previous anchor's pages (they end before the new anchor's eve).
+  assert.notDeepEqual(
+    queryKeys.agenda.history('2026-08-20'),
+    queryKeys.agenda.history('2026-08-18'),
+  );
+  assert.deepEqual(queryKeys.agenda.history('2026-08-18'), [
+    'agenda',
+    'history',
+    '2026-08-18',
+  ]);
 });
 
 test('queryKeys.calendar.events("a", "b") is ["calendar", "events", "a", "b"]', () => {

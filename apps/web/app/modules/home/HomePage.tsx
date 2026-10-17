@@ -1,25 +1,28 @@
-// Home — the agenda as an infinite stream of days, then a Backlog section
+// Home — the agenda as an infinite run of days, then a Backlog section
 // (ADR 0004 amendment, slice 5; ADR 0007, slice 6). One vertically scrolling
 // run of civil days inside its own scroll container: opening the page lands on
 // the server's `anchor_date` (the oldest past day that still has something
 // pending), scroll UP for history, DOWN to the end of today+6. There is NO
 // future page — each loaded page paints its own `from…to`, so a history page
-// and a later anchor never get gap-filled into a wall of empty days. Each day
-// keeps the two piles (living rows ranked by `sort_order`, then the muted
-// Completed dump), plus a sticky header; a past day with pending work shows an
-// amber count and a one-tap "Move all to today". Under the last day sits the
-// **Backlog**: the dated future stretch (grouped by day), then the `OPEN` rows
-// one Board-ordered list. Dragging a row onto today or a later stream day
-// reschedules it (`/reschedule` with the target rank — an `OPEN` task becomes
-// `PLANNED`); a same-day drop is the old `/move` reorder; dragging a row into
-// the Backlog drops it (`{ backlog: true }` → `OPEN` on today+50y), and
-// dragging one OPEN row onto another is the Board's task `/move` so Home and
-// Board share one order. Occurrences and running tasks are never dropped
-// there. The date picker, the add-task picker and remove-from-day are gone —
-// tasks are born on the Board, and a task's row follows the task's own
-// lifecycle. Built on the existing task/occurrence actions (complete, skip,
-// reopen, start, pause, rename, TaskModal, error banner, optimistic `['tasks']`
-// patches) and reschedule/complete art.
+// and a later anchor never get gap-filled into a wall of empty days. The cache
+// itself is two reads (`queries/agenda.ts`): the default window
+// (`anchor_date … today+6` plus the backlog) is a plain query, and history is
+// a second, lazy query keyed by the anchor it walks behind — so a refetch can
+// never drop today. Each day keeps the two piles (living rows ranked by
+// `sort_order`, then the muted Completed dump), plus a sticky header; a past
+// day with pending work shows an amber count and a one-tap "Move all to
+// today". Under the last day sits the **Backlog**: the dated future stretch
+// (grouped by day), then the `OPEN` rows one Board-ordered list. Dragging a row
+// onto today or a later stream day reschedules it (`/reschedule` with the
+// target rank — an `OPEN` task becomes `PLANNED`); a same-day drop is the old
+// `/move` reorder; dragging a row into the Backlog drops it (`{ backlog: true
+// }` → `OPEN` on today+50y), and dragging one OPEN row onto another is the
+// Board's task `/move` so Home and Board share one order. Occurrences and
+// running tasks are never dropped there. The date picker, the add-task picker
+// and remove-from-day are gone — tasks are born on the Board, and a task's row
+// follows the task's own lifecycle. Built on the existing task/occurrence
+// actions (complete, skip, reopen, start, pause, rename, TaskModal, error
+// banner, optimistic `['tasks']` patches) and reschedule/complete art.
 
 import {
   useCallback,
@@ -61,10 +64,13 @@ import { TaskModal } from '@/app/components/TaskModal';
 import { quotes } from '@/app/mock-data';
 import { moveDayToToday } from '@/lib/api';
 import {
-  useAgendaStream,
+  readAgendaPages,
+  useAgendaCurrent,
+  useAgendaHistory,
   useMoveAgendaItem,
   useRescheduleAgendaItem,
-  type AgendaStreamData,
+  writeAgendaPages,
+  type AgendaPages,
 } from '@/app/queries/agenda';
 import { queryKeys } from '@/app/queries/keys';
 import {
@@ -95,6 +101,7 @@ import {
   dedupeAgendaItems,
   eachCivilDate,
   groupItemsByDate,
+  historyPageZero,
   isAgendaItemPending,
   isOpenBacklogTask,
   moveItemToBacklog,
@@ -108,6 +115,7 @@ import {
 } from './agenda-helpers';
 import type {
   AgendaItemRecord,
+  AgendaResponse,
   MoveTaskInput,
   OccurrenceStatus,
   RescheduleAgendaItemInput,
@@ -123,11 +131,19 @@ import type {
 const DAY_ID_PREFIX = 'day-';
 /** The Backlog section's droppable id — a constant, never a `day-` id. */
 const BACKLOG_DROPPABLE_ID = 'backlog';
-/** Hard cap on the Today button's crawl up into history to an unloaded today. */
-const MAX_TODAY_FETCHES = 30;
 
 function dayElementId(date: string): string {
   return `${DAY_ID_PREFIX}${date}`;
+}
+
+/** The default read's own `anchor_date` as the cache holds it right now — the
+ *  key that names Home's history cache and the split in `writeAgendaPages`.
+ *  Empty until the default read resolves (nothing to read or write then). */
+function currentAnchor(): string {
+  return (
+    queryClient.getQueryData<AgendaResponse>(queryKeys.agenda.current())
+      ?.anchor_date ?? ''
+  );
 }
 
 /** Milliseconds until the next midnight in `timeZone` (an IANA name), read
@@ -429,32 +445,56 @@ function BacklogSection({
 }
 
 export function HomePage() {
-  // The stream: page 0 is the server's default read (the GET omits `from`/
-  // `to` entirely, so the browser never computes today) — `anchor_date …
-  // today+6` plus the backlog; `pages` grows UP for history only.
-  const stream = useAgendaStream();
-  const pages = useMemo(() => stream.data?.pages ?? [], [stream.data]);
-  const firstPage = pages[0];
+  // The two agenda reads (ADR 0004 amendment, ADR 0007): the default window —
+  // `anchor_date … today+6` plus the backlog — is a plain query, so an
+  // invalidation always refetches today; history is a second, lazy query keyed
+  // by the anchor it walks behind.
+  const current = useAgendaCurrent();
+  const currentPage = current.data;
   // The server's civil today (primary calendar time zone) — refreshed from
-  // every read; anchors the day headers, the Play gate, the reschedule
-  // floor and the Today button.
-  const serverToday = firstPage?.today ?? '';
-  const anchorDate = firstPage?.anchor_date ?? '';
-  // The zone `today` is computed in — the freshest read of it is the latest
-  // page. Drives the midnight refresh below.
-  const timeZone = pages[pages.length - 1]?.time_zone ?? '';
-  // The day spine: each loaded page's OWN `from…to`, pages sorted by `from`,
-  // deduped (the first page to claim a date wins). Deliberately NOT one
-  // `eachCivilDate(first.from, last.to)` run — that would fill the hole
-  // between a history page and a later anchor with empty days. Backlog rows
-  // never enter it, so it can never walk out to today+50y.
-  const days = useMemo(() => {
-    const ordered = [...pages].sort((a, b) =>
+  // every read; anchors the day headers, the Play gate, the reschedule floor
+  // and the Today button.
+  const serverToday = currentPage?.today ?? '';
+  const anchorDate = currentPage?.anchor_date ?? '';
+  // The server's oldest row — the floor of the history walk (`earliest_date`),
+  // and what decides whether history has anything to load at all.
+  const earliestDate = currentPage?.earliest_date ?? '';
+  // The zone `today` is computed in. Drives the midnight refresh below.
+  const timeZone = currentPage?.time_zone ?? '';
+  // History never fetches on mount: the user has to reach the top of the
+  // stream first (see `maybeFetchPreviousPage`). State, not a ref — flipping it
+  // is what re-renders the hook into an enabled query.
+  const [historyEnabled, setHistoryEnabled] = useState(false);
+  const history = useAgendaHistory(anchorDate, earliestDate, historyEnabled);
+  // The history pages in query order (page 0 is the anchor's eve week, older
+  // weeks are appended) — the span the top-edge gesture grows.
+  const historyPages = useMemo(() => history.data?.pages ?? [], [history.data]);
+  // The oldest history week loaded, or null while none is. A top-edge fetch
+  // PREPENDS in the rendered spine exactly when this moves back.
+  const historyOldestFrom = useMemo(
+    () =>
+      historyPages.reduce<string | null>(
+        (oldest, page) =>
+          oldest === null || page.from < oldest ? page.from : oldest,
+        null,
+      ),
+    [historyPages],
+  );
+  // The rendered day spine: history weeks (sorted by `from`) then the default
+  // window's own `from…to`, deduped (the first page to claim a date wins).
+  // Deliberately NOT one `eachCivilDate(first.from, last.to)` run — that would
+  // fill the hole between a history page and a later anchor with empty days.
+  // Backlog rows never enter it, so it can never walk out to today+50y.
+  const pages = useMemo(() => {
+    const ordered = [...historyPages].sort((a, b) =>
       a.from < b.from ? -1 : a.from > b.from ? 1 : 0,
     );
+    return currentPage ? [...ordered, currentPage] : ordered;
+  }, [historyPages, currentPage]);
+  const days = useMemo(() => {
     const seen = new Set<string>();
     const spine: string[] = [];
-    for (const page of ordered) {
+    for (const page of pages) {
       for (const day of eachCivilDate(page.from, page.to)) {
         if (seen.has(day)) continue;
         seen.add(day);
@@ -471,11 +511,12 @@ export function HomePage() {
     [pages],
   );
   const byDate = useMemo(() => groupItemsByDate(items), [items]);
-  // The Backlog (ADR 0007): the pages' `backlog` arrays, split into the dated
-  // stretch (grouped by day) and the OPEN stretch (server order = Board order).
+  // The Backlog (ADR 0007): the DEFAULT read's `backlog` array (a history read
+  // always answers with an empty one), split into the dated stretch (grouped by
+  // day) and the OPEN stretch (server order = Board order).
   const backlogItems = useMemo(
-    () => dedupeAgendaItems(pages.flatMap((page) => page.backlog ?? [])),
-    [pages],
+    () => dedupeAgendaItems(currentPage?.backlog ?? []),
+    [currentPage],
   );
   const backlogSplit = useMemo(
     () => splitBacklogSection(backlogItems, serverToday),
@@ -534,25 +575,24 @@ export function HomePage() {
   // Cache plumbing
   // ──────────────────────────────────────────
 
-  /** The stream as it is RIGHT NOW (never the render-time snapshot): a drag
-   *  can land after a refetch resolved, and the optimistic paint must build
-   *  on what is actually cached. */
-  const readStream = useCallback(
-    (): AgendaStreamData | undefined =>
-      queryClient.getQueryData<AgendaStreamData>(queryKeys.agenda.stream()),
-    [],
-  );
+  /** Home's whole agenda cache as it is RIGHT NOW (never the render-time
+   *  snapshot): a drag can land after a refetch resolved, and the optimistic
+   *  paint must build on what is actually cached. `anchor` is the default
+   *  read's own `anchor_date` — without a default read there is nothing to
+   *  read or write. */
+  const readStream = useCallback((): AgendaPages | undefined => {
+    const anchor = currentAnchor();
+    if (!anchor) return undefined;
+    return readAgendaPages(anchor);
+  }, []);
 
   const patchStream = useCallback(
     (
-      updater: (
-        current: AgendaStreamData | undefined,
-      ) => AgendaStreamData | undefined,
+      updater: (current: AgendaPages | undefined) => AgendaPages | undefined,
     ) => {
-      queryClient.setQueryData<AgendaStreamData>(
-        queryKeys.agenda.stream(),
-        updater,
-      );
+      const anchor = currentAnchor();
+      if (!anchor) return;
+      writeAgendaPages(anchor, updater(readAgendaPages(anchor)));
     },
     [],
   );
@@ -565,11 +605,11 @@ export function HomePage() {
    *  Completed dump). */
   const placeTaskOnToday = useCallback(
     (
-      current: AgendaStreamData | undefined,
+      data: AgendaPages | undefined,
       itemId: string,
       fn: (item: AgendaItemRecord) => AgendaItemRecord,
-    ): AgendaStreamData | undefined => {
-      const next = updateStreamItem(current, itemId, fn);
+    ): AgendaPages | undefined => {
+      const next = updateStreamItem(data, itemId, fn);
       const row = streamItemsOf(next).find((entry) => entry.id === itemId);
       if (!row || !serverToday || row.local_date === serverToday) return next;
       return moveStreamItem(
@@ -598,7 +638,7 @@ export function HomePage() {
 
   /** The OPEN stretch of the Backlog as the cache holds it right now (server
    *  order, which is the Board's `tasks.sort_order` order). */
-  const openBacklogRowsOf = (data: AgendaStreamData | undefined) =>
+  const openBacklogRowsOf = (data: AgendaPages | undefined) =>
     splitBacklogSection(
       dedupeAgendaItems(
         (data?.pages ?? []).flatMap((page) => page.backlog ?? []),
@@ -1408,62 +1448,81 @@ export function HomePage() {
   // fetch settles (see `maybeFetchMore`).
   const topVisibleRef = useRef(false);
   // History loads stay off until the anchor landing scroll has been placed:
-  // an auto-prepend during that first paint would fetch a week and shift the
+  // an auto-load during that first paint would fetch a week and shift the
   // stream before the user has seen the anchor. Armed at the end of the
   // landing layout effect (see below).
   const historyArmedRef = useRef(false);
-  // Scroll geometry captured before a prepend, so the extra height can be
-  // added to `scrollTop` afterwards — the anchor must not jump.
+  // Scroll geometry captured before a history week loads, so the extra height
+  // can be added to `scrollTop` afterwards — the anchor must not jump.
   const prependRef = useRef<{
     scrollHeight: number;
-    firstFrom: string | null;
+    // The oldest history week loaded at capture time (null when none was):
+    // history pages are APPENDED, so a new week is a prepend in the rendered
+    // spine exactly when this moves back.
+    oldestFrom: string | null;
     pageCount: number;
   } | null>(null);
   const landedOnAnchorRef = useRef(false);
   const [todayVisible, setTodayVisible] = useState(false);
-  // The Today button's scroll waits for React to commit the fetched days
-  // (`fetchPreviousPage()` resolves before the notify manager's timeout
-  // flush, so the DOM right after the await is still the old one). State, not
-  // a ref: clicking Today while its day is ALREADY loaded (just off screen)
+  // The Today button's scroll waits for React to commit the painted day. State,
+  // not a ref: clicking Today while its day is ALREADY loaded (just off screen)
   // fetches nothing, so nothing else would re-run the layout effect that
   // scrolls.
   const [scrollTodayPending, setScrollTodayPending] = useState(false);
 
-  const hasPreviousPage = stream.hasPreviousPage;
-  const isFetchingPreviousPage = stream.isFetchingPreviousPage;
-  const fetchPreviousPage = stream.fetchPreviousPage;
+  // The history walk's own flags: older weeks APPEND to the history query, so
+  // the top-edge gesture is a `fetchNextPage` while `hasNextPage`.
+  const hasOlderHistory = history.hasNextPage;
+  const isFetchingOlderHistory = history.isFetchingNextPage;
+  const fetchOlderHistory = history.fetchNextPage;
   const pageCount = pages.length;
 
   const rememberPrepend = useCallback(() => {
     const root = scrollRef.current;
     if (!root) return;
-    const data = readStream();
     prependRef.current = {
       scrollHeight: root.scrollHeight,
-      firstFrom: data?.pages[0]?.from ?? null,
-      pageCount: data?.pages.length ?? 0,
+      oldestFrom: historyOldestFrom,
+      pageCount: historyPages.length,
     };
-  }, [readStream]);
+  }, [historyOldestFrom, historyPages.length]);
 
   /** The history gesture: the stream is sitting at its top edge. The anchor
    *  day lands aligned with the top sentinel, so `scrollTop` starts at ~0 —
    *  there is no room left for a "moved up by 4px" delta, and a wheel-up at
    *  the clamped edge fires no scroll event at all. `scrollTop <= 1` catches
    *  the edge itself; `topVisibleRef` catches the approach. Returns true when
-   *  a fetch was started (so the caller can skip the opposite direction). */
+   *  a fetch was started (so the caller can skip the opposite direction).
+   *
+   *  The first hit is what turns the history query on (state, so the hook
+   *  re-renders and page 0 — the anchor's eve week — loads); every later hit
+   *  appends the week before the oldest loaded one. */
   const maybeFetchPreviousPage = useCallback((): boolean => {
     if (!historyArmedRef.current) return false; // still landing on the anchor
     const root = scrollRef.current;
     if (!root) return false;
     if (root.scrollTop > 1 && !topVisibleRef.current) return false;
-    if (!hasPreviousPage || isFetchingPreviousPage) return false;
+    if (!historyEnabled) {
+      // Nothing older than the anchor: there is no page 0, so Home never asks
+      // for an empty week (the query stays off).
+      if (!anchorDate || !historyPageZero(anchorDate, earliestDate)) {
+        return false;
+      }
+      rememberPrepend();
+      setHistoryEnabled(true);
+      return true;
+    }
+    if (!hasOlderHistory || isFetchingOlderHistory) return false;
     rememberPrepend();
-    void fetchPreviousPage();
+    void fetchOlderHistory();
     return true;
   }, [
-    hasPreviousPage,
-    isFetchingPreviousPage,
-    fetchPreviousPage,
+    anchorDate,
+    earliestDate,
+    historyEnabled,
+    hasOlderHistory,
+    isFetchingOlderHistory,
+    fetchOlderHistory,
     rememberPrepend,
   ]);
 
@@ -1510,7 +1569,7 @@ export function HomePage() {
     );
     observer.observe(top);
     return () => observer.disconnect();
-  }, [pageCount, hasPreviousPage, isFetchingPreviousPage, maybeFetchMore]);
+  }, [pageCount, hasOlderHistory, isFetchingOlderHistory, maybeFetchMore]);
 
   // Land on `anchor_date` once, aligned to the top of the stream. Later
   // prepends must NOT re-run this (the height compensation below keeps the
@@ -1537,22 +1596,24 @@ export function HomePage() {
     return () => cancelAnimationFrame(frame);
   }, [anchorDate, days, maybeFetchMore]);
 
-  // A prepend adds height ABOVE the viewport: add exactly that much to
-  // `scrollTop` so the day under the user's eyes does not jump. Only a REAL
-  // prepend counts — an optimistic `setQueryData` while a previous-page fetch
-  // is in flight must leave the recorded geometry alone, or the page that
-  // finally arrives gets no correction at all.
+  // A history week adds height ABOVE the viewport: add exactly that much to
+  // `scrollTop` so the day under the user's eyes does not jump. History pages
+  // are APPENDED, so a new week is a prepend in the rendered spine exactly
+  // when the oldest loaded `from` moves back. Only a REAL prepend counts — an
+  // optimistic `setQueryData` while a fetch is in flight must leave the
+  // recorded geometry alone, or the week that finally arrives gets no
+  // correction at all.
   useLayoutEffect(() => {
     const root = scrollRef.current;
     const recorded = prependRef.current;
     if (!root || !recorded) return;
-    const firstFrom = pages[0]?.from ?? null;
     if (
-      pages.length <= recorded.pageCount ||
-      firstFrom === recorded.firstFrom
+      historyPages.length <= recorded.pageCount ||
+      historyOldestFrom === recorded.oldestFrom
     ) {
-      // An append, an optimistic edit, or a failure — the viewport is
-      // already right, and the pending prepend (if any) is still coming.
+      // An optimistic edit, a failed fetch, or a quiet refetch that re-read
+      // the same weeks — the viewport is already right, and the pending
+      // prepend (if any) is still coming.
       return;
     }
     prependRef.current = null;
@@ -1565,23 +1626,25 @@ export function HomePage() {
       // observer callback confirms the move.
       topVisibleRef.current = false;
     }
-  }, [pages]);
+  }, [historyPages, historyOldestFrom]);
 
-  // The previous-page fetch settled without growing the stream into a new
-  // `from` (it failed, or the server had nothing older): drop the pending
-  // measurement rather than let it sit across later unrelated page changes.
-  // A passive effect, on purpose — layout effects have already run for this
-  // commit, so a prepend that DID land has been applied above.
+  // The history fetch settled without growing the cache into a new oldest week
+  // (it failed, or the server had nothing older): drop the pending measurement
+  // rather than let it sit across later unrelated page changes. A passive
+  // effect, on purpose — layout effects have already run for this commit, so a
+  // prepend that DID land has been applied above.
   useEffect(() => {
-    if (isFetchingPreviousPage) return;
+    if (history.isFetching) return;
     const recorded = prependRef.current;
     if (!recorded) return;
-    const firstFrom = pages[0]?.from ?? null;
-    if (pages.length > recorded.pageCount && firstFrom !== recorded.firstFrom) {
+    if (
+      historyPages.length > recorded.pageCount &&
+      historyOldestFrom !== recorded.oldestFrom
+    ) {
       return; // the layout effect above consumed it
     }
     prependRef.current = null;
-  }, [isFetchingPreviousPage, pages]);
+  }, [history.isFetching, historyPages, historyOldestFrom]);
 
   // Is today's header on screen? Its absence (today not loaded yet) counts as
   // "not visible", so the Today button shows.
@@ -1606,47 +1669,15 @@ export function HomePage() {
     return () => observer.disconnect();
   }, [serverToday, pageCount, days]);
 
-  /** The floating Today button: today always sits inside the default window
-   *  (`anchor_date <= today <= today+6`), so this only has to walk the CACHE
-   *  (page `from`/`to`, never the DOM) UP into history when a loaded history
-   *  page starts after it — capped, a crawl and not a loop, and never a
-   *  forward fetch (there is no forward page). The scroll itself is placed by
-   *  the layout effect below: `fetchPreviousPage()` resolves before React has
-   *  committed the new days (the notify manager flushes on a timeout), so the
-   *  DOM is still the old one here. */
-  const scrollToToday = async () => {
-    const root = scrollRef.current;
-    if (!root || !serverToday) return;
+  /** The floating Today button: today sits on the default read (`anchor_date
+   *  <= today <= today+6`), which is always loaded once Home paints, so this
+   *  only has to scroll its header into view — no crawling up through history
+   *  to search unloaded days. The scroll itself is placed by the layout effect
+   *  below: the day is not in the DOM until the read commits its days. */
+  const scrollToToday = () => {
+    if (!scrollRef.current || !serverToday) return;
     historyArmedRef.current = true;
     setScrollTodayPending(true);
-    for (let step = 0; step < MAX_TODAY_FETCHES; step += 1) {
-      const loaded = readStream()?.pages ?? [];
-      const first = loaded[0];
-      const last = loaded[loaded.length - 1];
-      if (!first || !last) break;
-      if (first.from <= serverToday && serverToday <= last.to) break;
-      // Past the loaded end: only the default window can hold today, and it
-      // is always loaded — no forward page to walk.
-      if (serverToday >= first.from) break;
-      // The back-scroll floor is the server's oldest row.
-      if (first.from <= first.earliest_date) break;
-      rememberPrepend();
-      await fetchPreviousPage();
-      // A failed / no-op fetch makes no new page — stop rather than spin.
-      if ((readStream()?.pages.length ?? 0) <= loaded.length) break;
-    }
-    // The crawl can stop short of today: the fetch cap, a failed fetch, or
-    // `earliest_date` refusing an older page. Disarm in that case — a flag
-    // left set would yank the viewport the next time today's header renders
-    // for an unrelated reason (the user simply scrolling to it). When today
-    // IS loaded, keep it set so the layout effect places the scroll once the
-    // new days are committed.
-    const settled = readStream()?.pages ?? [];
-    const first = settled[0];
-    const last = settled[settled.length - 1];
-    if (!first || !last || serverToday < first.from || serverToday > last.to) {
-      setScrollTodayPending(false);
-    }
   };
 
   // Today is in the DOM: place the pending scroll now. Fires on the commit
@@ -1666,17 +1697,23 @@ export function HomePage() {
   // Render
   // ──────────────────────────────────────────
 
+  // The default read drives the page: no pages until it resolves, and its
+  // failure is the only one that can wipe the stream.
   const loadError =
-    stream.error instanceof Error
-      ? stream.error.message
-      : stream.error
+    current.error instanceof Error
+      ? current.error.message
+      : current.error
         ? 'Failed to load agenda'
         : null;
   const hasPages = pages.length > 0;
-  // A later read failed (a history fetch or a background refetch): a one-line
-  // notice above the still-mounted days — never a wipe.
-  const pageFetchError =
-    stream.isFetchPreviousPageError || (hasPages && !!loadError);
+  // A history fetch failed: a one-line notice above the still-mounted days —
+  // never a wipe of today. `isFetchNextPageError` covers an appended week; a
+  // history query that errored with no pages at all is the opening eve-week
+  // fetch (an `enabled` flip, which TanStack does not tag as a fetch-more).
+  const historyFetchError =
+    history.isFetchNextPageError ||
+    (historyEnabled && !history.data && history.isError);
+  const pageFetchError = historyFetchError || (hasPages && !!loadError);
 
   // Drag sensors: a vertical list with a dedicated grip means a short move
   // activates — Mouse 8px + Touch 8px, still NO 250ms hold (a long-press
@@ -1750,11 +1787,14 @@ export function HomePage() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (stream.isFetchPreviousPageError) {
+                    // A failed history page retries itself: `fetchNextPage` on
+                    // a query with no pages yet re-reads page 0 from
+                    // `initialPageParam` (the eve week).
+                    if (historyFetchError) {
                       rememberPrepend();
-                      void stream.fetchPreviousPage();
+                      void history.fetchNextPage();
                     } else {
-                      void stream.refetch();
+                      void current.refetch();
                     }
                   }}
                   className="text-xs font-medium underline"
@@ -1770,8 +1810,8 @@ export function HomePage() {
               ref={scrollRef}
               className="relative h-[calc(100dvh-17rem)] min-h-[20rem] overflow-y-auto overscroll-contain rounded-xl border border-border/60 bg-cream lg:h-[calc(100dvh-12rem)]"
             >
-              {/* First load — no pages yet */}
-              {!hasPages && stream.isLoading && (
+              {/* First load — the default read has not resolved yet */}
+              {!hasPages && current.isLoading && (
                 <div className="flex items-center justify-center gap-2 py-24 text-muted-foreground">
                   <Loader2 className="h-5 w-5 animate-spin" />
                   Loading agenda…
@@ -1779,13 +1819,13 @@ export function HomePage() {
               )}
 
               {/* First fetch failed and there is nothing to show */}
-              {!hasPages && !stream.isLoading && loadError && (
+              {!hasPages && !current.isLoading && loadError && (
                 <div className="m-2 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
                   <p className="text-sm">{loadError}</p>
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => void stream.refetch()}
+                    onClick={() => void current.refetch()}
                   >
                     Retry
                   </Button>
