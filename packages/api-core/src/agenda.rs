@@ -581,6 +581,40 @@ pub(crate) fn add_civil_days(date: &str, days: i64) -> Result<String, AgendaErro
 }
 
 // ──────────────────────────────────────────
+// The backlog date and the 10-year line (ADR 0007)
+// ──────────────────────────────────────────
+
+/// Backlog date offset: today + 50 years, in calendar months.
+pub(crate) const BACKLOG_OFFSET_MONTHS: u32 = 600;
+/// The planning horizon: today + 10 years, in calendar months. A row dated
+/// `>=` this is in the backlog region.
+pub(crate) const PLANNING_HORIZON_MONTHS: u32 = 120;
+
+/// Adds `months` calendar months to a validated `YYYY-MM-DD`.
+///
+/// Uses [`chrono::NaiveDate::checked_add_months`], which **clamps** the day
+/// (2024-02-29 + 12 months = 2025-02-28), never rolls into March. Overflow
+/// past chrono's range is a 400, never a panic.
+pub(crate) fn add_civil_months(date: &str, months: u32) -> Result<String, AgendaError> {
+    civil_date(date)?
+        .checked_add_months(chrono::Months::new(months))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .ok_or_else(|| AgendaError::Invalid("date out of range".to_string()))
+}
+
+/// The backlog date: civil today + 50 years (ADR 0007). Computed at write
+/// time, never a stored constant.
+pub(crate) fn backlog_local_date(today: &str) -> Result<String, AgendaError> {
+    add_civil_months(today, BACKLOG_OFFSET_MONTHS)
+}
+
+/// The 10-year line: civil today + 10 years (ADR 0007). A date `>=` this is
+/// in the backlog region; reschedule's upper bound is exclusive.
+pub(crate) fn planning_horizon_date(today: &str) -> Result<String, AgendaError> {
+    add_civil_months(today, PLANNING_HORIZON_MONTHS)
+}
+
+// ──────────────────────────────────────────
 // POST /api/agenda/items/:id/move — reorder within the date's pile
 // ──────────────────────────────────────────
 
@@ -4509,6 +4543,52 @@ mod tests {
             id,
             NOW_UNIX,
         ))
+    }
+
+    // ──────────────────────────────────────────
+    // Backlog date arithmetic (ADR 0007)
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn add_civil_months_clamps_the_day_and_crosses_years() {
+        assert_eq!(add_civil_months("2026-10-17", 600).unwrap(), "2076-10-17");
+        assert_eq!(
+            add_civil_months("2024-02-29", 600).unwrap(),
+            "2074-02-28",
+            "Feb 29 clamps to Feb 28, never rolls into March"
+        );
+        assert_eq!(add_civil_months("2024-02-29", 120).unwrap(), "2034-02-28");
+        assert_eq!(add_civil_months("2026-08-23", 600).unwrap(), "2076-08-23");
+    }
+
+    #[test]
+    fn backlog_and_planning_horizon_dates_use_the_shared_month_math() {
+        assert_eq!(backlog_local_date("2026-08-23").unwrap(), "2076-08-23");
+        assert_eq!(planning_horizon_date("2026-08-23").unwrap(), "2036-08-23");
+        assert_eq!(
+            backlog_local_date("2026-08-23").unwrap(),
+            add_civil_months("2026-08-23", BACKLOG_OFFSET_MONTHS).unwrap()
+        );
+        assert_eq!(
+            planning_horizon_date("2026-08-23").unwrap(),
+            add_civil_months("2026-08-23", PLANNING_HORIZON_MONTHS).unwrap()
+        );
+    }
+
+    #[test]
+    fn civil_month_helpers_reject_a_non_date() {
+        for bad in ["not a date", "2026-13-01", "2026-02-30"] {
+            for err in [
+                add_civil_months(bad, 600).unwrap_err(),
+                backlog_local_date(bad).unwrap_err(),
+                planning_horizon_date(bad).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(err, AgendaError::Invalid(ref m) if m == "date must be YYYY-MM-DD"),
+                    "{err:?} for {bad:?}"
+                );
+            }
+        }
     }
 
     // ──────────────────────────────────────────
