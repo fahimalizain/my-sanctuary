@@ -29,11 +29,10 @@ mod health;
 mod session;
 
 pub use agenda::{
-    add_agenda_item, complete_occurrence, delete_agenda_item, get_agenda, move_agenda_item,
-    patch_occurrence, pause_occurrence, reopen_occurrence, reschedule_agenda_item,
-    run_elongate_occurrences, skip_occurrence, start_occurrence, AgendaError, AgendaItemResponse,
-    AgendaItemView,
-    AgendaResponse, DeleteAgendaItemResponse, OccurrenceActionResponse, OccurrenceResponse,
+    complete_occurrence, get_agenda, move_agenda_item, move_day_to_today, patch_occurrence,
+    pause_occurrence, reopen_occurrence, reschedule_agenda_item, run_elongate_occurrences,
+    skip_occurrence, start_occurrence, AgendaError, AgendaItemResponse, AgendaItemView,
+    AgendaResponse, MoveDayToTodayResponse, OccurrenceActionResponse, OccurrenceResponse,
     OccurrenceView, AGENDA_KIND_OCCURRENCE, AGENDA_KIND_TASK, OCCURRENCE_STATUS_DONE,
     OCCURRENCE_STATUS_IN_PROGRESS, OCCURRENCE_STATUS_PENDING, OCCURRENCE_STATUS_SKIPPED,
 };
