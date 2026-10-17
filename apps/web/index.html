@@ -4,6 +4,30 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#204f0a" />
+    <script>
+      // Keep in sync with apps/web/lib/theme.ts (storage key, colors, and
+      // preference rules). Runs before paint so the resolved theme is applied
+      // without a flash; the bundle re-applies the same values.
+      (function () {
+        try {
+          var preference = localStorage.getItem('sanctuary.theme');
+          var isDark =
+            preference === 'dark' ||
+            (preference === 'system' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.toggle('dark', isDark);
+          document.documentElement.style.colorScheme = isDark
+            ? 'dark'
+            : 'light';
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) {
+            meta.setAttribute('content', isDark ? '#11140f' : '#204f0a');
+          }
+        } catch {
+          // localStorage or matchMedia unavailable — light defaults stay.
+        }
+      })();
+    </script>
     <link rel="icon" type="image/png" href="/favicon.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <title>Sanctuary</title>

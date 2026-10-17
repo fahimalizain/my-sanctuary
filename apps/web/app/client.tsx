@@ -6,23 +6,26 @@ import { router } from './router';
 import { AuthProvider } from '@/lib/auth';
 import { CalendarEventsProvider } from '@/app/modules/calendar/events-context';
 import { queryClient } from '@/lib/queryClient';
+import { ThemeProvider } from '@/lib/theme-context';
 
 const rootElement = document.getElementById('root')!;
 if (!rootElement.innerHTML) {
   const root = ReactDOM.createRoot(rootElement);
   root.render(
-    <QueryClientProvider client={queryClient}>
-      <AuthProvider>
-        <CalendarEventsProvider>
-          <RouterProvider router={router} />
-        </CalendarEventsProvider>
-      </AuthProvider>
-      {import.meta.env.DEV ? (
-        <ReactQueryDevtools
-          initialIsOpen={false}
-          buttonPosition="bottom-left"
-        />
-      ) : null}
-    </QueryClientProvider>,
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <CalendarEventsProvider>
+            <RouterProvider router={router} />
+          </CalendarEventsProvider>
+        </AuthProvider>
+        {import.meta.env.DEV ? (
+          <ReactQueryDevtools
+            initialIsOpen={false}
+            buttonPosition="bottom-left"
+          />
+        ) : null}
+      </QueryClientProvider>
+    </ThemeProvider>,
   );
 }
