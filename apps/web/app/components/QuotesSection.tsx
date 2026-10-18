@@ -61,40 +61,23 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
         <ChevronRight className="h-4 w-4" />
       </button>
 
-      <div className="mt-4 flex items-center justify-between max-lg:hidden">
-        <div className="flex gap-1.5">
-          {quotes.map((_, index) => (
-            <button
-              key={index}
-              type="button"
-              onClick={() => setCurrentIndex(index)}
-              aria-label={`Show quote ${index + 1}`}
-              aria-current={index === currentIndex}
-              className={cn(
-                'h-2 w-2 rounded-full transition-colors',
-                index === currentIndex ? 'bg-primary' : 'bg-muted',
-              )}
-            />
-          ))}
-        </div>
-        <div className="flex gap-1">
-          <button
-            type="button"
-            onClick={goToPrev}
-            aria-label="Previous quote"
-            className="rounded-md p-1.5 transition-colors hover:bg-muted"
-          >
-            <ChevronLeft className="h-4 w-4 text-muted-foreground" />
-          </button>
-          <button
-            type="button"
-            onClick={goToNext}
-            aria-label="Next quote"
-            className="rounded-md p-1.5 transition-colors hover:bg-muted"
-          >
-            <ChevronRight className="h-4 w-4 text-muted-foreground" />
-          </button>
-        </div>
+      <div className="mt-4 flex items-center justify-end gap-1 max-lg:hidden">
+        <button
+          type="button"
+          onClick={goToPrev}
+          aria-label="Previous quote"
+          className="rounded-md p-1.5 transition-colors hover:bg-muted"
+        >
+          <ChevronLeft className="h-4 w-4 text-muted-foreground" />
+        </button>
+        <button
+          type="button"
+          onClick={goToNext}
+          aria-label="Next quote"
+          className="rounded-md p-1.5 transition-colors hover:bg-muted"
+        >
+          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+        </button>
       </div>
     </div>
   );
