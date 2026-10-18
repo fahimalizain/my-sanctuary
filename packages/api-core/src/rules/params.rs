@@ -34,6 +34,10 @@ pub const MAX_ICON_LEN: usize = 32;
 pub const MAX_REASON_LEN: usize = 200;
 /// `window_days` upper bound.
 pub const MAX_WINDOW_DAYS: i64 = 366;
+/// `target_hours` upper bound — a day has 24 hours.
+pub const MAX_TARGET_HOURS: f64 = 24.0;
+/// `target_minutes` upper bound — a day has 24 * 60 minutes.
+pub const MAX_TARGET_MINUTES: i64 = 24 * 60;
 
 // ──────────────────────────────────────────
 // Enums
@@ -409,10 +413,13 @@ impl RuleParams {
     }
 
     /// Parses stored JSON for a known kind.
+    ///
+    /// A failure here means the row in `rule_revisions` is garbage — a 500, not
+    /// a 400: the request that read it was fine.
     pub fn from_json(kind: RuleKind, json: &str) -> Result<Self, RulesError> {
         let value: serde_json::Value = serde_json::from_str(json)
-            .map_err(|err| RulesError::Invalid(format!("invalid params: {err}")))?;
-        Self::from_value(kind, value)
+            .map_err(|err| RulesError::Corrupt(format!("invalid params JSON: {err}")))?;
+        Self::from_value(kind, value).map_err(|err| RulesError::Corrupt(err.to_string()))
     }
 
     /// Parses a request body's `params` value for a known kind. A `kind` key
@@ -475,6 +482,9 @@ impl RuleParams {
     /// Validates every bound and every category reference.
     pub fn validate(&self, catalog: &CategoryCatalog) -> Result<(), RulesError> {
         let window = self.window_days();
+        // The upper bound is tighter than the scorer's lookback cap, so an
+        // accepted window is always scoreable; `score`'s
+        // `max_window_days_fits_inside_the_lookback` pins that relation.
         if !(1..=MAX_WINDOW_DAYS).contains(&window) {
             return Err(RulesError::Invalid(format!(
                 "window_days must be between 1 and {MAX_WINDOW_DAYS}"
@@ -490,8 +500,20 @@ impl RuleParams {
                 if params.min_minutes < 1 {
                     return Err(RulesError::Invalid("min_minutes must be at least 1".to_string()));
                 }
+                // `min_minutes * 60` is the scorer's threshold: a value whose
+                // threshold cannot be represented must never reach it.
+                if params.min_minutes.checked_mul(60).is_none() {
+                    return Err(RulesError::Invalid(
+                        "min_minutes is too large to score".to_string(),
+                    ));
+                }
                 if params.min_days < 1 {
                     return Err(RulesError::Invalid("min_days must be at least 1".to_string()));
+                }
+                if params.min_days > window {
+                    return Err(RulesError::Invalid(
+                        "min_days must not exceed window_days".to_string(),
+                    ));
                 }
             }
             RuleParams::CategoryDailyAvg(params) => {
@@ -518,16 +540,31 @@ impl RuleParams {
                 if params.min_nights < 1 {
                     return Err(RulesError::Invalid("min_nights must be at least 1".to_string()));
                 }
+                if params.min_nights > window {
+                    return Err(RulesError::Invalid(
+                        "min_nights must not exceed window_days".to_string(),
+                    ));
+                }
                 validate_hours("target_hours", params.target_hours)?;
             }
             RuleParams::SleepTiming(params) => {
                 if params.min_nights < 1 {
                     return Err(RulesError::Invalid("min_nights must be at least 1".to_string()));
                 }
+                if params.min_nights > window {
+                    return Err(RulesError::Invalid(
+                        "min_nights must not exceed window_days".to_string(),
+                    ));
+                }
                 if params.target_minutes < 0 {
                     return Err(RulesError::Invalid(
                         "target_minutes must not be negative".to_string(),
                     ));
+                }
+                if params.target_minutes > MAX_TARGET_MINUTES {
+                    return Err(RulesError::Invalid(format!(
+                        "target_minutes must be at most {MAX_TARGET_MINUTES}"
+                    )));
                 }
             }
         }
@@ -636,6 +673,11 @@ fn validate_selector(selector: &CategorySelector, catalog: &CategoryCatalog) -> 
 fn validate_hours(field: &str, hours: f64) -> Result<(), RulesError> {
     if !hours.is_finite() || hours < 0.0 {
         return Err(RulesError::Invalid(format!("{field} must be a finite number ≥ 0")));
+    }
+    if hours > MAX_TARGET_HOURS {
+        return Err(RulesError::Invalid(format!(
+            "{field} must be at most {MAX_TARGET_HOURS}"
+        )));
     }
     Ok(())
 }
@@ -763,12 +805,28 @@ impl CategoryCatalog {
     }
 
     /// The synthetic-sleep sentinel plus every living category whose slug or
-    /// title is `sleep` (case-insensitive).
+    /// title is `sleep` (case-insensitive) **and its children** (one level).
+    ///
+    /// The digest stores the leaf, so a category filed under `sleep` (a nap
+    /// type, say) is sleep too: it must never count as waking time.
     pub fn sleep_ids(&self) -> BTreeSet<String> {
         let mut out: BTreeSet<String> = BTreeSet::new();
         out.insert(SYNTHETIC_SLEEP_CATEGORY_ID.to_string());
+        let roots: BTreeSet<String> = self
+            .cats
+            .iter()
+            .filter(|cat| {
+                cat.slug.eq_ignore_ascii_case("sleep") || cat.title.eq_ignore_ascii_case("sleep")
+            })
+            .map(|cat| cat.id.clone())
+            .collect();
+        out.extend(roots.iter().cloned());
         for cat in &self.cats {
-            if cat.slug.eq_ignore_ascii_case("sleep") || cat.title.eq_ignore_ascii_case("sleep") {
+            if cat
+                .parent_id
+                .as_deref()
+                .is_some_and(|parent| roots.contains(parent))
+            {
                 out.insert(cat.id.clone());
             }
         }

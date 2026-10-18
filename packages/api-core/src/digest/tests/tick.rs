@@ -195,6 +195,13 @@ impl DigestRepo for FakeDigestRepo {
         Ok(self.state.lock().expect("fake lock").primary_tz.clone())
     }
 
+    async fn latest_time_zone(&self, user_id: &str) -> Result<Option<String>, RepoError> {
+        let state = self.state.lock().expect("fake lock");
+        assert_eq!(user_id, state.user_id);
+        // The persisted meta rows ARE `state.days` in this fake.
+        Ok(state.days.values().next_back().map(|day| day.time_zone.clone()))
+    }
+
     async fn latest_zone_before(
         &self,
         user_id: &str,

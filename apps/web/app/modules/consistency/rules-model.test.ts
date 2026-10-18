@@ -159,6 +159,7 @@ function ruleScore(overrides: Partial<RuleScore>): RuleScore {
     sort_order: 0,
     condition: '≥12 days of ≥1h / 60d',
     on_track: true,
+    window_full: true,
     actual_label: '14 days',
     target_label: '12 days / 60d',
     owed: 'On track',

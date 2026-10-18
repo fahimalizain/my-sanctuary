@@ -454,6 +454,19 @@ pub const DIGEST_PRIMARY_TIME_ZONE_SQL: &str = "
     LIMIT 1
 ";
 
+/// The zone of the newest persisted day — the zone to use before any primary
+/// calendar exists.
+///
+/// A user who has been digested (a backfill, a cron tick) but whose calendar
+/// list has not synced yet still knows their own zone: reading it here keeps
+/// "today" from jumping to UTC and moving every window by a day.
+pub const DIGEST_LATEST_TIME_ZONE_SQL: &str = "
+    SELECT time_zone FROM daily_meta
+    WHERE user_id = ?
+    ORDER BY local_date DESC
+    LIMIT 1
+";
+
 /// The nearest **persisted** day zone strictly before one date — the
 /// `prior_zone` a rebuild of that date must inherit when the date itself has
 /// no voting segment.
@@ -817,6 +830,12 @@ pub trait DigestRepo: Send + Sync {
     ) -> Result<Vec<DigestEvent>, RepoError>;
     /// The user's primary calendar IANA zone, or `None` before the first sync.
     async fn primary_time_zone(&self, user_id: &str) -> Result<Option<String>, RepoError>;
+    /// The `daily_meta.time_zone` of the newest persisted day, or `None` when
+    /// no day was ever computed.
+    ///
+    /// This is the zone fallback for `today` before a primary calendar exists:
+    /// a user with digested history but no synced calendar still has a zone.
+    async fn latest_time_zone(&self, user_id: &str) -> Result<Option<String>, RepoError>;
     /// The `daily_meta.time_zone` of the nearest row **before** `date`, or
     /// `None` when no earlier day was ever computed.
     ///

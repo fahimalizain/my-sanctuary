@@ -12,9 +12,9 @@ use api_core::repo::RepoError;
 use api_core::rules::repo::{
     CategoryRow, CategorySecondsRow, NewRuleRow, PauseRow, RevisionRow, RuleRepo, RuleRow,
     SleepNightRow, RULES_COUNT_SQL, RULES_GET_SQL, RULES_INSERT_SQL, RULES_LIST_SQL,
-    RULES_SET_SORT_ORDER_SQL, RULES_UPDATE_SQL, RULE_CATEGORIES_SQL, RULE_CATEGORY_SECONDS_SQL,
-    RULE_REVISIONS_INSERT_SQL, RULE_REVISIONS_LIST_SQL, RULE_SLEEP_NIGHTS_SQL, PAUSES_DELETE_SQL,
-    PAUSES_INSERT_SQL, PAUSES_LIST_SQL,
+    RULES_SET_SORT_ORDER_SQL, RULES_UPDATE_SQL, RULE_AGGREGATED_DAYS_SQL, RULE_CATEGORIES_SQL,
+    RULE_CATEGORY_SECONDS_SQL, RULE_REVISIONS_INSERT_SQL, RULE_REVISIONS_LIST_SQL,
+    RULE_SLEEP_NIGHTS_SQL, PAUSES_DELETE_SQL, PAUSES_INSERT_SQL, PAUSES_LIST_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1Type};
@@ -79,7 +79,13 @@ impl RuleRepo for D1RuleRepo {
         rule: &NewRuleRow,
         now_rfc3339: &str,
     ) -> Result<RuleRow, RepoError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        // A seed carries its own deterministic id; a user-created rule gets a
+        // fresh uuid. `INSERT OR IGNORE` drops a duplicate id silently, which
+        // is what makes a concurrent double seed harmless.
+        let id = rule
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let sort_order = rule.sort_order.to_string();
         let stmt = self
             .db
@@ -158,32 +164,36 @@ impl RuleRepo for D1RuleRepo {
         run_stmt(stmt).await
     }
 
-    async fn list_revisions(&self, rule_id: &str) -> Result<Vec<RevisionRow>, RepoError> {
+    async fn list_revisions(&self, user_id: &str) -> Result<Vec<RevisionRow>, RepoError> {
         let stmt = self
             .db
             .prepare(RULE_REVISIONS_LIST_SQL)
-            .bind_refs(&[D1Type::Text(rule_id)])
+            .bind_refs(&[D1Type::Text(user_id)])
             .map_err(backend)?;
         query_vec(stmt).await
     }
 
     async fn insert_revision(
         &self,
+        user_id: &str,
         rule_id: &str,
+        id: Option<&str>,
         effective_from: &str,
         params_json: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let minted = id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let stmt = self
             .db
             .prepare(RULE_REVISIONS_INSERT_SQL)
             .bind_refs(&[
-                D1Type::Text(&id),
+                D1Type::Text(&minted),
                 D1Type::Text(rule_id),
                 D1Type::Text(effective_from),
                 D1Type::Text(params_json),
                 D1Type::Text(now_rfc3339),
+                D1Type::Text(rule_id),
+                D1Type::Text(user_id),
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
@@ -276,6 +286,29 @@ impl RuleRepo for D1RuleRepo {
             ])
             .map_err(backend)?;
         query_vec(stmt).await
+    }
+
+    async fn load_aggregated_days(
+        &self,
+        user_id: &str,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<String>, RepoError> {
+        #[derive(Deserialize)]
+        struct DateRow {
+            local_date: String,
+        }
+        let stmt = self
+            .db
+            .prepare(RULE_AGGREGATED_DAYS_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Text(from_date),
+                D1Type::Text(to_date),
+            ])
+            .map_err(backend)?;
+        let rows: Vec<DateRow> = query_vec(stmt).await?;
+        Ok(rows.into_iter().map(|row| row.local_date).collect())
     }
 
     async fn load_categories(&self, user_id: &str) -> Result<Vec<CategoryRow>, RepoError> {

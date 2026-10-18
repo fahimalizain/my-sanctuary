@@ -10,9 +10,9 @@ use api_core::repo::RepoError;
 use api_core::rules::repo::{
     CategoryRow, CategorySecondsRow, NewRuleRow, PauseRow, RevisionRow, RuleRepo, RuleRow,
     SleepNightRow, RULES_COUNT_SQL, RULES_GET_SQL, RULES_INSERT_SQL, RULES_LIST_SQL,
-    RULES_SET_SORT_ORDER_SQL, RULES_UPDATE_SQL, RULE_CATEGORIES_SQL, RULE_CATEGORY_SECONDS_SQL,
-    RULE_REVISIONS_INSERT_SQL, RULE_REVISIONS_LIST_SQL, RULE_SLEEP_NIGHTS_SQL, PAUSES_DELETE_SQL,
-    PAUSES_INSERT_SQL, PAUSES_LIST_SQL,
+    RULES_SET_SORT_ORDER_SQL, RULES_UPDATE_SQL, RULE_AGGREGATED_DAYS_SQL, RULE_CATEGORIES_SQL,
+    RULE_CATEGORY_SECONDS_SQL, RULE_REVISIONS_INSERT_SQL, RULE_REVISIONS_LIST_SQL,
+    RULE_SLEEP_NIGHTS_SQL, PAUSES_DELETE_SQL, PAUSES_INSERT_SQL, PAUSES_LIST_SQL,
 };
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -59,7 +59,12 @@ impl RuleRepo for SqliteRuleRepo {
         rule: &NewRuleRow,
         now_rfc3339: &str,
     ) -> Result<RuleRow, RepoError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        // A seed carries its own deterministic id; a user-created rule gets a
+        // fresh uuid. `INSERT OR IGNORE` drops a duplicate id silently.
+        let id = rule
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let conn = lock(&self.db)?;
         exec(
             &conn,
@@ -130,24 +135,34 @@ impl RuleRepo for SqliteRuleRepo {
         )
     }
 
-    async fn list_revisions(&self, rule_id: &str) -> Result<Vec<RevisionRow>, RepoError> {
+    async fn list_revisions(&self, user_id: &str) -> Result<Vec<RevisionRow>, RepoError> {
         let conn = lock(&self.db)?;
-        query_vec(&conn, RULE_REVISIONS_LIST_SQL, &[&rule_id])
+        query_vec(&conn, RULE_REVISIONS_LIST_SQL, &[&user_id])
     }
 
     async fn insert_revision(
         &self,
+        user_id: &str,
         rule_id: &str,
+        id: Option<&str>,
         effective_from: &str,
         params_json: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let minted = id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let conn = lock(&self.db)?;
         exec(
             &conn,
             RULE_REVISIONS_INSERT_SQL,
-            &[&id, &rule_id, &effective_from, &params_json, &now_rfc3339],
+            &[
+                &minted,
+                &rule_id,
+                &effective_from,
+                &params_json,
+                &now_rfc3339,
+                &rule_id,
+                &user_id,
+            ],
         )
     }
 
@@ -222,6 +237,25 @@ impl RuleRepo for SqliteRuleRepo {
             RULE_SLEEP_NIGHTS_SQL,
             &[&user_id, &from_date, &to_date],
         )
+    }
+
+    async fn load_aggregated_days(
+        &self,
+        user_id: &str,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<String>, RepoError> {
+        #[derive(Deserialize)]
+        struct DateRow {
+            local_date: String,
+        }
+        let conn = lock(&self.db)?;
+        let rows: Vec<DateRow> = query_vec(
+            &conn,
+            RULE_AGGREGATED_DAYS_SQL,
+            &[&user_id, &from_date, &to_date],
+        )?;
+        Ok(rows.into_iter().map(|row| row.local_date).collect())
     }
 
     async fn load_categories(&self, user_id: &str) -> Result<Vec<CategoryRow>, RepoError> {

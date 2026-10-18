@@ -14,16 +14,20 @@
 //!
 //! # The model in one paragraph
 //!
-//! A verdict for date `D` walks backward from `D` collecting **counted** days
-//! until `window_days` are gathered or the lookback cap is hit. Paused days are
-//! never counted and never break a streak; a daily-average travel-excluded
-//! weekday is skipped the same way. Days before `starts_on` are out of play
-//! (strip `off`, no streak) but their digest rows still feed the window of the
-//! first in-play days. Each day is scored with the revision active on it.
-//! `on_track` is the window ending `score_as_of`; the real `today` is always
-//! `pending` in the strip and never consumed by a streak. A finished challenge
-//! is scored at its `ends_on`, so that last day is judged — and counts — while
-//! its phase is still derived from `today`.
+//! A verdict for date `D` with `window_days = N` looks at the **N calendar
+//! days ending on `D`**, inclusive (`start = D - (N - 1)`), extended backward
+//! by the paused days inside that span ([`window_start`]). Travel-excluded days
+//! never extend anything: they are dropped from a daily average's numerator and
+//! denominator, not replaced. Paused days are never counted and never break a
+//! streak. Days before `starts_on` are out of play (strip `off`, no streak) but
+//! their digest rows still feed the window of the first in-play days. Each day
+//! is scored with the revision active on it. A window is only judged when it is
+//! **full**: every non-paused day in it has a `daily_meta` row, so a hole the
+//! backfill has not reached yet is never scored as a zero. `on_track` is the
+//! window ending `score_as_of`; the real `today` is always `pending` in the
+//! strip and never consumed by a streak. A finished challenge is scored at its
+//! `ends_on`, so that last day is judged — and counts — while its phase is
+//! still derived from `today`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,8 +37,8 @@ use serde::Serialize;
 use crate::digest::shift_date;
 
 use super::params::{
-    format_bedtime, format_wake, CategoryCatalog, CategoryDailyAvgParams, Comparator, RuleKind,
-    RuleParams, RulePhase, RuleStatus, SleepMetric, MAX_WINDOW_DAYS,
+    format_bedtime, format_wake, CategoryCatalog, CategoryDailyAvgParams, CategorySelector,
+    Comparator, RuleKind, RuleParams, RulePhase, RuleStatus, SleepMetric, MAX_WINDOW_DAYS,
 };
 use super::RulesError;
 
@@ -48,6 +52,8 @@ pub const EVIDENCE_WEEKDAYS: usize = 10;
 pub const EVIDENCE_NIGHTS: usize = 14;
 /// The owed sentence shown when a sleep rule cannot see enough nights.
 pub const NOT_ENOUGH_NIGHTS: &str = "log Asleep / Woke Up — not enough paired nights";
+/// The owed sentence shown while a window still has un-aggregated days.
+pub const HISTORY_BUILDING: &str = "history still building";
 
 /// Seconds in an hour (the only place the digest's seconds become hours).
 const HOUR_SECS: f64 = 3600.0;
@@ -108,11 +114,17 @@ pub struct DigestSlice {
     pub category_seconds: BTreeMap<String, BTreeMap<String, i64>>,
     /// Paired nights, any order.
     pub nights: Vec<Night>,
+    /// The `daily_meta.local_date`s the digest has aggregated. A day that is
+    /// not here is a hole, not a zero: the window containing it is not full.
+    pub aggregated: BTreeSet<String>,
 }
 
 impl DigestSlice {
     /// Records one category's seconds on one day (test convenience).
+    ///
+    /// A day with rows is an aggregated day, so this marks it too.
     pub fn add(&mut self, date: &str, category_id: &str, seconds: i64) {
+        self.aggregated.insert(date.to_string());
         *self
             .category_seconds
             .entry(date.to_string())
@@ -122,7 +134,11 @@ impl DigestSlice {
     }
 
     /// Records one paired night (test convenience).
+    ///
+    /// A paired night comes from a day rebuild, so its `wake_date` is
+    /// aggregated.
     pub fn add_night(&mut self, wake_date: &str, bed_min_past_noon: i64, wake_min_past_midnight: i64, seconds: i64) {
+        self.aggregated.insert(wake_date.to_string());
         self.nights.push(Night {
             wake_date: wake_date.to_string(),
             asleep_at: format!("{wake_date}T00:00:00Z"),
@@ -131,6 +147,24 @@ impl DigestSlice {
             seconds,
             source: "paired".to_string(),
         });
+    }
+
+    /// Marks one day as aggregated — a computed day with nothing in it
+    /// (test convenience).
+    pub fn mark_aggregated(&mut self, date: &str) {
+        self.aggregated.insert(date.to_string());
+    }
+
+    /// Marks the inclusive `[from, to]` range aggregated (test convenience).
+    pub fn mark_aggregated_range(&mut self, from: &str, to: &str) {
+        let mut cursor = Some(from.to_string());
+        while let Some(date) = cursor {
+            if date.as_str() > to {
+                break;
+            }
+            self.aggregated.insert(date.clone());
+            cursor = shift_date(&date, 1);
+        }
     }
 }
 
@@ -173,6 +207,11 @@ pub struct RuleScore {
     pub sort_order: i64,
     pub condition: String,
     pub on_track: bool,
+    /// Whether the window ending `score_as_of` has an aggregate row on every
+    /// non-paused day in it. `false` means the backfill has not reached the
+    /// whole window: `on_track` is `false`, `owed` says why, and the strip's
+    /// in-play cells are `pending`.
+    pub window_full: bool,
     pub actual_label: String,
     pub target_label: String,
     pub owed: String,
@@ -247,6 +286,8 @@ pub struct Scoreboard {
     pub time_zone: String,
     /// Headline: passing rules over `active_rules` (paused rules excluded).
     pub on_track: usize,
+    /// Rules on the board whose phase is `paused` — the "2 paused" chip.
+    pub paused_rules: usize,
     pub active_rules: usize,
     pub all_pass_streak: i64,
     pub best_all_pass_streak: i64,
@@ -255,12 +296,19 @@ pub struct Scoreboard {
     pub dirty_days: i64,
     /// Rules with phase `active` or `paused`, by `sort_order` then name.
     pub rules: Vec<RuleScore>,
+    /// Operator-facing notes (a skipped seed, an unreadable rule row). Never
+    /// serialized — the Worker logs them; the client never sees them.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 /// The `GET /api/rules/archive` body.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArchiveResponse {
     pub rules: Vec<RuleScore>,
+    /// Operator-facing notes, never serialized (see [`Scoreboard::warnings`]).
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 /// How one day lands for a rule.
@@ -286,6 +334,88 @@ impl DayState {
             DayState::Off => "off",
         }
     }
+}
+
+// ──────────────────────────────────────────
+// The window
+// ──────────────────────────────────────────
+
+/// Why a window cannot be judged yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotFull {
+    /// The pause extension would start before
+    /// `as_of - (MAX_LOOKBACK_DAYS - 1)`. The model refuses to truncate
+    /// silently: the window is simply not full.
+    Lookback,
+    /// A non-paused day inside the window has no `daily_meta` row — the
+    /// backfill has not reached it, so it is a hole rather than a zero.
+    MissingDay(String),
+}
+
+impl std::fmt::Display for NotFull {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotFull::Lookback => formatter.write_str("the window reaches past the lookback cap"),
+            NotFull::MissingDay(date) => {
+                write!(formatter, "{date} has no aggregated day yet")
+            }
+        }
+    }
+}
+
+/// The first day of the `window_days` **calendar** window ending at `as_of`,
+/// extended backward once for pauses.
+///
+/// The window is `N` calendar days ending on `as_of`, inclusive:
+/// `start = as_of - (N - 1)`. Let `P` be the number of paused days in
+/// `[start, as_of]`; the window then starts at `as_of - (N - 1) - P`, and the
+/// paused days that extension pulled in are counted again — until a pass adds
+/// no new paused day, or the lookback cap is hit ([`NotFull::Lookback`]).
+/// Travel-excluded days never extend anything.
+///
+/// This is the **only** place the window's start date is computed: the scorer
+/// and the digest load floor ([`digest_load_floor`]) both call it, so the SQL
+/// never reads a narrower range than the scorer asks for.
+pub fn window_start(
+    as_of: &str,
+    window_days: i64,
+    is_paused: &dyn Fn(&str) -> bool,
+) -> Result<String, NotFull> {
+    let window = window_days.clamp(1, MAX_WINDOW_DAYS);
+    let floor = shift_date(as_of, -(MAX_LOOKBACK_DAYS - 1)).ok_or(NotFull::Lookback)?;
+    let base = shift_date(as_of, -(window - 1)).ok_or(NotFull::Lookback)?;
+    let mut start = base.clone();
+    let mut previous = 0_i64;
+    loop {
+        let paused = window_dates(&start, as_of).iter().filter(|date| is_paused(date)).count() as i64;
+        if paused <= previous {
+            // This pass added no new paused day: the window is settled.
+            break;
+        }
+        let Some(earlier) = shift_date(&base, -paused) else {
+            return Err(NotFull::Lookback);
+        };
+        if earlier < floor {
+            return Err(NotFull::Lookback);
+        }
+        start = earlier;
+        previous = paused;
+    }
+    Ok(start)
+}
+
+/// Every civil date in the inclusive `[from, to]`, oldest first.
+fn window_dates(from: &str, to: &str) -> Vec<String> {
+    let mut dates: Vec<String> = Vec::new();
+    let mut cursor = Some(from.to_string());
+    while let Some(date) = cursor {
+        if date.as_str() > to {
+            break;
+        }
+        dates.push(date.clone());
+        cursor = shift_date(&date, 1);
+    }
+    dates
 }
 
 // ──────────────────────────────────────────
@@ -315,6 +445,10 @@ pub fn score_rule(
 }
 
 /// Scores the scoreboard: every rule's card plus the headline.
+///
+/// Every rule is *evaluated* (the all-pass walk needs the day states of rules
+/// that have since left the board), but only the rules with phase `active` or
+/// `paused` pay for a full card: strip, evidence, and params JSON.
 pub fn score_board(input: BoardInput<'_>) -> Result<Scoreboard, RulesError> {
     let BoardInput {
         as_of,
@@ -334,47 +468,48 @@ pub fn score_board(input: BoardInput<'_>) -> Result<Scoreboard, RulesError> {
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    let mut evaluated: Vec<(RuleSpec, RuleScore, BTreeMap<String, DayState>)> = Vec::new();
+    let empty: Vec<Revision> = Vec::new();
+    let mut cards: Vec<(RuleSpec, RuleScore, BTreeMap<String, DayState>)> = Vec::new();
+    let mut history: Vec<BTreeMap<String, DayState>> = Vec::new();
     for spec in &specs {
-        let empty: Vec<Revision> = Vec::new();
         let revisions = revisions.get(&spec.id).unwrap_or(&empty);
         // The board is live: its cursor is today, and today stays pending.
-        let evaluation =
-            Evaluator::new(spec, revisions, &pauses, catalog, digest, as_of, as_of)?.evaluate()?;
-        evaluated.push((spec.clone(), evaluation.score, evaluation.states));
+        let evaluator = Evaluator::new(spec, revisions, &pauses, catalog, digest, as_of, as_of)?;
+        if rule_phase(spec, as_of).is_on_board() {
+            let evaluation = evaluator.evaluate()?;
+            history.push(evaluation.states.clone());
+            cards.push((spec.clone(), evaluation.score, evaluation.states));
+        } else {
+            // Off the board: a compact state map is all the streak needs, and
+            // the strip / evidence builder is never entered (M7).
+            history.push(evaluator.state_map());
+        }
     }
 
-    let active: Vec<&RuleScore> = evaluated
+    let active: Vec<&RuleScore> = cards
         .iter()
         .map(|(_, score, _)| score)
         .filter(|score| score.phase == RulePhase::Active.as_str())
         .collect();
     let on_track = active.iter().filter(|score| score.on_track).count();
     let active_rules = active.len();
-
-    // The all-pass walk considers the board (active + paused): a day counts
-    // when at least one such rule has a real pass/fail on it, and the run
-    // continues while every one of them passed.
-    let board: Vec<&(RuleSpec, RuleScore, BTreeMap<String, DayState>)> = evaluated
+    let paused_rules = cards
         .iter()
-        .filter(|(_, score, _)| {
-            score.phase == RulePhase::Active.as_str() || score.phase == RulePhase::Paused.as_str()
-        })
-        .collect();
-    let (all_pass_streak, best_all_pass_streak) = all_pass_walk(&board, as_of);
+        .filter(|(_, score, _)| score.phase == RulePhase::Paused.as_str())
+        .count();
 
-    let rules = evaluated
-        .into_iter()
-        .map(|(_, score, _)| score)
-        .filter(|score| {
-            score.phase == RulePhase::Active.as_str() || score.phase == RulePhase::Paused.as_str()
-        })
-        .collect();
+    // The all-pass walk considers every rule that was in play on a date —
+    // including the ones that have since been archived or finished, so
+    // archiving never rewrites the streak.
+    let (all_pass_streak, best_all_pass_streak) = all_pass_walk(&specs, &history, as_of);
+
+    let rules = cards.into_iter().map(|(_, score, _)| score).collect();
 
     Ok(Scoreboard {
         as_of: as_of.to_string(),
         time_zone: time_zone.to_string(),
         on_track,
+        paused_rules,
         active_rules,
         all_pass_streak,
         best_all_pass_streak,
@@ -382,22 +517,28 @@ pub fn score_board(input: BoardInput<'_>) -> Result<Scoreboard, RulesError> {
         backfilling: flags.backfilling,
         dirty_days: flags.dirty_days,
         rules,
+        warnings: Vec::new(),
     })
 }
 
-/// The all-pass runs over `board` (active + paused rules), from the earliest
-/// in-play day through yesterday.
+/// The all-pass runs over every rule's day states, from the earliest in-play
+/// day through yesterday.
+///
+/// A day counts when at least one rule was in play on it (`Pass`/`Fail`), and
+/// the run continues while every one of them passed. `Off` (out of play, an
+/// unselected weekday) and `Paused` neither count nor break.
 fn all_pass_walk(
-    board: &[&(RuleSpec, RuleScore, BTreeMap<String, DayState>)],
+    specs: &[RuleSpec],
+    history: &[BTreeMap<String, DayState>],
     as_of: &str,
 ) -> (i64, i64) {
     let floor = shift_date(as_of, -(MAX_LOOKBACK_DAYS - 1)).unwrap_or_else(|| as_of.to_string());
     let Some(yesterday) = shift_date(as_of, -1) else {
         return (0, 0);
     };
-    let start = board
+    let start = specs
         .iter()
-        .map(|(spec, _, _)| {
+        .map(|spec| {
             if spec.starts_on > floor {
                 spec.starts_on.clone()
             } else {
@@ -416,7 +557,7 @@ fn all_pass_walk(
         }
         let mut considered = 0_usize;
         let mut failed = false;
-        for (_, _, states) in board {
+        for states in history {
             match states.get(&date).copied().unwrap_or(DayState::Off) {
                 DayState::Pass => considered += 1,
                 DayState::Fail => {
@@ -441,27 +582,39 @@ fn all_pass_walk(
 
 /// The derived phase of a rule — never stored, and never written on read.
 ///
-/// `archived` wins over everything; then `paused`; then `finished` when the
-/// challenge's inclusive `ends_on` is in the past; else `active`.
+/// `archived` wins over everything; then a challenge whose inclusive `ends_on`
+/// is behind `as_of` is **finished** (even while its status is `paused` — a
+/// paused challenge still ends); then `paused`; else `active`.
 pub fn rule_phase(spec: &RuleSpec, as_of: &str) -> RulePhase {
+    if spec.status == RuleStatus::Archived {
+        return RulePhase::Archived;
+    }
+    if spec
+        .ends_on
+        .as_deref()
+        .is_some_and(|ends_on| ends_on < as_of)
+    {
+        return RulePhase::Finished;
+    }
     match spec.status {
-        RuleStatus::Archived => RulePhase::Archived,
         RuleStatus::Paused => RulePhase::Paused,
-        RuleStatus::Active => match spec.ends_on.as_deref() {
-            Some(ends_on) if ends_on < as_of => RulePhase::Finished,
-            _ => RulePhase::Active,
-        },
+        _ => RulePhase::Active,
     }
 }
 
 /// The earliest digest date a scoreboard can read.
 ///
-/// Every scored day `D` looks back at most `min(400, window_days * 3)` calendar
-/// days, and the streak history is clamped to `as_of - 399`, so the floor is
-/// the earlier of the earliest `starts_on` and the strip start, minus that
-/// lookback.
-pub fn digest_load_floor(min_starts_on: &str, max_window_days: i64, as_of: &str) -> String {
-    let cap = (max_window_days.clamp(1, MAX_WINDOW_DAYS) * 3).min(MAX_LOOKBACK_DAYS);
+/// The earliest day any rule is scored at is the earlier of its `starts_on`
+/// and the strip start, clamped to the streak floor; every window that ends
+/// there is [`window_start`] deep. The caller passes the same pause predicate
+/// the scorer uses, so the SQL range can never be narrower than the scorer's
+/// window.
+pub fn digest_load_floor(
+    min_starts_on: &str,
+    max_window_days: i64,
+    as_of: &str,
+    is_paused: &dyn Fn(&str) -> bool,
+) -> String {
     let strip_start = shift_date(as_of, -(STRIP_DAYS - 1)).unwrap_or_else(|| as_of.to_string());
     let history_floor =
         shift_date(as_of, -(MAX_LOOKBACK_DAYS - 1)).unwrap_or_else(|| as_of.to_string());
@@ -470,7 +623,7 @@ pub fn digest_load_floor(min_starts_on: &str, max_window_days: i64, as_of: &str)
     let anchor = min_starts_on
         .max(history_floor.as_str())
         .min(strip_start.as_str());
-    shift_date(anchor, -(cap - 1)).unwrap_or_else(|| as_of.to_string())
+    window_start(anchor, max_window_days, is_paused).unwrap_or(history_floor)
 }
 
 // ──────────────────────────────────────────
@@ -496,19 +649,30 @@ struct Evaluation {
 /// What one window evaluation produced.
 #[derive(Debug, Clone, Default)]
 struct WindowOutcome {
-    pass: bool,
-    /// Counted days, oldest first.
-    counted: Vec<String>,
-    /// Selector seconds over the counted days.
+    /// The window's non-paused days, oldest first — the scoring set.
+    days: Vec<String>,
+    /// Selector seconds over `days`.
     total_seconds: i64,
     /// Days clearing `min_minutes`.
     hits: i64,
-    /// Paired nights on counted days, oldest first.
+    /// Paired nights on `days`, oldest first.
     nights: Vec<Night>,
     /// Median of the metric (hours for duration, minutes for timing).
     median: f64,
     /// Sample stdev in minutes.
     stdev: f64,
+    /// `None` when every non-paused day in the window has an aggregate row.
+    not_full: Option<NotFull>,
+    /// The verdict, ignoring fullness: only meaningful when `not_full` is
+    /// `None`.
+    pass: bool,
+}
+
+impl WindowOutcome {
+    /// Whether the window can be judged at all.
+    fn is_full(&self) -> bool {
+        self.not_full.is_none()
+    }
 }
 
 struct Evaluator<'a> {
@@ -517,6 +681,7 @@ struct Evaluator<'a> {
     revisions: Vec<ParsedRevision>,
     global_pauses: Vec<(String, String)>,
     rule_pauses: Vec<(String, String)>,
+    catalog: &'a CategoryCatalog,
     sleep_ids: BTreeSet<String>,
     digest: &'a DigestSlice,
     /// The card's cursor: the window, strip, `on_track`, and owed numbers.
@@ -530,7 +695,7 @@ impl<'a> Evaluator<'a> {
         spec: &'a RuleSpec,
         revisions: &[Revision],
         pauses: &[PausePeriod],
-        catalog: &CategoryCatalog,
+        catalog: &'a CategoryCatalog,
         digest: &'a DigestSlice,
         score_as_of: &'a str,
         today: &'a str,
@@ -594,6 +759,7 @@ impl<'a> Evaluator<'a> {
             revisions: parsed,
             global_pauses,
             rule_pauses,
+            catalog,
             sleep_ids: catalog.sleep_ids(),
             digest,
             score_as_of,
@@ -704,86 +870,82 @@ impl<'a> Evaluator<'a> {
 
     // ── the window ──────────────────────────────────────────────────────────
 
-    /// The counted days of the window ending at `end`, oldest first.
-    ///
-    /// Walking backward from `end`: a day counts when it is not paused and
-    /// passes the kind's own filter (for `category_daily_avg`, a selected
-    /// weekday that is not travel-excluded). Paused and skipped days extend the
-    /// window. The walk examines at most `min(window_days * 3, 400)` days.
-    fn counted_days(&self, revision: &ParsedRevision, end: &str) -> Vec<String> {
-        let window = revision.params.window_days().clamp(1, MAX_WINDOW_DAYS);
-        let cap = (window * 3).min(MAX_LOOKBACK_DAYS) as usize;
-        let mut out: Vec<String> = Vec::new();
-        let mut cursor = Some(end.to_string());
-        let mut examined = 0_usize;
-        while let Some(date) = cursor {
-            if examined >= cap {
-                break;
-            }
-            examined += 1;
-            if !self.is_paused(&date) && self.counts(revision, &date) {
-                out.push(date.clone());
-                if out.len() as i64 >= window {
-                    break;
-                }
-            }
-            cursor = shift_date(&date, -1);
-        }
-        out.reverse();
-        out
-    }
-
-    /// Whether `date` would count toward this revision's window (ignoring
-    /// pauses).
-    fn counts(&self, revision: &ParsedRevision, date: &str) -> bool {
-        match &revision.params {
-            RuleParams::CategoryDailyAvg(params) => {
-                weekday(date).is_some_and(|day| params.weekdays.contains(&day))
-                    && !self.travel_excluded(revision, date)
-            }
-            _ => true,
-        }
-    }
-
     /// Evaluates the window ending at `end` with `revision`'s params.
+    ///
+    /// The window is [`window_start`]'s calendar span: non-paused days score,
+    /// paused days only extend it, and travel-excluded days are dropped from a
+    /// daily average without being replaced. `not_full` is set when a
+    /// non-paused day in it has no aggregate row, or when the pause extension
+    /// ran past the lookback cap.
     fn outcome(&self, revision: &ParsedRevision, end: &str) -> WindowOutcome {
-        let counted = self.counted_days(revision, end);
-        let mut outcome = WindowOutcome {
-            counted: counted.clone(),
-            ..WindowOutcome::default()
+        let mut outcome = WindowOutcome::default();
+        let start = match window_start(end, revision.params.window_days(), &|date| {
+            self.is_paused(date)
+        }) {
+            Ok(start) => start,
+            Err(reason) => {
+                // Nothing can be read: report the hole, not a zero.
+                outcome.not_full = Some(reason);
+                return outcome;
+            }
         };
+        outcome.days = window_dates(&start, end)
+            .into_iter()
+            .filter(|date| !self.is_paused(date))
+            .collect();
+        // A day the backfill has not aggregated is a hole, not a zero.
+        if let Some(missing) = outcome
+            .days
+            .iter()
+            .find(|date| !self.digest.aggregated.contains(date.as_str()))
+        {
+            outcome.not_full = Some(NotFull::MissingDay(missing.clone()));
+        }
         match &revision.params {
             RuleParams::CategoryTotal(params) => {
-                outcome.total_seconds = counted
+                outcome.total_seconds = outcome
+                    .days
                     .iter()
-                    .map(|date| self.selector_seconds(&revision.ids, date))
+                    .map(|date| self.selector_seconds(&revision.ids, date.as_str()))
                     .sum();
                 let hours = outcome.total_seconds as f64 / HOUR_SECS;
                 outcome.pass = params.comparator.passes(hours, params.target_hours);
             }
             RuleParams::CategoryDays(params) => {
-                let threshold = params.min_minutes * 60;
-                outcome.hits = counted
+                let threshold = threshold_seconds(params.min_minutes);
+                outcome.hits = outcome
+                    .days
                     .iter()
-                    .filter(|date| self.selector_seconds(&revision.ids, date) >= threshold)
+                    .filter(|date| self.selector_seconds(&revision.ids, date.as_str()) >= threshold)
                     .count() as i64;
                 outcome.pass = outcome.hits >= params.min_days;
             }
             RuleParams::CategoryDailyAvg(params) => {
-                outcome.total_seconds = counted
+                // Only the selected weekdays inside the window, and only the
+                // ones that are not travel-majority: those are dropped from
+                // both the numerator and the denominator, never replaced by an
+                // older weekday.
+                let included: Vec<&String> = outcome
+                    .days
                     .iter()
-                    .map(|date| self.selector_seconds(&revision.ids, date))
+                    .filter(|date| {
+                        weekday(date.as_str()).is_some_and(|day| params.weekdays.contains(&day))
+                    })
+                    .filter(|date| !self.travel_excluded(revision, date.as_str()))
+                    .collect();
+                outcome.total_seconds = included
+                    .iter()
+                    .map(|date| self.selector_seconds(&revision.ids, date.as_str()))
                     .sum();
-                let mean = if counted.is_empty() {
+                outcome.median = if included.is_empty() {
                     0.0
                 } else {
-                    outcome.total_seconds as f64 / HOUR_SECS / counted.len() as f64
+                    outcome.total_seconds as f64 / HOUR_SECS / included.len() as f64
                 };
-                outcome.median = mean;
-                outcome.pass = mean >= params.target_hours;
+                outcome.pass = outcome.median >= params.target_hours;
             }
             RuleParams::SleepDuration(params) => {
-                outcome.nights = self.nights_on(&counted);
+                outcome.nights = self.nights_on(&outcome.days);
                 // The median is reported even when there are too few nights to
                 // judge: the card shows what is logged, the `owed` sentence
                 // says why it cannot be scored yet.
@@ -798,7 +960,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
             RuleParams::SleepTiming(params) => {
-                outcome.nights = self.nights_on(&counted);
+                outcome.nights = self.nights_on(&outcome.days);
                 let values: Vec<f64> = outcome
                     .nights
                     .iter()
@@ -867,7 +1029,13 @@ impl<'a> Evaluator<'a> {
         if date == self.today {
             return DayState::Pending;
         }
-        if self.outcome(revision, date).pass {
+        let outcome = self.outcome(revision, date);
+        if !outcome.is_full() {
+            // The backfill has not reached this day's window: a hole is not a
+            // failure.
+            return DayState::Pending;
+        }
+        if outcome.pass {
             DayState::Pass
         } else {
             DayState::Fail
@@ -904,31 +1072,42 @@ impl<'a> Evaluator<'a> {
         let states = self.state_map();
         let revision = self.params_on(self.score_as_of);
         let outcome = self.outcome(revision, self.score_as_of);
+        let window_full = outcome.is_full();
 
-        let mut streak = 0_i64;
-        let mut best_streak = 0_i64;
-        let mut passes = 0_i64;
-        let mut counted_completed = 0_i64;
-        for (date, state) in &states {
-            // A completed day: at or before the card's cursor and strictly
-            // before the real today. Live, that is "through yesterday"; a
-            // finished challenge scored at its `ends_on` counts that day too.
-            if date.as_str() > self.score_as_of || date.as_str() >= self.today {
-                continue;
-            }
-            match state {
-                DayState::Pass => {
-                    streak += 1;
-                    best_streak = best_streak.max(streak);
-                    passes += 1;
-                    counted_completed += 1;
+        // A window that is not full has no verdict and no history: the card
+        // says the history is still building instead of reporting a partial
+        // number as a failure.
+        let (mut streak, mut best_streak, mut compliance) = (0_i64, 0_i64, None);
+        if window_full {
+            let mut passes = 0_i64;
+            let mut counted_completed = 0_i64;
+            for (date, state) in &states {
+                // A completed day: at or before the card's cursor and strictly
+                // before the real today. Live, that is "through yesterday"; a
+                // finished challenge scored at its `ends_on` counts that day
+                // too.
+                if date.as_str() > self.score_as_of || date.as_str() >= self.today {
+                    continue;
                 }
-                DayState::Fail => {
-                    streak = 0;
-                    counted_completed += 1;
+                match state {
+                    DayState::Pass => {
+                        streak += 1;
+                        best_streak = best_streak.max(streak);
+                        passes += 1;
+                        counted_completed += 1;
+                    }
+                    DayState::Fail => {
+                        streak = 0;
+                        counted_completed += 1;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            compliance = if counted_completed == 0 {
+                None
+            } else {
+                Some(passes as f64 / counted_completed as f64)
+            };
         }
 
         let strip: Vec<StripCell> = self
@@ -956,17 +1135,14 @@ impl<'a> Evaluator<'a> {
             paused_on: self.spec.paused_on.clone(),
             sort_order: self.spec.sort_order,
             condition: revision.params.condition(),
-            on_track: outcome.pass,
+            on_track: window_full && outcome.pass,
+            window_full,
             actual_label: self.actual_label(revision, &outcome),
             target_label: revision.params.target_label(),
             owed: self.owed(revision, &outcome),
             streak,
             best_streak,
-            compliance: if counted_completed == 0 {
-                None
-            } else {
-                Some(passes as f64 / counted_completed as f64)
-            },
+            compliance,
             // The canonical JSON round-trips through `serde_json::Value` so the
             // client reads exactly what a `PATCH` would re-send.
             params: serde_json::from_str(&revision.params.to_json())
@@ -1013,7 +1189,13 @@ impl<'a> Evaluator<'a> {
     }
 
     /// The rule's actual params — never hardcoded 12 / 7 / 4.
+    ///
+    /// A window that is not full owes nothing but history: there is no honest
+    /// number to report yet.
     fn owed(&self, revision: &ParsedRevision, outcome: &WindowOutcome) -> String {
+        if !outcome.is_full() {
+            return HISTORY_BUILDING.to_string();
+        }
         match &revision.params {
             RuleParams::CategoryTotal(params) => {
                 if outcome.pass {
@@ -1034,14 +1216,17 @@ impl<'a> Evaluator<'a> {
                     "need {} more day(s) with ≥{} {}",
                     params.min_days - outcome.hits,
                     super::params::compact_minutes(params.min_minutes),
-                    self.spec.name
+                    self.category_noun(&params.categories)
                 )
             }
             RuleParams::CategoryDailyAvg(params) => {
-                if outcome.pass {
-                    return "on track".to_string();
-                }
-                let mut owed = format!("need +{:.1}h on the mean", params.target_hours - outcome.median);
+                let mut owed = if outcome.pass {
+                    "on track".to_string()
+                } else {
+                    format!("need +{:.1}h on the mean", params.target_hours - outcome.median)
+                };
+                // The live progress rides along even when the mean already
+                // passes: the card is about today, not only about the gap.
                 if let Some(today) = self.today_fragment(revision, params) {
                     owed.push(' ');
                     owed.push_str(&today);
@@ -1095,7 +1280,8 @@ impl<'a> Evaluator<'a> {
 
     /// `today 4.2 / 7.0h · 2.8h left` — only on the live board (the card's
     /// cursor is the real today) and when today is an included weekday. A
-    /// frozen final day must never be described as "today".
+    /// frozen final day must never be described as "today". The "left" clause
+    /// is dropped once today's own hours already clear the target.
     fn today_fragment(
         &self,
         revision: &ParsedRevision,
@@ -1123,6 +1309,20 @@ impl<'a> Evaluator<'a> {
         Some(fragment)
     }
 
+    /// The lowercase noun a `category_days` owed sentence uses: the selector's
+    /// own category (`fitness`), never the rule's display name (which the user
+    /// may have renamed to anything).
+    fn category_noun(&self, selector: &CategorySelector) -> String {
+        match selector {
+            CategorySelector::AllProductive => "productive".to_string(),
+            CategorySelector::Ids { ids, .. } => ids
+                .iter()
+                .find_map(|id| self.catalog.get(id))
+                .map(|cat| cat.title.to_lowercase())
+                .unwrap_or_else(|| self.spec.name.to_lowercase()),
+        }
+    }
+
     fn evidence(&self, revision: &ParsedRevision, outcome: &WindowOutcome) -> Evidence {
         match &revision.params {
             RuleParams::CategoryTotal(_) => Evidence::CategoryTotal {
@@ -1130,7 +1330,9 @@ impl<'a> Evaluator<'a> {
                     .strip_dates()
                     .into_iter()
                     .map(|date| {
-                        if self.is_paused(&date) {
+                        // A day that is not in play (before `starts_on`, after
+                        // `ends_on`) or paused has no window to sum.
+                        if self.is_paused(&date) || !self.in_play(&date) {
                             return EvidencePoint { date, hours: None };
                         }
                         let revision = self.params_on(&date);
@@ -1143,10 +1345,10 @@ impl<'a> Evaluator<'a> {
                     .collect(),
             },
             RuleParams::CategoryDays(params) => {
-                let threshold = params.min_minutes * 60;
+                let threshold = threshold_seconds(params.min_minutes);
                 Evidence::CategoryDays {
                     days: outcome
-                        .counted
+                        .days
                         .iter()
                         .map(|date| EvidenceDay {
                             date: date.clone(),
@@ -1167,10 +1369,10 @@ impl<'a> Evaluator<'a> {
                     .collect(),
             },
             RuleParams::SleepDuration(_) => Evidence::SleepDuration {
-                nights: self.evidence_nights(),
+                nights: self.evidence_nights(outcome),
             },
             RuleParams::SleepTiming(_) => Evidence::SleepTiming {
-                nights: self.evidence_nights(),
+                nights: self.evidence_nights(outcome),
             },
         }
     }
@@ -1206,20 +1408,14 @@ impl<'a> Evaluator<'a> {
         out
     }
 
-    /// The newest `EVIDENCE_NIGHTS` paired nights with `wake_date <=
-    /// score_as_of`.
-    fn evidence_nights(&self) -> Vec<EvidenceNight> {
-        let mut nights: Vec<&Night> = self
-            .digest
-            .nights
-            .iter()
-            .filter(|night| {
-                night.source == "paired" && night.wake_date.as_str() <= self.score_as_of
-            })
-            .collect();
-        nights.sort_by(|left, right| {
-            (&left.wake_date, &left.asleep_at).cmp(&(&right.wake_date, &right.asleep_at))
-        });
+    /// The newest `EVIDENCE_NIGHTS` paired nights **inside the scoring
+    /// window**, oldest first.
+    ///
+    /// A window is the unit a sleep rule is judged over, so its evidence is
+    /// that window's nights — never an unbounded last-14 from all history.
+    /// Still capped at `EVIDENCE_NIGHTS`.
+    fn evidence_nights(&self, outcome: &WindowOutcome) -> Vec<EvidenceNight> {
+        let mut nights: Vec<&Night> = outcome.nights.iter().collect();
         if nights.len() > EVIDENCE_NIGHTS {
             nights.drain(..nights.len() - EVIDENCE_NIGHTS);
         }
@@ -1239,6 +1435,15 @@ impl<'a> Evaluator<'a> {
 // ──────────────────────────────────────────
 // Small math
 // ──────────────────────────────────────────
+
+/// `min_minutes * 60` with the unrepresentable case pinned to `i64::MAX` — a
+/// threshold nothing can clear, never a debug overflow.
+///
+/// `RuleParams::validate` rejects such a value on the way in, so this only
+/// guards a hand-edited row.
+fn threshold_seconds(min_minutes: i64) -> i64 {
+    min_minutes.saturating_mul(60)
+}
 
 /// `0 = Monday … 6 = Sunday` (`chrono::Datelike::num_days_from_monday`).
 fn weekday(date: &str) -> Option<u32> {
@@ -1424,6 +1629,29 @@ mod tests {
         digest.add(date, category_id, (value * 3600.0).round() as i64);
     }
 
+    /// A digest whose inclusive `[from, to]` range is already aggregated — no
+    /// backfill hole in the window (M3).
+    fn digest_with_days(from: &str, to: &str) -> DigestSlice {
+        let mut digest = DigestSlice::default();
+        digest.mark_aggregated_range(from, to);
+        digest
+    }
+
+    /// The window's first day for a `window`-day span ending at `as_of`, with
+    /// no pauses.
+    fn window_from(as_of: &str, window: i64) -> String {
+        shift_date(as_of, -(window - 1)).expect("valid date")
+    }
+
+    /// One closed pause period.
+    fn pause(rule_id: Option<&str>, from: &str, to: &str) -> PausePeriod {
+        PausePeriod {
+            rule_id: rule_id.map(|id| id.to_string()),
+            from_date: from.to_string(),
+            to_date: to.to_string(),
+        }
+    }
+
     /// Scores with the card's cursor and the real today both at `as_of` — the
     /// live board.
     fn run(
@@ -1446,13 +1674,6 @@ mod tests {
             .clone()
     }
 
-    fn evidence_days(score: &RuleScore) -> Vec<String> {
-        match &score.evidence {
-            Evidence::CategoryDays { days } => days.iter().map(|day| day.date.clone()).collect(),
-            other => panic!("expected category_days evidence, got {other:?}"),
-        }
-    }
-
     fn evidence_points(score: &RuleScore) -> Vec<(String, Option<f64>)> {
         match &score.evidence {
             Evidence::CategoryTotal { points } => {
@@ -1467,15 +1688,16 @@ mod tests {
     #[test]
     fn category_days_passes_at_twelve_hits_and_fails_at_eleven() {
         let catalog = catalog();
-        let spec = spec("r-fitness", "Fitness", RuleKind::CategoryDays, EARLY);
+        let rule = spec("r-fitness", "Fitness", RuleKind::CategoryDays, EARLY);
         let revisions = [revision(EARLY, &days_params(&["fitness"], 60, 60, 12))];
         let window = days_ending(SUNDAY, 60);
 
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in window.iter().take(12) {
             hours(&mut digest, date, "fitness", 1.0);
         }
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
+        assert!(score.window_full);
         assert!(score.on_track);
         assert_eq!(score.owed, "on track");
         assert_eq!(score.actual_label, "12 days");
@@ -1483,22 +1705,43 @@ mod tests {
         assert_eq!(score.condition, "≥12 days of ≥1h / 60d");
 
         // One second short of the threshold is not a hit.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in window.iter().take(11) {
             hours(&mut digest, date, "fitness", 1.0);
         }
         digest.add(&window[11], "fitness", 3599);
         digest.add(&window[12], "fitness", 50 * 60);
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
         assert!(!score.on_track);
         assert!(score.owed.contains("1 more day"), "{}", score.owed);
+        assert_eq!(
+            score.owed,
+            "need 1 more day(s) with ≥1h fitness",
+            "the owed noun is the category, never the rule's display name"
+        );
         assert_eq!(score.actual_label, "11 days");
 
         // A single day of exactly one hour does hit.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         digest.add(&window[59], "fitness", 3600);
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
         assert_eq!(score.actual_label, "1 days");
+
+        // The noun follows the selector: `all_productive` is `productive`.
+        let productive = spec("r-productive", "Fitness", RuleKind::CategoryDays, EARLY);
+        let revisions = [revision(
+            EARLY,
+            &RuleParams::CategoryDays(CategoryDaysParams {
+                categories: CategorySelector::AllProductive,
+                window_days: 60,
+                min_minutes: 60,
+                min_days: 12,
+            }),
+        )];
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
+        hours(&mut digest, SUNDAY, "work", 1.0);
+        let score = run(&productive, &revisions, &catalog, &digest, SUNDAY);
+        assert!(score.owed.ends_with("productive"), "{}", score.owed);
     }
 
     // ── 2. one total per category per day ───────────────────────────────────
@@ -1521,43 +1764,120 @@ mod tests {
         assert_eq!(score.actual_label, "1 days");
     }
 
-    // ── 3. pause extends the window ─────────────────────────────────────────
+    // ── 3. the calendar window ──────────────────────────────────────────────
 
+    /// The pin test for M1/M2: 60 **calendar** days, not 60 counted weekdays.
     #[test]
-    fn a_paused_day_is_skipped_and_extends_the_window() {
+    fn a_sixty_day_window_is_calendar_days_not_counted_weekdays() {
         let catalog = catalog();
-        let spec = spec("r-fitness", "Fitness", RuleKind::CategoryDays, EARLY);
-        let revisions = [revision(EARLY, &days_params(&["fitness"], 60, 60, 12))];
+        let spec = spec("r-productive", "Productive weekdays", RuleKind::CategoryDailyAvg, EARLY);
+        let revisions = [revision(
+            EARLY,
+            &avg_params(
+                CategorySelector::AllProductive,
+                &[0, 1, 2, 3, 4],
+                60,
+                7.0,
+                Some((&["trip", "travel"], 50.0)),
+            ),
+        )];
+        // `SUNDAY` is 2026-10-18; the window's first day is 2026-08-20.
+        let start = window_from(SUNDAY, 60);
+        assert_eq!(start, "2026-08-20");
         let window = days_ending(SUNDAY, 60);
-        let paused_day = "2026-10-10";
-        let just_before = shift_date(&window[0], -1).expect("date"); // 2026-08-19
+        assert_eq!(window.first(), Some(&start));
+        let weekdays: Vec<&String> = window
+            .iter()
+            .filter(|date| weekday(date).is_some_and(|day| day <= 4))
+            .collect();
+        assert_eq!(weekdays.len(), 42, "exactly 42 Mon–Fri dates in the span");
 
-        let mut digest = DigestSlice::default();
-        // Eleven hits inside the naive window, plus the paused day (which would
-        // have been a hit) and one hit just before the naive window.
-        for date in window.iter().skip(10).take(11) {
-            hours(&mut digest, date, "fitness", 1.0);
+        // Every selected weekday is 8h except one travel-excluded Wednesday.
+        let travel = "2026-10-14";
+        assert_eq!(weekday(travel), Some(2), "a Wednesday inside the window");
+        let mut digest = digest_with_days(&start, SUNDAY);
+        for date in &weekdays {
+            if date.as_str() == travel {
+                continue;
+            }
+            hours(&mut digest, date.as_str(), "work", 8.0);
         }
-        hours(&mut digest, paused_day, "fitness", 1.0);
-        hours(&mut digest, &just_before, "fitness", 1.0);
+        hours(&mut digest, travel, "work", 2.0);
+        hours(&mut digest, travel, "travel", 3.0);
+        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
 
-        let pauses = [PausePeriod {
-            rule_id: Some("r-fitness".to_string()),
-            from_date: paused_day.to_string(),
-            to_date: paused_day.to_string(),
-        }];
-        let score = score_rule(
-            &spec, &revisions, &pauses, &catalog, &digest, SUNDAY, SUNDAY,
-        )
-        .expect("scores");
-        assert!(score.on_track, "{score:?}");
+        assert!(score.window_full);
+        assert_eq!(cell(&score, travel), "excluded", "still shown as excluded");
+        // 41 weekdays, not 42 and not backfilled with an older Wednesday:
+        // (41 * 8) / 41 = 8.00h.
+        assert_eq!(score.actual_label, "8.00h mean");
+        assert!(score.on_track);
+        match &score.evidence {
+            Evidence::CategoryDailyAvg { weekdays } => {
+                assert!(
+                    weekdays.iter().any(|day| day.date == travel && day.excluded),
+                    "the excluded Wednesday is on the strip"
+                );
+            }
+            other => panic!("expected daily-avg evidence, got {other:?}"),
+        }
+
+        // If the excluded day were replaced by an older weekday, the count
+        // would be 42 — prove the window is the calendar span by adding an
+        // older Monday: it is outside the window and must not move the mean.
+        hours(&mut digest, "2026-08-17", "work", 8.0);
+        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        assert_eq!(score.actual_label, "8.00h mean");
+    }
+
+    /// The pin test for the pause extension: one paused day inside the window
+    /// pulls the start one day earlier, and the paused day is not scored.
+    #[test]
+    fn a_pause_extends_the_calendar_window_by_paused_days() {
+        let catalog = catalog();
+        let spec = spec("r-productive", "Productive weekdays", RuleKind::CategoryDailyAvg, EARLY);
+        let revisions = [revision(
+            EARLY,
+            &avg_params(CategorySelector::AllProductive, &[0, 1, 2, 3, 4], 60, 7.0, None),
+        )];
+        let start = window_from(SUNDAY, 60);
+        assert_eq!(start, "2026-08-20");
+        let paused_day = "2026-10-14"; // a Wednesday, inside the strip
+        let pauses = [pause(Some("r-productive"), paused_day, paused_day)];
+        let is_paused = |date: &str| date == paused_day;
+        assert_eq!(
+            window_start(SUNDAY, 60, &is_paused).expect("a window"),
+            "2026-08-19",
+            "one paused day pulls the start one day earlier"
+        );
+
+        // Every selected weekday is 8h, so the paused Wednesday must not be in
+        // the mean (42 weekdays, not 43, and not 41).
+        let mut digest = digest_with_days("2026-08-19", SUNDAY);
+        for date in days_ending(SUNDAY, 60) {
+            if weekday(&date).is_some_and(|day| day <= 4) {
+                hours(&mut digest, date.as_str(), "work", 8.0);
+            }
+        }
+        hours(&mut digest, "2026-08-19", "work", 8.0); // a Wednesday, in reach
+        let score = score_rule(&spec, &revisions, &pauses, &catalog, &digest, SUNDAY, SUNDAY)
+            .expect("scores");
         assert_eq!(cell(&score, paused_day), "paused");
+        assert_eq!(
+            score.actual_label, "8.00h mean",
+            "the paused Wednesday is out of the mean"
+        );
+        assert!(score.window_full);
 
-        let counted = evidence_days(&score);
-        assert_eq!(counted.len(), 60);
-        assert!(!counted.contains(&paused_day.to_string()));
-        // The window reached one day further back because of the pause.
-        assert_eq!(counted.first(), Some(&just_before));
+        // A cascade: a second paused day just inside the extension keeps
+        // pulling the start earlier.
+        let cascade = ["2026-09-16", "2026-08-20"];
+        let is_paused = |date: &str| cascade.contains(&date);
+        assert_eq!(
+            window_start(SUNDAY, 60, &is_paused).expect("a window"),
+            "2026-08-18",
+            "two paused days inside the span"
+        );
     }
 
     #[test]
@@ -1565,14 +1885,10 @@ mod tests {
         let catalog = catalog();
         let spec = spec("r-fitness", "Fitness", RuleKind::CategoryDays, "2026-10-15");
         let revisions = [revision("2026-10-15", &days_params(&["fitness"], 1, 60, 1))];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days("2026-10-15", SUNDAY);
         hours(&mut digest, "2026-10-15", "fitness", 1.0);
         hours(&mut digest, "2026-10-17", "fitness", 1.0);
-        let pauses = [PausePeriod {
-            rule_id: Some("r-fitness".to_string()),
-            from_date: "2026-10-16".to_string(),
-            to_date: "2026-10-16".to_string(),
-        }];
+        let pauses = [pause(Some("r-fitness"), "2026-10-16", "2026-10-16")];
         let score = score_rule(
             &spec, &revisions, &pauses, &catalog, &digest, SUNDAY, SUNDAY,
         )
@@ -1588,25 +1904,25 @@ mod tests {
     #[test]
     fn category_total_window_and_comparators() {
         let catalog = catalog();
-        let spec = spec("r-learning", "Learning", RuleKind::CategoryTotal, EARLY);
+        let rule = spec("r-learning", "Learning", RuleKind::CategoryTotal, EARLY);
         let revisions = [revision(
             EARLY,
             &total_params(ids(&["learning"]), 7, Comparator::Gte, 4.0),
         )];
         let window = days_ending(SUNDAY, 7);
 
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window[0], SUNDAY);
         digest.add(&window[3], "learning", 4 * 3600);
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
         assert!(score.on_track);
         assert_eq!(score.actual_label, "4.0h");
         assert_eq!(score.target_label, "≥4h / 7d");
         assert_eq!(score.condition, "≥4h / 7d");
         assert_eq!(evidence_points(&score).len(), 14);
 
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window[0], SUNDAY);
         digest.add(&window[3], "learning", 4 * 3600 - 1);
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
         assert!(!score.on_track);
         assert_eq!(score.owed, "need +0.0h");
         assert_eq!(score.actual_label, "4.0h");
@@ -1616,22 +1932,59 @@ mod tests {
             EARLY,
             &total_params(ids(&["learning"]), 7, Comparator::Lte, 1.0),
         )];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window[0], SUNDAY);
         digest.add(&window[3], "learning", 2 * 3600);
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
         assert!(!score.on_track);
         assert_eq!(score.owed, "need -1.0h");
         assert_eq!(score.condition, "≤1h / 7d");
 
         // A day outside the window does not count.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&days_ending(SUNDAY, 8)[0], SUNDAY);
         digest.add(&days_ending(SUNDAY, 8)[0], "learning", 4 * 3600);
         let revisions = [revision(
             EARLY,
             &total_params(ids(&["learning"]), 7, Comparator::Gte, 4.0),
         )];
-        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
         assert!(!score.on_track);
+
+        // A day in play but outside the window is `null` in the evidence, not
+        // a zero sum.
+        let points = evidence_points(&score);
+        assert_eq!(points.last().map(|(date, _)| date.as_str()), Some(SUNDAY));
+        let out_of_window = shift_date(&window[0], -1).expect("date");
+        let before = points
+            .iter()
+            .find(|(date, _)| date == &out_of_window)
+            .map(|(_, hours)| *hours);
+        assert_eq!(
+            before,
+            Some(Some(4.0)),
+            "the evidence is the rolling window sum ending on that day"
+        );
+
+        // A strip day that is not in play (before `starts_on`) has no window to
+        // sum: `null`, not 0h.
+        let late = spec("r-late", "Learning", RuleKind::CategoryTotal, "2026-10-12");
+        let late_revisions = [revision(
+            "2026-10-12",
+            &total_params(ids(&["learning"]), 7, Comparator::Gte, 4.0),
+        )];
+        let mut digest = digest_with_days("2026-10-12", SUNDAY);
+        hours(&mut digest, SUNDAY, "learning", 5.0);
+        let score = run(&late, &late_revisions, &catalog, &digest, SUNDAY);
+        let points = evidence_points(&score);
+        assert_eq!(
+            points.first().map(|(_, hours)| *hours),
+            Some(None),
+            "before starts_on"
+        );
+        assert_eq!(
+            points.last().map(|(_, hours)| *hours),
+            Some(Some(5.0)),
+            "the live day still sums"
+        );
     }
 
     // ── 5. productive weekday mean ──────────────────────────────────────────
@@ -1644,8 +1997,9 @@ mod tests {
             EARLY,
             &avg_params(CategorySelector::AllProductive, &[0, 1, 2, 3, 4], 5, 7.0, None),
         )];
-        let mut digest = DigestSlice::default();
-        for date in ["2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"] {
+        // The 5-day window ending MONDAY: Thu 10-15 .. Mon 10-19.
+        let mut digest = digest_with_days(&window_from(MONDAY, 5), MONDAY);
+        for date in ["2026-10-15", "2026-10-16"] {
             hours(&mut digest, date, "work", 7.0);
         }
         // A Saturday does not count (and is `off` in the strip).
@@ -1655,16 +2009,16 @@ mod tests {
         assert_eq!(cell(&score, "2026-10-18"), "off");
         assert_eq!(cell(&score, MONDAY), "pending");
         // Monday (today) has no rows: it is an included weekday worth 0h, which
-        // pulls the mean down to 28 / 5.
-        assert_eq!(score.actual_label, "5.60h mean");
+        // pulls the mean down to 14 / 3.
+        assert_eq!(score.actual_label, "4.67h mean");
         assert!(!score.on_track);
-        assert_eq!(score.owed, "need +1.4h on the mean today 0.0 / 7.0h · 7.0h left");
+        assert_eq!(score.owed, "need +2.3h on the mean today 0.0 / 7.0h · 7.0h left");
         assert_eq!(score.target_label, "≥7h weekday mean");
         assert_eq!(score.condition, "≥7h weekday mean / 5d");
     }
 
     #[test]
-    fn travel_days_are_excluded_and_extend_the_window() {
+    fn travel_days_are_excluded_and_do_not_extend_the_window() {
         let catalog = catalog();
         let spec = spec("r-productive", "Productive weekdays", RuleKind::CategoryDailyAvg, EARLY);
         let revisions = [revision(
@@ -1678,12 +2032,12 @@ mod tests {
             ),
         )];
 
-        // Waking = 2h work + 3h travel → 60% → excluded, and the window reaches
-        // back one more weekday to keep five included days.
-        let mut digest = DigestSlice::default();
+        // Waking = 2h work + 3h travel → 60% → excluded, and the mean is over
+        // the remaining weekdays only: the window is not extended.
+        let mut digest = digest_with_days(&window_from(MONDAY, 5), MONDAY);
         hours(&mut digest, MONDAY, "work", 2.0);
         hours(&mut digest, MONDAY, "travel", 3.0);
-        for date in ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"] {
+        for date in ["2026-10-15", "2026-10-16"] {
             hours(&mut digest, date, "work", 7.0);
         }
         let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
@@ -1701,24 +2055,75 @@ mod tests {
             other => panic!("expected daily-avg evidence, got {other:?}"),
         }
 
+        // An excluded day is not replaced by an older weekday: with Monday
+        // excluded the mean is over the two 7h days (Thu + Fri).
+        let mut digest = digest_with_days("2026-10-01", MONDAY);
+        hours(&mut digest, MONDAY, "work", 2.0);
+        hours(&mut digest, MONDAY, "travel", 3.0);
+        for date in ["2026-10-15", "2026-10-16"] {
+            hours(&mut digest, date, "work", 7.0);
+        }
+        // 2026-10-12 is a Monday outside the 5-day window: if the window
+        // reached back for a replacement it would count.
+        hours(&mut digest, "2026-10-12", "work", 1.0);
+        let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
+        assert_eq!(score.actual_label, "7.00h mean", "{score:?}");
+
         // Exactly 50% is not "more than 50%".
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(MONDAY, 5), MONDAY);
         hours(&mut digest, MONDAY, "work", 1.0);
         hours(&mut digest, MONDAY, "travel", 1.0);
         let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
         assert_eq!(cell(&score, MONDAY), "pending");
-        assert_eq!(score.actual_label, "0.20h mean");
+        assert_eq!(score.actual_label, "0.33h mean");
 
         // Waking 0 (unclassified only) is never excluded, and productive stays 0.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(MONDAY, 5), MONDAY);
         hours(&mut digest, MONDAY, "", 5.0);
         let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
         assert_eq!(cell(&score, MONDAY), "pending");
         assert_eq!(score.actual_label, "0.00h mean");
     }
 
-    // ── 6. productive children ──────────────────────────────────────────────
+    // ── sleep children are never waking (m8) ────────────────────────────────
 
+    #[test]
+    fn a_child_of_sleep_is_not_waking() {
+        let catalog = CategoryCatalog::new(vec![
+            Cat::new("sleep", None, false, "sleep", "Sleep"),
+            Cat::new("nap", Some("sleep"), false, "nap", "Nap"),
+            Cat::new("trip", None, false, "trip", "Trip"),
+            Cat::new("work", None, true, "work", "Work"),
+        ]);
+        let sleep_ids = catalog.sleep_ids();
+        assert!(sleep_ids.contains("nap"), "a child of sleep is sleep: {sleep_ids:?}");
+        assert!(sleep_ids.contains("sleep"));
+        assert!(
+            sleep_ids.contains(crate::digest::SYNTHETIC_SLEEP_CATEGORY_ID),
+            "the synthetic sentinel always counts"
+        );
+
+        // Waking is classified non-sleep time: a 5h nap must not make the 1h
+        // trip look like 16% of the day.
+        let spec = spec("r-productive", "Productive weekdays", RuleKind::CategoryDailyAvg, EARLY);
+        let revisions = [revision(
+            EARLY,
+            &avg_params(
+                CategorySelector::AllProductive,
+                &[0, 1, 2, 3, 4],
+                1,
+                7.0,
+                Some((&["trip"], 50.0)),
+            ),
+        )];
+        let mut digest = digest_with_days(MONDAY, MONDAY);
+        hours(&mut digest, MONDAY, "nap", 5.0);
+        hours(&mut digest, MONDAY, "trip", 1.0);
+        let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
+        assert_eq!(cell(&score, MONDAY), "excluded", "{score:?}");
+    }
+
+    // ── 6. productive children ──────────────────────────────────────────────
     #[test]
     fn productive_expands_through_one_level_of_children() {
         let catalog = CategoryCatalog::new(vec![
@@ -1760,11 +2165,12 @@ mod tests {
         let revisions = [revision(EARLY, &duration_params(60, 14, 6.5))];
         let window = days_ending(SUNDAY, 14);
 
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 300, 23_400);
         }
         let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        assert!(score.window_full);
         assert!(score.on_track);
         assert_eq!(score.actual_label, "6.50h median");
         assert_eq!(score.target_label, "≥6.5h median");
@@ -1772,7 +2178,7 @@ mod tests {
         assert_eq!(score.owed, "on track");
 
         // Thirteen nights is a fail, not a pass.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in days_ending(SUNDAY, 13) {
             digest.add_night(&date, 630, 300, 23_400);
         }
@@ -1786,7 +2192,7 @@ mod tests {
         );
 
         // An estimated night in the window does not count toward `min_nights`.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 300, 23_400);
         }
@@ -1809,7 +2215,7 @@ mod tests {
         assert_eq!(score.actual_label, "6.50h median");
 
         // An even count averages the two middle values.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for (index, date) in window.iter().enumerate() {
             let seconds = if index < 7 { 6 * 3600 } else { 7 * 3600 };
             digest.add_night(date, 630, 300, seconds);
@@ -1819,13 +2225,40 @@ mod tests {
         assert!(score.on_track);
 
         // Too short: the deficit sentence.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 300, 6 * 3600);
         }
         let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
         assert!(!score.on_track);
         assert_eq!(score.owed, "median is 0.50h short");
+
+        // A night outside the window does not count, and the evidence is the
+        // window's own nights — never an unbounded last-14 from all history.
+        let mut digest = digest_with_days("2026-08-01", SUNDAY);
+        for date in &window {
+            digest.add_night(date, 630, 300, 23_400);
+        }
+        // 20 older nights, all outside the 60-day window (which starts
+        // 2026-08-20).
+        for offset in 62..82 {
+            let date = shift_date(SUNDAY, -offset).expect("date");
+            digest.add_night(&date, 630, 300, 8 * 3600);
+        }
+        let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
+        assert_eq!(score.actual_label, "6.50h median", "only the window's nights");
+        match &score.evidence {
+            Evidence::SleepDuration { nights } => {
+                assert_eq!(nights.len(), EVIDENCE_NIGHTS, "capped at 14");
+                assert_eq!(
+                    nights.first().map(|night| night.wake_date.as_str()),
+                    Some("2026-10-05"),
+                    "the oldest night in the window"
+                );
+                assert_eq!(nights.last().map(|night| night.wake_date.as_str()), Some(SUNDAY));
+            }
+            other => panic!("expected sleep evidence, got {other:?}"),
+        }
     }
 
     // ── 8. sleep timing ─────────────────────────────────────────────────────
@@ -1841,7 +2274,7 @@ mod tests {
             EARLY,
             &timing_params(SleepMetric::BedtimeMedian, Comparator::Lte, 630, 60, 14),
         )];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 300, 23_400);
         }
@@ -1853,7 +2286,7 @@ mod tests {
         assert_eq!(score.owed, "on track");
 
         // A median of 631 (22:31) fails.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for (index, date) in window.iter().enumerate() {
             digest.add_night(date, if index < 7 { 631 } else { 631 }, 300, 23_400);
         }
@@ -1867,7 +2300,7 @@ mod tests {
             EARLY,
             &timing_params(SleepMetric::WakeMedian, Comparator::Lte, 300, 60, 14),
         )];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 300, 23_400);
         }
@@ -1875,7 +2308,7 @@ mod tests {
         assert!(score.on_track);
         assert_eq!(score.condition, "median wake ≤05:00");
 
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 301, 23_400);
         }
@@ -1888,7 +2321,7 @@ mod tests {
             EARLY,
             &timing_params(SleepMetric::BedtimeStdev, Comparator::Lte, 45, 60, 14),
         )];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         for date in &window {
             digest.add_night(date, 630, 300, 23_400);
         }
@@ -1902,7 +2335,7 @@ mod tests {
             EARLY,
             &timing_params(SleepMetric::BedtimeStdev, Comparator::Lte, 8, 60, 2),
         )];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         digest.add_night(SUNDAY, 0, 300, 23_400);
         digest.add_night("2026-10-17", 10, 300, 23_400);
         let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
@@ -1918,7 +2351,7 @@ mod tests {
         assert_eq!(score.owed, "bed stdev 7m (≤7m)");
 
         // One night is a fail when `min_nights` is 2, even with stdev 0.
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(SUNDAY, 60), SUNDAY);
         digest.add_night(SUNDAY, 630, 300, 23_400);
         let score = run(&spec, &revisions, &catalog, &digest, SUNDAY);
         assert!(!score.on_track);
@@ -1941,7 +2374,7 @@ mod tests {
                 &total_params(ids(&["learning"]), 1, Comparator::Gte, 10.0),
             ),
         ];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days("2026-10-09", "2026-10-13");
         hours(&mut digest, "2026-10-10", "learning", 5.0);
         hours(&mut digest, "2026-10-11", "learning", 5.0);
 
@@ -1979,7 +2412,6 @@ mod tests {
         assert_eq!(score.best_streak, 0);
         assert_eq!(score.compliance, None);
     }
-
     // ── 11. finished challenges ─────────────────────────────────────────────
 
     #[test]
@@ -2111,13 +2543,30 @@ mod tests {
             EARLY,
             &avg_params(CategorySelector::AllProductive, &[0, 1, 2, 3, 4], 5, 7.0, None),
         )];
-        let mut digest = DigestSlice::default();
+        let mut digest = digest_with_days(&window_from(MONDAY, 5), MONDAY);
         digest.add(MONDAY, "work", 15_120); // 4.2h
         let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
-        assert_eq!(score.actual_label, "0.84h mean");
+        // Three included weekdays in the 5-day window (Thu, Fri, Mon).
+        assert_eq!(score.actual_label, "1.40h mean");
         assert!(score.owed.contains("today 4.2 / 7.0h"), "{}", score.owed);
         assert!(score.owed.contains("2.8h left"), "{}", score.owed);
-        assert_eq!(score.owed, "need +6.2h on the mean today 4.2 / 7.0h · 2.8h left");
+        assert_eq!(score.owed, "need +5.6h on the mean today 4.2 / 7.0h · 2.8h left");
+
+        // m6: the fragment rides along even when the mean already passes, and
+        // only the "left" clause is dropped once today clears the target.
+        let mut digest = digest_with_days(&window_from(MONDAY, 5), MONDAY);
+        for date in ["2026-10-15", "2026-10-16"] {
+            hours(&mut digest, date, "work", 9.0);
+        }
+        digest.add(MONDAY, "work", 15_120); // 4.2h
+        let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
+        assert!(score.on_track, "7.40h mean");
+        assert_eq!(score.owed, "on track today 4.2 / 7.0h · 2.8h left");
+
+        digest.add(MONDAY, "work", 3 * 3600 + 2880); // 8.0h total
+        let score = run(&spec, &revisions, &catalog, &digest, MONDAY);
+        assert!(score.on_track);
+        assert_eq!(score.owed, "on track today 8.0 / 7.0h", "no left clause");
     }
 
     // ── board: headline, streaks, compliance ────────────────────────────────
@@ -2175,6 +2624,7 @@ mod tests {
 
         assert_eq!(board.rules.len(), 3, "paused rules stay on the board");
         assert_eq!(board.active_rules, 2, "the paused rule is not in the headline");
+        assert_eq!(board.paused_rules, 1, "the paused chip's count");
         assert_eq!(board.on_track, 2);
         assert!(board.reclassifying);
         assert!(!board.backfilling);
@@ -2204,7 +2654,9 @@ mod tests {
                 &total_params(ids(&["learning"]), 7, Comparator::Gte, 4.0),
             )],
         )]);
-        let mut digest = DigestSlice::default();
+        // Every day back to September is aggregated, so the 7-day windows
+        // behind the whole strip are full.
+        let mut digest = digest_with_days("2026-09-01", SUNDAY);
         hours(&mut digest, SUNDAY, "learning", 4.5);
         let board = score_board(BoardInput {
             as_of: SUNDAY,
@@ -2228,6 +2680,7 @@ mod tests {
                 "best_all_pass_streak",
                 "dirty_days",
                 "on_track",
+                "paused_rules",
                 "reclassifying",
                 "rules",
                 "time_zone",
@@ -2237,8 +2690,13 @@ mod tests {
         assert_eq!(value["time_zone"], "Asia/Kolkata");
         assert_eq!(value["on_track"], 1);
         assert_eq!(value["active_rules"], 1);
+        assert_eq!(value["paused_rules"], 0);
         assert_eq!(value["all_pass_streak"], 0);
         assert_eq!(value["dirty_days"], 0);
+        assert!(
+            value.get("warnings").is_none(),
+            "operator notes never reach the client"
+        );
 
         let rule = &value["rules"][0];
         assert_eq!(
@@ -2264,10 +2722,12 @@ mod tests {
                 "streak",
                 "strip",
                 "target_label",
+                "window_full",
             ]
         );
         assert_eq!(rule["kind"], "category_total");
         assert_eq!(rule["phase"], "active");
+        assert_eq!(rule["window_full"], true);
         assert_eq!(rule["ends_on"], serde_json::Value::Null);
         assert_eq!(rule["actual_label"], "4.5h");
         assert_eq!(rule["condition"], "≥4h / 7d");
@@ -2291,9 +2751,15 @@ mod tests {
         // `compliance` is null, never absent, when nothing completed.
         let empty = spec_json(&catalog);
         assert_eq!(empty["compliance"], serde_json::Value::Null);
+        // A window the backfill has not reached is not a failure either.
+        assert_eq!(empty["window_full"], false);
+        assert_eq!(empty["on_track"], false);
+        assert_eq!(empty["owed"], HISTORY_BUILDING);
+        assert_eq!(empty["streak"], 0);
     }
 
-    /// A fresh rule with no history: `compliance` must serialize as `null`.
+    /// A fresh rule with no history: `compliance` must serialize as `null`, and
+    /// the card says the history is still building.
     fn spec_json(catalog: &CategoryCatalog) -> serde_json::Value {
         let spec = spec("r-new", "Learning", RuleKind::CategoryTotal, SUNDAY);
         let revisions = [revision(
@@ -2304,16 +2770,287 @@ mod tests {
         serde_json::to_value(&score).expect("serializes")
     }
 
-    // ── load floor ──────────────────────────────────────────────────────────
+    // ── the load floor ──────────────────────────────────────────────────────
+
+    /// The digest load uses the **same** start-date expression as the scorer.
+    #[test]
+    fn the_load_floor_is_the_scorers_window_start() {
+        let never = |_: &str| false;
+        // A 60-day window ending 2026-10-18 starts on 2026-08-20.
+        assert_eq!(
+            digest_load_floor("2026-06-01", 60, SUNDAY, &never),
+            window_start("2026-06-01", 60, &never).expect("a window"),
+            "the floor is the anchor's own window start"
+        );
+        assert_eq!(digest_load_floor("2026-06-01", 60, SUNDAY, &never), "2026-04-03");
+
+        // A rule created today still needs the strip's own windows: the anchor
+        // is the strip start (2026-10-05), and a 1-day window starts there.
+        assert_eq!(digest_load_floor(SUNDAY, 1, SUNDAY, &never), "2026-10-05");
+        assert_eq!(
+            digest_load_floor(SUNDAY, 1, SUNDAY, &never),
+            window_start("2026-10-05", 1, &never).expect("a window")
+        );
+
+        // A very old rule is clamped to the streak floor: as_of - 399 days,
+        // which is 2025-09-14.
+        assert_eq!(digest_load_floor("2000-01-01", 366, SUNDAY, &never), "2024-09-14");
+        assert_eq!(
+            digest_load_floor("2000-01-01", 366, SUNDAY, &never),
+            window_start("2025-09-14", 366, &never).expect("a window")
+        );
+
+        // A pause widens the floor exactly as it widens the window.
+        let paused = |date: &str| date == "2026-05-05";
+        assert_eq!(
+            digest_load_floor("2026-06-01", 60, SUNDAY, &paused),
+            "2026-04-02",
+            "one paused day inside the anchor's window"
+        );
+        assert_eq!(
+            digest_load_floor("2026-06-01", 60, SUNDAY, &paused),
+            window_start("2026-06-01", 60, &paused).expect("a window")
+        );
+    }
 
     #[test]
-    fn load_floor_reaches_the_whole_lookback() {
-        // 60-day window → 180-day cap; the rule started 2026-06-01.
-        assert_eq!(digest_load_floor("2026-06-01", 60, SUNDAY), "2025-12-04");
-        // A rule created today still needs the strip's own windows.
-        assert_eq!(digest_load_floor(SUNDAY, 1, SUNDAY), "2026-10-03");
-        // A very old rule is clamped to the streak floor (as_of - 399 days).
-        assert_eq!(digest_load_floor("2000-01-01", 366, SUNDAY), "2024-08-11");
+    fn max_window_days_fits_inside_the_lookback() {
+        // A stored `window_days` is rejected above `MAX_WINDOW_DAYS`, and that
+        // bound is tighter than the scorer's lookback cap — so every window a
+        // rule can ask for is one the lookback can reach.
+        assert!(MAX_WINDOW_DAYS <= MAX_LOOKBACK_DAYS);
+        // The cap itself is not full: the extension cannot reach past it.
+        let never = |_: &str| false;
+        assert!(window_start(SUNDAY, MAX_LOOKBACK_DAYS, &never).is_ok());
+        let always = |_: &str| true;
+        assert_eq!(
+            window_start(SUNDAY, 60, &always),
+            Err(NotFull::Lookback),
+            "every day paused: the extension runs past the cap"
+        );
+    }
+
+    // ── M3: a hole is not a failure ─────────────────────────────────────────
+
+    #[test]
+    fn a_window_with_a_hole_is_not_scored_as_a_failure() {
+        let catalog = catalog();
+        let rule = spec("r-learning", "Learning", RuleKind::CategoryTotal, EARLY);
+        let revisions = [revision(
+            EARLY,
+            &total_params(ids(&["learning"]), 7, Comparator::Gte, 4.0),
+        )];
+        let window = days_ending(SUNDAY, 7);
+        // Six of the seven days are aggregated; the hole is 2026-10-14.
+        let mut digest = digest_with_days(&window[0], SUNDAY);
+        digest.aggregated.remove("2026-10-14");
+        hours(&mut digest, SUNDAY, "learning", 5.0);
+
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
+        assert!(!score.window_full);
+        assert!(!score.on_track);
+        assert_eq!(score.owed, HISTORY_BUILDING);
+        assert_eq!(score.streak, 0);
+        assert_eq!(score.best_streak, 0);
+        assert_eq!(score.compliance, None, "no history is consumed");
+        assert_eq!(
+            cell(&score, SUNDAY),
+            "pending",
+            "today stays pending anyway"
+        );
+        assert_eq!(
+            cell(&score, "2026-10-17"),
+            "pending",
+            "an in-play day whose window has a hole is pending, not a fail"
+        );
+        // The hole is only a hole: the day itself still shows what is logged.
+        assert_eq!(score.actual_label, "5.0h");
+
+        // Fill the hole and the very same days get verdicts.
+        let mut digest = digest_with_days(&window[0], SUNDAY);
+        hours(&mut digest, SUNDAY, "learning", 5.0);
+        let score = run(&rule, &revisions, &catalog, &digest, SUNDAY);
+        assert!(score.window_full);
+        assert!(score.on_track);
+        assert_eq!(score.owed, "on track");
+
+        // A sleep rule does not fail for "not enough nights" while the window
+        // is still building.
+        let sleep = spec("r-sleep", "Sleep duration", RuleKind::SleepDuration, EARLY);
+        let revisions = [revision(EARLY, &duration_params(7, 3, 6.5))];
+        let mut digest = DigestSlice::default();
+        digest.add_night(SUNDAY, 630, 300, 23_400);
+        let score = run(&sleep, &revisions, &catalog, &digest, SUNDAY);
+        assert!(!score.window_full);
+        assert_eq!(score.owed, HISTORY_BUILDING);
+        assert!(!score.on_track);
+
+        // With the window full, the same one night is the usual failure.
+        let mut digest = digest_with_days(&window[0], SUNDAY);
+        digest.add_night(SUNDAY, 630, 300, 23_400);
+        let score = run(&sleep, &revisions, &catalog, &digest, SUNDAY);
+        assert!(score.window_full);
+        assert_eq!(score.owed, NOT_ENOUGH_NIGHTS);
+    }
+
+    // ── M4: a paused challenge still finishes ───────────────────────────────
+
+    #[test]
+    fn a_paused_challenge_past_its_end_is_finished() {
+        let catalog = catalog();
+        let mut paused = spec("r-fitness", "Fitness", RuleKind::CategoryDays, EARLY);
+        paused.status = RuleStatus::Paused;
+        paused.paused_on = Some("2026-10-01".to_string());
+        paused.ends_on = Some("2026-10-10".to_string());
+
+        assert_eq!(
+            rule_phase(&paused, SUNDAY),
+            RulePhase::Finished,
+            "the challenge ended, even while it is paused"
+        );
+        assert!(!rule_phase(&paused, SUNDAY).is_on_board());
+
+        // Still paused before its end.
+        assert_eq!(rule_phase(&paused, "2026-10-05"), RulePhase::Paused);
+        // The end day itself is in play: `ends_on == as_of` is not finished.
+        assert_eq!(rule_phase(&paused, "2026-10-10"), RulePhase::Paused);
+        // Archived wins over finished.
+        paused.status = RuleStatus::Archived;
+        assert_eq!(rule_phase(&paused, SUNDAY), RulePhase::Archived);
+
+        // The archive picks it up.
+        let mut open = spec("r-open", "Learning", RuleKind::CategoryTotal, EARLY);
+        open.status = RuleStatus::Paused;
+        open.paused_on = Some("2026-10-01".to_string());
+        open.ends_on = Some("2026-10-10".to_string());
+        let revisions = BTreeMap::from([(
+            "r-open".to_string(),
+            vec![revision(
+                EARLY,
+                &total_params(ids(&["learning"]), 1, Comparator::Gte, 1.0),
+            )],
+        )]);
+        let mut digest = digest_with_days(EARLY, SUNDAY);
+        hours(&mut digest, "2026-10-10", "learning", 2.0);
+        let board = score_board(BoardInput {
+            as_of: SUNDAY,
+            time_zone: "UTC",
+            rules: vec![open.clone()],
+            revisions,
+            pauses: Vec::new(),
+            catalog: &catalog,
+            digest: &digest,
+            flags: DigestFlags::default(),
+        })
+        .expect("board scores");
+        assert!(board.rules.is_empty(), "a finished paused rule leaves the board");
+        assert_eq!(board.paused_rules, 0);
+        // Its final day is still judged at its own cursor.
+        let score = score_rule(
+            &open,
+            &[revision(
+                EARLY,
+                &total_params(ids(&["learning"]), 1, Comparator::Gte, 1.0),
+            )],
+            &[],
+            &catalog,
+            &digest,
+            "2026-10-10",
+            SUNDAY,
+        )
+        .expect("scores");
+        assert_eq!(score.phase, "finished");
+        assert_eq!(
+            cell(&score, "2026-10-10"),
+            "paused",
+            "the open pause covers the final day, so nothing is scored there"
+        );
+        assert!(!score.on_track, "an empty (all-paused) window passes nothing");
+        assert_eq!(score.actual_label, "0.0h");
+    }
+
+    // ── M6: archiving never rewrites the streak ─────────────────────────────
+
+    #[test]
+    fn archiving_a_rule_does_not_rewrite_the_all_pass_streak() {
+        let catalog = catalog();
+        let learning = spec("r-learning", "Learning", RuleKind::CategoryTotal, "2026-10-13");
+        let fitness = spec("r-fitness", "Fitness", RuleKind::CategoryDays, "2026-10-13");
+        let revisions = BTreeMap::from([
+            (
+                "r-learning".to_string(),
+                vec![revision(
+                    "2026-10-13",
+                    &total_params(ids(&["learning"]), 1, Comparator::Gte, 1.0),
+                )],
+            ),
+            (
+                "r-fitness".to_string(),
+                vec![revision("2026-10-13", &days_params(&["fitness"], 1, 60, 1))],
+            ),
+        ]);
+        let mut digest = digest_with_days("2026-10-13", SUNDAY);
+        for date in ["2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16", "2026-10-17"] {
+            hours(&mut digest, date, "learning", 2.0);
+            hours(&mut digest, date, "fitness", 2.0);
+        }
+
+        let board = |rules: Vec<RuleSpec>| {
+            score_board(BoardInput {
+                as_of: SUNDAY,
+                time_zone: "UTC",
+                rules,
+                revisions: revisions.clone(),
+                pauses: Vec::new(),
+                catalog: &catalog,
+                digest: &digest,
+                flags: DigestFlags::default(),
+            })
+            .expect("board scores")
+        };
+        let both = board(vec![learning.clone(), fitness.clone()]);
+        assert_eq!(both.best_all_pass_streak, 5, "10-13 .. 10-17 pass together");
+
+        // Archive one of the two: it leaves the board but stays in the walk,
+        // because it *was* in play on those days.
+        let mut archived = fitness.clone();
+        archived.status = RuleStatus::Archived;
+        let after = board(vec![learning.clone(), archived.clone()]);
+        assert!(after.rules.iter().all(|rule| rule.id == "r-learning"));
+        assert_eq!(
+            after.best_all_pass_streak, 5,
+            "archiving must not rewrite the streak"
+        );
+
+        // A rule that fails alone still breaks the run.
+        let revisions = BTreeMap::from([
+            (
+                "r-learning".to_string(),
+                vec![revision(
+                    "2026-10-13",
+                    &total_params(ids(&["learning"]), 1, Comparator::Gte, 5.0),
+                )],
+            ),
+            (
+                "r-fitness".to_string(),
+                vec![revision("2026-10-13", &days_params(&["fitness"], 1, 60, 1))],
+            ),
+        ]);
+        let board = score_board(BoardInput {
+            as_of: SUNDAY,
+            time_zone: "UTC",
+            rules: vec![learning, archived],
+            revisions,
+            pauses: Vec::new(),
+            catalog: &catalog,
+            digest: &digest,
+            flags: DigestFlags::default(),
+        })
+        .expect("board scores");
+        assert_eq!(
+            board.best_all_pass_streak, 0,
+            "the live rule never clears its 5h target"
+        );
     }
 }
 

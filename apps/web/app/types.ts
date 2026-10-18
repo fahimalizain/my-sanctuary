@@ -827,6 +827,13 @@ export interface RuleScore {
   sort_order: number;
   condition: string;
   on_track: boolean;
+  /**
+   * Whether the window ending `as_of` has an aggregate row on every non-paused
+   * day in it. `false` means the backfill has not reached the whole window:
+   * `on_track` is `false`, `owed` says why, and the strip's in-play cells are
+   * `pending`.
+   */
+  window_full: boolean;
   actual_label: string;
   target_label: string;
   owed: string;
@@ -845,6 +852,8 @@ export interface ScoreboardResponse {
   time_zone: string;
   /** Headline numerator: passing rules. */
   on_track: number;
+  /** Rules on the board whose phase is `paused` (they are not in the headline). */
+  paused_rules: number;
   /** Headline denominator: `active` rules only (paused rules excluded). */
   active_rules: number;
   all_pass_streak: number;

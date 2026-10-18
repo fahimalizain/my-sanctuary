@@ -1,11 +1,16 @@
 //! The rules service: CRUD, seeding, digest loading, and the read models the
 //! Worker hands straight to `Response::from_json`.
 //!
-//! Everything the scorer needs is loaded in a handful of queries (rules,
-//! revisions, pauses, the living category tree, and one range scan each over
-//! `daily_category_minutes` and `sleep_nights`), then folded by the pure
-//! [`super::score`] functions. The load range is derived from the rules
-//! themselves by [`digest_load_floor`].
+//! Everything the scorer needs is loaded in a handful of queries (rules, **one**
+//! revisions query for the whole user, pauses, the living category tree, and one
+//! range scan each over `daily_meta`, `daily_category_minutes` and
+//! `sleep_nights`), then folded by the pure [`super::score`] functions. The load
+//! range is derived from the rules themselves by [`digest_load_floor`], which
+//! shares [`super::score::window_start`] with the scorer — the SQL can never
+//! read a narrower range than a window asks for.
+//!
+//! Seeding happens on the scoreboard path only, with deterministic ids and
+//! `INSERT OR IGNORE`, so two concurrent readers cannot write sixteen rules.
 
 use std::collections::BTreeMap;
 
@@ -152,8 +157,12 @@ pub struct PauseResponse {
 // Reads
 // ──────────────────────────────────────────
 
-/// "Today" in the user's primary calendar zone (unknown/empty → UTC), plus the
-/// zone name that was used.
+/// "Today" in the user's primary calendar zone, plus the zone name that was
+/// used.
+///
+/// Before the first calendar sync the primary zone is unknown; the last day the
+/// digest computed still knows the user's zone (`daily_meta.time_zone`), and
+/// only when there is no persisted day either does this fall back to UTC.
 pub async fn today(
     digest_repo: &dyn DigestRepo,
     user_id: &str,
@@ -163,7 +172,12 @@ pub async fn today(
     let time_zone = if crate::time::parse_iana_tz(&stored).is_some() {
         stored
     } else {
-        "UTC".to_string()
+        let latest = digest_repo.latest_time_zone(user_id).await?.unwrap_or_default();
+        if crate::time::parse_iana_tz(&latest).is_some() {
+            latest
+        } else {
+            "UTC".to_string()
+        }
     };
     Ok((civil_date_in_zone(now_unix, &time_zone), time_zone))
 }
@@ -177,18 +191,31 @@ pub async fn scoreboard(
 ) -> Result<Scoreboard, RulesError> {
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let (as_of, time_zone) = today(digest_repo, user_id, now_unix).await?;
-    ensure_default_rules(repo, user_id, &as_of, &now_rfc3339).await?;
+    let mut warnings: Vec<String> = Vec::new();
+    let seed = ensure_default_rules(repo, user_id, &as_of, &now_rfc3339).await?;
+    for name in &seed.skipped {
+        warnings.push(format!("skipped seed {name}, category missing"));
+    }
     // Opening the page also queues history: the rebuild itself belongs to the
     // cron/queue tick and is never awaited here.
     let status = digest_status(digest_repo, user_id, now_unix).await?;
     let rows = repo.list_rules(user_id).await?;
-    let loaded = load_inputs(repo, user_id, &as_of, &as_of, &rows).await?;
-    let specs = rows
-        .iter()
-        .filter(|row| has_revisions(&loaded, &row.id))
-        .map(RuleRow::spec)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(score_board(BoardInput {
+    // One corrupt row must never take the whole board down: it is skipped and
+    // logged, not answered with a 400.
+    let mut specs: Vec<RuleSpec> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        match row.spec() {
+            Ok(spec) => specs.push(spec),
+            Err(err) => warnings.push(format!("rule {} is unreadable: {err}", row.id)),
+        }
+    }
+    let loaded = load_inputs(repo, user_id, &as_of, &as_of, &specs).await?;
+    warnings.extend(loaded.unreadable.iter().cloned());
+    let specs: Vec<RuleSpec> = specs
+        .into_iter()
+        .filter(|spec| has_revisions(&loaded, &spec.id))
+        .collect();
+    let mut board = score_board(BoardInput {
         as_of: &as_of,
         time_zone: &time_zone,
         rules: specs,
@@ -201,7 +228,9 @@ pub async fn scoreboard(
             backfilling: status.backfilling,
             dirty_days: status.dirty_days,
         },
-    })?)
+    })?;
+    board.warnings = warnings;
+    Ok(board)
 }
 
 /// `GET /api/rules/archive` — finished and archived rules.
@@ -210,20 +239,28 @@ pub async fn scoreboard(
 /// a real verdict and counts; `today` stays the civil today, so the phase is
 /// `finished` and nothing is left pending. Archived-but-unfinished rules are
 /// scored live at today.
+///
+/// The archive never seeds: the scoreboard path owns that (a seeding race is
+/// then impossible), and a corrupt row is skipped like it is on the board.
 pub async fn archive_rules(
     repo: &dyn RuleRepo,
     digest_repo: &dyn DigestRepo,
     user_id: &str,
     now_unix: i64,
 ) -> Result<ArchiveResponse, RulesError> {
-    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let (today, _time_zone) = today(digest_repo, user_id, now_unix).await?;
-    ensure_default_rules(repo, user_id, &today, &now_rfc3339).await?;
     let rows = repo.list_rules(user_id).await?;
 
+    let mut warnings: Vec<String> = Vec::new();
     let mut targets: Vec<(RuleSpec, String)> = Vec::new();
     for row in &rows {
-        let spec = row.spec()?;
+        let spec = match row.spec() {
+            Ok(spec) => spec,
+            Err(err) => {
+                warnings.push(format!("rule {} is unreadable: {err}", row.id));
+                continue;
+            }
+        };
         match rule_phase(&spec, &today) {
             RulePhase::Finished => {
                 let at = spec
@@ -238,7 +275,10 @@ pub async fn archive_rules(
         }
     }
     if targets.is_empty() {
-        return Ok(ArchiveResponse { rules: Vec::new() });
+        return Ok(ArchiveResponse {
+            rules: Vec::new(),
+            warnings,
+        });
     }
 
     let earliest = targets
@@ -246,16 +286,17 @@ pub async fn archive_rules(
         .map(|(_, at)| at.clone())
         .min()
         .unwrap_or_else(|| today.clone());
-    let loaded = load_inputs(repo, user_id, &earliest, &today, &rows).await?;
+    let specs: Vec<RuleSpec> = targets.iter().map(|(spec, _)| spec.clone()).collect();
+    let loaded = load_inputs(repo, user_id, &earliest, &today, &specs).await?;
+    warnings.extend(loaded.unreadable.iter().cloned());
     let mut rules = Vec::with_capacity(targets.len());
     for (spec, at) in &targets {
-        if !has_revisions(&loaded, &spec.id) {
+        let Some(revisions) = loaded.revisions.get(&spec.id) else {
             continue;
-        }
-        let revisions = loaded.revisions.get(&spec.id).cloned().unwrap_or_default();
+        };
         rules.push(score_rule(
             spec,
-            &revisions,
+            revisions,
             &loaded.pauses,
             &loaded.catalog,
             &loaded.digest,
@@ -263,7 +304,7 @@ pub async fn archive_rules(
             &today,
         )?);
     }
-    Ok(ArchiveResponse { rules })
+    Ok(ArchiveResponse { rules, warnings })
 }
 
 /// Whether a rule can be scored at all.
@@ -285,50 +326,64 @@ struct Loaded {
     digest: DigestSlice,
     pauses: Vec<PausePeriod>,
     revisions: BTreeMap<String, Vec<Revision>>,
+    /// Rules whose stored params could not be read (bad JSON, an unknown
+    /// shape). They are skipped and logged, never scored.
+    unreadable: Vec<String>,
 }
 
 /// Loads rules-adjacent rows and the digest range the rules need.
 ///
 /// `earliest_as_of` is the earliest date any rule is scored at (the archive
 /// scores finished rules at their `ends_on`), which is what the digest floor
-/// has to reach.
+/// has to reach. Every rule's revisions come from **one** query; a rule whose
+/// stored params are unreadable is skipped instead of taking the page down.
 async fn load_inputs(
     repo: &dyn RuleRepo,
     user_id: &str,
     earliest_as_of: &str,
     as_of: &str,
-    rows: &[RuleRow],
+    specs: &[RuleSpec],
 ) -> Result<Loaded, RulesError> {
+    let stored = repo.list_revisions(user_id).await?;
     let mut revisions: BTreeMap<String, Vec<Revision>> = BTreeMap::new();
+    let mut unreadable: Vec<String> = Vec::new();
     let mut max_window = 1_i64;
     let mut min_starts_on: Option<String> = None;
-    for row in rows {
-        let kind = row.spec()?.kind;
-        let stored = repo.list_revisions(&row.id).await?;
-        for revision in &stored {
-            let params = RuleParams::from_json(kind, &revision.params_json)?;
-            max_window = max_window.max(params.window_days().clamp(1, MAX_WINDOW_DAYS));
+    for spec in specs {
+        let mut own: Vec<Revision> = Vec::new();
+        let mut readable = true;
+        for revision in stored.iter().filter(|row| row.rule_id == spec.id) {
+            match RuleParams::from_json(spec.kind, &revision.params_json) {
+                Ok(params) => {
+                    max_window = max_window.max(params.window_days().clamp(1, MAX_WINDOW_DAYS));
+                }
+                Err(err) => {
+                    // One bad revision makes the whole rule unreadable: scoring
+                    // it with the surviving revisions would silently change its
+                    // history.
+                    unreadable.push(format!("rule {} is unreadable: {err}", spec.id));
+                    readable = false;
+                    break;
+                }
+            }
+            own.push(Revision {
+                id: revision.id.clone(),
+                effective_from: revision.effective_from.clone(),
+                params_json: revision.params_json.clone(),
+                created_at: revision.created_at.clone(),
+            });
+        }
+        if readable && !own.is_empty() {
+            revisions.insert(spec.id.clone(), own);
         }
         min_starts_on = Some(match min_starts_on {
-            Some(current) if current <= row.starts_on => current,
-            _ => row.starts_on.clone(),
+            Some(current) if current <= spec.starts_on => current,
+            _ => spec.starts_on.clone(),
         });
-        revisions.insert(
-            row.id.clone(),
-            stored
-                .into_iter()
-                .map(|row| Revision {
-                    id: row.id,
-                    effective_from: row.effective_from,
-                    params_json: row.params_json,
-                    created_at: row.created_at,
-                })
-                .collect(),
-        );
     }
 
     let catalog = load_catalog(repo, user_id).await?;
-    let pauses = repo
+    let pauses: Vec<PausePeriod> = repo
         .list_pauses(user_id)
         .await?
         .iter()
@@ -338,9 +393,17 @@ async fn load_inputs(
             to_date: row.to_date.clone(),
         })
         .collect();
+    // The load floor uses the same pause predicate the scorer's windows use
+    // (every pause of the user: global or any rule's — a wider set can only
+    // widen the range, never narrow it).
+    let is_paused = |date: &str| {
+        pauses
+            .iter()
+            .any(|pause| pause.from_date.as_str() <= date && date <= pause.to_date.as_str())
+    };
     let floor = match min_starts_on {
-        Some(starts_on) => digest_load_floor(&starts_on, max_window, earliest_as_of),
-        None => digest_load_floor(as_of, max_window, earliest_as_of),
+        Some(starts_on) => digest_load_floor(&starts_on, max_window, earliest_as_of, &is_paused),
+        None => digest_load_floor(as_of, max_window, earliest_as_of, &is_paused),
     };
     let digest = load_digest(repo, user_id, &floor, as_of).await?;
 
@@ -349,6 +412,7 @@ async fn load_inputs(
         digest,
         pauses,
         revisions,
+        unreadable,
     })
 }
 
@@ -374,6 +438,7 @@ async fn load_digest(
             .entry(row.category_id)
             .or_insert(0) += row.seconds;
     }
+    digest.aggregated = repo.load_aggregated_days(user_id, from, to).await?.into_iter().collect();
     digest.nights = repo
         .load_sleep_nights(user_id, from, to)
         .await?
@@ -398,13 +463,18 @@ async fn score_one(
     as_of: &str,
     rule: &RuleRow,
 ) -> Result<RuleScore, RulesError> {
-    let loaded = load_inputs(repo, user_id, as_of, as_of, std::slice::from_ref(rule)).await?;
     let spec = rule.spec()?;
-    let revisions = loaded.revisions.get(&spec.id).cloned().unwrap_or_default();
+    let loaded = load_inputs(repo, user_id, as_of, as_of, std::slice::from_ref(&spec)).await?;
+    let Some(revisions) = loaded.revisions.get(&spec.id) else {
+        return Err(RulesError::Corrupt(format!(
+            "rule {} has no readable revisions",
+            spec.id
+        )));
+    };
     // A write's card is live: its cursor is today, and today stays pending.
     Ok(score_rule(
         &spec,
-        &revisions,
+        revisions,
         &loaded.pauses,
         &loaded.catalog,
         &loaded.digest,
@@ -429,6 +499,8 @@ struct SeedCats {
 /// One seeded rule: skipped (returning `None`) when a required category is
 /// missing.
 struct SeedRule {
+    /// The deterministic id's slug: `seed:{user_id}:{slug}`.
+    slug: &'static str,
     name: &'static str,
     icon: &'static str,
     kind: RuleKind,
@@ -439,6 +511,7 @@ struct SeedRule {
 fn seed_table() -> [SeedRule; 8] {
     [
         SeedRule {
+            slug: "fitness",
             name: "Fitness",
             icon: "fitness",
             kind: RuleKind::CategoryDays,
@@ -455,6 +528,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "productive",
             name: "Productive weekdays",
             icon: "productive",
             kind: RuleKind::CategoryDailyAvg,
@@ -488,6 +562,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "learning",
             name: "Learning",
             icon: "learning",
             kind: RuleKind::CategoryTotal,
@@ -504,6 +579,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "sleep-duration",
             name: "Sleep duration",
             icon: "sleep",
             kind: RuleKind::SleepDuration,
@@ -516,6 +592,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "bedtime",
             name: "Bedtime",
             icon: "bedtime",
             kind: RuleKind::SleepTiming,
@@ -530,6 +607,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "bedtime-spread",
             name: "Bedtime spread",
             icon: "bedtime",
             kind: RuleKind::SleepTiming,
@@ -544,6 +622,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "wake",
             name: "Wake",
             icon: "wake",
             kind: RuleKind::SleepTiming,
@@ -558,6 +637,7 @@ fn seed_table() -> [SeedRule; 8] {
             },
         },
         SeedRule {
+            slug: "wake-spread",
             name: "Wake spread",
             icon: "wake",
             kind: RuleKind::SleepTiming,
@@ -574,20 +654,58 @@ fn seed_table() -> [SeedRule; 8] {
     ]
 }
 
-/// Seeds the eight enforcement rules when the user has **zero** rules rows
-/// (archived ones count — this never reseeds). Returns how many were inserted.
+/// What a seed pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedOutcome {
+    /// Rows this pass actually added (a duplicate id adds none).
+    pub inserted: usize,
+    /// Seed names skipped because a required category is missing. The Worker
+    /// logs these; they never reach the JSON.
+    pub skipped: Vec<String>,
+}
+
+/// The deterministic id of one seed: `seed:{user_id}:{slug}`.
 ///
-/// A rule whose required category is missing is skipped, and the remaining
-/// rules keep compact `sort_order`s in table order.
+/// Two concurrent scoreboard loads therefore insert the *same* ids, and
+/// `INSERT OR IGNORE` makes the second pass a no-op instead of a duplicate.
+pub fn seed_rule_id(user_id: &str, slug: &str) -> String {
+    format!("seed:{user_id}:{slug}")
+}
+
+/// The deterministic id of a seed's first revision — the same id on both sides
+/// of a concurrent seed.
+fn seed_revision_id(user_id: &str, slug: &str) -> String {
+    format!("seed:{user_id}:{slug}:v1")
+}
+
+/// Seeds the eight enforcement rules when the user has **zero** rules rows
+/// (archived ones count — this never reseeds).
+///
+/// Only the scoreboard path calls this: the archive reads the board as it is,
+/// so the two endpoints cannot race each other into a double seed.
 pub async fn ensure_default_rules(
     repo: &dyn RuleRepo,
     user_id: &str,
     as_of: &str,
     now_rfc3339: &str,
-) -> Result<usize, RulesError> {
+) -> Result<SeedOutcome, RulesError> {
     if repo.count_rules(user_id).await? > 0 {
-        return Ok(0);
+        return Ok(SeedOutcome::default());
     }
+    seed_default_rules(repo, user_id, as_of, now_rfc3339).await
+}
+
+/// The seed body, without the "does the user already have rules" guard.
+///
+/// `inserted` is the row-count delta, so a second pass over the same ids
+/// honestly reports zero.
+async fn seed_default_rules(
+    repo: &dyn RuleRepo,
+    user_id: &str,
+    as_of: &str,
+    now_rfc3339: &str,
+) -> Result<SeedOutcome, RulesError> {
+    let before = repo.count_rules(user_id).await?;
     let catalog = load_catalog(repo, user_id).await?;
     let cats = SeedCats {
         fitness: catalog.resolve("fitness").map(|cat| cat.id.clone()),
@@ -597,14 +715,17 @@ pub async fn ensure_default_rules(
     };
     let starts_on = shift_date(as_of, -SEED_HISTORY_DAYS).unwrap_or_else(|| as_of.to_string());
 
-    let mut inserted = 0_usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut sort_order = 0_i64;
     for seed in seed_table() {
         let Some(params) = (seed.params)(&cats) else {
+            skipped.push(seed.name.to_string());
             continue;
         };
         let rule = repo
             .insert_rule(
                 &NewRuleRow {
+                    id: Some(seed_rule_id(user_id, seed.slug)),
                     user_id: user_id.to_string(),
                     name: seed.name.to_string(),
                     icon: seed.icon.to_string(),
@@ -613,16 +734,27 @@ pub async fn ensure_default_rules(
                     starts_on: starts_on.clone(),
                     ends_on: None,
                     paused_on: None,
-                    sort_order: inserted as i64,
+                    sort_order,
                 },
                 now_rfc3339,
             )
             .await?;
-        repo.insert_revision(&rule.id, &starts_on, &params.to_json(), now_rfc3339)
-            .await?;
-        inserted += 1;
+        repo.insert_revision(
+            user_id,
+            &rule.id,
+            Some(&seed_revision_id(user_id, seed.slug)),
+            &starts_on,
+            &params.to_json(),
+            now_rfc3339,
+        )
+        .await?;
+        sort_order += 1;
     }
-    Ok(inserted)
+    let after = repo.count_rules(user_id).await?;
+    Ok(SeedOutcome {
+        inserted: (after - before).max(0) as usize,
+        skipped,
+    })
 }
 
 // ──────────────────────────────────────────
@@ -660,6 +792,11 @@ pub async fn create_rule(
     let ends_on = match &input.ends_on {
         Some(ends_on) => {
             validate_date("ends_on", ends_on)?;
+            if ends_on.as_str() < as_of {
+                return Err(RulesError::Invalid(
+                    "ends_on must not be before today".to_string(),
+                ));
+            }
             Some(ends_on.clone())
         }
         None => None,
@@ -675,6 +812,8 @@ pub async fn create_rule(
     let rule = repo
         .insert_rule(
             &NewRuleRow {
+                // A user-created rule lets the repo mint its id.
+                id: None,
                 user_id: user_id.to_string(),
                 name: input.name.trim().to_string(),
                 icon,
@@ -690,7 +829,7 @@ pub async fn create_rule(
         .await?;
     // The first revision is effective from `starts_on` (not "today"), so the
     // original params apply from the beginning.
-    repo.insert_revision(&rule.id, &starts_on, &params.to_json(), now_rfc3339)
+    repo.insert_revision(user_id, &rule.id, None, &starts_on, &params.to_json(), now_rfc3339)
         .await?;
     score_one(repo, user_id, as_of, &rule).await
 }
@@ -723,6 +862,17 @@ pub async fn update_rule(
         if kind != spec.kind {
             return Err(RulesError::Invalid("kind cannot change".to_string()));
         }
+    }
+    // Scoring params on a rule that is over (finished or archived) are a 400:
+    // there is no history left for a new revision to apply to. Cosmetic edits
+    // (name, icon, sort order) stay allowed, and no revision is forked.
+    if input.params.is_some()
+        && matches!(
+            rule_phase(&spec, as_of),
+            RulePhase::Finished | RulePhase::Archived
+        )
+    {
+        return Err(RulesError::Invalid("rule is closed".to_string()));
     }
     if let Some(name) = &input.name {
         validate_name(name)?;
@@ -762,16 +912,17 @@ pub async fn update_rule(
         let catalog = load_catalog(repo, user_id).await?;
         let params = RuleParams::from_value(spec.kind, value.clone())?;
         params.validate(&catalog)?;
-        let stored = repo.list_revisions(&rule.id).await?;
+        let stored = repo.list_revisions(user_id).await?;
         let current = stored
             .iter()
+            .filter(|revision| revision.rule_id == rule.id)
             .rev()
             .find(|revision| revision.effective_from.as_str() <= as_of)
-            .or_else(|| stored.first())
+            .or_else(|| stored.iter().find(|revision| revision.rule_id == rule.id))
             .map(|revision| RuleParams::from_json(spec.kind, &revision.params_json))
             .transpose()?;
         if current.as_ref() != Some(&params) {
-            repo.insert_revision(&rule.id, as_of, &params.to_json(), now_rfc3339)
+            repo.insert_revision(user_id, &rule.id, None, as_of, &params.to_json(), now_rfc3339)
                 .await?;
         }
     }
@@ -810,6 +961,14 @@ pub async fn pause_rule(
             validate_date("to", to)?;
             if to.as_str() < from.as_str() {
                 return Err(RulesError::Invalid("to must not be before from".to_string()));
+            }
+            // A finished or archived rule cannot be paused any more: the days
+            // the period would cover are already judged.
+            if matches!(
+                rule_phase(&rule.spec()?, as_of),
+                RulePhase::Finished | RulePhase::Archived
+            ) {
+                return Err(RulesError::Conflict("rule is closed".to_string()));
             }
             repo.insert_pause(user_id, Some(id), from, to, "", now_rfc3339)
                 .await?;
@@ -891,8 +1050,13 @@ pub async fn set_rule_archived(
     score_one(repo, user_id, as_of, &rule).await
 }
 
-/// `POST /api/rules/reorder`. The body must list **every** living rule of the
-/// user exactly once; `sort_order` becomes the vec index.
+/// `POST /api/rules/reorder`. The body must list **every rule the client can
+/// see** (the board plus the archive) exactly once; `sort_order` becomes the
+/// vec index.
+///
+/// A revision-less orphan is invisible to the client, so it is neither
+/// required nor ordered — but a foreign id, or a missing visible rule, is a
+/// 400.
 pub async fn reorder_rules(
     repo: &dyn RuleRepo,
     user_id: &str,
@@ -900,16 +1064,34 @@ pub async fn reorder_rules(
     now_rfc3339: &str,
 ) -> Result<(), RulesError> {
     let rows = repo.list_rules(user_id).await?;
+    let revisions = repo.list_revisions(user_id).await?;
     let known: std::collections::BTreeSet<&str> =
         rows.iter().map(|row| row.id.as_str()).collect();
+    let visible: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter(|row| revisions.iter().any(|revision| revision.rule_id == row.id))
+        .map(|row| row.id.as_str())
+        .collect();
     let listed: std::collections::BTreeSet<&str> =
         input.ids.iter().map(String::as_str).collect();
-    if listed.len() != input.ids.len() || listed != known {
+    if listed.len() != input.ids.len() {
         return Err(RulesError::Invalid(
-            "ids must list every rule of this user exactly once".to_string(),
+            "ids must not repeat".to_string(),
         ));
     }
+    if let Some(foreign) = listed.iter().find(|id| !known.contains(*id)) {
+        return Err(RulesError::Invalid(format!("unknown rule {foreign:?}")));
+    }
+    if let Some(missing) = visible.iter().find(|id| !listed.contains(*id)) {
+        return Err(RulesError::Invalid(format!(
+            "ids must list every rule of this user exactly once (missing {missing:?})"
+        )));
+    }
     for (index, id) in input.ids.iter().enumerate() {
+        if !visible.contains(id.as_str()) {
+            // A revision-less orphan has no card to order.
+            continue;
+        }
         repo.set_sort_order(user_id, id, index as i64, now_rfc3339)
             .await?;
     }
@@ -1006,9 +1188,10 @@ fn validate_icon(icon: &str) -> Result<(), RulesError> {
     Ok(())
 }
 
-/// A civil date is valid when it round-trips through `chrono`.
+/// A civil date is valid when it round-trips through `chrono`: `2026-1-2` and
+/// `2026-02-31` are both rejected, not just "lexicographically shaped" strings.
 fn validate_date(field: &str, value: &str) -> Result<(), RulesError> {
-    if shift_date(value, 0).is_none() {
+    if crate::digest::parse_civil_date(value).is_none() {
         return Err(RulesError::Invalid(format!(
             "{field} must be a YYYY-MM-DD date"
         )));
@@ -1026,6 +1209,7 @@ mod tests {
 
     use super::*;
     use crate::repo::RepoError;
+    use crate::rules::params::Comparator;
     use crate::rules::repo::{CategorySecondsRow, RevisionRow, SleepNightRow};
 
     const AS_OF: &str = "2026-10-18";
@@ -1155,8 +1339,25 @@ mod tests {
             now_rfc3339: &str,
         ) -> Result<RuleRow, RepoError> {
             let mut state = self.state.lock().unwrap();
-            state.next_rule += 1;
-            let id = format!("rule-{}", state.next_rule);
+            // `INSERT OR IGNORE`: a deterministic id that already exists is
+            // left alone — the seed race guard the real SQL relies on.
+            let id = match &rule.id {
+                Some(id) => {
+                    if state.rules.iter().any(|row| row.id == *id) {
+                        return Ok(state
+                            .rules
+                            .iter()
+                            .find(|row| row.id == *id)
+                            .expect("just checked")
+                            .clone());
+                    }
+                    id.clone()
+                }
+                None => {
+                    state.next_rule += 1;
+                    format!("rule-{}", state.next_rule)
+                }
+            };
             let row = RuleRow {
                 id,
                 user_id: rule.user_id.clone(),
@@ -1205,12 +1406,18 @@ mod tests {
             Ok(())
         }
 
-        async fn list_revisions(&self, rule_id: &str) -> Result<Vec<RevisionRow>, RepoError> {
+        async fn list_revisions(&self, user_id: &str) -> Result<Vec<RevisionRow>, RepoError> {
             let state = self.state.lock().unwrap();
+            let owned: Vec<&str> = state
+                .rules
+                .iter()
+                .filter(|rule| rule.user_id == user_id)
+                .map(|rule| rule.id.as_str())
+                .collect();
             let mut rows: Vec<RevisionRow> = state
                 .revisions
                 .iter()
-                .filter(|revision| revision.rule_id == rule_id)
+                .filter(|revision| owned.contains(&revision.rule_id.as_str()))
                 .cloned()
                 .collect();
             rows.sort_by(|left, right| {
@@ -1225,14 +1432,36 @@ mod tests {
 
         async fn insert_revision(
             &self,
+            user_id: &str,
             rule_id: &str,
+            id: Option<&str>,
             effective_from: &str,
             params_json: &str,
             now_rfc3339: &str,
         ) -> Result<(), RepoError> {
             let mut state = self.state.lock().unwrap();
-            state.next_revision += 1;
-            let id = format!("rev-{}", state.next_revision);
+            // The statement is user-scoped: a foreign rule id writes nothing.
+            if !state
+                .rules
+                .iter()
+                .any(|rule| rule.user_id == user_id && rule.id == rule_id)
+            {
+                return Ok(());
+            }
+            // `INSERT OR IGNORE`: a deterministic id that already exists is
+            // left alone.
+            let id = match id {
+                Some(id) => {
+                    if state.revisions.iter().any(|row| row.id == id) {
+                        return Ok(());
+                    }
+                    id.to_string()
+                }
+                None => {
+                    state.next_revision += 1;
+                    format!("rev-{}", state.next_revision)
+                }
+            };
             state.revisions.push(RevisionRow {
                 id,
                 rule_id: rule_id.to_string(),
@@ -1304,6 +1533,17 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn load_aggregated_days(
+            &self,
+            _user_id: &str,
+            _from_date: &str,
+            _to_date: &str,
+        ) -> Result<Vec<String>, RepoError> {
+            // The fake has no digest: every window is "history still building",
+            // which is exactly what a CRUD test should see.
+            Ok(Vec::new())
+        }
+
         async fn load_categories(&self, _user_id: &str) -> Result<Vec<CategoryRow>, RepoError> {
             Ok(self.state.lock().unwrap().categories.clone())
         }
@@ -1324,8 +1564,9 @@ mod tests {
                 ("trip", "Trip"),
                 ("travel", "Travel"),
             ]);
-            let inserted = ensure_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
-            assert_eq!(inserted, 8);
+            let seed = ensure_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
+            assert_eq!(seed.inserted, 8);
+            assert!(seed.skipped.is_empty());
 
             let rules = repo.rules();
             assert_eq!(rules.len(), 8);
@@ -1343,6 +1584,21 @@ mod tests {
                     "Wake spread",
                 ]
             );
+            // The ids are deterministic: `seed:{user_id}:{slug}`.
+            let ids: Vec<&str> = rules.iter().map(|rule| rule.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec![
+                    "seed:u-1:fitness",
+                    "seed:u-1:productive",
+                    "seed:u-1:learning",
+                    "seed:u-1:sleep-duration",
+                    "seed:u-1:bedtime",
+                    "seed:u-1:bedtime-spread",
+                    "seed:u-1:wake",
+                    "seed:u-1:wake-spread",
+                ]
+            );
             for (index, rule) in rules.iter().enumerate() {
                 assert_eq!(rule.sort_order, index as i64);
                 assert_eq!(rule.starts_on, "2026-06-20", "120 days before as_of");
@@ -1350,7 +1606,7 @@ mod tests {
                 assert!(rule.ends_on.is_none());
             }
 
-            let fitness = repo.revision_params("rule-1");
+            let fitness = repo.revision_params("seed:u-1:fitness");
             assert_eq!(fitness.len(), 1);
             assert_eq!(fitness[0]["min_days"], 12);
             assert_eq!(fitness[0]["min_minutes"], 60);
@@ -1362,7 +1618,7 @@ mod tests {
                 "2026-06-20"
             );
 
-            let productive = repo.revision_params("rule-2");
+            let productive = repo.revision_params("seed:u-1:productive");
             assert_eq!(productive[0]["categories"], "all_productive");
             assert_eq!(productive[0]["weekdays"], serde_json::json!([0, 1, 2, 3, 4]));
             assert_eq!(productive[0]["exclude_if"]["percent_of_waking"], 50.0);
@@ -1371,14 +1627,52 @@ mod tests {
                 serde_json::json!(["cat-trip", "cat-travel"])
             );
 
-            let sleep = repo.revision_params("rule-4");
+            let sleep = repo.revision_params("seed:u-1:sleep-duration");
             assert_eq!(sleep[0]["min_nights"], 14);
             assert_eq!(sleep[0]["target_hours"], 6.5);
 
             // A second call never reseeds.
             let again = ensure_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
-            assert_eq!(again, 0);
+            assert_eq!(again, SeedOutcome::default());
             assert_eq!(repo.rules().len(), 8);
+            });
+    }
+
+    /// The seeding race (B1): two concurrent callers both see "no rules" and
+    /// both run the body. The deterministic ids plus `INSERT OR IGNORE` leave
+    /// eight rows, not sixteen.
+    #[test]
+    fn a_double_seed_writes_eight_rows_not_sixteen()  {
+        pollster::block_on(async {
+            let repo = FakeRuleRepo::with_categories(&[
+                ("fitness", "Fitness"),
+                ("learning", "Learning"),
+                ("trip", "Trip"),
+                ("travel", "Travel"),
+            ]);
+            // The body without the count guard: the two callers have both
+            // already passed it.
+            let first = seed_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
+            assert_eq!(first.inserted, 8);
+            let second = seed_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
+            assert_eq!(second.inserted, 0, "the second pass adds no row");
+
+            assert_eq!(repo.rules().len(), 8);
+            assert_eq!(repo.count_rules("u-1").await.expect("count"), 8);
+            // Each rule still has exactly one revision, under its own id.
+            for slug in [
+                "fitness",
+                "productive",
+                "learning",
+                "sleep-duration",
+                "bedtime",
+                "bedtime-spread",
+                "wake",
+                "wake-spread",
+            ] {
+                let id = seed_rule_id("u-1", slug);
+                assert_eq!(repo.revision_params(&id).len(), 1, "{id}");
+            }
             });
     }
 
@@ -1390,8 +1684,9 @@ mod tests {
                 ("trip", "Trip"),
                 ("travel", "Travel"),
             ]);
-            let inserted = ensure_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
-            assert_eq!(inserted, 7);
+            let seed = ensure_default_rules(&repo, "u-1", AS_OF, NOW).await.expect("seeds");
+            assert_eq!(seed.inserted, 7);
+            assert_eq!(seed.skipped, vec!["Learning".to_string()]);
             let rules = repo.rules();
             assert!(!rules.iter().any(|rule| rule.name == "Learning"));
             // The remaining rules keep compact sort orders in table order.
@@ -1402,12 +1697,19 @@ mod tests {
 
             // With no categories at all, the two category rules are skipped.
             let bare = FakeRuleRepo::default();
-            let inserted = ensure_default_rules(&bare, "u-1", AS_OF, NOW).await.expect("seeds");
-            assert_eq!(inserted, 6, "only Fitness and Learning need a category");
+            let seed = ensure_default_rules(&bare, "u-1", AS_OF, NOW).await.expect("seeds");
+            assert_eq!(seed.inserted, 6, "only Fitness and Learning need a category");
+            assert_eq!(
+                seed.skipped,
+                vec!["Fitness".to_string(), "Learning".to_string()],
+                "the skipped names are what the Worker logs"
+            );
             assert_eq!(bare.rules().len(), 6);
             assert_eq!(bare.rules()[0].name, "Productive weekdays");
             // Neither trip nor travel exists → no escape hatch.
-            assert!(bare.revision_params("rule-1")[0].get("exclude_if").is_none());
+            assert!(bare.revision_params("seed:u-1:productive")[0]
+                .get("exclude_if")
+                .is_none());
             });
     }
 
@@ -1433,7 +1735,9 @@ mod tests {
             (r#"{"window_days":0}"#, "window_days"),
             (r#"{"window_days":367}"#, "window_days"),
             (r#"{"min_days":0}"#, "min_days"),
+            (r#"{"min_days":61}"#, "min_days"),
             (r#"{"min_minutes":0}"#, "min_minutes"),
+            (r#"{"min_minutes":153722867280912931}"#, "min_minutes"),
             (r#"{"categories":{"ids":[],"include_children":true}}"#, "ids must not be empty"),
             (r#"{"categories":{"ids":["nope"],"include_children":true}}"#, "unknown category"),
         ] {
@@ -1527,6 +1831,70 @@ mod tests {
         // `categories` must be the tag or the object shape.
         assert!(RuleParams::from_value(RuleKind::CategoryTotal, params_json(r#""nope""#)).is_err());
         assert!(RuleParams::from_value(RuleKind::CategoryTotal, params_json(r#"{"categories":5,"window_days":7,"comparator":"gte","target_hours":1}"#)).is_err());
+
+        // m2: the bounds that keep the scorer honest.
+        for (kind, json, expected) in [
+            (
+                RuleKind::SleepDuration,
+                r#"{"window_days":7,"min_nights":8,"target_hours":6.5}"#,
+                "min_nights",
+            ),
+            (
+                RuleKind::SleepTiming,
+                r#"{"window_days":7,"min_nights":8,"metric":"wake_median","comparator":"lte","target_minutes":300}"#,
+                "min_nights",
+            ),
+            (
+                RuleKind::SleepTiming,
+                r#"{"window_days":60,"min_nights":14,"metric":"wake_median","comparator":"lte","target_minutes":1441}"#,
+                "target_minutes",
+            ),
+            (
+                RuleKind::CategoryTotal,
+                r#"{"categories":"all_productive","window_days":7,"comparator":"gte","target_hours":24.5}"#,
+                "target_hours",
+            ),
+            (
+                RuleKind::CategoryDays,
+                r#"{"categories":{"ids":["cat-fitness"],"include_children":true},
+                    "window_days":7,"min_minutes":60,"min_days":8}"#,
+                "min_days",
+            ),
+        ] {
+            let params = RuleParams::from_value(kind, params_json(json)).expect("parses");
+            let error = params.validate(&catalog).expect_err("rejects");
+            assert!(
+                error.to_string().contains(expected),
+                "{error} should mention {expected}"
+            );
+        }
+        // A non-finite float is never a target.
+        for bad in [f64::INFINITY, f64::NAN] {
+            let params = RuleParams::CategoryTotal(CategoryTotalParams {
+                categories: CategorySelector::AllProductive,
+                window_days: 7,
+                comparator: Comparator::Gte,
+                target_hours: bad,
+            });
+            assert!(params.validate(&catalog).is_err(), "{bad} must be rejected");
+        }
+        // The caps themselves are fine.
+        let params = RuleParams::from_value(
+            RuleKind::CategoryTotal,
+            params_json(
+                r#"{"categories":"all_productive","window_days":7,"comparator":"gte","target_hours":24}"#,
+            ),
+        )
+        .expect("parses");
+        assert!(params.validate(&catalog).is_ok());
+        let params = RuleParams::from_value(
+            RuleKind::SleepTiming,
+            params_json(
+                r#"{"window_days":60,"min_nights":60,"metric":"wake_median","comparator":"lte","target_minutes":1440}"#,
+            ),
+        )
+        .expect("parses");
+        assert!(params.validate(&catalog).is_ok());
     }
 
     // ── CRUD ────────────────────────────────────────────────────────────────
@@ -1552,7 +1920,13 @@ mod tests {
             assert_eq!(score.condition, "≥4h / 7d");
             assert_eq!(score.starts_on, "2026-09-01");
 
-            let revisions = repo.list_revisions(&score.id).await.expect("revisions");
+            let revisions = repo
+                .list_revisions("u-1")
+                .await
+                .expect("revisions")
+                .into_iter()
+                .filter(|revision| revision.rule_id == score.id)
+                .collect::<Vec<_>>();
             assert_eq!(revisions.len(), 1);
             assert_eq!(revisions[0].effective_from, "2026-09-01");
 
@@ -1584,12 +1958,44 @@ mod tests {
             ));
 
             // ends_on before starts_on is a 400.
-            let mut bad = input;
+            let mut bad = input.clone();
             bad.ends_on = Some("2026-08-01".to_string());
             assert!(matches!(
                 create_rule(&repo, "u-1", &bad, AS_OF, NOW).await,
                 Err(RulesError::Invalid(_))
             ));
+
+            // m5: ends_on strictly before today is a 400, but a one-day
+            // challenge ending today is fine.
+            let mut bad = input.clone();
+            bad.ends_on = Some("2026-10-17".to_string());
+            let error = create_rule(&repo, "u-1", &bad, AS_OF, NOW)
+                .await
+                .expect_err("rejects a past challenge");
+            assert!(
+                error.to_string().contains("before today"),
+                "{error}"
+            );
+            let mut one_day = input.clone();
+            one_day.ends_on = Some(AS_OF.to_string());
+            let score = create_rule(&repo, "u-1", &one_day, AS_OF, NOW)
+                .await
+                .expect("a one-day challenge is allowed");
+            assert_eq!(score.ends_on.as_deref(), Some(AS_OF));
+
+            // m1: dates must round-trip — `2026-1-2` and `2026-02-31` are not
+            // dates.
+            for bad_date in ["2026-1-2", "2026-02-31", "2026-10-18T00:00:00Z", "yesterday"] {
+                let mut bad = input.clone();
+                bad.starts_on = Some(bad_date.to_string());
+                let error = create_rule(&repo, "u-1", &bad, AS_OF, NOW)
+                    .await
+                    .expect_err("rejects a non-date");
+                assert!(
+                    error.to_string().contains("YYYY-MM-DD"),
+                    "{bad_date}: {error}"
+                );
+            }
             });
     }
 
@@ -1599,7 +2005,9 @@ mod tests {
             let repo = FakeRuleRepo::with_categories(&[("learning", "Learning")]);
             repo.push_rule("rule-1", "Study", RuleKind::CategoryTotal, "2026-09-01");
             repo.insert_revision(
+                "u-1",
                 "rule-1",
+                None,
                 "2026-09-01",
                 &params_json(
                     r#"{"categories":{"ids":["cat-learning"],"include_children":true},
@@ -1610,6 +2018,14 @@ mod tests {
             )
             .await
             .expect("revision");
+            let revisions_of = |repo: &FakeRuleRepo| {
+                let state = repo.state.lock().unwrap();
+                state
+                    .revisions
+                    .iter()
+                    .filter(|revision| revision.rule_id == "rule-1")
+                    .count()
+            };
 
             // A cosmetic edit does not fork params.
             let cosmetic = UpdateRuleInput {
@@ -1624,7 +2040,7 @@ mod tests {
             assert_eq!(score.name, "Study more");
             assert_eq!(score.icon, "book");
             assert_eq!(score.sort_order, 3);
-            assert_eq!(repo.list_revisions("rule-1").await.expect("revisions").len(), 1);
+            assert_eq!(revisions_of(&repo), 1);
 
             // Re-sending the same params is not a change either.
             let same = UpdateRuleInput {
@@ -1637,7 +2053,7 @@ mod tests {
             update_rule(&repo, "u-1", "rule-1", &same, AS_OF, NOW)
                 .await
                 .expect("updates");
-            assert_eq!(repo.list_revisions("rule-1").await.expect("revisions").len(), 1);
+            assert_eq!(revisions_of(&repo), 1);
 
             // A real change appends a revision effective from as_of.
             let changed = UpdateRuleInput {
@@ -1651,7 +2067,13 @@ mod tests {
                 .await
                 .expect("updates");
             assert_eq!(score.target_label, "≥6h / 7d");
-            let revisions = repo.list_revisions("rule-1").await.expect("revisions");
+            let revisions: Vec<RevisionRow> = repo
+                .list_revisions("u-1")
+                .await
+                .expect("revisions")
+                .into_iter()
+                .filter(|revision| revision.rule_id == "rule-1")
+                .collect();
             assert_eq!(revisions.len(), 2);
             assert_eq!(revisions[1].effective_from, AS_OF);
 
@@ -1697,7 +2119,9 @@ mod tests {
             let repo = FakeRuleRepo::with_categories(&[("learning", "Learning")]);
             repo.push_rule("rule-1", "Study", RuleKind::CategoryTotal, "2026-09-01");
             repo.insert_revision(
+                "u-1",
                 "rule-1",
+                None,
                 "2026-09-01",
                 &params_json(
                     r#"{"categories":{"ids":["cat-learning"],"include_children":true},
@@ -1829,6 +2253,106 @@ mod tests {
                 pause_rule(&repo, "u-1", "rule-1", &PauseRuleInput::default(), AS_OF, NOW).await,
                 Err(RulesError::Conflict(_))
             ));
+            // m12: nor with a closed range — the days it would cover are
+            // already judged.
+            let periods_before = repo.list_pauses("u-1").await.expect("pauses").len();
+            assert!(matches!(
+                pause_rule(
+                    &repo,
+                    "u-1",
+                    "rule-1",
+                    &PauseRuleInput {
+                        from: Some("2026-10-01".to_string()),
+                        to: Some("2026-10-05".to_string()),
+                    },
+                    AS_OF,
+                    NOW,
+                )
+                .await,
+                Err(RulesError::Conflict(_))
+            ));
+            assert_eq!(
+                repo.list_pauses("u-1").await.expect("pauses").len(),
+                periods_before,
+                "no period was written"
+            );
+            // m11: params on a finished rule are a 400, but a rename is fine.
+            let revisions_before = repo.state.lock().unwrap().revisions.len();
+            let error = update_rule(
+                &repo,
+                "u-1",
+                "rule-1",
+                &UpdateRuleInput {
+                    params: Some(params_json(
+                        r#"{"categories":{"ids":["cat-learning"],"include_children":true},
+                            "window_days":7,"comparator":"gte","target_hours":9.0}"#,
+                    )),
+                    ..UpdateRuleInput::default()
+                },
+                AS_OF,
+                NOW,
+            )
+            .await
+            .expect_err("rejects params on a closed rule");
+            assert_eq!(error, RulesError::Invalid("rule is closed".to_string()));
+            assert_eq!(
+                repo.state.lock().unwrap().revisions.len(),
+                revisions_before,
+                "no revision was forked"
+            );
+            let score = update_rule(
+                &repo,
+                "u-1",
+                "rule-1",
+                &UpdateRuleInput {
+                    name: Some("Study (done)".to_string()),
+                    ..UpdateRuleInput::default()
+                },
+                AS_OF,
+                NOW,
+            )
+            .await
+            .expect("a cosmetic edit stays allowed");
+            assert_eq!(score.name, "Study (done)");
+            assert_eq!(score.phase, "finished");
+
+            // An archived rule is closed too.
+            set_rule_archived(&repo, "u-1", "rule-1", true, AS_OF, NOW)
+                .await
+                .expect("archives");
+            assert_eq!(
+                update_rule(
+                    &repo,
+                    "u-1",
+                    "rule-1",
+                    &UpdateRuleInput {
+                        params: Some(params_json(
+                            r#"{"categories":{"ids":["cat-learning"],"include_children":true},
+                                "window_days":7,"comparator":"gte","target_hours":9.0}"#,
+                        )),
+                        ..UpdateRuleInput::default()
+                    },
+                    AS_OF,
+                    NOW,
+                )
+                .await,
+                Err(RulesError::Invalid("rule is closed".to_string()))
+            );
+            assert!(matches!(
+                pause_rule(
+                    &repo,
+                    "u-1",
+                    "rule-1",
+                    &PauseRuleInput {
+                        from: Some("2026-10-01".to_string()),
+                        to: Some("2026-10-05".to_string()),
+                    },
+                    AS_OF,
+                    NOW,
+                )
+                .await,
+                Err(RulesError::Conflict(_))
+            ));
             assert_eq!(
                 pause_rule(&repo, "u-1", "nope", &PauseRuleInput::default(), AS_OF, NOW).await,
                 Err(RulesError::RuleNotFound)
@@ -1842,6 +2366,18 @@ mod tests {
             let repo = FakeRuleRepo::with_categories(&[]);
             repo.push_rule("rule-1", "One", RuleKind::SleepDuration, "2026-09-01");
             repo.push_rule("rule-2", "Two", RuleKind::SleepTiming, "2026-09-01");
+            for id in ["rule-1", "rule-2"] {
+                repo.insert_revision(
+                    "u-1",
+                    id,
+                    None,
+                    "2026-09-01",
+                    &params_json(r#"{"window_days":1,"min_nights":1,"target_hours":6.5}"#).to_string(),
+                    NOW,
+                )
+                .await
+                .expect("revision");
+            }
 
             reorder_rules(
                 &repo,
@@ -1869,9 +2405,51 @@ mod tests {
                         reorder_rules(&repo, "u-1", &ReorderInput { ids }, NOW).await,
                         Err(RulesError::Invalid(_))
                     ),
-                    "partial or foreign id lists are rejected"
+                    "partial, duplicated or foreign id lists are rejected"
                 );
             }
+
+            // m4: a revision-less orphan is invisible to the client, so it is
+            // neither required nor ordered — not a 400 either way.
+            repo.push_rule("rule-orphan", "Orphan", RuleKind::SleepDuration, "2026-09-01");
+            reorder_rules(
+                &repo,
+                "u-1",
+                &ReorderInput {
+                    ids: vec!["rule-1".to_string(), "rule-2".to_string()],
+                },
+                NOW,
+            )
+            .await
+            .expect("an orphan is not required");
+            let orphan = repo
+                .rules()
+                .into_iter()
+                .find(|rule| rule.id == "rule-orphan")
+                .expect("orphan");
+            assert_eq!(orphan.sort_order, 2, "the orphan keeps its sort order");
+
+            // Listing the orphan is tolerated too: it is skipped, and the
+            // visible rules keep the order the client sent.
+            reorder_rules(
+                &repo,
+                "u-1",
+                &ReorderInput {
+                    ids: vec![
+                        "rule-2".to_string(),
+                        "rule-orphan".to_string(),
+                        "rule-1".to_string(),
+                    ],
+                },
+                NOW,
+            )
+            .await
+            .expect("an orphan in the list is skipped");
+            let rules = repo.rules();
+            assert_eq!(rules[0].id, "rule-2");
+            assert_eq!(rules[0].sort_order, 0);
+            assert_eq!(rules[1].id, "rule-1");
+            assert_eq!(rules[1].sort_order, 2);
             });
     }
 

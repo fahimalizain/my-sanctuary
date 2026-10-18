@@ -13,7 +13,8 @@ use api_core::digest::repo::{
     DIGEST_CLEAR_DIRTY_SQL, DIGEST_COUNT_DIRTY_SQL, DIGEST_DELETE_CATEGORY_SQL,
     DIGEST_DELETE_HOURS_SQL, DIGEST_DELETE_NIGHTS_SQL, DIGEST_EARLIEST_EVENT_DATE_SQL,
     DIGEST_EVENT_SPAN_SQL, DIGEST_HAS_META_SQL, DIGEST_HAS_STALE_META_SQL,
-    DIGEST_HAS_UNSTAMPED_SQL, DIGEST_JOB_STATUS_SQL, DIGEST_LATEST_ZONE_BEFORE_SQL,
+    DIGEST_HAS_UNSTAMPED_SQL, DIGEST_JOB_STATUS_SQL, DIGEST_LATEST_TIME_ZONE_SQL,
+    DIGEST_LATEST_ZONE_BEFORE_SQL,
     DIGEST_LIST_DIRTY_SQL, DIGEST_LOAD_EVENTS_SQL, DIGEST_MARK_DIRTY_CHUNK_SIZE,
     DIGEST_NIGHT_INSERT_CHUNK_SIZE, DIGEST_PRIMARY_TIME_ZONE_SQL, DIGEST_RECLASSIFY_BATCH_SQL,
     DIGEST_SET_CATEGORY_SQL, DIGEST_SLEEP_TARGET_PARAMS_SQL, DIGEST_UNSTAMPED_BATCH_SQL,
@@ -284,6 +285,17 @@ impl DigestRepo for SqliteDigestRepo {
         let conn = lock(&self.db)?;
         let row: Option<ZoneRow> =
             query_one(&conn, DIGEST_PRIMARY_TIME_ZONE_SQL, &[&user_id])?;
+        Ok(row.map(|row| row.time_zone))
+    }
+
+    async fn latest_time_zone(&self, user_id: &str) -> Result<Option<String>, RepoError> {
+        #[derive(Deserialize)]
+        struct ZoneRow {
+            time_zone: String,
+        }
+        let conn = lock(&self.db)?;
+        let row: Option<ZoneRow> =
+            query_one(&conn, DIGEST_LATEST_TIME_ZONE_SQL, &[&user_id])?;
         Ok(row.map(|row| row.time_zone))
     }
 

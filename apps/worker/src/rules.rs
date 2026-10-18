@@ -6,7 +6,7 @@
 //!
 //! Status map: 401 unauthorized, 400 invalid body / invalid params / unknown
 //! category, 404 unknown rule or pause, 409 a transition the rule's phase does
-//! not allow, 500 logged database errors.
+//! not allow, 500 corrupt stored data and logged database errors.
 //!
 //! `GET /api/rules/scoreboard` seeds the eight enforcement rules when the user
 //! has none, and asks the digest to start a backfill — it never waits for the
@@ -35,9 +35,16 @@ fn json_error(
 }
 
 /// Maps a service error to its HTTP response.
+///
+/// Only a request-body problem is a 400: corrupt stored data and a failed
+/// repository are 500s, logged for the operator.
 fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: RulesError) -> Result<Response> {
     match err {
         RulesError::Invalid(message) => json_error(ctx, 400, &message),
+        RulesError::Corrupt(message) => {
+            console_log!("rules: corrupt stored data: {message}");
+            json_error(ctx, 500, "failed to load rules")
+        }
         RulesError::RuleNotFound => json_error(ctx, 404, "rule not found"),
         RulesError::PauseNotFound => json_error(ctx, 404, "pause not found"),
         RulesError::Conflict(message) => json_error(ctx, 409, &message),
@@ -45,6 +52,14 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: RulesError) -> R
             console_log!("rules: database error: {err}");
             json_error(ctx, 500, "failed to load rules")
         }
+    }
+}
+
+/// Logs the operator-facing notes a scoring pass collected (a skipped seed, an
+/// unreadable rule row). They never reach the client.
+fn log_warnings(warnings: &[String]) {
+    for warning in warnings {
+        console_log!("rules: {warning}");
     }
 }
 
@@ -116,7 +131,10 @@ pub async fn scoreboard(
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     match api_core::scoreboard(&rules_d1(&ctx)?, &digest_d1(&ctx)?, &user.id, now_unix).await {
-        Ok(board) => json_response(&ctx, &board),
+        Ok(board) => {
+            log_warnings(&board.warnings);
+            json_response(&ctx, &board)
+        }
         Err(err) => map_error(&ctx, err),
     }
 }
@@ -128,7 +146,10 @@ pub async fn archive(req: Request, ctx: RouteContext<Option<api_core::Config>>) 
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     match api_core::archive_rules(&rules_d1(&ctx)?, &digest_d1(&ctx)?, &user.id, now_unix).await {
-        Ok(response) => json_response(&ctx, &response),
+        Ok(response) => {
+            log_warnings(&response.warnings);
+            json_response(&ctx, &response)
+        }
         Err(err) => map_error(&ctx, err),
     }
 }

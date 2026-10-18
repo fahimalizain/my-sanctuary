@@ -198,6 +198,16 @@ pub(crate) fn local_hh_mm_unix(date: &str, hour: u32, minute: u32, zone: &str) -
         .map(|dt| dt.timestamp())
 }
 
+/// Parses a civil date strictly: `YYYY-MM-DD`, zero-padded, and a real day.
+///
+/// The value must round-trip through `chrono`, so `2026-1-2` (which chrono
+/// accepts) and `2026-02-31` (which it does not) are both rejected. This is the
+/// API's date validator: a lexicographically shaped string is not enough.
+pub fn parse_civil_date(date: &str) -> Option<chrono::NaiveDate> {
+    let day = chrono::NaiveDate::from_str(date).ok()?;
+    (day.format("%Y-%m-%d").to_string() == date).then_some(day)
+}
+
 /// Shifts a `YYYY-MM-DD` civil date by whole days.
 pub fn shift_date(date: &str, days: i64) -> Option<String> {
     let day = chrono::NaiveDate::from_str(date).ok()?;

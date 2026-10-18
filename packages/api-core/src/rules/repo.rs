@@ -44,8 +44,13 @@ pub const RULES_COUNT_SQL: &str = "SELECT COUNT(*) AS rules FROM rules WHERE use
 
 /// Binds: id, user_id, name, icon, kind, status, starts_on, ends_on, paused_on,
 /// sort_order, created_at, updated_at (12).
+///
+/// `OR IGNORE` is the seeding race guard: the eight default rules carry
+/// deterministic ids (`seed:{user_id}:{slug}`), so two concurrent scoreboard
+/// loads cannot write sixteen rows. A user-created rule still binds a
+/// freshly minted uuid and never collides.
 pub const RULES_INSERT_SQL: &str = "
-    INSERT INTO rules (
+    INSERT OR IGNORE INTO rules (
       id, user_id, name, icon, kind, status, starts_on, ends_on, paused_on,
       sort_order, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -65,18 +70,31 @@ pub const RULES_UPDATE_SQL: &str = "
 pub const RULES_SET_SORT_ORDER_SQL: &str =
     "UPDATE rules SET sort_order = ?, updated_at = ? WHERE user_id = ? AND id = ?";
 
-/// One rule's revisions, oldest first — the order the scorer expects.
+/// Every revision of every rule the user owns, oldest first — one query for
+/// the whole board instead of one per rule.
+///
+/// Scoped through `rules.user_id`, so a foreign `rule_id` cannot be read.
 pub const RULE_REVISIONS_LIST_SQL: &str = "
     SELECT id, rule_id, effective_from, params_json, created_at
     FROM rule_revisions
-    WHERE rule_id = ?
+    WHERE rule_id IN (SELECT id FROM rules WHERE user_id = ?)
     ORDER BY effective_from, created_at, id
 ";
 
-/// Binds: id, rule_id, effective_from, params_json, created_at (5).
+/// Binds: id, rule_id, effective_from, params_json, created_at, rule_id,
+/// user_id (7).
+///
+/// `OR IGNORE` plus a caller-supplied id makes a seed's first revision
+/// idempotent: two concurrent seed passes write the same `seed:…:v1` row
+/// once. A `PATCH` revision binds a fresh uuid and never collides.
+///
+/// The `WHERE ? IN (SELECT id FROM rules WHERE user_id = ?)` clause is the
+/// user-scope check: a revision can only be written under a rule the user
+/// owns, and a foreign `rule_id` inserts nothing.
 pub const RULE_REVISIONS_INSERT_SQL: &str = "
-    INSERT INTO rule_revisions (id, rule_id, effective_from, params_json, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO rule_revisions (id, rule_id, effective_from, params_json, created_at)
+    SELECT ?, ?, ?, ?, ?
+    WHERE ? IN (SELECT id FROM rules WHERE user_id = ?)
 ";
 
 /// Every pause period of one user (global and per-rule).
@@ -122,6 +140,18 @@ pub const RULE_CATEGORIES_SQL: &str = "
     ORDER BY sort_order, title
 ";
 
+/// The civil dates the digest has aggregated, over the inclusive range.
+///
+/// A window is only full when every non-paused day in it appears here: a
+/// missing day means the backfill has not reached it yet, which is not the
+/// same as a stored zero.
+pub const RULE_AGGREGATED_DAYS_SQL: &str = "
+    SELECT local_date
+    FROM daily_meta
+    WHERE user_id = ? AND local_date >= ? AND local_date <= ?
+    ORDER BY local_date
+";
+
 // ──────────────────────────────────────────
 // Rows
 // ──────────────────────────────────────────
@@ -149,11 +179,14 @@ pub struct RuleRow {
 
 impl RuleRow {
     /// The pure scorer's view of this row.
+    ///
+    /// An unknown `kind` or `status` is corrupt stored data, not a bad request:
+    /// the caller skips the row and the Worker answers 500 for a lone write.
     pub fn spec(&self) -> Result<RuleSpec, RulesError> {
         let kind = RuleKind::parse(&self.kind)
-            .ok_or_else(|| RulesError::Invalid(format!("rule {} has an unknown kind", self.id)))?;
+            .ok_or_else(|| RulesError::Corrupt(format!("rule {} has an unknown kind", self.id)))?;
         let status = RuleStatus::parse(&self.status).ok_or_else(|| {
-            RulesError::Invalid(format!("rule {} has an unknown status", self.id))
+            RulesError::Corrupt(format!("rule {} has an unknown status", self.id))
         })?;
         Ok(RuleSpec {
             id: self.id.clone(),
@@ -172,6 +205,10 @@ impl RuleRow {
 /// The columns a new rule needs; the repo mints the id and timestamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRuleRow {
+    /// A deterministic id (the seeds use `seed:{user_id}:{slug}`), or `None`
+    /// for a freshly minted uuid. An id that already exists is ignored by
+    /// `INSERT OR IGNORE`, which is what makes a double seed harmless.
+    pub id: Option<String>,
     pub user_id: String,
     pub name: String,
     pub icon: String,
@@ -275,6 +312,10 @@ pub trait RuleRepo: Send + Sync {
     /// How many rules the user has (archived included) — the seed guard.
     async fn count_rules(&self, user_id: &str) -> Result<i64, RepoError>;
     /// Inserts a rule and returns the stored row (with its minted id).
+    ///
+    /// `rule.id` is honoured when set — that is how the seeds stay
+    /// deterministic — and an id that already exists is **ignored**, so the
+    /// same seed written twice leaves one row.
     async fn insert_rule(
         &self,
         rule: &NewRuleRow,
@@ -290,12 +331,18 @@ pub trait RuleRepo: Send + Sync {
         sort_order: i64,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
-    /// One rule's revisions, oldest first.
-    async fn list_revisions(&self, rule_id: &str) -> Result<Vec<RevisionRow>, RepoError>;
-    /// Appends a revision.
+    /// Every revision of every rule of the user, oldest first — one query.
+    async fn list_revisions(&self, user_id: &str) -> Result<Vec<RevisionRow>, RepoError>;
+    /// Appends a revision to one of the user's rules. A foreign `rule_id`
+    /// writes nothing (the statement is scoped through `rules.user_id`).
+    ///
+    /// `id` is honoured when set — the seeds use it so a concurrent double
+    /// seed writes one row — and an id that already exists is ignored.
     async fn insert_revision(
         &self,
+        user_id: &str,
         rule_id: &str,
+        id: Option<&str>,
         effective_from: &str,
         params_json: &str,
         now_rfc3339: &str,
@@ -328,6 +375,54 @@ pub trait RuleRepo: Send + Sync {
         from_date: &str,
         to_date: &str,
     ) -> Result<Vec<SleepNightRow>, RepoError>;
+    /// The `daily_meta.local_date`s the digest has aggregated, oldest first.
+    ///
+    /// The scorer needs the *set*, not the rows: a day in a window that is
+    /// missing here is not a zero, it is a hole the backfill has not filled.
+    async fn load_aggregated_days(
+        &self,
+        user_id: &str,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<String>, RepoError>;
     /// The user's living category tree.
     async fn load_categories(&self, user_id: &str) -> Result<Vec<CategoryRow>, RepoError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// m9: a revision can only be read or written under a rule the user owns.
+    /// Every revision statement has to carry `user_id` itself — the trait no
+    /// longer takes a bare `rule_id`.
+    #[test]
+    fn revision_statements_are_scoped_by_user_id() {
+        assert!(RULE_REVISIONS_LIST_SQL.contains("user_id"), "{RULE_REVISIONS_LIST_SQL}");
+        assert!(
+            RULE_REVISIONS_LIST_SQL.contains("rule_id IN (SELECT id FROM rules WHERE user_id = ?)"),
+            "{RULE_REVISIONS_LIST_SQL}"
+        );
+        assert!(RULE_REVISIONS_INSERT_SQL.contains("user_id"), "{RULE_REVISIONS_INSERT_SQL}");
+        assert!(
+            RULE_REVISIONS_INSERT_SQL.contains("(SELECT id FROM rules WHERE user_id = ?)"),
+            "{RULE_REVISIONS_INSERT_SQL}"
+        );
+    }
+
+    /// The seed race guard: the insert has to tolerate an id that already
+    /// exists.
+    #[test]
+    fn the_rule_insert_ignores_a_duplicate_id() {
+        assert!(RULES_INSERT_SQL.contains("INSERT OR IGNORE"), "{RULES_INSERT_SQL}");
+    }
+
+    /// The aggregated-day read is one user-scoped range scan.
+    #[test]
+    fn the_aggregated_day_read_is_a_user_scoped_range() {
+        assert!(RULE_AGGREGATED_DAYS_SQL.contains("daily_meta"), "{RULE_AGGREGATED_DAYS_SQL}");
+        assert!(RULE_AGGREGATED_DAYS_SQL.contains("user_id = ?"), "{RULE_AGGREGATED_DAYS_SQL}");
+        assert!(RULE_AGGREGATED_DAYS_SQL.contains("local_date >= ?"), "{RULE_AGGREGATED_DAYS_SQL}");
+        assert!(RULE_AGGREGATED_DAYS_SQL.contains("local_date <= ?"), "{RULE_AGGREGATED_DAYS_SQL}");
+    }
 }
