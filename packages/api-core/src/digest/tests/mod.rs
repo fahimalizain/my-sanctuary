@@ -881,6 +881,24 @@ fn est_none_never_collapses_when_one_day_has_no_events() {
 }
 
 #[test]
+fn a_blank_past_stretch_does_not_invent_a_night() {
+    // The backfill cursor walks every civil date from the first event to
+    // today, so a long rebuild would otherwise store a fake 6.5h `est_none`
+    // night on every blank day. `sleep_events.py` only inserted sleep between
+    // days that had events. `NOW` is 2030, so the before-noon today-guard is
+    // not what keeps these two 2020 dates empty.
+    let dates = ["2020-06-01".to_string(), "2020-06-02".to_string()];
+    let days = digest_days(&[], &dates, NOW, "UTC", None);
+    assert_eq!(days.len(), 2, "both requested dates are still emitted");
+    for day in &days {
+        assert_eq!(day.tracked_seconds, 0, "{}", day.local_date);
+        assert_eq!(day.sleep_seconds, 0, "{}", day.local_date);
+        assert!(day.nights.is_empty(), "{}", day.local_date);
+    }
+    assert_invariants(&days);
+}
+
+#[test]
 fn a_post_midnight_asleep_credits_the_previous_night() {
     // 01:00 with no wake marker, first real event at 09:00 → D0's bedtime.
     let events = vec![
@@ -1182,17 +1200,19 @@ fn the_pre_midnight_half_of_a_night_lands_on_the_previous_date() {
     let dates = ["2026-01-01".to_string(), "2026-01-02".to_string()];
     let days = digest_days(&events, &dates, NOW, "Asia/Kolkata", None);
     // 22:30–24:00 IST shared between the Asleep event and the synthetic half
-    // (2700s), plus the night that merely *wakes* on the 1st (est_none from
-    // 21:00 the previous evening, untouched by this pair).
-    assert_eq!(find(&days, "2026-01-01").sleep_seconds, 2_700 + 12_600);
+    // (2700s) — and nothing else: the 1st's only events are markers (excluded
+    // from anchors and from the neither-marker estimate), and the 31st has no
+    // events at all, so no `est_none` night is invented for it.
+    assert_eq!(find(&days, "2026-01-01").sleep_seconds, 2_700);
+    assert!(
+        find(&days, "2026-01-01").nights.is_empty(),
+        "a blank day must not own an estimated night"
+    );
     // 00:00–05:00 IST: 5h synthetic, shared with the Asleep event's second half.
     assert_eq!(find(&days, "2026-01-02").sleep_seconds, 9_000);
     // The paired night itself is only ever attached to its wake date.
     assert_eq!(find(&days, "2026-01-02").nights.len(), 1);
-    assert!(find(&days, "2026-01-01")
-        .nights
-        .iter()
-        .all(|night| night.source != SleepSource::Paired));
+    assert_eq!(find(&days, "2026-01-02").nights[0].source, SleepSource::Paired);
     assert_invariants(&days);
 }
 

@@ -302,8 +302,12 @@ pub(crate) struct EstimateDay<'a> {
 ///   `end <= bed`.
 /// * wake only → `start = max(wake - 6.5h, day0 last event end)`, dropped when
 ///   `start >= wake`.
-/// * neither → `start = max(day0 last event end, day0 21:00 local)`,
-///   `end = min(start + 6.5h, day1 first event)`, dropped when `end <= start`.
+/// * neither → **dropped when neither civil date has a real (non-marker)
+///   event** — a blank date must not invent a night (`sleep_events.py` only
+///   inserted sleep between days that had events, and a backfill walks every
+///   date since the first event). Otherwise `start = max(day0 last event end,
+///   day0 21:00 local)`, `end = min(start + 6.5h, day1 first event)`, dropped
+///   when `end <= start`.
 ///
 /// The today guard lives in the caller: an in-progress night is not guessed.
 pub(crate) fn estimate_night(
@@ -349,6 +353,13 @@ pub(crate) fn estimate_night(
             })
         }
         (None, None) => {
+            // Neither day has a real (non-marker) event: nothing anchors a
+            // night, so a blank civil date stays blank. Markers are excluded
+            // from anchors, so a lone Asleep/Woke pair does not count here —
+            // and a paired night never reaches this branch anyway.
+            if day0.anchors.last_end.is_none() && day1_day.anchors.first_start.is_none() {
+                return None;
+            }
             let anchor_21 = local_hh_mm_unix(day0.date, 21, 0, day0.zone);
             let start = match (day0.anchors.last_end, anchor_21) {
                 (Some(last), Some(anchor)) => last.max(anchor),

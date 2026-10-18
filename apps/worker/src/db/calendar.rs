@@ -25,7 +25,8 @@ use api_core::repo::{
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
+    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
     EVENT_UPSERT_QUARANTINE_SQL, OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
     OPERATION_UPDATE_STATUS_SQL, REPLICA_SEEN_INSERT_CHUNK_SIZE,
@@ -923,7 +924,22 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         lease_owner: &str,
         now_rfc3339: &str,
     ) -> Result<bool, RepoError> {
-        // Fenced UPDATE first; changes==0 is ambiguous (no ghosts vs lease
+        // Candidate spans first (same predicate as the UPDATE, lease gate
+        // included) — once the UPDATE tombstones the rows their spans are gone.
+        let candidate = self
+            .db
+            .prepare(EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL)
+            .bind_refs(&[
+                D1Type::Text(calendar_id),
+                D1Type::Text(calendar_id),
+                D1Type::Text(run_id),
+                D1Type::Text(lease_owner),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        let spans: Vec<EventSpanRow> = query_vec(candidate).await?;
+
+        // Fenced UPDATE next; changes==0 is ambiguous (no ghosts vs lease
         // lost) — probe lease ownership for the return value.
         let stmt = self
             .db
@@ -950,7 +966,18 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             ])
             .map_err(backend)?;
         let held: Option<LeaseHeldRow> = probe.first(None).await.map_err(backend)?;
-        Ok(held.is_some())
+        let held = held.is_some();
+
+        // A lost lease leaves the candidate list empty (the SELECT carries the
+        // same lease gate), so nothing is marked for rows the UPDATE did not
+        // touch. Best-effort: `mark_dirty` swallows and logs.
+        if held {
+            for span in &spans {
+                self.mark_dirty(calendar_id, None, Some(span.as_span()), now_rfc3339)
+                    .await;
+            }
+        }
+        Ok(held)
     }
 
     async fn upsert_quarantine(

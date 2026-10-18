@@ -566,6 +566,34 @@ fn seed_event(
     status: &str,
     recurring_event_id: &str,
 ) -> Result<(), String> {
+    // The sweep tests' default span: 2026-08-18 09:00–09:30 UTC, zone unset.
+    seed_timed_event(
+        conn,
+        id,
+        google_event_id,
+        "2026-08-18T09:00:00Z",
+        "2026-08-18T09:30:00Z",
+        "",
+        task_id,
+        status,
+        recurring_event_id,
+    )
+}
+
+/// Seed one living event with an explicit span, so the dirty-marking
+/// assertions can name the dates the sweep touches.
+#[allow(clippy::too_many_arguments)]
+fn seed_timed_event(
+    conn: &rusqlite::Connection,
+    id: &str,
+    google_event_id: &str,
+    start_time: &str,
+    end_time: &str,
+    time_zone: &str,
+    task_id: Option<&str>,
+    status: &str,
+    recurring_event_id: &str,
+) -> Result<(), String> {
     conn.execute(
         "INSERT INTO calendar_events (
             id, calendar_id, google_event_id, google_etag, google_updated_at,
@@ -575,18 +603,21 @@ fn seed_event(
             created_at, updated_at, deleted_at
          ) VALUES (
             ?1, 'cal-1', ?2, '', '',
-            ?3, ?2, '', '2026-08-18T09:00:00Z', '2026-08-18T09:30:00Z', '',
-            ?4, '', 0, ?5, ?6, '',
-            '', '', 0, '',
+            ?3, ?2, '', ?4, ?5, '',
+            ?6, '', 0, ?7, ?8, '',
+            ?9, ?9, 0, '',
             ?3, ?3, NULL
          )",
         rusqlite::params![
             id,
             google_event_id,
             NOW_RFC,
+            start_time,
+            end_time,
             task_id,
             status,
             recurring_event_id,
+            time_zone,
         ],
     )
     .map_err(|e| format!("seed event {id}: {e}"))?;
@@ -734,6 +765,108 @@ fn d1_sweep_absent_if_owner_membership_and_lease_fence() {
             .expect("ghost q3")
             .expect("ghost still living under expired lease");
     assert!(ghost_exp.deleted_at.is_none());
+}
+
+/// A full resync removes events the walk no longer sees; their days must be
+/// queued for a digest rebuild (the sweep's bugs used to leave stale
+/// `daily_meta` / category / sleep rows behind).
+#[test]
+fn d1_sweep_absent_if_owner_dirties_the_days_it_deletes() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        conn.execute(
+            "UPDATE google_calendars
+             SET lease_owner = ?1, lease_expires_at = ?2
+             WHERE id = 'cal-1'",
+            rusqlite::params!["owner-a", "2099-01-01T00:00:00Z"],
+        )
+        .expect("set lease");
+        // The ghost: living, absent from the seen snapshot, on its own date.
+        seed_timed_event(
+            &conn,
+            "e-ghost",
+            "ghost",
+            "2026-09-10T22:00:00Z",
+            "2026-09-10T23:00:00Z",
+            "UTC",
+            None,
+            "confirmed",
+            "",
+        )
+        .expect("ghost");
+        // Rows the sweep must skip: a cancelled exception and a task-linked
+        // event, deliberately on another date so the dirty assertions can tell
+        // them apart from the ghost's day.
+        seed_timed_event(
+            &conn,
+            "e-exc",
+            "exc-absent",
+            "2026-10-02T09:00:00Z",
+            "2026-10-02T09:30:00Z",
+            "UTC",
+            None,
+            "cancelled",
+            "master-1",
+        )
+        .expect("exc");
+        seed_timed_event(
+            &conn,
+            "e-task",
+            "task-linked",
+            "2026-10-02T09:00:00Z",
+            "2026-10-02T09:30:00Z",
+            "UTC",
+            Some("task-99"),
+            "confirmed",
+            "",
+        )
+        .expect("task");
+        // Seen snapshot: neither ghost nor the excluded rows.
+        conn.execute(
+            "INSERT INTO calendar_replica_seen (calendar_id, run_id, google_event_id, created_at)
+             VALUES ('cal-1', 'run-1', 'seen-elsewhere', ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("seed seen");
+    }
+
+    let ok = pollster::block_on(h.events.sweep_absent_if_owner(
+        "cal-1",
+        "run-1",
+        "owner-a",
+        NOW_RFC,
+    ))
+    .expect("sweep ok");
+    assert!(ok, "owner must hold lease");
+
+    let ghost = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "ghost"))
+        .expect("ghost q");
+    assert!(ghost.is_none(), "ghost must be soft-deleted");
+
+    // The excluded rows stay living.
+    let exc = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "exc-absent"))
+        .expect("exc q")
+        .expect("cancelled exception living");
+    assert_eq!(exc.status, "cancelled");
+    let task = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "task-linked"))
+        .expect("task q")
+        .expect("task-linked living");
+    assert_eq!(task.task_id, "task-99");
+
+    // The swept event's local date and its ±1 sleep neighbours are dirty; the
+    // skipped rows' date (2026-10-02) is not — a drifted SELECT predicate would
+    // show up here.
+    assert_eq!(
+        pollster::block_on(h.digest().list_dirty("u-1", 10)).expect("list dirty"),
+        vec![
+            "2026-09-09".to_string(),
+            "2026-09-10".to_string(),
+            "2026-09-11".to_string(),
+        ],
+        "the sweep must dirty exactly the days it deletes"
+    );
 }
 
 // ── Digest tables (slice 2) ─────────────────────────────────────────────────

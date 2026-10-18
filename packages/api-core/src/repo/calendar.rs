@@ -327,6 +327,11 @@ pub trait CalendarEventRepo: Send + Sync {
     /// lease is missing/stolen/expired (no further mutation). Zero updated
     /// rows is ambiguous — probe with [`CALENDAR_LEASE_HELD_SQL`] like
     /// [`Self::delete_by_google_event_id_if_owner`].
+    ///
+    /// The candidate rows are selected (same predicate) **before** the UPDATE
+    /// and their spans are dirty-marked, best-effort, when the lease probe says
+    /// the lease was held — a full resync's vanished events must rebuild their
+    /// days instead of leaving stale digest rows behind.
     async fn sweep_absent_if_owner(
         &self,
         calendar_id: &str,
@@ -908,16 +913,16 @@ pub const EVENT_UPSERT_QUARANTINE_SQL: &str = "
 pub const EVENT_CLEAR_QUARANTINE_FOR_CALENDAR_SQL: &str =
     "DELETE FROM calendar_event_quarantine WHERE calendar_id = ?";
 
-/// Fenced generation-membership sweep (issue #60). Soft-deletes living rows
-/// whose Google id is absent from this walk's completed seen snapshot.
-/// Does **not** use `last_synced_at`. Excludes cancelled exceptions and
-/// non-empty `task_id`. Lease EXISTS matches
-/// [`EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL`].
-/// Binds: now, now, calendar_id, calendar_id, run_id, lease_owner, now.
-pub const EVENT_SWEEP_ABSENT_IF_OWNER_SQL: &str = "
-    UPDATE calendar_events
-    SET deleted_at = ?, updated_at = ?
-    WHERE calendar_id = ?
+/// The generation-membership predicate shared by the sweep's candidate
+/// `SELECT` and its tombstoning `UPDATE`. A macro (not a `const`) because both
+/// statements must be interpolated into a `&str` constant — one `WHERE`
+/// fragment, two statements, so the spans read for dirty marking can never
+/// drift from the rows actually soft-deleted.
+///
+/// Binds, in order: calendar_id, calendar_id, run_id, lease_owner, now.
+macro_rules! event_sweep_absent_where {
+    () => {
+        "calendar_id = ?
       AND deleted_at IS NULL
       AND NOT (
         status = 'cancelled'
@@ -938,8 +943,38 @@ pub const EVENT_SWEEP_ABSENT_IF_OWNER_SQL: &str = "
           AND deleted_at IS NULL
           AND lease_owner = ?
           AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
-      )
-";
+      )"
+    };
+}
+
+/// Fenced generation-membership sweep (issue #60). Soft-deletes living rows
+/// whose Google id is absent from this walk's completed seen snapshot.
+/// Does **not** use `last_synced_at`. Excludes cancelled exceptions and
+/// non-empty `task_id`. Lease EXISTS matches
+/// [`EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL`].
+/// Binds: now, now, calendar_id, calendar_id, run_id, lease_owner, now.
+///
+/// The candidate spans for dirty marking come from
+/// [`EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL`], which shares this predicate.
+pub const EVENT_SWEEP_ABSENT_IF_OWNER_SQL: &str = concat!(
+    "
+    UPDATE calendar_events
+    SET deleted_at = ?, updated_at = ?
+    WHERE ",
+    event_sweep_absent_where!()
+);
+
+/// The spans of the rows [`EVENT_SWEEP_ABSENT_IF_OWNER_SQL`] would tombstone,
+/// read **before** the UPDATE so the digest can dirty the days a full resync
+/// really deletes. Identical predicate — including the lease gate — so a lost
+/// lease yields an empty candidate list and the sweep never dirties rows its
+/// UPDATE did not touch.
+///
+/// Binds: calendar_id, calendar_id, run_id, lease_owner, now.
+pub const EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL: &str = concat!(
+    "SELECT start_time, end_time, start_time_zone, end_time_zone FROM calendar_events WHERE ",
+    event_sweep_absent_where!()
+);
 
 /// D1 allows at most 100 bound parameters per SQL statement.
 /// `calendar_events` upsert binds 26 columns per row
@@ -2098,6 +2133,55 @@ mod tests {
         assert!(sql.contains("TRIM(recurring_event_id)"), "{sql}");
         assert!(sql.contains("TRIM(task_id)"), "{sql}");
         assert!(!sql.contains("DELETE FROM"), "{sql}");
+    }
+
+    #[test]
+    fn event_sweep_absent_spans_select_shares_the_update_predicate() {
+        let update = EVENT_SWEEP_ABSENT_IF_OWNER_SQL;
+        let select = EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL;
+
+        assert!(select.trim_start().starts_with("SELECT"), "{select}");
+        assert!(
+            select.contains("start_time, end_time, start_time_zone, end_time_zone"),
+            "{select}"
+        );
+        // A read, never a write — the UPDATE owns the tombstone.
+        assert!(!select.contains("SET deleted_at"), "{select}");
+        assert!(!select.contains("DELETE FROM"), "{select}");
+
+        // The spans the sweep dirties must be exactly the rows it deletes:
+        // both statements carry the same `WHERE` text.
+        fn where_of(sql: &str) -> &str {
+            sql.split_once("WHERE ")
+                .map(|(_, predicate)| predicate)
+                .unwrap_or_else(|| panic!("no WHERE in {sql}"))
+        }
+        assert_eq!(
+            where_of(select),
+            where_of(update),
+            "the sweep's SELECT and UPDATE predicates must not drift"
+        );
+
+        for clause in [
+            "status = 'cancelled'",
+            "recurring_event_id",
+            "TRIM(recurring_event_id)",
+            "task_id",
+            "TRIM(task_id)",
+            "calendar_replica_seen",
+            "run_id = ?",
+            "EXISTS",
+            "google_calendars",
+            "lease_owner = ?",
+            "lease_expires_at IS NULL OR lease_expires_at >= ?",
+        ] {
+            assert!(select.contains(clause), "SELECT missing {clause}: {select}");
+            assert!(update.contains(clause), "UPDATE missing {clause}: {update}");
+        }
+
+        // Bind order: calendar_id, calendar_id, run_id, lease_owner, now.
+        assert_eq!(select.matches('?').count(), 5, "{select}");
+        assert_eq!(update.matches('?').count(), 7, "{update}");
     }
 
     #[test]

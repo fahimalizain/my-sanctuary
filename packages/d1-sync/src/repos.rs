@@ -28,7 +28,8 @@ use api_core::repo::{
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL, EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL,
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
+    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
     EVENT_UPSERT_QUARANTINE_SQL,
     OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_UPDATE_PROGRESS_SQL, OPERATION_UPDATE_STATUS_SQL,
@@ -897,6 +898,20 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
         now_rfc3339: &str,
     ) -> Result<bool, RepoError> {
         let conn = lock(&self.db)?;
+        // Candidate spans before the UPDATE tombstones them: the SELECT shares
+        // the UPDATE's predicate (lease gate included), so a lost lease yields
+        // no candidates.
+        let spans: Vec<EventSpanRow> = query_vec(
+            &conn,
+            EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL,
+            &[
+                &calendar_id,
+                &calendar_id,
+                &run_id,
+                &lease_owner,
+                &now_rfc3339,
+            ],
+        )?;
         exec(
             &conn,
             EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
@@ -920,7 +935,15 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
             CALENDAR_LEASE_HELD_SQL,
             &[&calendar_id, &lease_owner, &now_rfc3339],
         )?;
-        Ok(held.is_some())
+        let held = held.is_some();
+        if held {
+            // Best-effort (the helper swallows the error): the tombstone is
+            // already committed, and a lost dirty mark only delays a rebuild.
+            for span in &spans {
+                Self::mark_dirty(&conn, calendar_id, None, Some(span.as_span()), now_rfc3339);
+            }
+        }
+        Ok(held)
     }
 
     async fn upsert_quarantine(
