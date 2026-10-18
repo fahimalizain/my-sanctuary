@@ -1135,6 +1135,15 @@ export function useCalendarDrag(
           suppressClickRef.current = true;
           resizeCb(s.eventId, preview);
         }
+        // The pill does not select, so nothing consumes that flag: the synthetic
+        // click lands on the pill, which has no click handler, and an unconsumed
+        // flag would eat the NEXT chip tap. `click` is dispatched after this
+        // `pointerup` and before the next task, so a macrotask clear still lets
+        // a synthetic click on a chip see it — a microtask would run first and
+        // clear it too early.
+        window.setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 0);
       }
 
       endSession();

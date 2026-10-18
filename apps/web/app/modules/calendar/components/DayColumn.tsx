@@ -136,12 +136,13 @@ export const TimedPreviewLayer = memo(function TimedPreviewLayer({
   const label = previewInfo
     ? formatEventTimeDetail(previewInfo.range.start, previewInfo.range.end)
     : null;
-  // Label once: on the segment holding the dragged edge, else the first.
+  // Label once: on the segment holding the dragged edge, else the first. A
+  // gutter scrub of the end moves the same edge, so it labels the same way.
   const segmentDays = days.filter((d) =>
     timedPreviewByDay.has(d.toDateString()),
   );
   const labelDay =
-    previewInfo?.kind === 'resize-end'
+    previewInfo?.kind === 'resize-end' || previewInfo?.kind === 'scrub-end'
       ? segmentDays[segmentDays.length - 1]
       : segmentDays[0];
 

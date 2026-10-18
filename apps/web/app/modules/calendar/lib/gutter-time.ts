@@ -148,10 +148,14 @@ export interface GutterPillInput {
 /**
  * Pills and the hour labels they cover, for the sticky gutter.
  *
- * Centers are clamped into the hours box — narrowed to the visible band when
- * one is known, so a pill whose edge scrolled away stays on screen and
- * grabbable — and the two edge pills keep `GUTTER_PILL_H + GUTTER_PILL_GAP`
- * apart, so a short event hosts both. The now pill and the hidden labels are
+ * The two edge pills are clamped into the hours box — narrowed to the visible
+ * band when one is known, so a pill whose edge scrolled away stays on screen
+ * and grabbable — and keep `GUTTER_PILL_H + GUTTER_PILL_GAP` apart, so a short
+ * event hosts both. Sticking is the edges' alone, because only they are
+ * grabbable: the now pill is clamped to the hours box and never to the band, so
+ * it stays on the now line instead of pinning to a viewport end the scroller
+ * has moved away from. It yields only when its own center lands within
+ * `GUTTER_PILL_H` of a placed edge pill. The now pill and the hidden labels are
  * tested against the centers as painted, not against the raw edge minutes.
  */
 export function layoutGutterPills(input: GutterPillInput): {
@@ -177,6 +181,7 @@ export function layoutGutterPills(input: GutterPillInput): {
     }
   }
 
+  // Edge pills only: the band-narrowed range that does the sticking.
   const clampCenter = (y: number): number => clamp(y, minCenter, maxCenter);
 
   const pills: GutterPillLayout[] = [];
@@ -211,7 +216,10 @@ export function layoutGutterPills(input: GutterPillInput): {
   }
 
   if (now && Number.isFinite(now.getTime())) {
-    const top = clampCenter(nowLineY(now, hourH));
+    // The hours box only, never the visible band: the now pill is decorative,
+    // and pinning it to a viewport end would draw the now line at a time it is
+    // not. Only a placed edge pill — which IS grabbable — can push it off.
+    const top = clamp(nowLineY(now, hourH), boxLo, boxHi);
     const edgeTops = pills.map((p) => p.top);
     // The event's own times win: a now pill drawn over an edge is unreadable.
     // Exact adjacency is not a collision.

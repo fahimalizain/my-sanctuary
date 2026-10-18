@@ -459,6 +459,26 @@ test('layoutGutterPills: a visible band outside the hours box is ignored', () =>
   assert.equal(byKey(pills, 'end')?.top, 10 * 48);
 });
 
+test('layoutGutterPills: the now pill does not stick to the visible band', () => {
+  // Hours scrolled to 600–800 with now at noon (12 × 48 = 576), a band away
+  // above it. Sticking is for the grabbable edge pills: the now pill stays on
+  // the now line and only the hours box bounds it.
+  const { pills, hiddenHours } = layoutGutterPills({
+    hourH: 48,
+    hourLabels: ALL_HOURS,
+    now: at(12),
+    edges: null,
+    visible: { top: 600, bottom: 800 },
+  });
+  const nowPill = byKey(pills, 'now');
+  assert.ok(nowPill);
+  assert.equal(nowPill.top, 576);
+  assert.notEqual(nowPill.top, 600 + GUTTER_PILL_H / 2);
+  assert.equal(nowPill.text, '12:00p');
+  assert.equal(pills.length, 1);
+  assert.deepEqual(hiddenHours, [12]);
+});
+
 test('layoutGutterPills: the now pill yields to the center the push landed on', () => {
   // Zero-length 9:00 → centers 423 / 441. A 9:20 now pill (448) is exactly one
   // pill clear of the unseparated 432, but not of the separated 441.
