@@ -1849,13 +1849,21 @@ export function HomePage() {
       {/* Today: jump back from anywhere in the stream (hidden while today's
           header is on screen) */}
       {serverToday && !todayVisible && (
-        <button
-          type="button"
-          onClick={() => void scrollToToday()}
-          className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-full border border-border bg-card px-4 py-2 text-sm font-medium text-foreground shadow-lg transition-colors hover:bg-muted lg:left-auto lg:right-8 lg:translate-x-0"
-        >
-          Today
-        </button>
+        <div className="pointer-events-none fixed inset-x-0 bottom-24 z-40">
+          <div className="mx-auto max-w-7xl px-6">
+            <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
+              <div className="flex justify-center lg:col-span-2">
+                <button
+                  type="button"
+                  onClick={() => void scrollToToday()}
+                  className="pointer-events-auto rounded-full border border-border bg-card px-4 py-2 text-sm font-medium text-foreground shadow-lg transition-colors hover:bg-muted"
+                >
+                  Today
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Task edit modal — the existing TaskModal (edit/delete/move) */}
