@@ -14,7 +14,6 @@ import {
   useCalendarsQuery,
   useCreateCalendarEvent,
   useDeleteCalendarEvent,
-  useUpdateCalendarEvent,
 } from '@/app/queries/calendar';
 import type { CalendarEvent } from '@/app/types';
 import { isCalendarWritable } from '../components/EventInspector';
@@ -41,12 +40,8 @@ import { hourLabelStep } from '../lib/calendar-zoom';
 import { isPersistableDraftTitle } from '../lib/event-draft';
 import { DESKTOP_MQ } from '../lib/inspector-anchor';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
-import {
-  buildDraftFlushPatch,
-  EventPatchQueue,
-  revertFailedPatch,
-  type EventPatchQueueHandlers,
-} from '../lib/event-patch-queue';
+import { buildDraftFlushPatch } from '../lib/event-patch-queue';
+import { setPatchWriteErrorListener } from '../lib/patch-write-error';
 import { repairCalendar } from '@/lib/api/calendar';
 import {
   repairTargetCalendarId,
@@ -64,25 +59,6 @@ import {
   isSameDay,
   type StripLockReason,
 } from '../lib/week-layout';
-
-/** Overlay still matches server response for fields we paint optimistically. */
-function overlayMatchesServerEvent(
-  overlay: CalendarEvent,
-  server: CalendarEvent,
-): boolean {
-  return (
-    overlay.title === server.title &&
-    overlay.description === server.description &&
-    overlay.start_time === server.start_time &&
-    overlay.end_time === server.end_time &&
-    Boolean(overlay.is_all_day) === Boolean(server.is_all_day) &&
-    (overlay.start_time_zone?.trim() || '') ===
-      (server.start_time_zone?.trim() || '') &&
-    (overlay.end_time_zone?.trim() || '') ===
-      (server.end_time_zone?.trim() || '') &&
-    overlay.calendar_id === server.calendar_id
-  );
-}
 
 export interface CalendarSessionInput {
   timeMin: string;
@@ -123,6 +99,8 @@ export function useCalendarSession({
   const eventsEmpty = events.length === 0;
 
   // Optimistic create/move/resize/delete overlay (read-time; not setQueryData).
+  // Also carries the app-wide PATCH queue: it lives in the provider so it
+  // survives navigation, while this page is only a caller.
   const queue = useCalendarEventsQueue();
 
   // Calendars for sidebar list + visibility filter.
@@ -186,7 +164,6 @@ export function useCalendarSession({
   const cutRemovalsStartedRef = useRef<Set<string>>(new Set());
 
   const createEvent = useCreateCalendarEvent();
-  const updateEvent = useUpdateCalendarEvent();
   const deleteEvent = useDeleteCalendarEvent();
 
   // Quiet notice for failed writes (distinct from sync health banner).
@@ -201,59 +178,13 @@ export function useCalendarSession({
     setWriteError(base);
   }, []);
 
-  // Per-event PATCH chain shared by inspector edits, drag move/resize and the
-  // temp-id create flush. Handlers are re-bound each render through a ref so
-  // the queue instance (and its pending state) outlives renders.
-  const eventsRef = useRef(events);
-  eventsRef.current = events;
-  const patchSyncRef = useRef<EventPatchQueueHandlers | null>(null);
-  patchSyncRef.current = {
-    send: async (id, input) => {
-      const result = await updateEvent.mutateAsync({ id, input });
-      return result.event;
-    },
-    onSuccess: (id, _sent, event, idle) => {
-      upsertCalendarEventInCache(event);
-      // Later patches are still queued: keep the overlay painted over them.
-      if (!idle) return;
-      const latest = queue.getOverlay(id);
-      if (
-        !latest ||
-        (latest.op === 'upsert' &&
-          overlayMatchesServerEvent(latest.event, event))
-      ) {
-        queue.clear(id);
-      }
-    },
-    onError: (id, sent, err, idle) => {
-      const latest = queue.getOverlay(id);
-      if (latest?.op === 'upsert') {
-        // Revert only the failed fields, and only those not superseded by a
-        // newer edit, back to the last known server row.
-        const base = eventsRef.current.find((e) => e.id === id);
-        if (!base) {
-          if (idle) queue.clear(id);
-        } else {
-          const reverted = revertFailedPatch(latest.event, base, sent);
-          if (idle && overlayMatchesServerEvent(reverted, base)) {
-            queue.clear(id);
-          } else if (!overlayMatchesServerEvent(reverted, latest.event)) {
-            queue.upsert(reverted);
-          }
-        }
-      }
-      reportWriteError("Couldn't save event", err);
-    },
-  };
-  const patchQueueRef = useRef<EventPatchQueue | null>(null);
-  if (!patchQueueRef.current) {
-    patchQueueRef.current = new EventPatchQueue({
-      send: (id, input) => patchSyncRef.current!.send(id, input),
-      onSuccess: (...args) => patchSyncRef.current!.onSuccess(...args),
-      onError: (...args) => patchSyncRef.current!.onError(...args),
-    });
-  }
-  const patchQueue = patchQueueRef.current;
+  // The PATCH queue outlives this page, so its late failures come back
+  // through this slot. Unmount clears it: a failure after the page is gone
+  // must not setState here (the overlay/cache reconcile still runs).
+  useEffect(() => {
+    setPatchWriteErrorListener(reportWriteError);
+    return () => setPatchWriteErrorListener(null);
+  }, [reportWriteError]);
 
   const writableCalendar = useMemo(
     () => defaultWritableCalendar(calendars),
@@ -441,7 +372,7 @@ export function useCalendarSession({
               });
               // Same per-event chain as inspector edits: field PATCH first,
               // then calendar MOVE, ahead of any later edit.
-              patchQueue.enqueue(result.event.id, flush);
+              queue.enqueuePatch(result.event.id, flush);
             }
           }
         },
@@ -467,7 +398,6 @@ export function useCalendarSession({
     createEvent,
     deleteEvent,
     queue,
-    patchQueue,
     reportWriteError,
     setDraftId,
   ]);
@@ -495,14 +425,13 @@ export function useCalendarSession({
       // Temp id with POST in flight — create onSuccess will flush the title.
       if (isTempEventId(selectedEventId)) return;
 
-      patchQueue.enqueue(selectedEventId, { summary });
+      queue.enqueuePatch(selectedEventId, { summary });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      patchQueue,
       persistDraft,
       clearWriteError,
     ],
@@ -533,14 +462,13 @@ export function useCalendarSession({
       // Temp id with POST in flight — create onSuccess will flush description.
       if (isTempEventId(selectedEventId)) return;
 
-      patchQueue.enqueue(selectedEventId, { description });
+      queue.enqueuePatch(selectedEventId, { description });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      patchQueue,
       persistDraft,
       clearWriteError,
     ],
@@ -580,14 +508,13 @@ export function useCalendarSession({
         return;
       }
 
-      patchQueue.enqueue(selectedEventId, { calendar_id: calendarId });
+      queue.enqueuePatch(selectedEventId, { calendar_id: calendarId });
     },
     [
       selectedEventId,
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      patchQueue,
       clearWriteError,
     ],
   );
@@ -605,7 +532,7 @@ export function useCalendarSession({
       id === unpersistedDraftIdRef.current ||
       id === unpersistedDraftId
     ) {
-      patchQueue.cancel(id);
+      queue.cancelPatch(id);
       queue.clear(id);
       if (unpersistedDraftIdRef.current === id || unpersistedDraftId === id) {
         setDraftId(null);
@@ -617,7 +544,7 @@ export function useCalendarSession({
 
     // Chip gone now; close inspector immediately. Cancel queued/in-flight
     // PATCHes so they neither 404 nor resurrect the row in the cache.
-    patchQueue.cancel(id);
+    queue.cancelPatch(id);
     queue.remove(id);
     setSelectedEventId(null);
     setFocusTitleOnOpen(false);
@@ -635,7 +562,6 @@ export function useCalendarSession({
     selectedEventId,
     unpersistedDraftId,
     queue,
-    patchQueue,
     deleteEvent,
     setDraftId,
     clearWriteError,
@@ -663,7 +589,7 @@ export function useCalendarSession({
       event.id === unpersistedDraftIdRef.current ||
       event.id === unpersistedDraftId
     ) {
-      patchQueue.cancel(event.id);
+      queue.cancelPatch(event.id);
       queue.clear(event.id);
       if (
         event.id === unpersistedDraftIdRef.current ||
@@ -686,7 +612,6 @@ export function useCalendarSession({
     selectedEventCalendar,
     unpersistedDraftId,
     queue,
-    patchQueue,
     setDraftId,
   ]);
 
@@ -797,7 +722,7 @@ export function useCalendarSession({
       // Same steps as the persisted branch of handleDeleteEvent — keep the
       // two in sync. Only the selection check differs: the paste already
       // moved it to the new chip, so the source is usually not selected.
-      patchQueue.cancel(cutId);
+      queue.cancelPatch(cutId);
       queue.remove(cutId);
       setSelectedEventId((prev) => {
         if (prev !== cutId) return prev;
@@ -824,7 +749,6 @@ export function useCalendarSession({
       clearWriteError,
       createEvent,
       deleteEvent,
-      patchQueue,
       queue,
       reportWriteError,
     ],
@@ -936,12 +860,12 @@ export function useCalendarSession({
       // Temp events have no server row — create onSuccess will flush times.
       if (isTempEventId(eventId)) return;
 
-      patchQueue.enqueue(eventId, {
+      queue.enqueuePatch(eventId, {
         start: next.start_time,
         end: next.end_time,
       });
     },
-    [overlaidEvents, events, queue, patchQueue, clearWriteError],
+    [overlaidEvents, events, queue, clearWriteError],
   );
 
   /** Inspector time/date edits — same overlay + PATCH path as drag/resize. */
@@ -984,7 +908,7 @@ export function useCalendarSession({
         return;
       }
 
-      patchQueue.enqueue(selectedEventId, {
+      queue.enqueuePatch(selectedEventId, {
         is_all_day: next.isAllDay,
         start: next.startIso,
         end: next.endIso,
@@ -995,7 +919,6 @@ export function useCalendarSession({
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      patchQueue,
       clearWriteError,
     ],
   );
@@ -1029,7 +952,7 @@ export function useCalendarSession({
 
       // Empty zone = Local: queue keeps '' so it supersedes an earlier pending
       // zone, and the wire request omits timeZone on Google.
-      patchQueue.enqueue(selectedEventId, {
+      queue.enqueuePatch(selectedEventId, {
         start: startIso,
         end: endIso,
         start_time_zone: zone,
@@ -1040,7 +963,6 @@ export function useCalendarSession({
       unpersistedDraftId,
       overlaidEvents,
       queue,
-      patchQueue,
       clearWriteError,
     ],
   );

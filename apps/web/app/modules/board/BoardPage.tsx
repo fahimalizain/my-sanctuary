@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -14,6 +14,7 @@ import type {
 } from '@dnd-kit/core';
 import { Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { setBoardTasksBusy } from '@/app/background-sync/board-tasks-busy';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { useCategoriesQuery } from '@/app/queries/categories';
@@ -71,11 +72,6 @@ import {
 } from './board-model';
 import type { BoardSearch } from './board-model';
 
-/** Background refetch while the board is mounted and idle. Passed to
- *  `useTasksQuery({ refetchInterval })`; set to `false` while a drag /
- *  move / focus is in flight. */
-const TASKS_REFETCH_INTERVAL_MS = 60_000;
-
 interface TaskFormState {
   mode: 'create' | 'edit';
   /** Edit target. */
@@ -126,19 +122,25 @@ export function BoardPage() {
   // A live drag or preview, an in-flight /move, an in-flight focus toggle:
   // while `busy` no tasks refetch may land — a window-focus or interval
   // refetch would overwrite the optimistic cache with the pre-move server
-  // list. Busy pauses interval and window-focus refetch on the tasks
-  // query — the tasks query pauses its interval and window-focus refetch
-  // while busy, and every task write also cancels any in-flight refetch via
-  // its mutation's `onMutate`.
+  // list. Busy is published to background sync, which pauses its always-on
+  // tasks poll; the Board observer keeps `refetchOnWindowFocus: !busy`, and
+  // every task write also cancels any in-flight refetch via its mutation's
+  // `onMutate`.
   const busy =
     activeDrag !== null ||
     dragItems !== null ||
     movingIds.size > 0 ||
     focusInFlight;
 
+  // Publish the busy flag for background sync's tasks observer. Clear it on
+  // unmount so leaving the board does not leave the poll paused.
+  useEffect(() => {
+    setBoardTasksBusy(busy);
+    return () => setBoardTasksBusy(false);
+  }, [busy]);
+
   const tasksQuery = useTasksQuery({
     enabled: listsQuery.isSuccess,
-    refetchInterval: busy ? false : TASKS_REFETCH_INTERVAL_MS,
     refetchOnWindowFocus: !busy,
   });
   const tasks = tasksQuery.data?.tasks ?? [];

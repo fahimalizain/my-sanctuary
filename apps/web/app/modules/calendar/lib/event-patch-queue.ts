@@ -81,6 +81,18 @@ export class EventPatchQueue {
     if (this.running.has(id)) this.cancelled.add(id);
   }
 
+  /**
+   * Cancel every id: drop all pending edits and ignore every in-flight
+   * result (no callbacks). Used when the account changes, so a response that
+   * resumes after logout cannot paint the previous account's event back onto
+   * the overlay. Same per-id meaning as `cancel`, so a later enqueue for any
+   * id still works normally.
+   */
+  cancelAll(): void {
+    this.pending.clear();
+    for (const id of this.running) this.cancelled.add(id);
+  }
+
   /** True while a request is in flight or edits are waiting for this id. */
   isBusy(id: string): boolean {
     return this.running.has(id) || this.pending.has(id);
