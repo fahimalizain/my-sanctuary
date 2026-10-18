@@ -56,12 +56,20 @@ export function CategoryFilter({
   selectedIds,
   onToggle,
   onClear,
+  portalContainer,
 }: {
   lists: TaskList[];
   categories: Category[];
   selectedIds: string[];
   onToggle: (id: string) => void;
   onClear: () => void;
+  /** Where the panel is portaled. Omitted = the desktop row's document.body
+   *  panel at viewport coordinates (unchanged). `null` = the caller's host
+   *  element is not mounted yet — render NOTHING rather than fall back to
+   *  the body. An element = the mobile sheet's host: portal into it, so the
+   *  panel is a descendant of the dialog content (see the note above the
+   *  portal below). */
+  portalContainer?: HTMLElement | null;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -78,6 +86,23 @@ export function CategoryFilter({
   const panelRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+
+  // Where the panel is portaled, and therefore how its coordinates are read:
+  // - `undefined` (the desktop filter row): `document.body` + `position:
+  //   fixed` at viewport coordinates — today's behavior, unchanged.
+  // - `null` (the mobile sheet): the host element has not mounted yet. Hide
+  //   the panel; NEVER fall back to document.body. Inside a Radix Dialog the
+  //   body is `pointer-events: none`, the dialog's focus scope cannot reach a
+  //   node outside its content, and a body-level panel counts as an outside
+  //   click that would dismiss the sheet.
+  // - an element (the sheet's host): portal INTO it with `position:
+  //   absolute`, measured against its border box, so the panel is a real
+  //   descendant of the dialog content.
+  const panelHost =
+    portalContainer === undefined ? document.body : portalContainer;
+  // Host-relative (and clamped) coordinates whenever a host was handed in —
+  // including the not-ready `null`, which renders nothing at all.
+  const inHost = portalContainer !== undefined;
 
   const { sections, rows } = useMemo(() => {
     const groups = buildCategoryTree(lists, categories, query);
@@ -159,26 +184,49 @@ export function CategoryFilter({
   );
 
   // Position the panel from the trigger rect. Recompute on open, scroll
-  // (capture: the board scroller scrolls too), resize, query changes (the
-  // list height changes with the results) and selection changes (toggling
-  // adds/removes the pinned "Selected" block). Flip above when there is not
-  // enough room below.
+  // (capture: the board scroller — and the sheet's body — scroll too),
+  // resize, query changes (the list height changes with the results),
+  // selection changes (toggling adds/removes the pinned "Selected" block) and
+  // a change of portal host (the sheet's host mounts after the first commit).
+  //
+  // Two coordinate systems:
+  // - desktop row (no host): viewport coordinates for a `fixed` panel,
+  //   min-width 18rem, flip above when there is not enough room below.
+  // - sheet host: the panel is `absolute` inside the host, so measure against
+  //   the host's border box and clamp to it — the 18rem min-width is capped
+  //   at the host's width (it cannot overflow a narrow sheet) and the flip is
+  //   decided by the space left INSIDE the host, not in the viewport.
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open || panelHost === null) return;
     const position = () => {
       const trigger = triggerRef.current;
       const panel = panelRef.current;
-      if (!trigger || !panel) return;
+      if (!trigger || !panel || !panelHost) return;
       const rect = trigger.getBoundingClientRect();
-      const width = Math.max(rect.width, 18 * 16); // min-width 18rem
       const gap = 8;
       const height = panel.offsetHeight;
-      const spaceBelow = window.innerHeight - rect.bottom;
+      if (!inHost) {
+        const width = Math.max(rect.width, 18 * 16); // min-width 18rem
+        const spaceBelow = window.innerHeight - rect.bottom;
+        const top =
+          spaceBelow >= height + gap
+            ? rect.bottom + gap
+            : Math.max(gap, rect.top - height - gap);
+        setPos({ top, left: rect.left, width });
+        return;
+      }
+      const box = panelHost.getBoundingClientRect();
+      const width = Math.min(Math.max(rect.width, 18 * 16), box.width);
+      const spaceBelow = box.bottom - rect.bottom;
       const top =
         spaceBelow >= height + gap
-          ? rect.bottom + gap
-          : Math.max(gap, rect.top - height - gap);
-      setPos({ top, left: rect.left, width });
+          ? rect.bottom - box.top + gap
+          : Math.max(0, rect.top - box.top - height - gap);
+      const left = Math.min(
+        Math.max(0, rect.left - box.left),
+        box.width - width,
+      );
+      setPos({ top, left, width });
     };
     position();
     window.addEventListener('scroll', position, true);
@@ -187,7 +235,7 @@ export function CategoryFilter({
       window.removeEventListener('scroll', position, true);
       window.removeEventListener('resize', position);
     };
-  }, [open, query, selectedIds]);
+  }, [open, query, selectedIds, panelHost, inHost]);
 
   // Outside click (mousedown, ignoring trigger + panel) closes without
   // stealing focus from the control the user actually clicked.
@@ -388,13 +436,24 @@ export function CategoryFilter({
         />
       </button>
 
+      {/* `panelHost === null` — the sheet's host has not mounted yet — renders
+          NOTHING (never a body-level fallback; see the note by `panelHost`). */}
       {open &&
+        panelHost !== null &&
         createPortal(
           <div
             ref={panelRef}
             role="listbox"
             aria-multiselectable="true"
-            className="fixed z-50 rounded-xl border border-border bg-card p-2 shadow-lg"
+            data-category-filter-panel
+            className={cn(
+              'rounded-xl border border-border bg-card p-2 shadow-lg',
+              // Sheet host: `absolute` inside a host that is a child of the
+              // dialog content (Radix focus and outside-click still see a
+              // descendant), plus `pointer-events-auto` because the host itself
+              // ignores pointers so taps reach the form underneath.
+              inHost ? 'absolute z-50 pointer-events-auto' : 'fixed z-50',
+            )}
             style={
               pos
                 ? { top: pos.top, left: pos.left, width: pos.width }
@@ -462,7 +521,7 @@ export function CategoryFilter({
               )}
             </div>
           </div>,
-          document.body,
+          panelHost,
         )}
     </>
   );

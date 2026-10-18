@@ -47,6 +47,11 @@ interface BoardFiltersProps {
   /** Input/label id pair. The row keeps the default; the sheet passes its
    *  own so two mounted copies can never collide on `htmlFor`. */
   searchInputId?: string;
+  /** Host element for the category panel (see CategoryFilter's
+   *  `portalContainer`) — the mobile sheet's host, which mounts after the
+   *  sheet's first commit, hence `null` is meaningful. Omitting the prop
+   *  leaves the desktop row on `document.body`. */
+  categoryPortalContainer?: HTMLElement | null;
 }
 
 export function BoardFilters({
@@ -64,6 +69,7 @@ export function BoardFilters({
   onSearch,
   onClearFilters,
   searchInputId = 'board-task-search',
+  categoryPortalContainer,
 }: BoardFiltersProps) {
   // Untracked is the system sink: never a picker row and never a filter chip.
   // A `?category=` naming it is still resolved by the page (and matches
@@ -150,6 +156,13 @@ export function BoardFilters({
             selectedIds={selectedCategoryIds}
             onToggle={onToggleCategory}
             onClear={onClearCategories}
+            // Forwarded only when the caller handed one in: an OMITTED prop
+            // (the desktop row) keeps the panel on document.body, while an
+            // explicit `null` (the sheet's host is not mounted yet) must reach
+            // CategoryFilter so it hides instead of falling back to the body.
+            {...(categoryPortalContainer === undefined
+              ? {}
+              : { portalContainer: categoryPortalContainer })}
           />
         ) : (
           <span className="text-sm text-muted-foreground italic">
