@@ -1,7 +1,5 @@
 import {
   useEffect,
-  useLayoutEffect,
-  useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react';
@@ -20,62 +18,8 @@ const PILL_CLASS = `${PILL_BASE} pointer-events-none`;
 /** Edge pill: grabbable, so the pointer-events opt-out is dropped. */
 const EDGE_PILL_CLASS = `${PILL_BASE} touch-none cursor-ns-resize select-none`;
 
-/**
- * A touch that starts on a precision handle must not pan the hours. React's
- * `onTouchMove` is passive, so `preventDefault` there does nothing — and
- * `touch-action: none` on a child of the `pan-y` scroller is not reliable on
- * its own. The listener is attached for the life of the pill, before the
- * gesture starts, which is what keeps the first move cancelable.
- */
-function blockPillTouchScroll(event: TouchEvent): void {
-  if (event.cancelable) event.preventDefault();
-}
-
 const HOUR_LABEL_CLASS =
   'absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none';
-
-function GutterEdgePill({
-  edge,
-  top,
-  text,
-  onEdgePointerDown,
-}: {
-  edge: 'start' | 'end';
-  top: number;
-  text: string;
-  onEdgePointerDown: (
-    e: ReactPointerEvent<HTMLElement>,
-    edge: 'start' | 'end',
-  ) => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.addEventListener('touchmove', blockPillTouchScroll, { passive: false });
-    return () => el.removeEventListener('touchmove', blockPillTouchScroll);
-  }, []);
-
-  return (
-    <div
-      ref={ref}
-      role="slider"
-      tabIndex={-1}
-      aria-orientation="vertical"
-      aria-label={edge === 'start' ? 'Start time' : 'End time'}
-      aria-valuetext={text}
-      className={`${EDGE_PILL_CLASS} bg-foreground text-background shadow-sm`}
-      style={{ top }}
-      onPointerDown={(e) => {
-        // A press must not start a text selection.
-        e.preventDefault();
-        onEdgePointerDown(e, edge);
-      }}
-    >
-      {text}
-    </div>
-  );
-}
 
 export interface GutterTimesProps {
   hourH: number;
@@ -204,14 +148,25 @@ export function GutterTimes({
           );
         }
 
+        const edge = pill.key;
         return (
-          <GutterEdgePill
+          <div
             key={pill.key}
-            edge={pill.key}
-            top={pill.top}
-            text={pill.text}
-            onEdgePointerDown={onEdgePointerDown}
-          />
+            role="slider"
+            tabIndex={-1}
+            aria-orientation="vertical"
+            aria-label={edge === 'start' ? 'Start time' : 'End time'}
+            aria-valuetext={pill.text}
+            className={`${EDGE_PILL_CLASS} bg-foreground text-background shadow-sm`}
+            style={{ top: pill.top }}
+            onPointerDown={(e) => {
+              // A press must not start a text selection.
+              e.preventDefault();
+              onEdgePointerDown(e, edge);
+            }}
+          >
+            {pill.text}
+          </div>
         );
       })}
     </>

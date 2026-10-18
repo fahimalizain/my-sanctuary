@@ -1,7 +1,9 @@
 // A gutter precision handle (the start/end pill) must not move the hours.
 // Autoscroll, a trackpad wheel, and a touch pan all used to: a pill stuck to
 // the viewport edge already sits inside the autoscroll zone, so grabbing it
-// flung the day while the 1:10 edge barely moved.
+// flung the day while the 1:10 edge barely moved. The freeze is scoped to the
+// hours — the sidebar and the inspector keep scrolling — and it cancels the
+// ctrl/meta zoom wheel before the scroller's own listener sees it.
 //
 // DOM must exist before the hook module is imported — installDom() then a
 // dynamic import (static ESM imports hoist and can race the DOM setup).
@@ -212,6 +214,36 @@ function wheel(deltaY: number): WheelEvent {
   });
 }
 
+/** The zoom gesture: `useCalendarZoom` acts on ctrl/meta wheel only. */
+function ctrlWheel(deltaY: number): WheelEvent {
+  return new window.WheelEvent('wheel', {
+    deltaY,
+    ctrlKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+}
+
+function touchMove(): Event {
+  return new window.Event('touchmove', { bubbles: true, cancelable: true });
+}
+
+/** jsdom's document is shared by every test in this file. */
+function stubVisibilityState(state: DocumentVisibilityState): () => void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => state,
+  });
+  return () => Reflect.deleteProperty(document, 'visibilityState');
+}
+
+/** The real pill lives in the gutter, i.e. inside the scroller's subtree. */
+function mountPill(scroller: HTMLElement): HTMLDivElement {
+  const pill = document.createElement('div');
+  scroller.append(pill);
+  return pill;
+}
+
 test('gutter scrub freezes vertical scroll and releases it on cancel', async () => {
   const frames = stubAnimationFrame();
   const grid = mountGrid(80);
@@ -276,6 +308,51 @@ test('gutter scrub freezes vertical scroll and releases it on cancel', async () 
   }
 });
 
+test('a scroll write that cannot land does not disarm the pin', async () => {
+  const frames = stubAnimationFrame();
+  const grid = mountGrid(80);
+  const pill = mountPill(grid.scroller);
+  // Take the scroll position over from `mountGrid` so a write can be made to
+  // fail, which is what a document too short to scroll that far does to the
+  // pin. A failed write is not a loop: it fires no scroll event of its own.
+  let value = 80;
+  let writable = true;
+  Object.defineProperty(grid.scroller, 'scrollTop', {
+    configurable: true,
+    get: () => value,
+    set: (next: number) => {
+      if (writable) value = next;
+    },
+  });
+  try {
+    const drag = await mountDrag();
+    await act(async () => {
+      drag.onGutterEdgePointerDown(
+        pointerDown(pill, 20, 300),
+        'end',
+        timedEvent(),
+      );
+    });
+
+    writable = false;
+    value = 170;
+    grid.scroller.dispatchEvent(new window.Event('scroll'));
+    assert.equal(value, 170, 'the write was clamped');
+
+    writable = true;
+    value = 250;
+    grid.scroller.dispatchEvent(new window.Event('scroll'));
+    assert.equal(value, 80, 'the pin survived the clamped write');
+
+    await act(async () => {
+      drag.cancel();
+    });
+  } finally {
+    grid.remove();
+    frames.restore();
+  }
+});
+
 test('a grid drag still autoscrolls and does not swallow the wheel', async () => {
   const frames = stubAnimationFrame();
   const grid = mountGrid(80);
@@ -314,6 +391,159 @@ test('a grid drag still autoscrolls and does not swallow the wheel', async () =>
       drag.cancel();
     });
   } finally {
+    grid.remove();
+    frames.restore();
+  }
+});
+
+test('a scrub cancels the ctrl/meta zoom wheel at the scroller', async () => {
+  const frames = stubAnimationFrame();
+  const grid = mountGrid(80);
+  const pill = mountPill(grid.scroller);
+  // Stands in for useCalendarZoom's wheel listener, which is bound on the
+  // scroller itself and rescales the hours.
+  const seen: WheelEvent[] = [];
+  const onScrollerWheel = (e: Event) => seen.push(e as WheelEvent);
+  grid.scroller.addEventListener('wheel', onScrollerWheel, { passive: false });
+  try {
+    const drag = await mountDrag();
+    await act(async () => {
+      drag.onGutterEdgePointerDown(
+        pointerDown(pill, 20, 300),
+        'end',
+        timedEvent(),
+      );
+    });
+
+    const zoom = ctrlWheel(-120);
+    pill.dispatchEvent(zoom);
+    assert.equal(zoom.defaultPrevented, true, 'ctrl+wheel must not rescale');
+    assert.deepEqual(seen, [], 'the zoom handler must never run');
+
+    await act(async () => {
+      drag.cancel();
+    });
+
+    const after = ctrlWheel(-120);
+    pill.dispatchEvent(after);
+    assert.deepEqual(seen, [after], 'zoom works again after release');
+  } finally {
+    grid.scroller.removeEventListener('wheel', onScrollerWheel);
+    grid.remove();
+    frames.restore();
+  }
+});
+
+test('a scrub leaves scrolling outside the hours alone', async () => {
+  const frames = stubAnimationFrame();
+  const grid = mountGrid(80);
+  const inspector = document.createElement('aside');
+  document.body.append(inspector);
+  try {
+    const drag = await mountDrag();
+    await act(async () => {
+      drag.onGutterEdgePointerDown(
+        pointerDown(inspector, 700, 300),
+        'end',
+        timedEvent(),
+      );
+    });
+
+    const outsideWheel = wheel(120);
+    inspector.dispatchEvent(outsideWheel);
+    assert.equal(
+      outsideWheel.defaultPrevented,
+      false,
+      'the inspector keeps its own scroll',
+    );
+    const outsideTouch = touchMove();
+    inspector.dispatchEvent(outsideTouch);
+    assert.equal(outsideTouch.defaultPrevented, false);
+
+    // The hold is still a hold: the hours themselves stay frozen.
+    const insideWheel = wheel(120);
+    grid.scroller.dispatchEvent(insideWheel);
+    assert.equal(insideWheel.defaultPrevented, true);
+
+    await act(async () => {
+      drag.cancel();
+    });
+  } finally {
+    inspector.remove();
+    grid.remove();
+    frames.restore();
+  }
+});
+
+test('losing focus mid-scrub releases the freeze', async () => {
+  const frames = stubAnimationFrame();
+  const grid = mountGrid(80);
+  const pill = mountPill(grid.scroller);
+  try {
+    const drag = await mountDrag();
+    const top = grid.readTop();
+    await act(async () => {
+      drag.onGutterEdgePointerDown(
+        pointerDown(pill, 20, 300),
+        'end',
+        timedEvent(),
+      );
+    });
+    const during = wheel(120);
+    grid.scroller.dispatchEvent(during);
+    assert.equal(during.defaultPrevented, true);
+
+    await act(async () => {
+      window.dispatchEvent(new window.Event('blur'));
+    });
+
+    const afterBlur = wheel(120);
+    grid.scroller.dispatchEvent(afterBlur);
+    assert.equal(afterBlur.defaultPrevented, false, 'the hours scroll again');
+    grid.scroller.scrollTop = top + 60;
+    grid.scroller.dispatchEvent(new window.Event('scroll'));
+    assert.equal(grid.readTop(), top + 60, 'a late scroll is not pinned back');
+
+    await act(async () => {
+      drag.cancel();
+    });
+  } finally {
+    grid.remove();
+    frames.restore();
+  }
+});
+
+test('a hidden document releases the freeze', async () => {
+  const frames = stubAnimationFrame();
+  const grid = mountGrid(80);
+  const pill = mountPill(grid.scroller);
+  const restoreVisibility = stubVisibilityState('hidden');
+  try {
+    const drag = await mountDrag();
+    await act(async () => {
+      drag.onGutterEdgePointerDown(
+        pointerDown(pill, 20, 300),
+        'end',
+        timedEvent(),
+      );
+    });
+    const during = wheel(120);
+    grid.scroller.dispatchEvent(during);
+    assert.equal(during.defaultPrevented, true);
+
+    await act(async () => {
+      document.dispatchEvent(new window.Event('visibilitychange'));
+    });
+
+    const after = wheel(120);
+    grid.scroller.dispatchEvent(after);
+    assert.equal(after.defaultPrevented, false, 'the hours scroll again');
+
+    await act(async () => {
+      drag.cancel();
+    });
+  } finally {
+    restoreVisibility();
     grid.remove();
     frames.restore();
   }
