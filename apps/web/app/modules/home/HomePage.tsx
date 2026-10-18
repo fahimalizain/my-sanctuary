@@ -18,11 +18,14 @@
 // `/move` reorder; dragging a row into the Backlog drops it (`{ backlog: true
 // }` → `OPEN` on today+50y), and dragging one OPEN row onto another is the
 // Board's task `/move` so Home and Board share one order. Occurrences and
-// running tasks are never dropped there. The date picker, the add-task picker
-// and remove-from-day are gone — tasks are born on the Board, and a task's row
-// follows the task's own lifecycle. Built on the existing task/occurrence
+// running tasks are never dropped there. The old header date picker, the
+// add-task picker and remove-from-day are gone — tasks are born on the Board,
+// and a task's row follows the task's own lifecycle. A row's calendar menu
+// offers today-relative presets, a month picker and (for tasks) Backlog.
+// Built on the existing task/occurrence
 // actions (complete, skip, reopen, start, pause, rename, TaskModal, error
-// banner, optimistic `['tasks']` patches) and reschedule/complete art.
+// banner, move notice, optimistic `['tasks']` patches) and reschedule/complete
+// art.
 
 import {
   useCallback,
@@ -49,7 +52,7 @@ import {
   arrayMove,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
-import { Loader2, Repeat } from 'lucide-react';
+import { Check, Loader2, Repeat, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -90,9 +93,11 @@ import {
 } from '@/app/queries/tasks';
 import { queryClient } from '@/lib/queryClient';
 import { AgendaItemRow, SortableAgendaItemRow } from './AgendaItemRow';
+import { addCivilDays } from '../routines/rrule-preview';
 import {
   addMonthsClamp,
   agendaDateLabel,
+  agendaShortDateLabel,
   agendaMoveTargetAt,
   appendRankOnStream,
   applyAgendaMove,
@@ -131,9 +136,15 @@ import type {
 const DAY_ID_PREFIX = 'day-';
 /** The Backlog section's droppable id — a constant, never a `day-` id. */
 const BACKLOG_DROPPABLE_ID = 'backlog';
+/** A dated stretch group inside the Backlog (past today+6 … today+10y−1). */
+const BACKLOG_DAY_ID_PREFIX = 'backlog-day-';
 
 function dayElementId(date: string): string {
   return `${DAY_ID_PREFIX}${date}`;
+}
+
+function backlogDayElementId(date: string): string {
+  return `${BACKLOG_DAY_ID_PREFIX}${date}`;
 }
 
 /** The default read's own `anchor_date` as the cache holds it right now — the
@@ -148,6 +159,7 @@ function currentAnchor(): string {
 
 interface AgendaRowHandlers {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
+  onMoveToBacklog: (item: AgendaItemRecord) => void;
   onCompleteTask: (item: AgendaItemRecord) => void;
   onStartTask: (item: AgendaItemRecord) => void;
   onPauseTask: (item: AgendaItemRecord) => void;
@@ -157,6 +169,15 @@ interface AgendaRowHandlers {
   onStartOccurrence: (item: AgendaItemRecord) => void;
   onPauseOccurrence: (item: AgendaItemRecord) => void;
   onRenameOccurrence: (item: AgendaItemRecord) => void;
+}
+
+/** A successful move's transient confirmation. `itemId` lets Show scroll
+ *  straight to the exact row (the day header is only a fallback). */
+interface ActionNotice {
+  message: string;
+  itemId: string;
+  /** Set for a date move; omitted for a backlog drop. */
+  date?: string;
 }
 
 /** Can a drag grab this row? Living work only: open tasks (OPEN | PLANNED |
@@ -194,6 +215,7 @@ function AgendaDay({
   handlers,
   onMoveDayToToday,
   loadingHistory,
+  highlightedItemId,
 }: {
   day: string;
   serverToday: string;
@@ -201,6 +223,7 @@ function AgendaDay({
   handlers: AgendaRowHandlers;
   onMoveDayToToday: (day: string) => void;
   loadingHistory: boolean;
+  highlightedItemId: string | null;
 }) {
   const { living, completed } = partitionAgendaItems(items);
   const pendingCount = items.filter(isAgendaItemPending).length;
@@ -282,6 +305,7 @@ function AgendaDay({
                     key={entry.id}
                     item={entry}
                     serverToday={serverToday}
+                    highlighted={highlightedItemId === entry.id}
                     {...handlers}
                   />
                 ) : (
@@ -291,6 +315,7 @@ function AgendaDay({
                     isDragging={false}
                     showHandle={false}
                     serverToday={serverToday}
+                    highlighted={highlightedItemId === entry.id}
                     {...handlers}
                   />
                 ),
@@ -313,6 +338,7 @@ function AgendaDay({
                 isDragging={false}
                 showHandle={false}
                 serverToday={serverToday}
+                highlighted={highlightedItemId === entry.id}
                 {...handlers}
               />
             ))}
@@ -336,11 +362,13 @@ function BacklogSection({
   dated,
   open,
   handlers,
+  highlightedItemId,
 }: {
   serverToday: string;
   dated: AgendaItemRecord[];
   open: AgendaItemRecord[];
   handlers: AgendaRowHandlers;
+  highlightedItemId: string | null;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: BACKLOG_DROPPABLE_ID });
   // Server order already puts the dated stretch first; grouping in encounter
@@ -354,6 +382,7 @@ function BacklogSection({
         key={entry.id}
         item={entry}
         serverToday={serverToday}
+        highlighted={highlightedItemId === entry.id}
         {...handlers}
       />
     ) : (
@@ -363,12 +392,13 @@ function BacklogSection({
         isDragging={false}
         showHandle={false}
         serverToday={serverToday}
+        highlighted={highlightedItemId === entry.id}
         {...handlers}
       />
     );
 
   return (
-    <section ref={setNodeRef} aria-label="Backlog">
+    <section ref={setNodeRef} id={BACKLOG_DROPPABLE_ID} aria-label="Backlog">
       <header className="sticky top-0 z-10 flex items-center gap-2 border-b border-border/60 bg-cream/95 px-1 py-2 backdrop-blur">
         <h2 className="font-heading text-sm font-semibold text-foreground">
           Backlog
@@ -388,7 +418,11 @@ function BacklogSection({
           </p>
         )}
         {[...datedGroups.entries()].map(([date, rows]) => (
-          <div key={date} className="space-y-2 pb-2">
+          <div
+            key={date}
+            id={backlogDayElementId(date)}
+            className="space-y-2 pb-2"
+          >
             <h3 className="px-1 text-xs font-medium tracking-wide text-muted-foreground">
               {agendaDateLabel(date, serverToday)}
             </h3>
@@ -493,8 +527,25 @@ export function HomePage() {
   // Action failures (move/complete/skip/etc.): a banner above the still-
   // visible stream — rows are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
+  // A successful move's transient confirmation (with Show); replaces any
+  // previous notice, auto-dismisses, and never survives a failure.
+  const [actionNotice, setActionNotice] = useState<ActionNotice | null>(null);
+  // The row to ring briefly after Show has scrolled to it.
+  const [flashItemId, setFlashItemId] = useState<string | null>(null);
   // The row currently dragged — feeds the DragOverlay title chip.
   const [activeDrag, setActiveDrag] = useState<AgendaItemRecord | null>(null);
+
+  useEffect(() => {
+    if (!actionNotice) return;
+    const timer = window.setTimeout(() => setActionNotice(null), 6000);
+    return () => window.clearTimeout(timer);
+  }, [actionNotice]);
+
+  useEffect(() => {
+    if (!flashItemId) return;
+    const timer = window.setTimeout(() => setFlashItemId(null), 1800);
+    return () => window.clearTimeout(timer);
+  }, [flashItemId]);
 
   const [taskModal, setTaskModal] = useState<TaskRecord | null>(null);
   // The renamed occurrence's whole agenda row: the item id is what the
@@ -721,11 +772,28 @@ export function HomePage() {
     }
   };
 
+  /** Confirmation for a successful move. A target past the default window's
+   *  last day (today+6) lives in the Backlog's dated stretch; saying so
+   *  prevents "it disappeared" when the row leaves the main stream. */
+  const showMoveNotice = (moved: AgendaItemRecord) => {
+    const date = moved.local_date;
+    const inDatedBacklog = !!serverToday && date > addCivilDays(serverToday, 6);
+    const relative = agendaDateLabel(date, serverToday);
+    const absolute = agendaShortDateLabel(date, serverToday);
+    const dateLabel =
+      relative === absolute ? absolute : `${relative} · ${absolute}`;
+    setActionNotice({
+      message: `Moved to ${dateLabel}${inDatedBacklog ? ' · Backlog' : ''}`,
+      itemId: moved.id,
+      date,
+    });
+  };
+
   /** Move a row onto another day (drag across days, or the row's own
    *  reschedule popover). `sortOrder` is the absolute rank the drop wants —
    *  the target row's own `sort_order` (`crossDaySortOrder`); omitted — the
    *  popover path, or a drop on the day container — appends at the pile's
-   *  end server-side (`max + 1`), exactly like the old "Tomorrow". A failure
+   *  end server-side (`max + 1`), exactly like a popover pick. A failure
    *  restores the snapshot and banners. Landing a task that was still `OPEN`
    *  plans it server-side — this is the ONLY move that does, so it is the one
    *  caller that asks `moveStreamItem` to paint `PLANNED`. The server also
@@ -768,8 +836,10 @@ export function HomePage() {
       // Patch the shared tasks cache so Board/Lists see the flipped status
       // and the new Planned rank.
       setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+      showMoveNotice(data.item);
     } catch (err) {
       patchStream(() => snapshot);
+      setActionNotice(null);
       setActionError(err instanceof Error ? err.message : 'Move failed');
     }
   };
@@ -798,8 +868,13 @@ export function HomePage() {
       // Patch the shared tasks cache so Board/Lists see the flipped status
       // and the appended Open rank.
       setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+      setActionNotice({
+        message: 'Moved to Backlog',
+        itemId: data.item.id,
+      });
     } catch (err) {
       patchStream(() => snapshot);
+      setActionNotice(null);
       setActionError(err instanceof Error ? err.message : 'Move failed');
     }
   };
@@ -1408,6 +1483,25 @@ export function HomePage() {
   // scrolls.
   const [scrollTodayPending, setScrollTodayPending] = useState(false);
 
+  /** Success notice's Show: find the moved row (it has a stable DOM id) and
+   *  scroll it into view inside the stream, then ring it briefly. The day
+   *  header / dated Backlog group / Backlog are fallbacks only. */
+  const showDestination = (notice: ActionNotice) => {
+    let target = document.getElementById(`agenda-item-${notice.itemId}`);
+    if (!target && notice.date) {
+      target = document.getElementById(dayElementId(notice.date));
+    }
+    if (!target && notice.date) {
+      target = document.getElementById(backlogDayElementId(notice.date));
+    }
+    if (!target) target = document.getElementById(BACKLOG_DROPPABLE_ID);
+    if (!target) return;
+    const isRow = target.id.startsWith('agenda-item-');
+    target.scrollIntoView({ block: isRow ? 'center' : 'start' });
+    setFlashItemId(notice.itemId);
+    setActionNotice(null);
+  };
+
   // The history walk's own flags: older weeks APPEND to the history query, so
   // the top-edge gesture is a `fetchNextPage` while `hasNextPage`.
   const hasOlderHistory = history.hasNextPage;
@@ -1684,6 +1778,7 @@ export function HomePage() {
 
   const handlers: AgendaRowHandlers = {
     onReschedule: (entry, date) => void handleCrossDayMove(entry, date),
+    onMoveToBacklog: (entry) => void handleBacklogDrop(entry),
     onCompleteTask: (entry) => void handleCompleteTask(entry),
     onStartTask: (entry) => void handleStartTask(entry),
     onPauseTask: (entry) => void handlePauseTask(entry),
@@ -1732,6 +1827,39 @@ export function HomePage() {
                 >
                   Dismiss
                 </Button>
+              </div>
+            )}
+
+            {/* A successful move's confirmation: the row may have left the
+                visible day, so Show scrolls the stream to it. */}
+            {actionNotice && !actionError && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="mb-3 flex items-center gap-2 rounded-xl bg-primary/10 px-3 py-2 text-foreground"
+              >
+                <Check className="h-4 w-4 shrink-0 text-primary" />
+                <p
+                  className="min-w-0 flex-1 truncate text-sm"
+                  title={actionNotice.message}
+                >
+                  {actionNotice.message}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => showDestination(actionNotice)}
+                  className="shrink-0 rounded-md px-2 py-1 text-xs font-semibold text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                >
+                  Show
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActionNotice(null)}
+                  aria-label="Dismiss move confirmation"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-primary/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
               </div>
             )}
 
@@ -1836,6 +1964,7 @@ export function HomePage() {
                         items={byDate.get(day) ?? []}
                         handlers={handlers}
                         loadingHistory={isLoadingOlderHistory}
+                        highlightedItemId={flashItemId}
                         onMoveDayToToday={(target) =>
                           void handleMoveDayToToday(target)
                         }
@@ -1851,6 +1980,7 @@ export function HomePage() {
                       dated={backlogSplit.dated}
                       open={backlogSplit.open}
                       handlers={handlers}
+                      highlightedItemId={flashItemId}
                     />
 
                     {/* Floating title chip while dragging — the source row

@@ -1,9 +1,9 @@
 // Pure helpers for Home's agenda stream (ADR 0004 amendment — slice 5, ADR
-// 0007 — slice 6): the day label, the reorder rank math, the living /
-// Completed dump split, the backlog split, the date-window walk, and the
-// optimistic edits over React Query's infinite `{ pages }` cache. Kept
-// React-free so `node:test` can cover them (HomePage.tsx is presentational
-// glue on top).
+// 0007 — slice 6): the day label, the move presets / picker bounds, the
+// reorder rank math, the living / Completed dump split, the backlog split, the
+// date-window walk, and the optimistic edits over React Query's infinite
+// `{ pages }` cache. Kept React-free so `node:test` can cover them
+// (HomePage.tsx is presentational glue on top).
 
 import type { InfiniteData } from '@tanstack/react-query';
 import type {
@@ -34,16 +34,10 @@ function pad(n: number): string {
   return String(n).padStart(2, '0');
 }
 
-/** Day-header title for one civil date: "Today" / "Tomorrow" / "Yesterday"
- *  relative to `today`, otherwise "Tue 25 Aug" (weekday, day, month — parsed
- *  with the same UTC-carrier trick as `rrule-preview`). A date in ANOTHER year
- *  also carries its year ("Fri 1 Jan 2027") so a long stream's history is
- *  never ambiguous — relative labels never do. Malformed input returns the
- *  input unchanged. */
-export function agendaDateLabel(date: string, today: string): string {
-  if (date === today) return 'Today';
-  if (date === addCivilDays(today, 1)) return 'Tomorrow';
-  if (date === addCivilDays(today, -1)) return 'Yesterday';
+/** The absolute day label: "Tue 25 Aug", plus the year ("Fri 1 Jan 2027")
+ *  when it differs from `today`'s year. Parsed with the same UTC-carrier trick
+ *  as `rrule-preview`. Malformed input returns the input unchanged. */
+function absoluteDateLabel(date: string, today: string): string {
   const m = date.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return date;
   // Component round-trip rejects rollovers (month 13, day 40) — same strict
@@ -63,6 +57,23 @@ export function agendaDateLabel(date: string, today: string): string {
   }
   const label = `${WEEKDAY_SHORT[carrier.getUTCDay()]} ${Number(d)} ${MONTH_SHORT[Number(mo) - 1]}`;
   return y === today.trim().slice(0, 4) ? label : `${label} ${y}`;
+}
+
+/** Day-header title for one civil date: "Today" / "Tomorrow" / "Yesterday"
+ *  relative to `today`, otherwise the absolute "Tue 25 Aug" (with a year when
+ *  it differs). Malformed input returns the input unchanged. */
+export function agendaDateLabel(date: string, today: string): string {
+  if (date === today) return 'Today';
+  if (date === addCivilDays(today, 1)) return 'Tomorrow';
+  if (date === addCivilDays(today, -1)) return 'Yesterday';
+  return absoluteDateLabel(date, today);
+}
+
+/** The absolute day label ("Sun 23 Aug", or "Fri 1 Jan 2027" across years) for
+ *  a move preset's subtitle. Relative labels stay in `agendaDateLabel`; this
+ *  one never says Today/Tomorrow, so a preset's target is never ambiguous. */
+export function agendaShortDateLabel(date: string, today: string): string {
+  return absoluteDateLabel(date, today);
 }
 
 /** Every civil date from `from` through `to`, inclusive and ascending — the
@@ -105,6 +116,80 @@ export function addMonthsClamp(date: string, months: number): string {
  *  from the SERVER's civil today with the same month clamp as the API. */
 export function rescheduleMaxDate(today: string): string {
   return addCivilDays(addMonthsClamp(today, 120), -1);
+}
+
+/** Sunday = 0 … Saturday = 6 for a civil date, or null when malformed. The
+ *  UTC carrier keeps the weekday independent of the browser's timezone. */
+function civilDayOfWeek(date: string): number | null {
+  const trimmed = date.trim();
+  if (!isCivilDateValid(trimmed)) return null;
+  const [y, m, d] = trimmed.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+/** The coming Monday, STRICTLY after `date` (a Monday maps to +7 days; a
+ *  Sunday maps to +1). Malformed input returns the input unchanged. */
+function nextMondayAfter(date: string): string {
+  const day = civilDayOfWeek(date);
+  if (day === null) return date;
+  const delta = (1 - day + 7) % 7 || 7;
+  return addCivilDays(date, delta);
+}
+
+/** The `YYYY-MM` month the move picker opens on: the row's month when its
+ *  date is inside the API's `[today, today+10y)` range, otherwise today's
+ *  month. A backlog row sits at today+50y and a history row is in the past;
+ *  opening either on the row's own month would strand the user far from a
+ *  selectable day. Invalid today yields an empty month. */
+export function reschedulePickerMonth(itemDate: string, today: string): string {
+  if (!isCivilDateValid(today)) return '';
+  const max = rescheduleMaxDate(today);
+  const seed = itemDate >= today && itemDate <= max ? itemDate : today;
+  return seed.slice(0, 7);
+}
+
+export interface ReschedulePreset {
+  id: 'today' | 'tomorrow' | 'in-a-week' | 'next-monday';
+  label: string;
+  /** Target civil date, already shifted from the SERVER's today. */
+  date: string;
+}
+
+/** Quick-move destinations for the agenda row menu, anchored to the SERVER's
+ *  civil today — never the row's own date. In particular "Tomorrow" is
+ *  today + 1; a row dated three days out must not move one day later when the
+ *  user picks it. Options that would be a no-op (the row's current date) or
+ *  duplicate a previous option (Next Monday can equal Tomorrow or In a week)
+ *  are omitted. Invalid/missing today yields no presets. */
+export function reschedulePresets(
+  item: AgendaItemRecord,
+  today: string,
+): ReschedulePreset[] {
+  if (!isCivilDateValid(today)) return [];
+  const candidates: ReschedulePreset[] = [
+    { id: 'today', label: 'Today', date: today },
+    {
+      id: 'tomorrow',
+      label: 'Tomorrow',
+      date: addCivilDays(today, 1),
+    },
+    {
+      id: 'next-monday',
+      label: 'Next Monday',
+      date: nextMondayAfter(today),
+    },
+    {
+      id: 'in-a-week',
+      label: 'In a week',
+      date: addCivilDays(today, 7),
+    },
+  ];
+  const seen = new Set<string>([item.local_date]);
+  return candidates.filter((candidate) => {
+    if (candidate.date < today || seen.has(candidate.date)) return false;
+    seen.add(candidate.date);
+    return true;
+  });
 }
 
 /** The loaded span of the stream: the FIRST page's `from` through the LAST
@@ -619,6 +704,27 @@ export function canReschedule(item: AgendaItemRecord): boolean {
     );
   }
   return false;
+}
+
+/** Backlog as a destination (ADR 0007): tasks only, living work only, and
+ *  never the row that already sits on the backlog date. An `OPEN` task on a
+ *  near date can still be dropped (the row moves; no status change), while a
+ *  `PLANNED` / `IN_PROGRESS` row is the real transition. Occurrences have no
+ *  backlog, and terminal cards are never invited back into it. */
+export function canMoveToBacklog(
+  item: AgendaItemRecord,
+  today: string,
+): boolean {
+  if (!isCivilDateValid(today)) return false;
+  if (item.kind !== 'task' || !item.task) return false;
+  if (
+    item.task.status === 'IN_PROGRESS' ||
+    item.task.status === 'COMPLETED' ||
+    item.task.status === 'DISCARDED'
+  ) {
+    return false;
+  }
+  return !isOpenBacklogTask(item, today);
 }
 
 /** True when the row belongs under the Completed dump: a task embed in a
