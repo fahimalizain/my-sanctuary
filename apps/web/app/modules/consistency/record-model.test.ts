@@ -10,10 +10,12 @@ import {
   hoursLabel,
   hoursText,
   legendEntries,
+  meanUntrackedHours,
   medianHoursLabel,
   RECORD_RANGES,
   shareLabel,
   shortDate,
+  sleepSourceLabel,
   stackDay,
 } from './record-model';
 
@@ -34,6 +36,14 @@ test('hoursText: an hours figure stays one decimal', () => {
 test('medianHoursLabel: two decimals, em dash when there is no median', () => {
   assert.equal(medianHoursLabel(6.5), '6.50h');
   assert.equal(medianHoursLabel(null), '—');
+});
+
+test('sleepSourceLabel: the sources in words, an unknown one as itself', () => {
+  assert.equal(sleepSourceLabel('paired'), 'Paired');
+  assert.equal(sleepSourceLabel('est_no_wake'), 'No wake marker');
+  assert.equal(sleepSourceLabel('est_no_asleep'), 'No asleep marker');
+  assert.equal(sleepSourceLabel('est_none'), 'No markers');
+  assert.equal(sleepSourceLabel('est_from_mars'), 'est_from_mars');
 });
 
 test('shareLabel: a whole percent', () => {
@@ -119,6 +129,30 @@ test('stackDay: a zero day is an empty slot and never overflows the plot', () =>
   );
   assert.equal(stacked[0].height, 100);
   assert.equal(stacked[0].y, 0);
+});
+
+// ── data quality ─────────────────────────────────────────────────────────
+
+test('meanUntrackedHours: skips nulls and has no answer without a figure', () => {
+  const days = [
+    // A tracked day, an unbuilt day, and today: only the first has a figure.
+    { ...day('2026-10-16', []), untracked_seconds: 3_600 },
+    { ...day('2026-10-17', []), aggregated: false },
+    day('2026-10-18', []),
+  ];
+  assert.equal(meanUntrackedHours(days), 1);
+  // Every value null (today, unbuilt days) → the line is omitted.
+  assert.equal(meanUntrackedHours([day('2026-10-18', [])]), null);
+  assert.equal(meanUntrackedHours([]), null);
+});
+
+test('meanUntrackedHours: the mean of the days that do carry a figure', () => {
+  const days = [
+    { ...day('2026-10-16', []), untracked_seconds: 0 },
+    { ...day('2026-10-17', []), untracked_seconds: 7_200 },
+    day('2026-10-18', []),
+  ];
+  assert.equal(meanUntrackedHours(days), 1, '0h and 2h average to 1h');
 });
 
 test('legendEntries: biggest total first, capped', () => {

@@ -66,6 +66,15 @@ export function ConsistencyPage() {
       : boardQuery.error
         ? 'Failed to load the scoreboard'
         : null;
+  // The archive list is not decoration: reorder sends every living rule id, so
+  // a failed read is surfaced on both views instead of silently disabling the
+  // arrows.
+  const archiveError =
+    archiveQuery.error instanceof Error
+      ? archiveQuery.error.message
+      : archiveQuery.error
+        ? 'Failed to load the archive'
+        : null;
   const isLoading = boardQuery.isLoading;
   const busy =
     createRule.isPending ||
@@ -79,7 +88,6 @@ export function ConsistencyPage() {
   // archive list is actually loaded — a partial list is a 400.
   const canReorder = archiveQuery.isSuccess && !reorderRules.isPending;
 
-  const pausedCount = rules.filter((rule) => rule.phase === 'paused').length;
   const ruleNames = useMemo(() => {
     const names = new Map<string, string>();
     for (const rule of board?.rules ?? []) names.set(rule.id, rule.name);
@@ -231,6 +239,24 @@ export function ConsistencyPage() {
           </div>
         )}
 
+        {/* Archive read failure — reorder stays disabled while it is down */}
+        {archiveError && (
+          <div className="mb-6 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
+            <p className="selectable text-sm">
+              {archiveError} — reorder is disabled until the archive loads.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                void archiveQuery.refetch();
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
+
         {/* Action failure */}
         {actionError && (
           <div className="mb-6 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
@@ -254,18 +280,36 @@ export function ConsistencyPage() {
           </div>
         )}
 
-        {/* Headline */}
+        {/* Headline — active rules only; paused rules are counted beside them
+            rather than scored as failures */}
         {board && (
           <section className="mb-6">
-            {board.active_rules === 0 && pausedCount === 0 ? (
+            {board.active_rules === 0 && board.paused_rules === 0 ? (
               <p className="font-heading text-3xl font-bold text-foreground">
                 No rules yet
               </p>
             ) : (
               <>
                 <p className="font-heading text-4xl font-bold text-foreground">
-                  <span className="text-primary">{board.on_track}</span> /{' '}
-                  {board.active_rules} on track
+                  {board.active_rules === 0 ? (
+                    'All paused'
+                  ) : (
+                    <>
+                      <span className="text-primary">{board.on_track}</span> /{' '}
+                      {board.active_rules} on track
+                    </>
+                  )}
+                  {board.paused_rules > 0 && (
+                    // `whitespace-nowrap` keeps the suffix together: on a
+                    // phone it drops to its own line instead of orphaning a
+                    // word.
+                    <>
+                      {' '}
+                      <span className="whitespace-nowrap text-2xl text-muted-foreground">
+                        · {board.paused_rules} paused
+                      </span>
+                    </>
+                  )}
                 </p>
                 <p className="mt-1 text-sm text-muted-foreground">
                   all-pass streak {board.all_pass_streak} · best{' '}
@@ -336,24 +380,6 @@ export function ConsistencyPage() {
               </div>
             )}
 
-            {archiveQuery.error instanceof Error &&
-              archiveRules.length === 0 && (
-                <div className="mb-6 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
-                  <p className="selectable text-sm">
-                    {archiveQuery.error.message}
-                  </p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      void archiveQuery.refetch();
-                    }}
-                  >
-                    Retry
-                  </Button>
-                </div>
-              )}
-
             {!archiveQuery.isLoading &&
               !archiveQuery.error &&
               archiveRules.length === 0 && (
@@ -388,7 +414,9 @@ export function ConsistencyPage() {
         {/* "The Record" — the descriptive report, collapsed and below the
             board. It fetches only once opened and never blocks the cards
             above it. */}
-        <TheRecord />
+        <TheRecord
+          building={Boolean(board?.reclassifying || board?.backfilling)}
+        />
       </div>
 
       <RuleDialog

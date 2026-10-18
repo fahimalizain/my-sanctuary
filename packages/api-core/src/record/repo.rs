@@ -95,14 +95,17 @@ pub const RECORD_EARLIEST_META_DATE_SQL: &str =
 pub const RECORD_EARLIEST_NIGHT_DATE_SQL: &str =
     "SELECT MIN(wake_date) AS earliest_date FROM sleep_nights WHERE user_id = ?";
 
-/// The titles `quality` flags: living, self-organized, non-recurring,
-/// non-all-day events the classifier never stamped.
+/// The candidate events `quality` flags: living, self-organized, non-recurring,
+/// non-all-day events the classifier never stamped, with the instant and zone
+/// the assembler needs to place each one on the user's own civil calendar.
 ///
 /// `substr(start_time, 1, 10)` is the **UTC** date prefix of the RFC 3339
-/// stamp, not the event's local civil date — the same compromise the digest's
-/// own window compare makes.
+/// stamp, not the event's local civil date, so the caller pads the bounds by a
+/// day on each side and the assembler keeps only the rows whose local date
+/// falls inside the report's window. Grouping, ranking, and the cap all happen
+/// there too.
 pub const RECORD_UNCLASSIFIED_TITLES_SQL: &str = "
-    SELECT e.title AS title, COUNT(*) AS event_count
+    SELECT e.title AS title, e.start_time AS start_time, e.start_time_zone AS start_time_zone
     FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
@@ -116,9 +119,7 @@ pub const RECORD_UNCLASSIFIED_TITLES_SQL: &str = "
       AND (e.category_id IS NULL OR e.category_id = '')
       AND substr(e.start_time, 1, 10) >= ?
       AND substr(e.start_time, 1, 10) <= ?
-    GROUP BY e.title
-    ORDER BY COUNT(*) DESC, e.title
-    LIMIT ?
+    ORDER BY e.title, e.start_time
 ";
 
 // ──────────────────────────────────────────
@@ -185,13 +186,16 @@ pub struct RecordNightRow {
     pub seconds: i64,
 }
 
-/// One unclassified title and how often it occurred.
+/// One candidate event for the `quality` title list: the title plus the start
+/// instant and zone the assembler resolves to a local civil date.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordTitleRow {
+pub struct RecordTitleCandidateRow {
     #[serde(default, deserialize_with = "de_empty_string")]
     pub title: String,
-    #[serde(rename = "event_count")]
-    pub count: i64,
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub start_time: String,
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub start_time_zone: String,
 }
 
 // ──────────────────────────────────────────
@@ -253,15 +257,17 @@ pub trait RecordRepo: Send + Sync {
     async fn earliest_meta_date(&self, user_id: &str) -> Result<Option<String>, RepoError>;
     /// The earliest `sleep_nights.wake_date`.
     async fn earliest_night_date(&self, user_id: &str) -> Result<Option<String>, RepoError>;
-    /// The top `limit` unclassified titles in the inclusive UTC-date-prefix
-    /// range, most frequent first.
+    /// The candidate events for the `quality` title list: every living
+    /// unclassified event whose **UTC date prefix** falls in the inclusive
+    /// range. Callers pass a range padded by a day on each side; the assembler
+    /// keeps only the rows whose local civil date is inside the report's own
+    /// window, then groups and caps them.
     async fn unclassified_titles(
         &self,
         user_id: &str,
         from_date: &str,
         to_date: &str,
-        limit: usize,
-    ) -> Result<Vec<RecordTitleRow>, RepoError>;
+    ) -> Result<Vec<RecordTitleCandidateRow>, RepoError>;
 }
 
 // ──────────────────────────────────────────

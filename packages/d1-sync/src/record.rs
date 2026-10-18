@@ -8,7 +8,7 @@
 
 use api_core::record::{
     RecordCategoryRow, RecordCategorySecondsRow, RecordDaySecondsRow, RecordHourSecondsRow,
-    RecordMetaRow, RecordNightRow, RecordRepo, RecordTitleRow, RECORD_CATEGORIES_SQL,
+    RecordMetaRow, RecordNightRow, RecordRepo, RecordTitleCandidateRow, RECORD_CATEGORIES_SQL,
     RECORD_CATEGORY_SECONDS_SQL, RECORD_EARLIEST_META_DATE_SQL, RECORD_EARLIEST_NIGHT_DATE_SQL,
     RECORD_HOUR_SECONDS_SQL, RECORD_META_SQL, RECORD_NIGHTS_SQL, RECORD_PRIMARY_TIME_ZONE_SQL,
     RECORD_PRODUCTIVE_SECONDS_SQL, RECORD_UNCLASSIFIED_TITLES_SQL,
@@ -136,14 +136,12 @@ impl RecordRepo for SqliteRecordRepo {
         user_id: &str,
         from_date: &str,
         to_date: &str,
-        limit: usize,
-    ) -> Result<Vec<RecordTitleRow>, RepoError> {
+    ) -> Result<Vec<RecordTitleCandidateRow>, RepoError> {
         let conn = lock(&self.db)?;
-        let limit = limit.min(i32::MAX as usize) as i64;
         query_vec(
             &conn,
             RECORD_UNCLASSIFIED_TITLES_SQL,
-            &[&user_id, &from_date, &to_date, &limit],
+            &[&user_id, &from_date, &to_date],
         )
     }
 }
@@ -257,7 +255,8 @@ pub fn seed_night(
 }
 
 /// Seeds one calendar event (test helper) — enough columns for the
-/// unclassified-title query.
+/// unclassified-title query. `start_time_zone` is the event's own IANA zone
+/// (`''` = none), which is what the record's title filter reads.
 #[allow(clippy::too_many_arguments)]
 pub fn seed_event(
     conn: &Connection,
@@ -265,6 +264,7 @@ pub fn seed_event(
     calendar_id: &str,
     title: &str,
     start_time: &str,
+    start_time_zone: &str,
     status: &str,
     is_all_day: bool,
     is_self_organized: bool,
@@ -276,9 +276,9 @@ pub fn seed_event(
         conn,
         "INSERT INTO calendar_events (
            id, calendar_id, google_event_id, last_synced_at, title, start_time,
-           end_time, status, is_all_day, is_self_organized, event_type,
-           recurrence, category_id, deleted_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+           start_time_zone, end_time, status, is_all_day, is_self_organized,
+           event_type, recurrence, category_id, deleted_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
         &[
             &id,
             &calendar_id,
@@ -286,6 +286,7 @@ pub fn seed_event(
             &"2026-01-01T00:00:00Z",
             &title,
             &start_time,
+            &start_time_zone,
             &start_time,
             &status,
             &i64::from(is_all_day),

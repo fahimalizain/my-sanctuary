@@ -10,7 +10,7 @@
 
 use api_core::record::{
     RecordCategoryRow, RecordCategorySecondsRow, RecordDaySecondsRow, RecordHourSecondsRow,
-    RecordMetaRow, RecordNightRow, RecordRepo, RecordTitleRow, RECORD_CATEGORIES_SQL,
+    RecordMetaRow, RecordNightRow, RecordRepo, RecordTitleCandidateRow, RECORD_CATEGORIES_SQL,
     RECORD_CATEGORY_SECONDS_SQL, RECORD_EARLIEST_META_DATE_SQL, RECORD_EARLIEST_NIGHT_DATE_SQL,
     RECORD_HOUR_SECONDS_SQL, RECORD_META_SQL, RECORD_NIGHTS_SQL, RECORD_PRIMARY_TIME_ZONE_SQL,
     RECORD_PRODUCTIVE_SECONDS_SQL, RECORD_UNCLASSIFIED_TITLES_SQL,
@@ -180,8 +180,7 @@ impl RecordRepo for D1RecordRepo {
         user_id: &str,
         from_date: &str,
         to_date: &str,
-        limit: usize,
-    ) -> Result<Vec<RecordTitleRow>, RepoError> {
+    ) -> Result<Vec<RecordTitleCandidateRow>, RepoError> {
         let stmt = self
             .db
             .prepare(RECORD_UNCLASSIFIED_TITLES_SQL)
@@ -189,7 +188,6 @@ impl RecordRepo for D1RecordRepo {
                 D1Type::Text(user_id),
                 D1Type::Text(from_date),
                 D1Type::Text(to_date),
-                D1Type::Integer(limit.min(i32::MAX as usize) as i32),
             ])
             .map_err(backend)?;
         query_vec(stmt).await

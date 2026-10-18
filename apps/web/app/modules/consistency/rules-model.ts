@@ -63,8 +63,6 @@ export const RULE_ICONS = [
   'wake',
 ] as const;
 
-export type RuleIconKey = (typeof RULE_ICONS)[number];
-
 /** Monday-first short labels (`weekdays` is `0 = Monday … 6 = Sunday`). */
 export const WEEKDAY_LABELS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 
@@ -92,6 +90,31 @@ export function phaseLabel(phase: RuleScore['phase']): string {
     case 'archived':
       return 'Archived';
   }
+}
+
+// ──────────────────────────────────────────
+// Verdict chip
+// ──────────────────────────────────────────
+
+/** The board chip's one word — never a PASS/FAIL stamp.
+ *
+ *  An incomplete window is `Building` before anything else: the API has no
+ *  verdict to show yet, whatever the phase says. */
+export function boardVerdict(
+  rule: Pick<RuleScore, 'phase' | 'on_track' | 'window_full'>,
+): string {
+  if (!rule.window_full) return 'Building';
+  if (rule.phase === 'paused') return 'Paused';
+  return rule.on_track ? 'On track' : 'Behind';
+}
+
+/** The archive row's second, muted word: only a finished challenge whose
+ *  window is fully computed has a verdict to report. */
+export function archiveVerdict(
+  rule: Pick<RuleScore, 'phase' | 'on_track' | 'window_full'>,
+): string | null {
+  if (rule.phase !== 'finished' || !rule.window_full) return null;
+  return rule.on_track ? 'On track' : 'Behind';
 }
 
 // ──────────────────────────────────────────
@@ -160,12 +183,12 @@ export function reorderIds(
 // ──────────────────────────────────────────
 
 /** Minutes past noon back to a wall clock `HH:MM` (`660` → `23:00`). */
-export function formatBedtime(minutes: number): string {
+function formatBedtime(minutes: number): string {
   return clock(minutes + 12 * 60);
 }
 
 /** Minutes past midnight as a wall clock `HH:MM` (`300` → `05:00`). */
-export function formatWake(minutes: number): string {
+function formatWake(minutes: number): string {
   return clock(minutes);
 }
 

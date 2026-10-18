@@ -997,7 +997,10 @@ export interface RecordUnclassifiedTitle {
 }
 
 export interface RecordQuality {
+  /** The newest estimated nights first, capped at 60. */
   estimated_nights: RecordEstimatedNight[];
+  /** Whether the range held more estimated nights than the cap lists. */
+  estimated_nights_truncated: boolean;
   unclassified_titles: RecordUnclassifiedTitle[];
 }
 

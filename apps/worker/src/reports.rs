@@ -16,7 +16,7 @@
 
 use worker::*;
 
-use api_core::RecordRange;
+use api_core::{RecordError, RecordRange};
 
 fn d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1DigestRepo> {
     let db = ctx
@@ -42,6 +42,20 @@ fn json_error(
         .with_status(status)
         .with_headers(headers);
     Ok(response)
+}
+
+/// Maps a service error to its HTTP response.
+///
+/// An invalid range is the caller's problem (400, with the reason); a failed
+/// repository is a 500, logged for the operator.
+fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: RecordError) -> Result<Response> {
+    match err {
+        RecordError::Invalid(message) => json_error(ctx, 400, &message),
+        RecordError::Repo(err) => {
+            console_log!("reports: record failed: {err}");
+            json_error(ctx, 500, "failed to load the record")
+        }
+    }
 }
 
 /// `GET /api/reports/status` → 200
@@ -103,9 +117,6 @@ pub async fn record(
                 &ctx,
             ))?))
         }
-        Err(err) => {
-            console_log!("reports: record failed: {err}");
-            json_error(&ctx, 500, "failed to load the record")
-        }
+        Err(err) => map_error(&ctx, err),
     }
 }

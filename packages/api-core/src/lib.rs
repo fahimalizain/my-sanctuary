@@ -116,7 +116,7 @@ pub use record::{
     assemble_record, record_report, EstimatedNight, HeatmapRow, RankingRow, RecordCategoryRow,
     RecordCategorySecondsRow, RecordData, RecordDay, RecordDaySecondsRow, RecordError,
     RecordHourSecondsRow, RecordMetaRow, RecordNightRow, RecordQuality, RecordRange, RecordReport,
-    RecordRepo, RecordSegment, RecordTitleRow, RecordWindow, TrendPoint, UnclassifiedTitle,
+    RecordRepo, RecordSegment, RecordTitleCandidateRow, RecordWindow, TrendPoint, UnclassifiedTitle,
     YearRow, ESTIMATED_NIGHTS_CAP, RECORD_CATEGORIES_SQL, RECORD_CATEGORY_SECONDS_SQL,
     RECORD_EARLIEST_META_DATE_SQL, RECORD_EARLIEST_NIGHT_DATE_SQL, RECORD_HOUR_SECONDS_SQL,
     RECORD_META_SQL, RECORD_NIGHTS_SQL, RECORD_PRIMARY_TIME_ZONE_SQL,

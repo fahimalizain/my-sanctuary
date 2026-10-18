@@ -33,7 +33,7 @@ pub use assemble::{
 };
 pub use repo::{
     RecordCategoryRow, RecordCategorySecondsRow, RecordDaySecondsRow, RecordHourSecondsRow,
-    RecordMetaRow, RecordNightRow, RecordRepo, RecordTitleRow, RECORD_CATEGORIES_SQL,
+    RecordMetaRow, RecordNightRow, RecordRepo, RecordTitleCandidateRow, RECORD_CATEGORIES_SQL,
     RECORD_CATEGORY_SECONDS_SQL, RECORD_EARLIEST_META_DATE_SQL, RECORD_EARLIEST_NIGHT_DATE_SQL,
     RECORD_HOUR_SECONDS_SQL, RECORD_META_SQL, RECORD_NIGHTS_SQL, RECORD_PRIMARY_TIME_ZONE_SQL,
     RECORD_PRODUCTIVE_SECONDS_SQL, RECORD_UNCLASSIFIED_TITLES_SQL,

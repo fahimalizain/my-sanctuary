@@ -28,21 +28,30 @@ import {
   hoursLabel,
   hoursText,
   legendEntries,
+  meanUntrackedHours,
   medianHoursLabel,
   RECORD_RANGES,
   RECORD_WEEKDAY_LABELS,
   shareLabel,
   shortDate,
+  sleepSourceLabel,
   stackDay,
 } from './record-model';
 
 /** The shared card chrome inside the details. */
 const CARD = 'rounded-xl border border-border bg-card p-4';
 
-export function TheRecord() {
+/** The board's own cadence while the digest is still building history. */
+const BUILDING_POLL_MS = 4000;
+
+export function TheRecord({ building }: { building: boolean }) {
   const [open, setOpen] = useState(false);
   const [range, setRange] = useState<RecordRangeKey>('30d');
-  const query = useRecordQuery({ range, enabled: open });
+  const query = useRecordQuery({
+    range,
+    enabled: open,
+    refetchInterval: building ? BUILDING_POLL_MS : false,
+  });
   const report = query.data;
   const loadError =
     query.error instanceof Error
@@ -108,6 +117,9 @@ export function TheRecord() {
 
         {report && (
           <>
+            {building && (
+              <p className="text-xs text-muted-foreground">Building history…</p>
+            )}
             <DaysCard days={report.days} />
             <RankingCard ranking={report.ranking} />
             <TrendCard trend={report.trend} />
@@ -260,40 +272,48 @@ function RankingCard({ ranking }: { ranking: RecordRankingRow[] }) {
       <Caption>
         Ranking — this range, with the window before it beside each row.
       </Caption>
-      <div className="space-y-2">
+      <div className="space-y-3 sm:space-y-2">
         {ranking.map((row) => (
           <div
             key={row.category_id || 'unclassified'}
-            className="flex items-center gap-3"
+            // Five columns do not fit a phone: below `sm` the name keeps its
+            // own line and the figures sit under it beside the bar. At `sm+`
+            // the wrappers flatten and the row is one line again.
+            className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3"
           >
-            <span
-              className="h-2.5 w-2.5 flex-shrink-0 rounded-sm"
-              style={{ backgroundColor: row.color }}
-            />
-            <span
-              className="w-28 flex-shrink-0 truncate text-sm text-foreground"
-              title={row.title}
-            >
-              {row.title}
-            </span>
-            <span className="h-2 flex-1 overflow-hidden rounded-sm bg-muted">
+            <div className="flex min-w-0 items-center gap-2 sm:contents">
               <span
-                className="block h-full rounded-sm"
-                style={{
-                  width: `${Math.max(0, Math.min(1, row.share)) * 100}%`,
-                  backgroundColor: row.color,
-                }}
+                className="h-2.5 w-2.5 flex-shrink-0 rounded-sm"
+                style={{ backgroundColor: row.color }}
               />
-            </span>
-            <span className="w-14 flex-shrink-0 text-right text-sm text-foreground">
-              {hoursLabel(row.seconds)}
-            </span>
-            <span className="w-10 flex-shrink-0 text-right text-xs text-muted-foreground">
-              {shareLabel(row.share)}
-            </span>
-            <span className="w-14 flex-shrink-0 text-right text-xs text-foreground">
-              {deltaLabel(row.seconds, row.previous_seconds)}
-            </span>
+              <span
+                className="min-w-0 flex-1 truncate text-sm text-foreground sm:w-28 sm:flex-none"
+                title={row.title}
+              >
+                {row.title}
+              </span>
+            </div>
+            <div className="flex min-w-0 items-center gap-3 sm:contents">
+              <span className="h-2 min-w-0 flex-1 overflow-hidden rounded-sm bg-muted">
+                <span
+                  className="block h-full rounded-sm"
+                  style={{
+                    width: `${Math.max(0, Math.min(1, row.share)) * 100}%`,
+                    backgroundColor: row.color,
+                  }}
+                />
+              </span>
+              <span className="w-14 flex-shrink-0 text-right text-sm text-foreground">
+                {hoursLabel(row.seconds)}
+              </span>
+              <span className="w-10 flex-shrink-0 text-right text-xs text-muted-foreground">
+                {shareLabel(row.share)}
+              </span>
+              {/* Neutral on purpose: a delta is a reading, not a verdict. */}
+              <span className="w-14 flex-shrink-0 text-right text-xs text-foreground">
+                {deltaLabel(row.seconds, row.previous_seconds)}
+              </span>
+            </div>
           </div>
         ))}
       </div>
@@ -322,7 +342,9 @@ function TrendCard({ trend }: { trend: RecordTrendPoint[] }) {
   const height = 140;
   const baseline = height - 16;
   const top = 8;
-  const max = Math.max(1, ...values);
+  // The daily hours set the scale too: a spike must not be clipped just
+  // because neither average reaches it.
+  const max = Math.max(1, ...values, ...trend.map((point) => point.hours));
   const step = trend.length > 1 ? width / (trend.length - 1) : 0;
   const x = (index: number) => (trend.length > 1 ? index * step : width / 2);
   const y = (hours: number) => baseline - (hours / max) * (baseline - top);
@@ -336,7 +358,10 @@ function TrendCard({ trend }: { trend: RecordTrendPoint[] }) {
 
   return (
     <section className={CARD}>
-      <Caption>Productive trend — peak mean {hoursText(max)} per day.</Caption>
+      <Caption>
+        Productive trend — the scale reaches {hoursText(max)} a day; the lines
+        are the 30- and 60-day means.
+      </Caption>
       <svg
         viewBox={`0 0 ${width} ${height}`}
         role="img"
@@ -430,6 +455,8 @@ function HeatmapCard({ heatmap }: { heatmap: RecordHeatmapRow[] }) {
               {row.seconds.map((seconds, hour) => (
                 <div
                   key={hour}
+                  role="img"
+                  aria-label={`${RECORD_WEEKDAY_LABELS[row.weekday]} ${clockLabel(hour)} · ${hoursLabel(seconds)}`}
                   className={
                     seconds > 0
                       ? 'h-4 flex-1 rounded-sm bg-primary'
@@ -471,10 +498,18 @@ function HeatmapCard({ heatmap }: { heatmap: RecordHeatmapRow[] }) {
 function QualityCard({ report }: { report: RecordReport }) {
   const { estimated_nights: nights, unclassified_titles: titles } =
     report.quality;
+  // Only the days that carry a figure: today is still being written and an
+  // unbuilt day was never computed, so neither is a tracked zero.
+  const untracked = meanUntrackedHours(report.days);
 
   return (
     <section className={CARD}>
       <Caption>Data quality</Caption>
+      {untracked !== null && (
+        <p className="mb-3 text-sm text-foreground">
+          Untracked · {hoursText(untracked)}/day
+        </p>
+      )}
       {nights.length === 0 && titles.length === 0 ? (
         <Empty>Nothing to flag.</Empty>
       ) : (
@@ -482,6 +517,7 @@ function QualityCard({ report }: { report: RecordReport }) {
           <div>
             <p className="mb-1 text-sm text-foreground">
               Estimated nights — {nights.length}
+              {report.quality.estimated_nights_truncated ? '+' : ''}
             </p>
             {nights.length === 0 ? (
               <p className="text-xs text-muted-foreground">
@@ -491,7 +527,7 @@ function QualityCard({ report }: { report: RecordReport }) {
               <ul className="space-y-0.5 text-xs text-muted-foreground">
                 {nights.slice(0, 8).map((night) => (
                   <li key={`${night.wake_date}-${night.source}`}>
-                    {night.wake_date} · {night.source}
+                    {night.wake_date} · {sleepSourceLabel(night.source)}
                   </li>
                 ))}
                 {nights.length > 8 && <li>…{nights.length - 8} more</li>}

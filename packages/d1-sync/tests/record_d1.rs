@@ -91,16 +91,34 @@ fn d1_record_round_trips_a_report_through_the_service() {
             ("ev-2", "2026-10-17T18:00:00Z", "Bus to Kondotty"),
         ] {
             seed_event(
-                &conn, id, "cal-1", title, start, "", false, true, "", None, None,
+                &conn, id, "cal-1", title, start, "", "", false, true, "", None, None,
             )
             .expect("event");
         }
+        // 20:00Z on the 11th is already the 12th in Kolkata, so the padded
+        // UTC-prefix read picks it up and the local-date filter keeps it.
+        seed_event(
+            &conn,
+            "ev-kolkata",
+            "cal-1",
+            "Flight to Kochi",
+            "2026-10-11T20:00:00Z",
+            "Asia/Kolkata",
+            "",
+            false,
+            true,
+            "",
+            None,
+            None,
+        )
+        .expect("event");
         seed_event(
             &conn,
             "ev-cancelled",
             "cal-1",
             "Bus to Kondotty",
             "2026-10-17T08:00:00Z",
+            "",
             "cancelled",
             false,
             true,
@@ -116,6 +134,7 @@ fn d1_record_round_trips_a_report_through_the_service() {
             "Bus to Kondotty",
             "2026-10-17T08:00:00Z",
             "",
+            "",
             true,
             true,
             "",
@@ -129,6 +148,7 @@ fn d1_record_round_trips_a_report_through_the_service() {
             "cal-1",
             "Bus to Kondotty",
             "2026-10-17T08:00:00Z",
+            "",
             "",
             false,
             false,
@@ -144,6 +164,7 @@ fn d1_record_round_trips_a_report_through_the_service() {
             "Bus to Kondotty",
             "2026-10-17T08:00:00Z",
             "",
+            "",
             false,
             true,
             "",
@@ -157,6 +178,7 @@ fn d1_record_round_trips_a_report_through_the_service() {
             "cal-1",
             "Bus to Kondotty",
             "2026-10-17T08:00:00Z",
+            "",
             "",
             false,
             true,
@@ -172,6 +194,7 @@ fn d1_record_round_trips_a_report_through_the_service() {
             "Bus to Kondotty",
             "2026-10-17T08:00:00Z",
             "",
+            "",
             false,
             true,
             "",
@@ -186,6 +209,7 @@ fn d1_record_round_trips_a_report_through_the_service() {
             "cal-1",
             "Bus to Kondotty",
             "2026-09-01T08:00:00Z",
+            "",
             "",
             false,
             true,
@@ -285,22 +309,33 @@ fn d1_record_round_trips_a_report_through_the_service() {
     assert_eq!(report.quality.estimated_nights.len(), 1);
     assert_eq!(report.quality.estimated_nights[0].wake_date, "2026-10-18");
     assert_eq!(report.quality.estimated_nights[0].source, "est_none");
-    assert_eq!(report.quality.unclassified_titles.len(), 1);
+    assert!(!report.quality.estimated_nights_truncated);
+    // Two events inside the range, busiest title first; the Kolkata event's
+    // UTC prefix is the day *before* the window opens.
+    assert_eq!(report.quality.unclassified_titles.len(), 2);
     assert_eq!(
         report.quality.unclassified_titles[0].title,
         "Bus to Kondotty"
     );
     assert_eq!(report.quality.unclassified_titles[0].count, 2);
+    assert_eq!(
+        report.quality.unclassified_titles[1].title,
+        "Flight to Kochi"
+    );
+    assert_eq!(report.quality.unclassified_titles[1].count, 1);
 
     // ── years ───────────────────────────────────────────────────────────────
     assert_eq!(report.years.len(), 1);
     let year = &report.years[0];
     assert_eq!(year.year, 2026);
-    assert_eq!(year.days, 291, "January 1 through October 18");
+    assert_eq!(
+        year.days, 3,
+        "October 16 (the first aggregate) through the 18th"
+    );
     assert_eq!(year.paired_nights, 1, "the estimated night is not measured");
     assert_eq!(year.sleep_median_hours, Some(6.0));
-    // 3h productive (1h + 2h) over 291 days.
-    assert!((year.productive_hours_per_day - 3.0 / 291.0).abs() < 1e-12);
+    // 3h productive (1h + 2h) over the three days the aggregates cover.
+    assert!((year.productive_hours_per_day - 3.0 / 3.0).abs() < 1e-12);
 }
 
 #[test]

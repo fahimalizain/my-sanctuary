@@ -18,11 +18,11 @@ const PLOT_WIDTH = 280;
 const MUTED_FILL = 'fill-muted-foreground';
 const TARGET_STROKE = 'stroke-muted-foreground/40';
 
-/** Minutes past noon the bed lane spans (10:00 → 15:00). */
+/** The bed lane's reference span: 22:00 → 02:00, in minutes past noon. */
 const BED_MIN = 600;
-const BED_MAX = 900;
-/** Minutes past midnight the wake lane spans (00:00 → 08:00). */
-const WAKE_MIN = 0;
+const BED_MAX = 840;
+/** The wake lane's reference span: 04:00 → 08:00, in minutes past midnight. */
+const WAKE_MIN = 240;
 const WAKE_MAX = 480;
 
 export function RuleEvidence({ rule }: { rule: RuleScore }) {
@@ -298,23 +298,41 @@ function SleepLanes({
 }) {
   if (nights.length === 0) return <EmptyEvidence />;
 
-  const leftPad = 26;
+  // The gutter holds the lane name and, right-aligned against the lane, the
+  // clock at each end.
+  const leftPad = 30;
   const column = 16;
   const laneHeight = 34;
-  const laneGap = 8;
+  const laneGap = 10;
   const labelRow = 12;
+  const topPad = 6;
   const width = leftPad + nights.length * column + 4;
-  const bedTop = 0;
-  const wakeTop = laneHeight + laneGap;
+  const bedTop = topPad;
+  const wakeTop = bedTop + laneHeight + laneGap;
   const height = wakeTop + laneHeight + labelRow;
 
+  // Each lane widens to hold its own data, so an early night is never clamped
+  // away: the reference span is the floor, the nights are the ceiling.
+  const bed = laneBounds(
+    nights.map((night) => night.bed_min_past_noon),
+    BED_MIN,
+    BED_MAX,
+  );
+  const wake = laneBounds(
+    nights.map((night) => night.wake_min_past_midnight),
+    WAKE_MIN,
+    WAKE_MAX,
+  );
+
+  // Time runs the same way on both lanes: the earliest clock is at the top,
+  // the latest at the bottom. The dates run left (oldest) to right (newest).
   const bedY = (minutes: number) =>
     bedTop +
-    ((BED_MAX - clamp(minutes, BED_MIN, BED_MAX)) / (BED_MAX - BED_MIN)) *
+    ((clamp(minutes, bed[0], bed[1]) - bed[0]) / (bed[1] - bed[0])) *
       laneHeight;
   const wakeY = (minutes: number) =>
     wakeTop +
-    ((clamp(minutes, WAKE_MIN, WAKE_MAX) - WAKE_MIN) / (WAKE_MAX - WAKE_MIN)) *
+    ((clamp(minutes, wake[0], wake[1]) - wake[0]) / (wake[1] - wake[0])) *
       laneHeight;
   const x = (index: number) => leftPad + index * column + column / 2;
 
@@ -366,6 +384,42 @@ function SleepLanes({
         >
           wake
         </text>
+        <text
+          x={leftPad - 2}
+          y={bedTop + 4}
+          textAnchor="end"
+          fontSize={8}
+          className={MUTED_FILL}
+        >
+          {clockPastNoon(bed[0])}
+        </text>
+        <text
+          x={leftPad - 2}
+          y={bedTop + laneHeight - 2}
+          textAnchor="end"
+          fontSize={8}
+          className={MUTED_FILL}
+        >
+          {clockPastNoon(bed[1])}
+        </text>
+        <text
+          x={leftPad - 2}
+          y={wakeTop + 4}
+          textAnchor="end"
+          fontSize={8}
+          className={MUTED_FILL}
+        >
+          {clockPastMidnight(wake[0])}
+        </text>
+        <text
+          x={leftPad - 2}
+          y={wakeTop + laneHeight - 2}
+          textAnchor="end"
+          fontSize={8}
+          className={MUTED_FILL}
+        >
+          {clockPastMidnight(wake[1])}
+        </text>
         {nights.map((night, index) => (
           <circle
             key={`${night.wake_date}-bed`}
@@ -409,6 +463,18 @@ function SleepLanes({
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * The `[min, max]` a lane is drawn over: the reference span, widened to hold
+ * every value in `values` so no point is clamped away.
+ */
+function laneBounds(
+  values: number[],
+  min: number,
+  max: number,
+): [number, number] {
+  return [Math.min(min, ...values), Math.max(max, ...values)];
 }
 
 function clockPastNoon(minutes: number): string {

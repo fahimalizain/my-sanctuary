@@ -15,13 +15,17 @@ export function recordQueryOptions(range: RecordRangeKey) {
   });
 }
 
-/** The report read. `enabled` keeps it off until the section is opened. */
+/** The report read. `enabled` keeps it off until the section is opened;
+ *  `refetchInterval` lets the caller follow the digest's own 4s cadence while
+ *  it is still building history. */
 export function useRecordQuery(opts: {
   range: RecordRangeKey;
   enabled: boolean;
+  refetchInterval?: number | false;
 }) {
   return useQuery({
     ...recordQueryOptions(opts.range),
     enabled: opts.enabled,
+    refetchInterval: opts.refetchInterval ?? false,
   });
 }

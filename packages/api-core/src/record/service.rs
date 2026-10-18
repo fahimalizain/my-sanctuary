@@ -7,15 +7,38 @@
 //! the aggregates already contain and asks the tick to fill in the rest.
 
 use crate::digest::{ensure_backfill_job, shift_date, DigestRepo};
-use crate::time::{civil_date_in_zone, unix_secs_to_rfc3339};
+use crate::time::{civil_date_in_zone, parse_iana_tz, unix_secs_to_rfc3339};
 
-use super::assemble::{assemble_record, UNCLASSIFIED_TITLES_CAP};
+use super::assemble::assemble_record;
 use super::repo::{earliest_of, min_date, RecordRepo};
 use super::{first_year_start, RecordData, RecordError, RecordRange, RecordReport};
 
 /// Extra days behind the range's first day that the trend's `ma60` window
 /// needs (`ma60` covers the 60 days *ending* on a day).
 pub const TREND_WINDOW_DAYS: i64 = 59;
+
+/// The zone the report's "today" is read in: the primary calendar zone, else
+/// the zone of the last day the digest computed, else UTC.
+///
+/// The same fallback the rules path makes (`rules::service::today`), so the
+/// board and the record never disagree about which civil date it is. Before
+/// the first calendar sync the primary zone is unknown while `daily_meta`
+/// already knows it; jumping straight to UTC would move the user's day.
+async fn report_time_zone(
+    repo: &dyn RecordRepo,
+    digest_repo: &dyn DigestRepo,
+    user_id: &str,
+) -> Result<String, RecordError> {
+    let stored = repo.primary_time_zone(user_id).await?.unwrap_or_default();
+    if parse_iana_tz(&stored).is_some() {
+        return Ok(stored.trim().to_string());
+    }
+    let latest = digest_repo.latest_time_zone(user_id).await?.unwrap_or_default();
+    if parse_iana_tz(&latest).is_some() {
+        return Ok(latest.trim().to_string());
+    }
+    Ok("UTC".to_string())
+}
 
 /// `GET /api/reports/record` — the assembled report.
 ///
@@ -30,8 +53,7 @@ pub async fn record_report(
     now_unix: i64,
 ) -> Result<RecordReport, RecordError> {
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let stored = repo.primary_time_zone(user_id).await?.unwrap_or_default();
-    let time_zone = crate::digest::normalized_zone_name(&stored);
+    let time_zone = report_time_zone(repo, digest_repo, user_id).await?;
     let as_of = civil_date_in_zone(now_unix, &time_zone);
 
     // Opening the report also queues history. The rebuild itself belongs to the
@@ -60,6 +82,10 @@ pub async fn record_report(
     // recent years — the same floor the assembler renders from.
     let years_from = first_year_start(earliest_date.as_deref(), &as_of);
     let history_from = min_date(&trend_from, &years_from);
+    // The title list is filtered on each event's **local** civil date in the
+    // assembler, so the read is padded by a day on each side of the UTC prefix.
+    let titles_from = shift_date(&window.from, -1).unwrap_or_else(|| window.from.clone());
+    let titles_to = shift_date(&window.to, 1).unwrap_or_else(|| window.to.clone());
 
     let data = RecordData {
         categories,
@@ -78,7 +104,7 @@ pub async fn record_report(
         nights: repo.load_nights(user_id, &years_from, &window.to).await?,
         earliest_date,
         titles: repo
-            .unclassified_titles(user_id, &window.from, &window.to, UNCLASSIFIED_TITLES_CAP)
+            .unclassified_titles(user_id, &titles_from, &titles_to)
             .await?,
     };
 

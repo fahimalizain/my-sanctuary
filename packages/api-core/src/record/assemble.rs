@@ -22,10 +22,11 @@ use serde::Serialize;
 
 use crate::digest::{shift_date, untracked_seconds, SYNTHETIC_SLEEP_CATEGORY_ID};
 use crate::rules::{Cat, CategoryCatalog};
+use crate::time::{civil_date_in_zone, rfc3339_to_unix_secs};
 
 use super::repo::{
     RecordCategoryRow, RecordCategorySecondsRow, RecordDaySecondsRow, RecordHourSecondsRow,
-    RecordMetaRow, RecordNightRow, RecordTitleRow,
+    RecordMetaRow, RecordNightRow, RecordTitleCandidateRow,
 };
 use super::{days_between, first_year, parse_date, RecordRange, RecordWindow};
 
@@ -150,7 +151,12 @@ pub struct UnclassifiedTitle {
 /// estimated nights and unfiled titles are both "flag it or don't".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordQuality {
+    /// The estimated nights nearest `as_of`, newest first, capped at
+    /// [`ESTIMATED_NIGHTS_CAP`].
     pub estimated_nights: Vec<EstimatedNight>,
+    /// Whether the range held more estimated nights than the cap lists (the
+    /// client renders the count as `60+`).
+    pub estimated_nights_truncated: bool,
     pub unclassified_titles: Vec<UnclassifiedTitle>,
 }
 
@@ -169,7 +175,8 @@ pub struct YearRow {
     /// two middle values, like the rules scorer).
     pub sleep_median_hours: Option<f64>,
     pub paired_nights: i64,
-    /// January 1 through December 31, clipped to `as_of`.
+    /// January 1 (or the user's earliest aggregate day, whichever is later)
+    /// through December 31, clipped to `as_of`.
     pub days: i64,
 }
 
@@ -196,8 +203,9 @@ pub struct RecordData {
     /// The earliest aggregate day the user has (`daily_meta` or a night), or
     /// `None` before the first rebuild.
     pub earliest_date: Option<String>,
-    /// The unclassified titles the repo already grouped and ranked.
-    pub titles: Vec<RecordTitleRow>,
+    /// The candidate events the repo read for the title list (its UTC date
+    /// prefix is inside the range the service asked for, padded by a day).
+    pub titles: Vec<RecordTitleCandidateRow>,
 }
 
 // ──────────────────────────────────────────
@@ -334,7 +342,7 @@ pub fn assemble_record(
         .collect();
 
     // ── heatmap ─────────────────────────────────────────────────────────────
-    let heatmap = heatmap(&catalog, &data.hour_seconds, &window);
+    let heatmap = heatmap(&catalog, &data.hour_seconds, &window, as_of);
 
     // ── quality ─────────────────────────────────────────────────────────────
     let mut estimated: Vec<&RecordNightRow> = data
@@ -346,9 +354,10 @@ pub fn assemble_record(
                 && night.wake_date.as_str() <= window.to.as_str()
         })
         .collect();
-    // Oldest first; the load order (`wake_date, asleep_at`) breaks same-date
-    // ties.
-    estimated.sort_by(|left, right| left.wake_date.cmp(&right.wake_date));
+    // The newest nights are the ones worth a second look; the load order
+    // (`wake_date, asleep_at`) breaks same-date ties.
+    estimated.sort_by(|left, right| right.wake_date.cmp(&left.wake_date));
+    let estimated_nights_truncated = estimated.len() > ESTIMATED_NIGHTS_CAP;
     estimated.truncate(ESTIMATED_NIGHTS_CAP);
     let quality = RecordQuality {
         estimated_nights: estimated
@@ -359,21 +368,14 @@ pub fn assemble_record(
                 seconds: night.seconds,
             })
             .collect(),
-        unclassified_titles: data
-            .titles
-            .iter()
-            .take(UNCLASSIFIED_TITLES_CAP)
-            .map(|row| UnclassifiedTitle {
-                title: row.title.clone(),
-                count: row.count,
-            })
-            .collect(),
+        estimated_nights_truncated,
+        unclassified_titles: unclassified_titles(&window, &data.titles),
     };
 
     // ── years ───────────────────────────────────────────────────────────────
     let as_of_year = parse_date(as_of).map(|date| date.year()).unwrap_or(1970);
     let years = (first_year(history, as_of)..=as_of_year)
-        .map(|year| year_row(year, as_of, as_of_year, &productive, &data.nights))
+        .map(|year| year_row(year, as_of, as_of_year, history, &productive, &data.nights))
         .collect();
 
     RecordReport {
@@ -568,16 +570,22 @@ fn moving_average(
 
 /// The 7 × 24 mean productive seconds grid.
 ///
-/// The denominator is every occurrence of that weekday in the selected range
-/// (zero-filled days included), and only productive categories contribute —
-/// the same leaves the trend counts.
+/// The denominator is every **finished** occurrence of that weekday in the
+/// selected range (zero-filled days included), and only productive categories
+/// contribute — the same leaves the trend counts. `as_of` itself is left out
+/// of both the sums and the denominator: today is still being written, so its
+/// hours are a partial day, not a reading.
 fn heatmap(
     catalog: &RecordCatalog,
     rows: &[RecordHourSecondsRow],
     window: &RecordWindow,
+    as_of: &str,
 ) -> Vec<HeatmapRow> {
     let mut occurrences = [0_i64; 7];
     for date in each_date(&window.from, &window.to) {
+        if date == as_of {
+            continue;
+        }
         if let Some(weekday) = weekday_of(&date) {
             occurrences[weekday as usize] += 1;
         }
@@ -586,7 +594,7 @@ fn heatmap(
     let mut sums = [[0_i64; 24]; 7];
     for row in rows {
         let date = row.local_date.as_str();
-        if date < window.from.as_str() || date > window.to.as_str() {
+        if date < window.from.as_str() || date > window.to.as_str() || date == as_of {
             continue;
         }
         if !(0..24).contains(&row.hour) || !catalog.productive(&row.category_id) {
@@ -615,21 +623,71 @@ fn heatmap(
         .collect()
 }
 
+/// The `quality` title list: the candidate events folded to `(title, count)`.
+///
+/// The repo's read is a UTC-date-prefix scan padded by a day, so the real
+/// filter is here: a candidate counts only when the instant it started, read
+/// in its own zone (empty zone → UTC), lands on a civil date inside `window`.
+/// The most frequent titles come first, then the alphabet; the cap keeps the
+/// list a summary.
+fn unclassified_titles(
+    window: &RecordWindow,
+    rows: &[RecordTitleCandidateRow],
+) -> Vec<UnclassifiedTitle> {
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    for row in rows {
+        let Some(start) = rfc3339_to_unix_secs(&row.start_time) else {
+            continue;
+        };
+        let date = civil_date_in_zone(start, &row.start_time_zone);
+        if date < window.from || date > window.to {
+            continue;
+        }
+        *counts.entry(row.title.clone()).or_insert(0) += 1;
+    }
+
+    let mut titles: Vec<UnclassifiedTitle> = counts
+        .into_iter()
+        .map(|(title, count)| UnclassifiedTitle { title, count })
+        .collect();
+    titles.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    titles.truncate(UNCLASSIFIED_TITLES_CAP);
+    titles
+}
+
 /// One calendar year's row.
+///
+/// The year starts at its January 1 **or** the user's earliest aggregate day,
+/// whichever is later: a year whose first data lands in December is a few days
+/// long, and `productive_hours_per_day` divides by that, not by a whole year of
+/// days nobody had a diary for.
 fn year_row(
     year: i32,
     as_of: &str,
     as_of_year: i32,
+    earliest: Option<&str>,
     productive: &BTreeMap<String, i64>,
     nights: &[RecordNightRow],
 ) -> YearRow {
-    let start = format!("{year:04}-01-01");
+    let jan_first = format!("{year:04}-01-01");
     // No future days: the running year stops at `as_of`.
     let end = if year >= as_of_year {
         as_of.to_string()
     } else {
         format!("{year:04}-12-31")
     };
+    let start = match earliest {
+        Some(earliest) if earliest > jan_first.as_str() => earliest.to_string(),
+        _ => jan_first,
+    };
+    // A history floor past this year's end would make the day walk run
+    // backwards; the year is then simply its last day.
+    let start = if start > end { end.clone() } else { start };
 
     let mut days = 0_i64;
     let mut total = 0.0;

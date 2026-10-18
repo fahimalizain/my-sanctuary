@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 
 use crate::digest::shift_date;
 
-use super::assemble::{assemble_record, RecordSegment};
+use super::assemble::{assemble_record, RecordSegment, UNCLASSIFIED_TITLES_CAP};
 use super::repo::{
     RecordCategoryRow, RecordCategorySecondsRow, RecordDaySecondsRow, RecordHourSecondsRow,
-    RecordMetaRow, RecordNightRow, RecordTitleRow,
+    RecordMetaRow, RecordNightRow, RecordTitleCandidateRow,
 };
 use super::{RankingRow, RecordData, RecordRange};
 
@@ -21,6 +21,12 @@ const AS_OF: &str = "2026-10-18";
 /// 273 days earlier (`273 % 7 == 0`, so also a Sunday): 2026-01-18T06:00:00Z.
 const NOW_JANUARY: i64 = NOW_UNIX - 273 * 86_400;
 const AS_OF_JANUARY: &str = "2026-01-18";
+/// One day later: 2026-10-19T06:00:00Z — a Monday.
+const NOW_MONDAY: i64 = NOW_UNIX + 86_400;
+const AS_OF_MONDAY: &str = "2026-10-19";
+/// 45 days later: 2026-12-02T06:00:00Z.
+const NOW_DECEMBER: i64 = NOW_UNIX + 45 * 86_400;
+const AS_OF_DECEMBER: &str = "2026-12-02";
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -81,11 +87,20 @@ fn night(wake_date: &str, source: &str, seconds: i64) -> RecordNightRow {
     }
 }
 
-fn title(title: &str, count: i64) -> RecordTitleRow {
-    RecordTitleRow {
+/// One candidate event for the `quality` title list.
+fn candidate(title: &str, start_time: &str, zone: &str) -> RecordTitleCandidateRow {
+    RecordTitleCandidateRow {
         title: title.to_string(),
-        count,
+        start_time: start_time.to_string(),
+        start_time_zone: zone.to_string(),
     }
+}
+
+/// `count` candidate events of one title, an hour apart, on `date` in `zone`.
+fn candidates(title: &str, count: usize, date: &str, zone: &str) -> Vec<RecordTitleCandidateRow> {
+    (0..count)
+        .map(|index| candidate(title, &format!("{date}T{index:02}:00:00Z"), zone))
+        .collect()
 }
 
 fn segments_by_id(segments: &[RecordSegment]) -> BTreeMap<&str, &RecordSegment> {
@@ -425,6 +440,41 @@ fn heatmap_means_over_every_occurrence_of_the_weekday() {
     assert_eq!(report.heatmap[1].seconds[9], 0);
 }
 
+#[test]
+fn heatmap_leaves_today_out_of_the_sums_and_the_denominator() {
+    // 2026-10-19 is a Monday, so the 7-day view (2026-10-13 .. 2026-10-19) has
+    // exactly one Monday — today.
+    let data = RecordData {
+        categories: work_tree(),
+        meta: vec![meta(AS_OF_MONDAY, 3_600)],
+        hour_seconds: vec![hour(AS_OF_MONDAY, 9, "work", 3_600)],
+        productive_seconds: vec![productive(AS_OF_MONDAY, 3_600)],
+        ..RecordData::default()
+    };
+    let report = assemble_record(&data, AS_OF_MONDAY, "UTC", RecordRange::Last7, NOW_MONDAY);
+    assert_eq!(
+        report.heatmap[0].seconds[9], 0,
+        "today is still being written: it is not a reading"
+    );
+
+    // The 30-day view (2026-09-20 .. 2026-10-19) has five Mondays. Only the
+    // four finished ones count, so the mean is 7200 over 4, not 10800 over 5.
+    let data = RecordData {
+        categories: work_tree(),
+        meta: vec![meta(AS_OF_MONDAY, 3_600)],
+        hour_seconds: vec![
+            hour("2026-10-12", 9, "work", 7_200),
+            hour(AS_OF_MONDAY, 9, "work", 3_600),
+        ],
+        ..RecordData::default()
+    };
+    let report = assemble_record(&data, AS_OF_MONDAY, "UTC", RecordRange::Last30, NOW_MONDAY);
+    assert_eq!(
+        report.heatmap[0].seconds[9], 1_800,
+        "7200 over the four finished Mondays"
+    );
+}
+
 // ── 7. years ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -445,7 +495,10 @@ fn years_median_reads_paired_nights_only() {
     assert_eq!(report.years.len(), 1);
     let year = &report.years[0];
     assert_eq!(year.year, 2026);
-    assert_eq!(year.days, 291, "January 1 through October 18");
+    assert_eq!(
+        year.days, 18,
+        "October 1 (the history floor) through October 18"
+    );
     assert_eq!(year.paired_nights, 2);
     // Even count: the mean of the two middle values (6h and 7h).
     assert_eq!(year.sleep_median_hours, Some(6.5));
@@ -496,6 +549,50 @@ fn years_split_weekday_and_weekend_means_and_cap_at_eight() {
     assert_eq!(year.productive_hours_per_day, 3.0 / 291.0);
 }
 
+#[test]
+fn a_year_counts_days_from_its_earliest_aggregate_not_january_first() {
+    // The only aggregate is 2026-12-01, so 2026 is two days old — not the 336
+    // days between January 1 and December 2.
+    let data = RecordData {
+        categories: work_tree(),
+        meta: vec![meta("2026-12-01", 3_600)],
+        category_seconds: vec![secs("2026-12-01", "work", 3_600)],
+        productive_seconds: vec![productive("2026-12-01", 3_600)],
+        earliest_date: Some("2026-12-01".to_string()),
+        ..RecordData::default()
+    };
+
+    let report = assemble_record(
+        &data,
+        AS_OF_DECEMBER,
+        "UTC",
+        RecordRange::Last7,
+        NOW_DECEMBER,
+    );
+    assert_eq!(report.years.len(), 1);
+    let year = &report.years[0];
+    assert_eq!(year.year, 2026);
+    assert_eq!(year.days, 2, "December 1 through December 2");
+    // One hour over two days, not over a year nobody had a diary for.
+    assert_eq!(year.productive_hours_per_day, 0.5);
+
+    // A year the history floor predates still starts at its own January 1.
+    let earlier = RecordData {
+        earliest_date: Some("2025-11-30".to_string()),
+        ..data
+    };
+    let report = assemble_record(
+        &earlier,
+        AS_OF_DECEMBER,
+        "UTC",
+        RecordRange::Last7,
+        NOW_DECEMBER,
+    );
+    assert_eq!(report.years.len(), 2);
+    assert_eq!(report.years[1].year, 2026);
+    assert_eq!(report.years[1].days, 336, "January 1 through December 2");
+}
+
 // ── 8. the unclassified bucket ──────────────────────────────────────────────
 
 #[test]
@@ -505,7 +602,7 @@ fn unclassified_seconds_are_their_own_segment_and_are_not_productive() {
         meta: vec![meta("2026-10-17", 1_800)],
         category_seconds: vec![secs("2026-10-17", "", 1_800)],
         hour_seconds: vec![hour("2026-10-17", 9, "", 1_800)],
-        titles: vec![title("Bus to Kondotty", 3)],
+        titles: candidates("Bus to Kondotty", 3, "2026-10-17", "UTC"),
         ..RecordData::default()
     };
 
@@ -540,6 +637,77 @@ fn unclassified_seconds_are_their_own_segment_and_are_not_productive() {
         "Bus to Kondotty"
     );
     assert_eq!(report.quality.unclassified_titles[0].count, 3);
+}
+
+#[test]
+fn unclassified_titles_are_filtered_on_the_events_own_civil_date() {
+    // The repo's read is a UTC-date-prefix scan padded by a day, so the real
+    // filter is the local civil date here. The 7-day view is
+    // 2026-10-12 .. 2026-10-18.
+    let data = RecordData {
+        categories: work_tree(),
+        titles: vec![
+            // 20:00Z on the 11th is already the 12th in Kolkata: it counts.
+            candidate("Late flight", "2026-10-11T20:00:00Z", "Asia/Kolkata"),
+            // The same instant with no zone is read as UTC, and the 11th is
+            // outside the window: it does not.
+            candidate("Late flight", "2026-10-11T20:00:00Z", ""),
+            // 20:00Z on the 18th is the 19th in Kolkata: the reverse case.
+            candidate("Night bus", "2026-10-18T20:00:00Z", "Asia/Kolkata"),
+            // No zone, so the UTC date is the window's own last day: it does.
+            candidate("Night bus", "2026-10-18T20:00:00Z", ""),
+        ],
+        ..RecordData::default()
+    };
+
+    let report = assemble_record(&data, AS_OF, "UTC", RecordRange::Last7, NOW_UNIX);
+    let titles: Vec<(&str, i64)> = report
+        .quality
+        .unclassified_titles
+        .iter()
+        .map(|row| (row.title.as_str(), row.count))
+        .collect();
+    assert_eq!(
+        titles,
+        vec![("Late flight", 1), ("Night bus", 1)],
+        "one event of each title is inside the window"
+    );
+}
+
+#[test]
+fn unclassified_titles_group_by_title_and_keep_the_busiest_eight() {
+    let mut rows = vec![
+        candidate("Bus to Kondotty", "2026-10-17T08:00:00Z", "UTC"),
+        candidate("Bus to Kondotty", "2026-10-17T18:00:00Z", "UTC"),
+        candidate("Bus to Kondotty", "2026-10-16T08:00:00Z", "UTC"),
+        candidate("Flight to Kochi", "2026-10-17T06:00:00Z", "UTC"),
+    ];
+    for index in 0..9 {
+        rows.push(candidate(
+            &format!("Errand {index}"),
+            "2026-10-17T09:00:00Z",
+            "UTC",
+        ));
+    }
+    let data = RecordData {
+        categories: work_tree(),
+        titles: rows,
+        ..RecordData::default()
+    };
+
+    let report = assemble_record(&data, AS_OF, "UTC", RecordRange::Last7, NOW_UNIX);
+    let titles = &report.quality.unclassified_titles;
+    assert_eq!(titles.len(), UNCLASSIFIED_TITLES_CAP);
+    assert_eq!(titles[0].title, "Bus to Kondotty");
+    assert_eq!(titles[0].count, 3, "three events fold into one title");
+    // Ties break on the title, and the cap keeps the first eight.
+    assert_eq!(titles[1].title, "Errand 0");
+    assert_eq!(titles[1].count, 1);
+    assert_eq!(titles[7].title, "Errand 6");
+    assert!(
+        !titles.iter().any(|row| row.title == "Flight to Kochi"),
+        "the alphabetical tail falls off the cap"
+    );
 }
 
 // ── presentation and quality details ────────────────────────────────────────
@@ -583,7 +751,7 @@ fn segments_render_unknown_ids_empty_colours_and_synthetic_sleep() {
 }
 
 #[test]
-fn quality_lists_estimated_nights_oldest_first_and_caps_them() {
+fn quality_lists_the_newest_estimated_nights_and_flags_the_cap() {
     // 70 estimated nights inside a 90-day view, plus one before it.
     let mut nights = vec![night("2026-07-01", "est_none", 23_400)];
     for offset in 0..70 {
@@ -599,7 +767,12 @@ fn quality_lists_estimated_nights_oldest_first_and_caps_them() {
     let report = assemble_record(&data, AS_OF, "UTC", RecordRange::Last90, NOW_UNIX);
     assert_eq!(report.from, "2026-07-21");
     assert_eq!(report.quality.estimated_nights.len(), 60, "capped at 60");
-    assert_eq!(report.quality.estimated_nights[0].wake_date, "2026-08-01");
+    assert!(
+        report.quality.estimated_nights_truncated,
+        "the range held more than the cap lists"
+    );
+    // The newest 60 nights: 2026-08-11 through 2026-10-09, newest first.
+    assert_eq!(report.quality.estimated_nights[0].wake_date, "2026-10-09");
     assert_eq!(report.quality.estimated_nights[0].source, "est_no_wake");
     assert_eq!(report.quality.estimated_nights[0].seconds, 21_600);
     assert_eq!(
@@ -609,7 +782,7 @@ fn quality_lists_estimated_nights_oldest_first_and_caps_them() {
             .last()
             .expect("last")
             .wake_date,
-        "2026-09-29"
+        "2026-08-11"
     );
     // A night outside the selected range is not flagged here.
     assert!(!report
@@ -617,6 +790,19 @@ fn quality_lists_estimated_nights_oldest_first_and_caps_them() {
         .estimated_nights
         .iter()
         .any(|night| night.wake_date == "2026-07-01"));
+
+    // Under the cap nothing is dropped and the flag stays false.
+    let few = RecordData {
+        nights: vec![
+            night("2026-09-01", "est_none", 23_400),
+            night("2026-09-02", "est_no_asleep", 23_400),
+        ],
+        ..RecordData::default()
+    };
+    let report = assemble_record(&few, AS_OF, "UTC", RecordRange::Last90, NOW_UNIX);
+    assert_eq!(report.quality.estimated_nights.len(), 2);
+    assert!(!report.quality.estimated_nights_truncated);
+    assert_eq!(report.quality.estimated_nights[0].wake_date, "2026-09-02");
 }
 
 #[test]

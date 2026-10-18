@@ -2,13 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CategoryDailyAvgParams, RuleScore } from '../../types';
 import {
+  archiveVerdict,
+  boardVerdict,
   buildRuleParams,
   emptyRuleForm,
-  formatBedtime,
-  formatWake,
   parseRuleParams,
   reorderIds,
   ruleFormValuesFromRule,
+  sleepTargetLabel,
   stripClass,
   swapNeighbors,
   targetHoursFromCondition,
@@ -279,11 +280,42 @@ test('swapNeighbors: swaps in place and refuses the ends', () => {
 
 // ── formatting ───────────────────────────────────────────────────────────
 
-test('formatBedtime/formatWake mirror the Rust clock helpers', () => {
-  assert.equal(formatBedtime(660), '23:00');
-  assert.equal(formatBedtime(0), '12:00');
-  assert.equal(formatWake(300), '05:00');
-  assert.equal(formatWake(0), '00:00');
+test('sleepTargetLabel formats the clock readings, not the raw minutes', () => {
+  assert.equal(sleepTargetLabel('bedtime_median', 660), '23:00');
+  assert.equal(sleepTargetLabel('bedtime_median', 0), '12:00');
+  assert.equal(sleepTargetLabel('wake_median', 300), '05:00');
+  assert.equal(sleepTargetLabel('wake_median', 0), '00:00');
+  assert.equal(sleepTargetLabel('bedtime_stdev', 45), '45 min spread');
+});
+
+// ── verdict chip ─────────────────────────────────────────────────────────
+
+/** A rule the chip only reads three fields from. */
+function chipped(
+  phase: RuleScore['phase'],
+  on_track: boolean,
+  window_full: boolean,
+) {
+  return { phase, on_track, window_full };
+}
+
+test('boardVerdict: an incomplete window is Building before anything else', () => {
+  assert.equal(boardVerdict(chipped('active', false, false)), 'Building');
+  assert.equal(boardVerdict(chipped('paused', false, false)), 'Building');
+});
+
+test('boardVerdict: phase, then the verdict', () => {
+  assert.equal(boardVerdict(chipped('paused', false, true)), 'Paused');
+  assert.equal(boardVerdict(chipped('active', true, true)), 'On track');
+  assert.equal(boardVerdict(chipped('active', false, true)), 'Behind');
+});
+
+test('archiveVerdict: only a finished, fully computed window has one', () => {
+  assert.equal(archiveVerdict(chipped('finished', true, true)), 'On track');
+  assert.equal(archiveVerdict(chipped('finished', false, true)), 'Behind');
+  assert.equal(archiveVerdict(chipped('finished', true, false)), null);
+  assert.equal(archiveVerdict(chipped('archived', true, true)), null);
+  assert.equal(archiveVerdict(chipped('paused', true, true)), null);
 });
 
 test('targetHoursFromCondition reads the target hours, else null', () => {

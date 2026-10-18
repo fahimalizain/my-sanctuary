@@ -65,6 +65,39 @@ export function medianHoursLabel(hours: number | null): string {
   return hours === null ? '—' : `${hours.toFixed(2)}h`;
 }
 
+/** The `sleep_nights.source` values in the words the reader sees. */
+const SLEEP_SOURCE_LABELS: Record<string, string> = {
+  paired: 'Paired',
+  est_no_wake: 'No wake marker',
+  est_no_asleep: 'No asleep marker',
+  est_none: 'No markers',
+};
+
+/** A night's source as words (`est_no_wake` → `No wake marker`). An unknown
+ *  value is shown as itself rather than hidden. */
+export function sleepSourceLabel(source: string): string {
+  return SLEEP_SOURCE_LABELS[source] ?? source;
+}
+
+/**
+ * The mean untracked hours per day over the days that carry a figure.
+ *
+ * `untracked_seconds` is `null` while the day is still being written (today in
+ * its own zone) and for a day nothing has been computed for yet; neither is a
+ * tracked zero, so neither joins the mean. `null` when no day has a figure at
+ * all — the line is then simply absent.
+ */
+export function meanUntrackedHours(days: RecordDay[]): number | null {
+  let seconds = 0;
+  let counted = 0;
+  for (const day of days) {
+    if (day.untracked_seconds === null) continue;
+    seconds += day.untracked_seconds;
+    counted += 1;
+  }
+  return counted === 0 ? null : seconds / counted / 3600;
+}
+
 /**
  * A neutral delta label against the previous window: `+1.2h`, `−0.4h`, `0h`
  * (U+2212 minus). No colour, no judgement — the reader decides.
