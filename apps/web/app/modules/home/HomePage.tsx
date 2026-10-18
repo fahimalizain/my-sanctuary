@@ -61,7 +61,7 @@ import {
 import { FocusTimer } from '@/app/components/FocusTimer';
 import { QuotesSection } from '@/app/components/QuotesSection';
 import { TaskModal } from '@/app/components/TaskModal';
-import { quotes } from '@/app/mock-data';
+import { quotes } from '@/app/data/quotes';
 import { moveDayToToday } from '@/lib/api';
 import {
   readAgendaPages,
