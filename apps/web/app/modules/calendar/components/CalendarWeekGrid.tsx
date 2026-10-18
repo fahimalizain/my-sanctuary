@@ -123,15 +123,19 @@ export function CalendarWeekGrid({
       <div
         ref={scrollerRef}
         data-calendar-scroller
-        className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden snap-x snap-mandatory [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        className="flex-1 min-h-0 overflow-auto snap-x snap-mandatory [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
         // Day columns snap (snap-start) to the track's left edge, i.e. just
         // right of the sticky gutter; padding = gutter keeps them aligned there.
-        // One axis per gesture: `overflow-x: hidden` makes the strip
-        // programmatically scrollable but *not* user-scrollable, so the browser
-        // can never pan it sideways — not even on Safari, where `touch-action:
-        // pan-y` does not reliably rail a touch. Horizontal movement is driven
-        // entirely by useCalendarStrip (touch swipe, trackpad burst).
-        // `pan-y` still keeps vertical touch panning native.
+        // Both axes stay user-scrollable — `overflow-x: hidden` is *not* a way
+        // to rail the strip sideways: on iOS a vertical pan re-evaluates the
+        // mandatory x-snap, the x axis is not user-scrollable, and WebKit
+        // collapses the target to the first snap column (scrollLeft 0, the
+        // oldest overscan day), which the rebase then repeats — the strip flies
+        // backwards through history dates.
+        // The x axis is programmatically driven instead (touch swipe, trackpad
+        // burst, drag autoscroll): `touch-action: pan-y` keeps a touch single
+        // axis, and `useCalendarStrip` rejects any `scrollLeft` the browser
+        // moves on its own.
         style={{ scrollPaddingLeft: gutterW }}
         onScroll={onScroll}
       >
