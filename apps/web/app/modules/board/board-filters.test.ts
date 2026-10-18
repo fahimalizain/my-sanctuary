@@ -6,6 +6,7 @@ import {
   categoryMatchesSelection,
   categoryTriggerLabel,
   childIdsOf,
+  countActiveFilterGroups,
   expandCategorySelection,
   isImpliedByParent,
   selectedCategoryRows,
@@ -548,5 +549,84 @@ test('taskMatchesSearch: present in both title and description still matches', (
   assert.equal(
     taskMatchesSearch(card('Plan review', 'review notes'), 'review'),
     true,
+  );
+});
+
+// ── countActiveFilterGroups ──────────────────────────────────────────────
+
+// One helper feeds both the page-level "Clear filters" affordance and the
+// mobile filter badge, so the two can never disagree. `categoryIds` is the
+// RESOLVED list (unknown URL ids already dropped by the caller) — this helper
+// never sees the raw `?category=` string.
+
+test('countActiveFilterGroups: nothing selected → 0', () => {
+  assert.equal(
+    countActiveFilterGroups({
+      priority: undefined,
+      difficulty: undefined,
+      categoryIds: [],
+      search: undefined,
+    }),
+    0,
+  );
+});
+
+test('countActiveFilterGroups: priority only, difficulty only, one category → 1 each', () => {
+  assert.equal(
+    countActiveFilterGroups({ priority: 'high', categoryIds: [] }),
+    1,
+  );
+  assert.equal(
+    countActiveFilterGroups({ difficulty: 'hard', categoryIds: [] }),
+    1,
+  );
+  assert.equal(countActiveFilterGroups({ categoryIds: ['root-dev'] }), 1);
+});
+
+test('countActiveFilterGroups: category counts ONCE however many ids are selected', () => {
+  assert.equal(
+    countActiveFilterGroups({
+      categoryIds: ['root-dev', 'child-frontend', 'child-ui'],
+    }),
+    1,
+  );
+});
+
+test('countActiveFilterGroups: a padded but non-blank search is one group', () => {
+  assert.equal(
+    countActiveFilterGroups({ categoryIds: [], search: '  roadmap  ' }),
+    1,
+  );
+});
+
+test('countActiveFilterGroups: empty, whitespace-only and undefined searches are not filters', () => {
+  assert.equal(countActiveFilterGroups({ categoryIds: [], search: '' }), 0);
+  assert.equal(countActiveFilterGroups({ categoryIds: [], search: '   ' }), 0);
+  assert.equal(
+    countActiveFilterGroups({ categoryIds: [], search: undefined }),
+    0,
+  );
+});
+
+test('countActiveFilterGroups: all four groups → 4', () => {
+  assert.equal(
+    countActiveFilterGroups({
+      priority: 'low',
+      difficulty: 'medium',
+      categoryIds: ['root-dev', 'child-frontend', 'child-ui'],
+      search: 'review',
+    }),
+    4,
+  );
+});
+
+test('countActiveFilterGroups: priority + three categories + whitespace search → 2', () => {
+  assert.equal(
+    countActiveFilterGroups({
+      priority: 'high',
+      categoryIds: ['root-dev', 'child-frontend', 'child-ui'],
+      search: '   ',
+    }),
+    2,
   );
 });

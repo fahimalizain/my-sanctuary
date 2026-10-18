@@ -12,8 +12,15 @@ import type {
   DragOverEvent,
   DragStartEvent,
 } from '@dnd-kit/core';
-import { Loader2, Plus } from 'lucide-react';
+import { Loader2, Plus, SlidersHorizontal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
+import { cn } from '@/lib/utils';
 import { setBoardTasksBusy } from '@/app/background-sync/board-tasks-busy';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
@@ -30,8 +37,6 @@ import {
   useUpdateTask,
 } from '@/app/queries/tasks';
 import {
-  TASK_PRIORITIES,
-  TASK_PRIORITY_LABELS,
   type FocusTaskResponse,
   type MoveTaskInput,
   type MoveTaskResponse,
@@ -43,8 +48,8 @@ import {
   type TaskStatus,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
-import { CategoryFilter } from './CategoryFilter';
-import { FilterPill } from './FilterPill';
+import { BoardColumnTabs } from './BoardColumnTabs';
+import { BoardFilters } from './BoardFilters';
 import { TaskCard } from './TaskCard';
 import {
   boardCollisionDetection,
@@ -59,6 +64,7 @@ import {
 import type { BoardColumnItems } from './board-dnd';
 import {
   categoryMatchesSelection,
+  countActiveFilterGroups,
   taskMatchesSearch,
   toggleCategoryId,
 } from './board-filters';
@@ -71,6 +77,7 @@ import {
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
+import { pickVisibleColumn } from './board-scroll';
 
 interface TaskFormState {
   mode: 'create' | 'edit';
@@ -171,8 +178,121 @@ export function BoardPage() {
   // still-visible board — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // The board (mobile tab row + scroller) is hidden only when there is
+  // nothing to show: first load in flight, or a load error that replaced
+  // the board. One boolean, so the scroller, the tabs and the observer can
+  // never disagree about whether the board is mounted — the observer effect
+  // depends on it to re-run once the scroller ref exists.
+  const boardShown = lists.length > 0 || (!isLoading && !loadError);
+
+  // ──────────────────────────────────────────
+  // Mobile column tabs (below md)
+  // ──────────────────────────────────────────
+
+  // Column currently in view. Written by the IntersectionObserver below as
+  // the user swipes, and immediately on a tab tap so the highlight never
+  // waits for the smooth scroll to land.
+  const [activeColumn, setActiveColumn] = useState<TaskStatus>(
+    COLUMNS[0].status,
+  );
+  // The horizontal column scroller — also the IntersectionObserver root:
+  // the columns are clipped by THIS box, not by the viewport, so viewport
+  // roots would measure columns hidden behind the page's own clip.
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  // Cumulative intersection ratio per column. IntersectionObserver only
+  // reports entries that crossed a threshold, so the max of one batch can
+  // be a 0.15 peek while the truly-visible column (0.9) simply did not
+  // change this frame. Merge every batch here and let the helper pick.
+  const ratiosRef = useRef<Record<string, number>>({});
+  // A tab tap's smooth scroll is in flight: ignore observer updates so the
+  // highlight stays on the tapped column instead of flickering through the
+  // columns it pans past.
+  const programmaticScroll = useRef(false);
+
+  useEffect(() => {
+    const root = scrollerRef.current;
+    if (!boardShown || !root) return;
+    const targets = [
+      ...root.querySelectorAll<HTMLElement>('[data-board-column]'),
+    ];
+    if (targets.length === 0) return;
+    ratiosRef.current = {};
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const next = { ...ratiosRef.current };
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.boardColumn;
+          if (id) next[id] = entry.intersectionRatio;
+        }
+        ratiosRef.current = next;
+        // Ignore updates during a programmatic tab scroll (see below).
+        if (programmaticScroll.current) return;
+        const picked = pickVisibleColumn(
+          next,
+          COLUMNS.map((column) => column.status),
+        );
+        if (picked) setActiveColumn(picked as TaskStatus);
+      },
+      // Five thresholds: below md a snapped column covers most of the
+      // scroller and the next only peeks, so the winner stays stable
+      // instead of flipping on every pixel of a drag.
+      { root, threshold: [0, 0.25, 0.5, 0.75, 1] },
+    );
+    for (const target of targets) observer.observe(target);
+    return () => observer.disconnect();
+  }, [boardShown]);
+
+  /** Tab tap → pan the scroller to that column. The scroll itself is what
+   *  moves the board: the tabs never reorder or re-mount columns. */
+  const scrollToColumn = (status: TaskStatus) => {
+    const root = scrollerRef.current;
+    const target = root?.querySelector<HTMLElement>(
+      `[data-board-column="${status}"]`,
+    );
+    if (!root || !target) return;
+    setActiveColumn(status);
+    programmaticScroll.current = true;
+    // `inline: 'start'` honors the scroller's scroll-padding (scroll-px-4),
+    // so the column lands on the same inset snap-start uses. `block:
+    // 'nearest'` so no ancestor scrolls vertically.
+    target.scrollIntoView({
+      behavior: 'smooth',
+      inline: 'start',
+      block: 'nearest',
+    });
+    const release = () => {
+      programmaticScroll.current = false;
+    };
+    root.addEventListener('scrollend', release, { once: true });
+    // scrollend is missing on older WebKit; don't leave the guard stuck.
+    window.setTimeout(() => {
+      root.removeEventListener('scrollend', release);
+      release();
+    }, 600);
+  };
+
   // Task dialog state.
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
+
+  // Mobile filters sheet (below md only). The inline filter row stays mounted
+  // behind `hidden md:block`, so crossing to md+ with the sheet open would
+  // leave two filter UIs on screen — close on the media query itself
+  // (rotation, window resize, desktop DevTools) rather than on a render.
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  // Portal host for the sheet's category panel (see CategoryFilter's
+  // `portalContainer`). A callback ref, so it is populated the commit the
+  // sheet mounts; `null` means "not mounted yet" and the panel renders
+  // nothing rather than falling back to document.body.
+  const [portalEl, setPortalEl] = useState<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 768px)');
+    const closeIfDesktop = () => {
+      if (mq.matches) setFiltersOpen(false);
+    };
+    mq.addEventListener('change', closeIfDesktop);
+    return () => mq.removeEventListener('change', closeIfDesktop);
+  }, []);
 
   // Mouse: 8px so a click still opens the modal (ADR 0002 § DnD).
   // Touch: PointerSensor loses to the board's overflow-x pan (and Chrome
@@ -206,22 +326,19 @@ export function BoardPage() {
   // URL filters (ADR 0002 § Filters)
   // ──────────────────────────────────────────
 
-  // Filter chips are built from the loaded categories; untracked is a
-  // system category that is never offered as a filter chip. Untracked
-  // cards are not hidden from the columns, and a `?category=` URL that
-  // names the sink still matches (the sink id is in `categories`).
-  const filterableCategories = useMemo(
-    () => categories.filter((cat) => !cat.is_untracked),
-    [categories],
-  );
-
+  // Resolves the URL's explicit category ids. Untracked is a system category
+  // that is never offered as a filter chip (that derivation now lives in
+  // `BoardFilters`), but its id stays resolvable here: untracked cards are
+  // still visible in their columns, and a `?category=` URL naming the sink
+  // still matches. Unknown ids are ignored (ADR 0002) — they cannot match any
+  // task's computed category.
   const categoryById = useMemo(
     () => new Map(categories.map((cat) => [cat.id, cat])),
     [categories],
   );
 
-  // Unknown ids from the URL are ignored (ADR 0002): they cannot match any
-  // task's computed category.
+  // Resolved explicit ids: the category control and `matchesFilters` below
+  // read the same list.
   const selectedCategoryIds = useMemo(() => {
     if (!category) return [];
     return category
@@ -230,11 +347,19 @@ export function BoardPage() {
       .filter((id) => id.length > 0 && categoryById.has(id));
   }, [category, categoryById]);
 
-  const hasActiveFilters =
-    priority !== undefined ||
-    difficulty !== undefined ||
-    selectedCategoryIds.length > 0 ||
-    (search ?? '').trim().length > 0;
+  // Badge count for the mobile Filters button — the page's only read of the
+  // helper. `BoardFilters` derives its own "are filters active?" boolean for
+  // the Clear filters affordance from these same four groups
+  // (`countActiveFilterGroups`), so the badge and the affordance share one
+  // source of truth and can never disagree (ADR 0002 § UI). Category counts
+  // once however many ids are selected; a whitespace-only search is not a
+  // filter.
+  const activeFilterCount = countActiveFilterGroups({
+    priority,
+    difficulty,
+    categoryIds: selectedCategoryIds,
+    search,
+  });
 
   // Merges the given fields into the URL search params. Only keys that are
   // PRESENT in `updates` are touched: an explicitly `undefined` value removes
@@ -855,26 +980,75 @@ export function BoardPage() {
     return null;
   };
 
+  // Viewport-locked page (same height idiom as CalendarPage): the root is a
+  // fixed 100dvh flex column that never grows with column content, so the
+  // header and filters hold their place and only a column body scrolls.
   return (
-    <div className="flex min-h-screen flex-col bg-cream">
-      <div className="mx-auto w-full max-w-7xl px-6 pt-8">
-        {/* Header */}
-        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+    <div className="flex h-[100dvh] flex-col overflow-hidden bg-cream">
+      {/* Header, banners, loader and filters — fixed height (shrink-0), so
+          everything below them is the leftover viewport. */}
+      <div className="mx-auto w-full max-w-7xl shrink-0 px-6 pt-4 md:pt-8">
+        {/* Header. Below md it is ONE compact row — title + icon buttons —
+            and the filters live in the sheet; from md up it is the original
+            row (subtitle, full labels, gap-4, mb-8). */}
+        <header className="mb-4 flex flex-row items-center justify-between gap-3 md:mb-8 md:gap-4">
           <div>
-            <h1 className="font-heading text-3xl font-bold text-foreground mb-2">
+            <h1 className="font-heading text-2xl font-bold text-foreground md:mb-2 md:text-3xl">
               Board
             </h1>
-            <p className="text-muted-foreground">
+            <p className="hidden text-muted-foreground md:block">
               Backlog, Planned, In Progress, Done, Discarded
             </p>
           </div>
-          <div className="flex shrink-0 gap-3">
-            <Button variant="outline" onClick={() => openCreateTask('OPEN')}>
+          {/* Mobile shortcuts first, desktop pair after; `hidden md:inline-flex`
+              overrides Button's base `inline-flex` through tailwind-merge. */}
+          <div className="flex shrink-0 gap-2 md:gap-3">
+            <Button
+              variant="outline"
+              size="icon"
+              className="md:hidden"
+              aria-label="New task"
+              onClick={() => openCreateTask('OPEN')}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              className="relative md:hidden"
+              aria-haspopup="dialog"
+              aria-expanded={filtersOpen}
+              aria-label={
+                activeFilterCount === 0
+                  ? 'Filters'
+                  : `Filters, ${activeFilterCount} active`
+              }
+              onClick={() => setFiltersOpen(true)}
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+              {/* Group count, not a chip: the `Badge` component is far too
+                  large for a 40px icon button. aria-hidden — the count is
+                  already in the button's label. */}
+              {activeFilterCount > 0 && (
+                <span
+                  aria-hidden
+                  className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-medium leading-none text-primary-foreground"
+                >
+                  {activeFilterCount}
+                </span>
+              )}
+            </Button>
+            <Button
+              variant="outline"
+              className="hidden md:inline-flex"
+              onClick={() => openCreateTask('OPEN')}
+            >
               <Plus className="h-4 w-4 mr-2" />
               New Task
             </Button>
             <Button
               variant="outline"
+              className="hidden md:inline-flex"
               onClick={() => navigate({ to: '/categories' })}
             >
               Edit Categories
@@ -934,127 +1108,64 @@ export function BoardPage() {
         {/* Board — hidden only when there is nothing to show (first load in
             flight, or a load error that replaced the board). Action errors
             never unmount it. */}
-        {(lists.length > 0 || (!isLoading && !loadError)) && (
-          /* URL filters — one wrapping horizontal row (ADR 0002 § UI):
-                Priority and Difficulty are single-select All+value pills;
-                Category is a searchable checkbox combobox grouped by list →
-                root → children; Search is a free-text title/description
-                filter driven by `?search=` (each keystroke rewrites the
-                param, whitespace-only removes it). Clear filters sits on
-                this same row, aligned with the controls. Filters combine
-                with AND. */
-          <section className="mb-6">
-            <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
-              <div className="flex flex-col items-start gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Priority
-                </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  <FilterPill
-                    selected={priority === undefined}
-                    onClick={() => setPriorityFilter(undefined)}
-                  >
-                    All
-                  </FilterPill>
-                  {TASK_PRIORITIES.map((value) => (
-                    <FilterPill
-                      key={value}
-                      selected={priority === value}
-                      onClick={() => setPriorityFilter(value)}
-                    >
-                      {TASK_PRIORITY_LABELS[value]}
-                    </FilterPill>
-                  ))}
-                </div>
-              </div>
-
-              <div className="flex flex-col items-start gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Difficulty
-                </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  <FilterPill
-                    selected={difficulty === undefined}
-                    onClick={() => setDifficultyFilter(undefined)}
-                  >
-                    All
-                  </FilterPill>
-                  {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
-                    (value) => (
-                      <FilterPill
-                        key={value}
-                        selected={difficulty === value}
-                        onClick={() => setDifficultyFilter(value)}
-                      >
-                        {value[0].toUpperCase() + value.slice(1)}
-                      </FilterPill>
-                    ),
-                  )}
-                </div>
-              </div>
-
-              <div className="flex flex-col items-start gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Category
-                </span>
-                {filterableCategories.length > 0 ? (
-                  <CategoryFilter
-                    lists={lists}
-                    categories={categories}
-                    selectedIds={selectedCategoryIds}
-                    onToggle={toggleCategoryFilter}
-                    onClear={() => updateSearch({ category: undefined })}
-                  />
-                ) : (
-                  <span className="text-sm text-muted-foreground italic">
-                    No categories yet
-                  </span>
-                )}
-              </div>
-
-              <div className="flex flex-col items-start gap-1.5">
-                <label
-                  htmlFor="board-task-search"
-                  className="text-xs font-medium uppercase tracking-wide text-muted-foreground"
-                >
-                  Search
-                </label>
-                {/* type="text" (never "search" — that paints a native
-                    cancel button); every keystroke writes `?search=` via
-                    updateSearch (replace: true), which treats whitespace-only
-                    as delete. Focus border only — never the primary fill. */}
-                <input
-                  id="board-task-search"
-                  type="text"
-                  value={search ?? ''}
-                  onChange={(event) =>
-                    updateSearch({ search: event.target.value })
-                  }
-                  placeholder="Search tasks"
-                  className="w-56 min-w-0 rounded-xl border-2 border-input bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:border-primary transition-all"
-                />
-              </div>
-
-              {hasActiveFilters && (
-                <button
-                  type="button"
-                  onClick={clearFilters}
-                  className="shrink-0 py-1.5 text-sm font-medium text-primary hover:underline"
-                >
-                  Clear filters
-                </button>
-              )}
-            </div>
+        {boardShown && (
+          <section className="mb-6 hidden md:block">
+            {/* Filter chrome lives in the shared `BoardFilters` (the mobile
+                sheet renders the same component); every URL write stays in
+                this page and is handed down as a callback (ADR 0002 § UI).
+                Left MOUNTED (hidden, not unmounted) so the two copies share
+                one state — which is why the sheet passes its own
+                `searchInputId` and no portal container here. */}
+            <BoardFilters
+              layout="row"
+              priority={priority}
+              difficulty={difficulty}
+              search={search}
+              lists={lists}
+              categories={categories}
+              selectedCategoryIds={selectedCategoryIds}
+              onPriority={setPriorityFilter}
+              onDifficulty={setDifficultyFilter}
+              onToggleCategory={toggleCategoryFilter}
+              onClearCategories={() => updateSearch({ category: undefined })}
+              onSearch={(value) => updateSearch({ search: value })}
+              onClearFilters={clearFilters}
+            />
           </section>
         )}
       </div>
 
-      {(lists.length > 0 || (!isLoading && !loadError)) && (
-        /* Five status columns. The scroller fills leftover viewport
-                height so empty space below the columns still pans. Columns
-                are a fixed 260px; the row stays centered and overflow-x
-                on narrow screens. mb-24 sits the scrollbar just above
-                the floating nav. */
+      {/* Mobile column tabs — a single thin row between the header block
+          and the board scroller (below md; hidden from md up, where every
+          column is already on screen). A DIRECT flex child of the page
+          root, NOT inside the scroller or the DndContext: the controls must
+          neither pan with the columns nor take part in a drag. Counts are
+          `displayTasks` — the same filtered + capped array the column
+          header pills show, including the in-drag preview. */}
+      {boardShown && (
+        <BoardColumnTabs
+          tabs={COLUMNS.map((column) => ({
+            status: column.status,
+            title: column.title,
+            count: displayTasks(column.status).length,
+          }))}
+          activeStatus={activeColumn}
+          onSelect={scrollToColumn}
+        />
+      )}
+
+      {boardShown && (
+        /* Five status columns (ADR 0002 § UI). The page is a fixed 100dvh
+                column, so this scroller takes exactly the height the header
+                and filters leave over and pans horizontally only
+                (`overflow-y-hidden`) — the vertical scroll lives in each
+                column body. Columns are `85vw` below md and a fixed 260px
+                from md up; below md the row snap-scrolls so the next column
+                peeks in, with snapping OFF while a card is dragged so
+                dnd-kit's horizontal auto-scroll can carry it into an
+                off-screen column. The row stays centered and overflows
+                sideways on narrow screens, and `mb-24` sits the scrollbar
+                just above the floating nav. */
         <DndContext
           sensors={sensors}
           collisionDetection={boardCollisionDetection}
@@ -1068,8 +1179,17 @@ export function BoardPage() {
             setDragItems(null);
           }}
         >
-          <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
-            <div className="mx-auto flex min-h-full w-max gap-6 px-6">
+          <div
+            ref={scrollerRef}
+            className={cn(
+              'mb-24 min-h-0 flex-1 overflow-x-auto overflow-y-hidden pb-2',
+              // mandatory snap fights dnd-kit: it writes scrollLeft every frame and
+              // the browser snaps back, so a card can never reach an off-screen column.
+              activeDrag === null &&
+                'max-md:snap-x max-md:snap-mandatory max-md:scroll-px-4',
+            )}
+          >
+            <div className="mx-auto flex h-full w-max gap-4 px-4 md:gap-6 md:px-6">
               {COLUMNS.map((column) => (
                 <BoardColumnView
                   key={column.status}
@@ -1096,6 +1216,94 @@ export function BoardPage() {
           </DragOverlay>
         </DndContext>
       )}
+
+      {/* Mobile filters sheet (below md — the inline row is `hidden md:block`
+          and both stay mounted, so each copy has its own search input id).
+          Radix portals it, so it sits here next to TaskModal, never inside
+          the board scroller. Filters apply live: no Apply button, and the
+          only dismissal is Escape / backdrop / the X. */}
+      <Sheet open={filtersOpen} onOpenChange={setFiltersOpen}>
+        <SheetContent
+          onEscapeKeyDown={(event) => {
+            // The category panel open INSIDE this sheet must swallow Escape:
+            // Radix listens for Escape in the CAPTURE phase (registered when
+            // the dialog opens), so it has already decided to dismiss by the
+            // time CategoryFilter's own bubble listener runs — preventing
+            // default is only possible here. The panel's listener then closes
+            // just the panel, leaving the sheet mounted.
+            //
+            // Scope the check to the sheet's own host: `event.currentTarget`
+            // is `document`, and a `document.querySelector` would also find
+            // the DESKTOP row's panel (portaled to `document.body`) while the
+            // sheet happens to be open. Only the in-sheet panel lives here.
+            if (portalEl?.querySelector('[data-category-filter-panel]')) {
+              event.preventDefault();
+            }
+          }}
+        >
+          {/* The visible shell: rounded top corners and the scroll clip live
+              HERE, not on SheetContent — the sheet frame must stay
+              `overflow-visible` so the category panel (portaled into the host
+              below) can grow past the shell. `max-h`, never `h`: a short
+              filter stack must not force an 85dvh empty panel. */}
+          <div className="flex max-h-[85dvh] flex-col overflow-hidden rounded-t-2xl border border-border bg-card shadow-lg">
+            <SheetHeader className="shrink-0 px-4 pb-2 pr-12 pt-4 text-left">
+              <SheetTitle>Filters</SheetTitle>
+            </SheetHeader>
+            {/* min-h-0 + flex-1: once the shell hits 85dvh the controls scroll
+                inside the sheet instead of pushing it taller. The safe-area
+                padding keeps the last control off the home indicator. */}
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+              <BoardFilters
+                layout="stack"
+                // The inline row is still mounted behind `hidden md:block`, so
+                // the two copies must not share an input id — its `htmlFor`
+                // would point at the hidden field.
+                searchInputId="board-task-search-sheet"
+                priority={priority}
+                difficulty={difficulty}
+                search={search}
+                lists={lists}
+                categories={categories}
+                selectedCategoryIds={selectedCategoryIds}
+                onPriority={setPriorityFilter}
+                onDifficulty={setDifficultyFilter}
+                onToggleCategory={toggleCategoryFilter}
+                onClearCategories={() => updateSearch({ category: undefined })}
+                onSearch={(value) => updateSearch({ search: value })}
+                onClearFilters={clearFilters}
+                // The category panel must be a DESCENDANT of the dialog
+                // content or Radix focus/outside-click break; `null` until the
+                // host below mounts, so CategoryFilter never falls back to
+                // document.body.
+                categoryPortalContainer={portalEl}
+              />
+              {/* Always shown, filters or not (the desktop header button is
+                  unreachable from here). Closes first so the sheet is not
+                  left open behind the categories route. */}
+              <button
+                type="button"
+                className="mt-4 py-1.5 text-sm font-medium text-primary hover:underline"
+                onClick={() => {
+                  setFiltersOpen(false);
+                  navigate({ to: '/categories' });
+                }}
+              >
+                Edit Categories
+              </button>
+            </div>
+          </div>
+          {/* Portal host for the category panel: a SIBLING of the shell (the
+              shell clips) pinned to the whole SheetContent frame, which is
+              `fixed` and therefore the containing block. `pointer-events-none`
+              so taps pass through to the form; the panel re-enables pointers
+              on itself, and `overflow-visible` lets it extend past the frame. */}
+          <div
+            ref={setPortalEl}
+            className="pointer-events-none absolute inset-0 z-10 overflow-visible"
+          />
+        </SheetContent>
+      </Sheet>
 
       {/* New / Edit Task Dialog — edit mode carries the immediate status
           pills (onMove) */}

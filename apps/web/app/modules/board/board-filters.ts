@@ -1,4 +1,9 @@
-import type { Category, TaskList } from '../../types';
+import type {
+  Category,
+  TaskDifficulty,
+  TaskList,
+  TaskPriority,
+} from '../../types';
 
 // Pure category-filter and task-search helpers for the board (ADR 0002
 // § Filters, amended 2026-08-20). No React, no DOM, no fetch — unit-tested
@@ -113,6 +118,33 @@ export function taskMatchesSearch(
     task.title.toLowerCase().includes(q) ||
     task.description.toLowerCase().includes(q)
   );
+}
+
+/**
+ * How many distinct filter groups currently narrow the board (0–4):
+ * priority, difficulty, category, search. The board's "Clear filters"
+ * affordance and the mobile filter badge both read this one helper, so the
+ * button and the badge can never disagree (ADR 0002 § UI).
+ *
+ * - category counts ONCE however many ids are selected (three ids is still
+ *   one group); `categoryIds` is the RESOLVED list — unknown URL ids already
+ *   dropped by the caller — so a stale `?category=ghost` is not a filter.
+ * - a whitespace-only search is not a filter, matching `updateSearch`'s
+ *   own "whitespace-only removes the param" rule.
+ */
+export function countActiveFilterGroups(filters: {
+  priority?: TaskPriority;
+  difficulty?: TaskDifficulty;
+  /** Already-resolved category ids (unknown URL ids dropped). */
+  categoryIds: readonly string[];
+  search?: string;
+}): number {
+  let count = 0;
+  if (filters.priority !== undefined) count += 1;
+  if (filters.difficulty !== undefined) count += 1;
+  if (filters.categoryIds.length > 0) count += 1;
+  if ((filters.search ?? '').trim().length > 0) count += 1;
+  return count;
 }
 
 export type CategoryTreeRoot = {
