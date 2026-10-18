@@ -3,9 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  NOTION_EVENT_COLORS,
   isEventPast,
-  notionBaseHex,
   notionEventCssVars,
   notionEventTheme,
 } from './event-colors';
@@ -143,81 +141,6 @@ test('notionEventCssVars: same hex returns the same object', () => {
   assert.equal(notionEventCssVars('#ed201d'), notionEventCssVars('#ED201D'));
 });
 
-// ── Google colorId → Notion palette ─────────────────────────────────────
-
-const COLOR_ID_TABLE: ReadonlyArray<readonly [string, string]> = [
-  ['#7986cb', '#9a9cfe'],
-  ['#33b679', '#92e1c1'],
-  ['#8e24aa', '#985df6'],
-  ['#e67c73', '#d06b65'],
-  ['#f6bf26', '#f4be40'],
-  ['#f4511e', '#fd7941'],
-  ['#039be5', '#4ca8df'],
-  ['#616161', '#b8b8b8'],
-  ['#3f51b5', '#4986e8'],
-  ['#0b8043', '#5ecc89'],
-  ['#d50000', '#ed201d'],
-];
-
-test('notionBaseHex: every Google colorId hex maps to its Notion hex', () => {
-  for (const [google, notion] of COLOR_ID_TABLE) {
-    assert.equal(notionBaseHex(google), notion, google);
-    assert.equal(notionBaseHex(google.toUpperCase()), notion, google);
-  }
-  assert.equal(notionBaseHex('#D50000'), '#ed201d');
-  assert.equal(notionBaseHex('  #d50000  '), '#ed201d');
-});
-
-test('notionBaseHex: non-colorId hexes pass through trimmed, not lowercased', () => {
-  const passthrough = [
-    '#7cb342',
-    '#e4c441',
-    '#c45a2c',
-    '#009688',
-    '#795548',
-    '#ef6c00',
-    '#4a5c8a',
-    '#7a4a6a',
-    '#8a6a2c',
-  ];
-  for (const hex of passthrough) {
-    assert.equal(notionBaseHex(hex), hex);
-  }
-  assert.equal(notionBaseHex('#7CB342'), '#7CB342');
-  assert.equal(notionBaseHex('#039BE5'), '#4ca8df');
-});
-
-// ── Palette ─────────────────────────────────────────────────────────────
-
-test('NOTION_EVENT_COLORS: 17 colors in hash order', () => {
-  assert.deepEqual(NOTION_EVENT_COLORS, [
-    '#ed201d',
-    '#d06b65',
-    '#fd7941',
-    '#f4be40',
-    '#b3dc6d',
-    '#7bd149',
-    '#5ecc89',
-    '#92e1c1',
-    '#4ca8df',
-    '#4986e8',
-    '#9a9cfe',
-    '#b99afe',
-    '#985df6',
-    '#f691b3',
-    '#cca6ad',
-    '#ac725f',
-    '#b8b8b8',
-  ]);
-  assert.equal(NOTION_EVENT_COLORS.length, 17);
-});
-
-test('NOTION_EVENT_COLORS: contains every mapped Notion hex', () => {
-  for (const [, notion] of COLOR_ID_TABLE) {
-    assert.ok(NOTION_EVENT_COLORS.includes(notion), notion);
-  }
-});
-
 // ── Formatting across real data and edge inputs ────────────────────────
 
 const FORMAT_HEXES = [
@@ -248,8 +171,7 @@ const FORMAT_HEXES = [
 
 test('notionEventTheme: both themes stay valid rgb() for every input', () => {
   for (const hex of FORMAT_HEXES) {
-    const base = notionBaseHex(hex);
-    const theme = notionEventTheme(base);
+    const theme = notionEventTheme(hex);
     for (const mode of ['light', 'dark'] as const) {
       const tone = theme[mode];
       for (const field of TONE_FIELDS) {
@@ -260,15 +182,13 @@ test('notionEventTheme: both themes stay valid rgb() for every input', () => {
   }
 });
 
-test('notionEventTheme: mapped Google colors reuse the palette theme', () => {
-  assert.equal(
-    notionEventTheme(notionBaseHex('#d50000')),
-    notionEventTheme('#ed201d'),
+test('notionEventTheme: the passed hex is not remapped onto a palette', () => {
+  assert.notEqual(notionEventTheme('#d50000'), notionEventTheme('#ed201d'));
+  assert.notEqual(
+    notionEventTheme('#d50000').dark.backgroundSecondary,
+    'rgb(108, 41, 32)',
   );
-  assert.equal(
-    notionEventTheme(notionBaseHex('#616161')),
-    notionEventTheme('#b8b8b8'),
-  );
+  assert.notEqual(notionEventTheme('#616161'), notionEventTheme('#b8b8b8'));
 });
 
 // ── isEventPast ─────────────────────────────────────────────────────────

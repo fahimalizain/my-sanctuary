@@ -1,4 +1,5 @@
-// Notion Calendar event chip colors: a self-contained CIECAM02 JCh port.
+// Notion Calendar event chip colors: a self-contained CIECAM02 JCh port that
+// derives washed chip tones from whatever hex the caller passes.
 // Viewing conditions match d3-cam02's defaults (D65, La = 64/π/5, Yb = 20).
 
 interface Rgb {
@@ -310,49 +311,6 @@ function cssLuminance(css: string): number {
   const g = srgbToLinearLuminance(Number(match[2]) / 255);
   const b = srgbToLinearLuminance(Number(match[3]) / 255);
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-
-// ── Palette ─────────────────────────────────────────────────────────────
-
-/** Notion's 17 chip palette, in hash order. */
-export const NOTION_EVENT_COLORS: readonly string[] = [
-  '#ed201d', // red
-  '#d06b65', // coral
-  '#fd7941', // orange
-  '#f4be40', // yellow
-  '#b3dc6d', // lime
-  '#7bd149', // grass
-  '#5ecc89', // green
-  '#92e1c1', // mint
-  '#4ca8df', // blue
-  '#4986e8', // sapphire
-  '#9a9cfe', // indigo
-  '#b99afe', // violet
-  '#985df6', // purple
-  '#f691b3', // pink
-  '#cca6ad', // blush
-  '#ac725f', // brown
-  '#b8b8b8', // gray
-];
-
-const GOOGLE_TO_NOTION: Readonly<Record<string, string>> = {
-  '#7986cb': '#9a9cfe',
-  '#33b679': '#92e1c1',
-  '#8e24aa': '#985df6',
-  '#e67c73': '#d06b65',
-  '#f6bf26': '#f4be40',
-  '#f4511e': '#fd7941',
-  '#039be5': '#4ca8df',
-  '#616161': '#b8b8b8',
-  '#3f51b5': '#4986e8',
-  '#0b8043': '#5ecc89',
-  '#d50000': '#ed201d',
-};
-
-/** GCal event-colorId hex → Notion palette hex; anything else returned trimmed, unchanged. */
-export function notionBaseHex(hex: string): string {
-  const trimmed = hex.trim();
-  return GOOGLE_TO_NOTION[trimmed.toLowerCase()] ?? trimmed;
 }
 
 // ── Theme derivation ────────────────────────────────────────────────────
