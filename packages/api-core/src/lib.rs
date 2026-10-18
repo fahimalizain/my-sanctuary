@@ -22,6 +22,7 @@ pub mod pattern_gen;
 pub mod realtime;
 pub mod repo;
 pub mod routines;
+pub mod rules;
 pub mod tasks;
 pub mod time;
 pub mod token;
@@ -114,6 +115,15 @@ pub use routines::{
     create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
     validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,
     RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
+};
+pub use rules::{
+    archive_rules, create_global_pause, create_rule, delete_pause, digest_load_floor,
+    ensure_default_rules, list_pauses, pause_rule, reorder_rules, resume_rule, rule_phase,
+    score_board, score_rule, scoreboard, set_rule_archived, today, update_rule, ArchiveResponse,
+    BoardInput, CategoryCatalog, DigestFlags, DigestSlice, NewPauseInput, NewRuleInput, NewRuleRow,
+    PausePeriod, PauseResponse, PauseRow, PauseRuleInput, PauseView, PausesResponse, ReorderInput,
+    Revision, RevisionRow, RuleKind, RuleParams, RulePhase, RuleRepo, RuleRow, RuleScore, RuleSpec,
+    RuleStatus, RulesError, Scoreboard, UpdateRuleInput, SEED_HISTORY_DAYS,
 };
 pub use repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_delete_by_ids_sql,

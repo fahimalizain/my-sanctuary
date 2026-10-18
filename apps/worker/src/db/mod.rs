@@ -117,6 +117,9 @@ pub use calendar::*;
 pub mod digest;
 pub use digest::*;
 
+pub mod rules;
+pub use rules::*;
+
 /// `users` table persistence.
 pub struct D1UserRepo {
     db: D1Database,

@@ -6,12 +6,14 @@
 
 mod digest;
 mod repos;
+mod rules;
 
 pub use digest::{calendar_owner, count_rows, event_span, mark_dirty_spans, SqliteDigestRepo};
 pub use repos::{
     SqliteCalendarEventRepo, SqliteCalendarEventOperationRepo, SqliteCalendarRepo, SqliteTokenRepo,
     SqliteWatchChannelRepo,
 };
+pub use rules::{seed_category, seed_category_seconds, SqliteRuleRepo};
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,11 @@ impl Harness {
     /// A digest repo over the same connection (one D1 database).
     pub fn digest(&self) -> SqliteDigestRepo {
         SqliteDigestRepo::new(Arc::clone(&self.db))
+    }
+
+    /// A rules repo over the same connection (one D1 database).
+    pub fn rules(&self) -> SqliteRuleRepo {
+        SqliteRuleRepo::new(Arc::clone(&self.db))
     }
 }
 

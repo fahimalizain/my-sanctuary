@@ -9,6 +9,7 @@ mod lists;
 mod queue;
 mod reports;
 mod routines;
+mod rules;
 mod sync_log;
 mod tasks;
 mod user_hub;
@@ -143,6 +144,29 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/routines/:id", auth::options)
         .get_async("/api/reports/status", reports::status)
         .options("/api/reports/status", auth::options)
+        .get_async("/api/rules/scoreboard", rules::scoreboard)
+        .get_async("/api/rules/archive", rules::archive)
+        .post_async("/api/rules", rules::create_rule)
+        .post_async("/api/rules/reorder", rules::reorder_rules)
+        .patch_async("/api/rules/:id", rules::update_rule)
+        .post_async("/api/rules/:id/pause", rules::pause_rule)
+        .post_async("/api/rules/:id/resume", rules::resume_rule)
+        .post_async("/api/rules/:id/archive", rules::archive_rule)
+        .post_async("/api/rules/:id/restore", rules::restore_rule)
+        .options("/api/rules", auth::options)
+        .options("/api/rules/scoreboard", auth::options)
+        .options("/api/rules/archive", auth::options)
+        .options("/api/rules/reorder", auth::options)
+        .options("/api/rules/:id", auth::options)
+        .options("/api/rules/:id/pause", auth::options)
+        .options("/api/rules/:id/resume", auth::options)
+        .options("/api/rules/:id/archive", auth::options)
+        .options("/api/rules/:id/restore", auth::options)
+        .get_async("/api/pauses", rules::list_pauses)
+        .post_async("/api/pauses", rules::create_pause)
+        .delete_async("/api/pauses/:id", rules::delete_pause)
+        .options("/api/pauses", auth::options)
+        .options("/api/pauses/:id", auth::options)
         .get_async("/api/agenda", agenda::get_agenda)
         .post_async("/api/agenda/items/:id/move", agenda::move_agenda_item)
         .post_async("/api/agenda/items/:id/reschedule", agenda::reschedule_agenda_item)
