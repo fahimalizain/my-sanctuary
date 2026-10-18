@@ -64,6 +64,10 @@ export function BoardColumnView({
 
   return (
     <section
+      // Anchor for the mobile column tabs (BoardColumnTabs): a bare status
+      // id is space-free, so `querySelector` can address the column
+      // directly. The value is a TaskStatus, stable across renders.
+      data-board-column={column.status}
       className={cn(
         'flex h-full min-h-0 w-[85vw] shrink-0 snap-start flex-col overflow-hidden rounded-xl border bg-card transition-colors md:w-[260px]',
         overThisColumn

@@ -48,6 +48,7 @@ import {
   type TaskStatus,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
+import { BoardColumnTabs } from './BoardColumnTabs';
 import { BoardFilters } from './BoardFilters';
 import { TaskCard } from './TaskCard';
 import {
@@ -76,6 +77,7 @@ import {
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
+import { pickVisibleColumn } from './board-scroll';
 
 interface TaskFormState {
   mode: 'create' | 'edit';
@@ -175,6 +177,99 @@ export function BoardPage() {
   // Action failures (move 409, etc.): rendered as a banner above the
   // still-visible board — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
+
+  // The board (mobile tab row + scroller) is hidden only when there is
+  // nothing to show: first load in flight, or a load error that replaced
+  // the board. One boolean, so the scroller, the tabs and the observer can
+  // never disagree about whether the board is mounted — the observer effect
+  // depends on it to re-run once the scroller ref exists.
+  const boardShown = lists.length > 0 || (!isLoading && !loadError);
+
+  // ──────────────────────────────────────────
+  // Mobile column tabs (below md)
+  // ──────────────────────────────────────────
+
+  // Column currently in view. Written by the IntersectionObserver below as
+  // the user swipes, and immediately on a tab tap so the highlight never
+  // waits for the smooth scroll to land.
+  const [activeColumn, setActiveColumn] = useState<TaskStatus>(
+    COLUMNS[0].status,
+  );
+  // The horizontal column scroller — also the IntersectionObserver root:
+  // the columns are clipped by THIS box, not by the viewport, so viewport
+  // roots would measure columns hidden behind the page's own clip.
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  // Cumulative intersection ratio per column. IntersectionObserver only
+  // reports entries that crossed a threshold, so the max of one batch can
+  // be a 0.15 peek while the truly-visible column (0.9) simply did not
+  // change this frame. Merge every batch here and let the helper pick.
+  const ratiosRef = useRef<Record<string, number>>({});
+  // A tab tap's smooth scroll is in flight: ignore observer updates so the
+  // highlight stays on the tapped column instead of flickering through the
+  // columns it pans past.
+  const programmaticScroll = useRef(false);
+
+  useEffect(() => {
+    const root = scrollerRef.current;
+    if (!boardShown || !root) return;
+    const targets = [
+      ...root.querySelectorAll<HTMLElement>('[data-board-column]'),
+    ];
+    if (targets.length === 0) return;
+    ratiosRef.current = {};
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const next = { ...ratiosRef.current };
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.boardColumn;
+          if (id) next[id] = entry.intersectionRatio;
+        }
+        ratiosRef.current = next;
+        // Ignore updates during a programmatic tab scroll (see below).
+        if (programmaticScroll.current) return;
+        const picked = pickVisibleColumn(
+          next,
+          COLUMNS.map((column) => column.status),
+        );
+        if (picked) setActiveColumn(picked as TaskStatus);
+      },
+      // Five thresholds: below md a snapped column covers most of the
+      // scroller and the next only peeks, so the winner stays stable
+      // instead of flipping on every pixel of a drag.
+      { root, threshold: [0, 0.25, 0.5, 0.75, 1] },
+    );
+    for (const target of targets) observer.observe(target);
+    return () => observer.disconnect();
+  }, [boardShown]);
+
+  /** Tab tap → pan the scroller to that column. The scroll itself is what
+   *  moves the board: the tabs never reorder or re-mount columns. */
+  const scrollToColumn = (status: TaskStatus) => {
+    const root = scrollerRef.current;
+    const target = root?.querySelector<HTMLElement>(
+      `[data-board-column="${status}"]`,
+    );
+    if (!root || !target) return;
+    setActiveColumn(status);
+    programmaticScroll.current = true;
+    // `inline: 'start'` honors the scroller's scroll-padding (scroll-px-4),
+    // so the column lands on the same inset snap-start uses. `block:
+    // 'nearest'` so no ancestor scrolls vertically.
+    target.scrollIntoView({
+      behavior: 'smooth',
+      inline: 'start',
+      block: 'nearest',
+    });
+    const release = () => {
+      programmaticScroll.current = false;
+    };
+    root.addEventListener('scrollend', release, { once: true });
+    // scrollend is missing on older WebKit; don't leave the guard stuck.
+    window.setTimeout(() => {
+      root.removeEventListener('scrollend', release);
+      release();
+    }, 600);
+  };
 
   // Task dialog state.
   const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
@@ -1013,7 +1108,7 @@ export function BoardPage() {
         {/* Board — hidden only when there is nothing to show (first load in
             flight, or a load error that replaced the board). Action errors
             never unmount it. */}
-        {(lists.length > 0 || (!isLoading && !loadError)) && (
+        {boardShown && (
           <section className="mb-6 hidden md:block">
             {/* Filter chrome lives in the shared `BoardFilters` (the mobile
                 sheet renders the same component); every URL write stays in
@@ -1040,7 +1135,26 @@ export function BoardPage() {
         )}
       </div>
 
-      {(lists.length > 0 || (!isLoading && !loadError)) && (
+      {/* Mobile column tabs — a single thin row between the header block
+          and the board scroller (below md; hidden from md up, where every
+          column is already on screen). A DIRECT flex child of the page
+          root, NOT inside the scroller or the DndContext: the controls must
+          neither pan with the columns nor take part in a drag. Counts are
+          `displayTasks` — the same filtered + capped array the column
+          header pills show, including the in-drag preview. */}
+      {boardShown && (
+        <BoardColumnTabs
+          tabs={COLUMNS.map((column) => ({
+            status: column.status,
+            title: column.title,
+            count: displayTasks(column.status).length,
+          }))}
+          activeStatus={activeColumn}
+          onSelect={scrollToColumn}
+        />
+      )}
+
+      {boardShown && (
         /* Five status columns (ADR 0002 § UI). The page is a fixed 100dvh
                 column, so this scroller takes exactly the height the header
                 and filters leave over and pans horizontally only
@@ -1066,6 +1180,7 @@ export function BoardPage() {
           }}
         >
           <div
+            ref={scrollerRef}
             className={cn(
               'mb-24 min-h-0 flex-1 overflow-x-auto overflow-y-hidden pb-2',
               // mandatory snap fights dnd-kit: it writes scrollLeft every frame and
