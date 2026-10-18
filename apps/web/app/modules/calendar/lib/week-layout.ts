@@ -25,10 +25,30 @@ export const CHIP_Z_SELECTED = 40;
 export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
-/** Snap click-to-create, drag-create, and move times to this many minutes. */
+/**
+ * Finest grid, in minutes: the default step of `snapMinutes` and the range
+ * helpers, and the minimum duration a drag-create can produce. Grid create /
+ * move / resize hit-test `snapStepMinutes` instead — precision is a scaled gain
+ * (`snappedMinuteDelta`), not this step on every row.
+ */
 export const SNAP_MINUTES = 1;
-/** Snap resize active-edge times to this many minutes. */
-export const RESIZE_SNAP_MINUTES = 1;
+/**
+ * Grid step (minutes) for create / move / resize at the default zoom and above.
+ * Derived from the zoom, never from the pointer type: touch, mouse, and pen all
+ * share it.
+ */
+export const SNAP_STEP_BASE = 5;
+/** Coarse steps (minutes) that a zoomed-out grid may step up to. */
+export const SNAP_STEP_COARSE_LADDER = [SNAP_STEP_BASE, 15, 30] as const;
+/**
+ * A coarse step must paint at least this tall, or a cell is hard to land on.
+ * Only consulted below `HOUR_H_BASE` — the default grid stays on the base step
+ * even though its 5-minute cell is 4px (see `snapStepMinutes`).
+ */
+export const SNAP_STEP_MIN_PX = 6;
+/** Coarsest coarse step; also the fallback when even it paints under the bar. */
+export const SNAP_STEP_COARSEST =
+  SNAP_STEP_COARSE_LADDER[SNAP_STEP_COARSE_LADDER.length - 1];
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
 /**
@@ -37,11 +57,6 @@ export const DEFAULT_EVENT_DURATION_MIN = 30;
  * pack exactly). It is not the drag grid.
  */
 export const PACK_WIDEN_BELOW_MIN = 15;
-/**
- * Touch-drag haptics fire when the relevant instant crosses this many minutes.
- * Coarser than the 1-minute snap so a drag does not buzz every minute.
- */
-export const HAPTIC_TICK_MINUTES = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -1262,6 +1277,31 @@ export function snapMinutes(min: number, step = SNAP_MINUTES): number {
   if (min >= MINUTES_PER_DAY) return MINUTES_PER_DAY;
   const grid = Number.isFinite(step) && step > 0 ? step : SNAP_MINUTES;
   return Math.round(min / grid) * grid;
+}
+
+/**
+ * Coarse grid step (minutes) for a drag at `hourH` — the absolute grid, and the
+ * only grid a create / move / resize hit-tests against. Never finer than
+ * `SNAP_STEP_BASE`: 1-minute precision is not a finer absolute grid, it is the
+ * scaled `snappedMinuteDelta` gain.
+ *
+ * At `HOUR_H_BASE` and above the step is always `SNAP_STEP_BASE`, including
+ * `HOUR_H_MAX`. Below it, the step is the smallest coarse rung whose on-screen
+ * height (`step * hourH / 60`) clears `SNAP_STEP_MIN_PX`, so the grid coarsens
+ * as the user zooms out. An unusable `hourH` — or a zoom where even 30 minutes
+ * paints under the bar — gives the coarsest rung.
+ *
+ * The bar deliberately does not reach the default grid: a 5-minute cell at
+ * `HOUR_H_BASE` is only 4px, and it stays the step. Coarsening is for zooming
+ * out, not for the default zoom, so max zoom can never buy a finer grid.
+ */
+export function snapStepMinutes(hourH: number): number {
+  if (!Number.isFinite(hourH) || hourH <= 0) return SNAP_STEP_COARSEST;
+  if (hourH >= HOUR_H_BASE) return SNAP_STEP_BASE;
+  for (const step of SNAP_STEP_COARSE_LADDER) {
+    if ((step * hourH) / 60 >= SNAP_STEP_MIN_PX) return step;
+  }
+  return SNAP_STEP_COARSEST;
 }
 
 /** Convert a Y offset (px) within the hours area to minutes since midnight. */
