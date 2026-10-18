@@ -151,7 +151,9 @@ function AgendaRowShell({
  *  action pill still sets the line height. At sm+ it flattens into the row. */
 function AgendaRowMeta({ children }: { children: ReactNode }) {
   return (
-    <div className="flex items-center gap-1.5 -mt-1 sm:contents">{children}</div>
+    <div className="flex items-center gap-1.5 -mt-1 sm:contents">
+      {children}
+    </div>
   );
 }
 
