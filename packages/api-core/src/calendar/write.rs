@@ -2,6 +2,7 @@ use super::CalendarError;
 use crate::models::{CalendarEvent, GoogleCalendar, NewEventInput, PatchEventFields};
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
+use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
 /// Result of [`create_event`]: the created event plus the response source.
@@ -124,6 +125,28 @@ pub async fn create_event(
         now_unix,
     )
     .await
+}
+
+/// Populates or refreshes a calendar's cached Google `eventLabels`.
+///
+/// The HTTP create path resolves a matched category's hex to an
+/// `eventLabelId` against this cache. A never-populated calendar (label cache
+/// empty) would otherwise reject a colored insert, so callers that
+/// auto-resolve a category color can ensure the cache first. Best-effort by
+/// design: the caller decides whether a refresh failure should drop the color
+/// or fail the create.
+pub async fn ensure_calendar_event_labels(
+    http: &dyn HttpClient,
+    calendars: &dyn CalendarRepo,
+    access: &GoogleAccess,
+    calendar_id: &str,
+    now_unix: i64,
+) -> Result<(), CalendarError> {
+    let Some(cal) = calendars.get_by_id(calendar_id).await? else {
+        return Err(CalendarError::NotFound);
+    };
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    super::labels::ensure_event_labels(http, calendars, access, &cal, &now_rfc3339).await
 }
 
 /// Patches selected fields on Google (`events.patch`) via the outbound

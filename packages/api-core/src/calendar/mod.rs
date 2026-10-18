@@ -229,8 +229,9 @@ pub use list::{
     ListSnapshot, parse_event_time_range, CalendarListOutput,
 };
 pub use write::{
-    create_event, delete_event, delete_event_for_user, patch_event, patch_event_fields,
-    patch_event_summary, update_event_for_user, CreateEventOutput,
+    create_event, delete_event, delete_event_for_user, ensure_calendar_event_labels,
+    patch_event, patch_event_fields, patch_event_summary, update_event_for_user,
+    CreateEventOutput,
 };
 pub use watch::{
     ensure_watch, is_public_https_callback, renew_watch_if_needed, stop_watches_for_calendar,

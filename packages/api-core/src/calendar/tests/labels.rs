@@ -47,6 +47,38 @@ fn empty_cache_fetches_and_stamps() {
 }
 
 #[test]
+fn public_refresh_by_calendar_id_populates_the_cache() {
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.event_labels = String::new();
+    cal.event_labels_updated_at = None;
+
+    let body = r##"{"labelProperties":{"eventLabels":[
+        {"id":"green","backgroundColor":"#0b8043"}
+    ]}}"##;
+    let http = FakeHttp::new(vec![("/calendars/", 200, body)]);
+    let calendars = FakeCalendarRepo::with(vec![cal]);
+
+    pollster::block_on(crate::calendar::ensure_calendar_event_labels(
+        &http,
+        &calendars,
+        &access(),
+        "cal-1",
+        NOW_UNIX,
+    ))
+    .unwrap();
+
+    let gets = http.gets.lock().unwrap();
+    assert_eq!(gets.len(), 1, "{gets:?}");
+    assert!(gets[0].contains("/calendars/primary%40example.com"));
+
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(
+        stored[0].event_labels,
+        r##"[{"id":"green","backgroundColor":"#0b8043"}]"##
+    );
+}
+
+#[test]
 fn fresh_non_empty_cache_skips() {
     let cal = calendar("cal-1", "primary@example.com", true);
     let http = FakeHttp::new(vec![]);

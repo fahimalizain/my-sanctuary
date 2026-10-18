@@ -441,7 +441,9 @@ pub struct NewEventInput {
     /// Category hex (any `#rgb`/`#rrggbb`); `create_event` snaps it onto the
     /// 24 event-label palette and sends the matching cached label id with
     /// `eventLabelVersion=1`. Omitted from the Google payload when `None` or
-    /// blank after trim — hand-created events stay uncolored.
+    /// blank after trim. The HTTP create path fills `None` from the title's
+    /// matched category (the same classifier the calendar paint uses), so
+    /// hand-created events inherit their chip color on Google too.
     #[serde(default)]
     pub color_hex: Option<String>,
     /// Focus segment flag (task-focus, slice 3): when `task_id` is set AND

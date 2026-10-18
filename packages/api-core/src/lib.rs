@@ -43,7 +43,8 @@ pub use agenda_fill::{
 };
 pub use calendar::{
     classify_operator_warning, create_event, decide_webhook, delete_event, delete_event_for_user,
-    ensure_watch, is_public_https_callback, list_calendars, list_calendars_after_refresh_failure,
+    ensure_calendar_event_labels, ensure_watch, is_public_https_callback, list_calendars,
+    list_calendars_after_refresh_failure,
     list_events, list_events_after_refresh_failure, list_events_with_snapshot, load_list_snapshot,
     mint_run_id, operator_warning_record,
     parse_event_time_range, patch_event, patch_event_fields, persist_webhook_decision,
