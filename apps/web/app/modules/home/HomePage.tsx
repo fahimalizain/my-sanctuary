@@ -200,12 +200,14 @@ function AgendaDay({
   items,
   handlers,
   onMoveDayToToday,
+  loadingHistory,
 }: {
   day: string;
   serverToday: string;
   items: AgendaItemRecord[];
   handlers: AgendaRowHandlers;
   onMoveDayToToday: (day: string) => void;
+  loadingHistory: boolean;
 }) {
   const { living, completed } = partitionAgendaItems(items);
   const pendingCount = items.filter(isAgendaItemPending).length;
@@ -222,14 +224,17 @@ function AgendaDay({
     disabled: isPast,
   });
   const empty = items.length === 0;
+  // While the history row is above the stream, the day headers stick below
+  // it (the row is 2rem tall) instead of sliding underneath it.
+  const stickyTop = loadingHistory ? 'top-8' : 'top-0';
 
   return (
     <section id={dayElementId(day)}>
       <header
         className={
           empty
-            ? 'sticky top-0 z-10 flex items-center gap-2 border-b border-border/50 bg-cream/95 px-1 py-1.5 backdrop-blur'
-            : 'sticky top-0 z-10 flex items-center gap-2 border-b border-border/60 bg-cream/95 px-1 py-2 backdrop-blur'
+            ? `sticky ${stickyTop} z-10 flex items-center gap-2 border-b border-border/50 bg-cream/95 px-1 py-1.5 backdrop-blur`
+            : `sticky ${stickyTop} z-10 flex items-center gap-2 border-b border-border/60 bg-cream/95 px-1 py-2 backdrop-blur`
         }
       >
         <h2
@@ -1378,6 +1383,11 @@ export function HomePage() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
+  // The top loading row is real height above the day headers; its measured
+  // height is added to (or removed from) `scrollTop` when it mounts/unmounts so
+  // the content under it does not move.
+  const historyLoadingRowRef = useRef<HTMLDivElement>(null);
+  const historyLoadingRowHeightRef = useRef(0);
   // Last known intersection of the top sentinel — the observer only fires on
   // CHANGES, so a moored sentinel needs this to be re-checked after every
   // fetch settles (see `maybeFetchMore`).
@@ -1409,8 +1419,12 @@ export function HomePage() {
   // the top-edge gesture is a `fetchNextPage` while `hasNextPage`.
   const hasOlderHistory = history.hasNextPage;
   const isFetchingOlderHistory = history.isFetchingNextPage;
+  // Page 0 (the anchor's eve week) and each appended week show the same
+  // top-of-stream spinner. A background refetch does neither.
+  const isLoadingOlderHistory = history.isLoading || isFetchingOlderHistory;
   const fetchOlderHistory = history.fetchNextPage;
   const pageCount = pages.length;
+  const hasPages = pageCount > 0;
 
   const rememberPrepend = useCallback(() => {
     const root = scrollRef.current;
@@ -1563,6 +1577,20 @@ export function HomePage() {
     }
   }, [historyPages, historyOldestFrom]);
 
+  // The loading row is real height above the day headers. Move `scrollTop`
+  // with it as it mounts (a fetch starts) or unmounts (the fetch settles), or
+  // the stream would shift by the row's height on every load. A successful
+  // fetch also prepends a week; that height is handled separately above.
+  useLayoutEffect(() => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const next = historyLoadingRowRef.current?.offsetHeight ?? 0;
+    const previous = historyLoadingRowHeightRef.current;
+    if (next === previous) return;
+    historyLoadingRowHeightRef.current = next;
+    root.scrollTop += next - previous;
+  }, [hasPages, isLoadingOlderHistory]);
+
   // The history fetch settled without growing the cache into a new oldest week
   // (it failed, or the server had nothing older): drop the pending measurement
   // rather than let it sit across later unrelated page changes. A passive
@@ -1640,7 +1668,6 @@ export function HomePage() {
       : current.error
         ? 'Failed to load agenda'
         : null;
-  const hasPages = pages.length > 0;
   // A history fetch failed: a one-line notice above the still-mounted days —
   // never a wipe of today. `isFetchNextPageError` covers an appended week; a
   // history query that errored with no pages at all is the opening eve-week
@@ -1772,6 +1799,21 @@ export function HomePage() {
 
               {hasPages && (
                 <>
+                  {/* A real row above the sticky day headers — one row above
+                      the date the user is looking at. Its height is compensated
+                      in `scrollTop` when it mounts/unmounts. */}
+                  {isLoadingOlderHistory && (
+                    <div
+                      ref={historyLoadingRowRef}
+                      role="status"
+                      className="sticky top-0 z-30 flex h-8 items-center justify-center gap-2 border-b border-border/50 bg-cream/95 text-muted-foreground backdrop-blur"
+                    >
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span className="text-xs font-medium">
+                        Loading earlier days…
+                      </span>
+                    </div>
+                  )}
                   <div
                     ref={topSentinelRef}
                     aria-hidden
@@ -1798,6 +1840,7 @@ export function HomePage() {
                         serverToday={serverToday}
                         items={byDate.get(day) ?? []}
                         handlers={handlers}
+                        loadingHistory={isLoadingOlderHistory}
                         onMoveDayToToday={(target) =>
                           void handleMoveDayToToday(target)
                         }
