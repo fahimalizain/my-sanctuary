@@ -513,10 +513,11 @@ function engagePrecisionHold(
 
 /**
  * One precision step: pointer travel since engage, scaled down by the gain and
- * applied to the frozen anchor. `hitDay` is the civil day under the pointer (the
- * hold's own day when the hit-test missed), which is the horizontal axis — it
- * stacks with the vertical minute delta, because crossing midnight and crossing
- * a column are different moves.
+ * applied to the frozen anchor. `hitDay` is the civil day under the pointer — or,
+ * on a miss, the last column the pointer was on, so the horizontal axis holds
+ * still instead of falling back to the engage day. It stacks with the vertical
+ * minute delta, because crossing midnight and crossing a column are different
+ * moves.
  *
  * Returns the same hold object when the range did not change, so `stepSession`
  * can skip the render.
@@ -658,10 +659,12 @@ function stepSession(
         session,
         y,
         hourH,
-        // A miss has no column of its own: keep the hold's pointer day, so the
-        // column shift falls back to 0 rather than following a column the
-        // pointer has left. The zone stays the previous one either way.
-        hit ? hit.slot.day : hold.pointerDay,
+        // A miss has no column of its own: the last column the pointer was on
+        // stays the horizontal anchor, so the day shift is unchanged and the
+        // ghost cannot snap back to the day precision engaged on. The zone
+        // stays the previous one either way, and the travel still comes from
+        // clientY, so vertical precision over the gutter keeps working.
+        hit ? hit.slot.day : currentSlot.day,
       );
     }
   }
