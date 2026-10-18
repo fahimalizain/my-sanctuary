@@ -146,13 +146,6 @@ function currentAnchor(): string {
   );
 }
 
-/** Home's slim, compact constraints for the ONE FocusTimer below `lg` (sticky
- *  strip above the stream): heading to screen-readers, digits and buttons
- *  shrunk, session line dropped. Every rule is `max-lg:`-scoped so the `lg`
- *  breakpoint keeps the untouched card. */
-const COMPACT_TIMER_CLASSES =
-  'max-lg:p-2.5 max-lg:[&_h2]:sr-only max-lg:[&>div:nth-child(2)]:mb-2 max-lg:[&>div:nth-child(2)>div:first-child]:text-2xl max-lg:[&>div:nth-child(2)>p]:hidden max-lg:[&>div:nth-child(3)]:mb-0 max-lg:[&>div:last-child]:hidden';
-
 interface AgendaRowHandlers {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
   onCompleteTask: (item: AgendaItemRecord) => void;
@@ -1710,10 +1703,10 @@ export function HomePage() {
 
   return (
     <div className="min-h-screen bg-cream">
-      <div className="mx-auto max-w-7xl px-6 pt-8">
-        <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
+      <div className="mx-auto flex h-[100dvh] max-w-7xl flex-col px-6 pt-8 lg:block lg:h-auto">
+        <div className="flex min-h-0 flex-1 flex-col gap-8 lg:grid lg:min-h-0 lg:grid-cols-3">
           {/* Main column — the day stream */}
-          <div className="min-w-0 lg:col-span-2">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col lg:col-span-2 lg:block">
             <header className="mb-4 flex items-center justify-between gap-4">
               <h1 className="font-heading text-3xl font-bold text-foreground">
                 Agenda
@@ -1767,13 +1760,15 @@ export function HomePage() {
             )}
 
             {/* The stream: its own scroll container, so the page itself never
-                grows without bound and dnd-kit can auto-scroll a drag. Native
-                scroll anchoring is off: the prepend compensation below already
-                shifts `scrollTop` by the new week's height, and the browser's
-                own shift would land on top of it (a double jump). */}
+                grows without bound and dnd-kit can auto-scroll a drag. On
+                mobile it is the flex remainder under the timer and quote, so
+                the compact quote never pushes the stream past the viewport.
+                Native scroll anchoring is off: the prepend compensation below
+                already shifts `scrollTop` by the new week's height, and the
+                browser's own shift would land on top of it (a double jump). */}
             <div
               ref={scrollRef}
-              className="relative h-[calc(100dvh-14.5rem)] min-h-[20rem] overflow-y-auto overscroll-contain bg-cream [overflow-anchor:none] lg:h-[calc(100dvh-5.25rem)]"
+              className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain bg-cream [overflow-anchor:none] lg:h-[calc(100dvh-5.25rem)] lg:flex-none"
             >
               {/* First load — the default read has not resolved yet */}
               {!hasPages && current.isLoading && (
@@ -1879,15 +1874,16 @@ export function HomePage() {
           </div>
 
           {/* Right panel — Focus & Quotes. Below lg this panel LEADS the page
-              (`order-first`), so its ONE FocusTimer sits above the stream as a
-              compact strip while the quotes stay hidden; at lg it returns to
-              the right column, timer on top. One instance only: the timer owns
-              its state, so a second mount would reset it on every resize. */}
-          <div className="order-first space-y-6 lg:order-none">
-            <div className="max-lg:sticky max-lg:top-2 max-lg:z-20 max-lg:mb-3 max-lg:rounded-xl max-lg:border max-lg:border-border max-lg:bg-card/95 max-lg:shadow-sm max-lg:backdrop-blur">
-              <FocusTimer className={COMPACT_TIMER_CLASSES} />
+              (`order-first`): the compact FocusTimer and the compact quote
+              strip sit above the stream, and the stream takes the remaining
+              height. At lg it returns to the right column, timer on top and
+              the full quote card below. One instance of each: the timer owns
+              its state, and the quote strip owns its carousel index. */}
+          <div className="order-first space-y-2 lg:order-none lg:space-y-6">
+            <div className="max-lg:sticky max-lg:top-2 max-lg:z-20">
+              <FocusTimer />
             </div>
-            <QuotesSection quotes={quotes} className="hidden lg:block" />
+            <QuotesSection quotes={quotes} />
           </div>
         </div>
       </div>
