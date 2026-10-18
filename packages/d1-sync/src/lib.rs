@@ -4,8 +4,10 @@
 //! name order (the same SQL wrangler `--local` applies), and exposes rusqlite
 //! repo implementations over api-core SQL constants.
 
+mod digest;
 mod repos;
 
+pub use digest::{calendar_owner, count_rows, event_span, mark_dirty_spans, SqliteDigestRepo};
 pub use repos::{
     SqliteCalendarEventRepo, SqliteCalendarEventOperationRepo, SqliteCalendarRepo, SqliteTokenRepo,
     SqliteWatchChannelRepo,
@@ -29,6 +31,13 @@ pub struct Harness {
     pub watches: SqliteWatchChannelRepo,
     pub tokens: SqliteTokenRepo,
     pub operations: SqliteCalendarEventOperationRepo,
+}
+
+impl Harness {
+    /// A digest repo over the same connection (one D1 database).
+    pub fn digest(&self) -> SqliteDigestRepo {
+        SqliteDigestRepo::new(Arc::clone(&self.db))
+    }
 }
 
 /// A no-op [`TaskCategoryRepo`] for walk tests that do not exercise the

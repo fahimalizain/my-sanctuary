@@ -1,8 +1,8 @@
 //! `#[event(scheduled)]` — the background cron jobs:
 //! - **every tick** (`*/2 * * * *` and `*/15 * * * *`): elongate every living
-//!   `IN_PROGRESS` task's Google event (`end = max(current, ceil-5min(now
-//!   + 5min)` in the event calendar's TZ)) so a running task never looks
-//!   finished on the calendar.
+//!   `IN_PROGRESS` task's Google event so a running task never looks finished
+//!   on the calendar; then run one reports digest tick — rebuild the days
+//!   event writes dirtied, and drive a running backfill/reclassify.
 //! - **only the 15-minute tick**: the fallback cron (ADR 0001 § Fallback
 //!   cron) — publish replicas for dirty / stale / backoff-due calendars
 //!   (15-minute `last_success_at` backstop), renew watch channels that would
@@ -14,9 +14,10 @@
 //!   `*/2` tick.
 //!
 //! The orchestration lives in `api_core::run_elongate_cron` /
-//! `api_core::run_fallback_cron` / `api_core::run_agenda_fill_cron` (pure,
-//! unit-tested); this handler is a thin shell that loads the config, wires the
-//! D1 repos and `WorkerHttp`, and logs the reports.
+//! `api_core::run_fallback_cron` / `api_core::run_agenda_fill_cron` /
+//! `api_core::run_digest_tick` (pure, unit-tested); this handler is a thin
+//! shell that loads the config, wires the D1 repos and `WorkerHttp`, and logs
+//! the reports.
 
 use worker::*;
 
@@ -77,6 +78,67 @@ async fn run_agenda_fill(env: &Env, now_unix: i64) {
     );
 }
 
+/// Runs one digest tick and logs its report. Never fails the cron: every error
+/// is a logged report entry (same contract as `run_fallback_cron`).
+///
+/// The tick handles **one** user per call, so a shared cron can make progress
+/// without a tick ballooning past the Worker's limits; `remaining` work is
+/// best-effort re-enqueued so latency does not wait for the 2-minute grid.
+async fn run_digest(env: &Env, now_unix: i64) {
+    let repo = match env.d1("DB") {
+        Ok(db) => crate::db::D1DigestRepo::new(db),
+        Err(err) => {
+            console_log!("cron: DB binding missing for digest: {err}");
+            return;
+        }
+    };
+    let categories = match env.d1("DB") {
+        Ok(db) => crate::db::D1TaskCategoryRepo::new(db),
+        Err(err) => {
+            console_log!("cron: DB binding missing for digest: {err}");
+            return;
+        }
+    };
+    let report = api_core::run_digest_tick(
+        &repo,
+        &categories,
+        None,
+        api_core::DIGEST_TICK_BUDGET_DAYS,
+        now_unix,
+    )
+    .await;
+    for error in &report.errors {
+        console_log!("cron: {error}");
+    }
+    console_log!(
+        "cron: digest user={:?} rebuilt={} reclassified={} remaining={} errors={}",
+        report.user_id,
+        report.rebuilt_days,
+        report.reclassified,
+        report.remaining,
+        report.errors.len()
+    );
+    // Latency: pull the next tick forward instead of waiting for the cron.
+    if report.remaining {
+        if let Some(user_id) = report.user_id {
+            match env.queue("CALENDAR_SYNC") {
+                Ok(queue) => {
+                    let message = api_core::DigestQueueMessage {
+                        kind: api_core::DigestJobKind::Rebuild,
+                        user_id,
+                    };
+                    if let Err(err) = queue.send(message).await {
+                        console_log!("cron: digest re-enqueue failed: {err}");
+                    }
+                }
+                Err(err) => {
+                    console_log!("cron: CALENDAR_SYNC binding missing on digest re-enqueue: {err}");
+                }
+            }
+        }
+    }
+}
+
 /// Cron entrypoint, invoked by the `*/2 * * * *` and `*/15 * * * *` triggers
 /// in `wrangler.toml`.
 ///
@@ -99,6 +161,11 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         return;
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+
+    // The digest tick needs no Google API and must run on EVERY tick: a */2
+    // tick is what drains the days an event write just dirtied. It runs before
+    // the 15-minute block on purpose.
+    run_digest(&env, now_unix).await;
 
     let Some(oauth) = config.oauth.clone() else {
         console_log!("cron: oauth not configured — skipping cron");

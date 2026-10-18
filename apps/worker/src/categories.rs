@@ -12,11 +12,21 @@
 //! `GET /api/categories` intentionally does NOT seed: the taxonomy is seeded
 //! once by `GET /api/lists` so parallel first-visit fetches can never
 //! double-seed.
+//!
+//! **Reclassify trigger (reports slice 2).** Every *successful* create,
+//! update or delete restarts the digest's `reclassify` job (status `running`,
+//! cursor `''`) because the already-stamped `calendar_events.category_id`
+//! values only change when the classifier re-runs. The rebuild itself never
+//! happens inside the request: a best-effort queue message pulls a tick
+//! forward, and the cron picks up a `running` job regardless. A queue failure
+//! must not fail the HTTP response. `is_productive`-only edits restart the
+//! scan too — wasteful but correct and simple.
 
 use worker::*;
 
 use api_core::categories::CategoriesError;
 use api_core::models::{NewTaskCategoryInput, UpdateTaskCategory};
+use api_core::DigestRepo;
 
 /// 401 body for missing/invalid sessions.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -63,6 +73,45 @@ fn lists_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D
     Ok(crate::db::D1TaskListRepo::new(db))
 }
 
+/// Restarts the digest reclassify job after a taxonomy change, then pings the
+/// queue so a tick starts immediately.
+///
+/// Both steps are best-effort: the cron sees a `running` job on the next tick
+/// even when the queue is unavailable, and a failure here must never turn a
+/// successful category edit into a 500.
+async fn trigger_reclassify(ctx: &RouteContext<Option<api_core::Config>>, user_id: &str) {
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
+    let repo = match ctx.d1("DB") {
+        Ok(db) => crate::db::D1DigestRepo::new(db),
+        Err(err) => {
+            console_log!("categories: DB binding missing for reclassify: {err}");
+            return;
+        }
+    };
+    if let Err(err) = repo
+        .upsert_job_status(user_id, "reclassify", "running", "", &now_rfc3339)
+        .await
+    {
+        console_log!("categories: reclassify job reset failed: {err}");
+        return;
+    }
+    match ctx.env.queue("CALENDAR_SYNC") {
+        Ok(queue) => {
+            let message = api_core::DigestQueueMessage {
+                kind: api_core::DigestJobKind::Reclassify,
+                user_id: user_id.to_string(),
+            };
+            if let Err(err) = queue.send(message).await {
+                console_log!("categories: reclassify enqueue failed: {err}");
+            }
+        }
+        Err(err) => {
+            console_log!("categories: CALENDAR_SYNC binding missing: {err}");
+        }
+    }
+}
+
 /// `GET /api/categories` → 200 `{"categories":[...]}` (the taxonomy is seeded
 /// by `GET /api/lists`, so this is a pure read).
 pub async fn list_categories(
@@ -99,6 +148,9 @@ pub async fn create_category(
     };
     match api_core::categories::create_category(&d1(&ctx)?, &lists_d1(&ctx)?, &user.id, &input).await {
         Ok(response) => {
+            // The stored category stamps are now stale; a tick will re-run the
+            // classifier over the cached events. Never blocks the response.
+            trigger_reclassify(&ctx, &user.id).await;
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,
@@ -128,6 +180,9 @@ pub async fn update_category(
     };
     match api_core::categories::update_category(&d1(&ctx)?, &lists_d1(&ctx)?, &user.id, id, &updates).await {
         Ok(response) => {
+            // The stored category stamps are now stale; a tick will re-run the
+            // classifier over the cached events. Never blocks the response.
+            trigger_reclassify(&ctx, &user.id).await;
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,
@@ -153,6 +208,9 @@ pub async fn delete_category(
     let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
     match api_core::categories::delete_category(&d1(&ctx)?, &user.id, id, &now_rfc3339).await {
         Ok(response) => {
+            // The stored category stamps are now stale; a tick will re-run the
+            // classifier over the cached events. Never blocks the response.
+            trigger_reclassify(&ctx, &user.id).await;
             let response = Response::from_json(&response)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
                 &ctx,

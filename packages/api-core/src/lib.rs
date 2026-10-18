@@ -13,6 +13,7 @@ pub use calendar::replica as calendar_replica;
 pub use calendar::sync as calendar_sync;
 pub use calendar::window as calendar_window;
 pub mod categories;
+pub mod digest;
 pub mod google_color;
 pub mod lists;
 pub mod models;
@@ -75,6 +76,16 @@ pub use calendar_color::{
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
+};
+pub use digest::{
+    bed_minutes_past_noon, digest_days, digest_status, dirty_dates_for_span, dirty_dates_for_spans,
+    effective_zone_name, ensure_backfill_job, include_event, marker_kind, normalized_zone_name,
+    resolve_sleep_category_id, run_digest_tick, run_digest_tick_user, shift_date,
+    untracked_seconds, wake_minutes_past_midnight, BackfillJob, CategorySeconds, DayAnchors,
+    DayDigest, DigestEvent, DigestEventRow, DigestJobKind, DigestQueueMessage, DigestRepo,
+    DigestStatus, DigestTickReport, EventSpan, EventSpanRow, HourSeconds, JobStatus, MarkerKind,
+    NightRow, ReclassifyRow, SleepMarker, SleepSource, WorkerQueueMessage, ALGO_VERSION,
+    DEFAULT_SLEEP_SECS, DIGEST_TICK_BUDGET_DAYS, SLEEP_PAIR_MAX_SECS, SYNTHETIC_SLEEP_CATEGORY_ID,
 };
 pub use google_color::{
     canonicalize_hex, is_event_label_hex, parse_hex_rgb, snap_to_event_label_hex,

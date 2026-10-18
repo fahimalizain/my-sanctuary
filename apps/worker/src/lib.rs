@@ -7,6 +7,7 @@ mod db;
 mod http;
 mod lists;
 mod queue;
+mod reports;
 mod routines;
 mod sync_log;
 mod tasks;
@@ -140,6 +141,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .delete_async("/api/routines/:id", routines::delete_routine)
         .options("/api/routines", auth::options)
         .options("/api/routines/:id", auth::options)
+        .get_async("/api/reports/status", reports::status)
+        .options("/api/reports/status", auth::options)
         .get_async("/api/agenda", agenda::get_agenda)
         .post_async("/api/agenda/items/:id/move", agenda::move_agenda_item)
         .post_async("/api/agenda/items/:id/reschedule", agenda::reschedule_agenda_item)
