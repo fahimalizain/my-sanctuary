@@ -154,15 +154,3 @@ export const todayItems: TimelineItem[] = [
 
 // Backwards compatibility alias
 export const todayBlocks = todayItems;
-
-export const quotes = [
-  {
-    text: 'The only way to do great work is to love what you do.',
-    author: 'Steve Jobs',
-  },
-  { text: 'Focus on being productive instead of busy.', author: 'Tim Ferriss' },
-  {
-    text: 'Your future is created by what you do today, not tomorrow.',
-    author: 'Robert Kiyosaki',
-  },
-];
