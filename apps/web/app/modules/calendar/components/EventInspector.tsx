@@ -928,7 +928,15 @@ export function EventInspector({
             hidden && 'invisible pointer-events-none',
           )}
           onOpenAutoFocus={(e) => {
-            if (!focusTitle) e.preventDefault();
+            // Radix FocusScope would otherwise focus the first tabbable
+            // element — the "More actions" button — and steal focus from the
+            // title effect below. Own the auto-focus instead.
+            e.preventDefault();
+            if (!focusTitle) return;
+            const title = titleRef.current;
+            if (!title) return;
+            title.focus();
+            title.select();
           }}
           onInteractOutside={(e) => {
             const target = e.target;

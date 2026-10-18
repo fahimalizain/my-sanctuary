@@ -45,6 +45,10 @@ export function installDom(): void {
   assign('MouseEvent', window.MouseEvent);
   assign('KeyboardEvent', window.KeyboardEvent);
   assign('FocusEvent', window.FocusEvent);
+  // Radix FocusScope walks tabbables with NodeFilter and checks selectable
+  // inputs with HTMLInputElement — both live on jsdom's window only.
+  assign('NodeFilter', window.NodeFilter);
+  assign('HTMLInputElement', window.HTMLInputElement);
   assign(
     'PointerEvent',
     (window as unknown as { PointerEvent?: typeof window.MouseEvent })
