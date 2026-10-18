@@ -12,6 +12,7 @@ import {
   EMPTY_WHEEL_BURST,
   SCROLL_X_THRESHOLD_PX,
   STRIP_OVERSCAN,
+  WHEEL_BURST_IDLE_MS,
   addDays,
   clampPeriodLength,
   classifyScrollAxis,
@@ -215,6 +216,11 @@ export function useCalendarStrip(): CalendarStrip {
   // cannot clear another owner's `scroll-snap-type: none`.
   const stripLockReasonsRef = useRef<Set<StripLockReason>>(new Set());
 
+  // `scrollTop` to hold while an x gesture owns the strip (null = free).
+  // `overflow-x: hidden` already denies the browser the x axis; this denies it
+  // the y axis for the same gesture, so one finger can only move one axis.
+  const pinTopRef = useRef<number | null>(null);
+
   /** Apply the scroller's snap override from the currently held owners. */
   const applyStripLock = useCallback(() => {
     // CSS scroll-snap re-snaps on every programmatic scrollLeft write, which
@@ -243,6 +249,15 @@ export function useCalendarStrip(): CalendarStrip {
 
     const scroller = scrollerRef.current;
     if (!scroller || colW <= 0) return;
+
+    // One axis per gesture: when the swipe owns the strip, the browser's
+    // vertical pan (if any) is undone before anything is published.
+    if (
+      pinTopRef.current !== null &&
+      scroller.scrollTop !== pinTopRef.current
+    ) {
+      scroller.scrollTop = pinTopRef.current;
+    }
 
     const idx = computeVisibleStartIndex(
       scroller.scrollLeft,
@@ -299,6 +314,16 @@ export function useCalendarStrip(): CalendarStrip {
     }
   }, []);
 
+  /** Quiet-period timer that lands an x wheel burst on a column. */
+  const wheelSettleTimerRef = useRef<number | null>(null);
+
+  const clearWheelSettle = useCallback(() => {
+    if (wheelSettleTimerRef.current !== null) {
+      clearTimeout(wheelSettleTimerRef.current);
+      wheelSettleTimerRef.current = null;
+    }
+  }, []);
+
   /**
    * Drop the gesture without moving the strip: another owner took the scroller
    * (drag / pinch / a second finger) or the window was re-parked, so `left0` is
@@ -306,9 +331,14 @@ export function useCalendarStrip(): CalendarStrip {
    */
   const dropSwipe = useCallback(() => {
     cancelSettle();
+    clearWheelSettle();
+    pinTopRef.current = null;
     resetSwipeGesture();
-    if (stripLockReasonsRef.current.delete('swipe')) applyStripLock();
-  }, [applyStripLock, cancelSettle]);
+    // Both sideways owners are JS-driven x: dropping one drops the other.
+    let released = stripLockReasonsRef.current.delete('swipe');
+    if (stripLockReasonsRef.current.delete('wheel')) released = true;
+    if (released) applyStripLock();
+  }, [applyStripLock, cancelSettle, clearWheelSettle]);
 
   const lockStrip = useCallback(
     (reason: StripLockReason) => {
@@ -336,12 +366,18 @@ export function useCalendarStrip(): CalendarStrip {
    * tween ends exactly on a column, so re-engaging snap has nothing to correct;
    * a rebase the lock suppressed runs from this scroll.
    */
-  const finishSwipe = useCallback(() => {
-    cancelSettle();
-    resetSwipeGesture();
-    unlockStrip('swipe');
-    onScrollerScroll();
-  }, [cancelSettle, onScrollerScroll, unlockStrip]);
+  const finishSwipe = useCallback(
+    (reason: StripLockReason = 'swipe') => {
+      cancelSettle();
+      clearWheelSettle();
+      resetSwipeGesture();
+      // The tween has landed: the vertical axis is free again.
+      pinTopRef.current = null;
+      unlockStrip(reason);
+      onScrollerScroll();
+    },
+    [cancelSettle, clearWheelSettle, onScrollerScroll, unlockStrip],
+  );
 
   /**
    * Ease `scrollLeft` onto column `target` with snap still off. Snap must stay
@@ -349,13 +385,13 @@ export function useCalendarStrip(): CalendarStrip {
    * would let the browser pick its own column and fight the tween.
    */
   const startSettle = useCallback(
-    (target: number) => {
+    (target: number, reason: StripLockReason = 'swipe') => {
       const scroller = scrollerRef.current;
       cancelSettle();
       // The gesture itself is over; the lock stays held until the tween lands.
       resetSwipeGesture();
       if (!scroller || colW <= 0) {
-        finishSwipe();
+        finishSwipe(reason);
         return;
       }
 
@@ -364,7 +400,7 @@ export function useCalendarStrip(): CalendarStrip {
       const delta = to - from;
       if (Math.abs(delta) < 0.5) {
         scroller.scrollLeft = to;
-        finishSwipe();
+        finishSwipe(reason);
         return;
       }
 
@@ -383,12 +419,38 @@ export function useCalendarStrip(): CalendarStrip {
         settleRafRef.current = null;
         // Land exactly on the column, not on a float.
         scroller.scrollLeft = to;
-        finishSwipe();
+        finishSwipe(reason);
       };
       settleRafRef.current = requestAnimationFrame(step);
     },
     [cancelSettle, colW, finishSwipe],
   );
+
+  /**
+   * Land a sideways trackpad burst on the nearest column. The wheel has no
+   * finger-up, so a quiet gap (`WHEEL_BURST_IDLE_MS`) stands in for the release;
+   * every event of the burst pushes the settle back out.
+   */
+  const armWheelSettle = useCallback(() => {
+    clearWheelSettle();
+    wheelSettleTimerRef.current = window.setTimeout(() => {
+      wheelSettleTimerRef.current = null;
+      const scroller = scrollerRef.current;
+      if (!scroller || colW <= 0) {
+        dropSwipe();
+        return;
+      }
+      startSettle(
+        computeVisibleStartIndex(
+          scroller.scrollLeft,
+          colW,
+          dayCount,
+          periodLength,
+        ),
+        'wheel',
+      );
+    }, WHEEL_BURST_IDLE_MS);
+  }, [clearWheelSettle, colW, dayCount, dropSwipe, periodLength, startSettle]);
 
   // Touch events, not pointer events: the browser fires `pointercancel` the
   // moment native panning starts, so pointer events cannot follow a finger
@@ -446,6 +508,10 @@ export function useCalendarStrip(): CalendarStrip {
           // direction is fixed here and kept for the whole gesture, so travel
           // stays continuous if the finger reverses past its origin.
           gesture.lockSign = dx > 0 ? 1 : -1;
+          // One axis per gesture: from the moment the swipe takes over, the
+          // browser's vertical pan is frozen where it is (not rewound, which
+          // would jump the hours back under a diagonal finger).
+          pinTopRef.current = scroller.scrollTop;
           lockStrip('swipe');
         }
       }
@@ -462,6 +528,12 @@ export function useCalendarStrip(): CalendarStrip {
         maxLeft,
         Math.max(0, gesture.left0 - travel),
       );
+      if (
+        pinTopRef.current !== null &&
+        scroller.scrollTop !== pinTopRef.current
+      ) {
+        scroller.scrollTop = pinTopRef.current;
+      }
       gesture.lastX = touch.clientX;
       gesture.samples.push({ t: e.timeStamp, x: touch.clientX });
       if (gesture.samples.length > SWIPE_SAMPLE_LIMIT) gesture.samples.shift();
@@ -531,40 +603,57 @@ export function useCalendarStrip(): CalendarStrip {
   // deliberate, horizontal-dominant swipe. Until then only the vertical part
   // applies — re-applied by hand, since preventing the default would otherwise
   // swallow the scroll the user asked for. Sideways travel dropped in the dead
-  // zone is simply lost, never caught up.
+  // zone is simply lost, never caught up. A committed x burst is driven here
+  // too (the axis is not user-scrollable), and settles on a column once the
+  // burst goes quiet.
   const wheelBurstRef = useRef<WheelBurst>(EMPTY_WHEEL_BURST);
 
-  const onWheel = useCallback((e: WheelEvent) => {
-    // Ctrl/meta wheel is pinch-zoom, owned by useCalendarZoom: that handler
-    // preventDefaults and rewrites `scrollTop`. Leave it entirely alone.
-    if (e.ctrlKey || e.metaKey) return;
-    // Any lock owner writes `scrollLeft` itself (auto-scroll, zoom, swipe); a
-    // wheel burst must not be classified against, or fight, those writes.
-    if (stripRebaseSuppressed(stripLockReasonsRef.current)) return;
+  const onWheel = useCallback(
+    (e: WheelEvent) => {
+      // Ctrl/meta wheel is pinch-zoom, owned by useCalendarZoom: that handler
+      // preventDefaults and rewrites `scrollTop`. Leave it entirely alone.
+      if (e.ctrlKey || e.metaKey) return;
+      // A pointer owner (auto-scroll, zoom, touch swipe) writes `scrollLeft`
+      // itself; a wheel burst must not be classified against, or fight, those
+      // writes. `wheel` is this handler's own lock, so it is not a blocker.
+      const held = stripLockReasonsRef.current;
+      if (held.has('drag') || held.has('pinch') || held.has('swipe')) return;
 
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
+      const scroller = scrollerRef.current;
+      if (!scroller) return;
 
-    const dxPx = wheelDeltaPx(e.deltaX, e.deltaMode, scroller.clientWidth);
-    const dyPx = wheelDeltaPx(e.deltaY, e.deltaMode, scroller.clientHeight);
-    const burst = nextWheelBurst(wheelBurstRef.current, {
-      dx: dxPx,
-      dy: dyPx,
-      t: e.timeStamp,
-    });
-    wheelBurstRef.current = burst;
+      const dxPx = wheelDeltaPx(e.deltaX, e.deltaMode, scroller.clientWidth);
+      const dyPx = wheelDeltaPx(e.deltaY, e.deltaMode, scroller.clientHeight);
+      const burst = nextWheelBurst(wheelBurstRef.current, {
+        dx: dxPx,
+        dy: dyPx,
+        t: e.timeStamp,
+      });
+      wheelBurstRef.current = burst;
 
-    // `x`: a deliberate sideways swipe, so native horizontal scroll takes it and
-    // mandatory snap pages the days as before.
-    if (burst.axis === 'x') return;
-    // deltaX 0 is an ordinary mouse wheel: exactly the pre-fix behaviour.
-    if (e.deltaX === 0) return;
+      // `x`: a deliberate sideways burst. The strip is not user-scrollable on
+      // that axis (`overflow-x: hidden` is what makes one-finger gestures
+      // single-axis on every browser), so the burst is driven here and landed
+      // on a column when it goes quiet. preventDefault also keeps a Mac
+      // two-finger swipe from triggering history navigation.
+      if (burst.axis === 'x') {
+        e.preventDefault();
+        cancelSettle();
+        if (!held.has('wheel')) lockStrip('wheel');
+        scroller.scrollLeft += dxPx;
+        armWheelSettle();
+        return;
+      }
+      // deltaX 0 is an ordinary mouse wheel: exactly the pre-fix behaviour.
+      if (e.deltaX === 0) return;
 
-    // `pending` (dead zone) or `y`: consume the event and apply the vertical
-    // part only, so `scrollLeft` never moves under the day snap.
-    e.preventDefault();
-    if (dyPx !== 0) scroller.scrollBy({ top: dyPx, behavior: 'instant' });
-  }, []);
+      // `pending` (dead zone) or `y`: consume the event and apply the vertical
+      // part only, so `scrollLeft` never moves under the day snap.
+      e.preventDefault();
+      if (dyPx !== 0) scroller.scrollBy({ top: dyPx, behavior: 'instant' });
+    },
+    [armWheelSettle, cancelSettle, lockStrip],
+  );
 
   // The scroller is always mounted, so this attaches once per layout change.
   useLayoutEffect(() => {

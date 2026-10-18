@@ -168,6 +168,11 @@ function StripHarness({
             configurable: true,
             get: () => 4000,
           });
+          // Tall enough that a scrollTop pin can be observed.
+          Object.defineProperty(el, 'scrollHeight', {
+            configurable: true,
+            get: () => 4000,
+          });
           scrollerAttached.current = true;
         }
       },
@@ -531,6 +536,60 @@ test('useCalendarStrip: drag taking the strip drops the swipe mid-gesture', asyn
   assert.equal(scroller!.style.scrollSnapType, '');
 });
 
+// ── Single-axis gestures ────────────────────────────────────────────────
+// One finger may only move one axis. `overflow-x: hidden` denies the browser
+// the strip's x axis; the vertical pin denies it the y axis while a swipe owns
+// the strip, so a native pan that lands anyway cannot move the hours.
+
+test('useCalendarStrip: a horizontal swipe pins the vertical axis until it settles', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const top0 = scroller!.scrollTop;
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 400, clientY: 300 }], 16),
+    );
+  });
+  assert.equal(scroller!.style.scrollSnapType, 'none');
+
+  // The browser starts a vertical pan under the swipe: it is undone, not
+  // published, so the gesture stays horizontal.
+  scroller!.scrollTop = top0 + 140;
+  await act(async () => {
+    strip.onScrollerScroll();
+  });
+  assert.equal(scroller!.scrollTop, top0, 'the hours are held for the gesture');
+
+  // The pin outlives the finger: it holds through the release tween.
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', [], 200));
+  });
+  scroller!.scrollTop = top0 + 90;
+  await act(async () => {
+    strip.onScrollerScroll();
+  });
+  assert.equal(scroller!.scrollTop, top0);
+
+  await act(async () => {
+    await sleep(400);
+  });
+  assert.equal(scroller!.style.scrollSnapType, '', 'the tween landed');
+
+  // Once settled the vertical axis is the browser's again.
+  scroller!.scrollTop = top0 + 90;
+  await act(async () => {
+    strip.onScrollerScroll();
+  });
+  assert.equal(scroller!.scrollTop, top0 + 90);
+});
+
 // ── Wheel axis latch ────────────────────────────────────────────────────
 // A Mac trackpad adds a small horizontal delta to a vertical two-finger
 // scroll. Mandatory day snap then walks the strip onto the neighbouring day,
@@ -633,8 +692,9 @@ test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', 
     'a wheel burst holds no snap lock: nothing is left to restore',
   );
 
-  // A pause starts a new burst, so this one decides its own (horizontal) axis
-  // and the strip pages natively again.
+  // A pause starts a new burst, so this one decides its own axis. A committed
+  // horizontal burst is no longer native: the strip cannot be user-scrolled on
+  // x, so the handler takes it and holds snap off until the burst settles.
   await act(async () => {
     await sleep(150);
   });
@@ -642,11 +702,17 @@ test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', 
   await act(async () => {
     scroller!.dispatchEvent(horizontal);
   });
-  assert.equal(horizontal.defaultPrevented, false, 'a new burst re-decides');
-  assert.equal(scrollByCalls.length, 4);
+  assert.equal(horizontal.defaultPrevented, true, 'a new burst re-decides');
+  assert.equal(
+    scroller!.scrollLeft,
+    left0 - 60,
+    'the x burst drives the strip',
+  );
+  assert.equal(scroller!.style.scrollSnapType, 'none');
+  assert.equal(scrollByCalls.length, 4, 'still no vertical write');
 });
 
-test('useCalendarStrip: a horizontal wheel burst stays native only once deliberate', async () => {
+test('useCalendarStrip: a committed horizontal wheel burst drives the strip, then settles', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
@@ -670,21 +736,43 @@ test('useCalendarStrip: a horizontal wheel burst stays native only once delibera
   assert.deepEqual(scrollByCalls, []);
   assert.equal(scroller!.scrollLeft, left0, 'no horizontal movement yet');
 
-  // The third event takes the burst to 48px at 12:1: a deliberate swipe, so
-  // it and the rest of the gesture stay native and snap pages the day.
+  // 48px at 16:1 commits the burst to x. The strip is not user-scrollable on
+  // that axis, so the handler writes `scrollLeft` itself, under its own snap
+  // lock — no vertical write, no native horizontal scroll.
   const committed = [
     wheelEvent({ deltaX: -8, deltaY: 0 }),
-    wheelEvent({ deltaX: -30, deltaY: 2 }),
+    wheelEvent({ deltaX: -80, deltaY: 2 }),
+    wheelEvent({ deltaX: 10, deltaY: 0 }),
   ];
   await act(async () => {
     for (const ev of committed) scroller!.dispatchEvent(ev);
   });
   assert.deepEqual(
     committed.map((ev) => ev.defaultPrevented),
-    [false, false],
-    'a committed horizontal burst scrolls and snaps natively',
+    [true, true, true],
+    'a committed horizontal burst is consumed and driven by hand',
   );
-  assert.deepEqual(scrollByCalls, []);
+  // -8 - 80 + 10 = -78px: the strip followed the burst (deltaX < 0 scrolls
+  // the strip left, towards earlier days).
+  assert.equal(scroller!.scrollLeft, left0 - 78);
+  assert.equal(
+    scroller!.style.scrollSnapType,
+    'none',
+    'snap off while the burst drives the strip',
+  );
+  assert.deepEqual(scrollByCalls, [], 'the x burst never scrolls vertically');
+
+  // A quiet gap lands the burst on a column and re-engages snap.
+  await act(async () => {
+    await sleep(400);
+  });
+  assert.equal(
+    scroller!.scrollLeft % strip.colW,
+    0,
+    'the settle lands exactly on a column',
+  );
+  assert.notEqual(scroller!.scrollLeft, left0, 'the burst changed the day');
+  assert.equal(scroller!.style.scrollSnapType, '');
 });
 
 test('useCalendarStrip: a mouse wheel with no deltaX behaves exactly as before', async () => {

@@ -367,7 +367,7 @@ export function shiftWindowStart(
 // ── Strip lock ownership ────────────────────────────────────────────────
 
 /** Gesture owners that can hold the horizontal strip's scroll-snap off. */
-export type StripLockReason = 'drag' | 'pinch' | 'swipe';
+export type StripLockReason = 'drag' | 'pinch' | 'swipe' | 'wheel';
 
 /**
  * Scroll-snap stays `none` while any owner holds the lock.
@@ -380,13 +380,19 @@ export function stripSnapDisabled(held: ReadonlySet<StripLockReason>): boolean {
 
 /**
  * Rebase is suppressed for every owner: each one writes `scrollLeft` itself
- * (drag auto-scroll, pinch zoom, touch swipe), and a rebase write would fight
- * those. A future owner that only holds snap off must be added explicitly.
+ * (drag auto-scroll, pinch zoom, touch swipe, sideways wheel burst), and a
+ * rebase write would fight those. A future owner that only holds snap off must
+ * be added explicitly.
  */
 export function stripRebaseSuppressed(
   held: ReadonlySet<StripLockReason>,
 ): boolean {
-  return held.has('drag') || held.has('pinch') || held.has('swipe');
+  return (
+    held.has('drag') ||
+    held.has('pinch') ||
+    held.has('swipe') ||
+    held.has('wheel')
+  );
 }
 
 // ── Touch scroll axis ───────────────────────────────────────────────────

@@ -383,7 +383,7 @@ test('shiftWindowStart: period 3 → ±3 days', () => {
 
 test('stripSnapDisabled: true while any owner is held', () => {
   assert.equal(stripSnapDisabled(new Set<StripLockReason>()), false);
-  for (const reason of ['drag', 'pinch', 'swipe'] as const) {
+  for (const reason of ['drag', 'pinch', 'swipe', 'wheel'] as const) {
     assert.equal(stripSnapDisabled(new Set<StripLockReason>([reason])), true);
   }
   assert.equal(
@@ -393,7 +393,7 @@ test('stripSnapDisabled: true while any owner is held', () => {
 });
 
 test('stripRebaseSuppressed: every lock owner writes scrollLeft, so none rebases', () => {
-  for (const reason of ['drag', 'pinch', 'swipe'] as const) {
+  for (const reason of ['drag', 'pinch', 'swipe', 'wheel'] as const) {
     assert.equal(
       stripRebaseSuppressed(new Set<StripLockReason>([reason])),
       true,
