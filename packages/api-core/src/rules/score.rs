@@ -1,8 +1,10 @@
 //! The pure consistency scorer: `score_rule` and `score_board`.
 //!
-//! No async, no repositories, no clock — callers pass `as_of` (a civil date)
-//! and the already-loaded digest slice, so every rule of the model is
-//! unit-testable by hand-built days.
+//! No async, no repositories, no clock — callers pass two civil dates and the
+//! already-loaded digest slice, so every rule of the model is unit-testable by
+//! hand-built days. `score_as_of` is the card's cursor: the window, the strip,
+//! `on_track`, and the owed numbers all end there. `today` is the user's real
+//! civil today, and it alone is left provisional.
 //!
 //! # Units
 //!
@@ -18,8 +20,10 @@
 //! weekday is skipped the same way. Days before `starts_on` are out of play
 //! (strip `off`, no streak) but their digest rows still feed the window of the
 //! first in-play days. Each day is scored with the revision active on it.
-//! `on_track` is the window ending `as_of`; `as_of` itself is always
-//! `pending` in the strip and never consumed by a streak.
+//! `on_track` is the window ending `score_as_of`; the real `today` is always
+//! `pending` in the strip and never consumed by a streak. A finished challenge
+//! is scored at its `ends_on`, so that last day is judged — and counts — while
+//! its phase is still derived from `today`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,7 +38,7 @@ use super::params::{
 };
 use super::RulesError;
 
-/// Days in the strip (ending at `as_of`, oldest first).
+/// Days in the strip (ending at `score_as_of`, oldest first).
 pub const STRIP_DAYS: i64 = 14;
 /// Hardest lookback for any window, and for the streak history.
 pub const MAX_LOOKBACK_DAYS: i64 = 400;
@@ -195,14 +199,15 @@ pub struct EvidencePoint {
     pub hours: Option<f64>,
 }
 
-/// `category_days` evidence: the counted window ending `as_of`.
+/// `category_days` evidence: the counted window ending `score_as_of`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvidenceDay {
     pub date: String,
     pub hit: bool,
 }
 
-/// `category_daily_avg` evidence: the last selected weekdays ending `as_of`.
+/// `category_daily_avg` evidence: the last selected weekdays ending
+/// `score_as_of`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EvidenceWeekday {
     pub date: String,
@@ -283,16 +288,26 @@ impl DayState {
 // Entry points
 // ──────────────────────────────────────────
 
-/// Scores one rule as of `as_of`.
+/// Scores one rule: `score_as_of` is the card's cursor, `today` is the real
+/// civil today.
+///
+/// The live board passes the same date twice. A finished challenge passes its
+/// `ends_on` as the cursor and today as itself, so the final day gets a real
+/// verdict while the phase stays `finished`.
 pub fn score_rule(
     spec: &RuleSpec,
     revisions: &[Revision],
     pauses: &[PausePeriod],
     catalog: &CategoryCatalog,
     digest: &DigestSlice,
-    as_of: &str,
+    score_as_of: &str,
+    today: &str,
 ) -> Result<RuleScore, RulesError> {
-    Ok(Evaluator::new(spec, revisions, pauses, catalog, digest, as_of)?.evaluate()?.score)
+    Ok(
+        Evaluator::new(spec, revisions, pauses, catalog, digest, score_as_of, today)?
+            .evaluate()?
+            .score,
+    )
 }
 
 /// Scores the scoreboard: every rule's card plus the headline.
@@ -319,7 +334,9 @@ pub fn score_board(input: BoardInput<'_>) -> Result<Scoreboard, RulesError> {
     for spec in &specs {
         let empty: Vec<Revision> = Vec::new();
         let revisions = revisions.get(&spec.id).unwrap_or(&empty);
-        let evaluation = Evaluator::new(spec, revisions, &pauses, catalog, digest, as_of)?.evaluate()?;
+        // The board is live: its cursor is today, and today stays pending.
+        let evaluation =
+            Evaluator::new(spec, revisions, &pauses, catalog, digest, as_of, as_of)?.evaluate()?;
         evaluated.push((spec.clone(), evaluation.score, evaluation.states));
     }
 
@@ -498,7 +515,10 @@ struct Evaluator<'a> {
     rule_pauses: Vec<(String, String)>,
     sleep_ids: BTreeSet<String>,
     digest: &'a DigestSlice,
-    as_of: &'a str,
+    /// The card's cursor: the window, strip, `on_track`, and owed numbers.
+    score_as_of: &'a str,
+    /// The user's real civil today — the only day left `pending`.
+    today: &'a str,
 }
 
 impl<'a> Evaluator<'a> {
@@ -508,7 +528,8 @@ impl<'a> Evaluator<'a> {
         pauses: &[PausePeriod],
         catalog: &CategoryCatalog,
         digest: &'a DigestSlice,
-        as_of: &'a str,
+        score_as_of: &'a str,
+        today: &'a str,
     ) -> Result<Self, RulesError> {
         if revisions.is_empty() {
             return Err(RulesError::Invalid(format!(
@@ -571,7 +592,8 @@ impl<'a> Evaluator<'a> {
             rule_pauses,
             sleep_ids: catalog.sleep_ids(),
             digest,
-            as_of,
+            score_as_of,
+            today,
         })
     }
 
@@ -612,9 +634,11 @@ impl<'a> Evaluator<'a> {
                 .map_or(true, |ends_on| date <= ends_on)
     }
 
-    /// The derived phase, never stored.
+    /// The derived phase, never stored. Phase is about the real today: a rule
+    /// whose `ends_on` is behind it is finished even while its card is scored
+    /// at that `ends_on`.
     fn phase(&self) -> RulePhase {
-        rule_phase(self.spec, self.as_of)
+        rule_phase(self.spec, self.today)
     }
 
     // ── digest reads ────────────────────────────────────────────────────────
@@ -826,7 +850,9 @@ impl<'a> Evaluator<'a> {
                 return DayState::Excluded;
             }
         }
-        if date == self.as_of {
+        // Only the real today is provisional: a finished challenge's last day
+        // is judged even though it is the card's cursor.
+        if date == self.today {
             return DayState::Pending;
         }
         if self.outcome(revision, date).pass {
@@ -838,7 +864,7 @@ impl<'a> Evaluator<'a> {
 
     /// The earliest date worth scoring: `starts_on`, clamped to the lookback.
     fn history_start(&self) -> String {
-        let floor = shift_date(self.as_of, -(MAX_LOOKBACK_DAYS - 1))
+        let floor = shift_date(self.score_as_of, -(MAX_LOOKBACK_DAYS - 1))
             .unwrap_or_else(|| self.spec.starts_on.clone());
         if self.spec.starts_on > floor {
             self.spec.starts_on.clone()
@@ -851,7 +877,7 @@ impl<'a> Evaluator<'a> {
         let mut out: BTreeMap<String, DayState> = BTreeMap::new();
         let mut cursor = Some(self.history_start());
         while let Some(date) = cursor {
-            if date.as_str() > self.as_of {
+            if date.as_str() > self.score_as_of {
                 break;
             }
             out.insert(date.clone(), self.day_state(&date));
@@ -864,19 +890,18 @@ impl<'a> Evaluator<'a> {
 
     fn evaluate(&self) -> Result<Evaluation, RulesError> {
         let states = self.state_map();
-        let revision = self.params_on(self.as_of);
-        let outcome = self.outcome(revision, self.as_of);
+        let revision = self.params_on(self.score_as_of);
+        let outcome = self.outcome(revision, self.score_as_of);
 
-        let yesterday = shift_date(self.as_of, -1);
         let mut streak = 0_i64;
         let mut best_streak = 0_i64;
         let mut passes = 0_i64;
         let mut counted_completed = 0_i64;
         for (date, state) in &states {
-            if yesterday
-                .as_deref()
-                .is_some_and(|yesterday| date.as_str() > yesterday)
-            {
+            // A completed day: at or before the card's cursor and strictly
+            // before the real today. Live, that is "through yesterday"; a
+            // finished challenge scored at its `ends_on` counts that day too.
+            if date.as_str() > self.score_as_of || date.as_str() >= self.today {
                 continue;
             }
             match state {
@@ -936,10 +961,10 @@ impl<'a> Evaluator<'a> {
         Ok(Evaluation { score, states })
     }
 
-    /// The 14 civil dates ending at `as_of`, oldest first.
+    /// The 14 civil dates ending at `score_as_of`, oldest first.
     fn strip_dates(&self) -> Vec<String> {
         let mut dates: Vec<String> = Vec::with_capacity(STRIP_DAYS as usize);
-        let mut cursor = Some(self.as_of.to_string());
+        let mut cursor = Some(self.score_as_of.to_string());
         for _ in 0..STRIP_DAYS {
             let Some(date) = cursor else {
                 break;
@@ -1052,14 +1077,18 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// `today 4.2 / 7.0h · 2.8h left` — only when `as_of` is itself an
-    /// included weekday.
+    /// `today 4.2 / 7.0h · 2.8h left` — only on the live board (the card's
+    /// cursor is the real today) and when today is an included weekday. A
+    /// frozen final day must never be described as "today".
     fn today_fragment(
         &self,
         revision: &ParsedRevision,
         params: &CategoryDailyAvgParams,
     ) -> Option<String> {
-        let today = self.as_of;
+        if self.score_as_of != self.today {
+            return None;
+        }
+        let today = self.today;
         if !self.in_play(today) || self.is_paused(today) {
             return None;
         }
@@ -1130,16 +1159,16 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// The last `EVIDENCE_WEEKDAYS` selected weekdays ending at `as_of`, oldest
-    /// first — travel-excluded ones included so the UI can grey them. Paused
-    /// days are not counted, so they do not appear.
+    /// The last `EVIDENCE_WEEKDAYS` selected weekdays ending at `score_as_of`,
+    /// oldest first — travel-excluded ones included so the UI can grey them.
+    /// Paused days are not counted, so they do not appear.
     fn evidence_weekdays(
         &self,
         revision: &ParsedRevision,
         params: &CategoryDailyAvgParams,
     ) -> Vec<(String, bool)> {
         let mut out: Vec<(String, bool)> = Vec::new();
-        let mut cursor = Some(self.as_of.to_string());
+        let mut cursor = Some(self.score_as_of.to_string());
         let mut examined = 0_i64;
         while let Some(date) = cursor {
             if examined >= MAX_LOOKBACK_DAYS {
@@ -1161,13 +1190,16 @@ impl<'a> Evaluator<'a> {
         out
     }
 
-    /// The newest `EVIDENCE_NIGHTS` paired nights with `wake_date <= as_of`.
+    /// The newest `EVIDENCE_NIGHTS` paired nights with `wake_date <=
+    /// score_as_of`.
     fn evidence_nights(&self) -> Vec<EvidenceNight> {
         let mut nights: Vec<&Night> = self
             .digest
             .nights
             .iter()
-            .filter(|night| night.source == "paired" && night.wake_date.as_str() <= self.as_of)
+            .filter(|night| {
+                night.source == "paired" && night.wake_date.as_str() <= self.score_as_of
+            })
             .collect();
         nights.sort_by(|left, right| {
             (&left.wake_date, &left.asleep_at).cmp(&(&right.wake_date, &right.asleep_at))
@@ -1376,6 +1408,8 @@ mod tests {
         digest.add(date, category_id, (value * 3600.0).round() as i64);
     }
 
+    /// Scores with the card's cursor and the real today both at `as_of` — the
+    /// live board.
     fn run(
         spec: &RuleSpec,
         revisions: &[Revision],
@@ -1383,7 +1417,7 @@ mod tests {
         digest: &DigestSlice,
         as_of: &str,
     ) -> RuleScore {
-        score_rule(spec, revisions, &[], catalog, digest, as_of).expect("rule scores")
+        score_rule(spec, revisions, &[], catalog, digest, as_of, as_of).expect("rule scores")
     }
 
     fn cell(score: &RuleScore, date: &str) -> String {
@@ -1496,7 +1530,10 @@ mod tests {
             from_date: paused_day.to_string(),
             to_date: paused_day.to_string(),
         }];
-        let score = score_rule(&spec, &revisions, &pauses, &catalog, &digest, SUNDAY).expect("scores");
+        let score = score_rule(
+            &spec, &revisions, &pauses, &catalog, &digest, SUNDAY, SUNDAY,
+        )
+        .expect("scores");
         assert!(score.on_track, "{score:?}");
         assert_eq!(cell(&score, paused_day), "paused");
 
@@ -1520,7 +1557,10 @@ mod tests {
             from_date: "2026-10-16".to_string(),
             to_date: "2026-10-16".to_string(),
         }];
-        let score = score_rule(&spec, &revisions, &pauses, &catalog, &digest, SUNDAY).expect("scores");
+        let score = score_rule(
+            &spec, &revisions, &pauses, &catalog, &digest, SUNDAY, SUNDAY,
+        )
+        .expect("scores");
         assert_eq!(cell(&score, "2026-10-16"), "paused");
         assert_eq!(score.streak, 2);
         assert_eq!(score.best_streak, 2);
@@ -1971,7 +2011,8 @@ mod tests {
         assert_eq!(board.rules[0].phase, "active");
 
         // The finished rule is out of the headline but still has a final score:
-        // its window ends on `ends_on`, where the 2h live.
+        // its cursor is `ends_on`, where the 2h live, while `today` is the real
+        // civil day — so the last day is judged rather than left pending.
         let score = score_rule(
             &finished,
             &[revision(
@@ -1982,11 +2023,16 @@ mod tests {
             &catalog,
             &digest,
             "2026-10-17",
+            SUNDAY,
         )
         .expect("scores");
         assert!(score.on_track);
+        assert_eq!(score.phase, "finished", "ends_on is behind the real today");
+        assert_eq!(cell(&score, "2026-10-17"), "pass", "final day judged");
+        assert!(score.streak >= 1, "the final day counts: {}", score.streak);
         assert_eq!(rule_phase(&finished, SUNDAY), RulePhase::Finished);
-        // Scored at `as_of` instead, the same rule would fail (nothing on the day).
+        // Scored with its cursor at the real today instead, the same rule fails
+        // (nothing on the day) and leaves it pending.
         let naive = score_rule(
             &finished,
             &[revision(
@@ -1996,6 +2042,7 @@ mod tests {
             &[],
             &catalog,
             &digest,
+            SUNDAY,
             SUNDAY,
         )
         .expect("scores");

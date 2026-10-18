@@ -204,8 +204,12 @@ pub async fn scoreboard(
     })?)
 }
 
-/// `GET /api/rules/archive` — finished and archived rules, each scored at
-/// `min(as_of, ends_on)` when finished, else at `as_of`.
+/// `GET /api/rules/archive` — finished and archived rules.
+///
+/// A finished rule is scored with its cursor at `ends_on`, so its last day is
+/// a real verdict and counts; `today` stays the civil today, so the phase is
+/// `finished` and nothing is left pending. Archived-but-unfinished rules are
+/// scored live at today.
 pub async fn archive_rules(
     repo: &dyn RuleRepo,
     digest_repo: &dyn DigestRepo,
@@ -213,23 +217,23 @@ pub async fn archive_rules(
     now_unix: i64,
 ) -> Result<ArchiveResponse, RulesError> {
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    let (as_of, _time_zone) = today(digest_repo, user_id, now_unix).await?;
-    ensure_default_rules(repo, user_id, &as_of, &now_rfc3339).await?;
+    let (today, _time_zone) = today(digest_repo, user_id, now_unix).await?;
+    ensure_default_rules(repo, user_id, &today, &now_rfc3339).await?;
     let rows = repo.list_rules(user_id).await?;
 
     let mut targets: Vec<(RuleSpec, String)> = Vec::new();
     for row in &rows {
         let spec = row.spec()?;
-        match rule_phase(&spec, &as_of) {
+        match rule_phase(&spec, &today) {
             RulePhase::Finished => {
                 let at = spec
                     .ends_on
                     .clone()
-                    .filter(|end| end.as_str() < as_of.as_str())
-                    .unwrap_or_else(|| as_of.clone());
+                    .filter(|end| end.as_str() < today.as_str())
+                    .unwrap_or_else(|| today.clone());
                 targets.push((spec, at));
             }
-            RulePhase::Archived => targets.push((spec, as_of.clone())),
+            RulePhase::Archived => targets.push((spec, today.clone())),
             RulePhase::Active | RulePhase::Paused => {}
         }
     }
@@ -241,8 +245,8 @@ pub async fn archive_rules(
         .iter()
         .map(|(_, at)| at.clone())
         .min()
-        .unwrap_or_else(|| as_of.clone());
-    let loaded = load_inputs(repo, user_id, &earliest, &as_of, &rows).await?;
+        .unwrap_or_else(|| today.clone());
+    let loaded = load_inputs(repo, user_id, &earliest, &today, &rows).await?;
     let mut rules = Vec::with_capacity(targets.len());
     for (spec, at) in &targets {
         if !has_revisions(&loaded, &spec.id) {
@@ -256,6 +260,7 @@ pub async fn archive_rules(
             &loaded.catalog,
             &loaded.digest,
             at,
+            &today,
         )?);
     }
     Ok(ArchiveResponse { rules })
@@ -396,12 +401,14 @@ async fn score_one(
     let loaded = load_inputs(repo, user_id, as_of, as_of, std::slice::from_ref(rule)).await?;
     let spec = rule.spec()?;
     let revisions = loaded.revisions.get(&spec.id).cloned().unwrap_or_default();
+    // A write's card is live: its cursor is today, and today stays pending.
     Ok(score_rule(
         &spec,
         &revisions,
         &loaded.pauses,
         &loaded.catalog,
         &loaded.digest,
+        as_of,
         as_of,
     )?)
 }
