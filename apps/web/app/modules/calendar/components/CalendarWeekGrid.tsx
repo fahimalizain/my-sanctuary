@@ -123,11 +123,15 @@ export function CalendarWeekGrid({
       <div
         ref={scrollerRef}
         data-calendar-scroller
-        className="flex-1 min-h-0 overflow-auto snap-x snap-mandatory [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden snap-x snap-mandatory [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
         // Day columns snap (snap-start) to the track's left edge, i.e. just
         // right of the sticky gutter; padding = gutter keeps them aligned there.
-        // pan-y hands horizontal touch to the JS swipe: native 2D panning moves
-        // the strip from the first pixel, so it can have no dead zone.
+        // One axis per gesture: `overflow-x: hidden` makes the strip
+        // programmatically scrollable but *not* user-scrollable, so the browser
+        // can never pan it sideways — not even on Safari, where `touch-action:
+        // pan-y` does not reliably rail a touch. Horizontal movement is driven
+        // entirely by useCalendarStrip (touch swipe, trackpad burst).
+        // `pan-y` still keeps vertical touch panning native.
         style={{ scrollPaddingLeft: gutterW }}
         onScroll={onScroll}
       >
