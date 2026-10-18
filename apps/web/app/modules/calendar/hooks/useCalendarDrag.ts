@@ -44,7 +44,6 @@ import {
 } from '../lib/calendar-drag';
 import { tick } from '../lib/haptics';
 import {
-  COL_HEADER_H,
   SNAP_MINUTES,
   dateOnDay,
   minutesFromY,
@@ -506,8 +505,10 @@ function scrubSessionAt(
  * that lag once the finger stops moving, which is what converges the edge onto
  * the sample the finger is resting on.
  *
- * The grab is the anchor, never a moving one: an autoscroll moves `contentY` and
+ * The grab is the anchor, never a moving one: a scroll moves `contentY` and
  * `scrollTop` together, so `pointerTravelPx` subtracts it back to no travel.
+ * A scrub does not scroll on purpose (`freezeVerticalScroll`); the subtraction
+ * stays so a scroll that races the lock cannot nudge the edge.
  *
  * Mutates `samples` — the gesture's own buffer, not render state — keeping the
  * grab so the anchor survives the cap. `recorded` is false when there was
@@ -846,6 +847,41 @@ function stepSession(
   };
 }
 
+/**
+ * Hold `scroller` still vertically until the returned function runs.
+ *
+ * The gutter pills are a precision scrub. `touch-action: none` on the pill is
+ * not enough: the scroller is `touch-action: pan-y`, a trackpad wheel still
+ * scrolls while the button is held, and a browser drag-autoscroll writes
+ * `scrollTop` without a cancelable event. Wheel and touch pan are cancelled
+ * here — the listener has to be non-passive, or `preventDefault` is ignored —
+ * and a scroll that lands anyway is pinned back to the position at lock time.
+ */
+function freezeVerticalScroll(scroller: HTMLElement): () => void {
+  const top = scroller.scrollTop;
+  let pinning = false;
+  const pin = () => {
+    if (pinning || scroller.scrollTop === top) return;
+    pinning = true;
+    scroller.scrollTop = top;
+    pinning = false;
+    // A shorter document clamps the write and would re-fire forever. Wheel and
+    // touch are still cancelled; only the pin gives up.
+    if (scroller.scrollTop !== top) scroller.removeEventListener('scroll', pin);
+  };
+  const block = (event: Event) => {
+    if (event.cancelable) event.preventDefault();
+  };
+  scroller.addEventListener('scroll', pin);
+  window.addEventListener('touchmove', block, { capture: true, passive: false });
+  window.addEventListener('wheel', block, { capture: true, passive: false });
+  return () => {
+    scroller.removeEventListener('scroll', pin);
+    window.removeEventListener('touchmove', block, { capture: true });
+    window.removeEventListener('wheel', block, { capture: true });
+  };
+}
+
 export function useCalendarDrag(
   options: UseCalendarDragOptions,
 ): CalendarDragApi {
@@ -1022,25 +1058,16 @@ export function useCalendarDrag(
     autoScrollRafRef.current = 0;
     const session = sessionRef.current;
     if (!claimedRef.current || !session) return;
+    // Precision gutter handles freeze the view instead (see
+    // `freezeVerticalScroll`). The loop is not started for a scrub; bailing
+    // here is the backstop so a stuck pill cannot fling the hours.
+    if (isScrubKind(session.kind)) return;
     const scroller = document.querySelector('[data-calendar-scroller]');
     if (!(scroller instanceof HTMLElement)) return;
     const rect = scroller.getBoundingClientRect();
     const { x, y } = lastPtrRef.current;
-    let dx = 0;
-    let dy = 0;
-    if (isScrubKind(session.kind)) {
-      // A scrub has no horizontal axis: the visible top of the hours is the
-      // sticky band's bottom, so that edge scrolls hours, not the header.
-      const band = document.querySelector('[data-allday-row]');
-      const top =
-        band instanceof HTMLElement
-          ? band.getBoundingClientRect().bottom
-          : rect.top + COL_HEADER_H;
-      dy = autoscrollDelta(y, top, rect.bottom);
-    } else {
-      dx = autoscrollDelta(x, rect.left, rect.right);
-      dy = autoscrollDelta(y, rect.top, rect.bottom);
-    }
+    const dx = autoscrollDelta(x, rect.left, rect.right);
+    const dy = autoscrollDelta(y, rect.top, rect.bottom);
     if (dx !== 0) scroller.scrollLeft += dx;
     if (dy !== 0) scroller.scrollTop += dy;
     if (dx !== 0 || dy !== 0) applyPoint(x, y, lastKeysRef.current);
@@ -1051,6 +1078,21 @@ export function useCalendarDrag(
     if (autoScrollRafRef.current) return;
     autoScrollRafRef.current = requestAnimationFrame(tickAutoScroll);
   }, [tickAutoScroll]);
+
+  /** Release of `freezeVerticalScroll`, or null when the view is free to pan. */
+  const verticalScrollLockRef = useRef<(() => void) | null>(null);
+
+  const unlockScrollerVertical = useCallback(() => {
+    verticalScrollLockRef.current?.();
+    verticalScrollLockRef.current = null;
+  }, []);
+
+  const lockScrollerVertical = useCallback(() => {
+    unlockScrollerVertical();
+    const scroller = document.querySelector('[data-calendar-scroller]');
+    if (!(scroller instanceof HTMLElement)) return;
+    verticalScrollLockRef.current = freezeVerticalScroll(scroller);
+  }, [unlockScrollerVertical]);
 
   const claimGesture = useCallback(
     (pointerId: number) => {
@@ -1084,6 +1126,9 @@ export function useCalendarDrag(
       // A settle left armed by an earlier scrub must not outlive it and paint
       // into this session's state: every new session starts with a clean slate.
       clearScrubSettle();
+      // A scrub replaced by another gesture (or a scrub that follows one) must
+      // not leave the previous freeze in place, and must not inherit it.
+      unlockScrollerVertical();
       sessionRef.current = next;
       didDragRef.current = false;
       setSession(next);
@@ -1108,10 +1153,23 @@ export function useCalendarDrag(
           // Capture can fail if the target is not active; window listeners still work.
         }
         document.body.style.userSelect = 'none';
-        startAutoScroll();
+        if (isScrubKind(next.kind)) {
+          // Precision handles freeze the hours. Autoscroll would fling the day:
+          // a pill stuck to the viewport edge already sits in the edge zone,
+          // and the travel math subtracts scroll out, so the edge would not
+          // even follow.
+          lockScrollerVertical();
+        } else {
+          startAutoScroll();
+        }
       }
     },
-    [clearScrubSettle, startAutoScroll],
+    [
+      clearScrubSettle,
+      lockScrollerVertical,
+      startAutoScroll,
+      unlockScrollerVertical,
+    ],
   );
 
   const endSession = useCallback(() => {
@@ -1120,6 +1178,7 @@ export function useCalendarDrag(
     // inside the lag still drops the movement it never showed.
     clearScrubSettle();
     stopAutoScroll();
+    unlockScrollerVertical();
     sessionRef.current = null;
     setSession(null);
     setDidDrag(false);
@@ -1128,7 +1187,7 @@ export function useCalendarDrag(
     captureTargetRef.current = null;
     optsRef.current.unlockStrip('drag');
     document.body.style.userSelect = '';
-  }, [clearScrubSettle, stopAutoScroll]);
+  }, [clearScrubSettle, stopAutoScroll, unlockScrollerVertical]);
 
   // Track touches at window capture (ahead of React's delegated handlers).
   // A 2nd finger latches multi-touch: drop any session and block new ones
@@ -1345,9 +1404,10 @@ export function useCalendarDrag(
   useEffect(() => {
     return () => {
       clearScrubSettle();
+      unlockScrollerVertical();
       document.body.style.userSelect = '';
     };
-  }, [clearScrubSettle]);
+  }, [clearScrubSettle, unlockScrollerVertical]);
 
   const onColumnPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLElement>, day: Date) => {
@@ -1485,8 +1545,11 @@ export function useCalendarDrag(
 
   /**
    * Grab the selected event's start / end pill in the gutter. Touch and mouse
-   * alike claim the gesture on the first pixel (a scrub never scrolls), and both
-   * run the same 1:10 gain: Cmd/Ctrl precision is a grid gesture, not this one.
+   * alike claim the gesture on the first pixel, and both run the same 1:10
+   * gain: Cmd/Ctrl precision is a grid gesture, not this one. The scroller's
+   * vertical axis stays frozen for the whole gesture — autoscroll, touch pan,
+   * and wheel would slide the hours under a handle that is only landing a
+   * minute.
    */
   const onGutterEdgePointerDown = useCallback(
     (
