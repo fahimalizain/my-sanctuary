@@ -13,10 +13,14 @@ import { SortableTaskCard } from './TaskCard';
 
 /** One board column: neutral surface with a 2px status accent on the header
  *  only. The count is the number of cards currently shown (after filter +
- *  cap) — never a `20 / 64` overflow hint. The CARD LIST is the column
- *  droppable (`column:<status>`), so the empty space below the cards (and
- *  whole empty columns) accept a drop; the cards inside remain a vertical
- *  SortableContext. */
+ *  cap) — never a `20 / 64` overflow hint. The section stretches to the
+ *  row's leftover viewport height (`h-full`) and clips for its rounded
+ *  corners; the only scrolling box is the CARD LIST, which is also the
+ *  column droppable (`column:<status>`) — its border box is the visible
+ *  column body that `pointerWithin` measures. Being `flex-1` inside that
+ *  bounded section, the list fills the remaining height even with one card,
+ *  so the empty space below the cards (and whole empty columns) still
+ *  accepts a drop. The cards inside remain a vertical SortableContext. */
 export function BoardColumnView({
   column,
   tasks,
@@ -56,7 +60,7 @@ export function BoardColumnView({
   return (
     <section
       className={cn(
-        'flex w-[260px] shrink-0 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
+        'flex h-full min-h-0 w-[260px] shrink-0 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
         overThisColumn
           ? 'border-primary/60 ring-2 ring-primary/20'
           : 'border-border',
@@ -99,7 +103,7 @@ export function BoardColumnView({
         <div
           ref={setNodeRef}
           className={cn(
-            'flex-1 space-y-2 p-3 transition-colors',
+            'min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3 transition-colors',
             overThisColumn && tasks.length === 0 && 'bg-muted/40 rounded-lg',
           )}
         >

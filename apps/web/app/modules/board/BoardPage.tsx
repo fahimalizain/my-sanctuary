@@ -855,9 +855,14 @@ export function BoardPage() {
     return null;
   };
 
+  // Viewport-locked page (same height idiom as CalendarPage): the root is a
+  // fixed 100dvh flex column that never grows with column content, so the
+  // header and filters hold their place and only a column body scrolls.
   return (
-    <div className="flex min-h-screen flex-col bg-cream">
-      <div className="mx-auto w-full max-w-7xl px-6 pt-8">
+    <div className="flex h-[100dvh] flex-col overflow-hidden bg-cream">
+      {/* Header, banners, loader and filters — fixed height (shrink-0), so
+          everything below them is the leftover viewport. */}
+      <div className="mx-auto w-full max-w-7xl shrink-0 px-6 pt-8">
         {/* Header */}
         <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
@@ -1050,11 +1055,13 @@ export function BoardPage() {
       </div>
 
       {(lists.length > 0 || (!isLoading && !loadError)) && (
-        /* Five status columns. The scroller fills leftover viewport
-                height so empty space below the columns still pans. Columns
-                are a fixed 260px; the row stays centered and overflow-x
-                on narrow screens. mb-24 sits the scrollbar just above
-                the floating nav. */
+        /* Five status columns (ADR 0002 § UI). The page is a fixed 100dvh
+                column, so this scroller takes exactly the height the header
+                and filters leave over and pans horizontally only
+                (`overflow-y-hidden`) — the vertical scroll lives in each
+                column body. Columns are a fixed 260px, the row stays
+                centered and overflows sideways on narrow screens, and
+                `mb-24` sits the scrollbar just above the floating nav. */
         <DndContext
           sensors={sensors}
           collisionDetection={boardCollisionDetection}
@@ -1068,8 +1075,8 @@ export function BoardPage() {
             setDragItems(null);
           }}
         >
-          <div className="mb-24 min-h-0 flex-1 overflow-x-auto pb-2">
-            <div className="mx-auto flex min-h-full w-max gap-6 px-6">
+          <div className="mb-24 min-h-0 flex-1 overflow-x-auto overflow-y-hidden pb-2">
+            <div className="mx-auto flex h-full w-max gap-6 px-6">
               {COLUMNS.map((column) => (
                 <BoardColumnView
                   key={column.status}
