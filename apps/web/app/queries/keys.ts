@@ -1,3 +1,5 @@
+import type { RecordRangeKey } from '@/app/types';
+
 export const queryKeys = {
   auth: {
     all: ['auth'] as const,
@@ -22,6 +24,12 @@ export const queryKeys = {
     // `/api/pauses` lives under `rules` on purpose: every rule mutation
     // invalidates the pause list, so one prefix invalidation reaches it.
     pauses: () => [...queryKeys.rules.all, 'pauses'] as const,
+  },
+  // "The Record" (reports slice 5). Keyed by the range picker's value, so a
+  // range change is a fresh read and `record.all` invalidates every range.
+  record: {
+    all: ['record'] as const,
+    range: (range: RecordRangeKey) => [...queryKeys.record.all, range] as const,
   },
   agenda: {
     all: ['agenda'] as const,

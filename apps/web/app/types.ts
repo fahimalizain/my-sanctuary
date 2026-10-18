@@ -918,3 +918,100 @@ export interface NewPauseInput {
   to: string;
   reason?: string;
 }
+
+// ──────────────────────────────────────────
+// The Record (reports slice 5) — shapes mirror
+// `packages/api-core/src/record/{assemble,mod}.rs`.
+//
+// Descriptive only: every duration is an integer number of seconds (the client
+// divides by 3600 for hours), and nothing here carries a target or a verdict.
+// ──────────────────────────────────────────
+
+// The `range` query values, exactly as the server accepts and echoes them.
+export type RecordRangeKey = '7d' | '30d' | '90d' | 'ytd';
+
+// One root category's seconds on one day (leaves have already rolled up).
+export interface RecordSegment {
+  category_id: string;
+  title: string;
+  color: string;
+  seconds: number;
+}
+
+export interface RecordDay {
+  date: string;
+  segments: RecordSegment[];
+  /** `null` while the day is still being written (it is today in its zone). */
+  untracked_seconds: number | null;
+}
+
+export interface RecordRankingRow {
+  category_id: string;
+  title: string;
+  color: string;
+  seconds: number;
+  previous_seconds: number;
+  /** `seconds` over the range's total (`0` when nothing was tracked). */
+  share: number;
+}
+
+export interface RecordTrendPoint {
+  date: string;
+  hours: number;
+  /** `null` until the user's history reaches 30 / 60 days. */
+  ma30: number | null;
+  ma60: number | null;
+}
+
+export interface RecordHeatmapRow {
+  /** `0 = Monday … 6 = Sunday`. */
+  weekday: number;
+  /** 24 mean productive seconds, one per clock hour. */
+  seconds: number[];
+}
+
+export interface RecordEstimatedNight {
+  wake_date: string;
+  /** `est_no_wake | est_no_asleep | est_none`. */
+  source: string;
+  seconds: number;
+}
+
+export interface RecordUnclassifiedTitle {
+  title: string;
+  count: number;
+}
+
+export interface RecordQuality {
+  estimated_nights: RecordEstimatedNight[];
+  unclassified_titles: RecordUnclassifiedTitle[];
+}
+
+export interface RecordYearRow {
+  year: number;
+  productive_hours_per_day: number;
+  weekday_hours: number;
+  weekend_hours: number;
+  /** `null` until the year has a paired night. */
+  sleep_median_hours: number | null;
+  paired_nights: number;
+  /** January 1 through December 31, clipped to `as_of`. */
+  days: number;
+}
+
+// The envelope returned by GET /api/reports/record.
+export interface RecordReport {
+  as_of: string;
+  time_zone: string;
+  range: RecordRangeKey;
+  from: string;
+  to: string;
+  previous_from: string;
+  previous_to: string;
+  days: RecordDay[];
+  ranking: RecordRankingRow[];
+  trend: RecordTrendPoint[];
+  heatmap: RecordHeatmapRow[];
+  quality: RecordQuality;
+  years: RecordYearRow[];
+}

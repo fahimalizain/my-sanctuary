@@ -120,6 +120,9 @@ pub use digest::*;
 pub mod rules;
 pub use rules::*;
 
+pub mod record;
+pub use record::*;
+
 /// `users` table persistence.
 pub struct D1UserRepo {
     db: D1Database,

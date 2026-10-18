@@ -29,6 +29,7 @@ import { ArchiveRuleRow, RuleCard } from './RuleCard';
 import { RuleDialog } from './RuleDialog';
 import type { RuleSubmitPayload } from './RuleDialog';
 import { reorderIds, swapNeighbors } from './rules-model';
+import { TheRecord } from './TheRecord';
 
 export function ConsistencyPage() {
   const boardQuery = useScoreboardQuery();
@@ -383,6 +384,11 @@ export function ConsistencyPage() {
             )}
           </>
         )}
+
+        {/* "The Record" — the descriptive report, collapsed and below the
+            board. It fetches only once opened and never blocks the cards
+            above it. */}
+        <TheRecord />
       </div>
 
       <RuleDialog

@@ -20,6 +20,7 @@ pub mod models;
 pub mod oauth;
 pub mod pattern_gen;
 pub mod realtime;
+pub mod record;
 pub mod repo;
 pub mod routines;
 pub mod rules;
@@ -111,6 +112,17 @@ pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
 pub use realtime::{RealtimeKind, RealtimeMessage};
+pub use record::{
+    assemble_record, record_report, EstimatedNight, HeatmapRow, RankingRow, RecordCategoryRow,
+    RecordCategorySecondsRow, RecordData, RecordDay, RecordDaySecondsRow, RecordError,
+    RecordHourSecondsRow, RecordMetaRow, RecordNightRow, RecordQuality, RecordRange, RecordReport,
+    RecordRepo, RecordSegment, RecordTitleRow, RecordWindow, TrendPoint, UnclassifiedTitle,
+    YearRow, ESTIMATED_NIGHTS_CAP, RECORD_CATEGORIES_SQL, RECORD_CATEGORY_SECONDS_SQL,
+    RECORD_EARLIEST_META_DATE_SQL, RECORD_EARLIEST_NIGHT_DATE_SQL, RECORD_HOUR_SECONDS_SQL,
+    RECORD_META_SQL, RECORD_NIGHTS_SQL, RECORD_PRIMARY_TIME_ZONE_SQL,
+    RECORD_PRODUCTIVE_SECONDS_SQL, RECORD_UNCLASSIFIED_TITLES_SQL, TREND_WINDOW_DAYS,
+    UNCLASSIFIED_TITLES_CAP, YEARS_CAP,
+};
 pub use routines::{
     create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
     validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,

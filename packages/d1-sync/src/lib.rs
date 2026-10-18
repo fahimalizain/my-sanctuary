@@ -5,10 +5,14 @@
 //! repo implementations over api-core SQL constants.
 
 mod digest;
+mod record;
 mod repos;
 mod rules;
 
 pub use digest::{calendar_owner, count_rows, event_span, mark_dirty_spans, SqliteDigestRepo};
+pub use record::{
+    seed_category_full, seed_event, seed_hour_seconds, seed_meta, seed_night, SqliteRecordRepo,
+};
 pub use repos::{
     SqliteCalendarEventRepo, SqliteCalendarEventOperationRepo, SqliteCalendarRepo, SqliteTokenRepo,
     SqliteWatchChannelRepo,
@@ -44,6 +48,11 @@ impl Harness {
     /// A rules repo over the same connection (one D1 database).
     pub fn rules(&self) -> SqliteRuleRepo {
         SqliteRuleRepo::new(Arc::clone(&self.db))
+    }
+
+    /// A record repo over the same connection (one D1 database).
+    pub fn record(&self) -> SqliteRecordRepo {
+        SqliteRecordRepo::new(Arc::clone(&self.db))
     }
 }
 
