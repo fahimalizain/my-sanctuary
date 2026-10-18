@@ -1740,10 +1740,13 @@ export function HomePage() {
             )}
 
             {/* The stream: its own scroll container, so the page itself never
-                grows without bound and dnd-kit can auto-scroll a drag. */}
+                grows without bound and dnd-kit can auto-scroll a drag. Native
+                scroll anchoring is off: the prepend compensation below already
+                shifts `scrollTop` by the new week's height, and the browser's
+                own shift would land on top of it (a double jump). */}
             <div
               ref={scrollRef}
-              className="relative h-[calc(100dvh-14.5rem)] min-h-[20rem] overflow-y-auto overscroll-contain bg-cream lg:h-[calc(100dvh-5.25rem)]"
+              className="relative h-[calc(100dvh-14.5rem)] min-h-[20rem] overflow-y-auto overscroll-contain bg-cream [overflow-anchor:none] lg:h-[calc(100dvh-5.25rem)]"
             >
               {/* First load — the default read has not resolved yet */}
               {!hasPages && current.isLoading && (
