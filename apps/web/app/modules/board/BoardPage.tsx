@@ -30,8 +30,6 @@ import {
   useUpdateTask,
 } from '@/app/queries/tasks';
 import {
-  TASK_PRIORITIES,
-  TASK_PRIORITY_LABELS,
   type FocusTaskResponse,
   type MoveTaskInput,
   type MoveTaskResponse,
@@ -43,8 +41,7 @@ import {
   type TaskStatus,
 } from '@/app/types';
 import { BoardColumnView } from './BoardColumn';
-import { CategoryFilter } from './CategoryFilter';
-import { FilterPill } from './FilterPill';
+import { BoardFilters } from './BoardFilters';
 import { TaskCard } from './TaskCard';
 import {
   boardCollisionDetection,
@@ -206,22 +203,19 @@ export function BoardPage() {
   // URL filters (ADR 0002 § Filters)
   // ──────────────────────────────────────────
 
-  // Filter chips are built from the loaded categories; untracked is a
-  // system category that is never offered as a filter chip. Untracked
-  // cards are not hidden from the columns, and a `?category=` URL that
-  // names the sink still matches (the sink id is in `categories`).
-  const filterableCategories = useMemo(
-    () => categories.filter((cat) => !cat.is_untracked),
-    [categories],
-  );
-
+  // Resolves the URL's explicit category ids. Untracked is a system category
+  // that is never offered as a filter chip (that derivation now lives in
+  // `BoardFilters`), but its id stays resolvable here: untracked cards are
+  // still visible in their columns, and a `?category=` URL naming the sink
+  // still matches. Unknown ids are ignored (ADR 0002) — they cannot match any
+  // task's computed category.
   const categoryById = useMemo(
     () => new Map(categories.map((cat) => [cat.id, cat])),
     [categories],
   );
 
-  // Unknown ids from the URL are ignored (ADR 0002): they cannot match any
-  // task's computed category.
+  // Resolved explicit ids: the category control and `matchesFilters` below
+  // read the same list.
   const selectedCategoryIds = useMemo(() => {
     if (!category) return [];
     return category
@@ -230,11 +224,10 @@ export function BoardPage() {
       .filter((id) => id.length > 0 && categoryById.has(id));
   }, [category, categoryById]);
 
-  const hasActiveFilters =
-    priority !== undefined ||
-    difficulty !== undefined ||
-    selectedCategoryIds.length > 0 ||
-    (search ?? '').trim().length > 0;
+  // "Are filters active?" is derived inside `BoardFilters` from these same
+  // four groups (`countActiveFilterGroups`), so the Clear filters affordance
+  // and the later mobile badge share one source of truth; this page needs no
+  // boolean of its own.
 
   // Merges the given fields into the URL search params. Only keys that are
   // PRESENT in `updates` are touched: an explicitly `undefined` value removes
@@ -940,116 +933,25 @@ export function BoardPage() {
             flight, or a load error that replaced the board). Action errors
             never unmount it. */}
         {(lists.length > 0 || (!isLoading && !loadError)) && (
-          /* URL filters — one wrapping horizontal row (ADR 0002 § UI):
-                Priority and Difficulty are single-select All+value pills;
-                Category is a searchable checkbox combobox grouped by list →
-                root → children; Search is a free-text title/description
-                filter driven by `?search=` (each keystroke rewrites the
-                param, whitespace-only removes it). Clear filters sits on
-                this same row, aligned with the controls. Filters combine
-                with AND. */
           <section className="mb-6">
-            <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
-              <div className="flex flex-col items-start gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Priority
-                </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  <FilterPill
-                    selected={priority === undefined}
-                    onClick={() => setPriorityFilter(undefined)}
-                  >
-                    All
-                  </FilterPill>
-                  {TASK_PRIORITIES.map((value) => (
-                    <FilterPill
-                      key={value}
-                      selected={priority === value}
-                      onClick={() => setPriorityFilter(value)}
-                    >
-                      {TASK_PRIORITY_LABELS[value]}
-                    </FilterPill>
-                  ))}
-                </div>
-              </div>
-
-              <div className="flex flex-col items-start gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Difficulty
-                </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  <FilterPill
-                    selected={difficulty === undefined}
-                    onClick={() => setDifficultyFilter(undefined)}
-                  >
-                    All
-                  </FilterPill>
-                  {(['easy', 'medium', 'hard'] as TaskDifficulty[]).map(
-                    (value) => (
-                      <FilterPill
-                        key={value}
-                        selected={difficulty === value}
-                        onClick={() => setDifficultyFilter(value)}
-                      >
-                        {value[0].toUpperCase() + value.slice(1)}
-                      </FilterPill>
-                    ),
-                  )}
-                </div>
-              </div>
-
-              <div className="flex flex-col items-start gap-1.5">
-                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Category
-                </span>
-                {filterableCategories.length > 0 ? (
-                  <CategoryFilter
-                    lists={lists}
-                    categories={categories}
-                    selectedIds={selectedCategoryIds}
-                    onToggle={toggleCategoryFilter}
-                    onClear={() => updateSearch({ category: undefined })}
-                  />
-                ) : (
-                  <span className="text-sm text-muted-foreground italic">
-                    No categories yet
-                  </span>
-                )}
-              </div>
-
-              <div className="flex flex-col items-start gap-1.5">
-                <label
-                  htmlFor="board-task-search"
-                  className="text-xs font-medium uppercase tracking-wide text-muted-foreground"
-                >
-                  Search
-                </label>
-                {/* type="text" (never "search" — that paints a native
-                    cancel button); every keystroke writes `?search=` via
-                    updateSearch (replace: true), which treats whitespace-only
-                    as delete. Focus border only — never the primary fill. */}
-                <input
-                  id="board-task-search"
-                  type="text"
-                  value={search ?? ''}
-                  onChange={(event) =>
-                    updateSearch({ search: event.target.value })
-                  }
-                  placeholder="Search tasks"
-                  className="w-56 min-w-0 rounded-xl border-2 border-input bg-background px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:border-primary transition-all"
-                />
-              </div>
-
-              {hasActiveFilters && (
-                <button
-                  type="button"
-                  onClick={clearFilters}
-                  className="shrink-0 py-1.5 text-sm font-medium text-primary hover:underline"
-                >
-                  Clear filters
-                </button>
-              )}
-            </div>
+            {/* Filter chrome lives in the shared `BoardFilters` (the mobile
+                sheet renders the same component); every URL write stays in
+                this page and is handed down as a callback (ADR 0002 § UI). */}
+            <BoardFilters
+              layout="row"
+              priority={priority}
+              difficulty={difficulty}
+              search={search}
+              lists={lists}
+              categories={categories}
+              selectedCategoryIds={selectedCategoryIds}
+              onPriority={setPriorityFilter}
+              onDifficulty={setDifficultyFilter}
+              onToggleCategory={toggleCategoryFilter}
+              onClearCategories={() => updateSearch({ category: undefined })}
+              onSearch={(value) => updateSearch({ search: value })}
+              onClearFilters={clearFilters}
+            />
           </section>
         )}
       </div>
