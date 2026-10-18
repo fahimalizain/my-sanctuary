@@ -90,6 +90,26 @@ test('notionEventTheme: Notion yellow dark matches measured pixels', () => {
   );
 });
 
+test('notionEventTheme: light past dims stay a step below active', () => {
+  // Ours, not Notion's: ribbon J65 / title J40 / time J48.
+  const { light } = notionEventTheme('#d50000');
+  assertRgb(
+    light.backgroundPrimaryDimmed,
+    'rgb(255, 107, 77)',
+    'backgroundPrimaryDimmed',
+  );
+  assertRgb(
+    light.foregroundPrimaryDimmed,
+    'rgb(190, 80, 61)',
+    'foregroundPrimaryDimmed',
+  );
+  assertRgb(
+    light.foregroundSecondaryDimmed,
+    'rgb(209, 104, 84)',
+    'foregroundSecondaryDimmed',
+  );
+});
+
 test('notionEventTheme: dimmed secondary is the secondary fill', () => {
   const theme = notionEventTheme('#ED201D');
   assert.equal(

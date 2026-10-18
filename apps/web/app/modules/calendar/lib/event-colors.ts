@@ -356,22 +356,24 @@ function toneFromJch(jch: Jch, dark: boolean): NotionTone {
   const backgroundPrimary = dark
     ? jchCss(jch.J * 1.03, jch.C, jch.h)
     : jchCss(jch.J * 0.97, jch.C * 1.1, jch.h);
-  const backgroundPrimaryDimmed = jchCss(dark ? 25 : 84, jch.C * 0.5, jch.h);
+  // Light dims are ours, not Notion's (84 / 60 / 70 washed past chips out):
+  // past light chips sit just a step below active ones.
+  const backgroundPrimaryDimmed = dark
+    ? jchCss(25, jch.C * 0.5, jch.h)
+    : jchCss(65, jch.C * 0.85, jch.h);
   const backgroundSecondary = jchCss(dark ? 20 : 95, jch.C * 0.4, jch.h);
   const foregroundPrimary = dark
     ? jchCss(100, chromatic ? 30 : jch.C, jch.h)
     : jchCss(30, chromatic ? 70 : jch.C, jch.h);
   const foregroundPrimaryDimmed = dark
     ? jchCss(45, chromatic ? 15 : jch.C, jch.h)
-    : jchCss(60, chromatic ? 25 : jch.C, jch.h);
+    : jchCss(40, chromatic ? 55 : jch.C, jch.h);
   const foregroundSecondary = dark
     ? jchCss(55, chromatic ? 35 : jch.C, jch.h)
     : jchCss(35, chromatic ? 60 : jch.C, jch.h);
-  const foregroundSecondaryDimmed = jchCss(
-    dark ? 35 : 70,
-    chromatic ? 20 : jch.C,
-    jch.h,
-  );
+  const foregroundSecondaryDimmed = dark
+    ? jchCss(35, chromatic ? 20 : jch.C, jch.h)
+    : jchCss(48, chromatic ? 50 : jch.C, jch.h);
   return {
     backgroundPrimary,
     backgroundPrimaryDimmed,
