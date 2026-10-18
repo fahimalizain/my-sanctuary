@@ -1683,7 +1683,7 @@ export function HomePage() {
 
   return (
     <div className="min-h-screen bg-cream">
-      <div className="mx-auto max-w-7xl px-6 pt-8 pb-28">
+      <div className="mx-auto max-w-7xl px-6 pt-8">
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
           {/* Main column — the day stream */}
           <div className="min-w-0 lg:col-span-2">
@@ -1743,7 +1743,7 @@ export function HomePage() {
                 grows without bound and dnd-kit can auto-scroll a drag. */}
             <div
               ref={scrollRef}
-              className="relative h-[calc(100dvh-17rem)] min-h-[20rem] overflow-y-auto overscroll-contain rounded-xl border border-border/60 bg-cream lg:h-[calc(100dvh-12rem)]"
+              className="relative h-[calc(100dvh-14.5rem)] min-h-[20rem] overflow-y-auto overscroll-contain bg-cream lg:h-[calc(100dvh-5.25rem)]"
             >
               {/* First load — the default read has not resolved yet */}
               {!hasPages && current.isLoading && (
