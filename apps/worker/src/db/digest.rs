@@ -20,9 +20,10 @@ use api_core::digest::repo::{
     DIGEST_COUNT_DIRTY_SQL, DIGEST_DELETE_CATEGORY_SQL, DIGEST_DELETE_HOURS_SQL,
     DIGEST_DELETE_NIGHTS_SQL, DIGEST_EARLIEST_EVENT_DATE_SQL, DIGEST_EVENT_SPAN_SQL,
     DIGEST_HAS_META_SQL, DIGEST_HAS_STALE_META_SQL, DIGEST_HOUR_INSERT_CHUNK_SIZE,
-    DIGEST_JOB_STATUS_SQL, DIGEST_LIST_DIRTY_SQL, DIGEST_LOAD_EVENTS_SQL,
-    DIGEST_MARK_DIRTY_CHUNK_SIZE, DIGEST_NIGHT_INSERT_CHUNK_SIZE, DIGEST_PRIMARY_TIME_ZONE_SQL,
-    DIGEST_RECLASSIFY_BATCH_SQL, DIGEST_SET_CATEGORY_SQL, DIGEST_UPSERT_JOB_STATUS_SQL,
+    DIGEST_JOB_STATUS_SQL, DIGEST_LATEST_ZONE_BEFORE_SQL, DIGEST_LIST_DIRTY_SQL,
+    DIGEST_LOAD_EVENTS_SQL, DIGEST_MARK_DIRTY_CHUNK_SIZE, DIGEST_NIGHT_INSERT_CHUNK_SIZE,
+    DIGEST_PRIMARY_TIME_ZONE_SQL, DIGEST_RECLASSIFY_BATCH_SQL, DIGEST_SET_CATEGORY_SQL,
+    DIGEST_UPSERT_JOB_STATUS_SQL,
     DIGEST_UPSERT_META_SQL, DIGEST_USERS_WITH_WORK_SQL,
 };
 use api_core::digest::{dirty_dates_for_spans, DigestEvent, DayDigest};
@@ -323,6 +324,24 @@ impl DigestRepo for D1DigestRepo {
             .db
             .prepare(DIGEST_PRIMARY_TIME_ZONE_SQL)
             .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row: Option<ZoneRow> = stmt.first::<ZoneRow>(None).await.map_err(backend)?;
+        Ok(row.map(|row| row.time_zone))
+    }
+
+    async fn latest_zone_before(
+        &self,
+        user_id: &str,
+        date: &str,
+    ) -> Result<Option<String>, RepoError> {
+        #[derive(Deserialize)]
+        struct ZoneRow {
+            time_zone: String,
+        }
+        let stmt = self
+            .db
+            .prepare(DIGEST_LATEST_ZONE_BEFORE_SQL)
+            .bind_refs(&[D1Type::Text(user_id), D1Type::Text(date)])
             .map_err(backend)?;
         let row: Option<ZoneRow> = stmt.first::<ZoneRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.time_zone))

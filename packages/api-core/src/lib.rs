@@ -140,6 +140,7 @@ pub use rules::{
 pub use repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_delete_by_ids_sql,
     build_occurrence_insert_sql, build_occurrence_list_by_ids_sql, build_replica_seen_insert_sql,
+    chunk_events_for_upsert,
     build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
     build_agenda_item_list_by_refs_sql, build_routine_list_by_ids_sql,
     AgendaItemRepo,

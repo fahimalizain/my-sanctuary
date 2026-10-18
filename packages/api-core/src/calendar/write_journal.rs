@@ -275,7 +275,8 @@ pub(crate) async fn move_event_with_journal(
         .ok();
     let ctx = match &taxonomy {
         Some(taxonomy) => taxonomy.event_ctx(&dest.google_calendar_id),
-        None => EventClassifyCtx::none(),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
     };
     let new_event = map_cached_event(&moved, &dest.id, &now_rfc3339, &ctx);
     let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
@@ -424,7 +425,8 @@ pub(crate) async fn patch_event_fields_with_journal(
         .ok();
     let ctx = match &taxonomy {
         Some(taxonomy) => taxonomy.event_ctx(&cal.google_calendar_id),
-        None => EventClassifyCtx::none(),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
     };
     let new_event = map_cached_event(&patched, &cal.id, &now_rfc3339, &ctx);
     let id = match events.upsert(new_event.clone(), &now_rfc3339).await {

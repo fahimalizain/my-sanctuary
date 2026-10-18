@@ -84,7 +84,7 @@ fn share_matches_the_readme_example() {
         ev("b", "2026-01-01T10:20:00Z", "2026-01-01T10:40:00Z", Some("b")),
         ev("c", "2026-01-01T10:40:00Z", "2026-01-01T11:00:00Z", Some("c")),
     ];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     let by_category = categories(day);
     assert_eq!(by_category.get("p"), Some(&1800), "parent keeps 30 minutes");
@@ -102,7 +102,7 @@ fn share_splits_three_fully_overlapping_events() {
         ev("y", "2026-01-01T10:00:00Z", "2026-01-01T10:10:00Z", Some("y")),
         ev("z", "2026-01-01T10:00:00Z", "2026-01-01T10:10:00Z", Some("z")),
     ];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     let by_category = categories(day);
     assert_eq!(by_category.get("x"), Some(&200));
@@ -120,7 +120,7 @@ fn share_gives_the_remainder_to_the_smallest_id() {
         ev("b", "2026-01-01T10:00:00Z", "2026-01-01T10:00:10Z", Some("b")),
         ev("c", "2026-01-01T10:00:00Z", "2026-01-01T10:00:10Z", Some("c")),
     ];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     let by_category = categories(day);
     assert_eq!(by_category.get("a"), Some(&4));
@@ -184,7 +184,7 @@ fn overnight_event_splits_on_local_midnights_in_the_start_zone() {
         "Asia/Kolkata",
         Some("night"),
     )];
-    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None, None);
     assert_eq!(find(&days, "2026-01-01").tracked_seconds, 1800);
     assert_eq!(find(&days, "2026-01-02").tracked_seconds, 1800);
     assert_eq!(categories(find(&days, "2026-01-01")).get("night"), Some(&1800));
@@ -204,7 +204,7 @@ fn event_ending_exactly_on_local_midnight_is_not_split() {
         "Asia/Kolkata",
         Some("evening"),
     )];
-    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None, None);
     assert_eq!(days.len(), 1, "one civil date only: {days:?}");
     assert_eq!(days[0].local_date, "2026-01-01");
     assert_eq!(days[0].tracked_seconds, 7200);
@@ -225,7 +225,7 @@ fn a_shorter_later_zone_does_not_move_the_split() {
     )];
     let mut events = events;
     events[0].end_time_zone = "Europe/London".to_string();
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     assert_eq!(find(&days, "2026-01-01").tracked_seconds, 3600);
     assert_eq!(find(&days, "2026-01-02").tracked_seconds, 3600);
     assert_eq!(
@@ -246,7 +246,7 @@ fn empty_start_zone_falls_back_to_the_end_zone() {
         Some("no-start-zone"),
     );
     event.end_time_zone = "Asia/Kolkata".to_string();
-    let days = digest_days(&[event], &[], NOW, "UTC", None);
+    let days = digest_days(&[event], &[], NOW, "UTC", None, None);
     // 18:30Z is 00:00 IST on the 2nd, so the date comes from the end zone.
     assert_eq!(find(&days, "2026-01-02").tracked_seconds, 3600);
     assert_eq!(find(&days, "2026-01-02").time_zone, "Asia/Kolkata");
@@ -257,7 +257,7 @@ fn clip_to_now_cuts_the_running_interval() {
     // 10:00–12:00 with now at 11:00 → 3600s (today is provisional).
     let now = utc("2026-01-01T11:00:00Z");
     let events = vec![ev("run", "2026-01-01T10:00:00Z", "2026-01-01T12:00:00Z", Some("run"))];
-    let days = digest_days(&events, &["2026-01-01".to_string()], now, "UTC", None);
+    let days = digest_days(&events, &["2026-01-01".to_string()], now, "UTC", None, None);
     assert_eq!(categories(find(&days, "2026-01-01")).get("run"), Some(&3600));
     assert_invariants(&days);
 }
@@ -266,7 +266,7 @@ fn clip_to_now_cuts_the_running_interval() {
 fn clip_drops_an_event_that_starts_exactly_at_now() {
     let now = utc("2026-01-01T11:00:00Z");
     let events = vec![ev("future", "2026-01-01T11:00:00Z", "2026-01-01T12:00:00Z", Some("future"))];
-    let days = digest_days(&events, &["2026-01-01".to_string()], now, "UTC", None);
+    let days = digest_days(&events, &["2026-01-01".to_string()], now, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     assert_eq!(categories(day).get("future"), None);
     assert_eq!(day.tracked_seconds, 0, "nothing but the estimated night");
@@ -278,7 +278,7 @@ fn unparseable_instants_drop_the_event() {
     bad.start_rfc3339 = "not a date".to_string();
     // No explicit dates ⇒ no sleep estimation, so the result is only about the
     // surviving segments.
-    let days = digest_days(&[bad], &[], NOW, "UTC", None);
+    let days = digest_days(&[bad], &[], NOW, "UTC", None, None);
     assert!(days.is_empty(), "the only event was dropped: {days:?}");
 }
 
@@ -291,14 +291,14 @@ fn unparseable_instants_drop_the_event() {
 fn filtered_out(label: &str, mutate: impl FnOnce(&mut DigestEvent)) {
     let mut event = ev("row", "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", Some("row"));
     mutate(&mut event);
-    let days = digest_days(&[event], &[], NOW, "UTC", None);
+    let days = digest_days(&[event], &[], NOW, "UTC", None, None);
     assert!(days.is_empty(), "{label} must be dropped: {days:?}");
 }
 
 fn kept(label: &str, mutate: impl FnOnce(&mut DigestEvent)) {
     let mut event = ev("row", "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", Some("row"));
     mutate(&mut event);
-    let days = digest_days(&[event], &[], NOW, "UTC", None);
+    let days = digest_days(&[event], &[], NOW, "UTC", None, None);
     assert_eq!(
         categories(find(&days, "2026-01-01")).get("row"),
         Some(&3600),
@@ -368,7 +368,7 @@ fn a_master_with_a_huge_duration_is_excluded_while_a_normal_row_is_not() {
     );
     master.recurrence = "RRULE:FREQ=DAILY".to_string();
     let normal = ev("normal", "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", Some("normal"));
-    let days = digest_days(&[master, normal], &["2026-01-01".to_string()], NOW, "UTC", None);
+    let days = digest_days(&[master, normal], &["2026-01-01".to_string()], NOW, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     assert_eq!(categories(day).get("master"), None);
     assert_eq!(categories(day).get("normal"), Some(&3600));
@@ -384,7 +384,7 @@ fn cancelled_exception_is_excluded_by_status() {
         Some("ex"),
     );
     exception.status = "cancelled".to_string();
-    let days = digest_days(&[exception], &[], NOW, "UTC", None);
+    let days = digest_days(&[exception], &[], NOW, "UTC", None, None);
     assert!(days.is_empty(), "a cancelled exception is dropped");
 }
 
@@ -415,7 +415,7 @@ fn day_zone_takes_the_highest_pre_share_weight() {
             Some("london"),
         ),
     ];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     assert_eq!(find(&days, "2026-01-01").time_zone, "Asia/Kolkata");
     assert_invariants(&days);
 }
@@ -444,7 +444,7 @@ fn day_zone_weight_is_the_clipped_interval_not_the_shared_one() {
         ),
     ];
     // 07:00Z is 12:30 IST and 07:00 GMT, both on 2026-01-01.
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     assert_eq!(day.time_zone, "Asia/Kolkata");
     let by_category = categories(day);
@@ -474,7 +474,7 @@ fn day_zone_ties_break_on_the_lexicographically_smaller_zone() {
             Some("kolkata"),
         ),
     ];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     // `Asia/Kolkata` < `Europe/London`.
     assert_eq!(find(&days, "2026-01-01").time_zone, "Asia/Kolkata");
 }
@@ -491,20 +491,57 @@ fn day_zone_inherits_the_previous_date_then_the_fallback_then_utc() {
     )];
     // 04:00Z–14:00Z is 09:30–19:30 IST on 2026-01-01.
     let dates = ["2026-01-01".to_string(), "2026-01-02".to_string(), "2026-01-03".to_string()];
-    let days = digest_days(&events, &dates, NOW, "Europe/London", None);
+    let days = digest_days(&events, &dates, NOW, "Europe/London", None, None);
     assert_eq!(find(&days, "2026-01-01").time_zone, "Asia/Kolkata");
     assert_eq!(find(&days, "2026-01-02").time_zone, "Asia/Kolkata", "carried forward");
     assert_eq!(find(&days, "2026-01-03").time_zone, "Asia/Kolkata", "carried again");
 
     // A date before any vote has nothing to inherit.
-    let days = digest_days(&events, &["2025-12-31".to_string()], NOW, "Europe/London", None);
+    let days = digest_days(&events, &["2025-12-31".to_string()], NOW, "Europe/London", None, None);
     assert_eq!(days[0].time_zone, "Europe/London");
 
     // An empty/unknown fallback is UTC (ADR 0004).
-    let days = digest_days(&events, &["2025-12-31".to_string()], NOW, "", None);
+    let days = digest_days(&events, &["2025-12-31".to_string()], NOW, "", None, None);
     assert_eq!(days[0].time_zone, "UTC");
-    let days = digest_days(&events, &["2025-12-31".to_string()], NOW, "bogus/zone", None);
+    let days = digest_days(&events, &["2025-12-31".to_string()], NOW, "bogus/zone", None, None);
     assert_eq!(days[0].time_zone, "UTC");
+}
+
+#[test]
+fn an_empty_day_inherits_the_persisted_zone_not_the_batch() {
+    // A one-day rebuild of a day with no events must not fall through to the
+    // primary zone (or UTC) when the day before it is persisted as Kolkata:
+    // the inferred zone is a function of this batch's votes plus persisted
+    // history, never of which other dirty dates happened to share the batch.
+    let dates = ["2026-01-02".to_string()];
+    let days = digest_days(&[], &dates, NOW, "UTC", Some("Asia/Kolkata"), None);
+    assert_eq!(find(&days, "2026-01-02").time_zone, "Asia/Kolkata");
+
+    // No persisted history: the same call falls back to the primary zone.
+    let days = digest_days(&[], &dates, NOW, "UTC", None, None);
+    assert_eq!(find(&days, "2026-01-02").time_zone, "UTC");
+
+    // A vote inside the batch still wins over persisted history.
+    let voted = vec![event(
+        "kolkata",
+        "kolkata",
+        "2026-01-02T04:00:00Z",
+        "2026-01-02T14:00:00Z",
+        "Asia/Kolkata",
+        Some("kolkata"),
+    )];
+    let days = digest_days(&voted, &dates, NOW, "UTC", Some("Europe/London"), None);
+    assert_eq!(
+        find(&days, "2026-01-02").time_zone,
+        "Asia/Kolkata",
+        "the batch's own vote is stronger than history"
+    );
+
+    // Empty and unknown strings are not zones (ADR 0004).
+    let days = digest_days(&[], &dates, NOW, "UTC", Some(""), None);
+    assert_eq!(find(&days, "2026-01-02").time_zone, "UTC");
+    let days = digest_days(&[], &dates, NOW, "UTC", Some("bogus/zone"), None);
+    assert_eq!(find(&days, "2026-01-02").time_zone, "UTC");
 }
 
 // ──────────────────────────────────────────
@@ -521,7 +558,7 @@ fn hours_split_on_the_day_zone_clock() {
         "UTC",
         Some("morning"),
     )];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     let by_hour = hours(find(&days, "2026-01-01"));
     assert_eq!(by_hour.get(&(10, "morning".to_string())), Some(&1800));
     assert_eq!(by_hour.get(&(11, "morning".to_string())), Some(&1800));
@@ -550,7 +587,7 @@ fn hours_use_the_winning_zone_even_for_events_zoned_elsewhere() {
             Some("london"),
         ),
     ];
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     let day = find(&days, "2026-01-01");
     let by_hour = hours(day);
     // The London event's 3600 shared seconds spread over its IST hour slices
@@ -616,6 +653,7 @@ fn touching_markers_pair_into_a_real_night() {
         NOW,
         "Asia/Kolkata",
         None,
+        None,
     );
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1, "exactly one paired night: {nights:?}");
@@ -646,7 +684,7 @@ fn a_short_evening_pair_does_not_steal_the_morning_wake() {
         marker("asleep-2", "Asleep", "2026-01-01T23:35:00+05:30", "2026-01-01T23:36:00+05:30"),
         marker("woke-2", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(
         nights.len(),
@@ -675,7 +713,7 @@ fn a_lone_short_pair_still_counts() {
         marker("asleep", "Asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:20:00+05:30"),
         marker("woke", "Woke Up", "2026-01-01T22:30:00+05:30", "2026-01-01T22:31:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-01".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-01".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].seconds, 1800);
@@ -691,7 +729,7 @@ fn a_ninety_minute_night_across_midnight_still_pairs() {
         marker("asleep", "Asleep", "2026-01-01T23:30:00+05:30", "2026-01-02T01:00:00+05:30"),
         marker("woke", "Woke Up", "2026-01-02T01:00:00+05:30", "2026-01-02T01:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].seconds, 5400, "90 minutes");
@@ -704,7 +742,7 @@ fn sixteen_hours_pairs_and_one_second_more_does_not() {
         marker("asleep", "Asleep", "2026-01-01T12:00:00+05:30", "2026-01-01T12:01:00+05:30"),
         marker("woke", "Woke Up", "2026-01-02T04:00:00+05:30", "2026-01-02T04:01:00+05:30"),
     ];
-    let days = digest_days(&exact, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&exact, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].seconds, 57_600, "16h exactly");
@@ -718,6 +756,7 @@ fn sixteen_hours_pairs_and_one_second_more_does_not() {
         &["2026-01-02".to_string()],
         NOW,
         "Asia/Kolkata",
+        None,
         None,
     );
     assert!(
@@ -734,7 +773,7 @@ fn same_instant_asleep_and_woke_do_not_pair() {
         marker("asleep", "Asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:01:00+05:30"),
         marker("woke", "Woke Up", "2026-01-01T22:00:00+05:30", "2026-01-01T22:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-01".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-01".to_string()], NOW, "Asia/Kolkata", None, None);
     assert!(
         all_nights(&days)
             .iter()
@@ -751,7 +790,7 @@ fn an_early_morning_asleep_pairs_with_its_morning_wake() {
         marker("asleep", "Asleep", "2026-01-02T01:00:00+05:30", "2026-01-02T01:01:00+05:30"),
         marker("woke", "Woke Up", "2026-01-02T08:00:00+05:30", "2026-01-02T08:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].seconds, 25_200, "7h");
@@ -775,7 +814,7 @@ fn marker_titles_are_case_sensitive_and_ambiguity_is_ignored() {
         marker("asleep", "asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:01:00+05:30"),
         marker("woke", "woke up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     assert!(all_nights(&days)
         .iter()
         .all(|night| night.source != SleepSource::Paired));
@@ -798,7 +837,7 @@ fn est_no_wake_uses_the_default_duration_when_it_is_earlier() {
             None,
         ),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNoWake);
@@ -821,7 +860,7 @@ fn est_no_wake_clamps_to_the_first_event() {
             None,
         ),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNoWake);
@@ -841,7 +880,7 @@ fn est_no_asleep_starts_six_and_a_half_hours_before_the_wake() {
         ),
         marker("woke", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNoAsleep);
@@ -873,7 +912,7 @@ fn est_none_starts_at_nine_pm_local() {
             None,
         ),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNone);
@@ -892,7 +931,7 @@ fn est_none_uses_nine_pm_when_the_previous_day_has_no_events() {
         "Asia/Kolkata",
         None,
     )];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNone);
@@ -905,7 +944,7 @@ fn est_none_never_collapses_when_one_day_has_no_events() {
     // the other day had no events. With no first event on D1 the missing
     // anchor must fall back to the 6.5h default alone.
     let events = vec![marker("asleep", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30")];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNoWake);
@@ -921,7 +960,7 @@ fn a_blank_past_stretch_does_not_invent_a_night() {
     // days that had events. `NOW` is 2030, so the before-noon today-guard is
     // not what keeps these two 2020 dates empty.
     let dates = ["2020-06-01".to_string(), "2020-06-02".to_string()];
-    let days = digest_days(&[], &dates, NOW, "UTC", None);
+    let days = digest_days(&[], &dates, NOW, "UTC", None, None);
     assert_eq!(days.len(), 2, "both requested dates are still emitted");
     for day in &days {
         assert_eq!(day.tracked_seconds, 0, "{}", day.local_date);
@@ -945,7 +984,7 @@ fn a_post_midnight_asleep_credits_the_previous_night() {
             None,
         ),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     let nights = all_nights(&days);
     assert_eq!(nights.len(), 1);
     assert_eq!(nights[0].source, SleepSource::EstNoWake);
@@ -970,7 +1009,7 @@ fn a_collapsing_estimate_emits_nothing() {
         ),
         marker("asleep", "Asleep", "2026-01-02T01:00:00+05:30", "2026-01-02T01:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None);
     assert!(all_nights(&days).is_empty(), "{:?}", all_nights(&days));
 }
 
@@ -982,7 +1021,7 @@ fn a_paired_night_is_never_also_estimated() {
     ];
     // Both sides of the night are in the rebuild set.
     let dates = ["2026-01-01".to_string(), "2026-01-02".to_string()];
-    let days = digest_days(&events, &dates, NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &dates, NOW, "Asia/Kolkata", None, None);
     let mornings = &find(&days, "2026-01-02").nights;
     assert_eq!(mornings.len(), 1, "one paired night on its wake date: {mornings:?}");
     assert_eq!(mornings[0].source, SleepSource::Paired);
@@ -998,7 +1037,7 @@ fn an_in_progress_morning_is_not_estimated_but_is_after_noon() {
     // 06:00 IST on 2026-01-02, no wake marker: the night may still be running.
     let now = utc("2026-01-02T00:30:00Z"); // 06:00 IST
     let events = vec![marker("asleep", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30")];
-    let days = digest_days(&events, &["2026-01-02".to_string()], now, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], now, "Asia/Kolkata", None, None);
     assert!(
         all_nights(&days).is_empty(),
         "before noon on today: no estimate"
@@ -1006,7 +1045,7 @@ fn an_in_progress_morning_is_not_estimated_but_is_after_noon() {
 
     // 13:00 IST the same day: the night is over, estimate it.
     let now = utc("2026-01-02T07:30:00Z"); // 13:00 IST
-    let days = digest_days(&events, &["2026-01-02".to_string()], now, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], now, "Asia/Kolkata", None, None);
     assert_eq!(all_nights(&days).len(), 1, "after noon: estimate");
 
     // A wake marker lifts the guard even in the morning.
@@ -1015,7 +1054,7 @@ fn an_in_progress_morning_is_not_estimated_but_is_after_noon() {
         marker("asleep", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
         marker("woke", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
     ];
-    let days = digest_days(&with_wake, &["2026-01-02".to_string()], now, "Asia/Kolkata", None);
+    let days = digest_days(&with_wake, &["2026-01-02".to_string()], now, "Asia/Kolkata", None, None);
     assert_eq!(all_nights(&days).len(), 1);
 }
 
@@ -1026,7 +1065,7 @@ fn a_paired_night_is_emitted_even_on_this_morning() {
         marker("asleep", "Asleep", "2026-01-01T22:30:00+05:30", "2026-01-02T05:00:00+05:30"),
         marker("woke", "Woke Up", "2026-01-02T05:00:00+05:30", "2026-01-02T05:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], now, "Asia/Kolkata", None);
+    let days = digest_days(&events, &["2026-01-02".to_string()], now, "Asia/Kolkata", None, None);
     assert_eq!(all_nights(&days).len(), 1);
 }
 
@@ -1041,6 +1080,7 @@ fn synthetic_sleep_uses_the_sleep_category_when_one_exists() {
         &["2026-01-02".to_string()],
         NOW,
         "Asia/Kolkata",
+        None,
         Some("cat-sleep"),
     );
     let day = find(&days, "2026-01-02");
@@ -1167,6 +1207,48 @@ fn dirty_dates_union_old_and_new_spans() {
     );
 }
 
+#[test]
+fn a_neighbor_wake_spills_its_evening_onto_the_rebuilt_day() {
+    // No markers: the night is estimated from the days' real-event anchors.
+    // The night that wakes on D + 1 starts at 21:00 on D, so its pre-midnight
+    // half belongs to D — and estimation only walks the dates it is handed.
+    let events = vec![
+        ev("evening", "2026-01-02T19:00:00Z", "2026-01-02T20:00:00Z", Some("work")),
+        ev("morning", "2026-01-03T09:00:00Z", "2026-01-03T10:00:00Z", Some("work")),
+    ];
+
+    // Asked for D alone, only the night that wakes on D exists (21:00 the
+    // previous evening → 03:30, so 12_600s land on D after midnight).
+    let alone = digest_days(&events, &["2026-01-02".to_string()], NOW, "UTC", None, None);
+    assert_eq!(find(&alone, "2026-01-02").sleep_seconds, 12_600);
+
+    // Asked for the neighbours too, the night that wakes on D + 1 spills its
+    // 21:00–24:00 half (10_800s) onto D.
+    let dates = [
+        "2026-01-01".to_string(),
+        "2026-01-02".to_string(),
+        "2026-01-03".to_string(),
+    ];
+    let expanded = digest_days(&events, &dates, NOW, "UTC", None, None);
+    let day = find(&expanded, "2026-01-02");
+    assert_eq!(
+        day.sleep_seconds,
+        12_600 + 10_800,
+        "the neighbour's evening half lands on the rebuilt day"
+    );
+    assert!(
+        day.nights.iter().all(|night| night.wake_date == "2026-01-02"),
+        "the spilled night still belongs to its wake date: {:?}",
+        day.nights
+    );
+    assert_eq!(
+        find(&expanded, "2026-01-03").nights.len(),
+        1,
+        "the night is owned by D + 1"
+    );
+    assert_invariants(&expanded);
+}
+
 // ──────────────────────────────────────────
 // Facade shape
 // ──────────────────────────────────────────
@@ -1176,7 +1258,7 @@ fn an_empty_rebuild_still_produces_a_zero_day() {
     // Today before noon with no wake marker: the night may still be running,
     // so nothing is estimated and the rebuilt day is a clean zero.
     let now = utc("2026-01-02T06:00:00Z"); // 11:30 IST on 2026-01-02
-    let days = digest_days(&[], &["2026-01-02".to_string()], now, "Asia/Kolkata", None);
+    let days = digest_days(&[], &["2026-01-02".to_string()], now, "Asia/Kolkata", None, None);
     assert_eq!(days.len(), 1);
     assert_eq!(days[0].tracked_seconds, 0);
     assert_eq!(days[0].sleep_seconds, 0);
@@ -1194,11 +1276,11 @@ fn only_the_requested_dates_are_emitted() {
         ev("one", "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", Some("one")),
         ev("two", "2026-01-02T10:00:00Z", "2026-01-02T11:00:00Z", Some("two")),
     ];
-    let days = digest_days(&events, &["2026-01-01".to_string()], NOW, "UTC", None);
+    let days = digest_days(&events, &["2026-01-01".to_string()], NOW, "UTC", None, None);
     assert_eq!(days.len(), 1, "the neighbour must not be replaced");
     assert_eq!(days[0].local_date, "2026-01-01");
 
-    let days = digest_days(&events, &[], NOW, "UTC", None);
+    let days = digest_days(&events, &[], NOW, "UTC", None, None);
     assert_eq!(days.len(), 2, "no explicit dates ⇒ every date with content");
 }
 
@@ -1214,6 +1296,7 @@ fn nights_are_attached_to_their_wake_date() {
         &["2026-01-02".to_string()],
         NOW,
         "Asia/Kolkata",
+        None,
         None,
     );
     assert_eq!(days.len(), 1);
@@ -1231,7 +1314,7 @@ fn the_pre_midnight_half_of_a_night_lands_on_the_previous_date() {
         marker("woke", "Woke Up", "2026-01-02T05:00:00+05:30", "2026-01-02T05:01:00+05:30"),
     ];
     let dates = ["2026-01-01".to_string(), "2026-01-02".to_string()];
-    let days = digest_days(&events, &dates, NOW, "Asia/Kolkata", None);
+    let days = digest_days(&events, &dates, NOW, "Asia/Kolkata", None, None);
     // 22:30–24:00 IST shared between the Asleep event and the synthetic half
     // (2700s) — and nothing else: the 1st's only events are markers (excluded
     // from anchors and from the neither-marker estimate), and the 31st has no
@@ -1260,6 +1343,7 @@ fn a_wide_window_and_a_single_requested_date_still_finds_the_night() {
         &["2026-01-02".to_string()],
         NOW,
         "Asia/Kolkata",
+        None,
         None,
     );
     assert_eq!(days.len(), 1);

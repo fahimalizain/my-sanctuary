@@ -249,6 +249,7 @@ impl PaintTaxonomy {
             google_calendar_id,
             categories: &self.categories,
             matchers: &self.matchers,
+            preserve: false,
         }
     }
 }

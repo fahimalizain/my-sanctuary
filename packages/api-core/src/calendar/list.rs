@@ -126,8 +126,9 @@ pub async fn list_events(
 ) -> Result<CalendarListOutput, CalendarError> {
     let snapshot = load_list_snapshot(calendars, watches, user_id).await?;
     // No taxonomy in hand on this wrapper: the window write-through stamps no
-    // category (`EventClassifyCtx::none`). The worker route loads the paint
-    // taxonomy itself and calls [`list_events_with_snapshot`] with it.
+    // category (`EventClassifyCtx::preserve`, so a stored stamp survives). The
+    // worker route loads the paint taxonomy itself and calls
+    // [`list_events_with_snapshot`] with it.
     list_events_with_snapshot(
         http,
         calendars,
@@ -161,8 +162,8 @@ pub async fn list_events(
 /// `taxonomy` is the caller's already-loaded paint taxonomy (the worker loads
 /// it in the same `join!` as the snapshot); the window write-through stamps
 /// each row's leaf `category_id` from it. `None` — a failed taxonomy load —
-/// only degrades the stamp (`EventClassifyCtx::none`); listing never 500s
-/// because paint data is missing.
+/// only degrades the stamp (`EventClassifyCtx::preserve` keeps whatever stamp
+/// is stored); listing never 500s because paint data is missing.
 pub async fn list_events_with_snapshot(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -313,7 +314,8 @@ pub async fn list_events_with_snapshot(
         // patterns; a missing taxonomy only degrades the stamp.
         let ctx = match taxonomy {
             Some(taxonomy) => taxonomy.event_ctx(&cal.google_calendar_id),
-            None => EventClassifyCtx::none(),
+            // A failed load must not blank a good stamp.
+            None => EventClassifyCtx::preserve(),
         };
         match fetch_and_apply_window(
             http,

@@ -7,7 +7,8 @@ use api_core::models::{
 use api_core::digest::repo::{EventSpan, EventSpanRow};
 use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_operation_list_by_statuses_sql,
-    build_replica_seen_insert_sql, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo,
+    build_replica_seen_insert_sql, chunk_events_for_upsert, CalendarEventOperationRepo,
+    CalendarEventRepo, CalendarRepo,
     RepoError, WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL,
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
@@ -26,7 +27,7 @@ use api_core::repo::{
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
     EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
-    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL,
     EVENT_UPSERT_QUARANTINE_SQL, OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
     OPERATION_UPDATE_STATUS_SQL, REPLICA_SEEN_INSERT_CHUNK_SIZE,
@@ -655,11 +656,13 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        // Chunk to stay under D1's 100 bound-parameter limit (4 rows of 23
-        // columns per statement); each chunk is one D1 subrequest. Mint
-        // candidate UUIDs; ON CONFLICT(calendar_id, google_event_id) preserves
-        // existing id and sets deleted_at = NULL (no per-event SELECT).
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+        // Chunk to stay under D1's 100 bound-parameter limit (3 rows of 26
+        // columns + the statement-level category flag per statement); each
+        // chunk is one D1 subrequest. Chunks never mix `preserve_category`
+        // (the flag binds once per statement). Mint candidate UUIDs; ON
+        // CONFLICT(calendar_id, google_event_id) preserves existing id and
+        // sets deleted_at = NULL (no per-event SELECT).
+        for chunk in chunk_events_for_upsert(&events) {
             let pending = self.gather_dirty(chunk).await;
             let ids: Vec<String> = (0..chunk.len())
                 .map(|_| uuid::Uuid::new_v4().to_string())
@@ -680,9 +683,9 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         if events.is_empty() {
             return Ok(true);
         }
-        // Same mint-UUID + chunking as upsert_batch; fence binds add only 3
-        // params per statement so chunk size stays 4 (92 + 3 = 95).
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+        // Same mint-UUID + chunking as upsert_batch; fence binds add 3 params
+        // per statement (plus the category flag) so chunk size stays 3.
+        for chunk in chunk_events_for_upsert(&events) {
             let calendar_id = chunk[0].calendar_id.as_str();
             let ids: Vec<String> = (0..chunk.len())
                 .map(|_| uuid::Uuid::new_v4().to_string())

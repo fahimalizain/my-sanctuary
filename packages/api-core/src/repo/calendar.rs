@@ -979,9 +979,15 @@ pub const EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL: &str = concat!(
 /// D1 allows at most 100 bound parameters per SQL statement.
 /// `calendar_events` upsert binds 26 columns per row
 /// (`… raw_json, category_id, is_self_organized, event_type, created_at,
-/// updated_at`) → max 3 rows per statement (`78 ≤ 100`; 4 rows would bind 104).
+/// updated_at`) plus one **statement-level** flag
+/// ([`EVENT_UPSERT_PRESERVE_BIND`]) → max 3 rows per statement
+/// (`3 * 26 + 1 = 79 ≤ 100`; 4 rows would bind 105).
 pub const EVENT_UPSERT_COL_COUNT: usize = 26;
 pub const EVENT_UPSERT_CHUNK_SIZE: usize = 100 / EVENT_UPSERT_COL_COUNT; // 3
+
+/// Statement-level binds added by the `ON CONFLICT` category guard
+/// (see [`EVENT_UPSERT_ON_CONFLICT`]).
+pub const EVENT_UPSERT_PRESERVE_BIND: usize = 1;
 
 /// `calendar_replica_seen` insert binds 4 columns per row → max 25 rows.
 pub const REPLICA_SEEN_INSERT_COL_COUNT: usize = 4;
@@ -1041,10 +1047,14 @@ const EVENT_UPSERT_ROW_SELECT: &str =
 /// `ON CONFLICT` merge for the `(calendar_id, google_event_id)` natural key.
 ///
 /// `task_id` stays `COALESCE`-protected (app-owned; an untagged Google event
-/// must never wipe a stored link). `category_id` is app-owned too but
-/// **overwrites** — a retitle must replace (or clear) a stale stamp — and only
-/// a real classifier context writes it. `is_self_organized` / `event_type` are
-/// Google-owned and overwrite from `excluded.*`.
+/// must never wipe a stored link). `category_id` is app-owned too and normally
+/// **overwrites** — a retitle must replace (or clear) a stale stamp — but the
+/// merge consults a statement-level flag (`1` = stamp, `0` = keep the stored
+/// id) so a **failed taxonomy load** cannot erase a good stamp
+/// (`preserve_category`). The flag binds **once per statement** and every row
+/// in the chunk must agree; a chunk that mixes them must be split.
+/// `is_self_organized` / `event_type` are Google-owned and overwrite from
+/// `excluded.*`.
 const EVENT_UPSERT_ON_CONFLICT: &str = "
     ON CONFLICT(calendar_id, google_event_id) DO UPDATE SET
         google_etag = excluded.google_etag,
@@ -1065,7 +1075,10 @@ const EVENT_UPSERT_ON_CONFLICT: &str = "
         end_time_zone = excluded.end_time_zone,
         is_all_day = excluded.is_all_day,
         raw_json = excluded.raw_json,
-        category_id = excluded.category_id,
+        category_id = CASE
+            WHEN ? = '1' THEN excluded.category_id
+            ELSE calendar_events.category_id
+        END,
         is_self_organized = excluded.is_self_organized,
         event_type = excluded.event_type,
         updated_at = excluded.updated_at,
@@ -1119,16 +1132,60 @@ fn push_event_upsert_args(
     ]);
 }
 
+/// The statement-level `category_id` merge flag: `"1"` stamps the incoming
+/// leaf, `"0"` keeps the stored one. Derived from
+/// [`NewCalendarEvent::preserve_category`], and every row in a chunk must
+/// agree (asserted by the builders) — the flag binds once per statement.
+fn event_upsert_preserve_flag(events: &[NewCalendarEvent]) -> &'static str {
+    let preserve = events[0].preserve_category;
+    assert!(
+        events.iter().all(|event| event.preserve_category == preserve),
+        "an event upsert chunk must agree on preserve_category"
+    );
+    if preserve {
+        "0"
+    } else {
+        "1"
+    }
+}
+
+/// Splits `events` into chunks of at most [`EVENT_UPSERT_CHUNK_SIZE`] rows that
+/// **all agree** on [`NewCalendarEvent::preserve_category`].
+///
+/// The category merge flag binds once per statement, so a chunk may never mix
+/// preserving and stamping rows; a mixed input is split at the boundary rather
+/// than silently applying one row's choice to another's stamp. Order is
+/// preserved, so `gather_dirty` still sees a contiguous span.
+pub fn chunk_events_for_upsert(events: &[NewCalendarEvent]) -> Vec<&[NewCalendarEvent]> {
+    let mut chunks: Vec<&[NewCalendarEvent]> = Vec::new();
+    let mut start = 0;
+    while start < events.len() {
+        let preserve = events[start].preserve_category;
+        let mut end = start + 1;
+        while end < events.len()
+            && events[end].preserve_category == preserve
+            && end - start < EVENT_UPSERT_CHUNK_SIZE
+        {
+            end += 1;
+        }
+        chunks.push(&events[start..end]);
+        start = end;
+    }
+    chunks
+}
+
 /// Builds a multi-row `INSERT … ON CONFLICT` statement for one chunk of
 /// events (non-empty and ≤ `EVENT_UPSERT_CHUNK_SIZE`). `ids` supplies the new
 /// UUID for each row and must match `events.len()` — the D1 implementation
 /// generates them (api-core stays free of a UUID dependency).
 ///
 /// Returns `(sql, args)` where every arg is a string; the D1 implementation
-/// binds them as `D1Type::Text`. 26 columns; COALESCE-free apart from the
-/// `task_id` guard — a Google event without the `sanctuary_task_id` property
-/// must not wipe a stored link. `category_id` binds through `NULLIF(?, '')`
-/// (`""` → SQL `NULL`) and **overwrites** on conflict; `is_self_organized` /
+/// binds them as `D1Type::Text`. 26 columns per row plus the statement-level
+/// category merge flag; COALESCE-free apart from the `task_id` guard — a Google
+/// event without the `sanctuary_task_id` property must not wipe a stored link.
+/// `category_id` binds through `NULLIF(?, '')` (`""` → SQL `NULL`) and
+/// **overwrites** on conflict unless the chunk preserves
+/// ([`NewCalendarEvent::preserve_category`]); `is_self_organized` /
 /// `event_type` are Google-owned and overwrite from `excluded.*` (no COALESCE).
 pub fn build_event_upsert_sql(
     events: &[NewCalendarEvent],
@@ -1147,7 +1204,9 @@ pub fn build_event_upsert_sql(
         ({EVENT_UPSERT_INSERT_COLUMNS})
         VALUES "
     );
-    let mut args: Vec<String> = Vec::with_capacity(events.len() * EVENT_UPSERT_COL_COUNT);
+    let mut args: Vec<String> = Vec::with_capacity(
+        events.len() * EVENT_UPSERT_COL_COUNT + EVENT_UPSERT_PRESERVE_BIND,
+    );
     for (index, (event, id)) in events.iter().zip(ids).enumerate() {
         if index > 0 {
             sql.push(',');
@@ -1157,6 +1216,7 @@ pub fn build_event_upsert_sql(
     }
     sql.push(' ');
     sql.push_str(EVENT_UPSERT_ON_CONFLICT);
+    args.push(event_upsert_preserve_flag(events).to_string());
     (sql, args)
 }
 
@@ -1170,8 +1230,9 @@ pub fn build_event_upsert_sql(
 /// SELECT returns zero rows and nothing is written.
 ///
 /// Extra binds (once per statement, not per row): `calendar_id`,
-/// `lease_owner`, `now_rfc3339` — so `26 * chunk + 3 ≤ 100` keeps
-/// `EVENT_UPSERT_CHUNK_SIZE` at 3 (`78 + 3 = 81`).
+/// `lease_owner`, `now_rfc3339`, plus the category merge flag that
+/// [`EVENT_UPSERT_ON_CONFLICT`] ends on — so `26 * chunk + 3 + 1 ≤ 100` keeps
+/// `EVENT_UPSERT_CHUNK_SIZE` at 3 (`78 + 3 + 1 = 82`).
 ///
 /// `calendar_id` is the replica calendar id (all events in a chunk share it).
 /// `ids` supplies the new UUID for each row and must match `events.len()`.
@@ -1194,8 +1255,9 @@ pub fn build_event_upsert_if_owner_sql(
         ({EVENT_UPSERT_INSERT_COLUMNS})
         SELECT * FROM ("
     );
-    let mut args: Vec<String> =
-        Vec::with_capacity(events.len() * EVENT_UPSERT_COL_COUNT + 3);
+    let mut args: Vec<String> = Vec::with_capacity(
+        events.len() * EVENT_UPSERT_COL_COUNT + 3 + EVENT_UPSERT_PRESERVE_BIND,
+    );
     for (index, (event, id)) in events.iter().zip(ids).enumerate() {
         if index > 0 {
             sql.push_str(" UNION ALL ");
@@ -1217,6 +1279,7 @@ pub fn build_event_upsert_if_owner_sql(
     args.push(lease_owner.to_string());
     args.push(now_rfc3339.to_string());
     sql.push_str(EVENT_UPSERT_ON_CONFLICT);
+    args.push(event_upsert_preserve_flag(events).to_string());
     (sql, args)
 }
 
@@ -1720,8 +1783,11 @@ mod tests {
         assert_eq!(EVENT_UPSERT_COL_COUNT, 26);
         assert_eq!(EVENT_UPSERT_CHUNK_SIZE, 3);
         assert!(EVENT_UPSERT_CHUNK_SIZE * EVENT_UPSERT_COL_COUNT <= 100);
-        // The fenced statement adds calendar_id + lease_owner + now.
-        assert!(EVENT_UPSERT_CHUNK_SIZE * EVENT_UPSERT_COL_COUNT + 3 <= 100);
+        // The fenced statement adds calendar_id + lease_owner + now, and the
+        // merge adds the statement-level category flag (26 * 3 + 3 + 1 = 82).
+        assert!(
+            EVENT_UPSERT_CHUNK_SIZE * EVENT_UPSERT_COL_COUNT + 3 + EVENT_UPSERT_PRESERVE_BIND <= 100
+        );
     }
 
     fn sample_new_event() -> NewCalendarEvent {
@@ -1747,6 +1813,7 @@ mod tests {
             is_all_day: false,
             raw_json: r#"{"id":"g-1"}"#.to_string(),
             category_id: Some("cat-work".to_string()),
+            preserve_category: false,
             is_self_organized: true,
             event_type: "default".to_string(),
         }
@@ -1779,7 +1846,9 @@ mod tests {
         assert!(sql.contains("is_all_day = excluded.is_all_day"), "{sql}");
         assert!(sql.contains("raw_json = excluded.raw_json"), "{sql}");
 
-        assert_eq!(args.len(), 26);
+        // 26 column binds per row + the statement-level category flag.
+        assert_eq!(args.len(), 26 + EVENT_UPSERT_PRESERVE_BIND);
+        assert_eq!(args[26], "1", "the chunk stamps: preserve_category = false");
         assert_eq!(args[0], "evt-1");
         assert_eq!(args[1], "cal-1");
         assert_eq!(args[5], "2026-08-17T12:00:00Z", "last_synced_at bound");
@@ -1807,8 +1876,10 @@ mod tests {
         );
         assert!(
             !sql.contains("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
-            "no 27th placeholder"
+            "no 27th column placeholder"
         );
+        // The merge flag is the one statement-level placeholder.
+        assert_eq!(sql.matches('?').count(), 26 + EVENT_UPSERT_PRESERVE_BIND);
     }
 
     #[test]
@@ -1818,8 +1889,8 @@ mod tests {
         let ids: Vec<String> = (0..3).map(|i| format!("evt-{i}")).collect();
         let (sql, args) = build_event_upsert_sql(&events, "2026-08-17T12:00:00Z", ids);
 
-        assert_eq!(args.len(), 3 * 26);
-        assert_eq!(sql.matches('?').count(), 3 * 26);
+        assert_eq!(args.len(), 3 * 26 + EVENT_UPSERT_PRESERVE_BIND);
+        assert_eq!(sql.matches('?').count(), 3 * 26 + EVENT_UPSERT_PRESERVE_BIND);
         assert_eq!(
             sql.matches(
                 "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?, ''),?,?,?,?)"
@@ -1833,11 +1904,15 @@ mod tests {
     }
 
     #[test]
-    fn event_upsert_overwrites_category_but_never_coalesces_it() {
-        // A retitle must be able to replace (or clear) a stamp: overwrite, no
-        // COALESCE. The task link keeps its COALESCE guard.
+    fn event_upsert_stamps_or_keeps_the_category_by_the_statement_flag() {
+        // A retitle must be able to replace (or clear) a stamp — but only when
+        // the row really was classified. A failed taxonomy load preserves, so
+        // the merge is a CASE on the one statement-level flag, never a
+        // COALESCE (an empty taxonomy must still be able to write NULL).
         assert!(
-            EVENT_UPSERT_ON_CONFLICT.contains("category_id = excluded.category_id"),
+            EVENT_UPSERT_ON_CONFLICT.contains(
+                "category_id = CASE\n            WHEN ? = '1' THEN excluded.category_id\n            ELSE calendar_events.category_id\n        END"
+            ),
             "{EVENT_UPSERT_ON_CONFLICT}"
         );
         assert!(
@@ -1849,6 +1924,50 @@ mod tests {
                 .contains("task_id = COALESCE(NULLIF(excluded.task_id, ''), calendar_events.task_id)"),
             "{EVENT_UPSERT_ON_CONFLICT}"
         );
+    }
+
+    #[test]
+    fn event_upsert_flag_keeps_the_stored_category_when_preserving() {
+        let mut event = sample_new_event();
+        event.category_id = None;
+        event.preserve_category = true;
+        let (sql, args) = build_event_upsert_sql(
+            &[event],
+            "2026-08-17T12:00:00Z",
+            vec!["evt-1".to_string()],
+        );
+        assert!(sql.contains("WHEN ? = '1'"), "{sql}");
+        assert_eq!(args.len(), 26 + EVENT_UPSERT_PRESERVE_BIND);
+        assert_eq!(args[26], "0", "a preserving chunk keeps the stored stamp");
+        assert_eq!(args[21], "", "the row still binds its (empty) leaf");
+    }
+
+    #[test]
+    fn event_upsert_chunks_split_on_preserve_category() {
+        // The flag binds once per statement, so a mixed input must be split
+        // rather than silently applying one row's choice to another's stamp.
+        let plain = sample_new_event();
+        let mut preserving = sample_new_event();
+        preserving.google_event_id = "g-2".to_string();
+        preserving.preserve_category = true;
+        let mut stamping = sample_new_event();
+        stamping.google_event_id = "g-3".to_string();
+        let events = vec![plain, preserving, stamping];
+        let chunks = chunk_events_for_upsert(&events);
+        assert_eq!(chunks.len(), 3, "every flag change starts a new chunk");
+        assert_eq!(chunks[0].len(), 1);
+        assert_eq!(chunks[1].len(), 1);
+        assert!(chunks[1][0].preserve_category);
+        assert_eq!(chunks[2].len(), 1);
+
+        // A uniform run is chunked at the D1 bind limit, not before.
+        let same = vec![sample_new_event(); 7];
+        let chunks = chunk_events_for_upsert(&same);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
+        assert!(chunk_events_for_upsert(&[]).is_empty());
     }
 
     #[test]
@@ -1875,7 +1994,7 @@ mod tests {
         );
         assert!(sql.contains("NULLIF(?, '')"), "{sql}");
         assert_eq!(args[21], "", "unclassified binds the empty string");
-        assert_eq!(sql.matches('?').count(), 26);
+        assert_eq!(sql.matches('?').count(), 26 + EVENT_UPSERT_PRESERVE_BIND);
 
         // A non-organized, non-default event binds 0/0 and keeps its eventType.
         event.category_id = Some(String::new());
@@ -2234,18 +2353,19 @@ mod tests {
             ),
             "{sql}"
         );
-        // 26 row binds + calendar_id + lease_owner + now.
-        assert_eq!(args.len(), 26 + 3);
+        // 26 row binds + calendar_id + lease_owner + now + the category flag.
+        assert_eq!(args.len(), 26 + 3 + EVENT_UPSERT_PRESERVE_BIND);
         assert_eq!(args[0], "evt-1");
         assert_eq!(args[26], "cal-1");
         assert_eq!(args[27], "owner-a");
         assert_eq!(args[28], "2026-08-17T12:00:00Z");
-        assert_eq!(sql.matches('?').count(), 26 + 3);
+        assert_eq!(args[29], "1", "the chunk stamps: preserve_category = false");
+        assert_eq!(sql.matches('?').count(), 26 + 3 + EVENT_UPSERT_PRESERVE_BIND);
         // The category bind is normalized in the fenced SELECT too.
         assert_eq!(sql.matches("NULLIF(?, '')").count(), 1, "{sql}");
         assert!(
-            sql.contains("category_id = excluded.category_id"),
-            "fenced upsert overwrites the stamp: {sql}"
+            sql.contains("category_id = CASE\n            WHEN ? = '1'"),
+            "fenced upsert stamps through the same flag: {sql}"
         );
     }
 
@@ -2262,16 +2382,17 @@ mod tests {
             "owner-a",
         );
 
-        // 3 * 26 row binds + 3 fence binds.
-        assert_eq!(args.len(), 3 * 26 + 3);
-        assert_eq!(sql.matches('?').count(), 3 * 26 + 3);
-        assert!(3 * 26 + 3 <= 100);
+        // 3 * 26 row binds + 3 fence binds + the statement-level flag.
+        assert_eq!(args.len(), 3 * 26 + 3 + EVENT_UPSERT_PRESERVE_BIND);
+        assert_eq!(sql.matches('?').count(), 3 * 26 + 3 + EVENT_UPSERT_PRESERVE_BIND);
+        assert!(3 * 26 + 3 + EVENT_UPSERT_PRESERVE_BIND <= 100);
         assert_eq!(args[0], "evt-0");
         assert_eq!(args[26], "evt-1");
         assert_eq!(args[26 * 2], "evt-2");
         assert_eq!(args[3 * 26], "cal-1");
         assert_eq!(args[3 * 26 + 1], "owner-a");
         assert_eq!(args[3 * 26 + 2], "2026-08-17T12:00:00Z");
+        assert_eq!(args[3 * 26 + 3], "1", "the chunk stamps");
     }
 
     #[test]

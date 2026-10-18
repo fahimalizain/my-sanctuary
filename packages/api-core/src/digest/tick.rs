@@ -9,6 +9,8 @@
 //! always finishes well inside the Worker's CPU/wall limits, and the remaining
 //! work is picked up by the next tick or by a re-enqueued queue message.
 
+use std::collections::BTreeSet;
+
 use crate::calendar_color::load_classify_taxonomy;
 use crate::categories::classify_event_leaf;
 use crate::repo::{RepoError, TaskCategoryRepo};
@@ -26,6 +28,15 @@ pub const RECLASSIFY_BATCH_LIMIT: usize = 50;
 /// before the window can still own a night inside it, and a lexicographic
 /// `substr` compare needs slack for zone-shifted instants anyway.
 pub const DIGEST_EVENT_WINDOW_PAD_DAYS: i64 = 2;
+/// Requested days one `load_events_touching` window may cover.
+///
+/// A run of dirty dates is split into chunks of at most this many **requested**
+/// days, so the loaded window is at most
+/// `45 + 2 * DIGEST_EVENT_WINDOW_PAD_DAYS = 49` civil dates wide (51 for the
+/// digest set, which is expanded by one day on each side). A sparse dirty set
+/// therefore never loads the years between its dates, and a long contiguous
+/// backlog never becomes one unbounded scan.
+pub const DIGEST_REBUILD_RUN_MAX_DAYS: usize = 45;
 /// The backfill starts one day before the earliest event so the first night's
 /// pre-midnight half is rebuilt too.
 pub const DIGEST_BACKFILL_START_PAD_DAYS: i64 = 1;
@@ -215,6 +226,10 @@ pub async fn run_digest_tick(
 /// Runs the tick for one named user.
 ///
 /// Order of work, highest priority first:
+/// 0. **today is marked dirty** (when the user has any event or any `daily_meta`
+///    row), so a quiet user's tail is recomputed instead of freezing at the
+///    last write — today is never cleared, so it is always the newest pending
+///    day;
 /// 1. a `running` reclassify spends one batch **first**, and while it is
 ///    unfinished it owns the whole tick: the stamps it writes are what a rollup
 ///    reads, so no day may be rebuilt before the scan is done;
@@ -234,6 +249,12 @@ pub async fn run_digest_tick_user(
         user_id: Some(user_id.to_string()),
         ..DigestTickReport::default()
     };
+    let today = user_today(repo, user_id, now_unix).await;
+    if let Err(err) = mark_today_dirty(repo, user_id, &today, &now_rfc3339).await {
+        report
+            .errors
+            .push(format!("digest: mark today dirty failed: {err}"));
+    }
 
     let backfill = match ensure_backfill_job(repo, user_id, &now_rfc3339).await {
         Ok(job) => job,
@@ -285,6 +306,7 @@ pub async fn run_digest_tick_user(
                 user_id,
                 &cursor,
                 budget_days,
+                &today,
                 now_unix,
                 &now_rfc3339,
                 &mut report,
@@ -296,6 +318,7 @@ pub async fn run_digest_tick_user(
                 category_repo,
                 user_id,
                 budget_days,
+                &today,
                 now_unix,
                 &mut report,
             )
@@ -305,10 +328,21 @@ pub async fn run_digest_tick_user(
 
     // Decide whether the caller should come back soon. Recomputed from the
     // DB: a partially successful branch may have left work behind.
+    //
+    // Only a day that is **already finished** (< today) is pending work:
+    // today's row is deliberately never cleared (its tail is still being
+    // written) and a future date has nothing to compute yet, so counting
+    // either as "work remains" would make every tick re-enqueue itself
+    // forever. The oldest dirty date answers both — dirty dates sort
+    // ascending, so if it is not before today, none is.
     let dirty_left = repo
-        .count_dirty(user_id)
+        .list_dirty(user_id, 1)
         .await
-        .map(|count| count > 0)
+        .map(|dates| {
+            dates
+                .first()
+                .is_some_and(|date| date.as_str() < today.as_str())
+        })
         .unwrap_or(false);
     let backfill_still_running = repo
         .job_status(user_id, JOB_BACKFILL)
@@ -326,6 +360,41 @@ pub async fn run_digest_tick_user(
     report
 }
 
+/// The user's **today**: the civil date of `now_unix` in the primary calendar
+/// zone (empty/unknown ⇒ UTC). One definition for the backfill floor, the
+/// rebuild guard, and the "today stays dirty" rule.
+async fn user_today(repo: &dyn DigestRepo, user_id: &str, now_unix: i64) -> String {
+    let primary_tz = repo
+        .primary_time_zone(user_id)
+        .await
+        .unwrap_or(None)
+        .unwrap_or_default();
+    civil_date_in_zone(now_unix, &primary_tz)
+}
+
+/// Marks `today` dirty for a user the tick is about to work on.
+///
+/// Today's rows are always clipped at `now` and are **never** cleared (see
+/// [`rebuild_dates`]), so the tail has to be recomputed by a later tick. A
+/// quiet user — no new event, no reclassify — would otherwise keep whatever
+/// partial total the last write produced.
+///
+/// A user with no event and no `daily_meta` row has nothing to keep open, so
+/// the mark is skipped: a user the tick would never pick gets no dirty row.
+async fn mark_today_dirty(
+    repo: &dyn DigestRepo,
+    user_id: &str,
+    today: &str,
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
+    let has_events = repo.earliest_event_date(user_id).await?.is_some();
+    if !has_events && !repo.has_meta(user_id).await? {
+        return Ok(());
+    }
+    repo.mark_dirty(user_id, &[today.to_string()], now_rfc3339)
+        .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_backfill(
     repo: &dyn DigestRepo,
@@ -333,17 +402,11 @@ async fn run_backfill(
     user_id: &str,
     cursor: &str,
     budget_days: usize,
+    today: &str,
     now_unix: i64,
     now_rfc3339: &str,
     report: &mut DigestTickReport,
 ) {
-    let primary_tz = repo
-        .primary_time_zone(user_id)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_default();
-    let today = civil_date_in_zone(now_unix, &primary_tz);
-
     let start = if cursor.is_empty() {
         match repo.earliest_event_date(user_id).await {
             Ok(Some(earliest)) => shift_date(&earliest, -DIGEST_BACKFILL_START_PAD_DAYS)
@@ -364,7 +427,7 @@ async fn run_backfill(
         cursor.to_string()
     };
 
-    if start > today || budget_days == 0 {
+    if start.as_str() > today || budget_days == 0 {
         finish_job(repo, user_id, JOB_BACKFILL, now_rfc3339, report).await;
         report.backfill_done = true;
         return;
@@ -374,7 +437,7 @@ async fn run_backfill(
     // finished time to aggregate, and its night must not be guessed early.
     let mut dates: Vec<String> = Vec::new();
     let mut next_date = start.clone();
-    while dates.len() < budget_days && next_date <= today {
+    while dates.len() < budget_days && next_date.as_str() <= today {
         dates.push(next_date.clone());
         match shift_date(&next_date, 1) {
             Some(shifted) => next_date = shifted,
@@ -391,14 +454,17 @@ async fn run_backfill(
         category_repo,
         user_id,
         &dates,
+        today,
         now_unix,
         &mut report.errors,
     )
     .await;
     match rebuilt {
-        Ok(days) => {
-            report.rebuilt_days += days;
-            if let Err(err) = repo.clear_dirty(user_id, &dates).await {
+        Ok(outcome) => {
+            report.rebuilt_days += outcome.rebuilt;
+            // Today's row was clipped at `now`: it stays dirty so the next
+            // tick recomputes the tail.
+            if let Err(err) = repo.clear_dirty(user_id, &outcome.clearable).await {
                 report
                     .errors
                     .push(format!("digest: clear dirty failed: {err}"));
@@ -406,8 +472,8 @@ async fn run_backfill(
             let next = dates
                 .last()
                 .and_then(|last| shift_date(last, 1))
-                .unwrap_or_else(|| today.clone());
-            if next > today {
+                .unwrap_or_else(|| today.to_string());
+            if next.as_str() > today {
                 finish_job(repo, user_id, JOB_BACKFILL, now_rfc3339, report).await;
                 report.backfill_done = true;
             } else if let Err(err) =
@@ -516,6 +582,7 @@ async fn run_rebuild(
     category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
     budget_days: usize,
+    today: &str,
     now_unix: i64,
     report: &mut DigestTickReport,
 ) {
@@ -536,14 +603,18 @@ async fn run_rebuild(
         category_repo,
         user_id,
         &dates,
+        today,
         now_unix,
         &mut report.errors,
     )
     .await;
     match rebuilt {
-        Ok(days) => {
-            report.rebuilt_days += days;
-            if let Err(err) = repo.clear_dirty(user_id, &dates).await {
+        Ok(outcome) => {
+            report.rebuilt_days += outcome.rebuilt;
+            // Only days that are already finished may be cleared: today's rows
+            // were clipped at `now` and must stay dirty for the next tick, and
+            // a future date was not rebuilt at all.
+            if let Err(err) = repo.clear_dirty(user_id, &outcome.clearable).await {
                 report
                     .errors
                     .push(format!("digest: clear dirty failed: {err}"));
@@ -555,25 +626,65 @@ async fn run_rebuild(
     }
 }
 
-/// Loads one padded event window, digests `dates`, and replaces each day.
+/// What one [`rebuild_dates`] pass did.
+struct RebuildOutcome {
+    /// Days whose `daily_meta` / category / hour / night rows were replaced.
+    rebuilt: usize,
+    /// Requested days **strictly before today** — the only dirty rows the
+    /// caller may clear. Today's rows were clipped at `now` (the day is still
+    /// being written) and a future date was not rebuilt at all, so both keep
+    /// their dirty row.
+    clearable: Vec<String>,
+}
+
+/// Rebuilds the requested `dates` for one user, in bounded runs.
+///
+/// Three rules keep a day honest:
+///
+/// 1. **A date strictly after `today` is never replaced.** A future date has
+///    no finished time: digesting it would clip every segment at `now`, write
+///    a zero day, and — with its dirty row cleared — freeze that way forever.
+///    Its dirty row is left in place for the tick that runs *on* the day.
+/// 2. **Today is rebuilt but never cleared.** The day is provisional, so its
+///    tail is recomputed by the next tick (which re-marks it dirty in
+///    [`run_digest_tick_user`]). A past day's digest is not clipped — its end
+///    is before `now` — so it may be cleared.
+/// 3. **The digest set is wider than the persist set.** `digest_days` sees the
+///    run's dates expanded by one civil day on each side, because the
+///    estimation only runs for the dates it is handed: the night that wakes on
+///    `D + 1` owns a pre-midnight half on `D`, and rebuilding `D` alone would
+///    silently drop it. Only the requested dates are written.
+///
+/// Dates are split into **contiguous runs** (a gap of at most
+/// `2 * DIGEST_EVENT_WINDOW_PAD_DAYS`, the windows that would otherwise
+/// overlap) and each run is loaded with its own `load_events_touching`, capped
+/// at [`DIGEST_REBUILD_RUN_MAX_DAYS`] requested days per load — a dirty set of
+/// `{2023-01-05, 2026-10-18}` must not load three years of events.
 ///
 /// Days are replaced even when they hold nothing (zeros + no nights) so a
-/// deleted event cannot leave stale minutes behind. Dirty rows are cleared by
-/// the caller only after this returns `Ok`.
+/// deleted event cannot leave stale minutes behind.
 async fn rebuild_dates(
     repo: &dyn DigestRepo,
     category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
     dates: &[String],
+    today: &str,
     now_unix: i64,
     errors: &mut Vec<String>,
-) -> Result<usize, RepoError> {
-    let (Some(first), Some(last)) = (dates.first(), dates.last()) else {
-        return Ok(0);
-    };
-    let from = shift_date(first, -DIGEST_EVENT_WINDOW_PAD_DAYS).unwrap_or_else(|| first.clone());
-    let to = shift_date(last, DIGEST_EVENT_WINDOW_PAD_DAYS).unwrap_or_else(|| last.clone());
-    let events = repo.load_events_touching(user_id, &from, &to).await?;
+) -> Result<RebuildOutcome, RepoError> {
+    let requested: BTreeSet<String> = dates.iter().cloned().collect();
+    let rebuildable: Vec<String> = requested
+        .iter()
+        .filter(|date| date.as_str() <= today)
+        .cloned()
+        .collect();
+    if rebuildable.is_empty() {
+        return Ok(RebuildOutcome {
+            rebuilt: 0,
+            clearable: Vec::new(),
+        });
+    }
+    let runs = rebuild_runs(&rebuildable);
     let fallback_tz = repo.primary_time_zone(user_id).await?.unwrap_or_default();
     // The sleep category comes from the taxonomy the tick already loads for
     // the reclassify job — never a second source of truth. A taxonomy failure
@@ -585,18 +696,94 @@ async fn rebuild_dates(
             None
         }
     };
-
-    let days = digest_days(
-        &events,
-        dates,
-        now_unix,
-        &fallback_tz,
-        sleep_category.as_deref(),
-    );
-    for day in &days {
-        repo.replace_day(user_id, day).await?;
+    // Read every run's prior zone **before** the first write: a zone this pass
+    // stores must not change what a later run infers from persisted history.
+    let mut plan: Vec<(Vec<String>, Option<String>)> = Vec::with_capacity(runs.len());
+    for run in runs {
+        let prior_zone = repo.latest_zone_before(user_id, &run[0]).await?;
+        plan.push((run, prior_zone));
     }
-    Ok(days.len())
+
+    let mut rebuilt = 0;
+    for (run, prior_zone) in &plan {
+        let (Some(first), Some(last)) = (run.first(), run.last()) else {
+            continue;
+        };
+        let from = shift_date(first, -DIGEST_EVENT_WINDOW_PAD_DAYS).unwrap_or_else(|| first.clone());
+        let to = shift_date(last, DIGEST_EVENT_WINDOW_PAD_DAYS).unwrap_or_else(|| last.clone());
+        let events = repo.load_events_touching(user_id, &from, &to).await?;
+        let digest_set = expand_dates(run);
+        let days = digest_days(
+            &events,
+            &digest_set,
+            now_unix,
+            &fallback_tz,
+            prior_zone.as_deref(),
+            sleep_category.as_deref(),
+        );
+        // The expanded neighbours were digested (their segments are shared with
+        // the run) but never persisted: only the requested dates are ours.
+        for day in days
+            .iter()
+            .filter(|day| run.iter().any(|date| date == &day.local_date))
+        {
+            repo.replace_day(user_id, day).await?;
+            rebuilt += 1;
+        }
+    }
+
+    let clearable = rebuildable
+        .iter()
+        .filter(|date| date.as_str() < today)
+        .cloned()
+        .collect();
+    Ok(RebuildOutcome { rebuilt, clearable })
+}
+
+/// Splits sorted dates into load runs.
+///
+/// Two dates share a run when the gap between them is at most
+/// `2 * DIGEST_EVENT_WINDOW_PAD_DAYS`: their padded windows would overlap
+/// anyway, so one load serves both. A longer run is chunked into
+/// [`DIGEST_REBUILD_RUN_MAX_DAYS`] consecutive days so a single
+/// `load_events_touching` stays bounded.
+fn rebuild_runs(dates: &[String]) -> Vec<Vec<String>> {
+    let mut runs: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut previous: Option<&String> = None;
+    for date in dates {
+        let contiguous = previous.is_some_and(|previous| {
+            shift_date(previous, 2 * DIGEST_EVENT_WINDOW_PAD_DAYS)
+                .is_some_and(|limit| date.as_str() <= limit.as_str())
+        });
+        if !current.is_empty() && (!contiguous || current.len() >= DIGEST_REBUILD_RUN_MAX_DAYS) {
+            runs.push(std::mem::take(&mut current));
+        }
+        current.push(date.clone());
+        previous = Some(date);
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+/// `dates` expanded by one civil day on each side, sorted and deduplicated.
+///
+/// A shift that fails (the extremes of `NaiveDate`) is skipped rather than
+/// failing the rebuild.
+fn expand_dates(dates: &[String]) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for date in dates {
+        if let Some(previous) = shift_date(date, -1) {
+            set.insert(previous);
+        }
+        set.insert(date.clone());
+        if let Some(next) = shift_date(date, 1) {
+            set.insert(next);
+        }
+    }
+    set.into_iter().collect()
 }
 
 async fn finish_job(

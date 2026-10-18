@@ -401,6 +401,7 @@ fn sample_new_event(google_event_id: &str, title: &str) -> NewCalendarEvent {
         is_all_day: false,
         raw_json: r#"{"id":"g-batch"}"#.to_string(),
         category_id: Some("cat-batch".to_string()),
+        preserve_category: false,
         is_self_organized: false,
         event_type: "focusTime".to_string(),
     }
@@ -556,6 +557,53 @@ fn d1_upsert_stores_empty_category_as_null() {
         )
         .expect("category_id column");
     assert_eq!(stored, None, "\"\" must be stored as SQL NULL");
+}
+
+/// `preserve_category` keeps the stored stamp on conflict — the merge arm a
+/// failed taxonomy load takes — while a real (stamping) context still writes
+/// NULL. The flag binds once per statement, so this is also the `CASE WHEN ?`
+/// round trip through the real SQL.
+#[test]
+fn d1_upsert_preserve_category_keeps_the_stored_stamp() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+    }
+
+    let mut stamped = sample_new_event("g-preserve", "Work");
+    stamped.category_id = Some("cat-work".to_string());
+    stamped.preserve_category = false;
+    pollster::block_on(h.events.upsert(stamped, NOW_RFC)).expect("stamped upsert");
+
+    // A walk whose taxonomy load failed: no leaf, preserve the stored one.
+    let mut preserving = sample_new_event("g-preserve", "Work");
+    preserving.category_id = None;
+    preserving.preserve_category = true;
+    pollster::block_on(h.events.upsert(preserving, NOW_RFC)).expect("preserving upsert");
+
+    let row = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "g-preserve"))
+        .expect("get")
+        .expect("living");
+    assert_eq!(
+        row.category_id.as_deref(),
+        Some("cat-work"),
+        "a preserving upsert must not erase the stamp"
+    );
+
+    // A successful (stamping) context with no match really is unclassified.
+    let mut unclassified = sample_new_event("g-preserve", "Work");
+    unclassified.category_id = None;
+    unclassified.preserve_category = false;
+    pollster::block_on(h.events.upsert(unclassified, NOW_RFC)).expect("stamp-null upsert");
+
+    let row = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "g-preserve"))
+        .expect("get")
+        .expect("living");
+    assert_eq!(
+        row.category_id, None,
+        "a successful load that matches nothing writes NULL"
+    );
 }
 
 fn seed_event(
@@ -1039,6 +1087,21 @@ fn d1_digest_replace_day_and_dirty_mark_round_trip() {
     assert_eq!(
         pollster::block_on(digest.primary_time_zone("u-1")).expect("tz"),
         Some("UTC".to_string())
+    );
+    // The persisted day zone, as `digest_days`' `prior_zone` lookup sees it:
+    // strictly before the asked date, nearest first.
+    assert_eq!(
+        pollster::block_on(digest.latest_zone_before("u-1", "2026-08-19")).expect("prior zone"),
+        Some("Asia/Kolkata".to_string())
+    );
+    assert_eq!(
+        pollster::block_on(digest.latest_zone_before("u-1", "2026-08-18")).expect("prior zone"),
+        None,
+        "the row itself is not history"
+    );
+    assert_eq!(
+        pollster::block_on(digest.latest_zone_before("u-1", "2026-08-01")).expect("prior zone"),
+        None
     );
     assert!(pollster::block_on(digest.has_meta("u-1")).expect("has meta"));
     assert!(!pollster::block_on(digest.has_stale_meta("u-1", api_core::ALGO_VERSION))

@@ -442,17 +442,31 @@ struct DateAggregate {
 /// sharing, so the shared total counts only elapsed time.
 ///
 /// `fallback_tz` is the user's primary calendar zone, used when a date has no
-/// voting segment and no earlier voted date to inherit from (empty/unknown ⇒
-/// UTC). `sleep_category_id` comes from the user's `sleep` category; `None`
-/// falls back to [`SYNTHETIC_SLEEP_CATEGORY_ID`].
+/// voting segment, no earlier voted date to inherit from, and no persisted
+/// prior zone either (empty/unknown ⇒ UTC). `prior_zone` is the nearest
+/// **earlier persisted** `daily_meta.time_zone` before the first date in this
+/// call (the repo loads it): a date with no votes inherits it, so a one-day
+/// rebuild of an empty date does not fall through to the primary zone just
+/// because the batch happened to be that small. Empty string is not a zone.
+/// `sleep_category_id` comes from the user's `sleep` category; `None` falls
+/// back to [`SYNTHETIC_SLEEP_CATEGORY_ID`].
+///
+/// A date's inferred zone is therefore a pure function of **this batch's
+/// votes plus persisted history** — never of which other dirty dates happened
+/// to travel in the same batch.
 pub fn digest_days(
     events: &[DigestEvent],
     dates: &[String],
     now_unix: i64,
     fallback_tz: &str,
+    prior_zone: Option<&str>,
     sleep_category_id: Option<&str>,
 ) -> Vec<DayDigest> {
     let fallback = normalized_zone_name(fallback_tz);
+    let prior = prior_zone
+        .map(str::trim)
+        .filter(|zone| parse_iana_tz(zone).is_some())
+        .map(str::to_string);
     let sleep_category = sleep_category_id
         .filter(|id| !id.is_empty())
         .unwrap_or(SYNTHETIC_SLEEP_CATEGORY_ID)
@@ -545,8 +559,9 @@ pub fn digest_days(
             winners.insert(date.clone(), winner);
         }
     }
-    // Vote, then the previous date's resolved zone, then `override_zone` (the
-    // wake marker's own zone for sleep minutes), then the caller's fallback.
+    // Vote, then the previous date's resolved zone, then the persisted prior
+    // zone, then `override_zone` (the wake marker's own zone for sleep
+    // minutes), then the caller's fallback.
     //
     // "Previous date" is the nearest **voted** date before this one: carrying
     // forward through a hole and looking back past a hole are the same thing
@@ -564,6 +579,9 @@ pub fn digest_days(
         }
         if let Some(winner) = previous_winner(date) {
             return winner;
+        }
+        if let Some(zone) = &prior {
+            return zone.clone();
         }
         if let Some(zone) = override_zone {
             let zone = zone.trim();

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 
 use super::repo::{DigestRepo, JobStatus, ReclassifyRow};
 use super::sleep::resolve_sleep_category_id;
-use super::tests::support::{day_events, kolkata_event, tick_now};
+use super::tests::support::{day_events, event, kolkata_event, tick_now, utc};
 use super::tick::{JOB_BACKFILL, JOB_DONE, JOB_RECLASSIFY, JOB_RUNNING, RECLASSIFY_BATCH_LIMIT};
 use super::*;
 use crate::models::{
@@ -63,6 +63,8 @@ pub struct FakeState {
     pub events: Vec<DigestEvent>,
     pub rows: Vec<FakeRow>,
     pub stamps: BTreeMap<String, Option<String>>,
+    /// Every `(from, to)` window `load_events_touching` was asked for.
+    pub load_windows: Vec<(String, String)>,
     pub mark_dirty_fails: bool,
     pub rules_broken: Option<String>,
 }
@@ -158,16 +160,36 @@ impl DigestRepo for FakeDigestRepo {
     async fn load_events_touching(
         &self,
         user_id: &str,
-        _from_date: &str,
-        _to_date: &str,
+        from_date: &str,
+        to_date: &str,
     ) -> Result<Vec<DigestEvent>, RepoError> {
-        let state = self.state.lock().expect("fake lock");
+        let mut state = self.state.lock().expect("fake lock");
         assert_eq!(user_id, state.user_id);
+        // The window is recorded (not filtered): the tests assert how many
+        // loads a dirty set produced and how wide they were.
+        state
+            .load_windows
+            .push((from_date.to_string(), to_date.to_string()));
         Ok(state.events.clone())
     }
 
     async fn primary_time_zone(&self, _user_id: &str) -> Result<Option<String>, RepoError> {
         Ok(self.state.lock().expect("fake lock").primary_tz.clone())
+    }
+
+    async fn latest_zone_before(
+        &self,
+        user_id: &str,
+        date: &str,
+    ) -> Result<Option<String>, RepoError> {
+        let state = self.state.lock().expect("fake lock");
+        assert_eq!(user_id, state.user_id);
+        // The persisted meta rows ARE `state.days` in this fake.
+        Ok(state
+            .days
+            .range(..date.to_string())
+            .next_back()
+            .map(|(_, day)| day.time_zone.clone()))
     }
 
     async fn job_status(&self, user_id: &str, kind: &str) -> Result<Option<JobStatus>, RepoError> {
@@ -537,11 +559,271 @@ fn dirty_days_are_rebuilt_and_cleared() {
     let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(report.backfill_started == false, "a done job is never restarted");
-    assert_eq!(report.rebuilt_days, 1);
-    assert!(repo.dirty_dates().is_empty(), "rebuilt days are cleared");
-    assert!(!report.remaining);
+    // The dirty past day plus today, which every tick keeps open.
+    assert_eq!(report.rebuilt_days, 2);
+    assert_eq!(
+        repo.dirty_dates(),
+        vec!["2026-01-10".to_string()],
+        "a finished day is cleared; today stays dirty for the next tick"
+    );
+    assert!(!report.remaining, "today alone is not a reason to come back");
     let day = repo.state().days.get("2026-01-02").cloned().expect("day");
     assert!(day.tracked_seconds > 0);
+}
+
+
+#[test]
+fn a_future_event_is_not_rebuilt_until_its_date() {
+    // A future-dated event dirties a future local date. Rebuilding it now
+    // would clip every segment at `now`, write a zero day, and clear the dirty
+    // row — so the date would never be recomputed once it arrives.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-02-01", "2026-02-01");
+        state.dirty.insert("2026-02-01".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.rebuilt_days, 1, "only today is rebuilt");
+    assert_eq!(
+        repo.state().replace_day_calls,
+        vec!["2026-01-10".to_string()],
+        "the future date is never replaced"
+    );
+    assert_eq!(
+        repo.dirty_dates(),
+        vec!["2026-01-10".to_string(), "2026-02-01".to_string()],
+        "the future row waits for the tick that runs on its own date"
+    );
+}
+
+#[test]
+fn todays_tail_stays_dirty_until_the_day_ends() {
+    // Today is always clipped at `now`: clearing its dirty row would freeze the
+    // tail at the last write.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-10", "2026-01-10");
+        state.dirty.insert("2026-01-10".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.rebuilt_days, 1);
+    assert_eq!(repo.dirty_dates(), vec!["2026-01-10".to_string()]);
+    assert!(
+        !report.remaining,
+        "today's own dirty row must not re-enqueue the tick forever"
+    );
+
+    // A quiet user — every event in the past — still gets today's tail
+    // recomputed, off the persisted `daily_meta` row.
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state.dirty.clear();
+        state.replace_day_calls.clear();
+    });
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.rebuilt_days, 1, "today alone");
+    assert_eq!(
+        repo.state().replace_day_calls,
+        vec!["2026-01-10".to_string()],
+        "a quiet user still gets today recomputed"
+    );
+    assert_eq!(repo.dirty_dates(), vec!["2026-01-10".to_string()]);
+}
+
+#[test]
+fn the_day_that_just_ended_is_finalized_on_the_next_tick() {
+    // Yesterday stays dirty across local midnight (it was today's row, and
+    // today is never cleared). The next tick rebuilds it **unclipped** — the
+    // whole event is in the past now — and only then clears it, leaving the
+    // new today dirty in its place.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.primary_tz = Some("UTC".to_string());
+        state.events = vec![event(
+            "evening",
+            "evening",
+            "2026-01-02T20:00:00Z",
+            "2026-01-02T22:00:00Z",
+            "UTC",
+            Some("work"),
+        )];
+        state.dirty.insert("2026-01-02".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    // 21:00 on the 2nd: the day is still running, so the event is clipped.
+    let report = poll(run_digest_tick_user(
+        &repo,
+        &taxonomy,
+        "u-1",
+        7,
+        utc("2026-01-02T21:00:00Z"),
+    ));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let clipped = repo.state().days.get("2026-01-02").cloned().expect("day");
+    assert_eq!(work_seconds(&clipped), 3_600, "one hour has elapsed");
+    assert_eq!(repo.dirty_dates(), vec!["2026-01-02".to_string()]);
+
+    // 06:00 on the 3rd: the 2nd is a finished day.
+    let report = poll(run_digest_tick_user(
+        &repo,
+        &taxonomy,
+        "u-1",
+        7,
+        utc("2026-01-03T06:00:00Z"),
+    ));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let finished = repo.state().days.get("2026-01-02").cloned().expect("day");
+    assert_eq!(work_seconds(&finished), 7_200, "the whole event, no clip");
+    assert_eq!(
+        repo.dirty_dates(),
+        vec!["2026-01-03".to_string()],
+        "the finished day is cleared; the new today is left dirty"
+    );
+    assert!(!report.remaining);
+}
+
+#[test]
+fn a_sparse_dirty_set_rebuilds_in_separate_runs() {
+    // Two dirty dates three years apart must not load (or share a digest pool
+    // with) everything in between.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = vec![
+            event(
+                "old",
+                "old",
+                "2023-01-05T10:00:00Z",
+                "2023-01-05T11:00:00Z",
+                "UTC",
+                Some("work"),
+            ),
+            event(
+                "new",
+                "new",
+                "2026-01-07T10:00:00Z",
+                "2026-01-07T11:00:00Z",
+                "UTC",
+                Some("work"),
+            ),
+        ];
+        state.dirty.insert("2023-01-05".to_string(), "x".to_string());
+        state.dirty.insert("2026-01-07".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let windows = repo.state().load_windows.clone();
+    assert_eq!(windows.len(), 2, "one load per run: {windows:?}");
+    assert_eq!(
+        windows[0],
+        ("2023-01-03".to_string(), "2023-01-07".to_string()),
+        "the sparse run is loaded alone, padded by ±2"
+    );
+    assert_eq!(
+        windows[1],
+        ("2026-01-05".to_string(), "2026-01-12".to_string()),
+        "2026-01-07 and today are one run (gap ≤ 4)"
+    );
+    assert!(
+        windows[0].1.as_str() < "2024-01-01",
+        "the first load stops in 2023: {windows:?}"
+    );
+    assert!(
+        windows[1].0.as_str() > "2025-01-01",
+        "the second load starts in 2026: {windows:?}"
+    );
+    assert_eq!(
+        repo.state().replace_day_calls,
+        vec![
+            "2023-01-05".to_string(),
+            "2026-01-07".to_string(),
+            "2026-01-10".to_string()
+        ]
+    );
+    let old = repo.state().days.get("2023-01-05").cloned().expect("day");
+    assert_eq!(work_seconds(&old), 3_600, "the 2023 event still lands");
+}
+
+#[test]
+fn the_rebuild_digests_the_neighbour_wake_and_persists_only_the_dirty_day() {
+    // dirty {2026-01-02}; events on the 2nd evening and the 3rd morning. The
+    // night that wakes on the 3rd owns a pre-midnight half on the 2nd, so the
+    // rebuild has to digest the 3rd — but it must not write it.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.primary_tz = Some("UTC".to_string());
+        state.events = vec![
+            event(
+                "evening",
+                "evening",
+                "2026-01-02T19:00:00Z",
+                "2026-01-02T20:00:00Z",
+                "UTC",
+                Some("work"),
+            ),
+            event(
+                "morning",
+                "morning",
+                "2026-01-03T09:00:00Z",
+                "2026-01-03T10:00:00Z",
+                "UTC",
+                Some("work"),
+            ),
+        ];
+        state.dirty.insert("2026-01-02".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let day = repo.state().days.get("2026-01-02").cloned().expect("day");
+    assert_eq!(
+        day.sleep_seconds, 23_400,
+        "the neighbour's 21:00–24:00 half (10_800) joins the night that wakes on D"
+    );
+    assert!(
+        !repo.state().days.contains_key("2026-01-03"),
+        "the digested neighbour is never persisted"
+    );
+}
+
+#[test]
+fn a_rebuilt_day_inherits_the_persisted_zone() {
+    // The day before the dirty day is persisted as Asia/Kolkata and the dirty
+    // day itself has no events: the rebuild must inherit the stored zone
+    // instead of falling through to the primary calendar's UTC.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.primary_tz = Some("UTC".to_string());
+        state
+            .days
+            .insert("2026-01-01".to_string(), stored_day("2026-01-01", "Asia/Kolkata"));
+        state.dirty.insert("2026-01-02".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let day = repo.state().days.get("2026-01-02").cloned().expect("day");
+    assert_eq!(
+        day.time_zone, "Asia/Kolkata",
+        "the zone comes from persisted history, not from the batch"
+    );
 }
 
 #[test]
@@ -614,6 +896,32 @@ fn running_job() -> JobStatus {
         status: JOB_RUNNING.to_string(),
         cursor: String::new(),
     }
+}
+
+/// A finished job: the tick will not restart it, so the rebuild branch runs.
+fn done_job() -> JobStatus {
+    JobStatus {
+        status: JOB_DONE.to_string(),
+        cursor: String::new(),
+    }
+}
+
+/// One already-computed day, as the fake's `daily_meta` row.
+fn stored_day(date: &str, zone: &str) -> DayDigest {
+    DayDigest {
+        time_zone: zone.to_string(),
+        computed_at: "2026-01-01T00:00:00Z".to_string(),
+        ..stale_day(date)
+    }
+}
+
+/// The `work` category's seconds on a rebuilt day.
+fn work_seconds(day: &DayDigest) -> i64 {
+    day.category_seconds
+        .iter()
+        .filter(|row| row.category_id == "work")
+        .map(|row| row.seconds)
+        .sum()
 }
 
 fn work_taxonomy() -> FakeTaxonomyRepo {
@@ -902,7 +1210,10 @@ fn a_failing_sleep_category_read_still_rebuilds() {
         7,
         today(),
     ));
-    assert_eq!(report.rebuilt_days, 1, "the rebuild degrades, it does not stall");
+    assert_eq!(
+        report.rebuilt_days, 2,
+        "the rebuild degrades, it does not stall (the dirty day and today)"
+    );
     assert_eq!(report.errors.len(), 1);
     assert!(report.errors[0].contains("sleep category"));
 }
@@ -937,7 +1248,15 @@ fn the_rebuild_is_idempotent() {
                 .expect("day"),
         );
     }
-    assert_eq!(repo.state().replace_day_calls.len(), 2);
+    assert_eq!(
+        repo.state()
+            .replace_day_calls
+            .iter()
+            .filter(|date| date.as_str() == "2026-01-02")
+            .count(),
+        2,
+        "the dirty day is rebuilt once per tick (today is rebuilt too)"
+    );
     // Running the same day twice leaves byte-identical rows.
     assert_eq!(payloads[0], payloads[1]);
     assert!(payloads[0].tracked_seconds > 0);

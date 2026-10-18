@@ -42,8 +42,9 @@ use crate::token::GoogleAccess;
 ///
 /// `ctx` stamps the app-owned leaf `category_id` on every write-through upsert
 /// (the SQL upsert **overwrites** the column). The caller passes the taxonomy
-/// it already loaded for paint; [`EventClassifyCtx::none`] only when that load
-/// failed — listing must not 500 because taxonomy is missing.
+/// it already loaded for paint; [`EventClassifyCtx::preserve`] only when that
+/// load failed — listing must not 500 because taxonomy is missing, and a
+/// failed load must not blank a stored stamp either.
 pub async fn fetch_and_apply_window(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,

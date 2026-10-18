@@ -92,7 +92,8 @@ fn quarantine_replay_payload(body: &[u8]) -> String {
 ///
 /// `ctx` stamps the app-owned leaf `category_id` on every upsert (the SQL
 /// upsert **overwrites** the column). Production callers must pass a real
-/// context — [`EventClassifyCtx::none`] only when the taxonomy load failed.
+/// context — [`EventClassifyCtx::preserve`] only when the taxonomy load
+/// failed (it keeps any stored stamp instead of blanking it).
 pub async fn sync_replica(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,

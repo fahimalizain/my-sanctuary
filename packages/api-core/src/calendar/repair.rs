@@ -25,7 +25,7 @@ use crate::token::GoogleAccess;
 /// **once per user** (this function is already per-user, no seeding) and
 /// reused for every repaired op — repair writes the same `category_id` stamp
 /// as the sync walks. A load failure only degrades the stamp
-/// (`EventClassifyCtx::none`), never the repair.
+/// (`EventClassifyCtx::preserve`), never the repair.
 ///
 /// Returns human-readable error strings (never tokens). One op failure does
 /// not abort the rest. Status is left unchanged on transport / non-terminal
@@ -306,14 +306,16 @@ async fn repair_move_source_gone(
 
 /// Classifier context for the calendar a repaired row lands on: the taxonomy
 /// is shared, the Google id differs per calendar (pattern scope). A missing
-/// taxonomy (`.ok()` above) degrades to the empty context.
+/// taxonomy (`.ok()` above) degrades to the **preserving** context, so the
+/// stored stamp survives the repair instead of being blanked.
 fn classify_ctx_for<'a>(
     taxonomy: Option<&'a PaintTaxonomy>,
     google_calendar_id: &'a str,
 ) -> EventClassifyCtx<'a> {
     match taxonomy {
         Some(taxonomy) => taxonomy.event_ctx(google_calendar_id),
-        None => EventClassifyCtx::none(),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
     }
 }
 

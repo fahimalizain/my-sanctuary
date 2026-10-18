@@ -914,7 +914,8 @@ async fn sync_calendar_traced_inner(
             .ok();
         let ctx = match &loaded_taxonomy {
             Some(taxonomy) => taxonomy.event_ctx(&fresh.google_calendar_id),
-            None => EventClassifyCtx::none(),
+            // A failed load must not blank a good stamp.
+            None => EventClassifyCtx::preserve(),
         };
         sync_replica(
             http,

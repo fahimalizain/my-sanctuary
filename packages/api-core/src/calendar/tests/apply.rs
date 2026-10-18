@@ -143,6 +143,7 @@ fn natural_key_upsert_returns_persisted_id() {
         is_all_day: false,
         raw_json: "{}".into(),
         category_id: None,
+        preserve_category: false,
         is_self_organized: true,
         event_type: String::new(),
     };
@@ -184,6 +185,7 @@ fn upsert_after_delete_clears_deleted_at() {
         is_all_day: false,
         raw_json: String::new(),
         category_id: None,
+        preserve_category: false,
         is_self_organized: true,
         event_type: String::new(),
     };
@@ -273,11 +275,50 @@ fn replica_walk_stamps_and_replaces_the_leaf_category() {
     assert_eq!(stored[0].event_type, "");
 }
 
-/// The documented footgun: a walk with an **empty** taxonomy (production only
-/// on a taxonomy-load failure, tests by default) overwrites a previously
-/// stamped category with NULL. A later reclassify job fills the gap.
+/// A taxonomy-load **failure** must not erase a stamp: the walk falls back to
+/// [`EventClassifyCtx::preserve`], so the stored `category_id` survives the
+/// upsert (a later reclassify fills any genuinely missing stamp).
 #[test]
-fn replica_walk_with_empty_taxonomy_clears_the_stamp() {
+fn taxonomy_failure_keeps_the_existing_category() {
+    let body = r#"{"items":[
+        {"id": "work-1", "summary": "Work",
+         "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-1"}"#;
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "work@x.com", true)]);
+    let events = FakeEventRepo::new();
+    let categories = StubTaskCategoryRepo::with_pattern("cat-work", "^Work$", 0);
+
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal,
+        "2023-11-14T22:13:20Z", &categories,
+    ))
+    .expect("stamped walk ok");
+    assert_eq!(
+        events.stored.lock().unwrap()[0].category_id.as_deref(),
+        Some("cat-work")
+    );
+
+    // The same walk with a taxonomy read that fails: the stamp stays.
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal,
+        "2023-11-14T22:14:00Z", &FAILING_TAXONOMY,
+    ))
+    .expect("failing-taxonomy walk ok");
+    assert_eq!(
+        events.stored.lock().unwrap()[0].category_id.as_deref(),
+        Some("cat-work"),
+        "a failed taxonomy load keeps the stored stamp"
+    );
+}
+
+/// A **successful** load whose patterns match nothing still writes `NULL`:
+/// the title really is unclassified, and keeping a stale stamp would be a lie.
+#[test]
+fn a_successful_taxonomy_with_no_match_still_clears_the_stamp() {
     let body = r#"{"items":[
         {"id": "work-1", "summary": "Work",
          "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
@@ -307,7 +348,7 @@ fn replica_walk_with_empty_taxonomy_clears_the_stamp() {
     .expect("empty-taxonomy walk ok");
     assert_eq!(
         events.stored.lock().unwrap()[0].category_id, None,
-        "empty taxonomy overwrites the stamp — intended only for load failure"
+        "an empty (but successful) taxonomy stamps unclassified"
     );
 }
 

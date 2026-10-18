@@ -277,7 +277,8 @@ pub(crate) async fn create_event_with_journal(
         .ok();
     let ctx = match &taxonomy {
         Some(taxonomy) => taxonomy.event_ctx(&cal.google_calendar_id),
-        None => EventClassifyCtx::none(),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
     };
     let new_event = map_cached_event(&created, &cal.id, &now_rfc3339, &ctx);
     let local_id = match events.upsert(new_event.clone(), &now_rfc3339).await {

@@ -10,9 +10,12 @@
 //! [`EventClassifyCtx`] so reports can read a stored category instead of
 //! re-matching titles. The context carries the **Google** calendar id
 //! (pattern scope), not the local `google_calendars.id` the row stores.
+//!
 //! Because the SQL upsert overwrites the column, every production upsert must
-//! pass a real context — [`EventClassifyCtx::none`] is for tests and failed
-//! taxonomy loads only.
+//! pass a real context — [`EventClassifyCtx::none`] is for tests only, and a
+//! failed taxonomy load uses [`EventClassifyCtx::preserve`], which sets
+//! `preserve_category` so the merge keeps the stored stamp instead of writing
+//! `NULL`.
 //!
 //! # Projection and storage
 //!
@@ -49,8 +52,9 @@ use crate::models::{CalendarEvent, NewCalendarEvent, TaskCategory};
 ///
 /// Every production upsert must carry a real context: the SQL upsert
 /// **overwrites** `category_id` (including back to `NULL`), so a walk that
-/// forgets to stamp a previously classified row wipes it. Only tests and
-/// taxonomy-load failures use [`EventClassifyCtx::none`].
+/// forgets to stamp a previously classified row wipes it. Only tests use
+/// [`EventClassifyCtx::none`]; a failed taxonomy load uses
+/// [`EventClassifyCtx::preserve`], which keeps the stored stamp instead.
 #[derive(Debug, Clone)]
 pub struct EventClassifyCtx<'a> {
     /// Google calendar id of the inbound events (scoped-pattern gate).
@@ -59,18 +63,36 @@ pub struct EventClassifyCtx<'a> {
     pub categories: &'a [TaskCategory],
     /// Compiled matchers built from those categories' patterns.
     pub matchers: &'a [CategoryWithPatterns],
+    /// Keep the stored `category_id` on conflict — see
+    /// [`NewCalendarEvent::preserve_category`]. Never a match against
+    /// `matchers`: the title was not classified, it was not looked at.
+    pub preserve: bool,
 }
 
 impl EventClassifyCtx<'_> {
     /// Empty context: no patterns match, so an upsert stamps
-    /// `category_id = None`. Use only for tests and for a **failed** taxonomy
-    /// load (a later reclassify job fills the gap) — never as a shortcut on a
-    /// production success path.
+    /// `category_id = None`. Use only for tests that deliberately have no
+    /// taxonomy (and where the stored stamp does not matter) — a production
+    /// failure path uses [`Self::preserve`].
     pub fn none() -> Self {
         Self {
             google_calendar_id: "",
             categories: &[],
             matchers: &[],
+            preserve: false,
+        }
+    }
+
+    /// Context for a **failed** taxonomy load: nothing is classified and the
+    /// stored stamp is kept (`preserve_category = true`), so a walk over a
+    /// transient load failure cannot erase a good `category_id`. A later
+    /// reclassify job fills any genuinely missing stamp.
+    pub fn preserve() -> Self {
+        Self {
+            google_calendar_id: "",
+            categories: &[],
+            matchers: &[],
+            preserve: true,
         }
     }
 }
@@ -131,6 +153,10 @@ fn is_cancelled_exception(item: &GoogleEvent) -> bool {
 /// the ctx's Google calendar scope; `None` (no match, or only the `untracked`
 /// sink) writes SQL `NULL`. Called by every upsert path — replica walk, window
 /// fetch, and the journaled create/patch/move cache applies.
+///
+/// A [`EventClassifyCtx::preserve`] context (a failed taxonomy load) skips the
+/// matchers entirely and marks the row `preserve_category`: the upsert then
+/// keeps the stored stamp instead of writing `NULL`.
 pub fn map_cached_event(
     event: &GoogleEvent,
     calendar_id: &str,
@@ -142,6 +168,11 @@ pub fn map_cached_event(
     } else {
         map_google_event(event, calendar_id, now_rfc3339)
     };
+    if ctx.preserve {
+        row.preserve_category = true;
+        return row;
+    }
+    row.preserve_category = false;
     row.category_id = classify_event_leaf(
         &row.title,
         ctx.google_calendar_id,
@@ -158,7 +189,9 @@ pub fn map_cached_event(
 /// property map to `""` and the upsert's `COALESCE` leaves any stored value
 /// untouched. `sanctuary_focus` / priority / difficulty are create-time
 /// snapshots on Google and are not cached. `category_id` is always `None` here
-/// — the leaf stamp comes from [`map_cached_event`].
+/// — the leaf stamp comes from [`map_cached_event`] — and
+/// `preserve_category` is `true`, so a mapper that reaches the repo directly
+/// (no classifier context at all) never blanks a stored stamp either.
 pub fn map_google_event(
     event: &GoogleEvent,
     calendar_id: &str,
@@ -203,6 +236,8 @@ pub fn map_google_event(
         is_all_day,
         raw_json: serde_json::to_string(event).unwrap_or_default(),
         category_id: None,
+        // No classifier context here: keep whatever stamp is already stored.
+        preserve_category: true,
         is_self_organized: google_is_self_organized(event),
         event_type: event
             .event_type
@@ -750,6 +785,7 @@ mod tests {
             google_calendar_id: "work@x.com",
             categories: &categories,
             matchers: &matchers,
+            preserve: false,
         };
 
         // A title that matches stamps the leaf id and still carries task_id.
@@ -778,6 +814,7 @@ mod tests {
             google_calendar_id: "work@x.com",
             categories: &categories,
             matchers: &matchers,
+            preserve: false,
         };
         let event = GoogleEvent {
             id: "exc-1".into(),

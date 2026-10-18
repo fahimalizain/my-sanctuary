@@ -240,9 +240,10 @@ fn default_is_self_organized() -> bool {
 ///
 /// **Ownership:** [`NewCalendarEvent::task_id`] is app-owned (SQL COALESCE) and
 /// so is [`NewCalendarEvent::category_id`] — but the category **overwrites**
-/// (`excluded.category_id`), so a retitle can replace or clear it; only a real
-/// classifier context may fill it. Identity columns are Google-owned and a
-/// merge may overwrite them.
+/// (`excluded.category_id`) unless [`NewCalendarEvent::preserve_category`] is
+/// set, so a retitle can replace or clear it while a **failed** taxonomy load
+/// cannot wipe a good stamp. Identity columns are Google-owned and a merge may
+/// overwrite them.
 /// [`NewCalendarEvent::raw_json`] is stored for later schema migrations and
 /// must never be exposed on the HTTP envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,8 +286,20 @@ pub struct NewCalendarEvent {
     /// Leaf category from
     /// [`crate::categories::classify_event_leaf`]. `None` = unclassified.
     /// Bound as `NULLIF(?, '')`; the upsert **overwrites** (including back to
-    /// `NULL`), so a Google merge cannot keep a stale stamp. App-owned.
+    /// `NULL`) unless [`Self::preserve_category`] is set. App-owned.
     pub category_id: Option<String>,
+    /// Keep the **stored** `category_id` on conflict instead of writing
+    /// [`Self::category_id`]. Not a column: it only picks the merge arm of the
+    /// upsert (`CASE WHEN ? = '1' THEN excluded.category_id ELSE
+    /// calendar_events.category_id END`).
+    ///
+    /// `true` only where no real classifier context was available — a failed
+    /// taxonomy load ([`crate::calendar_apply::EventClassifyCtx::preserve`]),
+    /// where blanking the stamp would lose a good classification. A
+    /// **successful** load that matches nothing must stay `false`: the title
+    /// really is unclassified and `NULL` is the truth. An INSERT of a brand
+    /// new row stores `NULL` either way — there is no prior stamp to keep.
+    pub preserve_category: bool,
     /// Google organizer flag (`organizer.self`, or no organizer → `true`).
     /// Google-owned; bound as `1`/`0`.
     pub is_self_organized: bool,

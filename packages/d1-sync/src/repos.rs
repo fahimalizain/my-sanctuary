@@ -11,7 +11,8 @@ use api_core::models::{
 use api_core::digest::repo::{EventSpan, EventSpanRow};
 use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_replica_seen_insert_sql,
-    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo,
+    chunk_events_for_upsert, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError,
+    TokenRepo,
     WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
     CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL, CALENDAR_DELETE_SQL,
     CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
@@ -29,7 +30,7 @@ use api_core::repo::{
     EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL, EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
     EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
-    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL,
     EVENT_UPSERT_QUARANTINE_SQL,
     OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_UPDATE_PROGRESS_SQL, OPERATION_UPDATE_STATUS_SQL,
@@ -671,8 +672,10 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
     ) -> Result<(), RepoError> {
         // Mint candidate UUIDs; ON CONFLICT(calendar_id, google_event_id)
         // preserves existing id and sets deleted_at = NULL (no per-event SELECT).
+        // Chunks never mix `preserve_category`: the category flag binds once per
+        // statement.
         let conn = lock(&self.db)?;
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+        for chunk in chunk_events_for_upsert(&events) {
             let pending = Self::gather_dirty(&conn, chunk);
             let ids: Vec<String> = (0..chunk.len())
                 .map(|_| uuid::Uuid::new_v4().to_string())
@@ -695,7 +698,7 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
         }
         // Same mint-UUID + chunking as upsert_batch; fence binds unchanged.
         let conn = lock(&self.db)?;
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+        for chunk in chunk_events_for_upsert(&events) {
             let calendar_id = chunk[0].calendar_id.as_str();
             let pending = Self::gather_dirty(&conn, chunk);
             let ids: Vec<String> = (0..chunk.len())

@@ -223,6 +223,87 @@ impl TaskCategoryRepo for EmptyTaskCategoryRepo {
     }
 }
 
+/// A [`TaskCategoryRepo`] whose taxonomy **read fails**: `load_classify_taxonomy`
+/// returns `Err`, which is the production failure path that must degrade to
+/// [`crate::calendar_apply::EventClassifyCtx::preserve`] — a failed load may
+/// never blank a stored stamp.
+pub(crate) struct FailingTaskCategoryRepo;
+
+/// Shared `'static` instance, so call sites stay one short argument.
+pub(crate) const FAILING_TAXONOMY: FailingTaskCategoryRepo = FailingTaskCategoryRepo;
+
+#[async_trait::async_trait(?Send)]
+impl TaskCategoryRepo for FailingTaskCategoryRepo {
+    async fn list_by_user_id(&self, _user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+        Err(RepoError::Backend("taxonomy read failed".to_string()))
+    }
+
+    async fn get_by_id(&self, _id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn insert(&self, _category: NewTaskCategory) -> Result<TaskCategory, RepoError> {
+        Err(RepoError::Backend(
+            "FailingTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _id: &str,
+        _updates: &UpdateTaskCategory,
+    ) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn soft_delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+        Ok(())
+    }
+
+    async fn count_by_user_id(&self, _user_id: &str) -> Result<i64, RepoError> {
+        Ok(0)
+    }
+
+    async fn count_children(&self, _category_id: &str) -> Result<i64, RepoError> {
+        Ok(0)
+    }
+
+    async fn get_untracked(&self, _user_id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn list_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        Err(RepoError::Backend("taxonomy read failed".to_string()))
+    }
+
+    async fn list_patterns_by_user_id(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        Err(RepoError::Backend("taxonomy read failed".to_string()))
+    }
+
+    async fn replace_patterns(
+        &self,
+        _category_id: &str,
+        _patterns: Vec<NewTaskCategoryPattern>,
+    ) -> Result<(), RepoError> {
+        Err(RepoError::Backend(
+            "FailingTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn delete_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<(), RepoError> {
+        Ok(())
+    }
+}
+
 /// Scripted HTTP fake: `routes` are `(url-substring, status, body)` in
 /// match order (permanent — not consumed; replica/window pagination reuses
 /// them). `one_shots` are checked first and **removed** on match (412
@@ -1249,8 +1330,13 @@ impl FakeEventRepo {
             existing.raw_json = event.raw_json;
             // App-owned leaf category: overwrite from the incoming row,
             // including back to `NULL` (a retitle must replace or clear a
-            // stale stamp). `NULLIF(?, '')` normalization is the caller's.
-            existing.category_id = event.category_id.filter(|id| !id.is_empty());
+            // stale stamp) — unless the row preserves, which mirrors
+            // `EVENT_UPSERT_ON_CONFLICT`'s `CASE WHEN ? = '1'`. A failed
+            // taxonomy load must not erase a good stamp.
+            // `NULLIF(?, '')` normalization is the caller's.
+            if !event.preserve_category {
+                existing.category_id = event.category_id.filter(|id| !id.is_empty());
+            }
             existing.is_self_organized = event.is_self_organized;
             existing.event_type = event.event_type;
             existing.updated_at = now_rfc3339.to_string();

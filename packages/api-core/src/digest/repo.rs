@@ -425,6 +425,21 @@ pub const DIGEST_PRIMARY_TIME_ZONE_SQL: &str = "
     LIMIT 1
 ";
 
+/// The nearest **persisted** day zone strictly before one date — the
+/// `prior_zone` a rebuild of that date must inherit when the date itself has
+/// no voting segment.
+///
+/// Without it the inferred zone would depend on which other dirty dates
+/// happened to share the batch: a one-day rebuild of an empty date would fall
+/// straight through to the primary zone (or UTC) even though the previous day
+/// is stored as `Asia/Kolkata`.
+pub const DIGEST_LATEST_ZONE_BEFORE_SQL: &str = "
+    SELECT time_zone FROM daily_meta
+    WHERE user_id = ? AND local_date < ?
+    ORDER BY local_date DESC
+    LIMIT 1
+";
+
 /// The earliest civil date any living event starts on — the backfill floor.
 /// `None` (no row) also answers "does this user have any calendar event?".
 pub const DIGEST_EARLIEST_EVENT_DATE_SQL: &str = "
@@ -614,6 +629,17 @@ pub trait DigestRepo: Send + Sync {
     ) -> Result<Vec<DigestEvent>, RepoError>;
     /// The user's primary calendar IANA zone, or `None` before the first sync.
     async fn primary_time_zone(&self, user_id: &str) -> Result<Option<String>, RepoError>;
+    /// The `daily_meta.time_zone` of the nearest row **before** `date`, or
+    /// `None` when no earlier day was ever computed.
+    ///
+    /// This is `digest_days`' `prior_zone`: persisted history that a date with
+    /// no voting segment inherits, so the inferred zone does not depend on
+    /// which other dirty dates shared the rebuild batch.
+    async fn latest_zone_before(
+        &self,
+        user_id: &str,
+        date: &str,
+    ) -> Result<Option<String>, RepoError>;
     /// A job's status row, or `None` when it never ran.
     async fn job_status(&self, user_id: &str, kind: &str) -> Result<Option<JobStatus>, RepoError>;
     /// Upserts a job's status + cursor.
