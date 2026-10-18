@@ -23,7 +23,7 @@ export const ALLDAY_CREATE_HOLD_MS = 220;
 
 /** Pointer travel of N grid-minutes moves a Cmd/Ctrl edge by N/5. */
 export const PRECISION_GAIN_GRID = 5;
-/** Touch gutter scrub (slice 3 will consume this): N grid-minutes → N/10. */
+/** Gutter scrub: N grid-minutes of travel move the edge N/10. Always on. */
 export const PRECISION_GAIN_SCRUB = 10;
 
 export type DragZone = 'timed' | 'allday';
@@ -33,6 +33,8 @@ export type DragKind =
   | 'move'
   | 'resize-start'
   | 'resize-end'
+  | 'scrub-start'
+  | 'scrub-end'
   | 'allday-create';
 
 /** A snapped position on the timed grid (or all-day: minutes = 0). */
@@ -682,6 +684,43 @@ export function precisionCreate(
 function clampDayMinutes(minutes: number): number {
   if (!Number.isFinite(minutes)) return 0;
   return Math.min(MINUTES_PER_DAY, Math.max(0, minutes));
+}
+
+// ── gutter scrub (1:10 gain, lagged release) ────────────────────────────
+//
+// The gutter has no day axis and no absolute grid, so a scrub is always the
+// 1:10 gain and commits the edge it was painting — which is the lagged one.
+
+/** How far behind the finger the painted edge trails. */
+export const SCRUB_RELEASE_LAG_MS = 80;
+
+/** A pointer position in hours-content space, stamped with its event time. */
+export interface PointerSample extends PointerAnchor {
+  t: number;
+}
+
+/**
+ * The sample to paint: the newest one at least `lagMs` old, so the edge trails
+ * the pointer and lift-off commits what the user was looking at.
+ *
+ * When every sample is younger than the lag — a gesture shorter than it — the
+ * earliest sample (the grab) is shown. `samples` must be in gesture order, so
+ * the first one is the grab. Empty, or a non-finite `now` → null.
+ */
+export function laggedPointer(
+  samples: readonly PointerSample[],
+  now: number,
+  lagMs = SCRUB_RELEASE_LAG_MS,
+): PointerSample | null {
+  if (!Number.isFinite(now)) return null;
+  const lag = Number.isFinite(lagMs) ? lagMs : 0;
+  const cutoff = now - lag;
+  let newest: PointerSample | null = null;
+  for (const sample of samples) {
+    if (sample.t > cutoff) continue;
+    if (!newest || sample.t >= newest.t) newest = sample;
+  }
+  return newest ?? samples[0] ?? null;
 }
 
 /** What the drag ghost needs to label itself (kept out of DayColumn props). */

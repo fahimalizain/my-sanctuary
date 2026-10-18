@@ -12,6 +12,8 @@ import { MINUTES_PER_DAY, minutesSinceMidnight, nowLineY } from './week-layout';
 export const GUTTER_PILL_H = 16;
 /** Painted hour-label height: `text-[10px] leading-none`. */
 export const GUTTER_HOUR_LABEL_H = 10;
+/** Clear space between the two edge pills once they are pushed apart. */
+export const GUTTER_PILL_GAP = 2;
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
@@ -77,6 +79,57 @@ export interface GutterPillLayout {
   minutes: number;
 }
 
+/**
+ * Place the start / end pill centers so both stay grabbable.
+ *
+ * Each center is clamped into `[minCenter, maxCenter]` first, which is what
+ * sticks an edge that scrolled out of the hours viewport to the visible end.
+ * A pair closer than `minSep` is then pushed apart about its midpoint and slid
+ * back inside the range, so a short event hosts two pills instead of one.
+ *
+ * The pair's own order is kept: an overnight event (end above start) is pushed
+ * apart in its own direction rather than swapped. A range shorter than `minSep`
+ * is spread as far as it fits and may overlap — never an error. Non-finite
+ * centers pin to `minCenter`, and neither finite gives `{minCenter, minCenter}`.
+ */
+export function separateEdgeCenters(
+  startTop: number,
+  endTop: number,
+  minCenter: number,
+  maxCenter: number,
+  minSep: number,
+): { startTop: number; endTop: number } {
+  const lo = Number.isFinite(minCenter) ? minCenter : 0;
+  const hi = Number.isFinite(maxCenter) ? Math.max(lo, maxCenter) : lo;
+  const pin = (y: number): number =>
+    Number.isFinite(y) ? clamp(y, lo, hi) : lo;
+
+  const start = pin(startTop);
+  const end = pin(endTop);
+  if (!Number.isFinite(startTop) && !Number.isFinite(endTop)) {
+    return { startTop: start, endTop: start };
+  }
+
+  const sep = Number.isFinite(minSep) && minSep > 0 ? minSep : 0;
+  const gap = Math.abs(end - start);
+  const want = Math.min(sep, hi - lo);
+  if (gap >= want) return { startTop: start, endTop: end };
+
+  const half = (want - gap) / 2;
+  const dir = end >= start ? 1 : -1;
+  const pushedStart = start - dir * half;
+  const pushedEnd = end + dir * half;
+
+  // Slide the pair back inside; the clamp covers a range too short to hold it.
+  const shiftUp = Math.max(0, lo - Math.min(pushedStart, pushedEnd));
+  const shiftDown = Math.min(0, hi - Math.max(pushedStart, pushedEnd));
+  const shift = shiftUp > 0 ? shiftUp : shiftDown;
+  return {
+    startTop: clamp(pushedStart + shift, lo, hi),
+    endTop: clamp(pushedEnd + shift, lo, hi),
+  };
+}
+
 export interface GutterPillInput {
   hourH: number;
   /** Hours the gutter would paint (already through `hourLabelStep`). */
@@ -85,26 +138,46 @@ export interface GutterPillInput {
   now: Date | null;
   /** Null when nothing timed is selected and no timed drag preview is active. */
   edges: { start: Date; end: Date } | null;
+  /**
+   * Visible hours band in hours-local Y (0 at midnight): `scrollTop` to
+   * `scrollTop + clientHeight - headerOffset`. Null / empty when unknown.
+   */
+  visible?: { top: number; bottom: number } | null;
 }
 
 /**
  * Pills and the hour labels they cover, for the sticky gutter.
  *
- * Content-box clamping only: a pill on 00:00 or on 1440 keeps its center
- * inside the hours box instead of being sliced in half. Viewport stickiness
- * and push-apart are deliberately absent, so short events may overlap.
+ * Centers are clamped into the hours box — narrowed to the visible band when
+ * one is known, so a pill whose edge scrolled away stays on screen and
+ * grabbable — and the two edge pills keep `GUTTER_PILL_H + GUTTER_PILL_GAP`
+ * apart, so a short event hosts both. The now pill and the hidden labels are
+ * tested against the centers as painted, not against the raw edge minutes.
  */
 export function layoutGutterPills(input: GutterPillInput): {
   pills: GutterPillLayout[];
   hiddenHours: number[];
 } {
-  const { hourH, hourLabels, now, edges } = input;
+  const { hourH, hourLabels, now, edges, visible } = input;
   if (!Number.isFinite(hourH) || hourH <= 0) {
     return { pills: [], hiddenHours: [] };
   }
 
-  const clampCenter = (y: number): number =>
-    clamp(y, GUTTER_PILL_H / 2, hourH * 24 - GUTTER_PILL_H / 2);
+  const boxLo = GUTTER_PILL_H / 2;
+  const boxHi = hourH * 24 - GUTTER_PILL_H / 2;
+  let minCenter = boxLo;
+  let maxCenter = boxHi;
+  if (visible && visible.bottom > visible.top) {
+    const visLo = Math.max(boxLo, visible.top + GUTTER_PILL_H / 2);
+    const visHi = Math.min(boxHi, visible.bottom - GUTTER_PILL_H / 2);
+    // A band outside the hours box is no band at all.
+    if (visLo <= visHi) {
+      minCenter = visLo;
+      maxCenter = visHi;
+    }
+  }
+
+  const clampCenter = (y: number): number => clamp(y, minCenter, maxCenter);
 
   const pills: GutterPillLayout[] = [];
   if (edges) {
@@ -112,17 +185,25 @@ export function layoutGutterPills(input: GutterPillInput): {
     const endMs = edges.end.getTime();
     if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
       const { startMin, endMin } = gutterEdgeMinutes(edges.start, edges.end);
+      const placed = separateEdgeCenters(
+        clampCenter((startMin / 60) * hourH),
+        clampCenter((endMin / 60) * hourH),
+        minCenter,
+        maxCenter,
+        GUTTER_PILL_H + GUTTER_PILL_GAP,
+      );
       // Text comes from the instants, not from the clamped minutes: the
-      // midnight end pill reads "12:00a" while sitting at 1440.
+      // midnight end pill reads "12:00a" while sitting at 1440. The painted top
+      // is a layout position only — the anchor time is the instant.
       pills.push({
         key: 'start',
-        top: clampCenter((startMin / 60) * hourH),
+        top: placed.startTop,
         text: formatGutterTime(edges.start),
         minutes: startMin,
       });
       pills.push({
         key: 'end',
-        top: clampCenter((endMin / 60) * hourH),
+        top: placed.endTop,
         text: formatGutterTime(edges.end),
         minutes: endMin,
       });

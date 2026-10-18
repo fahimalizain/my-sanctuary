@@ -13,9 +13,11 @@ import {
   type DragSlot,
   type DragZone,
   type PointerAnchor,
+  type PointerSample,
   type TimedRange,
   ALLDAY_CREATE_HOLD_MS,
   PRECISION_GAIN_GRID,
+  PRECISION_GAIN_SCRUB,
   allDayGrabOffsetDays,
   autoscrollDelta,
   civilDayShift,
@@ -23,6 +25,7 @@ import {
   createTouchTracker,
   crossedTickBoundary,
   isTapCreatePointer,
+  laggedPointer,
   movedAllDayRange,
   movedEnough,
   movedRange,
@@ -40,9 +43,11 @@ import {
 } from '../lib/calendar-drag';
 import { tick } from '../lib/haptics';
 import {
+  COL_HEADER_H,
   SNAP_MINUTES,
   dateOnDay,
   minutesFromY,
+  minutesSinceMidnight,
   snapMinutes,
   snapStepMinutes,
   startOfDay,
@@ -83,6 +88,15 @@ export interface CalendarDragApi {
     e: ReactPointerEvent<HTMLElement>,
     event: CalendarEvent,
     chipEl: HTMLElement,
+  ) => void;
+  /**
+   * Grab a timed event's start / end pill in the gutter: the coarse chip
+   * handles stay the quick drags, this is the fine one.
+   */
+  onGutterEdgePointerDown: (
+    e: ReactPointerEvent<HTMLElement>,
+    edge: 'start' | 'end',
+    event: CalendarEvent,
   ) => void;
   preview: TimedRange | null;
   previewKind: DragKind | null;
@@ -166,6 +180,11 @@ interface Session {
   paintedStartMin?: number;
   /** Civil-day offset from all-day event start to the grab day. */
   grabOffsetDays?: number;
+  /**
+   * Gutter scrub only: what the pills show now. Its active edge follows the
+   * lagged pointer sample, never the raw one.
+   */
+  scrubPreview?: TimedRange;
   originZone: DragZone;
   currentZone: DragZone;
   originTime: number;
@@ -180,6 +199,31 @@ interface Session {
 interface ModifierKeys {
   metaKey: boolean;
   ctrlKey: boolean;
+}
+
+/**
+ * A gutter scrub advances only on pointer move, and the sample list is the
+ * gesture's own buffer: `[grab, ...moves]`, capped.
+ */
+interface ScrubStep {
+  samples: PointerSample[];
+  /** Event time of the step; `applyPoint` without a pointer event stamps now. */
+  t: number;
+}
+
+/** Samples kept per scrub: enough history to cover the release lag. */
+const SCRUB_MAX_SAMPLES = 40;
+
+/** Gutter-edge scrub: a timed resize with no absolute grid and no day axis. */
+function isScrubKind(kind: DragKind): boolean {
+  return kind === 'scrub-start' || kind === 'scrub-end';
+}
+
+/** The edge a gesture moves; null for every kind that moves a whole range. */
+function movableEdge(kind: DragKind): 'start' | 'end' | null {
+  if (kind === 'resize-start' || kind === 'scrub-start') return 'start';
+  if (kind === 'resize-end' || kind === 'scrub-end') return 'end';
+  return null;
 }
 
 /** Keys whose press / release changes the precision modifier. */
@@ -330,11 +374,16 @@ function computePreview(session: Session): TimedRange | null {
     originalEnd,
     paintedStartMin,
     grabOffsetDays,
+    scrubPreview,
   } = session;
   // Precision owns the ghost: the hold carries the frozen edge plus the scaled
   // delta, and the absolute slots below are only the hit-test scaffolding.
   if (precisionHold && currentZone === 'timed') return precisionHold.preview;
   switch (kind) {
+    case 'scrub-start':
+    case 'scrub-end':
+      // The pills paint the lagged edge; the absolute slots are never read.
+      return scrubPreview ?? null;
     case 'create':
       if (currentZone === 'allday') return toAllDayRange(currentSlot);
       return rangeFromSlots(originSlot, currentSlot, 'timed', snapStep);
@@ -393,18 +442,67 @@ function computePreview(session: Session): TimedRange | null {
 
 /**
  * The instant whose `snapStep` bucket drives haptic ticks: the dragged edge
- * for resizes (the clamped commit, not the raw slot), else the current slot.
+ * for resizes and scrubs (the clamped commit, not the raw slot), else the
+ * current slot.
  */
 function tickInstantMs(session: Session): number | null {
-  if (session.kind === 'resize-start' || session.kind === 'resize-end') {
+  const edge = movableEdge(session.kind);
+  if (edge) {
     const range = computePreview(session);
     if (!range) return null;
-    return (
-      session.kind === 'resize-start' ? range.start : range.end
-    ).getTime();
+    return (edge === 'start' ? range.start : range.end).getTime();
   }
   const { day, minutes } = session.currentSlot;
   return dateOnDay(day, minutes).getTime();
+}
+
+/**
+ * One gutter scrub step. The sample is appended, then the active edge moves by
+ * the travel from the grab to the sample the lag says the user is looking at —
+ * so a lift-off commits the edge that was on screen.
+ *
+ * The grab is the anchor, never a moving one: an autoscroll moves `contentY` and
+ * `scrollTop` together, so `pointerTravelPx` subtracts it back to no travel.
+ *
+ * Mutates `samples` — the gesture's own buffer, not render state — keeping the
+ * grab so the anchor survives the cap. Returns null when nothing the gutter
+ * would paint changed, so a move inside the same minute costs no render.
+ */
+function stepScrub(
+  session: Session,
+  edge: 'start' | 'end',
+  samples: PointerSample[],
+  t: number,
+  clientY: number,
+  hourH: number,
+): Session | null {
+  const grab = samples[0];
+  const { originalStart, originalEnd } = session;
+  if (!grab || !originalStart || !originalEnd) return null;
+
+  const measured = measurePointerAnchor(clientY);
+  // No measurable grid: hold the edge still rather than jump on a layout change.
+  if (!measured) return null;
+
+  const at = Number.isFinite(t) ? t : performance.now();
+  samples.push({ ...measured, t: at });
+  if (samples.length > SCRUB_MAX_SAMPLES) {
+    samples.splice(1, samples.length - SCRUB_MAX_SAMPLES);
+  }
+
+  const lagged = laggedPointer(samples, at) ?? grab;
+  const delta = snappedMinuteDelta(
+    pointerTravelPx(grab, lagged),
+    hourH,
+    PRECISION_GAIN_SCRUB,
+  );
+  // Day shift is always 0 — the gutter has no day axis, so midnight is only the
+  // Date math inside `precisionResize`.
+  const preview = precisionResize(originalStart, originalEnd, edge, delta, 0);
+  if (session.scrubPreview && sameRange(preview, session.scrubPreview)) {
+    return null;
+  }
+  return { ...session, scrubPreview: preview };
 }
 
 function nextSlotFromPoint(
@@ -590,6 +688,9 @@ function movePrecisionHold(
  * the whole ghost whenever precision is off. The precision hold is engaged from
  * the pre-snap state first, so the key going down freezes the edge the user is
  * already looking at.
+ *
+ * A gutter scrub leaves before any of that: it has no absolute slot and no
+ * reduced-gain hold to engage or drop.
  */
 function stepSession(
   session: Session,
@@ -598,7 +699,15 @@ function stepSession(
   keys: ModifierKeys,
   hourH: number,
   didDrag: boolean,
+  scrub: ScrubStep,
 ): Session | null {
+  if (isScrubKind(session.kind)) {
+    const edge = movableEdge(session.kind);
+    return edge
+      ? stepScrub(session, edge, scrub.samples, scrub.t, y, hourH)
+      : null;
+  }
+
   const { precision, snapStep } = dragGrid(hourH, session.pointerType, keys);
 
   const originMinutes = session.originMinutesRaw;
@@ -707,6 +816,8 @@ export function useCalendarDrag(
   /** Touch sessions start unclaimed so the scroller can pan. */
   const claimedRef = useRef(false);
   const captureTargetRef = useRef<HTMLElement | null>(null);
+  /** Gutter scrub samples, `[grab, ...moves]`; empty outside a scrub. */
+  const scrubSamplesRef = useRef<PointerSample[]>([]);
   const lastPtrRef = useRef({ x: 0, y: 0 });
   /** Last modifier state read from a pointer or modifier key event. */
   const lastKeysRef = useRef<ModifierKeys>({ metaKey: false, ctrlKey: false });
@@ -721,9 +832,12 @@ export function useCalendarDrag(
    * Apply a pointer position to the active gesture, re-snapping it at the
    * modifier state carried by that event. Autoscroll and modifier key events
    * come through here too, so the ghost is always on the live grid.
+   *
+   * `t` is the event's own timestamp; the lag is measured against it, so a
+   * delayed frame does not age a sample early.
    */
   const applyPoint = useCallback(
-    (clientX: number, clientY: number, keys: ModifierKeys) => {
+    (clientX: number, clientY: number, keys: ModifierKeys, t?: number) => {
       lastKeysRef.current = keys;
       const s = sessionRef.current;
       if (!s) return;
@@ -734,6 +848,7 @@ export function useCalendarDrag(
         keys,
         optsRef.current.hourH,
         didDragRef.current,
+        { samples: scrubSamplesRef.current, t: t ?? performance.now() },
       );
       // Nothing a render would show changed (e.g. a held key repeat).
       if (!updated) return;
@@ -763,13 +878,27 @@ export function useCalendarDrag(
 
   const tickAutoScroll = useCallback(() => {
     autoScrollRafRef.current = 0;
-    if (!claimedRef.current || !sessionRef.current) return;
+    const session = sessionRef.current;
+    if (!claimedRef.current || !session) return;
     const scroller = document.querySelector('[data-calendar-scroller]');
     if (!(scroller instanceof HTMLElement)) return;
     const rect = scroller.getBoundingClientRect();
     const { x, y } = lastPtrRef.current;
-    const dx = autoscrollDelta(x, rect.left, rect.right);
-    const dy = autoscrollDelta(y, rect.top, rect.bottom);
+    let dx = 0;
+    let dy = 0;
+    if (isScrubKind(session.kind)) {
+      // A scrub has no horizontal axis: the visible top of the hours is the
+      // sticky band's bottom, so that edge scrolls hours, not the header.
+      const band = document.querySelector('[data-allday-row]');
+      const top =
+        band instanceof HTMLElement
+          ? band.getBoundingClientRect().bottom
+          : rect.top + COL_HEADER_H;
+      dy = autoscrollDelta(y, top, rect.bottom);
+    } else {
+      dx = autoscrollDelta(x, rect.left, rect.right);
+      dy = autoscrollDelta(y, rect.top, rect.bottom);
+    }
     if (dx !== 0) scroller.scrollLeft += dx;
     if (dy !== 0) scroller.scrollTop += dy;
     if (dx !== 0 || dy !== 0) applyPoint(x, y, lastKeysRef.current);
@@ -918,10 +1047,15 @@ export function useCalendarDrag(
       }
 
       e.preventDefault();
-      applyPoint(e.clientX, e.clientY, {
-        metaKey: e.metaKey,
-        ctrlKey: e.ctrlKey,
-      });
+      applyPoint(
+        e.clientX,
+        e.clientY,
+        {
+          metaKey: e.metaKey,
+          ctrlKey: e.ctrlKey,
+        },
+        e.timeStamp,
+      );
     };
 
     const onUpWin = (e: PointerEvent) => {
@@ -981,6 +1115,23 @@ export function useCalendarDrag(
         if (!dragged) {
           if (s.eventId) chipTap(s.eventId);
         } else if (preview && s.eventId) {
+          suppressClickRef.current = true;
+          resizeCb(s.eventId, preview);
+        }
+      } else if (isScrubKind(s.kind)) {
+        // The pointerup position is not a sample: the commit is the preview
+        // already on screen, and a tap that never moved commits nothing.
+        const original =
+          s.originalStart && s.originalEnd
+            ? { start: s.originalStart, end: s.originalEnd }
+            : null;
+        if (
+          dragged &&
+          preview &&
+          s.eventId &&
+          original &&
+          !sameRange(preview, original)
+        ) {
           suppressClickRef.current = true;
           resizeCb(s.eventId, preview);
         }
@@ -1173,6 +1324,72 @@ export function useCalendarDrag(
     [hourH, beginSession],
   );
 
+  /**
+   * Grab the selected event's start / end pill in the gutter. Touch and mouse
+   * alike claim the gesture on the first pixel (a scrub never scrolls), and both
+   * run the same 1:10 gain: Cmd/Ctrl precision is a grid gesture, not this one.
+   */
+  const onGutterEdgePointerDown = useCallback(
+    (
+      e: ReactPointerEvent<HTMLElement>,
+      edge: 'start' | 'end',
+      event: CalendarEvent,
+    ) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      // A grid drag already owns the gesture (the pills are painting its own
+      // preview), and a pinch must never leak into an edge resize.
+      if (sessionRef.current || touchesRef.current.latched) return;
+
+      const originalStart = new Date(event.start_time);
+      const originalEnd = new Date(event.end_time);
+      if (
+        !Number.isFinite(originalStart.getTime()) ||
+        !Number.isFinite(originalEnd.getTime())
+      ) {
+        return;
+      }
+      const anchor = measurePointerAnchor(e.clientY);
+      if (!anchor) return;
+
+      // The anchor is the event's own instant, not the pill's painted Y: a stuck
+      // or pushed pill must still move the real edge.
+      const originSlot: DragSlot = {
+        day: startOfDay(originalStart),
+        minutes: minutesSinceMidnight(
+          edge === 'start' ? originalStart : originalEnd,
+        ),
+      };
+
+      scrubSamplesRef.current = [{ ...anchor, t: e.timeStamp }];
+
+      beginSession(
+        {
+          kind: edge === 'start' ? 'scrub-start' : 'scrub-end',
+          // No coarse grid to hit-test: the gain's 1-minute steps are the grid.
+          snapStep: SNAP_MINUTES,
+          precision: false,
+          originSlot,
+          currentSlot: originSlot,
+          originX: e.clientX,
+          originY: e.clientY,
+          eventId: event.id,
+          originalStart,
+          originalEnd,
+          originZone: 'timed',
+          currentZone: 'timed',
+          originTime: performance.now(),
+          pointerId: e.pointerId,
+          pointerType: e.pointerType,
+        },
+        e.currentTarget,
+        e,
+        true,
+      );
+    },
+    [beginSession],
+  );
+
   const onAllDayPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLElement>, day: Date) => {
       if (e.button !== 0) return;
@@ -1274,6 +1491,7 @@ export function useCalendarDrag(
     onChipPointerDown,
     onAllDayPointerDown,
     onAllDayChipPointerDown,
+    onGutterEdgePointerDown,
     preview,
     previewKind: preview && session ? session.kind : null,
     previewPointerType: preview && session ? session.pointerType : null,

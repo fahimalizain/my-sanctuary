@@ -52,6 +52,11 @@ export interface CalendarWeekGridProps {
     eventId: string,
     chipEl: HTMLElement,
   ) => void;
+  /** Grab a gutter edge pill for the selected timed event. */
+  onGutterEdgePointerDown: (
+    e: ReactPointerEvent<HTMLElement>,
+    edge: 'start' | 'end',
+  ) => void;
   onChipSelect: (eventId: string) => void;
   isDragging: boolean;
   /** Precision modifier is live: show the 1-minute grid badge. */
@@ -95,6 +100,7 @@ export function CalendarWeekGrid({
   onRequestDelete,
   onAllDayPointerDown,
   onAllDayChipPointerDown,
+  onGutterEdgePointerDown,
   onChipSelect,
   isDragging,
   precisionSnap,
@@ -209,6 +215,8 @@ export function CalendarWeekGrid({
                 hourLabels={hourLabels}
                 now={todayIndex != null ? now : null}
                 edges={gutterEdges}
+                headerOffset={COL_HEADER_H + allDayHeight}
+                onEdgePointerDown={onGutterEdgePointerDown}
               />
             </div>
 

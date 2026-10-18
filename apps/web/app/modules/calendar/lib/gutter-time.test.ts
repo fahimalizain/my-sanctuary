@@ -1,21 +1,31 @@
 // Unit tests for the gutter time helpers: the compact pill format, the
-// midnight-end rule, and the pill / hour-label collision layout.
+// midnight-end rule, the pill / hour-label collision layout, and the
+// visible-band stick that keeps a scrolled-off edge grabbable.
 // No React / DOM.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   GUTTER_HOUR_LABEL_H,
+  GUTTER_PILL_GAP,
   GUTTER_PILL_H,
   formatGutterTime,
   gutterEdgeMinutes,
   layoutGutterPills,
+  separateEdgeCenters,
   type GutterPillLayout,
 } from './gutter-time';
 import { formatHourLabel } from './week-layout';
 
 /** Every hour, as `hourLabelStep(48)` (step 1) would paint them. */
 const ALL_HOURS = Array.from({ length: 24 }, (_, h) => h);
+
+/** The separation the layout asks for: a pill box plus a hairline of clear. */
+const MIN_SEP = GUTTER_PILL_H + GUTTER_PILL_GAP;
+
+function at(hour: number, minute = 0): Date {
+  return new Date(2026, 8, 8, hour, minute, 0, 0);
+}
 
 function byKey(
   pills: GutterPillLayout[],
@@ -238,9 +248,12 @@ test('layoutGutterPills: a 00:00 start pill is not sliced by the hours box', () 
       end: new Date(2026, 8, 8, 0, 30),
     },
   });
+  // Both centers clamp toward the top (8 and 24), which is only 16px apart:
+  // the pair is pushed apart to 18 instead, so 8 / 26.
   assert.equal(byKey(pills, 'start')?.top, GUTTER_PILL_H / 2);
   assert.equal(byKey(pills, 'start')?.top, 8);
-  assert.equal(byKey(pills, 'end')?.top, 24);
+  assert.equal(byKey(pills, 'end')?.top, 8 + MIN_SEP);
+  assert.equal(byKey(pills, 'end')?.top, 26);
 });
 
 test('layoutGutterPills: clamping feeds the now-pill collision test', () => {
@@ -260,21 +273,24 @@ test('layoutGutterPills: clamping feeds the now-pill collision test', () => {
   assert.equal(pills.length, 2);
 });
 
-test('layoutGutterPills: a zero-length event keeps both pills', () => {
-  const at = new Date(2026, 8, 8, 9, 0, 0, 0);
+test('layoutGutterPills: a zero-length event keeps both pills apart', () => {
+  const at9 = new Date(2026, 8, 8, 9, 0, 0, 0);
   const { pills, hiddenHours } = layoutGutterPills({
     hourH: 48,
     hourLabels: ALL_HOURS,
     now: null,
-    edges: { start: at, end: at },
+    edges: { start: at9, end: at9 },
   });
 
+  // Both edges read 9:00a, and their centers straddle 9:00 (9 × 48 = 432) by
+  // half the separation, so each one stays a grabbable pill of its own.
   assert.equal(pills.length, 2);
-  assert.equal(byKey(pills, 'start')?.top, 9 * 48);
-  assert.equal(byKey(pills, 'end')?.top, 9 * 48);
+  assert.equal(byKey(pills, 'start')?.top, 432 - MIN_SEP / 2);
+  assert.equal(byKey(pills, 'start')?.top, 423);
+  assert.equal(byKey(pills, 'end')?.top, 432 + MIN_SEP / 2);
+  assert.equal(byKey(pills, 'end')?.top, 441);
   assert.equal(byKey(pills, 'start')?.text, '9:00a');
   assert.equal(byKey(pills, 'end')?.text, '9:00a');
-  // Overlapping pills are left overlapping; push-apart is a later slice.
   assert.deepEqual(hiddenHours, [9]);
 });
 
@@ -340,8 +356,8 @@ test('layoutGutterPills: hidden hours are always painted labels', () => {
 });
 
 test('layoutGutterPills: GUTTER_HOUR_LABEL_H is the label box the clearance uses', () => {
-  // A 9:30 edge at hourH 48 → top 456; the 9 o'clock label (432) is 24px off,
-  // the 10 o'clock label (480) is 24px off: both clear of 13px half-heights.
+  // A 9:30 zero-length event at hourH 48 separates about 456 → 447 / 465, and
+  // the 9 o'clock (432) and 10 o'clock (480) labels are 15px clear of each.
   const { hiddenHours } = layoutGutterPills({
     hourH: 48,
     hourLabels: ALL_HOURS,
@@ -353,4 +369,132 @@ test('layoutGutterPills: GUTTER_HOUR_LABEL_H is the label box the clearance uses
   });
   assert.equal((GUTTER_PILL_H + GUTTER_HOUR_LABEL_H) / 2, 13);
   assert.deepEqual(hiddenHours, []);
+});
+
+// ── separateEdgeCenters ─────────────────────────────────────────────────
+
+test('separateEdgeCenters: two centers 4px apart become minSep apart', () => {
+  const r = separateEdgeCenters(100, 104, 0, 200, MIN_SEP);
+  assert.equal(r.startTop, 102 - MIN_SEP / 2);
+  assert.equal(r.endTop, 102 + MIN_SEP / 2);
+  assert.equal(r.endTop - r.startTop, MIN_SEP);
+});
+
+test('separateEdgeCenters: a pair near an end is slid back inside the range', () => {
+  const r = separateEdgeCenters(4, 6, 8, 1144, MIN_SEP);
+  assert.equal(r.startTop, 8);
+  assert.equal(r.endTop, 8 + MIN_SEP);
+});
+
+test('separateEdgeCenters: an overnight pair keeps its ends apart', () => {
+  // End above start: the pair spreads the way it already points, so the keys
+  // are never swapped to sort it.
+  const r = separateEdgeCenters(100, 98, 0, 200, MIN_SEP);
+  assert.equal(r.startTop, 108);
+  assert.equal(r.endTop, 90);
+  assert.ok(r.endTop < r.startTop);
+});
+
+test('separateEdgeCenters: a range shorter than minSep still returns finite centers', () => {
+  const r = separateEdgeCenters(4, 6, 0, 10, MIN_SEP);
+  for (const v of [r.startTop, r.endTop]) {
+    assert.ok(Number.isFinite(v));
+    assert.ok(v >= 0 && v <= 10, `${v} outside the range`);
+  }
+});
+
+test('separateEdgeCenters: non-finite centers pin to the top of the range', () => {
+  assert.deepEqual(separateEdgeCenters(Number.NaN, 100, 8, 1144, MIN_SEP), {
+    startTop: 8,
+    endTop: 100,
+  });
+  assert.deepEqual(
+    separateEdgeCenters(Number.NaN, Number.NaN, 8, 1144, MIN_SEP),
+    { startTop: 8, endTop: 8 },
+  );
+});
+
+// ── visible band stick ──────────────────────────────────────────────────
+
+test('layoutGutterPills: a start off the top sticks to the visible band', () => {
+  // Hours scrolled so 600 is the first visible row: the 9:00 start (432) is off
+  // screen and pins to 600 + half a pill; the 4:00p end (768) is on it.
+  const { pills } = layoutGutterPills({
+    hourH: 48,
+    hourLabels: ALL_HOURS,
+    now: null,
+    edges: { start: at(9), end: at(16) },
+    visible: { top: 600, bottom: 800 },
+  });
+  assert.equal(byKey(pills, 'start')?.top, 600 + GUTTER_PILL_H / 2);
+  assert.equal(byKey(pills, 'start')?.top, 608);
+  assert.equal(byKey(pills, 'end')?.top, 16 * 48);
+  assert.equal(byKey(pills, 'end')?.top, 768);
+  assert.equal(byKey(pills, 'start')?.text, '9:00a');
+});
+
+test('layoutGutterPills: an end off the bottom sticks to the visible band', () => {
+  const { pills } = layoutGutterPills({
+    hourH: 48,
+    hourLabels: ALL_HOURS,
+    now: null,
+    edges: { start: at(9), end: at(22) },
+    visible: { top: 400, bottom: 800 },
+  });
+  assert.equal(byKey(pills, 'start')?.top, 9 * 48);
+  assert.equal(byKey(pills, 'end')?.top, 800 - GUTTER_PILL_H / 2);
+  assert.equal(byKey(pills, 'end')?.top, 792);
+  assert.equal(byKey(pills, 'end')?.text, '10:00p');
+});
+
+test('layoutGutterPills: a visible band outside the hours box is ignored', () => {
+  const { pills } = layoutGutterPills({
+    hourH: 48,
+    hourLabels: ALL_HOURS,
+    now: null,
+    edges: { start: at(9), end: at(10) },
+    visible: { top: -500, bottom: -400 },
+  });
+  assert.equal(byKey(pills, 'start')?.top, 9 * 48);
+  assert.equal(byKey(pills, 'end')?.top, 10 * 48);
+});
+
+test('layoutGutterPills: the now pill yields to the center the push landed on', () => {
+  // Zero-length 9:00 → centers 423 / 441. A 9:20 now pill (448) is exactly one
+  // pill clear of the unseparated 432, but not of the separated 441.
+  const at9 = at(9);
+  const { pills } = layoutGutterPills({
+    hourH: 48,
+    hourLabels: ALL_HOURS,
+    now: at(9, 20),
+    edges: { start: at9, end: at9 },
+  });
+  assert.equal(byKey(pills, 'start')?.top, 423);
+  assert.equal(byKey(pills, 'end')?.top, 441);
+  assert.equal(byKey(pills, 'now'), undefined);
+  assert.equal(pills.length, 2);
+  assert.deepEqual(
+    layoutGutterPills({
+      hourH: 48,
+      hourLabels: ALL_HOURS,
+      now: at(9, 20),
+      edges: { start: at9, end: at9 },
+    }).hiddenHours,
+    [9],
+  );
+});
+
+test('layoutGutterPills: hour hiding uses the centers after the push', () => {
+  // 5:30–5:40 → 264 / 272, pushed to 259 / 277. The 6 o'clock label (288) is
+  // 16px clear of the raw end but only 11px clear of the placed one, so only
+  // the painted layout hides it.
+  const { pills, hiddenHours } = layoutGutterPills({
+    hourH: 48,
+    hourLabels: ALL_HOURS,
+    now: null,
+    edges: { start: at(5, 30), end: at(5, 40) },
+  });
+  assert.equal(byKey(pills, 'start')?.top, 259);
+  assert.equal(byKey(pills, 'end')?.top, 277);
+  assert.deepEqual(hiddenHours, [6]);
 });

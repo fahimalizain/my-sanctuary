@@ -1041,6 +1041,23 @@ export function useCalendarSession({
     [overlaidEvents, events, drag],
   );
 
+  /**
+   * Grab a gutter edge pill for the selected event. All-day and multi-day
+   * events have no pills on the 24h axis, so they never start a scrub.
+   */
+  const handleGutterEdgePointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLElement>, edge: 'start' | 'end') => {
+      const event = selectedEvent;
+      if (!event || event.is_all_day) return;
+      const start = new Date(event.start_time);
+      const end = new Date(event.end_time);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return;
+      if (isMultiDay(start, end)) return;
+      drag.onGutterEdgePointerDown(e, edge, event);
+    },
+    [selectedEvent, drag],
+  );
+
   const timedPreviewByDay = useMemo(
     () => timedPreviewSegments(drag.preview, drag.previewZone, days, hourH),
     [drag.preview, drag.previewZone, days, hourH],
@@ -1172,6 +1189,7 @@ export function useCalendarSession({
     onChipPointerDown: drag.onChipPointerDown,
     onAllDayPointerDown: drag.onAllDayPointerDown,
     onAllDayChipPointerDown: handleAllDayChipPointerDown,
+    onGutterEdgePointerDown: handleGutterEdgePointerDown,
     timedPreviewByDay,
     previewInfo,
     gutterEdges,

@@ -9,6 +9,7 @@ import {
   AUTOSCROLL_MAX_PX,
   PRECISION_GAIN_GRID,
   PRECISION_GAIN_SCRUB,
+  SCRUB_RELEASE_LAG_MS,
   allDayGrabOffsetDays,
   allDayPreviewIndices,
   autoscrollDelta,
@@ -17,6 +18,7 @@ import {
   createTouchTracker,
   crossedTickBoundary,
   isTapCreatePointer,
+  laggedPointer,
   pointerTravelPx,
   precisionCreate,
   precisionMove,
@@ -41,6 +43,7 @@ import {
   toAllDayRange,
   toTimedRange,
   type DragSlot,
+  type PointerSample,
 } from './calendar-drag';
 import { HOUR_H_BASE, HOUR_H_MAX, SNAP_MINUTES, addDays } from './week-layout';
 
@@ -613,6 +616,14 @@ test('movedRange: coarse slots keep the minute phase of an off-grid event', () =
 test('precision gains: 1:5 for the grid, 1:10 for the gutter scrub', () => {
   assert.equal(PRECISION_GAIN_GRID, 5);
   assert.equal(PRECISION_GAIN_SCRUB, 10);
+  assert.equal(SCRUB_RELEASE_LAG_MS, 80);
+});
+
+test('snappedMinuteDelta: the scrub locks one minute to 8px at hourH 48', () => {
+  // 10 grid-minutes of travel at hourH 48 is 8px; at the scrub gain that is a
+  // whole minute either way, which is what makes a finger land on one.
+  assert.equal(snappedMinuteDelta(8, HOUR_H_BASE, PRECISION_GAIN_SCRUB), 1);
+  assert.equal(snappedMinuteDelta(-8, HOUR_H_BASE, PRECISION_GAIN_SCRUB), -1);
 });
 
 test('pointerTravelPx: scrolling alone is not travel', () => {
@@ -866,6 +877,21 @@ test('precisionResize: a civil-day shift past the fixed edge clamps', () => {
   assert.equal(r.end.getTime(), end.getTime());
 });
 
+test('precisionResize: a scrub-backed delta walks the active edge past midnight', () => {
+  // Monday 23:00 + 120 minutes → Tuesday 01:00, with no day axis involved.
+  const start = new Date(2024, 0, 1, 23, 0, 0);
+  const end = new Date(2024, 0, 2, 2, 0, 0);
+  const later = precisionResize(start, end, 'start', 120, 0);
+  assert.equal(later.start.getDate(), 2);
+  assert.equal(later.start.getHours(), 1);
+  assert.equal(later.end.getTime(), end.getTime());
+
+  const rather = precisionResize(start, end, 'end', 120, 0);
+  assert.equal(rather.end.getDate(), 2);
+  assert.equal(rather.end.getHours(), 4);
+  assert.equal(rather.start.getTime(), start.getTime());
+});
+
 test('precisionResize: 0/0 keeps the anchor instants', () => {
   const start = new Date(2024, 0, 1, 10, 7, 15);
   const end = new Date(2024, 0, 1, 11, 7, 15);
@@ -937,6 +963,56 @@ test('precisionCreate: the moving edge cannot overflow past midnight', () => {
   const r = precisionCreate(slot(mon, 22 * 60), slot(mon, 23 * 60), 300, mon);
   assert.equal(r.start.getTime(), new Date(2024, 0, 1, 22, 0, 0, 0).getTime());
   assert.equal(r.end.getTime(), new Date(2024, 0, 2, 0, 0, 0, 0).getTime());
+});
+
+// ── gutter scrub release lag ────────────────────────────────────────────
+
+function sampleAt(t: number): PointerSample {
+  return { contentY: t, scrollTop: 0, t };
+}
+
+test('laggedPointer: no samples → null', () => {
+  assert.equal(laggedPointer([], 100, 80), null);
+});
+
+test('laggedPointer: a sample still inside the lag is not shown yet', () => {
+  const grab = sampleAt(0);
+  const moved = sampleAt(50);
+  // t=50 is only 50ms old at now=100, so the grab is what the user sees.
+  assert.equal(laggedPointer([grab, moved], 100, 80), grab);
+});
+
+test('laggedPointer: the newest sample clear of the lag wins', () => {
+  const grab = sampleAt(0);
+  const moved = sampleAt(100);
+  assert.equal(laggedPointer([grab, moved], 180, 80), moved);
+});
+
+test('laggedPointer: a sample exactly `lagMs` old qualifies', () => {
+  const grab = sampleAt(0);
+  const at = sampleAt(20);
+  // now - lag = 20, so the sample on the boundary is old enough.
+  assert.equal(laggedPointer([grab, at], 100, 80), at);
+});
+
+test('laggedPointer: a gesture younger than the lag shows its only sample', () => {
+  const only = sampleAt(90);
+  assert.equal(laggedPointer([only], 100, 80), only);
+});
+
+test('laggedPointer: a non-finite now → null', () => {
+  assert.equal(laggedPointer([sampleAt(0)], Number.NaN, 80), null);
+  assert.equal(
+    laggedPointer([sampleAt(0)], Number.POSITIVE_INFINITY, 80),
+    null,
+  );
+});
+
+test('laggedPointer: the default lag is the scrub release lag', () => {
+  const grab = sampleAt(0);
+  const moved = sampleAt(100);
+  assert.equal(laggedPointer([grab, moved], 180), moved);
+  assert.equal(laggedPointer([grab, moved], 100), grab);
 });
 
 // ── preview geometry ────────────────────────────────────────────────────

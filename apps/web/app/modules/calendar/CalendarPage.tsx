@@ -221,6 +221,7 @@ export function CalendarPage() {
           onRequestDelete={canTouchDelete ? requestDelete : undefined}
           onAllDayPointerDown={session.onAllDayPointerDown}
           onAllDayChipPointerDown={session.onAllDayChipPointerDown}
+          onGutterEdgePointerDown={session.onGutterEdgePointerDown}
           onChipSelect={session.handleSelectChip}
           isDragging={session.isDragging}
           precisionSnap={session.precisionSnap}
