@@ -118,7 +118,7 @@ export function SettingsPage() {
               <h2 className="font-heading text-lg font-semibold text-foreground">
                 {user?.name || 'Guest'}
               </h2>
-              <p className="text-sm text-muted-foreground">
+              <p className="selectable text-sm text-muted-foreground">
                 {user?.email || 'Not signed in'}
               </p>
             </div>

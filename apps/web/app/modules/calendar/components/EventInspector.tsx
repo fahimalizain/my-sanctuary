@@ -595,7 +595,7 @@ function InspectorForm({
             className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0"
           />
         ) : descriptionDisplay ? (
-          <p className="whitespace-pre-wrap text-sm text-foreground">
+          <p className="selectable whitespace-pre-wrap text-sm text-foreground">
             {descriptionDisplay}
           </p>
         ) : (

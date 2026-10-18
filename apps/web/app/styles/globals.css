@@ -73,6 +73,25 @@
   }
   body {
     @apply bg-cream text-foreground font-body;
+    /* App-like default: a finger resting on the page must never start the
+       iOS text selector or long-press callout before a drag/hold gesture
+       claims the touch. Radix portals and createPortal content mount under
+       <body>, so they inherit this too. */
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  /* Editable controls opt back in: WebKit inherits user-select, and a
+     non-selectable ancestor has historically broken editing in fields. */
+  input,
+  textarea,
+  select,
+  [contenteditable]:not([contenteditable='false']) {
+    -webkit-user-select: text;
+    -moz-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
   }
   h1,
   h2,
@@ -81,5 +100,15 @@
   h5,
   h6 {
     @apply font-heading;
+  }
+}
+
+@layer utilities {
+  /* Opt-in for static text worth copying (errors, read-only notes, quotes). */
+  .selectable {
+    -webkit-user-select: text;
+    -moz-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
   }
 }

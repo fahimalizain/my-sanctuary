@@ -304,7 +304,7 @@ export function CategoriesPage() {
             above the still-visible tree */}
         {loadError && (
           <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
-            <p className="text-sm">{loadError}</p>
+            <p className="selectable text-sm">{loadError}</p>
             <Button
               variant="outline"
               size="sm"
@@ -324,7 +324,7 @@ export function CategoriesPage() {
         {/* Action error banner (e.g. a delete 409) — the tree stays mounted */}
         {actionError && (
           <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
-            <p className="text-sm">{actionError}</p>
+            <p className="selectable text-sm">{actionError}</p>
             <Button
               variant="outline"
               size="sm"
@@ -638,7 +638,9 @@ export function CategoriesPage() {
             </div>
 
             {formError && (
-              <p className="mb-4 text-sm text-destructive">{formError}</p>
+              <p className="selectable mb-4 text-sm text-destructive">
+                {formError}
+              </p>
             )}
           </div>
 

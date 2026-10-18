@@ -20,7 +20,9 @@ export function CalendarSyncBanner({
 
   return (
     <div className="shrink-0 flex items-center justify-between gap-3 border-b border-border bg-muted/50 px-4 py-2 text-sm">
-      <p className="text-muted-foreground truncate">{banner.message}</p>
+      <p className="selectable text-muted-foreground truncate">
+        {banner.message}
+      </p>
       <div className="flex items-center gap-2 shrink-0">
         {banner.showRetry && (
           <Button

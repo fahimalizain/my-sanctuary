@@ -1061,7 +1061,7 @@ export function BoardPage() {
             notice above the still-visible board */}
         {loadError && (
           <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
-            <p className="text-sm">{loadError}</p>
+            <p className="selectable text-sm">{loadError}</p>
             <Button
               variant="outline"
               size="sm"
@@ -1084,7 +1084,7 @@ export function BoardPage() {
         {/* Action error banner (e.g. a failed move) — the board stays mounted */}
         {actionError && (
           <div className="mb-6 flex items-center justify-between gap-4 bg-destructive/10 text-destructive rounded-xl px-4 py-3">
-            <p className="text-sm">{actionError}</p>
+            <p className="selectable text-sm">{actionError}</p>
             <Button
               variant="outline"
               size="sm"
