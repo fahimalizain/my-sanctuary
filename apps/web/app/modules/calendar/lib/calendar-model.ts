@@ -189,6 +189,7 @@ export function buildAllDayChips(
       endDay: i.endDay,
       lane,
       color: eventChipColor(i.event),
+      endMs: Date.parse(i.event.end_time),
     };
   });
 

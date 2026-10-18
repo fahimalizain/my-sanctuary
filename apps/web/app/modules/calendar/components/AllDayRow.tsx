@@ -3,33 +3,12 @@ import {
   ALLDAY_CHIP,
   ALLDAY_GAP,
   ALLDAY_PAD,
-  contrastingInk,
   isWeekend,
-  hexToRgba,
   formatEventDateLine,
   lastOccupiedCivilDate,
 } from '../lib/week-layout';
+import { isEventPast, notionEventCssVars } from '../lib/event-colors';
 import { cn } from '@/lib/utils';
-
-const PREVIEW_FILL_ALPHA = 0.18;
-
-/** Mix hex with black ~20% so the left ribbon still reads on a solid body. */
-function darkerRibbon(hex: string): string {
-  const h = hex.replace('#', '');
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  const n = parseInt(full, 16);
-  if (Number.isNaN(n)) return hex;
-  const r = Math.round(((n >> 16) & 255) * 0.8);
-  const g = Math.round(((n >> 8) & 255) * 0.8);
-  const b = Math.round((n & 255) * 0.8);
-  return `rgb(${r}, ${g}, ${b})`;
-}
 
 export interface AllDayChip {
   id: string;
@@ -40,6 +19,8 @@ export interface AllDayChip {
   endDay: number;
   lane: number;
   color: string;
+  /** End instant (ms), for the past tick. Layout data only, not stored color. */
+  endMs: number;
 }
 
 export interface AllDayPreview {
@@ -75,6 +56,8 @@ export interface AllDayRowProps {
   draggingEventId?: string | null;
   /** Ghost range while drag-creating across all-day cells. */
   preview?: AllDayPreview | null;
+  /** Current clock (ms) for the past tick; threaded from the session tick. */
+  nowMs: number;
 }
 
 export function AllDayRow({
@@ -90,6 +73,7 @@ export function AllDayRow({
   selectedEventId = null,
   draggingEventId = null,
   preview = null,
+  nowMs,
 }: AllDayRowProps) {
   const trackWidth = days.length * colWidth;
 
@@ -150,6 +134,7 @@ export function AllDayRow({
           const top = (ALLDAY_CHIP + ALLDAY_GAP) * chip.lane + ALLDAY_PAD;
           const selected = chip.id === selectedEventId;
           const dragging = chip.id === draggingEventId;
+          const past = isEventPast(chip.endMs, nowMs);
 
           return (
             <div
@@ -159,19 +144,23 @@ export function AllDayRow({
               role="button"
               tabIndex={0}
               className={cn(
-                'absolute overflow-hidden rounded-[6px] pointer-events-auto z-[1] cursor-grab active:cursor-grabbing',
+                'group absolute overflow-hidden rounded-[6px] pointer-events-auto z-[1] cursor-grab active:cursor-grabbing',
+                'bg-[var(--ev-fill)] dark:bg-[var(--ev-fill-dark)]',
+                'text-[var(--ev-title)] dark:text-[var(--ev-title-dark)]',
+                'data-[past]:text-[var(--ev-title-dim)] dark:data-[past]:text-[var(--ev-title-dim-dark)]',
+                '[outline-style:solid] outline-1 outline-cream',
                 selected && 'ring-1 ring-foreground/25',
                 dragging && 'opacity-40',
               )}
               style={{
+                ...notionEventCssVars(chip.color),
                 top,
                 height: ALLDAY_CHIP,
                 left: left + 1,
                 width: Math.max(0, width),
-                backgroundColor: chip.color,
-                color: contrastingInk(chip.color),
               }}
               title={chip.title}
+              data-past={past ? '' : undefined}
               onClick={(e) => {
                 e.stopPropagation();
                 onChipSelect?.(chip.id);
@@ -187,10 +176,13 @@ export function AllDayRow({
                 onChipPointerDown?.(e, chip.id, e.currentTarget);
               }}
             >
-              {/* 4px left ribbon — darker shade so it reads on solid fill */}
+              {/* 4px left ribbon — accent tone so it reads on the washed fill */}
               <div
-                className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-                style={{ backgroundColor: darkerRibbon(chip.color) }}
+                className={cn(
+                  'absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]',
+                  'bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]',
+                  'group-data-[past]:bg-[var(--ev-accent-dim)] dark:group-data-[past]:bg-[var(--ev-accent-dim-dark)]',
+                )}
                 aria-hidden
               />
               <div className="h-full pl-2 pr-1 py-px">
@@ -212,30 +204,32 @@ export function AllDayRow({
             const color = preview.color ?? '#2a5c8a';
             return (
               <div
-                className="absolute overflow-hidden rounded-[6px] pointer-events-none z-20 opacity-70"
+                className={cn(
+                  'absolute overflow-hidden rounded-[6px] pointer-events-none z-20 opacity-70',
+                  'bg-[var(--ev-fill)] dark:bg-[var(--ev-fill-dark)]',
+                  'text-[var(--ev-title)] dark:text-[var(--ev-title-dark)]',
+                  '[outline-style:solid] outline-1 outline-cream',
+                )}
                 style={{
+                  ...notionEventCssVars(color),
                   top: ALLDAY_PAD,
                   height: ALLDAY_CHIP,
                   left: left + 1,
                   width: Math.max(0, width),
-                  color: 'var(--foreground)',
                 }}
                 aria-hidden
               >
-                <div
-                  className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-                  style={{ backgroundColor: color }}
-                />
-                <div
-                  className="h-full pl-2 pr-1 py-px"
-                  style={{
-                    backgroundColor: hexToRgba(color, PREVIEW_FILL_ALPHA),
-                  }}
-                >
+                <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px] bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]" />
+                <div className="h-full pl-2 pr-1 py-px">
                   <div className="truncate text-[11px] font-medium leading-[17px]">
                     {preview.title ?? ''}
                     {preview.range && (
-                      <span className="ml-1.5 text-[10px] font-normal tabular-nums opacity-80">
+                      <span
+                        className={cn(
+                          'ml-1.5 text-[10px] font-normal tabular-nums',
+                          'text-[var(--ev-time)] dark:text-[var(--ev-time-dark)]',
+                        )}
+                      >
                         {formatEventDateLine(
                           preview.range.start,
                           lastOccupiedCivilDate(

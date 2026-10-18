@@ -3,6 +3,7 @@ import type { CalendarEvent } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { EventChip, PreviewChip, type PositionedEvent } from './EventChip';
 import type { DragPreviewInfo } from '../lib/calendar-drag';
+import { isEventPast } from '../lib/event-colors';
 import { formatEventTimeDetail, nowLineY } from '../lib/week-layout';
 
 const NOW_LINE_COLOR = '#F04842'; // Notion --secondary500
@@ -22,6 +23,8 @@ export interface DayColumnProps {
   showNow: boolean;
   /** Only needed when showNow; omit otherwise so memo stays stable. */
   now?: Date;
+  /** Current clock (ms) for the past tick; every column gets it, not just today. */
+  nowMs: number;
   onColumnPointerDown: (e: ReactPointerEvent<HTMLElement>, day: Date) => void;
   onChipPointerDown: (
     e: ReactPointerEvent<HTMLElement>,
@@ -50,6 +53,7 @@ export const DayColumn = memo(function DayColumn({
   isWeekend,
   showNow,
   now,
+  nowMs,
   onColumnPointerDown,
   onChipPointerDown,
   onSelectChip,
@@ -81,6 +85,7 @@ export const DayColumn = memo(function DayColumn({
           }
           onPointerDown={onChipPointerDown}
           dragging={draggingEventId === p.event.id}
+          past={isEventPast(Date.parse(p.event.end_time), nowMs)}
         />
       ))}
 

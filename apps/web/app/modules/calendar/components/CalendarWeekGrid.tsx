@@ -205,6 +205,7 @@ export function CalendarWeekGrid({
               selectedEventId={selectedEventId}
               draggingEventId={draggingEventId}
               preview={allDayPreview}
+              nowMs={now.getTime()}
             />
           </div>
 
@@ -249,6 +250,7 @@ export function CalendarWeekGrid({
                   isWeekend={isWeekend(day)}
                   showNow={isTodayCol}
                   now={isTodayCol ? now : undefined}
+                  nowMs={now.getTime()}
                   onColumnPointerDown={onColumnPointerDown}
                   onChipPointerDown={onChipPointerDown}
                   onSelectChip={onSelectChip}
