@@ -1058,6 +1058,24 @@ export function useCalendarSession({
     [drag.preview, drag.previewKind, drag.previewPointerType],
   );
 
+  /**
+   * Times the gutter shows: an active timed drag (create / move / resize)
+   * replaces the selection's committed times, so the pills track the ghost
+   * instead of the chip it left behind. All-day and multi-day events live in
+   * the all-day band and have no place on the 24h axis.
+   */
+  const gutterEdges = useMemo<{ start: Date; end: Date } | null>(() => {
+    if (drag.preview && drag.previewZone === 'timed') return drag.preview;
+    if (!selectedEvent || selectedEvent.is_all_day) return null;
+    const start = new Date(selectedEvent.start_time);
+    const end = new Date(selectedEvent.end_time);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return null;
+    }
+    if (isMultiDay(start, end)) return null;
+    return { start, end };
+  }, [drag.preview, drag.previewZone, selectedEvent]);
+
   const activeDragEvent = drag.activeEventId
     ? overlaidEvents.find((e) => e.id === drag.activeEventId)
     : undefined;
@@ -1155,6 +1173,7 @@ export function useCalendarSession({
     onAllDayChipPointerDown: handleAllDayChipPointerDown,
     timedPreviewByDay,
     previewInfo,
+    gutterEdges,
     previewColor,
     previewTitle,
     allDayPreview,

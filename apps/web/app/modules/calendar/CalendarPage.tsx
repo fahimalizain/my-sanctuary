@@ -208,6 +208,7 @@ export function CalendarPage() {
           totalHoursH={session.totalHoursH}
           hourGridBg={session.hourGridBg}
           hourLabels={session.hourLabels}
+          gutterEdges={session.gutterEdges}
           allDayHeight={session.allDayHeight}
           allDayChips={session.allDayChips}
           todayIndex={session.todayIndex}

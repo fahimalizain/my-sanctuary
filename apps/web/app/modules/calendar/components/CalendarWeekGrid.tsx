@@ -7,13 +7,9 @@ import { AllDayRow, type AllDayChip, type AllDayPreview } from './AllDayRow';
 import type { DragPreviewInfo } from '../lib/calendar-drag';
 import { dayNameShort } from '../lib/calendar-model';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
+import { GutterTimes } from './GutterTimes';
 import { type PositionedEvent } from './EventChip';
-import {
-  COL_HEADER_H,
-  formatHourLabel,
-  isSameDay,
-  isWeekend,
-} from '../lib/week-layout';
+import { COL_HEADER_H, isSameDay, isWeekend } from '../lib/week-layout';
 
 /** Stable empty list so DayColumn memo is not busted on empty days. */
 const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
@@ -34,6 +30,8 @@ export interface CalendarWeekGridProps {
   totalHoursH: number;
   hourGridBg: string;
   hourLabels: number[];
+  /** Timed start/end for the gutter pills (drag preview wins over selection). */
+  gutterEdges: { start: Date; end: Date } | null;
   allDayHeight: number;
   allDayChips: AllDayChip[];
   todayIndex: number | null;
@@ -82,6 +80,7 @@ export function CalendarWeekGrid({
   totalHoursH,
   hourGridBg,
   hourLabels,
+  gutterEdges,
   allDayHeight,
   allDayChips,
   todayIndex,
@@ -194,19 +193,12 @@ export function CalendarWeekGrid({
               className="shrink-0 sticky left-0 z-30 border-r border-border/60 bg-cream"
               style={{ width: gutterW, height: totalHoursH }}
             >
-              {hourLabels.map((h) => {
-                const label = formatHourLabel(h);
-                if (!label) return null;
-                return (
-                  <div
-                    key={h}
-                    className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
-                    style={{ top: h * hourH }}
-                  >
-                    {label}
-                  </div>
-                );
-              })}
+              <GutterTimes
+                hourH={hourH}
+                hourLabels={hourLabels}
+                now={todayIndex != null ? now : null}
+                edges={gutterEdges}
+              />
             </div>
 
             {/* Day columns — memoized; drag preview is a sibling overlay */}
