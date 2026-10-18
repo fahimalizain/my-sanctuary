@@ -15,7 +15,7 @@
 // mutation lives in HomePage; HomePage owns the verb branch (reopen vs
 // complete/skip).
 
-import { Children, useState, type ReactNode } from 'react';
+import { Children, type ReactNode } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type {
@@ -23,8 +23,6 @@ import type {
   DraggableSyntheticListeners,
 } from '@dnd-kit/core';
 import {
-  Calendar,
-  CalendarClock,
   CalendarX2,
   Check,
   GripVertical,
@@ -41,13 +39,8 @@ import type {
 } from '../../types';
 import { TASK_PRIORITY_LABELS } from '../../types';
 import { cn } from '@/lib/utils';
-import { canReschedule, rescheduleMaxDate } from './agenda-helpers';
-import { addCivilDays } from '../routines/rrule-preview';
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover';
+import { canReschedule } from './agenda-helpers';
+import { RescheduleControl } from './RescheduleControl';
 
 interface AgendaItemRowProps {
   item: AgendaItemRecord;
@@ -69,6 +62,11 @@ interface AgendaItemRowProps {
   /** Move the slot to another day (`YYYY-MM-DD`) — HomePage fires
    *  `POST /api/agenda/items/:id/reschedule` optimistically. */
   onReschedule: (item: AgendaItemRecord, date: string) => void;
+  /** Drop a task back into the Backlog (`{ backlog: true }`) — HomePage owns
+   *  the optimistic paint + success notice. Never offered for occurrences. */
+  onMoveToBacklog: (item: AgendaItemRecord) => void;
+  /** Briefly ring the row after the success notice's "Show" scrolled to it. */
+  highlighted?: boolean;
   onCompleteTask: (item: AgendaItemRecord) => void;
   onStartTask: (item: AgendaItemRecord) => void;
   /** Pause an in-progress task (ADR 0002 `/pause` → PLANNED). */
@@ -116,6 +114,8 @@ function AgendaRowShell({
   color,
   title,
   meta,
+  highlighted = false,
+  domId,
 }: {
   crossed: boolean;
   handle: ReactNode;
@@ -123,12 +123,16 @@ function AgendaRowShell({
   color: string;
   title: ReactNode;
   meta: ReactNode;
+  highlighted?: boolean;
+  domId: string;
 }) {
   return (
     <div
+      id={domId}
       className={cn(
         'overflow-hidden rounded-xl border border-border/60 bg-background transition-opacity',
         crossed && 'opacity-60',
+        highlighted && 'ring-2 ring-primary/40',
       )}
     >
       <div className="flex">
@@ -276,101 +280,6 @@ function DragHandle({
   );
 }
 
-/** Move-to-another-day control (ADR 0004 amendment — reschedule, slice 5
- *  stream rules; ADR 0007 — slice 6 bounds): a calendar icon opens a small
- *  popover with "Today" and "Tomorrow" actions plus a compact native date
- *  picker for any other day. Every action fires immediately — no confirm — so
- *  the row's optimistic drop in HomePage is instant; failures revert + banner.
- *  "Today" means the SERVER's civil today (`serverToday`), never the browser's
- *  date; "Tomorrow" is the ROW's own date +1 civil day and hides once that day
- *  is past (the API rejects a reschedule into the past). The picker is bounded
- *  `[serverToday, today+10y−1]` — the API's accepted `[today, today+10y)`
- *  range, with the same month clamp — so neither an impossible past day nor an
- *  out-of-range future day is ever offered. The popover closes and the picker
- *  resets after either action so it never reads as a filter. */
-function RescheduleControl({
-  item,
-  label,
-  serverToday,
-  onReschedule,
-}: {
-  item: AgendaItemRecord;
-  label: string;
-  serverToday: string;
-  onReschedule: AgendaItemRowProps['onReschedule'];
-}) {
-  const [open, setOpen] = useState(false);
-  const [pickDate, setPickDate] = useState('');
-  const tomorrow = addCivilDays(item.local_date, 1);
-  const showToday = !!serverToday && item.local_date !== serverToday;
-  const showTomorrow = !!serverToday && tomorrow >= serverToday;
-  // Computed from the SERVER's today, never the browser's — and only when the
-  // server has told us what today is.
-  const maxDate = serverToday ? rescheduleMaxDate(serverToday) : undefined;
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        aria-label={`Move ${label} to another day`}
-        title={`Move ${label} to another day`}
-        className={ICON_BTN}
-      >
-        <Calendar className="h-3.5 w-3.5" />
-      </PopoverTrigger>
-      <PopoverContent className="w-[min(12rem,calc(100vw-2rem))] flex flex-col gap-1">
-        {showToday && (
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onReschedule(item, serverToday);
-            }}
-            aria-label={`Move ${label} to today`}
-            title="Move to today"
-            className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-          >
-            <CalendarClock className="h-3.5 w-3.5" />
-            Today
-          </button>
-        )}
-        {showTomorrow && (
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onReschedule(item, tomorrow);
-            }}
-            aria-label={`Move ${label} to tomorrow`}
-            title="Move to tomorrow"
-            className="inline-flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-          >
-            <CalendarClock className="h-3.5 w-3.5" />
-            Tomorrow
-          </button>
-        )}
-        <input
-          type="date"
-          value={pickDate}
-          min={serverToday || undefined}
-          max={maxDate}
-          onChange={(e) => {
-            const next = e.target.value;
-            // No confirm: picking a day reschedules immediately, then the
-            // control resets so it never reads as a filter.
-            if (next) {
-              setPickDate('');
-              setOpen(false);
-              onReschedule(item, next);
-            }
-          }}
-          aria-label={`Move ${label} to another day`}
-          title="Move to another day"
-          className="w-full rounded-md border border-input bg-background px-1 py-0.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
-        />
-      </PopoverContent>
-    </Popover>
-  );
-}
-
 /** Shared Play ↔ Pause swap for both row kinds. Play when `canStart`;
  *  Pause when `running`; nothing otherwise. */
 function PlayPauseControl({
@@ -447,6 +356,8 @@ function OccurrenceRow({
   showHandle,
   serverToday,
   onReschedule,
+  highlighted,
+  domId,
   onComplete,
   onSkip,
   onStart,
@@ -461,6 +372,8 @@ function OccurrenceRow({
   showHandle: boolean;
   serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
+  highlighted: boolean;
+  domId: string;
   onComplete: () => void;
   onSkip: () => void;
   onStart: () => void;
@@ -479,6 +392,8 @@ function OccurrenceRow({
     <AgendaRowShell
       crossed={crossed}
       color={occurrence.category.color}
+      highlighted={highlighted}
+      domId={domId}
       handle={
         showHandle && !readOnly ? (
           <DragHandle
@@ -573,6 +488,7 @@ function OccurrenceRow({
                   item={item}
                   label={occurrence.resolved_title}
                   serverToday={serverToday}
+                  triggerClassName={ICON_BTN}
                   onReschedule={onReschedule}
                 />
               )}
@@ -593,6 +509,9 @@ function TaskRow({
   showHandle,
   serverToday,
   onReschedule,
+  onMoveToBacklog,
+  highlighted,
+  domId,
   onComplete,
   onStart,
   onPause,
@@ -606,6 +525,9 @@ function TaskRow({
   showHandle: boolean;
   serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
+  onMoveToBacklog: AgendaItemRowProps['onMoveToBacklog'];
+  highlighted: boolean;
+  domId: string;
   onComplete: () => void;
   onStart: () => void;
   onPause: () => void;
@@ -620,6 +542,8 @@ function TaskRow({
     <AgendaRowShell
       crossed={crossed}
       color={task.category.color}
+      highlighted={highlighted}
+      domId={domId}
       handle={
         showHandle ? (
           <DragHandle
@@ -673,7 +597,9 @@ function TaskRow({
                 item={item}
                 label={task.display_title}
                 serverToday={serverToday}
+                triggerClassName={ICON_BTN}
                 onReschedule={onReschedule}
+                onMoveToBacklog={() => onMoveToBacklog(item)}
               />
             )}
           </AgendaRowActions>
@@ -686,6 +612,8 @@ function TaskRow({
 export function AgendaItemRow(props: AgendaItemRowProps) {
   const { item } = props;
   const showHandle = props.showHandle ?? true;
+  const highlighted = props.highlighted ?? false;
+  const domId = `agenda-item-${item.id}`;
   if (item.kind === 'occurrence' && item.occurrence) {
     return (
       <OccurrenceRow
@@ -697,6 +625,8 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         showHandle={showHandle}
         serverToday={props.serverToday}
         onReschedule={props.onReschedule}
+        highlighted={highlighted}
+        domId={domId}
         onComplete={() => props.onCompleteOccurrence(item)}
         onSkip={() => props.onSkipOccurrence(item)}
         onStart={() => props.onStartOccurrence(item)}
@@ -716,6 +646,9 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         showHandle={showHandle}
         serverToday={props.serverToday}
         onReschedule={props.onReschedule}
+        onMoveToBacklog={props.onMoveToBacklog}
+        highlighted={highlighted}
+        domId={domId}
         onComplete={() => props.onCompleteTask(item)}
         onStart={() => props.onStartTask(item)}
         onPause={() => props.onPauseTask(item)}
