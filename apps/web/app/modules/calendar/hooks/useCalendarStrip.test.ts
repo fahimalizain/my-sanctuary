@@ -867,6 +867,180 @@ test('useCalendarStrip: shiftPeriod is an intentional write and is not reverted'
   }
 });
 
+// ── Column-width changes ────────────────────────────────────────────────
+// `committedLeftRef` is pixels: a rotation, window resize, sidebar or PWA
+// viewport change moves the columns out from under it. The strip has to re-park
+// the same visible index at the new width, or the guard writes the old pixels
+// back — mid-column at the new width — and mandatory snap re-snaps that write
+// while the read-back is rejected, leaving the day nobody published.
+
+/** A ResizeObserver that hands its callback to the test instead of firing it. */
+function captureResizeObserver(): {
+  callbacks: ResizeObserverCallback[];
+  restore: () => void;
+} {
+  const previous = globalThis.ResizeObserver;
+  const callbacks: ResizeObserverCallback[] = [];
+  class RecordingResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      callbacks.push(callback);
+    }
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  globalThis.ResizeObserver = RecordingResizeObserver;
+  return {
+    callbacks,
+    restore: () => {
+      globalThis.ResizeObserver = previous;
+    },
+  };
+}
+
+test('useCalendarStrip: a column-width change re-parks on the same visible day', async () => {
+  // The hook measures once in a layout effect and again from its ResizeObserver
+  // (install-dom's is a no-op), so the resize is delivered by firing the recorded
+  // callback. `measure` reads the element's width, not the entries.
+  const observer = captureResizeObserver();
+
+  try {
+    let latest: CalendarStrip | null = null;
+    const strip = await mountParkedStrip((s) => {
+      latest = s;
+    });
+    const scroller = strip.scrollerRef.current;
+    const grid = strip.gridColumnRef.current;
+    assert.ok(scroller);
+    assert.ok(grid);
+
+    const left0 = scroller!.scrollLeft;
+    const colW0 = strip.colW;
+    const start0 = latestStrip(() => latest).visibleStart;
+    assert.equal(left0, scrollLeftForIndex(STRIP_OVERSCAN, colW0));
+    assert.ok(left0 > 0, 'init park should have scrolled the strip');
+
+    // Rotation / window resize / sidebar: the columns get wider.
+    stubClientWidth(grid!, 1200);
+    const colW1 = colWidth(1200, strip.periodLength);
+    assert.notEqual(colW1, colW0, 'the fixture must change the column width');
+
+    const measure = observer.callbacks[0];
+    assert.ok(measure, 'the hook should have registered a ResizeObserver');
+    await act(async () => {
+      measure([], {} as ResizeObserver);
+    });
+    // The suppress release is rAF-deferred, as in every other park.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+
+    assert.equal(
+      scroller!.scrollLeft,
+      scrollLeftForIndex(STRIP_OVERSCAN, colW1),
+      'the same index, re-parked at the new column width',
+    );
+    assert.notEqual(
+      scroller!.scrollLeft,
+      left0,
+      'the old pixels would be mid-column at the new width',
+    );
+    assert.ok(
+      isSameDay(latestStrip(() => latest).visibleStart, start0),
+      'the visible day must not move',
+    );
+    assert.equal(
+      latestStrip(() => latest).visibleStart.getTime(),
+      start0.getTime(),
+      'and the window must not rebase',
+    );
+
+    // The regression: mandatory snap re-snaps a stale pixel write, the read-back
+    // differs, and the guard returned without publishing. The old pixels are
+    // thrown back at the strip; the new column is what must be restored.
+    scroller!.scrollLeft = left0;
+    await act(async () => {
+      latestStrip(() => latest).onScrollerScroll();
+    });
+    assert.equal(
+      scroller!.scrollLeft,
+      scrollLeftForIndex(STRIP_OVERSCAN, colW1),
+      'the guard restores the new column, not the old pixels',
+    );
+    assert.ok(
+      isSameDay(latestStrip(() => latest).visibleStart, start0),
+      'still the same visible day',
+    );
+  } finally {
+    observer.restore();
+  }
+});
+
+test('useCalendarStrip: a resize under a held owner waits for the release', async () => {
+  const observer = captureResizeObserver();
+
+  try {
+    let latest: CalendarStrip | null = null;
+    const strip = await mountParkedStrip((s) => {
+      latest = s;
+    });
+    const scroller = strip.scrollerRef.current;
+    const grid = strip.gridColumnRef.current;
+    assert.ok(scroller);
+    assert.ok(grid);
+    const left0 = scroller!.scrollLeft;
+    const start0 = latestStrip(() => latest).visibleStart;
+
+    // A drag owns `scrollLeft`: the re-park must not fight its writes.
+    await act(async () => {
+      strip.lockStrip('drag');
+    });
+
+    stubClientWidth(grid!, 1200);
+    const colW1 = colWidth(1200, strip.periodLength);
+    assert.notEqual(
+      colW1,
+      strip.colW,
+      'the fixture must change the column width',
+    );
+
+    const measure = observer.callbacks[0];
+    assert.ok(measure, 'the hook should have registered a ResizeObserver');
+    await act(async () => {
+      measure([], {} as ResizeObserver);
+    });
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+    });
+    assert.equal(
+      scroller!.scrollLeft,
+      left0,
+      'a held owner is not fought, whatever the column width',
+    );
+
+    // The release lands it: the visible day at the new width, not a rounding of
+    // the old pixels by that width.
+    await act(async () => {
+      latestStrip(() => latest).unlockStrip('drag');
+    });
+    assert.equal(
+      scroller!.scrollLeft,
+      scrollLeftForIndex(STRIP_OVERSCAN, colW1),
+      'the deferred re-park owns the landing',
+    );
+    assert.ok(
+      isSameDay(latestStrip(() => latest).visibleStart, start0),
+      'the visible day must not move',
+    );
+  } finally {
+    observer.restore();
+  }
+});
+
 // ── Single-axis gestures ────────────────────────────────────────────────
 // One finger may only move one axis. `overflow-x: hidden` denies the browser
 // the strip's x axis; the vertical pin denies it the y axis while a swipe owns

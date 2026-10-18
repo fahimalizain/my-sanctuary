@@ -197,6 +197,11 @@ export function useCalendarStrip(): CalendarStrip {
   // legitimate change is a write of ours, so anything else that moves it is put
   // back (see `onScrollerScroll`). null until the first park commits a value.
   const committedLeftRef = useRef<number | null>(null);
+  // A column-width change (rotation, window resize, sidebar, PWA viewport) that
+  // landed while a lock owner held the strip: the same visible index has to be
+  // re-parked at the new width, but not by fighting the owner (see the park
+  // layout effect and `flushPendingRepark`).
+  const pendingReparkRef = useRef(false);
   // Vertical rail: a touch that has not committed to x holds `scroll-snap-type`
   // off until the native pan it may have started has stopped. Deliberately not
   // a `StripLockReason` — a lock owner drops the swipe and suppresses rebase,
@@ -233,6 +238,15 @@ export function useCalendarStrip(): CalendarStrip {
   );
   const trackWidth = dayCount * colW;
   const contentWidth = gutterW + trackWidth;
+
+  // Latest visible index / column width for callbacks that must not close over
+  // a render's values: `visibleStartIdx` is deliberately not a park dependency,
+  // and the deferred re-park runs from `unlockStrip` / `dropSwipe`, after the
+  // render that changed `colW`.
+  const visibleStartIdxRef = useRef(visibleStartIdx);
+  const colWRef = useRef(colW);
+  visibleStartIdxRef.current = visibleStartIdx;
+  colWRef.current = colW;
 
   // ── Strip lock ownership ──────────────────────────────────────────────
   // Lock owners (drag / pinch / swipe) that hold the scroller's snap override.
@@ -287,7 +301,8 @@ export function useCalendarStrip(): CalendarStrip {
 
     // A native vertical pan is still in flight: push the rail's release out, so
     // snap cannot come back on while the pan is still moving. (`armRailQuietTimer`
-    // is declared with the rest of the rail below, next to the state it holds.)
+    // / `settleVerticalRail` are render-scope and this callback is re-created on
+    // a `colW` / `dayCount` / `periodLength` change, so its settle is never stale.)
     if (verticalRailRef.current) armRailQuietTimer();
 
     // ── Committed `scrollLeft` guard ────────────────────────────────────
@@ -461,6 +476,30 @@ export function useCalendarStrip(): CalendarStrip {
   };
 
   /**
+   * Land a re-park that a lock owner deferred (`pendingReparkRef`). The index is
+   * the visible day, not a rounding of the current pixels: after a column-width
+   * change those pixels are mid-column at the new width, so `alignStripToColumn`
+   * would land on a different day.
+   * @returns true when a deferred re-park was applied.
+   */
+  const flushPendingRepark = useCallback((): boolean => {
+    if (!pendingReparkRef.current) return false;
+    pendingReparkRef.current = false;
+    const scroller = scrollerRef.current;
+    const width = colWRef.current;
+    if (!scroller || width <= 0) return false;
+    const target = scrollLeftForIndex(visibleStartIdxRef.current, width);
+    suppressRebaseRef.current = true;
+    // Commit before the write, as every other park does: the scroll event it
+    // fires must already see the value the strip is about to be at.
+    committedLeftRef.current = target;
+    scroller.scrollLeft = target;
+    // Declared with the park layout effect below, like the other parks.
+    releaseSuppressRebase();
+    return true;
+  }, []);
+
+  /**
    * Drop the gesture without moving the strip: another owner took the scroller
    * (drag / pinch / a second finger) or the window was re-parked, so `left0` is
    * stale. Also cancels a release tween, releases the snap lock, and gives up
@@ -476,8 +515,13 @@ export function useCalendarStrip(): CalendarStrip {
     if (stripLockReasonsRef.current.delete('wheel')) released = true;
     if (verticalRailRef.current) released = true;
     releaseVerticalRail();
-    if (released) applyStripLock();
-  }, [applyStripLock, cancelSettle, clearWheelSettle]);
+    if (released) {
+      // The sideways owners are gone: a re-park they deferred can land. Any
+      // owner still held (a just-claimed drag) keeps holding it back.
+      if (stripLockReasonsRef.current.size === 0) flushPendingRepark();
+      applyStripLock();
+    }
+  }, [applyStripLock, cancelSettle, clearWheelSettle, flushPendingRepark]);
 
   const lockStrip = useCallback(
     (reason: StripLockReason) => {
@@ -522,17 +566,23 @@ export function useCalendarStrip(): CalendarStrip {
     (reason: StripLockReason) => {
       stripLockReasonsRef.current.delete(reason);
       // Swipe / wheel releases land through `startSettle`, so only the owners
-      // that scroll the strip themselves need the by-hand landing.
-      if (
-        (reason === 'drag' || reason === 'pinch') &&
-        stripLockReasonsRef.current.size === 0 &&
-        !verticalRailRef.current
-      ) {
-        alignStripToColumn();
+      // that scroll the strip themselves need the by-hand landing. A re-park a
+      // column-width change deferred owns the landing instead: it lands on the
+      // visible day at the new width, where `alignStripToColumn` would round the
+      // old pixels by that width and pick a different day.
+      if (stripLockReasonsRef.current.size === 0) {
+        const reparked = flushPendingRepark();
+        if (
+          !reparked &&
+          (reason === 'drag' || reason === 'pinch') &&
+          !verticalRailRef.current
+        ) {
+          alignStripToColumn();
+        }
       }
       applyStripLock();
     },
-    [alignStripToColumn, applyStripLock],
+    [alignStripToColumn, applyStripLock, flushPendingRepark],
   );
 
   /**
@@ -948,6 +998,43 @@ export function useCalendarStrip(): CalendarStrip {
       setVisibleStartIdx(STRIP_OVERSCAN);
       releaseSuppressRebase();
     }
+
+    // Column-width change (rotation, window resize, sidebar, PWA viewport).
+    // `committedLeftRef` is pixels, so the columns have moved out from under it
+    // and the guard would put the old pixels back — mid-column at the new width
+    // — fighting the mandatory snap that re-snaps that write while the read-back
+    // is rejected, leaving the strip on a day that was never published. Re-commit
+    // the visible day at the new width instead. The index is the current visible
+    // start, never `round(scrollLeft / colW)`: the old pixels divided by the new
+    // column width is a different day.
+    // Reached only once init has run, with no pending rebase (it returned above)
+    // and no pending jump (consumed above); both parks land on the target and
+    // fall through to the no-op below.
+    const target = scrollLeftForIndex(visibleStartIdxRef.current, colW);
+    if (
+      committedLeftRef.current !== null &&
+      Math.abs(committedLeftRef.current - target) < SCROLL_LEFT_GUARD_PX &&
+      Math.abs(scroller.scrollLeft - target) < SCROLL_LEFT_GUARD_PX
+    ) {
+      // Already on the column: nothing left to re-park (a resize back to the old
+      // width lands here too).
+      pendingReparkRef.current = false;
+      return;
+    }
+    if (stripLockReasonsRef.current.size > 0) {
+      // An owner writes `scrollLeft` itself: the re-park waits for the release
+      // that leaves the set empty. The vertical rail is not an owner — it only
+      // holds snap off, and it has to be holding the new column width when it
+      // settles or it would restore the old pixels.
+      pendingReparkRef.current = true;
+      return;
+    }
+    pendingReparkRef.current = false;
+    suppressRebaseRef.current = true;
+    // Commit before the write, as every other park does.
+    committedLeftRef.current = target;
+    scroller.scrollLeft = target;
+    releaseSuppressRebase();
   }, [colW, dayCount, mainWidth, periodLength, windowStart, scrollNonce]);
 
   /** Park the strip so `firstVisible` is the left edge of the viewport. */
