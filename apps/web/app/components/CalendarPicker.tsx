@@ -86,7 +86,9 @@ export function CalendarPicker({
         ))}
         {hasStaleValue && <option value={value}>{value}</option>}
       </select>
-      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+      {error && (
+        <p className="selectable mt-1 text-xs text-destructive">{error}</p>
+      )}
     </div>
   );
 }

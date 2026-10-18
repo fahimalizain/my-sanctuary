@@ -286,7 +286,9 @@ export function CalendarWeekGrid({
           <p className="text-foreground font-medium mb-2">
             Failed to load events
           </p>
-          <p className="text-sm text-muted-foreground mb-4">{error}</p>
+          <p className="selectable text-sm text-muted-foreground mb-4">
+            {error}
+          </p>
           <Button variant="outline" onClick={onRetry}>
             <RefreshCw className="h-4 w-4 mr-2" />
             Retry

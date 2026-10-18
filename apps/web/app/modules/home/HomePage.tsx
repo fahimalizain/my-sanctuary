@@ -1724,7 +1724,7 @@ export function HomePage() {
                 stays mounted */}
             {actionError && (
               <div className="mb-3 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
-                <p className="text-sm">{actionError}</p>
+                <p className="selectable text-sm">{actionError}</p>
                 <Button
                   variant="outline"
                   size="sm"
@@ -1781,7 +1781,7 @@ export function HomePage() {
               {/* First fetch failed and there is nothing to show */}
               {!hasPages && !current.isLoading && loadError && (
                 <div className="m-2 flex items-center justify-between gap-4 rounded-xl bg-destructive/10 px-4 py-3 text-destructive">
-                  <p className="text-sm">{loadError}</p>
+                  <p className="selectable text-sm">{loadError}</p>
                   <Button
                     variant="outline"
                     size="sm"
@@ -1953,7 +1953,9 @@ export function HomePage() {
               className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
             />
             {renameError && (
-              <p className="mt-3 text-sm text-destructive">{renameError}</p>
+              <p className="selectable mt-3 text-sm text-destructive">
+                {renameError}
+              </p>
             )}
           </div>
           <div className="flex shrink-0 justify-end gap-3 border-t border-border px-6 py-4">

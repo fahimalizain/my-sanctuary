@@ -147,9 +147,10 @@ export function CalendarPage() {
     strip.scrollerRef,
   ]);
 
-  // Calendar view is non-selectable; text fields opt back in (user-select + callout inherit).
+  // Long-press selection is disabled app-wide in globals.css; form fields opt
+  // back in there, and `.selectable` covers any static text worth copying.
   return (
-    <div className="h-[100dvh] bg-cream flex flex-col select-none [-webkit-touch-callout:none] [&_input]:select-text [&_textarea]:select-text [&_input]:[-webkit-touch-callout:default] [&_textarea]:[-webkit-touch-callout:default]">
+    <div className="h-[100dvh] bg-cream flex flex-col">
       <CalendarHeader
         rangeTitle={strip.rangeTitle}
         isRefreshing={session.isRefreshing}
@@ -168,7 +169,9 @@ export function CalendarPage() {
 
       {session.writeError && (
         <div className="shrink-0 flex items-center justify-between gap-3 border-b border-border px-4 py-1.5 text-xs">
-          <p className="text-muted-foreground truncate">{session.writeError}</p>
+          <p className="selectable text-muted-foreground truncate">
+            {session.writeError}
+          </p>
           <button
             type="button"
             onClick={session.clearWriteError}

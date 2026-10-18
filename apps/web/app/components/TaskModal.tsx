@@ -742,7 +742,9 @@ export function TaskModal({
                 static edit-only tag is gone in favor of it. */}
 
             {formError && (
-              <p className="mb-4 text-sm text-destructive">{formError}</p>
+              <p className="selectable mb-4 text-sm text-destructive">
+                {formError}
+              </p>
             )}
           </div>
 

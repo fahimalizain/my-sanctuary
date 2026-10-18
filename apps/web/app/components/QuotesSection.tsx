@@ -44,10 +44,10 @@ export function QuotesSection({ quotes, className }: QuotesSectionProps) {
       </div>
 
       <div className="min-w-0 flex-1 lg:flex lg:min-h-[100px] lg:flex-col lg:justify-center">
-        <p className="line-clamp-2 text-xs leading-snug text-foreground/90 lg:mb-3 lg:line-clamp-none lg:text-lg lg:leading-relaxed">
+        <p className="selectable line-clamp-2 text-xs leading-snug text-foreground/90 lg:mb-3 lg:line-clamp-none lg:text-lg lg:leading-relaxed">
           &ldquo;{currentQuote.text}&rdquo;
         </p>
-        <p className="mt-0.5 line-clamp-1 text-[10px] text-muted-foreground lg:mt-0 lg:line-clamp-none lg:text-sm">
+        <p className="selectable mt-0.5 line-clamp-1 text-[10px] text-muted-foreground lg:mt-0 lg:line-clamp-none lg:text-sm">
           — {currentQuote.author}
         </p>
       </div>
