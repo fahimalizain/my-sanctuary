@@ -12,10 +12,13 @@ import {
   type DragKind,
   type DragSlot,
   type DragZone,
+  type PointerAnchor,
   type TimedRange,
   ALLDAY_CREATE_HOLD_MS,
+  PRECISION_GAIN_GRID,
   allDayGrabOffsetDays,
   autoscrollDelta,
+  civilDayShift,
   classifyTouchGesture,
   createTouchTracker,
   crossedTickBoundary,
@@ -23,15 +26,21 @@ import {
   movedAllDayRange,
   movedEnough,
   movedRange,
+  pointerTravelPx,
+  precisionCreate,
   precisionModifierDown,
+  precisionMove,
+  precisionResize,
   rangeFromSlots,
   resolveChipGesture,
   resizedRange,
+  snappedMinuteDelta,
   toAllDayRange,
   toTimedRange,
 } from '../lib/calendar-drag';
 import { tick } from '../lib/haptics';
 import {
+  SNAP_MINUTES,
   dateOnDay,
   minutesFromY,
   snapMinutes,
@@ -84,7 +93,7 @@ export interface CalendarDragApi {
   isDragging: boolean;
   /**
    * Precision modifier is live: a non-touch pointer is holding Cmd (macOS) /
-   * Ctrl, and the gesture is on the timed grid at 1-minute snap.
+   * Ctrl on the timed grid, so the drag runs at the reduced 1:5 gain.
    */
   precisionSnap: boolean;
   /** True after a drag commit so a synthetic click can be ignored. */
@@ -93,17 +102,49 @@ export interface CalendarDragApi {
   cancel: () => void;
 }
 
+/**
+ * A precision (Cmd / Ctrl) drag freezes the edge where it was when the modifier
+ * came down and moves it one minute per `PRECISION_GAIN_GRID` minutes of pointer
+ * travel — so the edge drifts off the pointer, which is the point. The anchor is
+ * captured once, at engage.
+ */
+interface PrecisionHold {
+  /** Content-space pointer anchor; all travel is measured against it. */
+  anchor: PointerAnchor;
+  /**
+   * Civil day under the pointer when precision engaged. Frozen: the column shift
+   * is measured from here, so a pointer that has moved two columns right shifts
+   * the range two days.
+   */
+  pointerDay: Date;
+  /**
+   * Frozen base the delta is applied to: the absolute ghost at engage when a
+   * drag was already running, else the original event's own edges.
+   */
+  range: TimedRange;
+  /** What the ghost shows now: `range` + the cumulative delta / day shift. */
+  preview: TimedRange;
+  /** Create only: the origin slot, frozen at the engage point. */
+  originSlot?: DragSlot;
+  /** Create only: the moving edge's minute anchor (the pointer at engage). */
+  currentSlot?: DragSlot;
+}
+
 interface Session {
   kind: DragKind;
   /**
-   * Grid step (minutes) for the gesture, hit-tested with it. Re-read from the
-   * zoom and the pointer's live modifier state on every pointer and modifier
-   * key event — never frozen at pointerdown, or pressing Cmd mid-drag would
-   * leave the ghost on the coarse grid.
+   * Coarse grid step (minutes) for the gesture, hit-tested with it. Re-read from
+   * the zoom on every pointer move — never frozen at pointerdown — but never
+   * from the modifier: precision drives its own hold instead.
    */
   snapStep: number;
   /** Precision modifier is down (always false for touch). */
   precision: boolean;
+  /**
+   * Reduced-gain hold while the modifier is down on the timed grid; null
+   * otherwise (released key, all-day zone, or a grid that cannot be measured).
+   */
+  precisionHold?: PrecisionHold | null;
   originSlot: DragSlot;
   currentSlot: DragSlot;
   /**
@@ -118,9 +159,9 @@ interface Session {
   originalStart?: Date;
   originalEnd?: Date;
   /**
-   * Timed move only: painted chip start (`data-start-min`). The grab offset is
-   * derived from the re-snapped origin against this on every preview, so a
-   * modifier change re-snaps the hold point instead of keeping a stale error.
+   * Timed move only: painted chip start (`data-start-min`). The absolute grab
+   * offset is that paint error against the snapped origin, recomputed on every
+   * preview. A precision move ignores it: it shifts the frozen ghost instead.
    */
   paintedStartMin?: number;
   /** Civil-day offset from all-day event start to the grab day. */
@@ -165,7 +206,7 @@ function platformName(): string {
 }
 
 /**
- * Modifier state for a gesture: touch never gets precision snap, even on a
+ * Modifier state for a gesture: touch never gets the precision gain, even on a
  * device with a keyboard attached.
  */
 function precisionForPointer(
@@ -178,14 +219,21 @@ function precisionForPointer(
     : precisionModifierDown(keys, platform);
 }
 
-/** Live grid for a session: the precision modifier and the step it implies. */
+/**
+ * Live grid for a session: whether the precision modifier is down, and the
+ * coarse step the absolute path hit-tests with.
+ *
+ * Precision no longer changes the step. The absolute grid is the zoom's step
+ * whatever the modifier says, and a precision drag is a scaled delta on a
+ * frozen edge (`snappedMinuteDelta`), not a finer grid under the pointer.
+ */
 function dragGrid(
   hourH: number,
   pointerType: string,
   keys: ModifierKeys,
 ): { precision: boolean; snapStep: number } {
   const precision = precisionForPointer(pointerType, keys, platformName());
-  return { precision, snapStep: snapStepMinutes(hourH, precision) };
+  return { precision, snapStep: snapStepMinutes(hourH) };
 }
 
 function parseDayAttr(value: string | null | undefined): Date | null {
@@ -273,6 +321,7 @@ function computePreview(session: Session): TimedRange | null {
   const {
     kind,
     snapStep,
+    precisionHold,
     originZone,
     currentZone,
     originSlot,
@@ -282,6 +331,9 @@ function computePreview(session: Session): TimedRange | null {
     paintedStartMin,
     grabOffsetDays,
   } = session;
+  // Precision owns the ghost: the hold carries the frozen edge plus the scaled
+  // delta, and the absolute slots below are only the hit-test scaffolding.
+  if (precisionHold && currentZone === 'timed') return precisionHold.preview;
   switch (kind) {
     case 'create':
       if (currentZone === 'allday') return toAllDayRange(currentSlot);
@@ -304,10 +356,10 @@ function computePreview(session: Session): TimedRange | null {
       if (originZone === 'allday') return toTimedRange(currentSlot);
       // `movedRange` keeps its own 1-minute snap, so a coarse step would jump
       // an off-grid 10:07 event onto the grid on the first move. The slot is
-      // quantized to the live step instead, and the grab offset is recomputed
-      // from that snapped origin every preview: pressing Cmd then re-snaps the
-      // hold point onto the 1-minute grid instead of keeping the 5-minute
-      // error it had a moment ago.
+      // quantized to the live step instead, and the grab offset is the paint
+      // error the pointer grabbed with, so the chip stays under the pointer.
+      // Absolute moves only: a precision move adds a scaled delta to a frozen
+      // ghost and never re-derives the grab offset (see `precisionMove`).
       return movedRange(
         originalStart,
         originalEnd,
@@ -374,21 +426,177 @@ function nextSlotFromPoint(
 }
 
 /**
- * Re-snap an active gesture at a point for the pointer's current modifier
- * state. Returns null when nothing moved, so a held modifier key repeat costs
- * no render.
+ * Pointer anchor in hours-content space — Y inside the grid's content column,
+ * plus the scroller's own offset so a scroll can be subtracted out again.
  *
- * The origin is rebuilt from `originMinutesRaw` with the live step rather than
- * reused: a frozen 5-minute origin would leave 1-minute mode lying about where
- * the gesture started. The origin day is carried over untouched — re-reading it
- * from clientY would let autoscroll drag the anchor.
+ * Measured from the FIRST `[data-day-col]` rather than the column under the
+ * pointer: every column shares a top, and the first one is still there when the
+ * pointer is over the gutter or outside the grid.
  */
-function resnapSession(
+function measurePointerAnchor(clientY: number): PointerAnchor | null {
+  const col = document.querySelector('[data-day-col]');
+  const scroller = document.querySelector('[data-calendar-scroller]');
+  if (!(col instanceof HTMLElement) || !(scroller instanceof HTMLElement)) {
+    return null;
+  }
+  return {
+    contentY: clientY - col.getBoundingClientRect().top,
+    scrollTop: scroller.scrollTop,
+  };
+}
+
+function sameRange(a: TimedRange, b: TimedRange): boolean {
+  return (
+    a.start.getTime() === b.start.getTime() &&
+    a.end.getTime() === b.end.getTime()
+  );
+}
+
+/**
+ * Anchor a precision hold at the moment the modifier came down. `ghost` is the
+ * absolute range the gesture is showing (or is about to show); a null ghost
+ * means there is nothing to freeze, so precision stays off.
+ *
+ * - Create before the drag threshold: there is no edge yet, so both slots are
+ *   the pointer itself snapped to `SNAP_MINUTES` — that point is where the
+ *   finger is, and the gain applies only once it moves.
+ * - Move / resize before the threshold: the ORIGINAL event's own edges, not the
+ *   slot under the pointer (the event is where the chip already is, so nothing
+ *   jumps when the ghost appears). An all-day event dragged into the timed grid
+ *   has no timed original — its ghost is the timed default — so it uses `ghost`.
+ * - Already dragging: `ghost`, captured before this step's snap lands.
+ */
+function engagePrecisionHold(
+  session: Session,
+  ghost: TimedRange | null,
+  anchor: PointerAnchor,
+  pointerDay: Date,
+  didDrag: boolean,
+  hourH: number,
+): PrecisionHold | null {
+  if (session.kind === 'create' && !didDrag) {
+    const point: DragSlot = {
+      day: pointerDay,
+      minutes: snapMinutes(minutesFromY(anchor.contentY, hourH), SNAP_MINUTES),
+    };
+    const range = precisionCreate(point, point, 0, point.day);
+    return {
+      anchor,
+      pointerDay,
+      range,
+      preview: range,
+      originSlot: point,
+      currentSlot: point,
+    };
+  }
+
+  const original =
+    session.originalStart && session.originalEnd
+      ? {
+          start: new Date(session.originalStart.getTime()),
+          end: new Date(session.originalEnd.getTime()),
+        }
+      : null;
+  const range =
+    !didDrag && session.originZone === 'timed' && original ? original : ghost;
+  if (!range) return null;
+
+  return {
+    anchor,
+    pointerDay,
+    range,
+    preview: range,
+    originSlot: session.kind === 'create' ? session.originSlot : undefined,
+    currentSlot: session.kind === 'create' ? session.currentSlot : undefined,
+  };
+}
+
+/**
+ * One precision step: pointer travel since engage, scaled down by the gain and
+ * applied to the frozen anchor. `hitDay` is the civil day under the pointer (the
+ * hold's own day when the hit-test missed), which is the horizontal axis — it
+ * stacks with the vertical minute delta, because crossing midnight and crossing
+ * a column are different moves.
+ *
+ * Returns the same hold object when the range did not change, so `stepSession`
+ * can skip the render.
+ */
+function movePrecisionHold(
+  hold: PrecisionHold,
+  session: Session,
+  clientY: number,
+  hourH: number,
+  hitDay: Date,
+): PrecisionHold {
+  const measured = measurePointerAnchor(clientY);
+  // No measurable grid (or none at engage): travel is 0, so the edge holds
+  // still instead of jumping on a layout change.
+  const travel = measured ? pointerTravelPx(hold.anchor, measured) : 0;
+  const deltaMin = snappedMinuteDelta(travel, hourH, PRECISION_GAIN_GRID);
+  const dayShift = civilDayShift(hold.pointerDay, hitDay);
+
+  let preview: TimedRange;
+  switch (session.kind) {
+    case 'move':
+      preview = precisionMove(hold.range, deltaMin, dayShift);
+      break;
+    case 'resize-start':
+      preview = precisionResize(
+        hold.range.start,
+        hold.range.end,
+        'start',
+        deltaMin,
+        dayShift,
+      );
+      break;
+    case 'resize-end':
+      preview = precisionResize(
+        hold.range.start,
+        hold.range.end,
+        'end',
+        deltaMin,
+        dayShift,
+      );
+      break;
+    case 'create':
+      if (!hold.originSlot || !hold.currentSlot) return hold;
+      preview = precisionCreate(
+        hold.originSlot,
+        hold.currentSlot,
+        deltaMin,
+        hitDay,
+      );
+      break;
+    default:
+      // allday-create never reaches here: its zone is always all-day.
+      return hold;
+  }
+
+  return sameRange(preview, hold.preview) ? hold : { ...hold, preview };
+}
+
+/**
+ * Re-snap an active gesture at a point for the pointer's current modifier state.
+ * Returns null when nothing a render would show changed, so a held modifier key
+ * repeat, or a precision pointer wobble inside the same minute, costs no render.
+ *
+ * The origin is rebuilt from `originMinutesRaw` with the live zoom step rather
+ * than reused, so a mid-drag zoom change cannot leave the origin lying about
+ * where the gesture started. The origin day is carried over untouched —
+ * re-reading it from clientY would let autoscroll drag the anchor.
+ *
+ * The coarse absolute grid always runs: it owns the day column, the zone, and
+ * the whole ghost whenever precision is off. The precision hold is engaged from
+ * the pre-snap state first, so the key going down freezes the edge the user is
+ * already looking at.
+ */
+function stepSession(
   session: Session,
   x: number,
   y: number,
   keys: ModifierKeys,
   hourH: number,
+  didDrag: boolean,
 ): Session | null {
   const { precision, snapStep } = dragGrid(hourH, session.pointerType, keys);
 
@@ -412,10 +620,57 @@ function resnapSession(
       };
   const currentZone = hit ? hit.zone : session.currentZone;
 
+  // Precision: anchored before the snap above is committed, and dropped the
+  // moment the key is released or the gesture leaves the timed grid. The next
+  // preview is then the plain absolute snap, which puts the edge back on the
+  // pointer's slot — that jump is accepted, not compensated for.
+  let precisionHold: PrecisionHold | null = null;
+  if (precision && currentZone === 'timed') {
+    let hold = session.precisionHold ?? null;
+    if (!hold) {
+      const anchor = measurePointerAnchor(y);
+      if (anchor) {
+        // What to freeze: the ghost on screen when the gesture was already on
+        // the timed grid, else this step's timed preview — re-entering from the
+        // all-day band, where the absolute ghost is an all-day range.
+        const ghost =
+          session.currentZone === 'timed'
+            ? computePreview(session)
+            : computePreview({
+                ...session,
+                originSlot,
+                currentSlot,
+                currentZone,
+              });
+        hold = engagePrecisionHold(
+          session,
+          ghost,
+          anchor,
+          hit ? hit.slot.day : session.currentSlot.day,
+          didDrag,
+          hourH,
+        );
+      }
+    }
+    if (hold) {
+      precisionHold = movePrecisionHold(
+        hold,
+        session,
+        y,
+        hourH,
+        // A miss has no column of its own: keep the hold's pointer day, so the
+        // column shift falls back to 0 rather than following a column the
+        // pointer has left. The zone stays the previous one either way.
+        hit ? hit.slot.day : hold.pointerDay,
+      );
+    }
+  }
+
   if (
     snapStep === session.snapStep &&
     precision === session.precision &&
     currentZone === session.currentZone &&
+    precisionHold === (session.precisionHold ?? null) &&
     originSlot.minutes === session.originSlot.minutes &&
     currentSlot.day.getTime() === session.currentSlot.day.getTime() &&
     currentSlot.minutes === session.currentSlot.minutes
@@ -427,6 +682,7 @@ function resnapSession(
     ...session,
     snapStep,
     precision,
+    precisionHold,
     originSlot,
     currentSlot,
     currentZone,
@@ -468,14 +724,15 @@ export function useCalendarDrag(
       lastKeysRef.current = keys;
       const s = sessionRef.current;
       if (!s) return;
-      const updated = resnapSession(
+      const updated = stepSession(
         s,
         clientX,
         clientY,
         keys,
         optsRef.current.hourH,
+        didDragRef.current,
       );
-      // Same step, origin, and slot as before (e.g. a held key repeat).
+      // Nothing a render would show changed (e.g. a held key repeat).
       if (!updated) return;
       if (s.pointerType === 'touch' && claimedRef.current) {
         const prevMs = tickInstantMs(s);
@@ -737,9 +994,10 @@ export function useCalendarDrag(
     };
 
     /**
-     * Cmd (macOS) / Ctrl (elsewhere) pressed or released mid-drag re-snaps the
-     * gesture where the pointer already is — no pointermove needed. These keys
-     * are never preventDefault-ed. Escape keeps winning: it is checked first.
+     * Cmd (macOS) / Ctrl (elsewhere) pressed or released mid-drag engages or
+     * drops the reduced-gain hold where the pointer already is — no pointermove
+     * needed. These keys are never preventDefault-ed. Escape keeps winning: it
+     * is checked first.
      */
     const onKeyEvent = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -851,7 +1109,8 @@ export function useCalendarDrag(
       );
       const kind: DragKind = gesture.kind;
 
-      // Live for the gesture: a Cmd / Ctrl press mid-drag re-snaps it.
+      // Live for the gesture: a Cmd / Ctrl press mid-drag engages precision,
+      // and a release drops it back to this coarse grid.
       const { precision, snapStep } = dragGrid(hourH, e.pointerType, e);
 
       const originalStart = new Date(event.start_time);
@@ -999,8 +1258,8 @@ export function useCalendarDrag(
   // drag must not flash a preview.
   const preview = session && didDrag ? computePreview(session) : null;
 
-  // The badge is only honest while a timed gesture is actually on the 1-minute
-  // grid: an all-day drag (or a timed one dragged into the all-day band) is not.
+  // The badge is only honest while a timed gesture is running at the reduced
+  // gain: an all-day drag (or a timed one dragged into the all-day band) is not.
   const precisionSnap =
     session !== null &&
     session.pointerType !== 'touch' &&

@@ -1410,19 +1410,6 @@ test('snapStepMinutes: unusable hourH → coarsest rung', () => {
   assert.equal(snapStepMinutes(-48), 30);
 });
 
-test('snapStepMinutes: precision is 1 minute at every zoom', () => {
-  assert.equal(SNAP_MINUTES, 1);
-  assert.equal(snapStepMinutes(HOUR_H_BASE, true), SNAP_MINUTES);
-  assert.equal(snapStepMinutes(HOUR_H_MAX, true), SNAP_MINUTES);
-  assert.equal(snapStepMinutes(1, true), SNAP_MINUTES);
-  // The hourH guard comes after the precision check.
-  assert.equal(snapStepMinutes(NaN, true), SNAP_MINUTES);
-  assert.equal(snapStepMinutes(Number.POSITIVE_INFINITY, true), SNAP_MINUTES);
-  assert.equal(snapStepMinutes(Number.NEGATIVE_INFINITY, true), SNAP_MINUTES);
-  assert.equal(snapStepMinutes(0, true), SNAP_MINUTES);
-  assert.equal(snapStepMinutes(-48, true), SNAP_MINUTES);
-});
-
 test('minutesFromY: 88px at hourH=88 → 60', () => {
   assert.equal(minutesFromY(88, 88), 60);
   assert.equal(minutesFromY(0, 88), 0);

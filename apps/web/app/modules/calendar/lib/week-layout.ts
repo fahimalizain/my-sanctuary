@@ -26,16 +26,16 @@ export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
 /**
- * Finest grid step, in minutes: the precision-modifier step, and the default
- * step of `snapMinutes` and the range helpers. Grid create / move / resize use
- * `snapStepMinutes` instead; this stays the off-grid cleanup step and the
- * click-create fallback.
+ * Finest grid, in minutes: the default step of `snapMinutes` and the range
+ * helpers, and the minimum duration a drag-create can produce. Grid create /
+ * move / resize hit-test `snapStepMinutes` instead — precision is a scaled gain
+ * (`snappedMinuteDelta`), not this step on every row.
  */
 export const SNAP_MINUTES = 1;
 /**
- * Grid step (minutes) for create / move / resize at the default zoom and
- * above. Set by the gesture, not by the pointer type: touch, mouse, and pen
- * all share it.
+ * Grid step (minutes) for create / move / resize at the default zoom and above.
+ * Derived from the zoom, never from the pointer type: touch, mouse, and pen all
+ * share it.
  */
 export const SNAP_STEP_BASE = 5;
 /** Coarse steps (minutes) that a zoomed-out grid may step up to. */
@@ -1280,8 +1280,10 @@ export function snapMinutes(min: number, step = SNAP_MINUTES): number {
 }
 
 /**
- * Grid step (minutes) for a drag at `hourH`. Never finer than
- * `SNAP_STEP_BASE` unless `precision` is set, which gives `SNAP_MINUTES`.
+ * Coarse grid step (minutes) for a drag at `hourH` — the absolute grid, and the
+ * only grid a create / move / resize hit-tests against. Never finer than
+ * `SNAP_STEP_BASE`: 1-minute precision is not a finer absolute grid, it is the
+ * scaled `snappedMinuteDelta` gain.
  *
  * At `HOUR_H_BASE` and above the step is always `SNAP_STEP_BASE`, including
  * `HOUR_H_MAX`. Below it, the step is the smallest coarse rung whose on-screen
@@ -1293,8 +1295,7 @@ export function snapMinutes(min: number, step = SNAP_MINUTES): number {
  * `HOUR_H_BASE` is only 4px, and it stays the step. Coarsening is for zooming
  * out, not for the default zoom, so max zoom can never buy a finer grid.
  */
-export function snapStepMinutes(hourH: number, precision = false): number {
-  if (precision) return SNAP_MINUTES;
+export function snapStepMinutes(hourH: number): number {
   if (!Number.isFinite(hourH) || hourH <= 0) return SNAP_STEP_COARSEST;
   if (hourH >= HOUR_H_BASE) return SNAP_STEP_BASE;
   for (const step of SNAP_STEP_COARSE_LADDER) {
