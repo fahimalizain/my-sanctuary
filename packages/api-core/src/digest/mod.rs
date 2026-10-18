@@ -49,8 +49,8 @@ pub use repo::{
 };
 pub use sleep::{
     bed_minutes_past_noon, marker_kind, resolve_sleep_category_id, wake_minutes_past_midnight,
-    DayAnchors, MarkerKind, NightRow, SleepMarker, SleepSource, ALGO_VERSION,
-    DEFAULT_SLEEP_SECS, SLEEP_PAIR_MAX_SECS, SYNTHETIC_SLEEP_CATEGORY_ID,
+    DayAnchors, MarkerKind, NightRow, SleepMarker, SleepSource, ALGO_VERSION, DEFAULT_SLEEP_SECS,
+    SLEEP_INTERRUPTION_MAX_SECS, SLEEP_PAIR_MAX_SECS, SYNTHETIC_SLEEP_CATEGORY_ID,
 };
 pub use tick::{
     digest_status, ensure_backfill_job, run_digest_tick, run_digest_tick_user, BackfillJob,
@@ -630,6 +630,16 @@ pub fn digest_days(
     for night in &paired {
         paired_marker_indices.insert(night.asleep_idx);
         paired_marker_indices.insert(night.woke_idx);
+        // A night's interior markers are intermediates of it, not nights of
+        // their own: every marker whose start lies inside the night's span is
+        // consumed, endpoints included. Without this the 23:30 wake and 23:35
+        // bedtime of a 23:00 → 06:00 night would be estimated into a second
+        // (phantom) night.
+        for (index, marker) in markers.iter().enumerate() {
+            if marker.start_unix >= night.asleep_unix && marker.start_unix <= night.woke_unix {
+                paired_marker_indices.insert(index);
+            }
+        }
         // Bedtime minutes are measured in the wake date's day zone; when that
         // date has no vote and no earlier vote, the wake marker's own zone.
         let bed_zone =

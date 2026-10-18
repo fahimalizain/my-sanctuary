@@ -87,7 +87,8 @@ pub use digest::{
     DayDigest, DigestEvent, DigestEventRow, DigestJobKind, DigestQueueMessage, DigestRepo,
     DigestStatus, DigestTickReport, EventSpan, EventSpanRow, HourSeconds, JobStatus, MarkerKind,
     NightRow, ReclassifyRow, SleepMarker, SleepSource, WorkerQueueMessage, ALGO_VERSION,
-    DEFAULT_SLEEP_SECS, DIGEST_TICK_BUDGET_DAYS, SLEEP_PAIR_MAX_SECS, SYNTHETIC_SLEEP_CATEGORY_ID,
+    DEFAULT_SLEEP_SECS, DIGEST_TICK_BUDGET_DAYS, SLEEP_INTERRUPTION_MAX_SECS, SLEEP_PAIR_MAX_SECS,
+    SYNTHETIC_SLEEP_CATEGORY_ID,
 };
 pub use google_color::{
     canonicalize_hex, is_event_label_hex, parse_hex_rgb, snap_to_event_label_hex,

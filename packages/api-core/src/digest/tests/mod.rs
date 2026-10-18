@@ -694,14 +694,16 @@ fn touching_markers_pair_into_a_real_night() {
 fn a_short_evening_pair_does_not_steal_the_morning_wake() {
     // Four markers, one night: the 23:30 wake and the 23:35 bedtime are
     // intermediates of 23:00 → 06:00. The old oldest-asleep-first walk paired
-    // 23:00 with 23:30 (0.5h) and then 23:35 with 06:00 (~6.4h).
+    // 23:00 with 23:30 (0.5h) and then 23:35 with 06:00 (~6.4h); the merge step
+    // folds the 5-minute interruption back into the night.
     let events = vec![
         marker("asleep-1", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
         marker("woke-1", "Woke Up", "2026-01-01T23:30:00+05:30", "2026-01-01T23:31:00+05:30"),
         marker("asleep-2", "Asleep", "2026-01-01T23:35:00+05:30", "2026-01-01T23:36:00+05:30"),
         marker("woke-2", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
     ];
-    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
+    let dates = ["2026-01-01".to_string(), "2026-01-02".to_string()];
+    let days = digest_days(&events, &dates, NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
     let nights = all_nights(&days);
     assert_eq!(
         nights.len(),
@@ -714,12 +716,140 @@ fn a_short_evening_pair_does_not_steal_the_morning_wake() {
     assert_eq!(night.wake_date, "2026-01-02", "the morning's civil date");
     assert_eq!(night.asleep_at, "2026-01-01T17:30:00Z", "23:00 IST");
     assert_eq!(night.woke_at, "2026-01-02T00:30:00Z", "06:00 IST");
+    assert_eq!(night.bed_min_past_noon, 660, "23:00 → 660, not the 23:35 restart");
+    assert_eq!(night.wake_min_past_midnight, 360, "06:00 → 360");
     assert!(
         nights
             .iter()
             .all(|night| night.woke_at != "2026-01-01T18:00:00Z"),
         "the 23:30 wake must not pair with the 23:00 bedtime"
     );
+    // The consumed interior markers must not be estimated into a night of
+    // their own: the 23:30 wake alone would otherwise be an `est_no_asleep`
+    // night starting 6.5h before it.
+    assert!(
+        find(&days, "2026-01-01").nights.is_empty(),
+        "the interruption is not a second night: {:?}",
+        find(&days, "2026-01-01").nights
+    );
+    assert!(
+        nights.iter().all(|night| night.source == SleepSource::Paired),
+        "no estimated night: {nights:?}"
+    );
+}
+
+#[test]
+fn a_nap_is_not_swallowed_by_the_night() {
+    // 14:00 → 15:00 is exactly 16h before the 06:00 wake, so a walk that gives
+    // each wake the earliest bedtime inside `[wake - 16h, wake)` turned these
+    // four markers into one 16h "night" with a 14:00 bedtime. A nap and a night
+    // 8h apart are two nights.
+    let events = vec![
+        marker("nap-asleep", "Asleep", "2026-01-01T14:00:00+05:30", "2026-01-01T14:01:00+05:30"),
+        marker("nap-woke", "Woke Up", "2026-01-01T15:00:00+05:30", "2026-01-01T15:01:00+05:30"),
+        marker("asleep", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
+        marker("woke", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
+    ];
+    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
+    let nights = all_nights(&days);
+    assert_eq!(nights.len(), 2, "the nap and the night: {nights:?}");
+    assert!(nights.iter().all(|night| night.source == SleepSource::Paired));
+
+    let nap = &nights[0];
+    assert_eq!(nap.seconds, 3600, "the nap is an hour");
+    assert_eq!(nap.wake_date, "2026-01-01", "it wakes that afternoon");
+    assert_eq!(nap.asleep_at, "2026-01-01T08:30:00Z", "14:00 IST");
+    assert_eq!(nap.woke_at, "2026-01-01T09:30:00Z", "15:00 IST");
+    assert_eq!(nap.bed_min_past_noon, 120, "14:00 → 120");
+
+    let night = &nights[1];
+    assert_eq!(night.seconds, 25_200, "23:00 → 06:00 is 7h");
+    assert_eq!(night.wake_date, "2026-01-02");
+    assert_eq!(night.asleep_at, "2026-01-01T17:30:00Z", "23:00 IST, not 14:00");
+    assert_eq!(night.bed_min_past_noon, 660, "23:00 → 660");
+    assert_eq!(night.wake_min_past_midnight, 360, "06:00 → 360");
+}
+
+#[test]
+fn a_sixty_minute_interruption_merges_and_sixty_one_does_not() {
+    // 22:00 → 23:00, then 00:00 → 06:00: the hour awake is exactly the cap, so
+    // the two pairs are one night whose seconds include the gap.
+    let merges = vec![
+        marker("asleep-1", "Asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:01:00+05:30"),
+        marker("woke-1", "Woke Up", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
+        marker("asleep-2", "Asleep", "2026-01-02T00:00:00+05:30", "2026-01-02T00:01:00+05:30"),
+        marker("woke-2", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
+    ];
+    let days = digest_days(&merges, &[], NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
+    let nights = all_nights(&days);
+    assert_eq!(nights.len(), 1, "60 minutes awake still one night: {nights:?}");
+    let night = &nights[0];
+    assert_eq!(night.seconds, 28_800, "22:00 → 06:00, the awake hour included");
+    assert_eq!(night.asleep_at, "2026-01-01T16:30:00Z", "22:00 IST");
+    assert_eq!(night.woke_at, "2026-01-02T00:30:00Z", "06:00 IST");
+    assert_eq!(night.wake_date, "2026-01-02");
+    assert_eq!(night.bed_min_past_noon, 600, "the first bedtime: 22:00 → 600");
+
+    // One second more awake and the pairs stay two nights.
+    let splits = vec![
+        marker("asleep-1", "Asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:01:00+05:30"),
+        marker("woke-1", "Woke Up", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
+        marker("asleep-2", "Asleep", "2026-01-02T00:00:01+05:30", "2026-01-02T00:01:00+05:30"),
+        marker("woke-2", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
+    ];
+    let days = digest_days(&splits, &[], NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
+    let nights = all_nights(&days);
+    assert_eq!(nights.len(), 2, "60m + 1s awake: {nights:?}");
+    assert_eq!(nights[0].seconds, 3600, "22:00 → 23:00");
+    assert_eq!(nights[0].wake_date, "2026-01-01");
+    assert_eq!(nights[1].seconds, 21_599, "00:00:01 → 06:00");
+    assert_eq!(nights[1].wake_date, "2026-01-02");
+    assert_eq!(nights[1].bed_min_past_noon, 720, "the second bedtime is past midnight");
+}
+
+#[test]
+fn a_merge_that_would_pass_sixteen_hours_stays_two_nights() {
+    // 13:00 → 13:30 and 14:00 → 06:00: the 30-minute gap is short enough to
+    // merge, but the merged 13:00 → 06:00 span is 17h. The cap wins.
+    let events = vec![
+        marker("asleep-1", "Asleep", "2026-01-01T13:00:00+05:30", "2026-01-01T13:01:00+05:30"),
+        marker("woke-1", "Woke Up", "2026-01-01T13:30:00+05:30", "2026-01-01T13:31:00+05:30"),
+        marker("asleep-2", "Asleep", "2026-01-01T14:00:00+05:30", "2026-01-01T14:01:00+05:30"),
+        marker("woke-2", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
+    ];
+    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
+    let nights = all_nights(&days);
+    assert_eq!(nights.len(), 2, "the span cap refuses the merge: {nights:?}");
+    assert_eq!(nights[0].seconds, 1800, "13:00 → 13:30");
+    assert_eq!(nights[0].wake_date, "2026-01-01");
+    assert_eq!(nights[1].seconds, 57_600, "14:00 → 06:00 is 16h exactly");
+    assert_eq!(nights[1].wake_date, "2026-01-02");
+    assert_eq!(nights[1].asleep_at, "2026-01-01T08:30:00Z", "14:00 IST, not 13:00");
+    assert_eq!(nights[1].bed_min_past_noon, 120, "14:00 → 120");
+}
+
+#[test]
+fn three_short_interruptions_merge_into_one_night() {
+    // Three greedy pairs, each 30 minutes apart and the whole span under 16h:
+    // the chain folds into one night from the first Asleep to the last Woke Up.
+    let events = vec![
+        marker("asleep-1", "Asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:01:00+05:30"),
+        marker("woke-1", "Woke Up", "2026-01-01T22:30:00+05:30", "2026-01-01T22:31:00+05:30"),
+        marker("asleep-2", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
+        marker("woke-2", "Woke Up", "2026-01-01T23:30:00+05:30", "2026-01-01T23:31:00+05:30"),
+        marker("asleep-3", "Asleep", "2026-01-02T00:00:00+05:30", "2026-01-02T00:01:00+05:30"),
+        marker("woke-3", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
+    ];
+    let days = digest_days(&events, &[], NOW, "Asia/Kolkata", None, None, DEFAULT_SLEEP_SECS);
+    let nights = all_nights(&days);
+    assert_eq!(nights.len(), 1, "one night: {nights:?}");
+    let night = &nights[0];
+    assert_eq!(night.source, SleepSource::Paired);
+    assert_eq!(night.seconds, 28_800, "22:00 → 06:00");
+    assert_eq!(night.asleep_at, "2026-01-01T16:30:00Z", "the first Asleep");
+    assert_eq!(night.woke_at, "2026-01-02T00:30:00Z", "the last Woke Up");
+    assert_eq!(night.wake_date, "2026-01-02");
+    assert_eq!(night.bed_min_past_noon, 600, "22:00 → 600");
 }
 
 #[test]
@@ -1294,7 +1424,9 @@ fn an_empty_rebuild_still_produces_a_zero_day() {
     assert!(days[0].hour_seconds.is_empty());
     assert!(days[0].nights.is_empty());
     assert_eq!(days[0].computed_at, "2026-01-02T06:00:00Z");
-    assert_eq!(ALGO_VERSION, 1);
+    // `2`: the latest-wake-first pairing walk (version `1`) stored wrong
+    // nights, so a mismatch forces every day to be rebuilt.
+    assert_eq!(ALGO_VERSION, 2);
 }
 
 #[test]
