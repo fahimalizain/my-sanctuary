@@ -103,6 +103,12 @@ Tasks/events that get postponed (rescheduled to another day or week) are tracked
 
 ## Consistency & Rules
 
+> **Implemented model:** the decisions that shipped are recorded in
+> [ADR 0008: Consistency rules and The Record](adr/0008-consistency-and-the-record.md).
+> Where this section still describes per-event conditions or percentage goals,
+> the ADR is authoritative: rules are typed, scored over category aggregates,
+> and The Record is descriptive only.
+
 Sanctuary tracks how consistent you are with your personal commitments by letting you define **custom rules** that are checked against your calendar and task data.
 
 ### Custom Rules
@@ -183,6 +189,7 @@ Google Calendar is the **source of truth** for all scheduling:
 The current authentication implementation uses **Gorilla Sessions with `CookieStore`**, which stores the entire session (including Google OAuth access tokens and refresh tokens) in a **client-side, `HttpOnly` cookie** signed by `SESSION_SECRET`.
 
 **Current behavior:**
+
 - ✅ Signed with HMAC-SHA256 — prevents tampering
 - ✅ `HttpOnly` — JavaScript cannot read the cookie
 - ✅ `Secure` (in production) — only sent over HTTPS
