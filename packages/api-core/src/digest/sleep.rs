@@ -1,7 +1,7 @@
 //! Sleep nights: marker detection, pairing, and estimation.
 //!
 //! Ported from `calendar_ipynb/enforcement/scorer.py` (`_paired_nights`) and
-//! `calendar_ipynb/sleep_events.py` (`insert_sleep_events`), with two
+//! `calendar_ipynb/sleep_events.py` (`insert_sleep_events`), with three
 //! deliberate corrections:
 //!
 //! 1. **Instants.** A night runs from the **start** of the `Asleep` event to
@@ -11,6 +11,10 @@
 //!    `scorer.py` already used both starts; we keep that.
 //! 2. **No 2-hour floor.** `scorer.py`'s `SLEEP_PAIR_MIN_HOURS = 2.0` is gone:
 //!    a paired night only needs a positive duration. The 16-hour cap stays.
+//! 3. **No cascade.** `scorer.py`'s pairing walk is replaced: wakes are
+//!    consumed latest-first and every marker the chosen night spans is
+//!    consumed with it, so a short evening pair cannot steal the morning
+//!    wake. See [`pair_markers`].
 //!
 //! All durations are integer **seconds** (never fractional minutes). The
 //! user-facing word is minutes; divide by 60 only at read time (slice 5).
@@ -157,13 +161,28 @@ pub(crate) struct PairedNight {
     pub seconds: i64,
 }
 
-/// Greedy marker pairing — the `scorer.py` `_paired_nights` walk.
+/// Marker pairing. **Deliberately different** from `scorer.py`'s
+/// `_paired_nights`, which walks Asleep markers oldest-first and gives each
+/// the first unused wake inside `(0, 16h]`.
 ///
-/// Asleep starts and wake starts are sorted; for each Asleep (in order) the
-/// **first unused** wake whose delta lies in `(0, 16h]` is consumed. A wake
-/// that fails the window is *not* consumed, so a later Asleep may still take
-/// it. A wake that is exactly `16h` after the Asleep pairs; `16h + 1s` does
-/// not. Zero/negative deltas never pair.
+/// That walk cascades: a 30-minute evening pair (Asleep 23:00, Woke Up 23:30)
+/// takes the evening wake, the real bedtime (Asleep 23:35) then takes the
+/// morning wake, and one night becomes two — 0.5h plus ~6.4h, instead of the
+/// 23:00 → 06:00 night those four markers describe. This walk instead:
+///
+/// 1. Takes the Woke Up markers **latest to earliest**. For each still-unused
+///    wake it pairs the **earliest unused Asleep** whose start lies in
+///    `[wake - 16h, wake)` — the longest valid night ending at that wake.
+///    The window is closed at the bottom, so `16h` exactly pairs.
+/// 2. **Consumes every marker** (Asleep and Woke) whose start lies in
+///    `[asleep, wake]`, endpoints included. Those are intermediate markers of
+///    the same night and must not pair again.
+///
+/// A wake with no unused Asleep inside its window stays unpaired; estimation
+/// may still use it. The duration rules are unchanged: `(0, 16h]` pairs, zero
+/// and negative never do, `16h` exactly pairs and `16h + 1s` does not. The
+/// 2-hour floor stays gone, so a **lone** short pair (22:00 → 22:30) still
+/// counts.
 ///
 /// `markers` may be in any order; indices in the result refer to it.
 pub(crate) fn pair_markers(markers: &[SleepMarker]) -> Vec<PairedNight> {
@@ -183,30 +202,50 @@ pub(crate) fn pair_markers(markers: &[SleepMarker]) -> Vec<PairedNight> {
     asleep.sort_by_key(|&index| markers[index].start_unix);
     woke.sort_by_key(|&index| markers[index].start_unix);
 
-    let mut used_wakes: Vec<bool> = vec![false; woke.len()];
+    let mut used_asleep: Vec<bool> = vec![false; asleep.len()];
+    let mut used_woke: Vec<bool> = vec![false; woke.len()];
     let mut nights = Vec::new();
-    for &asleep_idx in &asleep {
-        let asleep_unix = markers[asleep_idx].start_unix;
-        for (wake_slot, &woke_idx) in woke.iter().enumerate() {
-            if used_wakes[wake_slot] {
-                continue;
-            }
-            let delta = markers[woke_idx].start_unix - asleep_unix;
-            if delta <= 0 || delta > SLEEP_PAIR_MAX_SECS {
-                // Skipped, NOT consumed — `scorer.py` keeps scanning.
-                continue;
-            }
-            used_wakes[wake_slot] = true;
-            nights.push(PairedNight {
-                asleep_idx,
-                woke_idx,
-                asleep_unix,
-                woke_unix: markers[woke_idx].start_unix,
-                wake_date: civil_date_in_zone(markers[woke_idx].start_unix, &markers[woke_idx].zone),
-                seconds: delta,
-            });
-            break;
+    // Latest wake first, so the longest night claims the markers it spans
+    // before any earlier wake can carve them up.
+    for wake_slot in (0..woke.len()).rev() {
+        if used_woke[wake_slot] {
+            continue;
         }
+        let woke_idx = woke[wake_slot];
+        let woke_unix = markers[woke_idx].start_unix;
+        // `asleep` is sorted, so the first match is the earliest bedtime — the
+        // longest night ending at this wake. Zero and negative deltas fail the
+        // strict `start < wake`, and `16h + 1s` fails `start >= floor`.
+        let floor = woke_unix - SLEEP_PAIR_MAX_SECS;
+        let found = asleep.iter().enumerate().find(|(slot, &index)| {
+            let start = markers[index].start_unix;
+            !used_asleep[*slot] && start >= floor && start < woke_unix
+        });
+        let Some((_, &asleep_idx)) = found else {
+            // No bedtime inside `[wake - 16h, wake)`: the wake stays unpaired
+            // and is left to estimation.
+            continue;
+        };
+        let asleep_unix = markers[asleep_idx].start_unix;
+        // Every marker this night spans is an intermediate of it, endpoints
+        // included — a 23:30 wake and a 23:35 bedtime inside 23:00 → 06:00
+        // must not become a pair of their own.
+        for (slot, &index) in asleep.iter().enumerate() {
+            let start = markers[index].start_unix;
+            used_asleep[slot] |= start >= asleep_unix && start <= woke_unix;
+        }
+        for (slot, &index) in woke.iter().enumerate() {
+            let start = markers[index].start_unix;
+            used_woke[slot] |= start >= asleep_unix && start <= woke_unix;
+        }
+        nights.push(PairedNight {
+            asleep_idx,
+            woke_idx,
+            asleep_unix,
+            woke_unix,
+            wake_date: civil_date_in_zone(woke_unix, &markers[woke_idx].zone),
+            seconds: woke_unix - asleep_unix,
+        });
     }
     nights.sort_by_key(|night| (night.wake_date.clone(), night.asleep_unix));
     nights

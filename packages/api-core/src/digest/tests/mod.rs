@@ -636,8 +636,41 @@ fn touching_markers_pair_into_a_real_night() {
 }
 
 #[test]
-fn a_short_evening_pair_beats_the_removed_two_hour_floor() {
-    // Asleep 22:00, Woke Up 22:30 the same evening → a 1800s paired night.
+fn a_short_evening_pair_does_not_steal_the_morning_wake() {
+    // Four markers, one night: the 23:30 wake and the 23:35 bedtime are
+    // intermediates of 23:00 → 06:00. The old oldest-asleep-first walk paired
+    // 23:00 with 23:30 (0.5h) and then 23:35 with 06:00 (~6.4h).
+    let events = vec![
+        marker("asleep-1", "Asleep", "2026-01-01T23:00:00+05:30", "2026-01-01T23:01:00+05:30"),
+        marker("woke-1", "Woke Up", "2026-01-01T23:30:00+05:30", "2026-01-01T23:31:00+05:30"),
+        marker("asleep-2", "Asleep", "2026-01-01T23:35:00+05:30", "2026-01-01T23:36:00+05:30"),
+        marker("woke-2", "Woke Up", "2026-01-02T06:00:00+05:30", "2026-01-02T06:01:00+05:30"),
+    ];
+    let days = digest_days(&events, &["2026-01-02".to_string()], NOW, "Asia/Kolkata", None);
+    let nights = all_nights(&days);
+    assert_eq!(
+        nights.len(),
+        1,
+        "one night, not an evening pair plus a morning: {nights:?}"
+    );
+    let night = &nights[0];
+    assert_eq!(night.seconds, 25_200, "23:00 → 06:00 is 7h");
+    assert_eq!(night.source, SleepSource::Paired);
+    assert_eq!(night.wake_date, "2026-01-02", "the morning's civil date");
+    assert_eq!(night.asleep_at, "2026-01-01T17:30:00Z", "23:00 IST");
+    assert_eq!(night.woke_at, "2026-01-02T00:30:00Z", "06:00 IST");
+    assert!(
+        nights
+            .iter()
+            .all(|night| night.woke_at != "2026-01-01T18:00:00Z"),
+        "the 23:30 wake must not pair with the 23:00 bedtime"
+    );
+}
+
+#[test]
+fn a_lone_short_pair_still_counts() {
+    // Asleep 22:00, Woke Up 22:30 the same evening, with no later wake to
+    // cascade to → a 1800s paired night. The 2-hour floor stays removed.
     let events = vec![
         marker("asleep", "Asleep", "2026-01-01T22:00:00+05:30", "2026-01-01T22:20:00+05:30"),
         marker("woke", "Woke Up", "2026-01-01T22:30:00+05:30", "2026-01-01T22:31:00+05:30"),
