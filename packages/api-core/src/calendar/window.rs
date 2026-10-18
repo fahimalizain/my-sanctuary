@@ -18,7 +18,7 @@ use url::Url;
 
 use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use super::apply::{
-    classify_replica_item, row_from_new_event, EventsPage, ReplicaApplyAction,
+    classify_replica_item, row_from_new_event, EventClassifyCtx, EventsPage, ReplicaApplyAction,
 };
 use super::google::encode_path_segment;
 use super::replica::{lease_expires_at, mint_lease_owner};
@@ -39,6 +39,11 @@ use crate::token::GoogleAccess;
 /// Returns ephemeral events only when write-through was skipped (lease miss).
 /// When the lease was held and pages applied, returns an empty vec (rows are
 /// already in D1 for the subsequent cache query).
+///
+/// `ctx` stamps the app-owned leaf `category_id` on every write-through upsert
+/// (the SQL upsert **overwrites** the column). The caller passes the taxonomy
+/// it already loaded for paint; [`EventClassifyCtx::none`] only when that load
+/// failed — listing must not 500 because taxonomy is missing.
 pub async fn fetch_and_apply_window(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -48,6 +53,7 @@ pub async fn fetch_and_apply_window(
     time_min_rfc3339: &str,
     time_max_rfc3339: &str,
     now_rfc3339: &str,
+    ctx: &EventClassifyCtx<'_>,
 ) -> Result<Vec<CalendarEvent>, CalendarError> {
     let owner = mint_lease_owner();
     let expires = lease_expires_at(now_rfc3339);
@@ -67,6 +73,7 @@ pub async fn fetch_and_apply_window(
         now_rfc3339,
         acquired,
         &owner,
+        ctx,
     )
     .await;
 
@@ -88,6 +95,7 @@ async fn fetch_pages(
     now_rfc3339: &str,
     write_through: bool,
     lease_owner: &str,
+    ctx: &EventClassifyCtx<'_>,
 ) -> Result<Vec<CalendarEvent>, CalendarError> {
     let mut page_token: Option<String> = None;
     let mut ephemeral: Vec<CalendarEvent> = Vec::new();
@@ -123,7 +131,7 @@ async fn fetch_pages(
         if write_through {
             let mut to_upsert = Vec::new();
             for item in &items {
-                match classify_replica_item(item, &cal.id, now_rfc3339) {
+                match classify_replica_item(item, &cal.id, now_rfc3339, ctx) {
                     ReplicaApplyAction::SoftDelete { google_event_id } => {
                         let deleted = events
                             .delete_by_google_event_id_if_owner(
@@ -165,7 +173,7 @@ async fn fetch_pages(
             }
         } else {
             for item in &items {
-                match classify_replica_item(item, &cal.id, now_rfc3339) {
+                match classify_replica_item(item, &cal.id, now_rfc3339, ctx) {
                     ReplicaApplyAction::SoftDelete { .. } => {
                         // No D1 row to delete; omit from ephemeral payload.
                     }

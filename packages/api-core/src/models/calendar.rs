@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{de_d1_bool, de_empty_string};
+use super::{de_d1_bool, de_empty_string, de_optional_empty_string};
 
 /// A calendar from the user's `/users/me/calendarList`, as stored in
 /// `google_calendars`. Doubles as the D1 row projection: field names match the
@@ -146,6 +146,10 @@ pub struct NewCalendar {
 /// **Ownership:**
 /// - [`CalendarEvent::task_id`] is app-owned and must never be in the
 ///   Google-overwrite set (SQL `COALESCE` on upsert).
+/// - [`CalendarEvent::category_id`] is the app-owned **leaf** category stamped
+///   by the event classifier at write time; `None` = unclassified (never the
+///   `untracked` sink's id). A Google merge overwrites it from the incoming
+///   row, so every production upsert must carry a real classifier context.
 /// - Identity columns (`ical_uid`, `sequence`, `status`, `recurring_event_id`,
 ///   `original_start`, `start_time_zone`, `end_time_zone`, `is_all_day`,
 ///   `raw_json`) are Google-owned; a merge may overwrite them.
@@ -204,18 +208,41 @@ pub struct CalendarEvent {
     /// HTTP envelope (`skip_serializing`).
     #[serde(default, deserialize_with = "de_empty_string", skip_serializing)]
     pub raw_json: String,
+    /// App-owned leaf category stamped at write time. `None` = unclassified
+    /// (never the `untracked` sink's id). D1 `NULL` and `""` both read as
+    /// `None`. Included on the HTTP envelope for later report slices.
+    #[serde(default, deserialize_with = "de_optional_empty_string")]
+    pub category_id: Option<String>,
+    /// Google `organizer.self` (or organizer absent) → `true`. D1 `INTEGER 0/1`;
+    /// absent on legacy JSON reads as `true` ("no organizer").
+    #[serde(default = "default_is_self_organized", deserialize_with = "de_d1_bool")]
+    pub is_self_organized: bool,
+    /// Google `eventType` (`default` / `focusTime` / `outOfOffice` /
+    /// `fromGmail`); `""` = unknown (legacy rows).
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub event_type: String,
     pub created_at: String,
     pub updated_at: String,
     /// Soft-delete marker; reads filter on `deleted_at IS NULL`.
     pub deleted_at: Option<String>,
 }
 
+/// `[`CalendarEvent::is_self_organized`]` default when the field is absent:
+/// legacy JSON fixtures (and pre-0019 rows) predate the organizer column and
+/// the migration's schema default is `1`.
+fn default_is_self_organized() -> bool {
+    true
+}
+
 /// Insert/update input for [`crate::repo::CalendarEventRepo::upsert`] /
 /// `upsert_batch`. The D1 implementation generates the UUID `id` and the
 /// `created_at`/`updated_at` timestamps.
 ///
-/// **Ownership:** [`NewCalendarEvent::task_id`] is app-owned (SQL COALESCE).
-/// Identity columns are Google-owned and a merge may overwrite them.
+/// **Ownership:** [`NewCalendarEvent::task_id`] is app-owned (SQL COALESCE) and
+/// so is [`NewCalendarEvent::category_id`] — but the category **overwrites**
+/// (`excluded.category_id`), so a retitle can replace or clear it; only a real
+/// classifier context may fill it. Identity columns are Google-owned and a
+/// merge may overwrite them.
 /// [`NewCalendarEvent::raw_json`] is stored for later schema migrations and
 /// must never be exposed on the HTTP envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +282,16 @@ pub struct NewCalendarEvent {
     pub is_all_day: bool,
     /// Full Google event JSON; never expose on the HTTP envelope.
     pub raw_json: String,
+    /// Leaf category from
+    /// [`crate::categories::classify_event_leaf`]. `None` = unclassified.
+    /// Bound as `NULLIF(?, '')`; the upsert **overwrites** (including back to
+    /// `NULL`), so a Google merge cannot keep a stale stamp. App-owned.
+    pub category_id: Option<String>,
+    /// Google organizer flag (`organizer.self`, or no organizer → `true`).
+    /// Google-owned; bound as `1`/`0`.
+    pub is_self_organized: bool,
+    /// Google `eventType` (never coerced); `""` = unknown. Google-owned.
+    pub event_type: String,
 }
 
 /// A Google Calendar watch channel (`events.watch` subscription), as stored in
@@ -512,6 +549,9 @@ mod tests {
             end_time_zone: "UTC".to_string(),
             is_all_day: false,
             raw_json: r#"{"id":"google-evt-1","secret":"must-not-leak"}"#.to_string(),
+            category_id: Some("cat-work".to_string()),
+            is_self_organized: true,
+            event_type: "default".to_string(),
             created_at: "2026-08-17T12:00:00Z".to_string(),
             updated_at: "2026-08-17T12:00:00Z".to_string(),
             deleted_at: None,
@@ -532,6 +572,12 @@ mod tests {
         }
         assert_eq!(value["start_time"], "2026-08-18T09:00:00Z");
         assert_eq!(value["task_id"], "task-1", "task link is part of the payload");
+        assert_eq!(
+            value["category_id"], "cat-work",
+            "the stamped category is part of the payload"
+        );
+        assert_eq!(value["is_self_organized"], true);
+        assert_eq!(value["event_type"], "default");
         assert!(
             value.get("raw_json").is_none(),
             "raw_json must never serialize onto the HTTP envelope: {value}"
@@ -562,6 +608,9 @@ mod tests {
             end_time_zone: String::new(),
             is_all_day: false,
             raw_json: r#"{"private":true}"#.to_string(),
+            category_id: None,
+            is_self_organized: false,
+            event_type: String::new(),
             created_at: "2026-08-17T12:00:00Z".to_string(),
             updated_at: "2026-08-17T12:00:00Z".to_string(),
             deleted_at: None,
@@ -620,6 +669,44 @@ mod tests {
         assert_eq!(event.google_etag, "");
         assert_eq!(event.recurrence, "");
         assert_eq!(event.task_id, "", "NULL task_id maps to empty string");
+        assert_eq!(
+            event.category_id, None,
+            "legacy rows (column absent) read as unclassified"
+        );
+        assert!(
+            event.is_self_organized,
+            "absent organizer flag defaults to organized (schema default 1)"
+        );
+        assert_eq!(event.event_type, "", "absent eventType reads as unknown");
+    }
+
+    #[test]
+    fn calendar_event_category_id_reads_null_and_empty_as_none() {
+        for raw in ["null", "\"\"", "\"  \""] {
+            let event: CalendarEvent = serde_json::from_str(&format!(
+                r#"{{
+                    "id": "evt-1", "calendar_id": "cal-1", "google_event_id": "g-1",
+                    "last_synced_at": "x", "title": "T", "start_time": "s", "end_time": "e",
+                    "category_id": {raw}, "is_self_organized": 0, "event_type": "focusTime",
+                    "created_at": "x", "updated_at": "x", "deleted_at": null
+                }}"#
+            ))
+            .unwrap();
+            assert_eq!(event.category_id, None, "raw {raw} must read as None");
+            assert_eq!(event.event_type, "focusTime", "eventType is never coerced");
+        }
+
+        let event: CalendarEvent = serde_json::from_str(
+            r#"{
+                "id": "evt-1", "calendar_id": "cal-1", "google_event_id": "g-1",
+                "last_synced_at": "x", "title": "T", "start_time": "s", "end_time": "e",
+                "category_id": "cat-work", "is_self_organized": 0, "event_type": "",
+                "created_at": "x", "updated_at": "x", "deleted_at": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(event.category_id.as_deref(), Some("cat-work"));
+        assert!(!event.is_self_organized, "D1 INTEGER 0 reads as false");
     }
 
     #[test]

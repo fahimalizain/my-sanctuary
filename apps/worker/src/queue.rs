@@ -64,6 +64,14 @@ pub async fn queue(
             return Ok(());
         }
     };
+    let categories = match env.d1("DB") {
+        Ok(db) => crate::db::D1TaskCategoryRepo::new(db),
+        Err(err) => {
+            console_log!("queue: DB binding missing: {err} — acking batch");
+            batch.ack_all();
+            return Ok(());
+        }
+    };
 
     let messages = match batch.messages() {
         Ok(messages) => messages,
@@ -133,6 +141,7 @@ pub async fn queue(
             &cal,
             now_unix,
             &WorkerClock,
+            &categories,
         )
         .await;
 

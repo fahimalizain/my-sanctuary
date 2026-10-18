@@ -154,6 +154,7 @@ fn create_posts_json_to_google_and_upserts_the_cache() {
 
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -247,6 +248,7 @@ fn create_all_day_posts_civil_dates_not_date_time() {
 
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -279,6 +281,7 @@ fn create_all_day_ignores_start_time_zone() {
 
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -307,6 +310,7 @@ fn create_timed_with_time_zone_stamps_both_ends() {
 
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -333,6 +337,7 @@ fn create_timed_with_blank_time_zone_omits_the_key() {
 
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -359,6 +364,7 @@ fn create_with_is_all_day_false_stays_timed() {
 
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -384,6 +390,7 @@ fn create_all_day_with_non_civil_start_is_invalid_before_journal() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
 
@@ -413,6 +420,7 @@ fn create_without_description_omits_the_key() {
     input.description = None;
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -442,6 +450,7 @@ fn create_with_color_hex_sends_event_label_id() {
 
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -472,6 +481,7 @@ fn create_with_blank_color_hex_omits_color_keys() {
 
         pollster::block_on(create_event(
             &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+            &NO_TAXONOMY,
         ))
         .unwrap();
 
@@ -504,6 +514,7 @@ fn create_with_color_hex_and_empty_label_cache_is_invalid() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -526,6 +537,7 @@ fn create_with_color_hex_and_no_matching_label_is_invalid() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &cobalt_input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -547,6 +559,7 @@ fn create_with_color_hex_and_no_matching_label_is_invalid() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &banana_input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -565,6 +578,7 @@ fn create_missing_calendar_is_not_found() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -582,6 +596,7 @@ fn create_wrong_owner_is_not_found() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -601,6 +616,7 @@ fn create_soft_deleted_calendar_is_not_found() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -618,6 +634,7 @@ fn create_google_non_2xx_is_an_api_error() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
@@ -642,6 +659,7 @@ fn create_cache_failure_after_google_is_repo_error() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
 
@@ -685,6 +703,7 @@ fn create_409_duplicate_gets_existing_and_applies_cache() {
 
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -725,6 +744,7 @@ fn create_journal_insert_failure_skips_google() {
 
     let err = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
 
@@ -749,6 +769,7 @@ fn create_with_task_id_sends_extended_properties_and_maps_it_back() {
     input.task_id = Some("task-1".to_string());
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -790,6 +811,7 @@ fn create_without_task_id_sends_only_sanctuary_event_id() {
 
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -827,6 +849,7 @@ fn create_with_task_and_focus_sends_both_shared_keys() {
     input.sanctuary_focus = true;
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -874,6 +897,7 @@ fn create_with_task_but_no_focus_omits_the_focus_key() {
     input.sanctuary_focus = false;
     pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -907,6 +931,7 @@ fn create_with_task_priority_and_difficulty_snapshots_both_keys() {
     input.sanctuary_focus = false;
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input, NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -962,6 +987,7 @@ fn patch_posts_end_and_upserts_the_echoed_event() {
     let output = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1012,7 +1038,8 @@ fn patch_preserves_task_link_when_google_echoes_it() {
     let output = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
-    ))
+                &NO_TAXONOMY,
+        ))
     .unwrap();
 
     assert_eq!(output.event.task_id, "task-1");
@@ -1030,6 +1057,7 @@ fn patch_missing_calendar_is_not_found() {
     let err = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "g-1",
         "2026-08-19T11:00:00Z", NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -1048,6 +1076,7 @@ fn patch_google_non_2xx_is_an_api_error() {
     let err = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
@@ -1071,6 +1100,7 @@ fn patch_cache_failure_is_repo_after_google_commit() {
     let err = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::Repo(_)), "got {err:?}");
@@ -1112,6 +1142,7 @@ fn patch_fields_start_only_payload() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1155,6 +1186,7 @@ fn patch_fields_start_end_summary_payload() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1198,6 +1230,7 @@ fn patch_fields_description_only_payload() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1241,6 +1274,7 @@ fn patch_fields_description_empty_string_clears() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1271,6 +1305,7 @@ fn patch_fields_all_none_is_invalid() {
         "google-evt-created",
         &PatchEventFields::default(),
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -1296,7 +1331,8 @@ fn patch_sends_if_match_and_stores_new_etag() {
     let output = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
-    ))
+                &NO_TAXONOMY,
+        ))
     .unwrap();
 
     assert_eq!(output.event.google_etag, "e2");
@@ -1328,6 +1364,7 @@ fn patch_412_then_success_retries_with_fresh_etag() {
     let output = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1370,7 +1407,8 @@ fn patch_three_412s_is_conflict_without_disabling_calendar() {
     let err = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
-    ))
+                &NO_TAXONOMY,
+        ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::Conflict), "got {err:?}");
     assert_eq!(http.patches.lock().unwrap().len(), 3, "exactly 3 PATCH attempts");
@@ -1395,6 +1433,7 @@ fn patch_403_forbidden_for_non_organizer_does_not_retry() {
     let err = pollster::block_on(patch_event(
         &http, &calendars, &events, &ops, &access(), "cal-1", "google-evt-created",
         "2026-08-19T11:00:00Z", NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "got {err:?}");
@@ -1545,6 +1584,7 @@ fn update_event_for_user_wrong_owner_is_not_found() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -1608,6 +1648,7 @@ fn update_event_for_user_patches_owned_event() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1666,6 +1707,7 @@ fn update_event_for_user_moves_to_destination_calendar() {
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1737,7 +1779,8 @@ fn update_event_for_user_calendar_id_with_summary_is_invalid() {
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
-    ))
+                &NO_TAXONOMY,
+        ))
     .unwrap_err();
     assert!(
         matches!(err, CalendarError::Invalid(ref m) if m.contains("cannot be combined")),
@@ -1774,6 +1817,7 @@ fn update_event_for_user_same_calendar_is_noop() {
             calendar_id: Some("cal-1".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1810,6 +1854,7 @@ fn update_event_for_user_dest_missing_is_not_found() {
             calendar_id: Some("cal-missing".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -1848,6 +1893,7 @@ fn update_event_for_user_dest_other_user_is_not_found() {
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::NotFound), "got {err:?}");
@@ -1886,6 +1932,7 @@ fn update_event_for_user_dest_reader_is_invalid() {
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -1927,6 +1974,7 @@ fn update_event_for_user_source_reader_is_invalid() {
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -1963,6 +2011,7 @@ fn update_event_for_user_empty_calendar_id_is_invalid() {
             calendar_id: Some("  ".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -2007,6 +2056,7 @@ fn update_event_for_user_all_day_emits_start_end_date() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -2050,6 +2100,7 @@ fn update_event_for_user_all_day_accepts_rfc3339_prefix() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -2089,6 +2140,7 @@ fn update_event_for_user_timed_with_timezone_on_start_and_end() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -2127,6 +2179,7 @@ fn update_event_for_user_all_day_without_start_end_is_invalid() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -2163,6 +2216,7 @@ fn update_event_for_user_timezone_without_start_end_is_invalid() {
             calendar_id: None,
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -2199,6 +2253,7 @@ fn update_event_for_user_calendar_id_with_is_all_day_is_invalid() {
             calendar_id: Some("cal-2".to_string()),
         },
         NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -2225,6 +2280,7 @@ fn create_echo_upsert_same_google_id_keeps_one_local_row() {
 
     let output = pollster::block_on(create_event(
         &http, &calendars, &events, &ops, &access(), "u-1", &input(), NOW_UNIX,
+        &NO_TAXONOMY,
     ))
     .unwrap();
     let google_id = output.event.google_event_id.clone();
@@ -2239,6 +2295,8 @@ fn create_echo_upsert_same_google_id_keeps_one_local_row() {
         summary: Some("New meeting".into()),
         description: Some("About things".into()),
         recurrence: None,
+        organizer: None,
+        event_type: None,
         start: Some(GoogleEventTime {
             date_time: Some("2026-08-19T09:00:00Z".into()),
             date: None,

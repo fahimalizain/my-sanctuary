@@ -9,7 +9,7 @@ use super::cron::{sync_calendar_traced, SyncCalendarOutcome};
 use super::diagnostics::{mint_run_id, ReplicaWalkDiagnostic, ReplicaWalkMeta, ReplicaWalkTrigger};
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TaskCategoryRepo};
 use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339, Clock};
 use crate::token::GoogleAccess;
 
@@ -56,6 +56,9 @@ fn ack_skip() -> QueueSyncReport {
 /// skip gates, walk via [`sync_calendar_traced`] when still dirty, then decide
 /// [`QueueSyncAction`].
 ///
+/// `category_repo` feeds the write-time classifier (one no-seed taxonomy load
+/// per walk); a load failure only degrades the stamp, never the sync.
+///
 /// Never throws. Repo / walk failures Ack so cron can recover. Does not bump
 /// dirty on re-enqueue.
 pub async fn run_queue_sync(
@@ -67,6 +70,7 @@ pub async fn run_queue_sync(
     cal: &GoogleCalendar,
     now_unix: i64,
     clock: &dyn Clock,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> QueueSyncReport {
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
 
@@ -120,6 +124,7 @@ pub async fn run_queue_sync(
             deployed_version: String::new(),
             started_unix_ms: now_unix.saturating_mul(1000),
         },
+        category_repo,
     )
     .await;
 

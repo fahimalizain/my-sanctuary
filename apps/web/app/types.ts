@@ -53,6 +53,22 @@ export interface CalendarEvent {
   recurrence?: string;
   /** Google recurringEventId for instances; empty / missing = master or one-shot. */
   recurring_event_id?: string;
+  /**
+   * Stored leaf category id stamped at write time (slice 1). `null` /
+   * missing = unclassified (never the `untracked` sink's id). No UI reads it
+   * yet — later reports do.
+   */
+  category_id?: string | null;
+  /**
+   * Google `organizer.self` (or no organizer) → true; D1 INTEGER 0/1 read as
+   * a boolean. Missing on legacy rows.
+   */
+  is_self_organized?: boolean;
+  /**
+   * Google `eventType` (`default` / `focusTime` / `outOfOffice` / `fromGmail`);
+   * `''` / missing = unknown (legacy rows).
+   */
+  event_type?: string;
 }
 
 export type CalendarSyncAggregateStatus =

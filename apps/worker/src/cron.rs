@@ -162,6 +162,17 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
     };
 
+    // The write-time classifier's taxonomy source (leaf `category_id` stamps
+    // on every Google cache apply). A load failure inside api-core degrades to
+    // an unstamped row — never a failed tick.
+    let categories = match env.d1("DB") {
+        Ok(db) => crate::db::D1TaskCategoryRepo::new(db),
+        Err(err) => {
+            console_log!("cron: DB binding missing: {err} — skipping cron");
+            return;
+        }
+    };
+
     /// Live wall clock for replica lease renewal (never `SystemTime` on wasm32).
     struct WorkerClock;
     impl api_core::Clock for WorkerClock {
@@ -183,6 +194,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &tokens,
         &oauth,
         now_unix,
+        &categories,
     )
     .await;
     for error in &elongate.errors {
@@ -197,6 +209,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &tokens,
         &oauth,
         now_unix,
+        &categories,
     )
     .await;
     for error in &elongate_occurrences.errors {
@@ -224,6 +237,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             config.watch_callback_url.as_deref(),
             now_unix,
             &WorkerClock,
+            &categories,
         )
         .await;
         for error in &report.errors {

@@ -31,6 +31,100 @@ pub struct Harness {
     pub operations: SqliteCalendarEventOperationRepo,
 }
 
+/// A no-op [`TaskCategoryRepo`] for walk tests that do not exercise the
+/// write-time classifier: no living categories and no patterns, so api-core's
+/// `load_classify_taxonomy` yields an empty taxonomy and every cache apply
+/// stamps `category_id = NULL`.
+pub struct EmptyTaskCategoryRepo;
+
+#[async_trait::async_trait(?Send)]
+impl api_core::repo::TaskCategoryRepo for EmptyTaskCategoryRepo {
+    async fn list_by_user_id(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<api_core::models::TaskCategory>, api_core::repo::RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_by_id(
+        &self,
+        _id: &str,
+    ) -> Result<Option<api_core::models::TaskCategory>, api_core::repo::RepoError> {
+        Ok(None)
+    }
+
+    async fn insert(
+        &self,
+        _category: api_core::models::NewTaskCategory,
+    ) -> Result<api_core::models::TaskCategory, api_core::repo::RepoError> {
+        Err(api_core::repo::RepoError::Backend(
+            "EmptyTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _id: &str,
+        _updates: &api_core::models::UpdateTaskCategory,
+    ) -> Result<Option<api_core::models::TaskCategory>, api_core::repo::RepoError> {
+        Ok(None)
+    }
+
+    async fn soft_delete(
+        &self,
+        _id: &str,
+        _now_rfc3339: &str,
+    ) -> Result<(), api_core::repo::RepoError> {
+        Ok(())
+    }
+
+    async fn count_by_user_id(&self, _user_id: &str) -> Result<i64, api_core::repo::RepoError> {
+        Ok(0)
+    }
+
+    async fn count_children(&self, _category_id: &str) -> Result<i64, api_core::repo::RepoError> {
+        Ok(0)
+    }
+
+    async fn get_untracked(
+        &self,
+        _user_id: &str,
+    ) -> Result<Option<api_core::models::TaskCategory>, api_core::repo::RepoError> {
+        Ok(None)
+    }
+
+    async fn list_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<Vec<api_core::models::TaskCategoryPattern>, api_core::repo::RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_patterns_by_user_id(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<api_core::models::TaskCategoryPattern>, api_core::repo::RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn replace_patterns(
+        &self,
+        _category_id: &str,
+        _patterns: Vec<api_core::models::NewTaskCategoryPattern>,
+    ) -> Result<(), api_core::repo::RepoError> {
+        Err(api_core::repo::RepoError::Backend(
+            "EmptyTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn delete_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<(), api_core::repo::RepoError> {
+        Ok(())
+    }
+}
+
 impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(path) = self._path.take() {

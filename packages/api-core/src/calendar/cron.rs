@@ -1,3 +1,4 @@
+use super::apply::EventClassifyCtx;
 use super::catalog::refresh_calendar_list;
 use super::diagnostics::{
     classify_operator_warning, mint_run_id, operator_warning_record, CheckpointResult,
@@ -17,11 +18,13 @@ use super::watch::{
 use super::{
     CalendarError, CRON_MAX_REPLICA_CALENDARS, CRON_SYNC_STALE_SECS,
 };
+use crate::calendar_color::load_classify_taxonomy;
 use crate::config::OAuthConfig;
 use crate::models::GoogleCalendar;
 use crate::oauth::HttpClient;
 use crate::repo::{
-    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TokenRepo, WatchChannelRepo,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TokenRepo,
+    WatchChannelRepo,
 };
 use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339, Clock, FrozenClock};
 use crate::token::{is_refresh_auth_revoked, refresh_if_needed, GoogleAccess, TokenError};
@@ -194,6 +197,7 @@ pub async fn run_fallback_cron(
     oauth: &OAuthConfig,
     watch_callback_url: Option<&str>,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> CronReport {
     let clock = FrozenClock(now_unix);
     run_fallback_cron_with_clock(
@@ -207,6 +211,7 @@ pub async fn run_fallback_cron(
         watch_callback_url,
         now_unix,
         &clock,
+        category_repo,
     )
     .await
 }
@@ -225,6 +230,7 @@ pub async fn run_fallback_cron_with_clock(
     watch_callback_url: Option<&str>,
     now_unix: i64,
     clock: &dyn Clock,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> CronReport {
     let mut report = CronReport::default();
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
@@ -338,6 +344,7 @@ pub async fn run_fallback_cron_with_clock(
             &access,
             user_id,
             now_unix,
+            category_repo,
         )
         .await;
         report.errors.extend(repair_errors);
@@ -400,6 +407,7 @@ pub async fn run_fallback_cron_with_clock(
                         deployed_version: String::new(),
                         started_unix_ms: now_unix.saturating_mul(1000),
                     },
+                    category_repo,
                 )
                 .await;
                 report.diagnostics.push(traced.diagnostic);
@@ -755,6 +763,7 @@ pub async fn sync_calendar(
     access: &GoogleAccess,
     cal: &GoogleCalendar,
     now_rfc3339: &str,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
     let clock = FrozenClock::from_rfc3339(now_rfc3339);
     let result = sync_calendar_traced(
@@ -772,6 +781,7 @@ pub async fn sync_calendar(
             deployed_version: String::new(),
             started_unix_ms: 0,
         },
+        category_repo,
     )
     .await;
     result.outcome
@@ -792,6 +802,7 @@ pub async fn sync_calendar_traced(
     now_rfc3339: &str,
     clock: &dyn Clock,
     meta: ReplicaWalkMeta,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> SyncCalendarResult {
     let mut report = ReplicaApplyReport::default();
     report.phase = ReplicaWalkPhase::LeaseAcquire;
@@ -814,6 +825,7 @@ pub async fn sync_calendar_traced(
         now_unix,
         clock,
         &mut report,
+        category_repo,
     )
     .await;
 
@@ -855,6 +867,7 @@ pub async fn sync_calendar_traced(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_calendar_traced_inner(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -866,6 +879,7 @@ async fn sync_calendar_traced_inner(
     now_unix: i64,
     clock: &dyn Clock,
     report: &mut ReplicaApplyReport,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
     calendars
         .record_sync_attempt(&cal.id, now_rfc3339)
@@ -892,6 +906,16 @@ async fn sync_calendar_traced_inner(
         let dirty_snapshot = fresh.dirty_requested_generation;
         // Refresh event-label cache when empty or stale (TTL).
         ensure_event_labels(http, calendars, access, &fresh, now_rfc3339).await?;
+        // Write-time classifier context, loaded once per walk. A taxonomy
+        // failure must NOT fail the walk (later reclassify fills the gap):
+        // fall back to the empty context and keep syncing the Google data.
+        let loaded_taxonomy = load_classify_taxonomy(category_repo, &fresh.user_id)
+            .await
+            .ok();
+        let ctx = match &loaded_taxonomy {
+            Some(taxonomy) => taxonomy.event_ctx(&fresh.google_calendar_id),
+            None => EventClassifyCtx::none(),
+        };
         sync_replica(
             http,
             calendars,
@@ -902,6 +926,7 @@ async fn sync_calendar_traced_inner(
             &owner,
             clock,
             report,
+            &ctx,
         )
         .await?;
         Ok::<i64, CalendarError>(dirty_snapshot)

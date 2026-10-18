@@ -1420,6 +1420,7 @@ pub async fn patch_occurrence(
                 updated.google_event_id.as_deref().expect("checked above"),
                 &resolved_after,
                 now_unix,
+                category_repo,
             )
             .await;
             match output {
@@ -1557,6 +1558,7 @@ pub async fn start_occurrence(
             start_time_zone: None,
         },
         now_unix,
+        category_repo,
     )
     .await?;
     let event = output.event;
@@ -1679,6 +1681,7 @@ pub async fn pause_occurrence(
                         occurrence.calendar_id.as_deref().expect("checked above"),
                         occurrence.google_event_id.as_deref().expect("checked above"),
                         now_unix,
+                        category_repo,
                     )
                     .await?;
                 }
@@ -1788,6 +1791,7 @@ async fn exit_occurrence(
                 occurrence.calendar_id.as_deref().expect("checked above"),
                 occurrence.google_event_id.as_deref().expect("checked above"),
                 now_unix,
+                category_repo,
             )
             .await?;
         }
@@ -1803,6 +1807,7 @@ async fn exit_occurrence(
 /// through the event window — so a run whose window already lapsed still
 /// closes. A Google 404 is treated like task exits: the event is gone, the
 /// caller proceeds with the status flip.
+#[allow(clippy::too_many_arguments)]
 async fn close_occurrence_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1812,6 +1817,7 @@ async fn close_occurrence_event(
     calendar_id: &str,
     google_event_id: &str,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<(), AgendaError> {
     // The cached row supplies the `start` for the invert guard; a missing
     // cache row still snaps (the guard falls back to `now`, so the PATCH is
@@ -1839,6 +1845,7 @@ async fn close_occurrence_event(
         google_event_id,
         &unix_secs_to_rfc3339(end_unix),
         now_unix,
+        category_repo,
     )
     .await
     {
@@ -2058,6 +2065,7 @@ fn is_writable(calendar: &GoogleCalendar) -> bool {
 ///    collected and the loop continues.
 ///
 /// Status is deliberately never touched here, exactly like tasks.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_elongate_occurrences(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -2067,6 +2075,7 @@ pub async fn run_elongate_occurrences(
     tokens: &dyn TokenRepo,
     oauth: &OAuthConfig,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> ElongateReport {
     let mut report = ElongateReport::default();
     let running = match occurrences.list_in_progress().await {
@@ -2151,6 +2160,7 @@ pub async fn run_elongate_occurrences(
             &event.google_event_id,
             &unix_secs_to_rfc3339(target_unix),
             now_unix,
+            category_repo,
         )
         .await
         {
@@ -4065,6 +4075,9 @@ mod tests {
                 end_time_zone: event.end_time_zone.clone(),
                 is_all_day: event.is_all_day,
                 raw_json: event.raw_json.clone(),
+                category_id: event.category_id.clone(),
+                is_self_organized: event.is_self_organized,
+                event_type: event.event_type.clone(),
                 created_at: now_rfc3339.to_string(),
                 updated_at: now_rfc3339.to_string(),
                 deleted_at: None,
@@ -4766,6 +4779,9 @@ mod tests {
             end_time_zone: String::new(),
             is_all_day: false,
             raw_json: String::new(),
+            category_id: None,
+            is_self_organized: true,
+            event_type: String::new(),
             created_at: "2026-08-23T00:00:00Z".to_string(),
             updated_at: "2026-08-23T00:00:00Z".to_string(),
             deleted_at: None,
@@ -8045,6 +8061,9 @@ mod tests {
                 end_time_zone: String::new(),
                 is_all_day: false,
                 raw_json: String::new(),
+                category_id: None,
+                is_self_organized: true,
+                event_type: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -8113,6 +8132,9 @@ mod tests {
                 end_time_zone: String::new(),
                 is_all_day: false,
                 raw_json: String::new(),
+                category_id: None,
+                is_self_organized: true,
+                event_type: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -8178,6 +8200,9 @@ mod tests {
                 end_time_zone: String::new(),
                 is_all_day: false,
                 raw_json: String::new(),
+                category_id: None,
+                is_self_organized: true,
+                event_type: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -8439,6 +8464,7 @@ mod tests {
             &FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]),
             &oauth_config(),
             elongate_now(),
+            &FakeTaskCategoryRepo::new(),
         ))
     }
 
@@ -8476,6 +8502,9 @@ mod tests {
                 end_time_zone: String::new(),
                 is_all_day: false,
                 raw_json: String::new(),
+                category_id: None,
+                is_self_organized: true,
+                event_type: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))
@@ -8528,6 +8557,9 @@ mod tests {
                 end_time_zone: String::new(),
                 is_all_day: false,
                 raw_json: String::new(),
+                category_id: None,
+                is_self_organized: true,
+                event_type: String::new(),
             },
             "2026-08-23T00:00:00Z",
         ))

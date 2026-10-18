@@ -10,15 +10,218 @@ use crate::models::{
     OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING, WatchChannel,
 };
 use crate::oauth::{HttpClient, HttpError};
+use crate::models::{
+    NewTaskCategory, NewTaskCategoryPattern, TaskCategory, TaskCategoryPattern, UpdateTaskCategory,
+};
 use crate::repo::{
-    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TokenRepo,
-    WatchChannelRepo,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, RepoError, TaskCategoryRepo,
+    TokenRepo, WatchChannelRepo,
 };
 use crate::token::GoogleAccess;
 
 // ──────────────────────────────────────────
 // Fakes
 // ──────────────────────────────────────────
+
+/// A fixed-taxonomy [`TaskCategoryRepo`] for the write-time stamping tests:
+/// returns exactly the categories and patterns it was built with (no seeding,
+/// no writes).
+pub(crate) struct StubTaskCategoryRepo {
+    categories: Vec<TaskCategory>,
+    patterns: Vec<TaskCategoryPattern>,
+}
+
+impl StubTaskCategoryRepo {
+    /// One root category with one unscoped pattern, and the leaf it stamps.
+    pub(crate) fn with_pattern(category_id: &str, regex: &str, sort_order: i64) -> Self {
+        Self {
+            categories: vec![TaskCategory {
+                id: category_id.to_string(),
+                user_id: "u-1".to_string(),
+                list_id: None,
+                parent_id: None,
+                title: category_id.to_string(),
+                slug: category_id.to_string(),
+                color: "#4285f4".to_string(),
+                is_productive: false,
+                google_calendar_id: None,
+                sort_order,
+                is_untracked: false,
+                created_at: "2026-08-18T00:00:00Z".to_string(),
+                updated_at: "2026-08-18T00:00:00Z".to_string(),
+                deleted_at: None,
+            }],
+            patterns: vec![TaskCategoryPattern {
+                id: format!("p-{category_id}"),
+                category_id: category_id.to_string(),
+                regex: regex.to_string(),
+                google_calendar_id: None,
+                sort_order: 0,
+                created_at: "2026-08-18T00:00:00Z".to_string(),
+                updated_at: "2026-08-18T00:00:00Z".to_string(),
+            }],
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl TaskCategoryRepo for StubTaskCategoryRepo {
+    async fn list_by_user_id(&self, _user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+        Ok(self.categories.clone())
+    }
+
+    async fn get_by_id(&self, id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(self.categories.iter().find(|row| row.id == id).cloned())
+    }
+
+    async fn insert(&self, _category: NewTaskCategory) -> Result<TaskCategory, RepoError> {
+        Err(RepoError::Backend(
+            "StubTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _id: &str,
+        _updates: &UpdateTaskCategory,
+    ) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn soft_delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+        Ok(())
+    }
+
+    async fn count_by_user_id(&self, _user_id: &str) -> Result<i64, RepoError> {
+        Ok(self.categories.len() as i64)
+    }
+
+    async fn count_children(&self, _category_id: &str) -> Result<i64, RepoError> {
+        Ok(0)
+    }
+
+    async fn get_untracked(&self, _user_id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(self.categories.iter().find(|row| row.is_untracked).cloned())
+    }
+
+    async fn list_patterns_by_category_id(
+        &self,
+        category_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        Ok(self
+            .patterns
+            .iter()
+            .filter(|row| row.category_id == category_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_patterns_by_user_id(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        Ok(self.patterns.clone())
+    }
+
+    async fn replace_patterns(
+        &self,
+        _category_id: &str,
+        _patterns: Vec<NewTaskCategoryPattern>,
+    ) -> Result<(), RepoError> {
+        Err(RepoError::Backend(
+            "StubTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn delete_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<(), RepoError> {
+        Ok(())
+    }
+}
+
+/// An always-empty [`TaskCategoryRepo`] for the walk boundaries: no living
+/// categories and no patterns, so `load_classify_taxonomy` yields an empty
+/// taxonomy and the write-time classifier stamps `category_id = NULL`.
+///
+/// Tests that assert on stamping build a real in-memory taxonomy instead.
+pub(crate) struct EmptyTaskCategoryRepo;
+
+/// Shared `'static` instance, so call sites stay one short argument.
+pub(crate) const NO_TAXONOMY: EmptyTaskCategoryRepo = EmptyTaskCategoryRepo;
+
+#[async_trait::async_trait(?Send)]
+impl TaskCategoryRepo for EmptyTaskCategoryRepo {
+    async fn list_by_user_id(&self, _user_id: &str) -> Result<Vec<TaskCategory>, RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_by_id(&self, _id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn insert(&self, _category: NewTaskCategory) -> Result<TaskCategory, RepoError> {
+        Err(RepoError::Backend(
+            "EmptyTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _id: &str,
+        _updates: &UpdateTaskCategory,
+    ) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn soft_delete(&self, _id: &str, _now_rfc3339: &str) -> Result<(), RepoError> {
+        Ok(())
+    }
+
+    async fn count_by_user_id(&self, _user_id: &str) -> Result<i64, RepoError> {
+        Ok(0)
+    }
+
+    async fn count_children(&self, _category_id: &str) -> Result<i64, RepoError> {
+        Ok(0)
+    }
+
+    async fn get_untracked(&self, _user_id: &str) -> Result<Option<TaskCategory>, RepoError> {
+        Ok(None)
+    }
+
+    async fn list_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_patterns_by_user_id(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<TaskCategoryPattern>, RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn replace_patterns(
+        &self,
+        _category_id: &str,
+        _patterns: Vec<NewTaskCategoryPattern>,
+    ) -> Result<(), RepoError> {
+        Err(RepoError::Backend(
+            "EmptyTaskCategoryRepo does not write".to_string(),
+        ))
+    }
+
+    async fn delete_patterns_by_category_id(
+        &self,
+        _category_id: &str,
+    ) -> Result<(), RepoError> {
+        Ok(())
+    }
+}
 
 /// Scripted HTTP fake: `routes` are `(url-substring, status, body)` in
 /// match order (permanent — not consumed; replica/window pagination reuses
@@ -1044,6 +1247,12 @@ impl FakeEventRepo {
             existing.end_time_zone = event.end_time_zone;
             existing.is_all_day = event.is_all_day;
             existing.raw_json = event.raw_json;
+            // App-owned leaf category: overwrite from the incoming row,
+            // including back to `NULL` (a retitle must replace or clear a
+            // stale stamp). `NULLIF(?, '')` normalization is the caller's.
+            existing.category_id = event.category_id.filter(|id| !id.is_empty());
+            existing.is_self_organized = event.is_self_organized;
+            existing.event_type = event.event_type;
             existing.updated_at = now_rfc3339.to_string();
             existing.deleted_at = None;
             return id;
@@ -1978,6 +2187,9 @@ pub(crate) fn seeded_event(
         end_time_zone: String::new(),
         is_all_day: false,
         raw_json: String::new(),
+        category_id: None,
+        is_self_organized: true,
+        event_type: String::new(),
         created_at: "2023-11-14T21:00:00Z".to_string(),
         updated_at: "2023-11-14T21:00:00Z".to_string(),
         deleted_at: None,
@@ -2198,6 +2410,9 @@ pub(crate) fn living_event(id: &str, calendar_id: &str, google_event_id: &str) -
         end_time_zone: String::new(),
         is_all_day: false,
         raw_json: String::new(),
+        category_id: None,
+        is_self_organized: true,
+        event_type: String::new(),
         created_at: "2026-08-17T12:00:00Z".to_string(),
         updated_at: "2026-08-17T12:00:00Z".to_string(),
         deleted_at: None,

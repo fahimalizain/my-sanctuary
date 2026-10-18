@@ -48,7 +48,7 @@ use url::Url;
 
 use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use super::apply::{
-    classify_replica_item, EventsPage, ReplicaApplyAction,
+    classify_replica_item, EventClassifyCtx, EventsPage, ReplicaApplyAction,
 };
 use super::diagnostics::{mint_run_id, CheckpointResult, ReplicaApplyReport, ReplicaWalkPhase};
 use super::google::encode_path_segment;
@@ -89,6 +89,10 @@ fn quarantine_replay_payload(body: &[u8]) -> String {
 /// `report` is updated in place with page/upsert/delete/attempt counts,
 /// phase, and checkpoint outcome. Secrets (tokens, URLs, bodies) are never
 /// written onto the report.
+///
+/// `ctx` stamps the app-owned leaf `category_id` on every upsert (the SQL
+/// upsert **overwrites** the column). Production callers must pass a real
+/// context — [`EventClassifyCtx::none`] only when the taxonomy load failed.
 pub async fn sync_replica(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -99,6 +103,7 @@ pub async fn sync_replica(
     lease_owner: &str,
     clock: &dyn Clock,
     report: &mut ReplicaApplyReport,
+    ctx: &EventClassifyCtx<'_>,
 ) -> Result<(), CalendarError> {
     let fingerprint = replica_query_fingerprint();
     // Empty stored fingerprint is compatible with an existing token (do not
@@ -244,7 +249,7 @@ pub async fn sync_replica(
                 // Skip upsert and soft-delete for in-flight google ids.
                 continue;
             }
-            match classify_replica_item(item, &cal.id, &now) {
+            match classify_replica_item(item, &cal.id, &now, ctx) {
                 ReplicaApplyAction::SoftDelete { google_event_id } => {
                     report.deletes = report.deletes.saturating_add(1);
                     let deleted = match events

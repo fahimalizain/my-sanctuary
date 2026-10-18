@@ -14,7 +14,11 @@ use api_core::{
     run_fallback_cron, sync_calendar, CalendarError, CalendarReplicaState, CheckpointResult,
     OAuthConfig, OperatorWarningLevel, SyncCalendarOutcome, WebhookPersistResult,
 };
-use d1_sync::{open_harness, seed_user_token_calendar, SeedOpts};
+use d1_sync::{open_harness, seed_user_token_calendar, EmptyTaskCategoryRepo, SeedOpts};
+
+/// The walk boundaries take a category repo for the write-time leaf stamp.
+/// These tests are not about classification: an empty taxonomy stamps NULL.
+const NO_TAXONOMY: EmptyTaskCategoryRepo = EmptyTaskCategoryRepo;
 
 const NOW_UNIX: i64 = 1_700_000_000; // 2023-11-14T22:13:20Z
 const NOW_RFC: &str = "2023-11-14T22:13:20Z";
@@ -170,6 +174,7 @@ fn d1_paginated_replica_publish_writes_token_only_after_last_page() {
         &access(),
         &cal,
         NOW_RFC,
+        &NO_TAXONOMY,
     ))
     .expect("sync ok");
     assert_eq!(outcome, SyncCalendarOutcome::Published);
@@ -224,6 +229,7 @@ fn d1_missing_terminal_token_is_not_success() {
         &access(),
         &cal,
         NOW_RFC,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -323,6 +329,7 @@ fn d1_cron_published_only_after_health_commit() {
         &oauth,
         None,
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.synced, 1, "errors={:?}", report.errors);
@@ -390,6 +397,9 @@ fn sample_new_event(google_event_id: &str, title: &str) -> NewCalendarEvent {
         end_time_zone: "UTC".to_string(),
         is_all_day: false,
         raw_json: r#"{"id":"g-batch"}"#.to_string(),
+        category_id: Some("cat-batch".to_string()),
+        is_self_organized: false,
+        event_type: "focusTime".to_string(),
     }
 }
 
@@ -424,6 +434,11 @@ fn d1_upsert_batch_preserves_id_and_revives_soft_delete() {
     assert_eq!(after_batch.id, original_id, "ON CONFLICT must preserve id");
     assert_eq!(after_batch.title, "Updated title");
     assert!(after_batch.deleted_at.is_none());
+    // The classification columns survive the round trip (0019): the leaf
+    // category overwrites from the incoming row, the Google-owned flags follow.
+    assert_eq!(after_batch.category_id.as_deref(), Some("cat-batch"));
+    assert!(!after_batch.is_self_organized);
+    assert_eq!(after_batch.event_type, "focusTime");
 
     // Soft-delete, then batch-upsert again → revived with same id.
     pollster::block_on(h.events.delete(&original_id, NOW_RFC)).expect("soft-delete");
@@ -479,6 +494,65 @@ fn d1_upsert_batch_preserves_id_and_revives_soft_delete() {
     assert_eq!(fenced.id, original_id, "if_owner must preserve id");
     assert_eq!(fenced.title, "Fenced title");
     assert!(fenced.deleted_at.is_none());
+    assert_eq!(fenced.category_id.as_deref(), Some("cat-batch"));
+    assert!(!fenced.is_self_organized);
+    assert_eq!(fenced.event_type, "focusTime");
+}
+
+/// The 0019 columns are app/Google-owned: the fenced upsert clears a stale
+/// leaf category when the incoming row is unclassified (`NULLIF(?, '')` →
+/// SQL `NULL`), and the organizer/eventType flags overwrite.
+#[test]
+fn d1_upsert_overwrites_category_and_organizer_flags() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+    }
+
+    let mut stamped = sample_new_event("g-flags", "Stamped");
+    stamped.category_id = Some("cat-work".to_string());
+    stamped.is_self_organized = true;
+    stamped.event_type = "default".to_string();
+    pollster::block_on(h.events.upsert(stamped, NOW_RFC)).expect("stamped upsert");
+
+    let mut unclassified = sample_new_event("g-flags", "Retitled");
+    unclassified.category_id = None;
+    unclassified.is_self_organized = false;
+    unclassified.event_type = "focusTime".to_string();
+    pollster::block_on(h.events.upsert(unclassified, NOW_RFC)).expect("retitle upsert");
+
+    let row = pollster::block_on(h.events.get_by_calendar_and_google_id("cal-1", "g-flags"))
+        .expect("get")
+        .expect("living");
+    assert_eq!(row.title, "Retitled");
+    assert_eq!(row.category_id, None, "a retitle clears the stale leaf stamp");
+    assert!(!row.is_self_organized);
+    assert_eq!(row.event_type, "focusTime");
+}
+
+/// An empty category id binds SQL NULL rather than an empty string.
+#[test]
+fn d1_upsert_stores_empty_category_as_null() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+    }
+
+    let mut event = sample_new_event("g-blank", "Blank");
+    event.category_id = Some(String::new());
+    pollster::block_on(h.events.upsert(event, NOW_RFC)).expect("upsert");
+
+    let conn = h.db.lock().unwrap();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT category_id FROM calendar_events WHERE google_event_id = 'g-blank'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("category_id column");
+    assert_eq!(stored, None, "\"\" must be stored as SQL NULL");
 }
 
 fn seed_event(

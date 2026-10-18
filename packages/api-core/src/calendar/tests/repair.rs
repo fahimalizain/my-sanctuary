@@ -73,6 +73,7 @@ fn repair_google_committed_insert_get_200_upserts_cache_zero_posts() {
         &access(),
         "u-1",
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
     assert!(errors.is_empty(), "{errors:?}");
     assert!(http.posts.lock().unwrap().is_empty(), "repair is GET-only");
@@ -112,6 +113,7 @@ fn repair_pending_insert_get_404_marks_failed_zero_posts() {
         &access(),
         "u-1",
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
     assert!(errors.is_empty(), "{errors:?}");
     assert!(http.posts.lock().unwrap().is_empty(), "never re-insert");
@@ -150,6 +152,7 @@ fn repair_google_committed_insert_get_404_local_deletes_and_closes() {
         &access(),
         "u-1",
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
     assert!(errors.is_empty(), "{errors:?}");
     assert!(http.posts.lock().unwrap().is_empty());
@@ -193,6 +196,7 @@ fn repair_skips_other_users_and_continues_on_get_error() {
         &access(),
         "u-1",
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("500"), "{errors:?}");
@@ -245,6 +249,7 @@ fn repair_google_committed_move_source_gone_dest_200_reassigns_zero_posts() {
         &access(),
         "u-1",
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
     assert!(errors.is_empty(), "{errors:?}");
     assert!(http.posts.lock().unwrap().is_empty(), "repair is GET-only");
@@ -295,6 +300,7 @@ fn repair_pending_move_source_and_dest_gone_marks_failed_keeps_local() {
         &access(),
         "u-1",
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
     assert!(errors.is_empty(), "{errors:?}");
     assert!(http.posts.lock().unwrap().is_empty());

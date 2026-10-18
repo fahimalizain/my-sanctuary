@@ -1,7 +1,7 @@
 use super::CalendarError;
 use crate::models::{CalendarEvent, GoogleCalendar, NewEventInput, PatchEventFields};
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TaskCategoryRepo};
 use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
@@ -104,6 +104,11 @@ pub(crate) fn build_shared_properties(
 /// `sanctuary_routine_id` + `sanctuary_occurrence_id` (plus
 /// `sanctuary_event_id`); `calendar_events.task_id` stays empty. `task_id`
 /// and the occurrence pair are mutually exclusive at the call sites.
+///
+/// `category_repo` feeds the write-time leaf `category_id` stamp on the cache
+/// apply (one no-seed taxonomy load per create). The load is best-effort: a
+/// failure leaves the row unclassified rather than failing the write — a later
+/// reclassify job fills the gap.
 pub async fn create_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -113,6 +118,7 @@ pub async fn create_event(
     user_id: &str,
     input: &NewEventInput,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     super::journal::create_event_with_journal(
         http,
@@ -123,6 +129,7 @@ pub async fn create_event(
         user_id,
         input,
         now_unix,
+        category_repo,
     )
     .await
 }
@@ -175,6 +182,7 @@ pub async fn patch_event_fields(
     google_event_id: &str,
     fields: &PatchEventFields,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     super::write_journal::patch_event_fields_with_journal(
         http,
@@ -186,6 +194,7 @@ pub async fn patch_event_fields(
         google_event_id,
         fields,
         now_unix,
+        category_repo,
     )
     .await
 }
@@ -202,6 +211,7 @@ pub async fn patch_event(
     google_event_id: &str,
     end_rfc3339: &str,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     patch_event_fields(
         http,
@@ -221,6 +231,7 @@ pub async fn patch_event(
             calendar_id: None,
         },
         now_unix,
+        category_repo,
     )
     .await
 }
@@ -237,6 +248,7 @@ pub async fn patch_event_summary(
     google_event_id: &str,
     summary: &str,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     patch_event_fields(
         http,
@@ -256,6 +268,7 @@ pub async fn patch_event_summary(
             calendar_id: None,
         },
         now_unix,
+        category_repo,
     )
     .await
 }
@@ -269,6 +282,7 @@ pub async fn patch_event_summary(
 /// description/is_all_day/start_time_zone. `start_time_zone` requires start
 /// and end. Wrong owner / missing → [`CalendarError::NotFound`] (no Google
 /// call, no journal).
+#[allow(clippy::too_many_arguments)]
 pub async fn update_event_for_user(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -279,6 +293,7 @@ pub async fn update_event_for_user(
     event_id: &str,
     fields: &PatchEventFields,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     let has_other = fields.start.is_some()
         || fields.end.is_some()
@@ -312,6 +327,7 @@ pub async fn update_event_for_user(
             &event.google_event_id,
             dest_local_id,
             now_unix,
+            category_repo,
         )
         .await;
     }
@@ -339,6 +355,7 @@ pub async fn update_event_for_user(
         &event.google_event_id,
         fields,
         now_unix,
+        category_repo,
     )
     .await
 }
