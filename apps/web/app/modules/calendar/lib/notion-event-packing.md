@@ -63,10 +63,12 @@ overlaps(a, b) ⇔ a.start < b.end && b.start < a.end
   (Notion extends equal start/end by 1 second before testing; Sanctuary may use
   a small ε such as `0.001` minutes). Point intervals still collide when nested
   inside another interval.
-- **Painted min height:** `packDayEvents(items, minDurationMin)` widens any event
-  shorter than `widenBelowMin` (the app passes `PACK_WIDEN_BELOW_MIN`, 15) to
-  `minDurationMin` (the `CHIP_MIN_H` chip height in minutes at the current `hourH`) to that length before overlap tests, so 0-min chips pack as
-  the space they actually paint. Default `0` keeps the spec examples exact.
+- **Painted min height is not part of packing:** `packDayEvents(items)` takes
+  no min-duration argument and never widens an event to the chip height it
+  paints. Overlap is the true half-open duration; ε applies only when
+  `end <= start`. `CHIP_MIN_H` is only `eventHeightPx`: a short chip may paint
+  into the next event, and that later chip covers the tail. Results do not
+  depend on `hourH`.
 - **Always-on-top:** if either event is always-on-top, they do **not** overlap
   (used for drag clones). Default false → no effect.
 
@@ -272,6 +274,11 @@ z-index: <selected || manipulating
 
 `left` + `margin-left` is intentional: pixel ribbon inset plus percent cascade
 within the remaining day column.
+
+Equal `layerIndex` stacks by DOM order: `buildEventsByDay` emits `startMin`
+order (stable for ties), so a later-starting chip covers the min-height tail of
+the chip before it. Selected chips still use the selected z-index, above every
+`layerIndex`.
 
 ---
 

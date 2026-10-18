@@ -7,8 +7,6 @@ import type { AllDayChip } from '../components/AllDayRow';
 import { toTimedRange, type DragSlot, type TimedRange } from './calendar-drag';
 import type { PositionedEvent } from '../components/EventChip';
 import {
-  CHIP_MIN_H,
-  PACK_WIDEN_BELOW_MIN,
   WEEK_DAYS,
   addDays,
   allDaySectionHeight,
@@ -237,10 +235,6 @@ export function buildEventsByDay(
         startMin: d.startMin,
         endMin: d.endMin,
       })),
-      (CHIP_MIN_H / hourH) * 60,
-      // Durations under PACK_WIDEN_BELOW_MIN widen to the painted min-chip
-      // height; 15 min and longer pack exactly at their true duration.
-      PACK_WIDEN_BELOW_MIN,
     );
     const packById = new Map(packed.map((p) => [p.id, p]));
 
@@ -259,6 +253,14 @@ export function buildEventsByDay(
         color: eventChipColor(d.event),
       };
     });
+
+    // Paint order only — never a pack tie-break (the pack input above keeps its
+    // incoming order). Equal `layerIndex` stacks by DOM order, so a
+    // later-starting chip must sit later in the array to cover the
+    // CHIP_MIN_H tail of an earlier, shorter chip. Ties keep their order.
+    positioned.sort((a, b) =>
+      a.startMin !== b.startMin ? a.startMin - b.startMin : 0,
+    );
 
     map.set(key, positioned);
   }

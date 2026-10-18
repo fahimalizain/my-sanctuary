@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
+import type { PositionedEvent } from '../components/EventChip';
 import {
   buildAllDayChips,
   buildEventsByDay,
@@ -200,6 +201,136 @@ test('buildEventsByDay: 10:00–11:00 event under day key with height > 0', () =
   assert.equal(list[0].startMin, 10 * 60);
   assert.equal(list[0].endMin, 11 * 60);
   assert.ok(list[0].height > 0);
+});
+
+/** Packing fields only: `top` / `height` are allowed to depend on the zoom. */
+function packGeometry(list: PositionedEvent[]) {
+  return list.map((p) => ({
+    id: p.event.id,
+    leftPercent: p.leftPercent,
+    widthPercent: p.widthPercent,
+    layerIndex: p.layerIndex,
+    leftPixels: p.leftPixels,
+  }));
+}
+
+// Oct 18: a 5-min chip paints well past its own end (CHIP_MIN_H is 67.5 min at
+// hourH 16 and 5.2 min at hourH 208), and a 10-min event sits 2 min clear of its
+// neighbour — the zoom-sensitive case the old widen got wrong.
+test('buildEventsByDay: pack geometry is identical at hourH 16, 48, 208', () => {
+  const day = new Date(2026, 9, 18); // Sun Oct 18 local
+  const at = (h: number, m: number) =>
+    new Date(2026, 9, 18, h, m, 0, 0).toISOString();
+  const events = [
+    makeEvent({
+      id: 'tafseer',
+      title: 'Tafseer Planning',
+      start_time: at(16, 37),
+      end_time: at(16, 42),
+    }),
+    makeEvent({
+      id: 'salat',
+      title: 'Salat & Istighfar',
+      start_time: at(16, 42),
+      end_time: at(16, 56),
+    }),
+    // True overlap → some widthPercent is not 1.
+    makeEvent({
+      id: 'long',
+      title: 'Deep work',
+      start_time: at(9, 0),
+      end_time: at(11, 0),
+    }),
+    makeEvent({
+      id: 'overlap',
+      title: 'Standup',
+      start_time: at(10, 0),
+      end_time: at(12, 0),
+    }),
+    // 10 min, 2 min gap: true durations never overlap.
+    makeEvent({
+      id: 'short',
+      title: 'Short',
+      start_time: at(6, 0),
+      end_time: at(6, 10),
+    }),
+    makeEvent({
+      id: 'neighbour',
+      title: 'Neighbour',
+      start_time: at(6, 12),
+      end_time: at(6, 22),
+    }),
+  ];
+
+  const key = day.toDateString();
+  const at16 = buildEventsByDay([day], events, 16).get(key)!;
+  const at48 = buildEventsByDay([day], events, 48).get(key)!;
+  const at208 = buildEventsByDay([day], events, 208).get(key)!;
+
+  assert.deepEqual(packGeometry(at48), packGeometry(at16));
+  assert.deepEqual(packGeometry(at208), packGeometry(at16));
+
+  // Chronological paint order at every zoom.
+  const chronological = [
+    'short',
+    'neighbour',
+    'long',
+    'overlap',
+    'tafseer',
+    'salat',
+  ];
+  assert.deepEqual(
+    at16.map((p) => p.event.id),
+    chronological,
+  );
+  assert.deepEqual(
+    at48.map((p) => p.event.id),
+    chronological,
+  );
+
+  // Guard: the overlap must really split the column, or the deepEqual above
+  // would also pass on all-1 geometry.
+  assert.ok(packGeometry(at16).some((p) => p.widthPercent < 1));
+
+  // Zoom still moves pixels — only packing is invariant. 60 min must not be a
+  // min-height chip at either zoom.
+  const tall = at48.find((p) => p.event.id === 'long')!;
+  const taller = at208.find((p) => p.event.id === 'long')!;
+  assert.notEqual(tall.height, taller.height);
+});
+
+test('buildEventsByDay: a later-starting chip is emitted after its neighbour', () => {
+  const day = new Date(2026, 9, 18); // Sun Oct 18 local
+  const at = (h: number, m: number) =>
+    new Date(2026, 9, 18, h, m, 0, 0).toISOString();
+  const tafseer = makeEvent({
+    id: 'tafseer',
+    title: 'Tafseer Planning',
+    start_time: at(16, 37),
+    end_time: at(16, 42),
+  });
+  const salat = makeEvent({
+    id: 'salat',
+    title: 'Salat & Istighfar',
+    start_time: at(16, 42),
+    end_time: at(16, 56),
+  });
+
+  // Reverse input order: an overlay append or an untied server ORDER BY can
+  // hand the pair over in either order. The output must still be chronological
+  // so Salat paints over Tafseer's min-height tail in DayColumn.
+  const list = buildEventsByDay([day], [salat, tafseer], 48).get(
+    day.toDateString(),
+  )!;
+  assert.deepEqual(
+    list.map((p) => p.event.id),
+    ['tafseer', 'salat'],
+  );
+  for (const p of list) {
+    assert.equal(p.leftPercent, 0);
+    assert.equal(p.widthPercent, 1);
+    assert.equal(p.layerIndex, 1);
+  }
 });
 
 // ── buildAllDayChips ────────────────────────────────────────────────────

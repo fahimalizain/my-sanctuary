@@ -51,12 +51,6 @@ export const SNAP_STEP_COARSEST =
   SNAP_STEP_COARSE_LADDER[SNAP_STEP_COARSE_LADDER.length - 1];
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
-/**
- * Packing widens only events shorter than this many minutes up to the painted
- * chip height. This is the layout contract from 58d443a (15 min and longer
- * pack exactly). It is not the drag grid.
- */
-export const PACK_WIDEN_BELOW_MIN = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.

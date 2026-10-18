@@ -216,29 +216,16 @@ function sortByStartMin(events: PackInput[]): PackInput[] {
 
 /**
  * Notion cascade packing for one civil day.
- * Caller clamps each event to the day before packing. `minDurationMin` is the
- * painted min-chip height in minutes (0 = true durations; zero → ε only).
- * Only events shorter than `widenBelowMin` (default: `minDurationMin`) widen.
+ * Caller clamps each event to the civil day before packing. Overlap tests use
+ * the true half-open durations; a zero or invalid duration (`end <= start`)
+ * contributes only ε. Packing never widens an event to the height it paints,
+ * so results are independent of the zoom and of the painted min chip.
  */
-export function packDayEvents(
-  items: PackInput[],
-  minDurationMin = 0,
-  widenBelowMin = minDurationMin,
-): PackResult[] {
+export function packDayEvents(items: PackInput[]): PackResult[] {
   if (items.length === 0) return [];
 
-  // Events shorter than `widenBelowMin` occupy the painted min-chip height for
-  // overlap purposes, so a 0-min chip never sits on top of a neighbour it
-  // visually covers. Results are keyed by id, so the widened ends are internal.
-  if (minDurationMin > 0) {
-    items = items.map((e) =>
-      e.endMin - e.startMin < widenBelowMin
-        ? { ...e, endMin: e.startMin + minDurationMin }
-        : e,
-    );
-  }
-
-  // Call-site order: startMin ascending (stable)
+  // Call-site order: startMin ascending (stable). Ties keep the incoming
+  // order (equal start and duration) — no id / title tie-break.
   const sorted = sortByStartMin(items);
 
   // 1. Cluster — greedy connected components
