@@ -750,6 +750,22 @@ test('data-event-inspector present on mobile and desktop shells', () => {
   assert.ok(document.querySelector('[data-event-inspector]'));
 });
 
+// ── 9b. Desktop auto-focus ──────────────────────────────────────────────
+
+test('desktop: focusTitle focuses the title input, not the toolbar', () => {
+  setMatchMediaDesktop(true);
+  mount({ focusTitle: true });
+  // Regression: Radix FocusScope autofocuses the first tabbable element
+  // ("More actions") unless onOpenAutoFocus takes over.
+  assert.equal(document.activeElement, screen.getByLabelText('Title'));
+});
+
+test('desktop: opening an existing event does not focus the title', () => {
+  setMatchMediaDesktop(true);
+  mount({ focusTitle: false });
+  assert.notEqual(document.activeElement, screen.getByLabelText('Title'));
+});
+
 // ── Mobile peek drawer ──────────────────────────────────────────────────
 
 test('mobile: taps open a peek with no backdrop capture; expand, collapse, close', () => {
