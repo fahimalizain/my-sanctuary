@@ -82,6 +82,82 @@ async fn paint_events_with_fallback(
     }
 }
 
+/// Auto-resolves the Google event label for a hand-created calendar event.
+///
+/// The web create body does not send a color. Use the same title classifier
+/// as the calendar paint path (the local chip color) and stamp the matched
+/// category hex onto the create input when the destination calendar has event
+/// labels. Best-effort: taxonomy or label-cache failures leave the event
+/// uncolored rather than failing the user's write.
+async fn resolve_create_color(
+    calendars: &crate::db::D1CalendarRepo,
+    list_repo: &crate::db::D1TaskListRepo,
+    category_repo: &crate::db::D1TaskCategoryRepo,
+    access: &api_core::GoogleAccess,
+    user_id: &str,
+    now_unix: i64,
+    input: &mut NewEventInput,
+) {
+    // Explicit `Some` (including an explicit empty string) is the caller's
+    // choice — only hand-created bodies with the field omitted auto-resolve.
+    if input.color_hex.is_some() {
+        return;
+    }
+
+    let cal = match calendars.get_by_id(&input.calendar_id).await {
+        Ok(Some(cal)) => cal,
+        Ok(None) => return,
+        Err(err) => {
+            console_log!("calendar: create color lookup failed: {err}");
+            return;
+        }
+    };
+    if cal.user_id != user_id {
+        return;
+    }
+
+    let taxonomy = match api_core::load_paint_taxonomy(list_repo, category_repo, user_id).await {
+        Ok(taxonomy) => taxonomy,
+        Err(err) => {
+            console_log!("calendar: create color taxonomy failed: {err}");
+            return;
+        }
+    };
+    let Some(color) = api_core::color_for_event_title(
+        &input.summary,
+        &cal.google_calendar_id,
+        &taxonomy.categories,
+        &taxonomy.matchers,
+    ) else {
+        return;
+    };
+
+    // A colored insert resolves the hex against the cached `eventLabels`.
+    // Refresh a never-populated cache once; on failure fall back to an
+    // uncolored create instead of failing the write.
+    if cal.event_labels.is_empty() {
+        if let Err(err) = api_core::ensure_calendar_event_labels(
+            &crate::http::WorkerHttp,
+            calendars,
+            access,
+            &cal.id,
+            now_unix,
+        )
+        .await
+        {
+            console_log!("calendar: create event-label refresh failed: {err}");
+            return;
+        }
+        // Re-read: some calendars (readers) legitimately have no labels.
+        match calendars.get_by_id(&cal.id).await {
+            Ok(Some(fresh)) if !fresh.event_labels.is_empty() => {}
+            _ => return,
+        }
+    }
+
+    input.color_hex = Some(color);
+}
+
 /// `GET /api/calendar/events` → 200
 /// `{"events":[...],"source":"cache"|"window"|"mixed","sync":{...}}`.
 ///
@@ -344,10 +420,13 @@ pub async fn repair_calendar(
 /// start_time_zone?}`. `is_all_day: true` writes civil `start.date` /
 /// `end.date` (both start and end must carry a civil date, else 400); the
 /// default timed path keeps `dateTime` and stamps a non-empty trimmed
-/// `start_time_zone` as `timeZone` on both objects. Journals the
-/// outbound insert, creates the event on Google, then upserts the returned
-/// row into the cache. A cache failure after Google commit is 500
-/// (`CalendarError::Repo`) — never 200 with a phantom local id.
+/// `start_time_zone` as `timeZone` on both objects. When `color_hex` is
+/// omitted, the title is classified against the user's category taxonomy and
+/// the matched color is written as the Google event label (best-effort: no
+/// match stays uncolored). Journals the outbound insert, creates the event on
+/// Google, then upserts the returned row into the cache. A cache failure after
+/// Google commit is 500 (`CalendarError::Repo`) — never 200 with a phantom
+/// local id.
 pub async fn create_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -368,7 +447,7 @@ pub async fn create_event(
         }
     };
 
-    let input: NewEventInput = match req.json().await {
+    let mut input: NewEventInput = match req.json().await {
         Ok(input) => input,
         Err(_) => return json_error(&ctx, 400, "invalid body"),
     };
@@ -376,6 +455,18 @@ pub async fn create_event(
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
+    let list_repo = crate::db::D1TaskListRepo::new(d1()?);
+    let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
+    resolve_create_color(
+        &calendars,
+        &list_repo,
+        &category_repo,
+        &access,
+        &user_id,
+        now_unix,
+        &mut input,
+    )
+    .await;
     match api_core::create_event(
         &crate::http::WorkerHttp,
         &calendars,

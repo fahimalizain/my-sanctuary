@@ -88,9 +88,9 @@ export function pasteDestinationCalendarId(
  * All-day rows send `is_all_day: true` and never a zone — they are civil
  * dates on both sides.
  *
- * `color_hex` is never sent: the insert path rejects a color while the
- * calendar's label cache is still empty. `item.color` is for the optimistic
- * chip only.
+ * `color_hex` is never sent: the server resolves the title's category color
+ * itself (refreshing the calendar's label cache when empty). `item.color` is
+ * for the optimistic chip only.
  */
 export function pasteCreateInput(
   item: CalendarClipboardItem,
