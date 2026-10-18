@@ -7,13 +7,9 @@ import { AllDayRow, type AllDayChip, type AllDayPreview } from './AllDayRow';
 import type { DragPreviewInfo } from '../lib/calendar-drag';
 import { dayNameShort } from '../lib/calendar-model';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
+import { GutterTimes } from './GutterTimes';
 import { type PositionedEvent } from './EventChip';
-import {
-  COL_HEADER_H,
-  formatHourLabel,
-  isSameDay,
-  isWeekend,
-} from '../lib/week-layout';
+import { COL_HEADER_H, isSameDay, isWeekend } from '../lib/week-layout';
 
 /** Stable empty list so DayColumn memo is not busted on empty days. */
 const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
@@ -34,6 +30,8 @@ export interface CalendarWeekGridProps {
   totalHoursH: number;
   hourGridBg: string;
   hourLabels: number[];
+  /** Timed start/end for the gutter pills (drag preview wins over selection). */
+  gutterEdges: { start: Date; end: Date } | null;
   allDayHeight: number;
   allDayChips: AllDayChip[];
   todayIndex: number | null;
@@ -54,8 +52,15 @@ export interface CalendarWeekGridProps {
     eventId: string,
     chipEl: HTMLElement,
   ) => void;
+  /** Grab a gutter edge pill for the selected timed event. */
+  onGutterEdgePointerDown: (
+    e: ReactPointerEvent<HTMLElement>,
+    edge: 'start' | 'end',
+  ) => void;
   onChipSelect: (eventId: string) => void;
   isDragging: boolean;
+  /** Precision modifier is live: show the 1-minute grid badge. */
+  precisionSnap: boolean;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
   previewInfo: DragPreviewInfo | null;
   previewColor: string;
@@ -82,6 +87,7 @@ export function CalendarWeekGrid({
   totalHoursH,
   hourGridBg,
   hourLabels,
+  gutterEdges,
   allDayHeight,
   allDayChips,
   todayIndex,
@@ -94,8 +100,10 @@ export function CalendarWeekGrid({
   onRequestDelete,
   onAllDayPointerDown,
   onAllDayChipPointerDown,
+  onGutterEdgePointerDown,
   onChipSelect,
   isDragging,
+  precisionSnap,
   timedPreviewByDay,
   previewInfo,
   previewColor,
@@ -131,10 +139,18 @@ export function CalendarWeekGrid({
             style={{ height: COL_HEADER_H, width: contentWidth }}
           >
             <div
-              className="shrink-0 sticky left-0 top-0 z-40 border-r border-border/60 bg-cream"
+              className="shrink-0 sticky left-0 top-0 z-40 flex items-center justify-center border-r border-border/60 bg-cream"
               style={{ width: gutterW }}
               aria-hidden
-            />
+            >
+              {/* The 52px gutter is full of time pills mid-drag, so the
+                  1-minute badge lives in this empty day-header corner. */}
+              {precisionSnap && (
+                <span className="text-[10px] font-medium tabular-nums text-foreground">
+                  1m
+                </span>
+              )}
+            </div>
             {days.map((day) => {
               const isToday = isSameDay(day, today);
               return (
@@ -194,19 +210,14 @@ export function CalendarWeekGrid({
               className="shrink-0 sticky left-0 z-30 border-r border-border/60 bg-cream"
               style={{ width: gutterW, height: totalHoursH }}
             >
-              {hourLabels.map((h) => {
-                const label = formatHourLabel(h);
-                if (!label) return null;
-                return (
-                  <div
-                    key={h}
-                    className="absolute right-1 -translate-y-1/2 text-[10px] leading-none text-muted-foreground tabular-nums select-none"
-                    style={{ top: h * hourH }}
-                  >
-                    {label}
-                  </div>
-                );
-              })}
+              <GutterTimes
+                hourH={hourH}
+                hourLabels={hourLabels}
+                now={todayIndex != null ? now : null}
+                edges={gutterEdges}
+                headerOffset={COL_HEADER_H + allDayHeight}
+                onEdgePointerDown={onGutterEdgePointerDown}
+              />
             </div>
 
             {/* Day columns — memoized; drag preview is a sibling overlay */}

@@ -4,7 +4,6 @@
 import {
   DEFAULT_EVENT_DURATION_MIN,
   MINUTES_PER_DAY,
-  RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
   addDays,
   clampMinutesToDay,
@@ -22,6 +21,11 @@ export const AUTOSCROLL_EDGE_PX = 48;
 export const AUTOSCROLL_MAX_PX = 18;
 export const ALLDAY_CREATE_HOLD_MS = 220;
 
+/** Pointer travel of N grid-minutes moves a Cmd/Ctrl edge by N/5. */
+export const PRECISION_GAIN_GRID = 5;
+/** Gutter scrub: N grid-minutes of travel move the edge N/10. Always on. */
+export const PRECISION_GAIN_SCRUB = 10;
+
 export type DragZone = 'timed' | 'allday';
 
 export type DragKind =
@@ -29,6 +33,8 @@ export type DragKind =
   | 'move'
   | 'resize-start'
   | 'resize-end'
+  | 'scrub-start'
+  | 'scrub-end'
   | 'allday-create';
 
 /** A snapped position on the timed grid (or all-day: minutes = 0). */
@@ -36,8 +42,10 @@ export interface DragSlot {
   /** Local midnight of the civil day. */
   day: Date;
   /**
-   * Minutes since midnight in [0, 1440].
-   * Create/move snap to `SNAP_MINUTES`; resize snaps to `RESIZE_SNAP_MINUTES`.
+   * Minutes since midnight in [0, 1440], hit-tested on the gesture's live step
+   * (`snapStepMinutes`), so create, move, and resize share one coarse grid.
+   * Precision (Cmd/Ctrl) does not re-snap it: it moves an edge by the scaled
+   * `snappedMinuteDelta` instead of a finer absolute grid.
    */
   minutes: number;
 }
@@ -55,6 +63,24 @@ export function movedEnough(dx: number, dy: number): boolean {
 /** Touch tap on empty grid still creates. Mouse/pen click does not. */
 export function isTapCreatePointer(pointerType: string): boolean {
   return pointerType === 'touch';
+}
+
+/** Apple platform strings: "Mac" / "MacIntel", "iPhone", "iPad", "iPod". */
+const APPLE_PLATFORM = /^(mac|iphone|ipad|ipod)/i;
+
+/**
+ * Whether the precision modifier (a non-touch drag moves at the reduced
+ * `PRECISION_GAIN_GRID` gain) is down.
+ *
+ * Apple platforms use Cmd only: Ctrl there is the context-menu gesture, so a
+ * Ctrl-drag must stay coarse. Everywhere else — including an unknown or empty
+ * `platform` — the key is Ctrl, never Meta.
+ */
+export function precisionModifierDown(
+  keys: { metaKey: boolean; ctrlKey: boolean },
+  platform: string,
+): boolean {
+  return APPLE_PLATFORM.test(platform) ? keys.metaKey : keys.ctrlKey;
 }
 
 /**
@@ -314,14 +340,16 @@ function slotInstant(slot: DragSlot, step = SNAP_MINUTES): Date {
 
 /**
  * Drag-create / all-day-create: order the two slots and enforce min duration.
- * - timed: snapped instants; equal slots → SNAP_MINUTES duration (drag-create
- *   never yields a 0-min event; only resize / inspector edits do)
+ * - timed: snapped instants at `step`; equal slots → `step` minutes, so a drag
+ *   that never leaves its cell still fills one cell of the zoom grid
+ *   (drag-create never yields a 0-min event; only resize / inspector edits do)
  * - allday: earlier day 00:00 → later day + 1 day 00:00 (exclusive end)
  */
 export function rangeFromSlots(
   a: DragSlot,
   b: DragSlot,
   mode: 'timed' | 'allday',
+  step = SNAP_MINUTES,
 ): TimedRange {
   if (mode === 'allday') {
     const dayA = startOfDay(a.day);
@@ -334,13 +362,14 @@ export function rangeFromSlots(
     };
   }
 
-  const tA = slotInstant(a);
-  const tB = slotInstant(b);
+  const minMin = Number.isFinite(step) && step > 0 ? step : SNAP_MINUTES;
+  const tA = slotInstant(a, step);
+  const tB = slotInstant(b, step);
   let start = tA.getTime() <= tB.getTime() ? tA : tB;
   let end = tA.getTime() <= tB.getTime() ? tB : tA;
 
   if (end.getTime() <= start.getTime()) {
-    end = new Date(start.getTime() + SNAP_MINUTES * 60_000);
+    end = new Date(start.getTime() + minMin * 60_000);
   }
 
   return { start, end };
@@ -416,6 +445,10 @@ export function movedAllDayRange(
  * Move: keep duration, place start so the grab point stays under the pointer.
  * `grabOffsetMin` is minutes from the (painted) event start to the pointer at
  * pointerdown; default 0 places start at the slot (legacy / no-offset callers).
+ *
+ * Absolute moves only. A precision (Cmd/Ctrl) move does not come through here:
+ * it adds a scaled minute delta to the frozen ghost instead, so the edge drifts
+ * off the pointer rather than being re-snapped onto a finer grid.
  */
 export function movedRange(
   originalStart: Date,
@@ -441,7 +474,7 @@ export function movedRange(
 /**
  * Resize one edge; keep the other fixed. Min duration is 0: dragging past
  * the fixed edge clamps onto it (start === end), never inverts.
- * The active edge snaps to RESIZE_SNAP_MINUTES (may cross days).
+ * The active edge snaps to `step` (default `SNAP_MINUTES`; may cross days).
  * The fixed edge is not re-snapped.
  */
 export function resizedRange(
@@ -449,8 +482,9 @@ export function resizedRange(
   originalEnd: Date,
   edge: 'start' | 'end',
   slot: DragSlot,
+  step = SNAP_MINUTES,
 ): TimedRange {
-  const slotTime = slotInstant(slot, RESIZE_SNAP_MINUTES);
+  const slotTime = slotInstant(slot, step);
 
   if (edge === 'start') {
     const end = originalEnd;
@@ -461,6 +495,267 @@ export function resizedRange(
   const start = originalStart;
   const end = slotTime.getTime() < start.getTime() ? start : slotTime;
   return { start, end };
+}
+
+// ── precision (Cmd / Ctrl) reduced gain ─────────────────────────────────
+//
+// Precision is not a finer absolute grid: the edge is anchored where it was
+// when the modifier came down and only a scaled pointer delta moves it, so the
+// edge drifts off the pointer on purpose.
+
+/**
+ * Where the pointer was, in hours-content space: Y inside the grid's content
+ * column, plus the scroller's own offset so scrolling can be subtracted out.
+ */
+export interface PointerAnchor {
+  /** Y in hours-content space. Increases when the grid scrolls down. */
+  contentY: number;
+  scrollTop: number;
+}
+
+/**
+ * Pointer travel (px) since `anchor`, with the scroller's own movement removed.
+ * Autoscrolling changes `contentY` and `scrollTop` by the same amount, so a
+ * stationary pointer adds 0 — scrolling must never nudge a precision edge.
+ *
+ * Deliberately not raw `clientY`: if the scroller moves on screen (layout shift,
+ * sticky header) `clientY` changes with no movement inside the grid.
+ * Non-finite input → 0.
+ */
+export function pointerTravelPx(
+  anchor: PointerAnchor,
+  current: PointerAnchor,
+): number {
+  if (
+    !Number.isFinite(anchor.contentY) ||
+    !Number.isFinite(anchor.scrollTop) ||
+    !Number.isFinite(current.contentY) ||
+    !Number.isFinite(current.scrollTop)
+  ) {
+    return 0;
+  }
+  return (
+    current.contentY - anchor.contentY - (current.scrollTop - anchor.scrollTop)
+  );
+}
+
+/**
+ * Grid minutes the pointer traveled, divided by `gain`: the reduced gain itself.
+ * `gain` is `PRECISION_GAIN_GRID` for the timed grid (1 minute per 5 minutes of
+ * travel) and `PRECISION_GAIN_SCRUB` for the touch gutter scrub.
+ * Non-finite travel, or a non-finite/non-positive `hourH` or `gain` → 0.
+ */
+export function scaledMinuteDelta(
+  travelPx: number,
+  hourH: number,
+  gain: number,
+): number {
+  if (
+    !Number.isFinite(travelPx) ||
+    !Number.isFinite(hourH) ||
+    hourH <= 0 ||
+    !Number.isFinite(gain) ||
+    gain <= 0
+  ) {
+    return 0;
+  }
+  return (travelPx * 60) / (hourH * gain);
+}
+
+/**
+ * `scaledMinuteDelta` rounded to a whole minute, half away from zero: +0.5 → +1
+ * and −0.5 → −1. `Math.round` alone is not symmetric on negatives
+ * (`Math.round(-0.5) === -0`), which would let a minute of travel render as no
+ * movement. 0 travel → 0, so engaging precision never jumps.
+ */
+export function snappedMinuteDelta(
+  travelPx: number,
+  hourH: number,
+  gain: number,
+): number {
+  const scaled = scaledMinuteDelta(travelPx, hourH, gain);
+  if (scaled === 0) return 0;
+  return scaled < 0 ? -Math.round(-scaled) : Math.round(scaled);
+}
+
+/**
+ * Whole civil days from `startOfDay(from)` to `startOfDay(to)`. Rounded ms over
+ * 86400000, so a 23h or 25h DST day still counts as one day. Same day → 0,
+ * `to` before `from` → negative. Invalid dates → 0.
+ */
+export function civilDayShift(from: Date, to: Date): number {
+  const a = startOfDay(from).getTime();
+  const b = startOfDay(to).getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.round((b - a) / 86_400_000);
+}
+
+/**
+ * Precision move: shift the whole anchor range by `deltaMin` minutes and then by
+ * `dayShift` civil days. Duration is preserved. A 0/0 call returns the anchor's
+ * instants unchanged (sub-minute phase kept), which is what makes the engage
+ * step a no-op rather than a jump. Non-finite delta or dayShift → 0.
+ */
+export function precisionMove(
+  anchor: TimedRange,
+  deltaMin: number,
+  dayShift: number,
+): TimedRange {
+  const delta = Number.isFinite(deltaMin) ? deltaMin : 0;
+  const days = Number.isFinite(dayShift) ? dayShift : 0;
+  const deltaMs = delta * 60_000;
+  const start = new Date(anchor.start.getTime() + deltaMs);
+  const end = new Date(anchor.end.getTime() + deltaMs);
+  return days === 0
+    ? { start, end }
+    : { start: addDays(start, days), end: addDays(end, days) };
+}
+
+/**
+ * Precision resize: move only the active edge, by `deltaMin` minutes and
+ * `dayShift` civil days. The other edge is not moved and not re-snapped, and the
+ * active edge clamps onto it when it passes (start === end — never inverted).
+ * Non-finite delta or dayShift → 0.
+ */
+export function precisionResize(
+  anchorStart: Date,
+  anchorEnd: Date,
+  edge: 'start' | 'end',
+  deltaMin: number,
+  dayShift: number,
+): TimedRange {
+  const delta = Number.isFinite(deltaMin) ? deltaMin : 0;
+  const days = Number.isFinite(dayShift) ? dayShift : 0;
+  const moved = (d: Date): Date => {
+    const at = new Date(d.getTime() + delta * 60_000);
+    return days === 0 ? at : addDays(at, days);
+  };
+
+  if (edge === 'start') {
+    const start = moved(anchorStart);
+    return {
+      start: start.getTime() > anchorEnd.getTime() ? anchorEnd : start,
+      end: anchorEnd,
+    };
+  }
+
+  const end = moved(anchorEnd);
+  return {
+    start: anchorStart,
+    end: end.getTime() < anchorStart.getTime() ? anchorStart : end,
+  };
+}
+
+/**
+ * Precision create: the origin slot is frozen (day and minutes) and the moving
+ * edge sits on `hitDay` with `anchorCurrent.minutes + deltaMin`, clamped to the
+ * civil day before the instant is built — create never spills into the next
+ * column by overflowing one; the pointer has to enter that column.
+ *
+ * Ordering and minimum duration match `rangeFromSlots(..., 'timed', 1)`: equal
+ * instants become 1 minute, never 0. No 5-minute snapping: the moving minutes
+ * are exact.
+ */
+export function precisionCreate(
+  origin: DragSlot,
+  anchorCurrent: DragSlot,
+  deltaMin: number,
+  hitDay: Date,
+): TimedRange {
+  const delta = Number.isFinite(deltaMin) ? deltaMin : 0;
+  const originAt = dateOnDay(
+    startOfDay(origin.day),
+    clampDayMinutes(origin.minutes),
+  );
+  const movingAt = dateOnDay(
+    startOfDay(hitDay),
+    clampDayMinutes(anchorCurrent.minutes + delta),
+  );
+
+  const originFirst = originAt.getTime() <= movingAt.getTime();
+  const start = originFirst ? originAt : movingAt;
+  const end = originFirst ? movingAt : originAt;
+  return end.getTime() <= start.getTime()
+    ? { start, end: new Date(start.getTime() + SNAP_MINUTES * 60_000) }
+    : { start, end };
+}
+
+/** Minutes since midnight, clamped into the civil day; non-finite → 0. */
+function clampDayMinutes(minutes: number): number {
+  if (!Number.isFinite(minutes)) return 0;
+  return Math.min(MINUTES_PER_DAY, Math.max(0, minutes));
+}
+
+// ── gutter scrub (1:10 gain, lagged release) ────────────────────────────
+//
+// The gutter has no day axis and no absolute grid, so a scrub is always the
+// 1:10 gain and commits the edge it was painting — which is the lagged one.
+
+/** How far behind the finger the painted edge trails. */
+export const SCRUB_RELEASE_LAG_MS = 80;
+
+/** A pointer position in hours-content space, stamped with its event time. */
+export interface PointerSample extends PointerAnchor {
+  t: number;
+}
+
+/**
+ * The sample to paint: the newest one at least `lagMs` old, so the edge trails
+ * the pointer and lift-off commits what the user was looking at.
+ *
+ * When every sample is younger than the lag — a gesture shorter than it — the
+ * earliest sample (the grab) is shown. `samples` must be in gesture order, so
+ * the first one is the grab. Empty, or a non-finite `now` → null.
+ */
+export function laggedPointer(
+  samples: readonly PointerSample[],
+  now: number,
+  lagMs = SCRUB_RELEASE_LAG_MS,
+): PointerSample | null {
+  if (!Number.isFinite(now)) return null;
+  const lag = Number.isFinite(lagMs) ? lagMs : 0;
+  const cutoff = now - lag;
+  let newest: PointerSample | null = null;
+  for (const sample of samples) {
+    if (sample.t > cutoff) continue;
+    if (!newest || sample.t >= newest.t) newest = sample;
+  }
+  return newest ?? samples[0] ?? null;
+}
+
+/**
+ * The range a gutter scrub paints at `now`: the active edge moves by the travel
+ * from the grab to the sample the lag says the user is looking at.
+ *
+ * `now` may sit past the newest sample. That is the idle case a settle timer
+ * re-runs: the finger has stopped moving, so the newest sample is no longer
+ * inside the lag and the edge converges onto where the finger rests. Nothing is
+ * sampled here — the range comes out of the samples the caller already has.
+ *
+ * Empty samples, or a non-finite `now` → null. The grab is `samples[0]`.
+ */
+export function scrubPreviewAt(input: {
+  samples: readonly PointerSample[];
+  now: number;
+  hourH: number;
+  edge: 'start' | 'end';
+  start: Date;
+  end: Date;
+  lagMs?: number;
+}): TimedRange | null {
+  const { samples, now, hourH, edge, start, end, lagMs } = input;
+  const grab = samples[0];
+  if (!grab || !Number.isFinite(now)) return null;
+
+  const lagged = laggedPointer(samples, now, lagMs) ?? grab;
+  const delta = snappedMinuteDelta(
+    pointerTravelPx(grab, lagged),
+    hourH,
+    PRECISION_GAIN_SCRUB,
+  );
+  // Day shift is always 0 — the gutter has no day axis, so midnight is only the
+  // Date math inside `precisionResize`.
+  return precisionResize(start, end, edge, delta, 0);
 }
 
 /** What the drag ghost needs to label itself (kept out of DayColumn props). */

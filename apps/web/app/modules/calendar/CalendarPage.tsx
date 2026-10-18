@@ -208,6 +208,7 @@ export function CalendarPage() {
           totalHoursH={session.totalHoursH}
           hourGridBg={session.hourGridBg}
           hourLabels={session.hourLabels}
+          gutterEdges={session.gutterEdges}
           allDayHeight={session.allDayHeight}
           allDayChips={session.allDayChips}
           todayIndex={session.todayIndex}
@@ -220,8 +221,10 @@ export function CalendarPage() {
           onRequestDelete={canTouchDelete ? requestDelete : undefined}
           onAllDayPointerDown={session.onAllDayPointerDown}
           onAllDayChipPointerDown={session.onAllDayChipPointerDown}
+          onGutterEdgePointerDown={session.onGutterEdgePointerDown}
           onChipSelect={session.handleSelectChip}
           isDragging={session.isDragging}
+          precisionSnap={session.precisionSnap}
           timedPreviewByDay={session.timedPreviewByDay}
           previewInfo={session.previewInfo}
           previewColor={session.previewColor}

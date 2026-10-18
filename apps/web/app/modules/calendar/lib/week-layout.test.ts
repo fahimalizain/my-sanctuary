@@ -73,8 +73,12 @@ import {
   weekRangeIso,
   snapMinutes,
   PACK_WIDEN_BELOW_MIN,
-  RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
+  SNAP_STEP_BASE,
+  SNAP_STEP_COARSE_LADDER,
+  SNAP_STEP_COARSEST,
+  SNAP_STEP_MIN_PX,
+  snapStepMinutes,
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
@@ -1344,10 +1348,10 @@ test('snapMinutes: nearest 1 minute, clamp 0..1440', () => {
   assert.equal(snapMinutes(15), 15);
 });
 
-test('snapMinutes: optional 1-minute step (resize)', () => {
+test('snapMinutes: optional explicit 1-minute step', () => {
   // nearest 1-minute
-  assert.equal(snapMinutes(10 * 60 + 7.4, RESIZE_SNAP_MINUTES), 607);
-  assert.equal(snapMinutes(10 * 60 + 7.6, RESIZE_SNAP_MINUTES), 608);
+  assert.equal(snapMinutes(10 * 60 + 7.4, 1), 607);
+  assert.equal(snapMinutes(10 * 60 + 7.6, 1), 608);
   assert.equal(snapMinutes(7, 1), 7);
   assert.equal(snapMinutes(8, 1), 8);
   // clamp
@@ -1361,6 +1365,49 @@ test('snapMinutes: explicit 15-minute step still quantizes', () => {
   assert.equal(snapMinutes(8, 15), 15);
   assert.equal(snapMinutes(22, 15), 15);
   assert.equal(snapMinutes(23, 15), 30);
+});
+
+// ── snapStepMinutes ─────────────────────────────────────────────────────
+
+test('snapStepMinutes: named grid constants', () => {
+  assert.equal(SNAP_STEP_BASE, 5);
+  assert.deepEqual(SNAP_STEP_COARSE_LADDER, [5, 15, 30]);
+  assert.equal(SNAP_STEP_MIN_PX, 6);
+  assert.equal(SNAP_STEP_COARSEST, 30);
+});
+
+test('snapStepMinutes: default zoom and every zoom above it stay at 5', () => {
+  assert.equal(snapStepMinutes(HOUR_H_BASE), 5);
+  assert.equal(snapStepMinutes(72), 5);
+  assert.equal(snapStepMinutes(HOUR_H_MAX), 5);
+});
+
+test('snapStepMinutes: the 6px bar deliberately misses the default grid', () => {
+  // A 5-minute cell is 4px at HOUR_H_BASE — under the bar, and still the step:
+  // coarsening is for zooming out, not for the default zoom.
+  assert.equal((SNAP_STEP_BASE * HOUR_H_BASE) / 60, 4);
+  assert.ok((SNAP_STEP_BASE * HOUR_H_BASE) / 60 < SNAP_STEP_MIN_PX);
+  assert.equal(snapStepMinutes(HOUR_H_BASE), SNAP_STEP_BASE);
+});
+
+test('snapStepMinutes: below the default hour, a sub-6px cell coarsens', () => {
+  // hourH 47: 5 minutes = 3.92px, 15 minutes = 11.75px.
+  assert.equal(snapStepMinutes(47), 15);
+  // hourH 24: 15 minutes is exactly 6px, so it clears the bar.
+  assert.equal((15 * 24) / 60, SNAP_STEP_MIN_PX);
+  assert.equal(snapStepMinutes(24), 15);
+  // hourH 23: 15 minutes = 5.75px, so only 30 clears the bar.
+  assert.equal(snapStepMinutes(23), 30);
+  assert.equal(snapStepMinutes(HOUR_H_MIN), 30);
+});
+
+test('snapStepMinutes: unusable hourH → coarsest rung', () => {
+  // Even 30 minutes paints under the bar at hourH 1.
+  assert.equal(snapStepMinutes(1), 30);
+  assert.equal(snapStepMinutes(NaN), 30);
+  assert.equal(snapStepMinutes(Number.POSITIVE_INFINITY), 30);
+  assert.equal(snapStepMinutes(0), 30);
+  assert.equal(snapStepMinutes(-48), 30);
 });
 
 test('minutesFromY: 88px at hourH=88 → 60', () => {
