@@ -854,22 +854,34 @@ function stepSession(
  * not enough: the scroller is `touch-action: pan-y`, a trackpad wheel still
  * scrolls while the button is held, and a browser drag-autoscroll writes
  * `scrollTop` without a cancelable event. Wheel and touch pan are cancelled
- * here — the listener has to be non-passive, or `preventDefault` is ignored —
- * and a scroll that lands anyway is pinned back to the position at lock time.
+ * here — the listeners have to be non-passive, or `preventDefault` is ignored
+ * — and a scroll that lands anyway is pinned back to the position at lock time.
+ *
+ * Both listeners sit on `window` in capture: a pan or a wheel can start
+ * anywhere in the scroller's subtree, and the listeners must be non-passive.
+ * They act only on events aimed inside `scroller`, so the sidebar and the
+ * inspector keep scrolling while a pill is held.
  */
 function freezeVerticalScroll(scroller: HTMLElement): () => void {
   const top = scroller.scrollTop;
-  let pinning = false;
   const pin = () => {
-    if (pinning || scroller.scrollTop === top) return;
-    pinning = true;
+    // No self-disarm: if the write is clamped by a shorter document the value
+    // is unchanged, which fires no scroll event, so this cannot loop and the
+    // pin holds for the whole gesture.
+    if (scroller.scrollTop === top) return;
     scroller.scrollTop = top;
-    pinning = false;
-    // A shorter document clamps the write and would re-fire forever. Wheel and
-    // touch are still cancelled; only the pin gives up.
-    if (scroller.scrollTop !== top) scroller.removeEventListener('scroll', pin);
+  };
+  const targetsScroller = (event: Event) => {
+    const { target } = event;
+    return target instanceof Node && scroller.contains(target);
   };
   const block = (event: Event) => {
+    if (!targetsScroller(event)) return;
+    // Propagation is stopped, not just the default action: `useCalendarZoom`
+    // listens for ctrl/meta wheel on the scroller itself, and rescaling the
+    // hours writes `scrollTop` from a layout effect — the pin would then revert
+    // that correction and pull the hour out from under the cursor.
+    event.stopPropagation();
     if (event.cancelable) event.preventDefault();
   };
   scroller.addEventListener('scroll', pin);
@@ -1094,8 +1106,28 @@ export function useCalendarDrag(
     verticalScrollLockRef.current = freezeVerticalScroll(scroller);
   }, [unlockScrollerVertical]);
 
+  /**
+   * What a claimed gesture does to the scroll position, stated once: a
+   * precision scrub freezes the axis it edits, every other drag autoscrolls
+   * when the pointer reaches an edge. Claiming is what engages it, so both
+   * claim paths run through here.
+   */
+  const startGestureScroll = useCallback(
+    (kind: DragKind) => {
+      if (isScrubKind(kind)) {
+        // Autoscroll would fling the day: a pill stuck to the viewport edge
+        // already sits in the edge zone, and the travel math subtracts scroll
+        // out, so the edge would not even follow.
+        lockScrollerVertical();
+        return;
+      }
+      startAutoScroll();
+    },
+    [lockScrollerVertical, startAutoScroll],
+  );
+
   const claimGesture = useCallback(
-    (pointerId: number) => {
+    (pointerId: number, kind: DragKind) => {
       if (claimedRef.current) return;
       claimedRef.current = true;
       tick();
@@ -1109,9 +1141,9 @@ export function useCalendarDrag(
           // Capture can fail if the target is not active; window listeners still work.
         }
       }
-      startAutoScroll();
+      startGestureScroll(kind);
     },
-    [startAutoScroll],
+    [startGestureScroll],
   );
 
   const beginSession = useCallback(
@@ -1153,23 +1185,10 @@ export function useCalendarDrag(
           // Capture can fail if the target is not active; window listeners still work.
         }
         document.body.style.userSelect = 'none';
-        if (isScrubKind(next.kind)) {
-          // Precision handles freeze the hours. Autoscroll would fling the day:
-          // a pill stuck to the viewport edge already sits in the edge zone,
-          // and the travel math subtracts scroll out, so the edge would not
-          // even follow.
-          lockScrollerVertical();
-        } else {
-          startAutoScroll();
-        }
+        startGestureScroll(next.kind);
       }
     },
-    [
-      clearScrubSettle,
-      lockScrollerVertical,
-      startAutoScroll,
-      unlockScrollerVertical,
-    ],
+    [clearScrubSettle, startGestureScroll, unlockScrollerVertical],
   );
 
   const endSession = useCallback(() => {
@@ -1199,9 +1218,17 @@ export function useCalendarDrag(
       if (touches.latched && sessionRef.current) endSession();
     };
     const onEnd = (e: PointerEvent) => touches.up(e.pointerId);
-    const onReset = () => touches.reset();
+    // A blur or a hidden tab can swallow the `pointerup` that would end the
+    // gesture, and a release nobody runs leaves the calendar unscrollable.
+    // Releasing is idempotent, so a repeat costs nothing.
+    const onReset = () => {
+      touches.reset();
+      unlockScrollerVertical();
+    };
     const onHidden = () => {
-      if (document.visibilityState === 'hidden') touches.reset();
+      if (document.visibilityState !== 'hidden') return;
+      touches.reset();
+      unlockScrollerVertical();
     };
     window.addEventListener('blur', onReset);
     document.addEventListener('visibilitychange', onHidden);
@@ -1215,7 +1242,7 @@ export function useCalendarDrag(
       window.removeEventListener('pointerup', onEnd, true);
       window.removeEventListener('pointercancel', onEnd, true);
     };
-  }, [endSession]);
+  }, [endSession, unlockScrollerVertical]);
 
   // Window-level move / up while a session is active.
   useEffect(() => {
@@ -1246,7 +1273,7 @@ export function useCalendarDrag(
           endSession();
           return;
         }
-        claimGesture(e.pointerId);
+        claimGesture(e.pointerId, s.kind);
       }
 
       if (!didDragRef.current && movedEnough(dx, dy)) {
