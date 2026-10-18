@@ -35,8 +35,9 @@ export interface DragSlot {
   /** Local midnight of the civil day. */
   day: Date;
   /**
-   * Minutes since midnight in [0, 1440], hit-tested on the gesture's zoom step
-   * (`snapStepMinutes`), so create, move, and resize share one grid.
+   * Minutes since midnight in [0, 1440], hit-tested on the gesture's live step
+   * (`snapStepMinutes`), so create, move, and resize share one grid; pressing
+   * or releasing the precision modifier re-snaps it mid-drag.
    */
   minutes: number;
 }
@@ -54,6 +55,23 @@ export function movedEnough(dx: number, dy: number): boolean {
 /** Touch tap on empty grid still creates. Mouse/pen click does not. */
 export function isTapCreatePointer(pointerType: string): boolean {
   return pointerType === 'touch';
+}
+
+/** Apple platform strings: "Mac" / "MacIntel", "iPhone", "iPad", "iPod". */
+const APPLE_PLATFORM = /^(mac|iphone|ipad|ipod)/i;
+
+/**
+ * Whether the precision modifier (a non-touch drag snaps to 1 minute) is down.
+ *
+ * Apple platforms use Cmd only: Ctrl there is the context-menu gesture, so a
+ * Ctrl-drag must stay coarse. Everywhere else — including an unknown or empty
+ * `platform` — the key is Ctrl, never Meta.
+ */
+export function precisionModifierDown(
+  keys: { metaKey: boolean; ctrlKey: boolean },
+  platform: string,
+): boolean {
+  return APPLE_PLATFORM.test(platform) ? keys.metaKey : keys.ctrlKey;
 }
 
 /**

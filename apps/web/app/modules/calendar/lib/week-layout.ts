@@ -26,23 +26,29 @@ export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
 /**
- * Finest grid step, in minutes, and the default step of `snapMinutes` and the
- * range helpers. Grid create / move / resize use `snapStepMinutes` instead;
- * this stays the off-grid cleanup step and the click-create fallback.
+ * Finest grid step, in minutes: the precision-modifier step, and the default
+ * step of `snapMinutes` and the range helpers. Grid create / move / resize use
+ * `snapStepMinutes` instead; this stays the off-grid cleanup step and the
+ * click-create fallback.
  */
 export const SNAP_MINUTES = 1;
-/** Grid steps (minutes, fine → coarse) that create / move / resize may use. */
-export const SNAP_STEP_LADDER = [1, 5, 10, 15, 30] as const;
-/** Coarsest ladder rung; also the fallback when even it paints under the bar. */
-export const SNAP_STEP_COARSEST = SNAP_STEP_LADDER[SNAP_STEP_LADDER.length - 1];
-/** Touch steps must paint at least this tall, or a cell is hard to land on. */
-export const SNAP_MIN_PX_TOUCH = 10;
 /**
- * Mouse / pen minimum, exactly one minute at `HOUR_H_MAX` (~3.47px) so max
- * zoom unlocks the 1-minute step. A strict 4px bar could not do that: one
- * minute at max zoom is only ~3.47px tall.
+ * Grid step (minutes) for create / move / resize at the default zoom and
+ * above. Set by the gesture, not by the pointer type: touch, mouse, and pen
+ * all share it.
  */
-export const SNAP_MIN_PX_FINE = HOUR_H_MAX / 60;
+export const SNAP_STEP_BASE = 5;
+/** Coarse steps (minutes) that a zoomed-out grid may step up to. */
+export const SNAP_STEP_COARSE_LADDER = [SNAP_STEP_BASE, 15, 30] as const;
+/**
+ * A coarse step must paint at least this tall, or a cell is hard to land on.
+ * Only consulted below `HOUR_H_BASE` — the default grid stays on the base step
+ * even though its 5-minute cell is 4px (see `snapStepMinutes`).
+ */
+export const SNAP_STEP_MIN_PX = 6;
+/** Coarsest coarse step; also the fallback when even it paints under the bar. */
+export const SNAP_STEP_COARSEST =
+  SNAP_STEP_COARSE_LADDER[SNAP_STEP_COARSE_LADDER.length - 1];
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
 /**
@@ -1274,19 +1280,25 @@ export function snapMinutes(min: number, step = SNAP_MINUTES): number {
 }
 
 /**
- * Grid step (minutes) for a drag at `hourH`: the smallest ladder rung whose
- * on-screen height (`step * hourH / 60`) clears the pointer's minimum, so the
- * grid coarsens as the user zooms out. An unusable `hourH`, or a zoom where
- * even 30 minutes paints under the bar, gives the coarsest rung.
+ * Grid step (minutes) for a drag at `hourH`. Never finer than
+ * `SNAP_STEP_BASE` unless `precision` is set, which gives `SNAP_MINUTES`.
  *
- * The mouse / pen bar is `SNAP_MIN_PX_FINE`, which resolves to 5 minutes at
- * `HOUR_H_BASE` (that cell is exactly 4px) and 1 minute at `HOUR_H_MAX`.
+ * At `HOUR_H_BASE` and above the step is always `SNAP_STEP_BASE`, including
+ * `HOUR_H_MAX`. Below it, the step is the smallest coarse rung whose on-screen
+ * height (`step * hourH / 60`) clears `SNAP_STEP_MIN_PX`, so the grid coarsens
+ * as the user zooms out. An unusable `hourH` — or a zoom where even 30 minutes
+ * paints under the bar — gives the coarsest rung.
+ *
+ * The bar deliberately does not reach the default grid: a 5-minute cell at
+ * `HOUR_H_BASE` is only 4px, and it stays the step. Coarsening is for zooming
+ * out, not for the default zoom, so max zoom can never buy a finer grid.
  */
-export function snapStepMinutes(hourH: number, pointerType: string): number {
+export function snapStepMinutes(hourH: number, precision = false): number {
+  if (precision) return SNAP_MINUTES;
   if (!Number.isFinite(hourH) || hourH <= 0) return SNAP_STEP_COARSEST;
-  const minPx = pointerType === 'touch' ? SNAP_MIN_PX_TOUCH : SNAP_MIN_PX_FINE;
-  for (const step of SNAP_STEP_LADDER) {
-    if ((step * hourH) / 60 >= minPx) return step;
+  if (hourH >= HOUR_H_BASE) return SNAP_STEP_BASE;
+  for (const step of SNAP_STEP_COARSE_LADDER) {
+    if ((step * hourH) / 60 >= SNAP_STEP_MIN_PX) return step;
   }
   return SNAP_STEP_COARSEST;
 }

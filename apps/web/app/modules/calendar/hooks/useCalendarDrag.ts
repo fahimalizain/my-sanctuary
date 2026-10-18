@@ -23,6 +23,7 @@ import {
   movedAllDayRange,
   movedEnough,
   movedRange,
+  precisionModifierDown,
   rangeFromSlots,
   resolveChipGesture,
   resizedRange,
@@ -81,6 +82,11 @@ export interface CalendarDragApi {
   /** Event being moved/resized (null for create gestures). */
   activeEventId: string | null;
   isDragging: boolean;
+  /**
+   * Precision modifier is live: a non-touch pointer is holding Cmd (macOS) /
+   * Ctrl, and the gesture is on the timed grid at 1-minute snap.
+   */
+  precisionSnap: boolean;
   /** True after a drag commit so a synthetic click can be ignored. */
   suppressNextClick: () => boolean;
   /** Drop an in-progress gesture without committing create/move/resize. */
@@ -89,17 +95,34 @@ export interface CalendarDragApi {
 
 interface Session {
   kind: DragKind;
-  /** Grid step (minutes) for this gesture, from pointerdown; hit-tests with it. */
+  /**
+   * Grid step (minutes) for the gesture, hit-tested with it. Re-read from the
+   * zoom and the pointer's live modifier state on every pointer and modifier
+   * key event — never frozen at pointerdown, or pressing Cmd mid-drag would
+   * leave the ghost on the coarse grid.
+   */
   snapStep: number;
+  /** Precision modifier is down (always false for touch). */
+  precision: boolean;
   originSlot: DragSlot;
   currentSlot: DragSlot;
+  /**
+   * Unsnapped minutes at pointerdown (timed gestures). Every re-snap rebuilds
+   * the origin slot from these; the origin day is never re-read from clientY,
+   * because autoscroll would move it under a stationary pointer.
+   */
+  originMinutesRaw?: number;
   originX: number;
   originY: number;
   eventId?: string;
   originalStart?: Date;
   originalEnd?: Date;
-  /** Minutes from painted chip start to pointer at pointerdown (move only). */
-  grabOffsetMin?: number;
+  /**
+   * Timed move only: painted chip start (`data-start-min`). The grab offset is
+   * derived from the re-snapped origin against this on every preview, so a
+   * modifier change re-snaps the hold point instead of keeping a stale error.
+   */
+  paintedStartMin?: number;
   /** Civil-day offset from all-day event start to the grab day. */
   grabOffsetDays?: number;
   originZone: DragZone;
@@ -112,11 +135,73 @@ interface Session {
   tapOnly?: boolean;
 }
 
+/** Live modifier state of the gesture, from a pointer or key event. */
+interface ModifierKeys {
+  metaKey: boolean;
+  ctrlKey: boolean;
+}
+
+/** Keys whose press / release changes the precision modifier. */
+function isModifierKey(key: string): boolean {
+  return key === 'Meta' || key === 'OS' || key === 'Control';
+}
+
+/**
+ * Apple layout of this device, for `precisionModifierDown`. Cached: it cannot
+ * change during a session.
+ *
+ * `navigator.platform` is deprecated but still the only source that yields the
+ * short tokens the helper reads: "MacIntel" (macOS and iPad alike), "iPhone",
+ * "Win32", "Linux x86_64". A missing value stays '' and reads as Ctrl rather
+ * than guessing Meta, so the modifier is never on by accident.
+ */
+let cachedPlatform: string | null = null;
+function platformName(): string {
+  if (cachedPlatform === null) {
+    cachedPlatform =
+      typeof navigator === 'undefined' ? '' : navigator.platform || '';
+  }
+  return cachedPlatform;
+}
+
+/**
+ * Modifier state for a gesture: touch never gets precision snap, even on a
+ * device with a keyboard attached.
+ */
+function precisionForPointer(
+  pointerType: string,
+  keys: ModifierKeys,
+  platform: string,
+): boolean {
+  return pointerType === 'touch'
+    ? false
+    : precisionModifierDown(keys, platform);
+}
+
+/** Live grid for a session: the precision modifier and the step it implies. */
+function dragGrid(
+  hourH: number,
+  pointerType: string,
+  keys: ModifierKeys,
+): { precision: boolean; snapStep: number } {
+  const precision = precisionForPointer(pointerType, keys, platformName());
+  return { precision, snapStep: snapStepMinutes(hourH, precision) };
+}
+
 function parseDayAttr(value: string | null | undefined): Date | null {
   if (!value) return null;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return null;
   return startOfDay(d);
+}
+
+function rawMinutesAtColumn(
+  clientY: number,
+  colEl: Element,
+  hourH: number,
+): number {
+  const top = colEl.getBoundingClientRect().top;
+  return minutesFromY(clientY - top, hourH);
 }
 
 function slotFromColumn(
@@ -126,10 +211,10 @@ function slotFromColumn(
   hourH: number,
   step: number,
 ): DragSlot {
-  const top = colEl.getBoundingClientRect().top;
-  const y = clientY - top;
-  const minutes = snapMinutes(minutesFromY(y, hourH), step);
-  return { day: startOfDay(day), minutes };
+  return {
+    day: startOfDay(day),
+    minutes: snapMinutes(rawMinutesAtColumn(clientY, colEl, hourH), step),
+  };
 }
 
 function hitTestTimed(
@@ -194,7 +279,7 @@ function computePreview(session: Session): TimedRange | null {
     currentSlot,
     originalStart,
     originalEnd,
-    grabOffsetMin,
+    paintedStartMin,
     grabOffsetDays,
   } = session;
   switch (kind) {
@@ -217,15 +302,19 @@ function computePreview(session: Session): TimedRange | null {
         return toAllDayRange(currentSlot);
       }
       if (originZone === 'allday') return toTimedRange(currentSlot);
-      // Deliberately not snapped to `snapStep`: the slot is already quantized
-      // to it and the grab offset carries the event's minute phase, so a
-      // coarse snap here would jump an off-grid 10:07 event onto the grid on
-      // the first move. Snapping the difference keeps the phase.
+      // `movedRange` keeps its own 1-minute snap, so a coarse step would jump
+      // an off-grid 10:07 event onto the grid on the first move. The slot is
+      // quantized to the live step instead, and the grab offset is recomputed
+      // from that snapped origin every preview: pressing Cmd then re-snaps the
+      // hold point onto the 1-minute grid instead of keeping the 5-minute
+      // error it had a moment ago.
       return movedRange(
         originalStart,
         originalEnd,
         currentSlot,
-        grabOffsetMin ?? 0,
+        paintedStartMin === undefined
+          ? 0
+          : originSlot.minutes - paintedStartMin,
       );
     case 'resize-start':
       if (!originalStart || !originalEnd) return null;
@@ -271,16 +360,77 @@ function nextSlotFromPoint(
   clientX: number,
   clientY: number,
   hourH: number,
+  step: number,
 ): { slot: DragSlot; zone: DragZone } | null {
   if (session.kind === 'allday-create') {
     const slot = hitTestAllDay(clientX, clientY);
     return slot ? { slot, zone: 'allday' } : null;
   }
   if (session.kind === 'resize-start' || session.kind === 'resize-end') {
-    const slot = hitTestTimed(clientX, clientY, hourH, session.snapStep);
+    const slot = hitTestTimed(clientX, clientY, hourH, step);
     return slot ? { slot, zone: 'timed' } : null;
   }
-  return hitTestAny(clientX, clientY, hourH, session.snapStep);
+  return hitTestAny(clientX, clientY, hourH, step);
+}
+
+/**
+ * Re-snap an active gesture at a point for the pointer's current modifier
+ * state. Returns null when nothing moved, so a held modifier key repeat costs
+ * no render.
+ *
+ * The origin is rebuilt from `originMinutesRaw` with the live step rather than
+ * reused: a frozen 5-minute origin would leave 1-minute mode lying about where
+ * the gesture started. The origin day is carried over untouched — re-reading it
+ * from clientY would let autoscroll drag the anchor.
+ */
+function resnapSession(
+  session: Session,
+  x: number,
+  y: number,
+  keys: ModifierKeys,
+  hourH: number,
+): Session | null {
+  const { precision, snapStep } = dragGrid(hourH, session.pointerType, keys);
+
+  const originMinutes = session.originMinutesRaw;
+  const originSlot =
+    originMinutes === undefined
+      ? session.originSlot
+      : {
+          day: session.originSlot.day,
+          minutes: snapMinutes(originMinutes, snapStep),
+        };
+
+  const hit = nextSlotFromPoint(session, x, y, hourH, snapStep);
+  // A miss (pointer over the gutter, off-window, or past a sticky edge) still
+  // re-snaps the current slot, so the ghost cannot keep a stale coarse minute.
+  const currentSlot = hit
+    ? hit.slot
+    : {
+        ...session.currentSlot,
+        minutes: snapMinutes(session.currentSlot.minutes, snapStep),
+      };
+  const currentZone = hit ? hit.zone : session.currentZone;
+
+  if (
+    snapStep === session.snapStep &&
+    precision === session.precision &&
+    currentZone === session.currentZone &&
+    originSlot.minutes === session.originSlot.minutes &&
+    currentSlot.day.getTime() === session.currentSlot.day.getTime() &&
+    currentSlot.minutes === session.currentSlot.minutes
+  ) {
+    return null;
+  }
+
+  return {
+    ...session,
+    snapStep,
+    precision,
+    originSlot,
+    currentSlot,
+    currentZone,
+  };
 }
 
 export function useCalendarDrag(
@@ -299,6 +449,8 @@ export function useCalendarDrag(
   const claimedRef = useRef(false);
   const captureTargetRef = useRef<HTMLElement | null>(null);
   const lastPtrRef = useRef({ x: 0, y: 0 });
+  /** Last modifier state read from a pointer or modifier key event. */
+  const lastKeysRef = useRef<ModifierKeys>({ metaKey: false, ctrlKey: false });
   const autoScrollRafRef = useRef(0);
   /** Active touches + multi-touch latch (pinch must never start a session). */
   const touchesRef = useRef(createTouchTracker());
@@ -306,30 +458,41 @@ export function useCalendarDrag(
   const [session, setSession] = useState<Session | null>(null);
   const [didDrag, setDidDrag] = useState(false);
 
-  const applyPoint = useCallback((clientX: number, clientY: number) => {
-    const s = sessionRef.current;
-    if (!s) return;
-    const hit = nextSlotFromPoint(s, clientX, clientY, optsRef.current.hourH);
-    if (!hit) return;
-    const updated: Session = {
-      ...s,
-      currentSlot: hit.slot,
-      currentZone: hit.zone,
-    };
-    if (s.pointerType === 'touch' && claimedRef.current) {
-      const prevMs = tickInstantMs(s);
-      const nextMs = tickInstantMs(updated);
-      if (
-        prevMs !== null &&
-        nextMs !== null &&
-        crossedTickBoundary(prevMs, nextMs, s.snapStep)
-      ) {
-        tick();
+  /**
+   * Apply a pointer position to the active gesture, re-snapping it at the
+   * modifier state carried by that event. Autoscroll and modifier key events
+   * come through here too, so the ghost is always on the live grid.
+   */
+  const applyPoint = useCallback(
+    (clientX: number, clientY: number, keys: ModifierKeys) => {
+      lastKeysRef.current = keys;
+      const s = sessionRef.current;
+      if (!s) return;
+      const updated = resnapSession(
+        s,
+        clientX,
+        clientY,
+        keys,
+        optsRef.current.hourH,
+      );
+      // Same step, origin, and slot as before (e.g. a held key repeat).
+      if (!updated) return;
+      if (s.pointerType === 'touch' && claimedRef.current) {
+        const prevMs = tickInstantMs(s);
+        const nextMs = tickInstantMs(updated);
+        if (
+          prevMs !== null &&
+          nextMs !== null &&
+          crossedTickBoundary(prevMs, nextMs, updated.snapStep)
+        ) {
+          tick();
+        }
       }
-    }
-    sessionRef.current = updated;
-    setSession(updated);
-  }, []);
+      sessionRef.current = updated;
+      setSession(updated);
+    },
+    [],
+  );
 
   const stopAutoScroll = useCallback(() => {
     if (autoScrollRafRef.current) {
@@ -349,7 +512,7 @@ export function useCalendarDrag(
     const dy = autoscrollDelta(y, rect.top, rect.bottom);
     if (dx !== 0) scroller.scrollLeft += dx;
     if (dy !== 0) scroller.scrollTop += dy;
-    if (dx !== 0 || dy !== 0) applyPoint(x, y);
+    if (dx !== 0 || dy !== 0) applyPoint(x, y, lastKeysRef.current);
     autoScrollRafRef.current = requestAnimationFrame(tickAutoScroll);
   }, [applyPoint]);
 
@@ -393,6 +556,9 @@ export function useCalendarDrag(
       setDidDrag(false);
       captureTargetRef.current = target;
       lastPtrRef.current = { x: e.clientX, y: e.clientY };
+      // Seed the modifier state so an autoscroll tick before the first
+      // pointermove does not fall back to the coarse grid.
+      lastKeysRef.current = { metaKey: e.metaKey, ctrlKey: e.ctrlKey };
 
       const isTouch = e.pointerType === 'touch';
       if (isTouch && !claimImmediately) {
@@ -492,7 +658,10 @@ export function useCalendarDrag(
       }
 
       e.preventDefault();
-      applyPoint(e.clientX, e.clientY);
+      applyPoint(e.clientX, e.clientY, {
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+      });
     };
 
     const onUpWin = (e: PointerEvent) => {
@@ -567,22 +736,38 @@ export function useCalendarDrag(
       endSession();
     };
 
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      endSession();
+    /**
+     * Cmd (macOS) / Ctrl (elsewhere) pressed or released mid-drag re-snaps the
+     * gesture where the pointer already is — no pointermove needed. These keys
+     * are never preventDefault-ed. Escape keeps winning: it is checked first.
+     */
+    const onKeyEvent = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (e.type === 'keydown') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          endSession();
+        }
+        return;
+      }
+      if (!isModifierKey(e.key)) return;
+      applyPoint(lastPtrRef.current.x, lastPtrRef.current.y, {
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+      });
     };
 
     window.addEventListener('pointermove', onMoveWin, { passive: false });
     window.addEventListener('pointerup', onUpWin);
     window.addEventListener('pointercancel', onCancelWin);
-    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keydown', onKeyEvent, true);
+    window.addEventListener('keyup', onKeyEvent, true);
     return () => {
       window.removeEventListener('pointermove', onMoveWin);
       window.removeEventListener('pointerup', onUpWin);
       window.removeEventListener('pointercancel', onCancelWin);
-      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('keydown', onKeyEvent, true);
+      window.removeEventListener('keyup', onKeyEvent, true);
     };
   }, [session, endSession, claimGesture, applyPoint]);
 
@@ -601,12 +786,19 @@ export function useCalendarDrag(
       if (target?.closest('.event-chip')) return;
 
       const col = e.currentTarget;
-      const snapStep = snapStepMinutes(hourH, e.pointerType);
-      const originSlot = slotFromColumn(e.clientY, col, day, hourH, snapStep);
+      const { precision, snapStep } = dragGrid(hourH, e.pointerType, e);
+      // Unsnapped origin: the modifier key can re-snap it mid-drag.
+      const originMinutesRaw = rawMinutesAtColumn(e.clientY, col, hourH);
+      const originSlot: DragSlot = {
+        day: startOfDay(day),
+        minutes: snapMinutes(originMinutesRaw, snapStep),
+      };
       beginSession(
         {
           kind: 'create',
           snapStep,
+          precision,
+          originMinutesRaw,
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -659,40 +851,43 @@ export function useCalendarDrag(
       );
       const kind: DragKind = gesture.kind;
 
-      // One step for the whole gesture, from the zoom and the pointer type.
-      const snapStep = snapStepMinutes(hourH, e.pointerType);
+      // Live for the gesture: a Cmd / Ctrl press mid-drag re-snaps it.
+      const { precision, snapStep } = dragGrid(hourH, e.pointerType, e);
 
       const originalStart = new Date(event.start_time);
       const originalEnd = new Date(event.end_time);
 
-      // Origin slot: under the pointer on the containing day column.
+      // Origin: under the pointer on the containing day column. The raw minutes
+      // are kept so the modifier key can re-snap the origin, and the day is
+      // pinned here (autoscroll must not move it).
       const col = chipEl.closest('[data-day-col]') as HTMLElement | null;
       const dayAttr = col?.getAttribute('data-day-col');
       const day = parseDayAttr(dayAttr) ?? startOfDay(originalStart);
-      const originSlot = col
-        ? slotFromColumn(e.clientY, col, day, hourH, snapStep)
-        : {
-            day: startOfDay(originalStart),
-            minutes: snapMinutes(
-              originalStart.getHours() * 60 + originalStart.getMinutes(),
-              snapStep,
-            ),
-          };
+      const originMinutesRaw = col
+        ? rawMinutesAtColumn(e.clientY, col, hourH)
+        : originalStart.getHours() * 60 + originalStart.getMinutes();
+      const originSlot: DragSlot = {
+        day,
+        minutes: snapMinutes(originMinutesRaw, snapStep),
+      };
 
-      // Grab offset from the painted (possibly clamped overnight) chip start,
-      // not the absolute event start — keeps the hold point under the pointer.
-      let grabOffsetMin = 0;
-      if (kind === 'move') {
-        const startMinOnCol = Number(chipEl.dataset.startMin);
-        if (Number.isFinite(startMinOnCol)) {
-          grabOffsetMin = originSlot.minutes - startMinOnCol;
-        }
-      }
+      // Grab point is measured from the painted (possibly clamped overnight)
+      // chip start, not the absolute event start. The offset itself is derived
+      // in computePreview, so it follows the re-snapped origin.
+      const chipStartMin = Number(chipEl.dataset.startMin);
+      const paintedStartMin =
+        kind === 'move'
+          ? Number.isFinite(chipStartMin)
+            ? chipStartMin
+            : originMinutesRaw
+          : undefined;
 
       beginSession(
         {
           kind,
           snapStep,
+          precision,
+          originMinutesRaw,
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -700,7 +895,7 @@ export function useCalendarDrag(
           eventId: event.id,
           originalStart,
           originalEnd,
-          grabOffsetMin: kind === 'move' ? grabOffsetMin : undefined,
+          paintedStartMin,
           originZone: 'timed',
           currentZone: 'timed',
           originTime: performance.now(),
@@ -724,10 +919,12 @@ export function useCalendarDrag(
       if (target?.closest('[data-allday-chip]')) return;
 
       const originSlot: DragSlot = { day: startOfDay(day), minutes: 0 };
+      const { precision, snapStep } = dragGrid(hourH, e.pointerType, e);
       beginSession(
         {
           kind: 'allday-create',
-          snapStep: snapStepMinutes(hourH, e.pointerType),
+          snapStep,
+          precision,
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -759,11 +956,13 @@ export function useCalendarDrag(
       const hit = hitTestAllDay(e.clientX, e.clientY);
       const day = hit?.day ?? startOfDay(originalStart);
       const originSlot: DragSlot = { day, minutes: 0 };
+      const { precision, snapStep } = dragGrid(hourH, e.pointerType, e);
 
       beginSession(
         {
           kind: 'move',
-          snapStep: snapStepMinutes(hourH, e.pointerType),
+          snapStep,
+          precision,
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -800,6 +999,14 @@ export function useCalendarDrag(
   // drag must not flash a preview.
   const preview = session && didDrag ? computePreview(session) : null;
 
+  // The badge is only honest while a timed gesture is actually on the 1-minute
+  // grid: an all-day drag (or a timed one dragged into the all-day band) is not.
+  const precisionSnap =
+    session !== null &&
+    session.pointerType !== 'touch' &&
+    session.precision &&
+    session.currentZone === 'timed';
+
   return {
     onColumnPointerDown,
     onChipPointerDown,
@@ -811,6 +1018,7 @@ export function useCalendarDrag(
     previewZone: preview && session ? session.currentZone : null,
     activeEventId: session?.eventId ?? null,
     isDragging: session !== null && didDrag,
+    precisionSnap,
     suppressNextClick,
     cancel,
   };

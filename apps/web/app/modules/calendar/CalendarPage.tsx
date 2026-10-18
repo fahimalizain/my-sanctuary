@@ -223,6 +223,7 @@ export function CalendarPage() {
           onAllDayChipPointerDown={session.onAllDayChipPointerDown}
           onChipSelect={session.handleSelectChip}
           isDragging={session.isDragging}
+          precisionSnap={session.precisionSnap}
           timedPreviewByDay={session.timedPreviewByDay}
           previewInfo={session.previewInfo}
           previewColor={session.previewColor}

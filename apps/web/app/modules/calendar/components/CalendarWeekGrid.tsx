@@ -54,6 +54,8 @@ export interface CalendarWeekGridProps {
   ) => void;
   onChipSelect: (eventId: string) => void;
   isDragging: boolean;
+  /** Precision modifier is live: show the 1-minute grid badge. */
+  precisionSnap: boolean;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
   previewInfo: DragPreviewInfo | null;
   previewColor: string;
@@ -95,6 +97,7 @@ export function CalendarWeekGrid({
   onAllDayChipPointerDown,
   onChipSelect,
   isDragging,
+  precisionSnap,
   timedPreviewByDay,
   previewInfo,
   previewColor,
@@ -130,10 +133,18 @@ export function CalendarWeekGrid({
             style={{ height: COL_HEADER_H, width: contentWidth }}
           >
             <div
-              className="shrink-0 sticky left-0 top-0 z-40 border-r border-border/60 bg-cream"
+              className="shrink-0 sticky left-0 top-0 z-40 flex items-center justify-center border-r border-border/60 bg-cream"
               style={{ width: gutterW }}
               aria-hidden
-            />
+            >
+              {/* The 52px gutter is full of time pills mid-drag, so the
+                  1-minute badge lives in this empty day-header corner. */}
+              {precisionSnap && (
+                <span className="text-[10px] font-medium tabular-nums text-foreground">
+                  1m
+                </span>
+              )}
+            </div>
             {days.map((day) => {
               const isToday = isSameDay(day, today);
               return (

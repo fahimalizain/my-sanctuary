@@ -1167,6 +1167,7 @@ export function useCalendarSession({
     selectEvent,
     beginDraft,
     isDragging: drag.isDragging,
+    precisionSnap: drag.precisionSnap,
     onColumnPointerDown: drag.onColumnPointerDown,
     onChipPointerDown: drag.onChipPointerDown,
     onAllDayPointerDown: drag.onAllDayPointerDown,

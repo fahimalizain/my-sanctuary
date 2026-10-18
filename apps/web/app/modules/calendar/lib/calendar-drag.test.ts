@@ -24,6 +24,7 @@ import {
   movedAllDayRange,
   movedEnough,
   movedRange,
+  precisionModifierDown,
   rangeFromSlots,
   resizeEdgeAt,
   resizedRange,
@@ -73,6 +74,70 @@ test('isTapCreatePointer: pen → false', () => {
 
 test('isTapCreatePointer: empty → false', () => {
   assert.equal(isTapCreatePointer(''), false);
+});
+
+// ── precisionModifierDown ───────────────────────────────────────────────
+
+test('precisionModifierDown: Apple platforms use Cmd, never Ctrl', () => {
+  assert.equal(
+    precisionModifierDown({ metaKey: true, ctrlKey: false }, 'Mac'),
+    true,
+  );
+  // Ctrl-click opens the context menu on macOS.
+  assert.equal(
+    precisionModifierDown({ metaKey: false, ctrlKey: true }, 'Mac'),
+    false,
+  );
+  // Both down is still a precision drag: Cmd is enough.
+  assert.equal(
+    precisionModifierDown({ metaKey: true, ctrlKey: true }, 'Mac'),
+    true,
+  );
+});
+
+test('precisionModifierDown: Apple platform names are case-insensitive', () => {
+  for (const platform of ['MacIntel', 'mac', 'iPhone', 'iPad', 'iPod']) {
+    assert.equal(
+      precisionModifierDown({ metaKey: true, ctrlKey: false }, platform),
+      true,
+      platform,
+    );
+    assert.equal(
+      precisionModifierDown({ metaKey: false, ctrlKey: true }, platform),
+      false,
+      platform,
+    );
+  }
+});
+
+test('precisionModifierDown: Windows / Linux use Ctrl, never Meta', () => {
+  for (const platform of ['Win32', 'Linux x86_64', 'Linux armv8l']) {
+    assert.equal(
+      precisionModifierDown({ metaKey: false, ctrlKey: true }, platform),
+      true,
+      platform,
+    );
+    assert.equal(
+      precisionModifierDown({ metaKey: true, ctrlKey: false }, platform),
+      false,
+      platform,
+    );
+  }
+});
+
+test('precisionModifierDown: unknown platform reads as Ctrl', () => {
+  assert.equal(
+    precisionModifierDown({ metaKey: false, ctrlKey: true }, ''),
+    true,
+  );
+  assert.equal(
+    precisionModifierDown({ metaKey: true, ctrlKey: false }, ''),
+    false,
+  );
+  assert.equal(
+    precisionModifierDown({ metaKey: false, ctrlKey: false }, 'Win32'),
+    false,
+  );
 });
 
 // ── classifyTouchGesture ────────────────────────────────────────────────
