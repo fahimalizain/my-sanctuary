@@ -340,6 +340,7 @@ pub async fn delete_task(
         &repos.calendars,
         &repos.events,
         &repos.operations,
+        &repos.categories,
         &repos.logs,
         &users,
         access.as_ref(),

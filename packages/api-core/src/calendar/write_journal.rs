@@ -6,7 +6,7 @@
 //! payload + fresh etag, then marks the operation `conflict` without disabling
 //! the calendar.
 
-use super::apply::{map_google_event, row_from_new_event};
+use super::apply::{map_cached_event, row_from_new_event, EventClassifyCtx};
 use super::google::encode_path_segment;
 use super::journal::{parse_google_event, payload_fingerprint};
 use super::write::CreateEventOutput;
@@ -16,8 +16,9 @@ use crate::models::{
     OP_STATUS_CONFLICT, OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING,
     OP_VERB_DELETE, OP_VERB_MOVE, OP_VERB_PATCH,
 };
+use crate::calendar_color::load_classify_taxonomy;
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TaskCategoryRepo};
 use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
@@ -143,7 +144,9 @@ fn is_writable_role(access_role: &str) -> bool {
 /// (same local id, new `calendar_id`).
 ///
 /// Journal `calendar_id` stays the **source** calendar. Payload is
-/// `{"destination":"<dest google_calendar_id>"}`.
+/// `{"destination":"<dest google_calendar_id>"}`. The cache apply re-stamps the
+/// leaf `category_id` under the **destination** calendar's scope (scoped
+/// patterns differ per calendar), best-effort like every other write.
 pub(crate) async fn move_event_with_journal(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -155,6 +158,7 @@ pub(crate) async fn move_event_with_journal(
     google_event_id: &str,
     dest_local_id: &str,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     if !is_writable_role(&source.access_role) {
         return Err(CalendarError::Invalid(
@@ -263,7 +267,18 @@ pub(crate) async fn move_event_with_journal(
         return Err(CalendarError::Repo(err));
     }
 
-    let new_event = map_google_event(&moved, &dest.id, &now_rfc3339);
+    // Write-time leaf category under the DESTINATION calendar's scope (a
+    // scoped pattern differs per calendar); best-effort — a failed taxonomy
+    // load leaves the row unclassified instead of failing the move.
+    let taxonomy = load_classify_taxonomy(category_repo, &dest.user_id)
+        .await
+        .ok();
+    let ctx = match &taxonomy {
+        Some(taxonomy) => taxonomy.event_ctx(&dest.google_calendar_id),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
+    };
+    let new_event = map_cached_event(&moved, &dest.id, &now_rfc3339, &ctx);
     let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
         Ok(id) => id,
         Err(err) => {
@@ -296,6 +311,10 @@ pub(crate) async fn move_event_with_journal(
 }
 
 /// Journaled `events.patch` with If-Match / 412 retry (issue #50 / V4).
+///
+/// The cache apply re-stamps the leaf `category_id` under the event's own
+/// calendar scope (a retitle must replace or clear a stale stamp), best-effort
+/// like every other write.
 pub(crate) async fn patch_event_fields_with_journal(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -306,6 +325,7 @@ pub(crate) async fn patch_event_fields_with_journal(
     google_event_id: &str,
     fields: &PatchEventFields,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     let payload = build_patch_payload(fields);
     if payload.is_empty() {
@@ -397,7 +417,18 @@ pub(crate) async fn patch_event_fields_with_journal(
         )
         .await?;
 
-    let new_event = map_google_event(&patched, &cal.id, &now_rfc3339);
+    // Write-time leaf category under the event's own calendar scope; a retitle
+    // replaces (or clears) a stale stamp. Best-effort: a failed taxonomy load
+    // only leaves the row unclassified.
+    let taxonomy = load_classify_taxonomy(category_repo, &cal.user_id)
+        .await
+        .ok();
+    let ctx = match &taxonomy {
+        Some(taxonomy) => taxonomy.event_ctx(&cal.google_calendar_id),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
+    };
+    let new_event = map_cached_event(&patched, &cal.id, &now_rfc3339, &ctx);
     let id = match events.upsert(new_event.clone(), &now_rfc3339).await {
         Ok(id) => id,
         Err(err) => {

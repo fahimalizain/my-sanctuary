@@ -1,5 +1,5 @@
 use super::support::*;
-use crate::calendar::list_events;
+use crate::calendar::{list_events, sync_calendar};
 use crate::models::NewCalendarEvent;
 use crate::repo::CalendarEventRepo;
 
@@ -142,6 +142,10 @@ fn natural_key_upsert_returns_persisted_id() {
         end_time_zone: String::new(),
         is_all_day: false,
         raw_json: "{}".into(),
+        category_id: None,
+        preserve_category: false,
+        is_self_organized: true,
+        event_type: String::new(),
     };
     let id1 = pollster::block_on(events.upsert(row.clone(), "2026-08-17T12:00:00Z")).unwrap();
     row.title = "Second".into();
@@ -180,6 +184,10 @@ fn upsert_after_delete_clears_deleted_at() {
         end_time_zone: String::new(),
         is_all_day: false,
         raw_json: String::new(),
+        category_id: None,
+        preserve_category: false,
+        is_self_organized: true,
+        event_type: String::new(),
     };
     let id = pollster::block_on(events.upsert(row.clone(), "2026-08-17T12:00:00Z")).unwrap();
     pollster::block_on(events.delete_by_google_event_id("cal-1", "g-1", "2026-08-17T12:30:00Z"))
@@ -194,4 +202,198 @@ fn upsert_after_delete_clears_deleted_at() {
     assert_eq!(stored.len(), 1);
     assert!(stored[0].deleted_at.is_none(), "upsert restores deleted_at");
     assert_eq!(stored[0].title, "Live");
+}
+
+// ──────────────────────────────────────────
+// Write-time leaf category stamp (slice 1)
+// ──────────────────────────────────────────
+
+/// A full replica walk with a real taxonomy stamps the leaf category on the
+/// upserted row; a retitle re-stamps (overwrites) it.
+#[test]
+fn replica_walk_stamps_and_replaces_the_leaf_category() {
+    let body = r#"{"items":[
+        {"id": "work-1", "summary": "Work",
+         "organizer": {"self": true}, "eventType": "focusTime",
+         "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-1"}"#;
+    let retitled = r#"{"items":[
+        {"id": "work-1", "summary": "Lunch",
+         "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-2"}"#;
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "work@x.com", true)]);
+    let events = FakeEventRepo::new();
+    let categories = StubTaskCategoryRepo::with_pattern("cat-work", "^Work$", 0);
+
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:13:20Z",
+        &categories,
+    ))
+    .expect("walk ok");
+
+    let stored = events.stored.lock().unwrap().clone();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].category_id.as_deref(), Some("cat-work"));
+    assert!(stored[0].is_self_organized, "organizer.self: true");
+    assert_eq!(stored[0].event_type, "focusTime");
+    drop(stored);
+
+    // Retitle: the walk re-stamps to NULL (no pattern matches "Lunch").
+    let http = FakeHttp::new(vec![("/events", 200, retitled)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        "2023-11-14T22:14:00Z",
+        &categories,
+    ))
+    .expect("second walk ok");
+
+    let stored = events.stored.lock().unwrap().clone();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].title, "Lunch");
+    assert_eq!(
+        stored[0].category_id, None,
+        "an unclassified retitle replaces the stale stamp"
+    );
+    assert!(
+        stored[0].is_self_organized,
+        "organizer absent → organized (Google-owned overwrite)"
+    );
+    assert_eq!(stored[0].event_type, "");
+}
+
+/// A taxonomy-load **failure** must not erase a stamp: the walk falls back to
+/// [`EventClassifyCtx::preserve`], so the stored `category_id` survives the
+/// upsert (a later reclassify fills any genuinely missing stamp).
+#[test]
+fn taxonomy_failure_keeps_the_existing_category() {
+    let body = r#"{"items":[
+        {"id": "work-1", "summary": "Work",
+         "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-1"}"#;
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "work@x.com", true)]);
+    let events = FakeEventRepo::new();
+    let categories = StubTaskCategoryRepo::with_pattern("cat-work", "^Work$", 0);
+
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal,
+        "2023-11-14T22:13:20Z", &categories,
+    ))
+    .expect("stamped walk ok");
+    assert_eq!(
+        events.stored.lock().unwrap()[0].category_id.as_deref(),
+        Some("cat-work")
+    );
+
+    // The same walk with a taxonomy read that fails: the stamp stays.
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal,
+        "2023-11-14T22:14:00Z", &FAILING_TAXONOMY,
+    ))
+    .expect("failing-taxonomy walk ok");
+    assert_eq!(
+        events.stored.lock().unwrap()[0].category_id.as_deref(),
+        Some("cat-work"),
+        "a failed taxonomy load keeps the stored stamp"
+    );
+}
+
+/// A **successful** load whose patterns match nothing still writes `NULL`:
+/// the title really is unclassified, and keeping a stale stamp would be a lie.
+#[test]
+fn a_successful_taxonomy_with_no_match_still_clears_the_stamp() {
+    let body = r#"{"items":[
+        {"id": "work-1", "summary": "Work",
+         "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+    ],"nextSyncToken":"st-1"}"#;
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "work@x.com", true)]);
+    let events = FakeEventRepo::new();
+    let categories = StubTaskCategoryRepo::with_pattern("cat-work", "^Work$", 0);
+
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal,
+        "2023-11-14T22:13:20Z", &categories,
+    ))
+    .expect("stamped walk ok");
+    assert_eq!(
+        events.stored.lock().unwrap()[0].category_id.as_deref(),
+        Some("cat-work")
+    );
+
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let cal = calendars.stored.lock().unwrap()[0].clone();
+    pollster::block_on(sync_calendar(
+        &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal,
+        "2023-11-14T22:14:00Z", &NO_TAXONOMY,
+    ))
+    .expect("empty-taxonomy walk ok");
+    assert_eq!(
+        events.stored.lock().unwrap()[0].category_id, None,
+        "an empty (but successful) taxonomy stamps unclassified"
+    );
+}
+
+/// Window write-through (first paint) stamps from the taxonomy the caller
+/// already loaded for paint — `list_events_with_snapshot` is the worker's
+/// route, and `None` (a failed taxonomy load) degrades to no stamp.
+#[test]
+fn window_write_through_stamps_from_the_paint_taxonomy() {
+    let body = r#"{"items":[
+        {"id": "work-1", "summary": "Work",
+         "start": {"dateTime": "2026-08-18T09:00:00Z"}, "end": {"dateTime": "2026-08-18T09:30:00Z"}}
+    ]}"#;
+    let http = FakeHttp::new(vec![("/events", 200, body)]);
+    let calendars = FakeCalendarRepo::with(vec![calendar("cal-1", "work@x.com", true)]);
+    let events = FakeEventRepo::new();
+    let watches = FakeWatchChannelRepo::new();
+    let categories = StubTaskCategoryRepo::with_pattern("cat-work", "^Work$", 0);
+    let taxonomy =
+        pollster::block_on(crate::calendar_color::load_classify_taxonomy(&categories, "u-1"))
+            .unwrap();
+    let snapshot =
+        pollster::block_on(crate::calendar::load_list_snapshot(&calendars, &watches, "u-1"))
+            .unwrap();
+
+    pollster::block_on(crate::calendar::list_events_with_snapshot(
+        &http,
+        &calendars,
+        &events,
+        &watches,
+        &access(),
+        "u-1",
+        "2026-08-01T00:00:00Z",
+        "2026-09-01T00:00:00Z",
+        NOW_UNIX,
+        None,
+        snapshot,
+        Some(&taxonomy),
+    ))
+    .expect("window listing ok");
+
+    let stored = events.stored.lock().unwrap().clone();
+    assert_eq!(stored.len(), 1, "write-through upserted the window row");
+    assert_eq!(
+        stored[0].category_id.as_deref(),
+        Some("cat-work"),
+        "the window row is stamped from the paint taxonomy"
+    );
 }

@@ -4,6 +4,19 @@
 //! path that writes the same projection). Classification decides upsert vs
 //! soft-delete; mapping populates Google-owned identity columns and `raw_json`.
 //!
+//! # Write-time category stamp
+//!
+//! [`map_cached_event`] also stamps the app-owned **leaf** `category_id` from
+//! [`EventClassifyCtx`] so reports can read a stored category instead of
+//! re-matching titles. The context carries the **Google** calendar id
+//! (pattern scope), not the local `google_calendars.id` the row stores.
+//!
+//! Because the SQL upsert overwrites the column, every production upsert must
+//! pass a real context — [`EventClassifyCtx::none`] is for tests only, and a
+//! failed taxonomy load uses [`EventClassifyCtx::preserve`], which sets
+//! `preserve_category` so the merge keeps the stored stamp instead of writing
+//! `NULL`.
+//!
 //! # Projection and storage
 //!
 //! - **All-day civil dates** are stored as RFC 3339 midnight **UTC**
@@ -27,7 +40,62 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{CalendarEvent, NewCalendarEvent};
+use crate::categories::{classify_event_leaf, CategoryWithPatterns};
+use crate::models::{CalendarEvent, NewCalendarEvent, TaskCategory};
+
+/// Write-time classifier context for one calendar.
+///
+/// `google_calendar_id` is the **Google** calendar id
+/// (`GoogleCalendar::google_calendar_id`) — never the local
+/// `google_calendars.id` the row's `calendar_id` column holds. Pattern scope
+/// compares Google ids.
+///
+/// Every production upsert must carry a real context: the SQL upsert
+/// **overwrites** `category_id` (including back to `NULL`), so a walk that
+/// forgets to stamp a previously classified row wipes it. Only tests use
+/// [`EventClassifyCtx::none`]; a failed taxonomy load uses
+/// [`EventClassifyCtx::preserve`], which keeps the stored stamp instead.
+#[derive(Debug, Clone)]
+pub struct EventClassifyCtx<'a> {
+    /// Google calendar id of the inbound events (scoped-pattern gate).
+    pub google_calendar_id: &'a str,
+    /// Living categories (leaf lookup + `sort_order` tie-break).
+    pub categories: &'a [TaskCategory],
+    /// Compiled matchers built from those categories' patterns.
+    pub matchers: &'a [CategoryWithPatterns],
+    /// Keep the stored `category_id` on conflict — see
+    /// [`NewCalendarEvent::preserve_category`]. Never a match against
+    /// `matchers`: the title was not classified, it was not looked at.
+    pub preserve: bool,
+}
+
+impl EventClassifyCtx<'_> {
+    /// Empty context: no patterns match, so an upsert stamps
+    /// `category_id = None`. Use only for tests that deliberately have no
+    /// taxonomy (and where the stored stamp does not matter) — a production
+    /// failure path uses [`Self::preserve`].
+    pub fn none() -> Self {
+        Self {
+            google_calendar_id: "",
+            categories: &[],
+            matchers: &[],
+            preserve: false,
+        }
+    }
+
+    /// Context for a **failed** taxonomy load: nothing is classified and the
+    /// stored stamp is kept (`preserve_category = true`), so a walk over a
+    /// transient load failure cannot erase a good `category_id`. A later
+    /// reclassify job fills any genuinely missing stamp.
+    pub fn preserve() -> Self {
+        Self {
+            google_calendar_id: "",
+            categories: &[],
+            matchers: &[],
+            preserve: true,
+        }
+    }
+}
 
 /// Action to take for one Google `events.list` item during replica apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,26 +110,21 @@ pub enum ReplicaApplyAction {
 ///    sparse cancelled exception (do **not** soft-delete).
 /// 2. `status == "cancelled"` without `recurringEventId` → soft-delete by
 ///    google event id (summary not required).
-/// 3. Otherwise → upsert via [`map_google_event`] (living event, including
-///    all-day and no-time).
+/// 3. Otherwise → upsert via [`map_cached_event`] (living event, including
+///    all-day and no-time), stamped with `ctx`'s leaf category.
 pub fn classify_replica_item(
     item: &GoogleEvent,
     calendar_id: &str,
     now_rfc3339: &str,
+    ctx: &EventClassifyCtx<'_>,
 ) -> ReplicaApplyAction {
-    let cancelled = item.status.as_deref() == Some("cancelled");
-    let recurring = item
-        .recurring_event_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    if cancelled {
-        if recurring.is_some() {
-            return ReplicaApplyAction::Upsert(map_cancelled_exception(
+    if item.status.as_deref() == Some("cancelled") {
+        if is_cancelled_exception(item) {
+            return ReplicaApplyAction::Upsert(map_cached_event(
                 item,
                 calendar_id,
                 now_rfc3339,
+                ctx,
             ));
         }
         return ReplicaApplyAction::SoftDelete {
@@ -69,7 +132,54 @@ pub fn classify_replica_item(
         };
     }
 
-    ReplicaApplyAction::Upsert(map_google_event(item, calendar_id, now_rfc3339))
+    ReplicaApplyAction::Upsert(map_cached_event(item, calendar_id, now_rfc3339, ctx))
+}
+
+/// `status == "cancelled"` **and** a non-empty trimmed `recurringEventId`:
+/// stored as a living sparse row instead of being soft-deleted.
+fn is_cancelled_exception(item: &GoogleEvent) -> bool {
+    item.status.as_deref() == Some("cancelled")
+        && item
+            .recurring_event_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty())
+}
+
+/// [`map_google_event`] (or the sparse cancelled-exception shape) plus the
+/// app-owned leaf category stamp.
+///
+/// The category is the deterministic winner of [`classify_event_leaf`] under
+/// the ctx's Google calendar scope; `None` (no match, or only the `untracked`
+/// sink) writes SQL `NULL`. Called by every upsert path — replica walk, window
+/// fetch, and the journaled create/patch/move cache applies.
+///
+/// A [`EventClassifyCtx::preserve`] context (a failed taxonomy load) skips the
+/// matchers entirely and marks the row `preserve_category`: the upsert then
+/// keeps the stored stamp instead of writing `NULL`.
+pub fn map_cached_event(
+    event: &GoogleEvent,
+    calendar_id: &str,
+    now_rfc3339: &str,
+    ctx: &EventClassifyCtx<'_>,
+) -> NewCalendarEvent {
+    let mut row = if is_cancelled_exception(event) {
+        map_cancelled_exception(event, calendar_id, now_rfc3339)
+    } else {
+        map_google_event(event, calendar_id, now_rfc3339)
+    };
+    if ctx.preserve {
+        row.preserve_category = true;
+        return row;
+    }
+    row.preserve_category = false;
+    row.category_id = classify_event_leaf(
+        &row.title,
+        ctx.google_calendar_id,
+        ctx.categories,
+        ctx.matchers,
+    );
+    row
 }
 
 /// Converts a Google event API response into the local cache model.
@@ -78,7 +188,10 @@ pub fn classify_replica_item(
 /// from `extendedProperties.shared.sanctuary_task_id`; events without the
 /// property map to `""` and the upsert's `COALESCE` leaves any stored value
 /// untouched. `sanctuary_focus` / priority / difficulty are create-time
-/// snapshots on Google and are not cached.
+/// snapshots on Google and are not cached. `category_id` is always `None` here
+/// — the leaf stamp comes from [`map_cached_event`] — and
+/// `preserve_category` is `true`, so a mapper that reaches the repo directly
+/// (no classifier context at all) never blanks a stored stamp either.
 pub fn map_google_event(
     event: &GoogleEvent,
     calendar_id: &str,
@@ -122,6 +235,26 @@ pub fn map_google_event(
         end_time_zone,
         is_all_day,
         raw_json: serde_json::to_string(event).unwrap_or_default(),
+        category_id: None,
+        // No classifier context here: keep whatever stamp is already stored.
+        preserve_category: true,
+        is_self_organized: google_is_self_organized(event),
+        event_type: event
+            .event_type
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// Google `organizer.self` as a boolean: an absent organizer means "no other
+/// organizer" → organized. An organizer object **without** `self: true`
+/// (including an empty `{}`) → not organized.
+fn google_is_self_organized(event: &GoogleEvent) -> bool {
+    match event.organizer.as_ref() {
+        None => true,
+        Some(organizer) => organizer.is_self == Some(true),
     }
 }
 
@@ -188,6 +321,9 @@ pub fn row_from_new_event(
         end_time_zone: event.end_time_zone,
         is_all_day: event.is_all_day,
         raw_json: event.raw_json,
+        category_id: event.category_id,
+        is_self_organized: event.is_self_organized,
+        event_type: event.event_type,
         created_at: now_rfc3339.to_string(),
         updated_at: now_rfc3339.to_string(),
         deleted_at: None,
@@ -239,6 +375,14 @@ pub struct GoogleEvent {
     pub start: Option<GoogleEventTime>,
     #[serde(default)]
     pub end: Option<GoogleEventTime>,
+    /// Google `organizer`. Absent on most hand-created events; `self: true`
+    /// marks the calendar owner as the organizer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organizer: Option<GoogleEventOrganizer>,
+    /// Google `eventType` (`default` / `focusTime` / `outOfOffice` /
+    /// `fromGmail`); never coerced, `None` when absent.
+    #[serde(default, rename = "eventType", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
     #[serde(default, rename = "extendedProperties")]
     pub extended_properties: Option<GoogleEventExtendedProperties>,
     #[serde(default, rename = "iCalUID")]
@@ -249,6 +393,14 @@ pub struct GoogleEvent {
     pub recurring_event_id: Option<String>,
     #[serde(default, rename = "originalStartTime")]
     pub original_start_time: Option<GoogleEventTime>,
+}
+
+/// `organizer` of a Google event. Only the `self` flag is modelled — the
+/// email/displayName are not cached.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoogleEventOrganizer {
+    #[serde(default, rename = "self", skip_serializing_if = "Option::is_none")]
+    pub is_self: Option<bool>,
 }
 
 /// `extendedProperties` of a Google event. Only the shared map is modelled —
@@ -318,6 +470,8 @@ mod tests {
             summary: Some("Standup".into()),
             description: Some("Daily".into()),
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: Some(GoogleEventTime {
                 date_time: Some("2026-08-18T09:00:00Z".into()),
                 date: None,
@@ -372,6 +526,8 @@ mod tests {
             summary: Some("Holiday".into()),
             description: None,
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: Some(GoogleEventTime {
                 date_time: None,
                 date: Some("2026-08-01".into()),
@@ -407,6 +563,8 @@ mod tests {
             summary: Some("Mixed".into()),
             description: None,
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: Some(GoogleEventTime {
                 date_time: Some("2026-08-18T09:00:00Z".into()),
                 date: Some("2026-08-18".into()),
@@ -442,6 +600,8 @@ mod tests {
             summary: None,
             description: None,
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: None,
             end: None,
             extended_properties: None,
@@ -450,7 +610,7 @@ mod tests {
             recurring_event_id: None,
             original_start_time: None,
         };
-        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z") {
+        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z", &EventClassifyCtx::none()) {
             ReplicaApplyAction::SoftDelete { google_event_id } => {
                 assert_eq!(google_event_id, "gone");
             }
@@ -468,6 +628,8 @@ mod tests {
             summary: None,
             description: None,
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: None,
             end: None,
             extended_properties: None,
@@ -480,7 +642,7 @@ mod tests {
                 time_zone: Some("UTC".into()),
             }),
         };
-        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z") {
+        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z", &EventClassifyCtx::none()) {
             ReplicaApplyAction::Upsert(row) => {
                 assert_eq!(row.google_event_id, "exc-1");
                 assert_eq!(row.status, "cancelled");
@@ -507,6 +669,8 @@ mod tests {
             summary: Some("Skip day".into()),
             description: None,
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: None,
             end: Some(GoogleEventTime {
                 date_time: None,
@@ -523,7 +687,7 @@ mod tests {
                 time_zone: None,
             }),
         };
-        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z") {
+        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z", &EventClassifyCtx::none()) {
             ReplicaApplyAction::Upsert(row) => {
                 assert_eq!(row.recurring_event_id, "  master  ");
                 assert_eq!(row.start_time, "2026-08-20T00:00:00Z");
@@ -548,6 +712,179 @@ mod tests {
     }
 
     #[test]
+    fn organizer_absent_or_self_is_organized() {
+        // Absent organizer → organized ("no other organizer").
+        let row = map_google_event(&timed_living(), "cal-1", "2026-08-17T12:00:00Z");
+        assert!(row.is_self_organized);
+
+        // `{"self": true}` → organized.
+        let mut event = timed_living();
+        event.organizer = Some(GoogleEventOrganizer { is_self: Some(true) });
+        assert!(map_google_event(&event, "cal-1", "2026-08-17T12:00:00Z").is_self_organized);
+
+        // Organizer present without `self: true` (an email, or `{}`) → not.
+        for organizer in [
+            GoogleEventOrganizer { is_self: Some(false) },
+            GoogleEventOrganizer { is_self: None },
+        ] {
+            let mut event = timed_living();
+            event.organizer = Some(organizer);
+            assert!(!map_google_event(&event, "cal-1", "2026-08-17T12:00:00Z").is_self_organized);
+        }
+    }
+
+    #[test]
+    fn organizer_and_event_type_deserialize_and_reach_raw_json() {
+        // The wire shape Google actually sends. `eventType` and `organizer`
+        // were dropped before this slice — raw_json is the re-sync fallback.
+        let event: GoogleEvent = serde_json::from_str(
+            r#"{
+                "id": "evt-9",
+                "summary": "Deep work",
+                "eventType": "focusTime",
+                "organizer": {"email": "me@x.com", "self": true},
+                "start": {"dateTime": "2026-08-18T09:00:00Z"},
+                "end": {"dateTime": "2026-08-18T10:00:00Z"}
+            }"#,
+        )
+        .expect("google payload parses");
+        let row = map_google_event(&event, "cal-1", "2026-08-17T12:00:00Z");
+        assert_eq!(row.event_type, "focusTime", "eventType is never coerced");
+        assert!(row.is_self_organized);
+        assert!(row.raw_json.contains("focusTime"), "{}", row.raw_json);
+        assert!(row.raw_json.contains("organizer"), "{}", row.raw_json);
+    }
+
+    #[test]
+    fn absent_event_type_maps_to_empty_and_is_trimmed() {
+        let row = map_google_event(&timed_living(), "cal-1", "2026-08-17T12:00:00Z");
+        assert_eq!(row.event_type, "");
+
+        let mut event = timed_living();
+        event.event_type = Some("  outOfOffice  ".into());
+        let row = map_google_event(&event, "cal-1", "2026-08-17T12:00:00Z");
+        assert_eq!(row.event_type, "outOfOffice");
+    }
+
+    #[test]
+    fn map_google_event_leaves_category_unstamped() {
+        // The leaf stamp is `map_cached_event`'s job — never the plain mapper's.
+        let row = map_google_event(&timed_living(), "cal-1", "2026-08-17T12:00:00Z");
+        assert_eq!(row.category_id, None);
+    }
+
+    #[test]
+    fn map_cached_event_stamps_leaf_category_and_keeps_task_id() {
+        let categories = vec![category_row("cat-work", 0, false)];
+        let matchers = vec![crate::categories::CategoryWithPatterns::new(
+            "cat-work".to_string(),
+            None,
+            vec![pattern_row("cat-work", "^Standup$")],
+        )];
+        let ctx = EventClassifyCtx {
+            google_calendar_id: "work@x.com",
+            categories: &categories,
+            matchers: &matchers,
+            preserve: false,
+        };
+
+        // A title that matches stamps the leaf id and still carries task_id.
+        let row = map_cached_event(&timed_living(), "cal-1", "2026-08-17T12:00:00Z", &ctx);
+        assert_eq!(row.category_id.as_deref(), Some("cat-work"));
+        assert_eq!(row.task_id, "task-42");
+
+        // A title that matches nothing writes None (SQL NULL), never a sink id.
+        let mut other = timed_living();
+        other.summary = Some("Lunch".into());
+        let row = map_cached_event(&other, "cal-1", "2026-08-17T12:00:00Z", &ctx);
+        assert_eq!(row.category_id, None);
+    }
+
+    #[test]
+    fn map_cached_event_stamps_cancelled_exception_from_its_title() {
+        // Cancelled exceptions keep their sparse slot fields and are stamped
+        // from the (possibly empty) title.
+        let categories = vec![category_row("cat-work", 0, false)];
+        let matchers = vec![crate::categories::CategoryWithPatterns::new(
+            "cat-work".to_string(),
+            None,
+            vec![pattern_row("cat-work", ".*")],
+        )];
+        let ctx = EventClassifyCtx {
+            google_calendar_id: "work@x.com",
+            categories: &categories,
+            matchers: &matchers,
+            preserve: false,
+        };
+        let event = GoogleEvent {
+            id: "exc-1".into(),
+            etag: None,
+            updated: None,
+            status: Some("cancelled".into()),
+            summary: None,
+            description: None,
+            recurrence: None,
+            organizer: Some(GoogleEventOrganizer { is_self: None }),
+            event_type: None,
+            start: None,
+            end: None,
+            extended_properties: None,
+            ical_uid: None,
+            sequence: None,
+            recurring_event_id: Some("master-1".into()),
+            original_start_time: Some(GoogleEventTime {
+                date_time: Some("2026-08-20T15:00:00Z".into()),
+                date: None,
+                time_zone: None,
+            }),
+        };
+        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z", &ctx) {
+            ReplicaApplyAction::Upsert(row) => {
+                assert_eq!(row.status, "cancelled");
+                assert_eq!(row.original_start, "2026-08-20T15:00:00Z");
+                assert_eq!(
+                    row.category_id.as_deref(),
+                    Some("cat-work"),
+                    "an empty title still classifies (catch-all) and stays coherent"
+                );
+                assert!(!row.is_self_organized, "organizer without self: not organized");
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
+    }
+
+    fn category_row(id: &str, sort_order: i64, is_untracked: bool) -> TaskCategory {
+        TaskCategory {
+            id: id.to_string(),
+            user_id: "u-1".to_string(),
+            list_id: None,
+            parent_id: None,
+            title: id.to_string(),
+            slug: id.to_string(),
+            color: "#4285f4".to_string(),
+            is_productive: false,
+            google_calendar_id: None,
+            sort_order,
+            is_untracked,
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    fn pattern_row(category_id: &str, regex: &str) -> crate::models::TaskCategoryPattern {
+        crate::models::TaskCategoryPattern {
+            id: format!("p-{category_id}-{regex}"),
+            category_id: category_id.to_string(),
+            regex: regex.to_string(),
+            google_calendar_id: None,
+            sort_order: 0,
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
     fn whitespace_only_recurring_event_id_is_ordinary_cancel() {
         let event = GoogleEvent {
             id: "gone".into(),
@@ -557,6 +894,8 @@ mod tests {
             summary: None,
             description: None,
             recurrence: None,
+            organizer: None,
+            event_type: None,
             start: None,
             end: None,
             extended_properties: None,
@@ -565,7 +904,7 @@ mod tests {
             recurring_event_id: Some("   ".into()),
             original_start_time: None,
         };
-        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z") {
+        match classify_replica_item(&event, "cal-1", "2026-08-17T12:00:00Z", &EventClassifyCtx::none()) {
             ReplicaApplyAction::SoftDelete { google_event_id } => {
                 assert_eq!(google_event_id, "gone");
             }

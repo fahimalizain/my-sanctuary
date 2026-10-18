@@ -163,8 +163,14 @@ fn is_writable(calendar: &GoogleCalendar) -> bool {
 /// → `GoogleCalendar.google_calendar_id`. Missing calendar → `""` (unscoped
 /// patterns still match; scoped ones do not).
 ///
-/// Unmatched / blank category color → [`calendar_fallback_color`] on the
-/// event's local `calendar_id`.
+/// Color precedence:
+/// 1. A **stored** `category_id` (stamped at write time) paints that category
+///    — own color, else parent, else the calendar fallback. The title is never
+///    re-matched: a later pattern change must not repaint a stored row.
+/// 2. Unclassified rows (`category_id: None`) keep the legacy behavior:
+///    [`color_for_event_title`] → [`classify`] (conflict → untracked → no
+///    color), then [`calendar_fallback_color`] on the event's local
+///    `calendar_id`.
 pub fn paint_events(
     events: impl IntoIterator<Item = CalendarEvent>,
     google_calendar_id_by_local_id: &HashMap<String, String>,
@@ -178,8 +184,18 @@ pub fn paint_events(
                 .get(&event.calendar_id)
                 .map(String::as_str)
                 .unwrap_or("");
-            let color = color_for_event_title(&event.title, google_cal_id, categories, matchers)
-                .unwrap_or_else(|| calendar_fallback_color(&event.calendar_id));
+            let stored = event
+                .category_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let matched = match stored {
+                Some(category_id) => color_for_matched_category(category_id, categories),
+                None => {
+                    color_for_event_title(&event.title, google_cal_id, categories, matchers)
+                }
+            };
+            let color = matched.unwrap_or_else(|| calendar_fallback_color(&event.calendar_id));
             CalendarEventView { event, color }
         })
         .collect()
@@ -219,6 +235,45 @@ pub fn matchers_from(
 pub struct PaintTaxonomy {
     pub categories: Vec<TaskCategory>,
     pub matchers: Vec<CategoryWithPatterns>,
+}
+
+impl PaintTaxonomy {
+    /// Classifier context for events **on one Google calendar** — the write-time
+    /// counterpart of the paint above. Pass the calendar's
+    /// `GoogleCalendar::google_calendar_id` (never the local row id).
+    pub fn event_ctx<'a>(
+        &'a self,
+        google_calendar_id: &'a str,
+    ) -> crate::calendar_apply::EventClassifyCtx<'a> {
+        crate::calendar_apply::EventClassifyCtx {
+            google_calendar_id,
+            categories: &self.categories,
+            matchers: &self.matchers,
+            preserve: false,
+        }
+    }
+}
+
+/// Loads the **write-time** classifier taxonomy: the user's living categories
+/// and their compiled matchers, in two concurrent queries — no lists, and
+/// **never seeds**.
+///
+/// Writes must not create taxonomy as a side effect (the paint path's
+/// [`load_paint_taxonomy`] owns seeding, on first visit). Callers that already
+/// have a [`PaintTaxonomy`] in hand should pass it instead of loading again.
+pub async fn load_classify_taxonomy(
+    category_repo: &dyn TaskCategoryRepo,
+    user_id: &str,
+) -> Result<PaintTaxonomy, CategoriesError> {
+    let (categories, patterns) = futures::join!(
+        category_repo.list_by_user_id(user_id),
+        category_repo.list_patterns_by_user_id(user_id),
+    );
+    let (categories, patterns) = (categories?, patterns?);
+    Ok(PaintTaxonomy {
+        matchers: matchers_from(&categories, patterns),
+        categories,
+    })
 }
 
 /// Loads the paint taxonomy. Lists, categories and patterns are read
@@ -346,9 +401,25 @@ mod tests {
             end_time_zone: String::new(),
             is_all_day: false,
             raw_json: String::new(),
+            category_id: None,
+            is_self_organized: true,
+            event_type: String::new(),
             created_at: "2026-08-17T12:00:00Z".to_string(),
             updated_at: "2026-08-17T12:00:00Z".to_string(),
             deleted_at: None,
+        }
+    }
+
+    /// [`living_event`] with a stored (stamped) leaf category.
+    fn living_event_stamped(
+        id: &str,
+        calendar_id: &str,
+        title: &str,
+        category_id: Option<&str>,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            category_id: category_id.map(str::to_string),
+            ..living_event(id, calendar_id, title)
         }
     }
 
@@ -707,6 +778,111 @@ mod tests {
             color_for_event_title("Family", "other@x.com", &categories, &matchers),
             Some("#8e24aa".to_string())
         );
+    }
+
+    #[test]
+    fn stored_category_paints_its_color_even_when_the_title_conflicts() {
+        // The stored stamp wins: two sibling categories both match "Work" now
+        // (a conflict for `classify`), but the row was stamped with `work` at
+        // write time and must keep painting it.
+        let categories = vec![
+            category("work", None, "#4285f4", false),
+            category("a", Some("work"), "#111111", false),
+            category("b", Some("work"), "#222222", false),
+            category("untracked", None, "#9e69af", true),
+        ];
+        let matchers = vec![
+            matcher("work", None, vec![pattern("work", "^Never$", None)]),
+            matcher("a", Some("work"), vec![pattern("a", "^Work$", None)]),
+            matcher("b", Some("work"), vec![pattern("b", "^Work$", None)]),
+        ];
+        let mut map = HashMap::new();
+        map.insert("cal-conflict".to_string(), "any@x.com".to_string());
+
+        // Legacy path: the same row without a stamp conflicts → fallback.
+        let unstamped = living_event("e0", "cal-conflict", "Work");
+        let views = paint_events(
+            vec![unstamped],
+            &map,
+            &categories,
+            &matchers,
+        );
+        assert_eq!(views[0].color, calendar_fallback_color("cal-conflict"));
+
+        // Stamped row: the stored category's color, no re-match.
+        let stamped = living_event_stamped("e1", "cal-conflict", "Work", Some("work"));
+        let views = paint_events(vec![stamped], &map, &categories, &matchers);
+        assert_eq!(views[0].color, "#4285f4");
+    }
+
+    #[test]
+    fn stored_category_paints_even_when_the_title_would_match_another_category() {
+        let categories = vec![
+            category("work", None, "#4285f4", false),
+            category("family", None, "#8e24aa", false),
+            category("untracked", None, "#9e69af", true),
+        ];
+        let matchers = vec![
+            matcher("work", None, vec![pattern("work", "^Work$", None)]),
+            matcher("family", None, vec![pattern("family", "^Family$", None)]),
+        ];
+        let mut map = HashMap::new();
+        map.insert("cal-1".to_string(), "any@x.com".to_string());
+
+        // Title now matches `family`, but the row is stamped `work`.
+        let stamped = living_event_stamped("e1", "cal-1", "Family", Some("work"));
+        let views = paint_events(vec![stamped], &map, &categories, &matchers);
+        assert_eq!(views[0].color, "#4285f4", "stored stamp beats the title");
+
+        // A stored id whose row is gone / blank falls back to the calendar.
+        let stale = living_event_stamped("e2", "cal-1", "Family", Some("ghost"));
+        let views = paint_events(vec![stale], &map, &categories, &matchers);
+        assert_eq!(views[0].color, calendar_fallback_color("cal-1"));
+
+        // Empty string is "unclassified", not a category id.
+        let blank = living_event_stamped("e3", "cal-1", "Family", Some(""));
+        let views = paint_events(vec![blank], &map, &categories, &matchers);
+        assert_eq!(
+            views[0].color, "#8e24aa",
+            "blank stamp falls back to the title's unique match"
+        );
+    }
+
+    #[test]
+    fn unclassified_rows_still_use_classify_conflict_fallback() {
+        // The unstamped (pre-backfill) path keeps today's behavior exactly:
+        // conflict → untracked → calendar fallback.
+        let categories = vec![
+            category("work", None, "#4285f4", false),
+            category("a", Some("work"), "#111111", false),
+            category("b", Some("work"), "#222222", false),
+            category("untracked", None, "#9e69af", true),
+        ];
+        let matchers = vec![
+            matcher("work", None, vec![pattern("work", "^Never$", None)]),
+            matcher("a", Some("work"), vec![pattern("a", "^Work$", None)]),
+            matcher("b", Some("work"), vec![pattern("b", "^Work$", None)]),
+        ];
+        let mut map = HashMap::new();
+        map.insert("cal-1".to_string(), "any@x.com".to_string());
+
+        let conflict = living_event("e1", "cal-1", "Work");
+        let views = paint_events(vec![conflict], &map, &categories, &matchers);
+        assert_eq!(views[0].color, calendar_fallback_color("cal-1"));
+
+        // …and a unique match still paints the matched category.
+        let unique_categories = vec![
+            category("work", None, "#4285f4", false),
+            category("untracked", None, "#9e69af", true),
+        ];
+        let unique_matchers = vec![matcher(
+            "work",
+            None,
+            vec![pattern("work", "^Work$", None)],
+        )];
+        let unique = living_event("e2", "cal-1", "Work");
+        let views = paint_events(vec![unique], &map, &unique_categories, &unique_matchers);
+        assert_eq!(views[0].color, "#4285f4");
     }
 
     #[test]

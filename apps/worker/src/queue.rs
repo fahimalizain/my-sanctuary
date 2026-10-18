@@ -6,9 +6,72 @@
 //! re-enqueue. Dirty generation plus the 15-minute fallback cron remain the
 //! correctness contract — this path never throws (a throw retries the batch
 //! and re-walks).
+//!
+//! Since reports slice 2 the same binding carries a second payload shape:
+//! [`api_core::DigestQueueMessage`] asks for a digest rebuild/reclassify. The
+//! batch is typed as [`api_core::WorkerQueueMessage`], an untagged enum whose
+//! `CalendarSync` variant comes first, so `{"calendar_id":"…"}` still
+//! deserializes exactly as it always did.
 
 use api_core::repo::CalendarRepo;
 use worker::*;
+
+/// One digest tick for one user, logging the report. Never throws: a digest
+/// failure is a logged report error, and the cron picks the work up again.
+async fn run_digest_for_user(env: &Env, user_id: &str, now_unix: i64) -> Result<()> {
+    let repo = match env.d1("DB") {
+        Ok(db) => crate::db::D1DigestRepo::new(db),
+        Err(err) => {
+            console_log!("queue: DB binding missing for digest: {err}");
+            return Ok(());
+        }
+    };
+    let categories = match env.d1("DB") {
+        Ok(db) => crate::db::D1TaskCategoryRepo::new(db),
+        Err(err) => {
+            console_log!("queue: DB binding missing for digest: {err}");
+            return Ok(());
+        }
+    };
+    let report = api_core::run_digest_tick_user(
+        &repo,
+        &categories,
+        user_id,
+        api_core::DIGEST_TICK_BUDGET_DAYS,
+        now_unix,
+    )
+    .await;
+    for error in &report.errors {
+        console_log!("queue: digest: {error}");
+    }
+    console_log!(
+        "queue: digest user={} rebuilt={} reclassified={} kept_dirty={} remaining={}",
+        user_id,
+        report.rebuilt_days,
+        report.reclassified,
+        report.kept_dirty,
+        report.remaining
+    );
+    if report.remaining {
+        // Same pattern as the calendar re-enqueue: the follow-up is a new
+        // message, so this one is acked either way.
+        match env.queue("CALENDAR_SYNC") {
+            Ok(queue) => {
+                let message = api_core::DigestQueueMessage {
+                    kind: api_core::DigestJobKind::Rebuild,
+                    user_id: user_id.to_string(),
+                };
+                if let Err(err) = queue.send(message).await {
+                    console_log!("queue: digest re-enqueue failed for {user_id}: {err}");
+                }
+            }
+            Err(err) => {
+                console_log!("queue: CALENDAR_SYNC binding missing on digest re-enqueue: {err}");
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Queue entrypoint for the `calendar-sync` consumer binding.
 ///
@@ -17,7 +80,7 @@ use worker::*;
 /// log and `ack_all` — never throw.
 #[event(queue)]
 pub async fn queue(
-    batch: MessageBatch<api_core::CalendarSyncMessage>,
+    batch: MessageBatch<api_core::WorkerQueueMessage>,
     env: Env,
     _ctx: Context,
 ) -> Result<()> {
@@ -64,6 +127,14 @@ pub async fn queue(
             return Ok(());
         }
     };
+    let categories = match env.d1("DB") {
+        Ok(db) => crate::db::D1TaskCategoryRepo::new(db),
+        Err(err) => {
+            console_log!("queue: DB binding missing: {err} — acking batch");
+            batch.ack_all();
+            return Ok(());
+        }
+    };
 
     let messages = match batch.messages() {
         Ok(messages) => messages,
@@ -85,8 +156,18 @@ pub async fn queue(
 
     // max_batch_size = 1, but loop defensively.
     for message in messages {
-        let body = message.body();
-        let calendar_id = body.calendar_id.clone();
+        // Digest jobs are a separate, self-contained path: the tick owns the
+        // retry contract (cron re-sees a `running` job), so failures are acked
+        // rather than re-delivered. The `CalendarSync` arm keeps today's flow.
+        let calendar_id = match message.body() {
+            api_core::WorkerQueueMessage::Digest(digest) => {
+                let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+                run_digest_for_user(&env, &digest.user_id, now_unix).await?;
+                message.ack();
+                continue;
+            }
+            api_core::WorkerQueueMessage::CalendarSync(sync) => sync.calendar_id.clone(),
+        };
 
         let cal = match calendars.get_by_id(&calendar_id).await {
             Ok(Some(cal)) => cal,
@@ -133,6 +214,7 @@ pub async fn queue(
             &cal,
             now_unix,
             &WorkerClock,
+            &categories,
         )
         .await;
 

@@ -315,6 +315,70 @@ pub struct ClassifyDetail {
     pub matched: Vec<String>,
 }
 
+/// Classifies an **event** title into one stored leaf category id, or `None`
+/// for "unclassified".
+///
+/// Events differ from tasks: several leaf matches are not a conflict — the
+/// caller stores a deterministic winner so later reports never re-match
+/// titles. Precedence, in order:
+///
+/// 1. [`reduced_matches`] under [`CalendarScope::Event`] (regex + scope; a
+///    child that matches beats its own parent).
+/// 2. Matches whose category is missing or is the `untracked` sink are
+///    dropped — the sink's id is **never** returned, `None` means
+///    unclassified.
+/// 3. 0 surviving matches → `None`; 1 → that id.
+/// 4. 2+ → the minimum key `(category.sort_order, first matching pattern's
+///    sort_order, category_id)` — category rank first, then the winning
+///    pattern's rank, then the id (lexicographic) as the final tie-break.
+///    A missing category `sort_order` is [`i64::MAX`] (it loses); a category
+///    whose patterns matched but cannot be re-found falls back to `i64::MAX`
+///    too.
+///
+/// [`classify`] itself stays the task contract (2+ matches → conflict).
+pub fn classify_event_leaf(
+    title: &str,
+    google_calendar_id: &str,
+    categories: &[TaskCategory],
+    matchers: &[CategoryWithPatterns],
+) -> Option<String> {
+    let scope = CalendarScope::Event { google_calendar_id };
+    let mut best: Option<(&TaskCategory, i64)> = None;
+    for matcher in reduced_matches(title, scope.clone(), matchers) {
+        let Some(category) = categories
+            .iter()
+            .find(|category| category.id == matcher.category_id)
+        else {
+            // A pattern set whose category row is gone (deleted between the
+            // reads): skip, never guess.
+            continue;
+        };
+        if category.is_untracked {
+            continue;
+        }
+        // The pattern that classified this category, walked in stored
+        // `sort_order` by the shared helper; scope is re-applied there.
+        let pattern_sort_order = first_matching_index(title, scope.clone(), matcher)
+            .map(|index| matcher.patterns[index].sort_order)
+            .unwrap_or(i64::MAX);
+        let key = (category.sort_order, pattern_sort_order, category.id.as_str());
+        match best {
+            None => best = Some((category, pattern_sort_order)),
+            Some((best_category, best_pattern_sort_order)) => {
+                let best_key = (
+                    best_category.sort_order,
+                    best_pattern_sort_order,
+                    best_category.id.as_str(),
+                );
+                if key < best_key {
+                    best = Some((category, pattern_sort_order));
+                }
+            }
+        }
+    }
+    best.map(|(category, _)| category.id.clone())
+}
+
 /// Classifies a title into its reduced match set, naming every matching
 /// category id (so callers can report a conflict's categories).
 ///
@@ -1665,6 +1729,265 @@ mod tests {
                 matched: vec!["coding".to_string()]
             }
         );
+    }
+
+    // ──────────────────────────────────────────
+    // Event leaf classification (calendar_events.category_id)
+    // ──────────────────────────────────────────
+
+    /// A living category row with an explicit `sort_order` — the event
+    /// tie-break reads it.
+    fn leaf_category(id: &str, sort_order: i64) -> TaskCategory {
+        TaskCategory {
+            id: id.to_string(),
+            user_id: "u-1".to_string(),
+            list_id: None,
+            parent_id: None,
+            title: id.to_string(),
+            slug: id.to_string(),
+            color: "#4285f4".to_string(),
+            is_productive: false,
+            google_calendar_id: None,
+            sort_order,
+            is_untracked: false,
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+            deleted_at: None,
+        }
+    }
+
+    /// A pattern row with an explicit `sort_order` and optional calendar scope.
+    fn event_pattern(
+        category_id: &str,
+        regex: &str,
+        sort_order: i64,
+        google_calendar_id: Option<&str>,
+    ) -> TaskCategoryPattern {
+        TaskCategoryPattern {
+            id: format!("p-{category_id}-{sort_order}"),
+            category_id: category_id.to_string(),
+            regex: regex.to_string(),
+            google_calendar_id: google_calendar_id.map(str::to_string),
+            sort_order,
+            created_at: "2026-08-18T00:00:00Z".to_string(),
+            updated_at: "2026-08-18T00:00:00Z".to_string(),
+        }
+    }
+
+    fn event_matcher(
+        category_id: &str,
+        parent_id: Option<&str>,
+        patterns: Vec<TaskCategoryPattern>,
+    ) -> CategoryWithPatterns {
+        CategoryWithPatterns::new(
+            category_id.to_string(),
+            parent_id.map(str::to_string),
+            patterns,
+        )
+    }
+
+    #[test]
+    fn event_leaf_no_match_is_unclassified() {
+        let categories = vec![leaf_category("work", 0)];
+        let matchers = vec![event_matcher(
+            "work",
+            None,
+            vec![event_pattern("work", "^Work$", 0, None)],
+        )];
+        assert_eq!(
+            classify_event_leaf("Lunch", "any@x.com", &categories, &matchers),
+            None
+        );
+    }
+
+    #[test]
+    fn event_leaf_unique_match_is_that_id() {
+        let categories = vec![leaf_category("work", 0), leaf_category("family", 1)];
+        let matchers = vec![
+            event_matcher("work", None, vec![event_pattern("work", "^Work$", 0, None)]),
+            event_matcher(
+                "family",
+                None,
+                vec![event_pattern("family", "^Family$", 0, None)],
+            ),
+        ];
+        assert_eq!(
+            classify_event_leaf("Work", "any@x.com", &categories, &matchers),
+            Some("work".to_string())
+        );
+    }
+
+    #[test]
+    fn event_leaf_child_beats_its_parent() {
+        let categories = vec![leaf_category("family", 0), leaf_category("chores", 0)];
+        let matchers = vec![
+            event_matcher(
+                "family",
+                None,
+                vec![event_pattern("family", "^Chores$", 0, None)],
+            ),
+            event_matcher(
+                "chores",
+                Some("family"),
+                vec![event_pattern("chores", "^Chores$", 0, None)],
+            ),
+        ];
+        assert_eq!(
+            classify_event_leaf("Chores", "any@x.com", &categories, &matchers),
+            Some("chores".to_string()),
+            "the parent is dropped before the tie-break"
+        );
+    }
+
+    #[test]
+    fn event_leaf_lower_category_sort_order_wins_regardless_of_slice_order() {
+        // Matchers deliberately listed worst-first: precedence is the stored
+        // sort_order, never the caller's vec order.
+        let categories = vec![leaf_category("late", 50), leaf_category("early", 1)];
+        let matchers = vec![
+            event_matcher("late", None, vec![event_pattern("late", "^Twin$", 0, None)]),
+            event_matcher(
+                "early",
+                None,
+                vec![event_pattern("early", "^Twin$", 0, None)],
+            ),
+        ];
+        assert_eq!(
+            classify_event_leaf("Twin", "any@x.com", &categories, &matchers),
+            Some("early".to_string())
+        );
+    }
+
+    #[test]
+    fn event_leaf_missing_category_sort_order_loses() {
+        // A category id with no row cannot be ranked: keep the ranked match.
+        let categories = vec![leaf_category("ranked", i64::MAX - 1)];
+        let matchers = vec![
+            event_matcher("ghost", None, vec![event_pattern("ghost", "^Twin$", 0, None)]),
+            event_matcher(
+                "ranked",
+                None,
+                vec![event_pattern("ranked", "^Twin$", 0, None)],
+            ),
+        ];
+        assert_eq!(
+            classify_event_leaf("Twin", "any@x.com", &categories, &matchers),
+            Some("ranked".to_string())
+        );
+    }
+
+    #[test]
+    fn event_leaf_equal_category_sort_order_uses_pattern_sort_order() {
+        // `b` matches on its second pattern (sort_order 5); `a` matches on its
+        // first (sort_order 1) → `a` wins even though `b` is listed first and
+        // both categories share sort_order 0.
+        let categories = vec![leaf_category("a", 0), leaf_category("b", 0)];
+        let matchers = vec![
+            event_matcher(
+                "b",
+                None,
+                vec![
+                    event_pattern("b", "^Never$", 0, None),
+                    event_pattern("b", "^Twin$", 5, None),
+                ],
+            ),
+            event_matcher("a", None, vec![event_pattern("a", "^Twin$", 1, None)]),
+        ];
+        assert_eq!(
+            classify_event_leaf("Twin", "any@x.com", &categories, &matchers),
+            Some("a".to_string())
+        );
+    }
+
+    #[test]
+    fn event_leaf_full_tie_breaks_on_category_id() {
+        let categories = vec![leaf_category("b", 3), leaf_category("a", 3)];
+        let matchers = vec![
+            event_matcher("b", None, vec![event_pattern("b", "^Twin$", 2, None)]),
+            event_matcher("a", None, vec![event_pattern("a", "^Twin$", 2, None)]),
+        ];
+        assert_eq!(
+            classify_event_leaf("Twin", "any@x.com", &categories, &matchers),
+            Some("a".to_string()),
+            "lexicographically smaller id wins the last tie-break"
+        );
+    }
+
+    #[test]
+    fn event_leaf_scope_gates_scoped_patterns_only() {
+        let categories = vec![leaf_category("work", 0), leaf_category("family", 1)];
+        let matchers = vec![
+            event_matcher(
+                "work",
+                None,
+                vec![event_pattern("work", "^Work$", 0, Some("work@x.com"))],
+            ),
+            event_matcher(
+                "family",
+                None,
+                vec![event_pattern("family", "^Family$", 0, None)],
+            ),
+        ];
+        // Scoped to another Google calendar → no match (never a fallback id).
+        assert_eq!(
+            classify_event_leaf("Work", "other@x.com", &categories, &matchers),
+            None
+        );
+        assert_eq!(
+            classify_event_leaf("Work", "work@x.com", &categories, &matchers),
+            Some("work".to_string())
+        );
+        // Unscoped patterns still match any calendar.
+        assert_eq!(
+            classify_event_leaf("Family", "other@x.com", &categories, &matchers),
+            Some("family".to_string())
+        );
+    }
+
+    #[test]
+    fn event_leaf_never_returns_the_untracked_sink() {
+        let categories = vec![leaf_category("work", 0), untracked_category_row()];
+        let matchers = vec![
+            event_matcher("work", None, vec![event_pattern("work", "^Never$", 0, None)]),
+            event_matcher(
+                "sink",
+                None,
+                vec![event_pattern("sink", ".*", 0, None)],
+            ),
+        ];
+        assert_eq!(
+            classify_event_leaf("Lunch", "any@x.com", &categories, &matchers),
+            None,
+            "the sink is never a stored category id"
+        );
+    }
+
+    #[test]
+    fn event_leaf_skips_invalid_stored_regexes() {
+        let categories = vec![leaf_category("broken", 0), leaf_category("work", 1)];
+        let matchers = vec![
+            event_matcher(
+                "broken",
+                None,
+                vec![event_pattern("broken", "[unclosed", 0, None)],
+            ),
+            event_matcher("work", None, vec![event_pattern("work", "^Work$", 0, None)]),
+        ];
+        assert_eq!(
+            classify_event_leaf("Work", "any@x.com", &categories, &matchers),
+            Some("work".to_string())
+        );
+        assert_eq!(
+            classify_event_leaf("[unclosed", "any@x.com", &categories, &matchers),
+            None
+        );
+    }
+
+    fn untracked_category_row() -> TaskCategory {
+        TaskCategory {
+            is_untracked: true,
+            ..leaf_category("sink", 100)
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ fn empty_items_with_next_sync_token_is_replica_success() {
 
     pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -57,6 +58,7 @@ fn google_list_failure_records_attempt_not_success() {
 
     let err = pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -118,6 +120,7 @@ fn upsert_failure_records_storage_transient_without_advancing_token() {
 
     let err = pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::Repo(_)), "{err:?}");
@@ -159,6 +162,7 @@ fn missing_terminal_next_sync_token_is_not_success() {
 
     let err = pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -218,6 +222,7 @@ fn events_list_410_after_retry_records_gone() {
 
     let err = pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -283,6 +288,7 @@ fn events_list_410_then_success_clears_full_sync_requested() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -321,6 +327,7 @@ fn full_sync_requested_drops_stored_token_on_next_walk() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -367,6 +374,7 @@ fn fingerprint_mismatch_requests_full_sync() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -405,6 +413,7 @@ fn fingerprint_mismatch_requests_full_sync() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -444,6 +453,7 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
     ]);
     let err = pollster::block_on(sync_calendar(
         &http_fail, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, now,
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")), "{err:?}");
@@ -473,6 +483,7 @@ fn replica_paginated_apply_publishes_token_only_after_last_page() {
     ]);
     pollster::block_on(sync_calendar(
         &http_ok, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, now,
+        &NO_TAXONOMY,
     ))
     .unwrap();
     let upserted = events.upserted_batch.lock().unwrap();
@@ -521,6 +532,7 @@ fn replica_410_completed_merge_full_sweeps_ghosts_and_preserves_task_id() {
     ]);
     pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -563,6 +575,7 @@ fn replica_410_later_page_merge_full_keeps_partial_apply() {
     ]);
     pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -618,6 +631,7 @@ fn replica_failure_after_page1_delete_replays_idempotently() {
         &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(_)), "{err:?}");
@@ -643,6 +657,7 @@ fn replica_failure_after_page1_delete_replays_idempotently() {
         &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
     assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-done");
@@ -681,6 +696,7 @@ fn replica_poison_on_one_calendar_records_mapping_poison() {
     let events = FakeEventRepo::new();
     let err = pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::InvalidResponse(_)), "{err:?}");
@@ -742,6 +758,7 @@ fn replica_success_after_poison_clears_coverage_and_quarantine() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::InvalidResponse(_)), "{err:?}");
@@ -770,6 +787,7 @@ fn replica_success_after_poison_clears_coverage_and_quarantine() {
         &access(),
         &cal_retry,
         "2023-11-14T22:14:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -803,6 +821,7 @@ fn replica_unexpired_foreign_lease_skips_without_failure() {
         &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -838,6 +857,7 @@ fn replica_expired_foreign_lease_is_stolen_and_walk_succeeds() {
         &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -888,6 +908,7 @@ fn replica_mid_walk_lease_loss_does_not_publish_token() {
         &FakeOperationRepo::new(), &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -953,6 +974,7 @@ fn replica_fenced_apply_steal_before_first_upsert_writes_nothing() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -1003,6 +1025,7 @@ fn replica_fenced_apply_expire_before_tombstone_leaves_row_living() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -1067,7 +1090,8 @@ fn replica_winner_after_expired_loser_applies_and_publishes() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
-    ))
+                &NO_TAXONOMY,
+        ))
     .unwrap_err();
     assert!(
         matches!(err, CalendarError::Invalid(ref m) if m.contains("lost replica lease")),
@@ -1086,6 +1110,7 @@ fn replica_winner_after_expired_loser_applies_and_publishes() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1131,6 +1156,7 @@ fn replica_cancelled_event_delete_failure_records_storage_transient() {
 
     let err = pollster::block_on(sync_calendar(
         &http, &calendars, &events, &FakeOperationRepo::new(), &access(), &cal, "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::Repo(_)), "{err:?}");
@@ -1222,6 +1248,7 @@ fn replica_skips_inflight_google_event_ids() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1290,6 +1317,7 @@ fn replica_merge_full_sweeps_absent_preserves_exceptions_and_task_id() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1351,6 +1379,7 @@ fn replica_merge_full_mid_walk_failure_does_not_sweep() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(matches!(err, CalendarError::GoogleApi(ref m) if m.contains("500")), "{err:?}");
@@ -1405,6 +1434,7 @@ fn replica_merge_full_lease_lost_before_sweep_does_not_tombstone_or_publish() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap_err();
     assert!(
@@ -1459,6 +1489,7 @@ fn replica_incremental_completed_does_not_sweep_preexisting_ghost() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
     assert_eq!(calendars.stored.lock().unwrap()[0].sync_token, "st-inc");
@@ -1526,6 +1557,7 @@ fn replica_merge_full_records_inflight_as_seen_and_does_not_sweep() {
         &access(),
         &cal,
         "2023-11-14T22:13:20Z",
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -1647,6 +1679,7 @@ fn replica_lease_expiry_advances_with_wall_time_on_long_walk() {
             deployed_version: String::new(),
             started_unix_ms: base.saturating_mul(1000),
         },
+        &NO_TAXONOMY,
     ));
 
     assert!(

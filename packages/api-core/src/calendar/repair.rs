@@ -5,20 +5,27 @@
 //! `failed` (user retries with a new client id). A google_committed insert
 //! whose Google row is gone is local-deleted and closed as `cache_applied`.
 
-use super::apply::{classify_replica_item, ReplicaApplyAction};
+use super::apply::{classify_replica_item, EventClassifyCtx, ReplicaApplyAction};
 use super::google::encode_path_segment;
 use super::journal::parse_google_event;
 use super::GOOGLE_EVENTS_BASE_URL;
+use crate::calendar_color::{load_classify_taxonomy, PaintTaxonomy};
 use crate::models::{
     CalendarEventOperation, OP_STATUS_CACHE_APPLIED, OP_STATUS_FAILED, OP_STATUS_GOOGLE_COMMITTED,
     OP_STATUS_PENDING, OP_VERB_DELETE, OP_VERB_INSERT, OP_VERB_MOVE, OP_VERB_PATCH,
 };
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TaskCategoryRepo};
 use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
 /// Recover in-flight journal rows for one user by GET only.
+///
+/// `category_repo` feeds the write-time classifier: the taxonomy is loaded
+/// **once per user** (this function is already per-user, no seeding) and
+/// reused for every repaired op — repair writes the same `category_id` stamp
+/// as the sync walks. A load failure only degrades the stamp
+/// (`EventClassifyCtx::preserve`), never the repair.
 ///
 /// Returns human-readable error strings (never tokens). One op failure does
 /// not abort the rest. Status is left unchanged on transport / non-terminal
@@ -31,6 +38,7 @@ pub async fn repair_inflight_operations(
     access: &GoogleAccess,
     user_id: &str,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
@@ -46,6 +54,12 @@ pub async fn repair_inflight_operations(
         }
     };
 
+    // One taxonomy load for the whole user (cached across ops); a failure
+    // leaves `None` and every op repairs with the empty context.
+    let taxonomy = load_classify_taxonomy(category_repo, user_id)
+        .await
+        .ok();
+
     for op in ops
         .into_iter()
         .filter(|op| op.user_id == user_id && !op.google_event_id.is_empty())
@@ -58,6 +72,7 @@ pub async fn repair_inflight_operations(
             access,
             &op,
             &now_rfc3339,
+            taxonomy.as_ref(),
         )
         .await
         {
@@ -68,6 +83,7 @@ pub async fn repair_inflight_operations(
     errors
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn repair_one(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -76,6 +92,7 @@ async fn repair_one(
     access: &GoogleAccess,
     op: &CalendarEventOperation,
     now_rfc3339: &str,
+    taxonomy: Option<&PaintTaxonomy>,
 ) -> Result<(), String> {
     let Some(cal) = calendars
         .get_by_id(&op.calendar_id)
@@ -104,7 +121,8 @@ async fn repair_one(
 
     if (200..300).contains(&status) {
         // Source still has the event — move never landed (or was abandoned).
-        return apply_get_ok(events, operations, op, &cal.id, &body, now_rfc3339).await;
+        let ctx = classify_ctx_for(taxonomy, &cal.google_calendar_id);
+        return apply_get_ok(events, operations, op, &cal.id, &body, now_rfc3339, &ctx).await;
     }
 
     if status == 404 || status == 410 {
@@ -117,6 +135,7 @@ async fn repair_one(
                 access,
                 op,
                 now_rfc3339,
+                taxonomy,
             )
             .await;
         }
@@ -132,6 +151,7 @@ async fn repair_one(
 
 /// Source GET 404/410 for a `move` op: event left the source calendar.
 /// Resolve destination from payload and GET there (never POST/PATCH).
+#[allow(clippy::too_many_arguments)]
 async fn repair_move_source_gone(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -140,6 +160,7 @@ async fn repair_move_source_gone(
     access: &GoogleAccess,
     op: &CalendarEventOperation,
     now_rfc3339: &str,
+    taxonomy: Option<&PaintTaxonomy>,
 ) -> Result<(), String> {
     let destination = parse_move_destination(&op.payload_json).ok_or_else(|| {
         format!(
@@ -209,7 +230,8 @@ async fn repair_move_source_gone(
                 })?;
         }
 
-        let row = match classify_replica_item(&ge, &dest_cal.id, now_rfc3339) {
+        let ctx = classify_ctx_for(taxonomy, &dest_cal.google_calendar_id);
+        let row = match classify_replica_item(&ge, &dest_cal.id, now_rfc3339, &ctx) {
             ReplicaApplyAction::SoftDelete { google_event_id } => {
                 events
                     .delete_by_google_event_id(&dest_cal.id, &google_event_id, now_rfc3339)
@@ -282,6 +304,21 @@ async fn repair_move_source_gone(
     ))
 }
 
+/// Classifier context for the calendar a repaired row lands on: the taxonomy
+/// is shared, the Google id differs per calendar (pattern scope). A missing
+/// taxonomy (`.ok()` above) degrades to the **preserving** context, so the
+/// stored stamp survives the repair instead of being blanked.
+fn classify_ctx_for<'a>(
+    taxonomy: Option<&'a PaintTaxonomy>,
+    google_calendar_id: &'a str,
+) -> EventClassifyCtx<'a> {
+    match taxonomy {
+        Some(taxonomy) => taxonomy.event_ctx(google_calendar_id),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
+    }
+}
+
 fn parse_move_destination(payload_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(payload_json).ok()?;
     value
@@ -299,6 +336,7 @@ async fn apply_get_ok(
     calendar_id: &str,
     body: &[u8],
     now_rfc3339: &str,
+    ctx: &EventClassifyCtx<'_>,
 ) -> Result<(), String> {
     let ge = parse_google_event(body, "repair events.get").map_err(|err| {
         format!(
@@ -325,7 +363,7 @@ async fn apply_get_ok(
         return Ok(());
     }
 
-    let (local_id, etag) = match classify_replica_item(&ge, calendar_id, now_rfc3339) {
+    let (local_id, etag) = match classify_replica_item(&ge, calendar_id, now_rfc3339, ctx) {
         ReplicaApplyAction::SoftDelete { google_event_id } => {
             events
                 .delete_by_google_event_id(calendar_id, &google_event_id, now_rfc3339)

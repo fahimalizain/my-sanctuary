@@ -1,3 +1,4 @@
+use super::apply::EventClassifyCtx;
 use super::catalog::refresh_calendar_list;
 use super::cron::stamp_auth_revoked_for_user;
 use super::sync::{classify_watch_coverage, events_sync_envelope, EventsSyncEnvelope};
@@ -6,6 +7,7 @@ use super::watch::{
 };
 use super::window::fetch_and_apply_window;
 use super::CalendarError;
+use crate::calendar_color::PaintTaxonomy;
 use crate::models::{CalendarEvent, GoogleCalendar, WatchChannel};
 use crate::oauth::HttpClient;
 use crate::repo::{CalendarEventRepo, CalendarRepo, WatchChannelRepo};
@@ -123,6 +125,10 @@ pub async fn list_events(
     watch_callback_url: Option<&str>,
 ) -> Result<CalendarListOutput, CalendarError> {
     let snapshot = load_list_snapshot(calendars, watches, user_id).await?;
+    // No taxonomy in hand on this wrapper: the window write-through stamps no
+    // category (`EventClassifyCtx::preserve`, so a stored stamp survives). The
+    // worker route loads the paint taxonomy itself and calls
+    // [`list_events_with_snapshot`] with it.
     list_events_with_snapshot(
         http,
         calendars,
@@ -135,6 +141,7 @@ pub async fn list_events(
         now_unix,
         watch_callback_url,
         snapshot,
+        None,
     )
     .await
 }
@@ -151,6 +158,12 @@ pub async fn list_events(
 /// - `watch_coverage` is stamped in memory on every GET and persisted only
 ///   when it differs from the stored value (cron/webhook paths keep it fresh
 ///   otherwise), so steady-state GETs do not write.
+///
+/// `taxonomy` is the caller's already-loaded paint taxonomy (the worker loads
+/// it in the same `join!` as the snapshot); the window write-through stamps
+/// each row's leaf `category_id` from it. `None` — a failed taxonomy load —
+/// only degrades the stamp (`EventClassifyCtx::preserve` keeps whatever stamp
+/// is stored); listing never 500s because paint data is missing.
 pub async fn list_events_with_snapshot(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -163,6 +176,7 @@ pub async fn list_events_with_snapshot(
     now_unix: i64,
     watch_callback_url: Option<&str>,
     snapshot: ListSnapshot,
+    taxonomy: Option<&PaintTaxonomy>,
 ) -> Result<CalendarListOutput, CalendarError> {
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let ListSnapshot {
@@ -296,6 +310,13 @@ pub async fn list_events_with_snapshot(
         }
 
         window_fetched = true;
+        // Per-calendar classifier context: the Google id is the scope key for
+        // patterns; a missing taxonomy only degrades the stamp.
+        let ctx = match taxonomy {
+            Some(taxonomy) => taxonomy.event_ctx(&cal.google_calendar_id),
+            // A failed load must not blank a good stamp.
+            None => EventClassifyCtx::preserve(),
+        };
         match fetch_and_apply_window(
             http,
             calendars,
@@ -305,6 +326,7 @@ pub async fn list_events_with_snapshot(
             start_rfc3339,
             end_rfc3339,
             &now_rfc3339,
+            &ctx,
         )
         .await
         {

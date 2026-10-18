@@ -54,6 +54,11 @@ export default {
         heading: ['Sen', 'sans-serif'],
         body: ['Kumbh Sans', 'sans-serif'],
       },
+      gridTemplateColumns: {
+        // The rule strip: fourteen equal cells that shrink with the card
+        // instead of overflowing a phone (Tailwind stops at 12 by default).
+        14: 'repeat(14, minmax(0, 1fr))',
+      },
       borderRadius: {
         lg: 'var(--radius)',
         md: 'calc(var(--radius) - 2px)',

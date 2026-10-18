@@ -10,7 +10,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::apply::{map_google_event, row_from_new_event, GoogleEvent};
+use super::apply::{map_cached_event, row_from_new_event, EventClassifyCtx, GoogleEvent};
 use super::google::encode_path_segment;
 use super::labels::CachedEventLabel;
 use super::write::{build_shared_properties, CreateEventOutput};
@@ -21,8 +21,9 @@ use crate::models::{
     NewCalendarEventOperation, NewEventInput, OP_STATUS_CACHE_APPLIED, OP_STATUS_FAILED,
     OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING, OP_VERB_INSERT,
 };
+use crate::calendar_color::load_classify_taxonomy;
 use crate::oauth::HttpClient;
-use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo};
+use crate::repo::{CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, TaskCategoryRepo};
 use crate::time::unix_secs_to_rfc3339;
 use crate::token::GoogleAccess;
 
@@ -110,6 +111,11 @@ fn build_insert_times(
 /// Journaled `events.insert`: persist the outbound op before Google, reuse a
 /// client-supplied event id, treat 409 as success via GET, and return the
 /// V2 persisted local id (never a phantom).
+///
+/// The cache apply stamps the created row's leaf `category_id` from the
+/// destination calendar's write-time context (`category_repo` → one
+/// no-seed taxonomy load per create; a load failure only leaves the row
+/// unclassified and never fails the write).
 pub(crate) async fn create_event_with_journal(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -119,6 +125,7 @@ pub(crate) async fn create_event_with_journal(
     user_id: &str,
     input: &NewEventInput,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<CreateEventOutput, CalendarError> {
     let Some(cal) = calendars.get_by_id(&input.calendar_id).await? else {
         return Err(CalendarError::NotFound);
@@ -262,7 +269,18 @@ pub(crate) async fn create_event_with_journal(
         )
         .await?;
 
-    let new_event = map_google_event(&created, &cal.id, &now_rfc3339);
+    // Write-time leaf category, loaded once per create. The taxonomy load is
+    // best-effort: a failure only leaves the row unclassified (a later
+    // reclassify job fills the gap) and never fails the write.
+    let taxonomy = load_classify_taxonomy(category_repo, &cal.user_id)
+        .await
+        .ok();
+    let ctx = match &taxonomy {
+        Some(taxonomy) => taxonomy.event_ctx(&cal.google_calendar_id),
+        // A failed load must not blank a good stamp.
+        None => EventClassifyCtx::preserve(),
+    };
+    let new_event = map_cached_event(&created, &cal.id, &now_rfc3339, &ctx);
     let local_id = match events.upsert(new_event.clone(), &now_rfc3339).await {
         Ok(id) => id,
         Err(err) => {

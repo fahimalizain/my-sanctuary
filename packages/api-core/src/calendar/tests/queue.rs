@@ -38,6 +38,7 @@ fn queue_published_clean_acks() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -70,6 +71,7 @@ fn queue_published_with_mid_walk_bump_reenqueues_once() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Reenqueue);
@@ -102,6 +104,7 @@ fn queue_multiple_mid_walk_bumps_single_reenqueue() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Reenqueue);
@@ -133,6 +136,7 @@ fn queue_lease_busy_acks_without_google_or_dirty_change() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -165,6 +169,7 @@ fn queue_sync_failure_acks_records_next_retry() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -200,6 +205,7 @@ fn queue_missing_calendar_acks_no_work() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -230,6 +236,7 @@ fn queue_disabled_calendar_acks_no_work() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -263,6 +270,7 @@ fn queue_soft_deleted_calendar_acks_no_work() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -295,6 +303,7 @@ fn queue_already_clean_acks_no_google() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);
@@ -328,6 +337,7 @@ fn queue_backoff_acks_no_google() {
         &cal,
         NOW_UNIX,
         &clock(),
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.action, QueueSyncAction::Ack);

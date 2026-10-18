@@ -74,6 +74,50 @@ where
     deserializer.deserialize_any(EmptyStringVisitor)
 }
 
+/// Deserializes a nullable TEXT column as `Option<String>`, mapping **both** D1
+/// `NULL` (a JS `null`) and the empty string to `None`. Used by app-owned
+/// optional columns where `""` and `NULL` both mean "absent" — e.g.
+/// `calendar_events.category_id`, which the upsert binds as `NULLIF(?, '')`.
+pub fn de_optional_empty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionalEmptyStringVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalEmptyStringVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or null")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(normalize_optional_string(value))
+        }
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(normalize_optional_string(&value))
+        }
+    }
+
+    deserializer.deserialize_any(OptionalEmptyStringVisitor)
+}
+
+/// Blank (empty or whitespace-only) → `None`; otherwise the trimmed value.
+fn normalize_optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub mod calendar;
 pub use calendar::*;
 

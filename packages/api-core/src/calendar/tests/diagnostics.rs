@@ -44,6 +44,7 @@ fn traced_paginated_walk_counts_and_sanitizes_diagnostic() {
             deployed_version: "9.9.9".into(),
             started_unix_ms: NOW_UNIX.saturating_mul(1000),
         },
+        &NO_TAXONOMY,
     ));
 
     assert!(
@@ -125,6 +126,7 @@ fn traced_missing_terminal_token_sets_checkpoint_and_preserves_success() {
             deployed_version: String::new(),
             started_unix_ms: 0,
         },
+        &NO_TAXONOMY,
     ));
 
     assert!(
@@ -210,6 +212,7 @@ fn cron_warns_stale_and_auth_even_when_not_replica_due() {
         &oauth,
         None,
         NOW_UNIX,
+        &NO_TAXONOMY,
     ));
 
     assert_eq!(report.synced, 0, "no replica walks expected");

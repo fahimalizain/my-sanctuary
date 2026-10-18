@@ -13,14 +13,17 @@ pub use calendar::replica as calendar_replica;
 pub use calendar::sync as calendar_sync;
 pub use calendar::window as calendar_window;
 pub mod categories;
+pub mod digest;
 pub mod google_color;
 pub mod lists;
 pub mod models;
 pub mod oauth;
 pub mod pattern_gen;
 pub mod realtime;
+pub mod record;
 pub mod repo;
 pub mod routines;
+pub mod rules;
 pub mod tasks;
 pub mod time;
 pub mod token;
@@ -76,6 +79,17 @@ pub use calendar_color::{
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,
 };
+pub use digest::{
+    bed_minutes_past_noon, digest_days, digest_status, dirty_dates_for_span, dirty_dates_for_spans,
+    effective_zone_name, ensure_backfill_job, include_event, marker_kind, normalized_zone_name,
+    resolve_sleep_category_id, run_digest_tick, run_digest_tick_user, shift_date,
+    untracked_seconds, wake_minutes_past_midnight, BackfillJob, CategorySeconds, DayAnchors,
+    DayDigest, DigestEvent, DigestEventRow, DigestJobKind, DigestQueueMessage, DigestRepo,
+    DigestStatus, DigestTickReport, EventSpan, EventSpanRow, HourSeconds, JobStatus, MarkerKind,
+    NightRow, ReclassifyRow, SleepMarker, SleepSource, WorkerQueueMessage, ALGO_VERSION,
+    DEFAULT_SLEEP_SECS, DIGEST_TICK_BUDGET_DAYS, SLEEP_INTERRUPTION_MAX_SECS, SLEEP_PAIR_MAX_SECS,
+    SYNTHETIC_SLEEP_CATEGORY_ID,
+};
 pub use google_color::{
     canonicalize_hex, is_event_label_hex, parse_hex_rgb, snap_to_event_label_hex,
     DEFAULT_EVENT_LABEL_COLOR, GOOGLE_EVENT_LABEL_COLORS, GOOGLE_EVENT_LABEL_NEUTRALS,
@@ -99,14 +113,37 @@ pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
 pub use realtime::{RealtimeKind, RealtimeMessage};
+pub use record::{
+    assemble_record, record_report, EstimatedNight, HeatmapRow, RankingRow, RecordCategoryRow,
+    RecordCategorySecondsRow, RecordData, RecordDay, RecordDaySecondsRow, RecordError,
+    RecordHourSecondsRow, RecordMetaRow, RecordNightRow, RecordQuality, RecordRange, RecordReport,
+    RecordRepo, RecordSegment, RecordTitleCandidateRow, RecordWindow, TrendPoint, UnclassifiedTitle,
+    YearRow, ESTIMATED_NIGHTS_CAP, RECORD_CATEGORIES_SQL, RECORD_CATEGORY_SECONDS_SQL,
+    RECORD_EARLIEST_META_DATE_SQL, RECORD_EARLIEST_NIGHT_DATE_SQL, RECORD_HOUR_SECONDS_SQL,
+    RECORD_META_SQL, RECORD_NIGHTS_SQL, RECORD_PRIMARY_TIME_ZONE_SQL,
+    RECORD_PRODUCTIVE_SECONDS_SQL, RECORD_UNCLASSIFIED_TITLES_SQL, TREND_WINDOW_DAYS,
+    UNCLASSIFIED_TITLES_CAP, YEARS_CAP,
+};
 pub use routines::{
     create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
     validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,
     RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
 };
+pub use rules::{
+    archive_rules, create_global_pause, create_rule, delete_pause, digest_load_floor,
+    ensure_default_rules, list_pauses, pause_rule, reorder_rules, resume_rule, rule_phase,
+    score_board, score_rule, scoreboard, seed_rule_id, set_rule_archived, today, update_rule,
+    window_start, ArchiveResponse, BoardInput, CategoryCatalog, DigestFlags, DigestSlice,
+    NewPauseInput, NewRuleInput, NewRuleRow, NotFull, PausePeriod, PauseResponse, PauseRow,
+    PauseRuleInput, PauseView, PausesResponse, ReorderInput, Revision, RevisionRow, RuleKind,
+    RuleParams, RulePhase, RuleRepo, RuleRow, RuleScore, RuleSpec, RuleStatus, RulesError,
+    Scoreboard, SeedOutcome, UpdateRuleInput, HISTORY_BUILDING, MAX_TARGET_HOURS,
+    MAX_TARGET_MINUTES, SEED_HISTORY_DAYS,
+};
 pub use repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_delete_by_ids_sql,
     build_occurrence_insert_sql, build_occurrence_list_by_ids_sql, build_replica_seen_insert_sql,
+    chunk_events_for_upsert,
     build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
     build_agenda_item_list_by_refs_sql, build_routine_list_by_ids_sql,
     AgendaItemRepo,
@@ -136,7 +173,8 @@ pub use repo::{
     CALENDAR_SET_EVENT_LABELS_SQL, CALENDAR_SET_WATCH_COVERAGE_SQL, CALENDAR_TRY_ACQUIRE_LEASE_SQL,
     CALENDAR_LEASE_HELD_SQL, EVENT_CLEAR_REPLICA_SEEN_FOR_CALENDAR_SQL,
     EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
-    EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_GET_ID_BY_NATURAL_KEY_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
+    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
     EVENT_UPSERT_COL_COUNT, REPLICA_SEEN_INSERT_CHUNK_SIZE, REPLICA_SEEN_INSERT_COL_COUNT,
     OCCURRENCE_GET_BY_ID_SQL, OCCURRENCE_GET_BY_ROUTINE_AND_DATE_SQL, OCCURRENCE_INSERT_SQL,
     OCCURRENCE_INSERT_CHUNK_SIZE, OCCURRENCE_INSERT_COL_COUNT,

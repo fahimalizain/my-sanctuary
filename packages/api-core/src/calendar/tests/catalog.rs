@@ -588,6 +588,7 @@ fn cron_publishes_newly_appeared_calendar_from_list_refresh() {
 
     let report = pollster::block_on(run_fallback_cron(
         &http, &calendars, &events, &FakeOperationRepo::new(), &watches, &tokens, &oauth, None, NOW_UNIX,
+        &NO_TAXONOMY,
     ));
 
     // published includes the new calendar id from list refresh, plus the

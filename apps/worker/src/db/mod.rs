@@ -114,6 +114,15 @@ pub(crate) fn bind_text(args: &[String]) -> Vec<D1Type> {
 pub mod calendar;
 pub use calendar::*;
 
+pub mod digest;
+pub use digest::*;
+
+pub mod rules;
+pub use rules::*;
+
+pub mod record;
+pub use record::*;
+
 /// `users` table persistence.
 pub struct D1UserRepo {
     db: D1Database,

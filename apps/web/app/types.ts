@@ -53,6 +53,22 @@ export interface CalendarEvent {
   recurrence?: string;
   /** Google recurringEventId for instances; empty / missing = master or one-shot. */
   recurring_event_id?: string;
+  /**
+   * Stored leaf category id stamped at write time (slice 1). `null` /
+   * missing = unclassified (never the `untracked` sink's id). No UI reads it
+   * yet — later reports do.
+   */
+  category_id?: string | null;
+  /**
+   * Google `organizer.self` (or no organizer) → true; D1 INTEGER 0/1 read as
+   * a boolean. Missing on legacy rows.
+   */
+  is_self_organized?: boolean;
+  /**
+   * Google `eventType` (`default` / `focusTime` / `outOfOffice` / `fromGmail`);
+   * `''` / missing = unknown (legacy rows).
+   */
+  event_type?: string;
 }
 
 export type CalendarSyncAggregateStatus =
@@ -661,4 +677,358 @@ export interface UpdateOccurrenceInput {
 export interface OccurrenceActionResponse {
   occurrence: OccurrenceRecord;
   event: CalendarEvent | null;
+}
+
+// ──────────────────────────────────────────
+// Consistency rules (reports slice 4) — shapes mirror
+// `packages/api-core/src/rules/{score,params,service}.rs`.
+// ──────────────────────────────────────────
+
+// `rules.kind` — the scoring family, immutable after create.
+export type RuleKind =
+  | 'category_total'
+  | 'category_days'
+  | 'category_daily_avg'
+  | 'sleep_duration'
+  | 'sleep_timing';
+
+// The derived phase (never stored). `finished` = a challenge whose `ends_on`
+// is behind the user's civil today; its last strip day is a real verdict.
+export type RulePhase = 'active' | 'paused' | 'finished' | 'archived';
+
+// One strip cell of the 14-day history.
+export type StripState =
+  | 'pass'
+  | 'fail'
+  | 'pending'
+  | 'paused'
+  | 'excluded'
+  | 'off';
+
+export type RuleComparator = 'gte' | 'lte';
+
+export type SleepMetric =
+  | 'bedtime_median'
+  | 'bedtime_stdev'
+  | 'wake_median'
+  | 'wake_stdev';
+
+// The literal `"all_productive"`, or an explicit id list with optional
+// one-level children.
+export type CategorySelector =
+  | 'all_productive'
+  | { ids: string[]; include_children: boolean };
+
+export interface CategoryTotalParams {
+  categories: CategorySelector;
+  window_days: number;
+  comparator: RuleComparator;
+  target_hours: number;
+}
+
+export interface CategoryDaysParams {
+  categories: CategorySelector;
+  window_days: number;
+  min_minutes: number;
+  min_days: number;
+}
+
+// The daily-average travel escape hatch — omitted entirely when unused (the
+// server denies unknown fields and `null` is not the same as absent).
+export interface ExcludeIf {
+  categories: CategorySelector;
+  percent_of_waking: number;
+}
+
+export interface CategoryDailyAvgParams {
+  categories: CategorySelector;
+  window_days: number;
+  /** `0 = Monday … 6 = Sunday`. */
+  weekdays: number[];
+  target_hours: number;
+  exclude_if?: ExcludeIf;
+}
+
+export interface SleepDurationParams {
+  window_days: number;
+  min_nights: number;
+  target_hours: number;
+}
+
+export interface SleepTimingParams {
+  window_days: number;
+  min_nights: number;
+  metric: SleepMetric;
+  comparator: RuleComparator;
+  target_minutes: number;
+}
+
+// The params object of one kind (the `kind` is on the rule, never inside the
+// params — the canonical JSON this client sends carries no tag).
+export type RuleParams =
+  | CategoryTotalParams
+  | CategoryDaysParams
+  | CategoryDailyAvgParams
+  | SleepDurationParams
+  | SleepTimingParams;
+
+export interface StripCell {
+  date: string;
+  state: StripState;
+}
+
+// `category_total` evidence: the rolling window sum ending on each strip day.
+export interface EvidencePoint {
+  date: string;
+  /** `null` when the endpoint itself is paused (the strip cell is `paused`). */
+  hours: number | null;
+}
+
+export interface EvidenceDay {
+  date: string;
+  hit: boolean;
+}
+
+export interface EvidenceWeekday {
+  date: string;
+  hours: number;
+  excluded: boolean;
+}
+
+export interface EvidenceNight {
+  wake_date: string;
+  bed_min_past_noon: number;
+  wake_min_past_midnight: number;
+  hours: number;
+  source: string;
+}
+
+// Internally tagged evidence, `type` = the rule kind.
+export type RuleEvidence =
+  | { type: 'category_total'; points: EvidencePoint[] }
+  | { type: 'category_days'; days: EvidenceDay[] }
+  | { type: 'category_daily_avg'; weekdays: EvidenceWeekday[] }
+  | { type: 'sleep_duration'; nights: EvidenceNight[] }
+  | { type: 'sleep_timing'; nights: EvidenceNight[] };
+
+// One rule's rendered score (`RuleScore` in Rust). `params` is the revision
+// active on the scoreboard's `as_of`; it is `unknown` on purpose — the edit
+// form validates the shape before hydrating (a legacy or hand-edited row must
+// never crash the page).
+export interface RuleScore {
+  id: string;
+  name: string;
+  icon: string;
+  kind: RuleKind;
+  phase: RulePhase;
+  starts_on: string;
+  ends_on: string | null;
+  paused_on: string | null;
+  sort_order: number;
+  condition: string;
+  on_track: boolean;
+  /**
+   * Whether the window ending `as_of` has an aggregate row on every non-paused
+   * day in it. `false` means the backfill has not reached the whole window:
+   * `on_track` is `false`, `owed` says why, and the strip's in-play cells are
+   * `pending`.
+   */
+  window_full: boolean;
+  actual_label: string;
+  target_label: string;
+  owed: string;
+  streak: number;
+  best_streak: number;
+  compliance: number | null;
+  params: unknown;
+  strip: StripCell[];
+  evidence: RuleEvidence;
+}
+
+// The envelope returned by GET /api/rules/scoreboard.
+export interface ScoreboardResponse {
+  /** `YYYY-MM-DD` — the civil date every card is scored at. */
+  as_of: string;
+  time_zone: string;
+  /** Headline numerator: passing rules. */
+  on_track: number;
+  /** Rules on the board whose phase is `paused` (they are not in the headline). */
+  paused_rules: number;
+  /** Headline denominator: `active` rules only (paused rules excluded). */
+  active_rules: number;
+  all_pass_streak: number;
+  best_all_pass_streak: number;
+  reclassifying: boolean;
+  backfilling: boolean;
+  dirty_days: number;
+  /** Phase `active` or `paused` only, by `sort_order` then name. */
+  rules: RuleScore[];
+}
+
+// The envelope returned by GET /api/rules/archive (finished and archived).
+export interface ArchiveRulesResponse {
+  rules: RuleScore[];
+}
+
+// One `pause_periods` row (`rule_id` null = every rule).
+export interface PauseRecord {
+  id: string;
+  rule_id: string | null;
+  from: string;
+  to: string;
+  reason: string;
+  created_at: string;
+}
+
+// The envelope returned by GET /api/pauses.
+export interface PausesResponse {
+  pauses: PauseRecord[];
+}
+
+// The envelope returned by POST /api/pauses.
+export interface PauseResponse {
+  pause: PauseRecord;
+}
+
+// The envelope returned by DELETE /api/pauses/:id.
+export interface DeletePauseResponse {
+  success: boolean;
+}
+
+// The envelope returned by POST /api/rules/reorder.
+export interface ReorderRulesResponse {
+  success: boolean;
+}
+
+// Request body for POST /api/rules. Omit `starts_on` to default to today.
+export interface NewRuleInput {
+  name: string;
+  icon?: string;
+  kind: RuleKind;
+  starts_on?: string;
+  ends_on?: string;
+  params: RuleParams;
+}
+
+// Request body for PATCH /api/rules/:id — every field optional. A present
+// `params` opens a new revision from today; `ends_on: null` (key present)
+// clears the challenge end.
+export interface UpdateRuleInput {
+  name?: string;
+  icon?: string;
+  starts_on?: string;
+  ends_on?: string | null;
+  params?: RuleParams;
+}
+
+// Request body for POST /api/pauses — a global (every rule) period.
+export interface NewPauseInput {
+  from: string;
+  to: string;
+  reason?: string;
+}
+
+// ──────────────────────────────────────────
+// The Record (reports slice 5) — shapes mirror
+// `packages/api-core/src/record/{assemble,mod}.rs`.
+//
+// Descriptive only: every duration is an integer number of seconds (the client
+// divides by 3600 for hours), and nothing here carries a target or a verdict.
+// ──────────────────────────────────────────
+
+// The `range` query values, exactly as the server accepts and echoes them.
+export type RecordRangeKey = '7d' | '30d' | '90d' | 'ytd';
+
+// One root category's seconds on one day (leaves have already rolled up).
+export interface RecordSegment {
+  category_id: string;
+  title: string;
+  color: string;
+  seconds: number;
+}
+
+export interface RecordDay {
+  date: string;
+  /** `false` when no `daily_meta` row exists: the date is unbuilt, not a zero. */
+  aggregated: boolean;
+  segments: RecordSegment[];
+  /**
+   * `null` while the day is still being written (it is today in its zone) and
+   * for a day with no aggregate at all.
+   */
+  untracked_seconds: number | null;
+}
+
+export interface RecordRankingRow {
+  category_id: string;
+  title: string;
+  color: string;
+  seconds: number;
+  previous_seconds: number;
+  /** `seconds` over the range's total (`0` when nothing was tracked). */
+  share: number;
+}
+
+export interface RecordTrendPoint {
+  date: string;
+  hours: number;
+  /** `null` until the user's history reaches 30 / 60 days. */
+  ma30: number | null;
+  ma60: number | null;
+}
+
+export interface RecordHeatmapRow {
+  /** `0 = Monday … 6 = Sunday`. */
+  weekday: number;
+  /** 24 mean productive seconds, one per clock hour. */
+  seconds: number[];
+}
+
+export interface RecordEstimatedNight {
+  wake_date: string;
+  /** `est_no_wake | est_no_asleep | est_none`. */
+  source: string;
+  seconds: number;
+}
+
+export interface RecordUnclassifiedTitle {
+  title: string;
+  count: number;
+}
+
+export interface RecordQuality {
+  /** The newest estimated nights first, capped at 60. */
+  estimated_nights: RecordEstimatedNight[];
+  /** Whether the range held more estimated nights than the cap lists. */
+  estimated_nights_truncated: boolean;
+  unclassified_titles: RecordUnclassifiedTitle[];
+}
+
+export interface RecordYearRow {
+  year: number;
+  productive_hours_per_day: number;
+  weekday_hours: number;
+  weekend_hours: number;
+  /** `null` until the year has a paired night. */
+  sleep_median_hours: number | null;
+  paired_nights: number;
+  /** January 1 through December 31, clipped to `as_of`. */
+  days: number;
+}
+
+// The envelope returned by GET /api/reports/record.
+export interface RecordReport {
+  as_of: string;
+  time_zone: string;
+  range: RecordRangeKey;
+  from: string;
+  to: string;
+  previous_from: string;
+  previous_to: string;
+  days: RecordDay[];
+  ranking: RecordRankingRow[];
+  trend: RecordTrendPoint[];
+  heatmap: RecordHeatmapRow[];
+  quality: RecordQuality;
+  years: RecordYearRow[];
 }

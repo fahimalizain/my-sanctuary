@@ -4,9 +4,11 @@ use api_core::models::{
     CalendarEvent, CalendarEventOperation, GoogleCalendar, NewCalendar, NewCalendarEvent,
     NewCalendarEventOperation, NewWatchChannel, WatchChannel,
 };
+use api_core::digest::repo::{EventSpan, EventSpanKeyRow, EventSpanRow};
 use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_operation_list_by_statuses_sql,
-    build_replica_seen_insert_sql, CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo,
+    build_replica_seen_insert_sql, chunk_events_for_upsert, CalendarEventOperationRepo,
+    CalendarEventRepo, CalendarRepo,
     RepoError, WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL,
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
@@ -24,7 +26,8 @@ use api_core::repo::{
     EVENT_DELETE_SQL, EVENT_DELETE_STALE_SQL, EVENT_GET_BY_CALENDAR_AND_GOOGLE_ID_SQL,
     EVENT_GET_BY_ID_SQL, EVENT_GET_ID_BY_NATURAL_KEY_SQL,
     EVENT_LIST_BY_USER_ID_AND_TIME_RANGE_SQL, EVENT_LIST_RUNNING_BY_USER_ID_SQL,
-    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL, EVENT_UPSERT_CHUNK_SIZE,
+    EVENT_REASSIGN_CALENDAR_SQL, EVENT_SWEEP_ABSENT_IF_OWNER_SQL,
+    EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL,
     EVENT_UPSERT_QUARANTINE_SQL, OPERATION_GET_BY_ID_SQL,
     OPERATION_INSERT_SQL, OPERATION_LIST_INFLIGHT_GOOGLE_IDS_SQL, OPERATION_UPDATE_PROGRESS_SQL,
     OPERATION_UPDATE_STATUS_SQL, REPLICA_SEEN_INSERT_CHUNK_SIZE,
@@ -34,7 +37,7 @@ use api_core::repo::{
     WATCH_CHANNEL_LIST_UNEXPIRED_BY_CALENDAR_ID_SQL,
 };
 use serde::Deserialize;
-use worker::{D1Database, D1Type};
+use worker::{console_log, D1Database, D1Type};
 
 use super::{backend, now_rfc3339, query_vec, run_stmt, run_stmt_changes};
 
@@ -52,6 +55,74 @@ impl D1CalendarRepo {
 /// `calendar_events` table persistence.
 pub struct D1CalendarEventRepo {
     db: D1Database,
+}
+
+/// One stored event's dirty-marking input for the single-event delete paths:
+/// the calendar it belongs to plus the span it leaves behind.
+struct DirtySpan {
+    calendar_id: String,
+    span: OwnedSpan,
+}
+
+/// One upsert chunk's dirty-marking inputs, captured **before** the events move
+/// into the upsert SQL.
+///
+/// The owner is resolved **once per chunk** and every stored span comes back in
+/// one `google_event_id IN (…)` SELECT, so a batch costs two reads and one
+/// dirty statement instead of three round trips per event. The batch shares one
+/// calendar (the fenced upsert already binds `chunk[0].calendar_id`), so one
+/// owner is correct; a missing/soft-deleted calendar means no mark at all.
+struct DirtyChunk {
+    user_id: Option<String>,
+    /// Stored spans ∪ incoming spans, in event order.
+    spans: Vec<OwnedSpan>,
+}
+
+/// Owned copy of [`EventSpan`].
+struct OwnedSpan {
+    start: String,
+    end: String,
+    start_tz: String,
+    end_tz: String,
+}
+
+impl OwnedSpan {
+    fn from_event(event: &NewCalendarEvent) -> Self {
+        Self {
+            start: event.start_time.clone(),
+            end: event.end_time.clone(),
+            start_tz: event.start_time_zone.clone(),
+            end_tz: event.end_time_zone.clone(),
+        }
+    }
+
+    fn from_row(row: &EventSpanRow) -> Self {
+        Self {
+            start: row.start_time.clone(),
+            end: row.end_time.clone(),
+            start_tz: row.start_time_zone.clone(),
+            end_tz: row.end_time_zone.clone(),
+        }
+    }
+
+    /// Same span, from the batch lookup's keyed row.
+    fn from_key_row(row: &EventSpanKeyRow) -> Self {
+        Self {
+            start: row.start_time.clone(),
+            end: row.end_time.clone(),
+            start_tz: row.start_time_zone.clone(),
+            end_tz: row.end_time_zone.clone(),
+        }
+    }
+
+    fn as_span(&self) -> EventSpan<'_> {
+        EventSpan {
+            start_rfc3339: &self.start,
+            end_rfc3339: &self.end,
+            start_time_zone: &self.start_tz,
+            end_time_zone: &self.end_tz,
+        }
+    }
 }
 
 impl D1CalendarEventRepo {
@@ -488,6 +559,11 @@ impl CalendarRepo for D1CalendarRepo {
     }
 
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        // The owner is read **before** the soft delete: the calendar is
+        // invisible to `DIGEST_CALENDAR_OWNER_SQL` afterwards.
+        let owner = crate::db::calendar_owner(&self.db, id)
+            .await
+            .unwrap_or(None);
         let stmt = self
             .db
             .prepare(CALENDAR_DELETE_SQL)
@@ -497,7 +573,23 @@ impl CalendarRepo for D1CalendarRepo {
                 D1Type::Text(id),
             ])
             .map_err(backend)?;
-        run_stmt(stmt).await
+        let changes = run_stmt_changes(stmt).await?;
+        // Best-effort: a lost dirty mark only delays a rebuild, while a failed
+        // delete loses the calendar. Only a delete that actually happened marks
+        // — a re-delete of an already-deleted calendar is a no-op.
+        if changes > 0 {
+            if let Some(user_id) = owner {
+                if let Err(err) =
+                    crate::db::mark_dirty_for_calendar_delete(&self.db, &user_id, id, now_rfc3339)
+                        .await
+                {
+                    console_log!(
+                        "calendar: digest dirty mark failed for deleted calendar {id}: {err}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn get_calendar_list_sync_token(
@@ -582,8 +674,24 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             Some(existing) => existing,
             None => uuid::Uuid::new_v4().to_string(),
         };
+        let calendar_id = event.calendar_id.clone();
+        let old_span = crate::db::stored_event_span(
+            &self.db,
+            &event.calendar_id,
+            &event.google_event_id,
+        )
+        .await
+        .unwrap_or(None);
+        let new_span = OwnedSpan::from_event(&event);
         let (sql, args) = build_event_upsert_sql(&[event], now_rfc3339, vec![id.clone()]);
         self.run_upsert(&sql, &args).await?;
+        self.mark_dirty(
+            &calendar_id,
+            old_span.as_ref(),
+            Some(new_span.as_span()),
+            now_rfc3339,
+        )
+        .await;
         Ok(id)
     }
 
@@ -592,16 +700,20 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        // Chunk to stay under D1's 100 bound-parameter limit (4 rows of 23
-        // columns per statement); each chunk is one D1 subrequest. Mint
-        // candidate UUIDs; ON CONFLICT(calendar_id, google_event_id) preserves
-        // existing id and sets deleted_at = NULL (no per-event SELECT).
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+        // Chunk to stay under D1's 100 bound-parameter limit (3 rows of 26
+        // columns + the statement-level category flag per statement); each
+        // chunk is one D1 subrequest. Chunks never mix `preserve_category`
+        // (the flag binds once per statement). Mint candidate UUIDs; ON
+        // CONFLICT(calendar_id, google_event_id) preserves existing id and
+        // sets deleted_at = NULL (no per-event SELECT).
+        for chunk in chunk_events_for_upsert(&events) {
+            let pending = self.gather_dirty(chunk).await;
             let ids: Vec<String> = (0..chunk.len())
                 .map(|_| uuid::Uuid::new_v4().to_string())
                 .collect();
             let (sql, args) = build_event_upsert_sql(chunk, now_rfc3339, ids);
             self.run_upsert(&sql, &args).await?;
+            self.apply_dirty(&pending, now_rfc3339).await;
         }
         Ok(())
     }
@@ -615,13 +727,14 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         if events.is_empty() {
             return Ok(true);
         }
-        // Same mint-UUID + chunking as upsert_batch; fence binds add only 3
-        // params per statement so chunk size stays 4 (92 + 3 = 95).
-        for chunk in events.chunks(EVENT_UPSERT_CHUNK_SIZE) {
+        // Same mint-UUID + chunking as upsert_batch; fence binds add 3 params
+        // per statement (plus the category flag) so chunk size stays 3.
+        for chunk in chunk_events_for_upsert(&events) {
             let calendar_id = chunk[0].calendar_id.as_str();
             let ids: Vec<String> = (0..chunk.len())
                 .map(|_| uuid::Uuid::new_v4().to_string())
                 .collect();
+            let pending = self.gather_dirty(chunk).await;
             let (sql, args) = build_event_upsert_if_owner_sql(
                 chunk,
                 now_rfc3339,
@@ -634,6 +747,7 @@ impl CalendarEventRepo for D1CalendarEventRepo {
                 // Lease missing/stolen/expired: INSERT SELECT wrote nothing.
                 return Ok(false);
             }
+            self.apply_dirty(&pending, now_rfc3339).await;
         }
         Ok(true)
     }
@@ -692,6 +806,7 @@ impl CalendarEventRepo for D1CalendarEventRepo {
     }
 
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        let stored = self.dirty_key_for_local_id(id).await;
         let stmt = self
             .db
             .prepare(EVENT_DELETE_SQL)
@@ -701,7 +816,12 @@ impl CalendarEventRepo for D1CalendarEventRepo {
                 D1Type::Text(id),
             ])
             .map_err(backend)?;
-        run_stmt(stmt).await
+        run_stmt(stmt).await?;
+        if let Some(pending) = stored {
+            self.mark_dirty(&pending.calendar_id, None, Some(pending.span.as_span()), now_rfc3339)
+                .await;
+        }
+        Ok(())
     }
 
     async fn reassign_calendar(
@@ -728,6 +848,9 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         google_event_id: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
+        let stored = crate::db::stored_event_span(&self.db, calendar_id, google_event_id)
+            .await
+            .unwrap_or(None);
         let stmt = self
             .db
             .prepare(EVENT_DELETE_BY_GOOGLE_EVENT_ID_SQL)
@@ -738,7 +861,13 @@ impl CalendarEventRepo for D1CalendarEventRepo {
                 D1Type::Text(google_event_id),
             ])
             .map_err(backend)?;
-        run_stmt(stmt).await
+        run_stmt(stmt).await?;
+        if let Some(stored) = stored {
+            let span = OwnedSpan::from_row(&stored);
+            self.mark_dirty(calendar_id, None, Some(span.as_span()), now_rfc3339)
+                .await;
+        }
+        Ok(())
     }
 
     async fn delete_by_google_event_id_if_owner(
@@ -751,6 +880,9 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         // Fenced UPDATE first so a lost owner cannot mutate even if the
         // subsequent lease probe races. changes==0 is ambiguous (no living
         // event vs lease lost) — probe lease ownership for the return value.
+        let stored = crate::db::stored_event_span(&self.db, calendar_id, google_event_id)
+            .await
+            .unwrap_or(None);
         let stmt = self
             .db
             .prepare(EVENT_DELETE_BY_GOOGLE_EVENT_ID_IF_OWNER_SQL)
@@ -775,6 +907,14 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             ])
             .map_err(backend)?;
         let held: Option<LeaseHeldRow> = probe.first(None).await.map_err(backend)?;
+        // Only a held lease actually tombstoned the row.
+        if held.is_some() {
+            if let Some(stored) = stored {
+                let span = OwnedSpan::from_row(&stored);
+                self.mark_dirty(calendar_id, None, Some(span.as_span()), now_rfc3339)
+                    .await;
+            }
+        }
         Ok(held.is_some())
     }
 
@@ -831,7 +971,22 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         lease_owner: &str,
         now_rfc3339: &str,
     ) -> Result<bool, RepoError> {
-        // Fenced UPDATE first; changes==0 is ambiguous (no ghosts vs lease
+        // Candidate spans first (same predicate as the UPDATE, lease gate
+        // included) — once the UPDATE tombstones the rows their spans are gone.
+        let candidate = self
+            .db
+            .prepare(EVENT_SWEEP_ABSENT_SPANS_IF_OWNER_SQL)
+            .bind_refs(&[
+                D1Type::Text(calendar_id),
+                D1Type::Text(calendar_id),
+                D1Type::Text(run_id),
+                D1Type::Text(lease_owner),
+                D1Type::Text(now_rfc3339),
+            ])
+            .map_err(backend)?;
+        let spans: Vec<EventSpanRow> = query_vec(candidate).await?;
+
+        // Fenced UPDATE next; changes==0 is ambiguous (no ghosts vs lease
         // lost) — probe lease ownership for the return value.
         let stmt = self
             .db
@@ -858,7 +1013,16 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             ])
             .map_err(backend)?;
         let held: Option<LeaseHeldRow> = probe.first(None).await.map_err(backend)?;
-        Ok(held.is_some())
+        let held = held.is_some();
+
+        // A lost lease leaves the candidate list empty (the SELECT carries the
+        // same lease gate), so nothing is marked for rows the UPDATE did not
+        // touch. Best-effort: `mark_dirty_for_stored_spans` swallows and logs.
+        if held {
+            self.mark_dirty_for_stored_spans(calendar_id, &spans, now_rfc3339)
+                .await;
+        }
+        Ok(held)
     }
 
     async fn upsert_quarantine(
@@ -923,6 +1087,140 @@ impl D1CalendarEventRepo {
         let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
         let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
         run_stmt_changes(stmt).await
+    }
+
+    /// Dirty-marking inputs for one chunk, captured **before** the events move
+    /// into the upsert SQL.
+    ///
+    /// Batching: one owner lookup and **one** span SELECT (`google_event_id IN
+    /// (…)`) per chunk, not one of each per event. The chunk shares a calendar,
+    /// so the owner is a single answer.
+    async fn gather_dirty(&self, events: &[NewCalendarEvent]) -> DirtyChunk {
+        let Some(first) = events.first() else {
+            return DirtyChunk {
+                user_id: None,
+                spans: Vec::new(),
+            };
+        };
+        let calendar_id = first.calendar_id.as_str();
+        let user_id = crate::db::calendar_owner(&self.db, calendar_id)
+            .await
+            .unwrap_or(None);
+        if user_id.is_none() {
+            // Missing/soft-deleted calendar: no mark at all.
+            return DirtyChunk {
+                user_id: None,
+                spans: Vec::new(),
+            };
+        }
+        let google_event_ids: Vec<String> = events
+            .iter()
+            .map(|event| event.google_event_id.clone())
+            .collect();
+        let stored = crate::db::stored_event_spans(&self.db, calendar_id, &google_event_ids)
+            .await
+            .unwrap_or_default();
+        let mut spans: Vec<OwnedSpan> = Vec::with_capacity(events.len() * 2);
+        for event in events {
+            if let Some(row) = stored
+                .iter()
+                .find(|row| row.google_event_id == event.google_event_id)
+            {
+                spans.push(OwnedSpan::from_key_row(row));
+            }
+            spans.push(OwnedSpan::from_event(event));
+        }
+        DirtyChunk { user_id, spans }
+    }
+
+    /// Best-effort dirty marking: a failure is logged, never returned. The
+    /// Google cache is the source of truth, and a lost mark only delays a
+    /// rebuild — while a failed event write loses real data.
+    ///
+    /// One statement for the whole chunk: the union of every event's stored and
+    /// incoming spans (`mark_dirty_dates` chunks it under D1's bind limit).
+    async fn apply_dirty(&self, pending: &DirtyChunk, now_rfc3339: &str) {
+        let Some(user_id) = pending.user_id.as_deref() else {
+            return;
+        };
+        let spans: Vec<EventSpan<'_>> = pending.spans.iter().map(OwnedSpan::as_span).collect();
+        if let Err(err) =
+            crate::db::mark_dirty_span_union(&self.db, user_id, &spans, now_rfc3339).await
+        {
+            console_log!("calendar: digest dirty mark failed for {user_id}: {err}");
+        }
+    }
+
+    /// Best-effort dirty marking for a list of **stored** spans of one calendar
+    /// (the absent sweep): one owner lookup and one dirty statement for the
+    /// union of their dates, not one round trip per row.
+    async fn mark_dirty_for_stored_spans(
+        &self,
+        calendar_id: &str,
+        rows: &[EventSpanRow],
+        now_rfc3339: &str,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let Some(user_id) = crate::db::calendar_owner(&self.db, calendar_id)
+            .await
+            .unwrap_or(None)
+        else {
+            return;
+        };
+        let spans: Vec<EventSpan<'_>> = rows.iter().map(EventSpanRow::as_span).collect();
+        if let Err(err) =
+            crate::db::mark_dirty_span_union(&self.db, &user_id, &spans, now_rfc3339).await
+        {
+            console_log!("calendar: digest dirty mark failed for calendar {calendar_id}: {err}");
+        }
+    }
+
+    /// Marks one event's days dirty (best-effort: log and swallow).
+    async fn mark_dirty(
+        &self,
+        calendar_id: &str,
+        old_span: Option<&EventSpanRow>,
+        new_span: Option<EventSpan<'_>>,
+        now_rfc3339: &str,
+    ) {
+        if let Err(err) = crate::db::mark_dirty_for_calendar_event(
+            &self.db,
+            calendar_id,
+            old_span,
+            new_span,
+            now_rfc3339,
+        )
+        .await
+        {
+            console_log!("calendar: digest dirty mark failed for calendar {calendar_id}: {err}");
+        }
+    }
+
+    /// The dirty-marking input for one stored event by local id (a delete has
+    /// no incoming span).
+    async fn dirty_key_for_local_id(&self, id: &str) -> Option<DirtySpan> {
+        #[derive(Deserialize)]
+        struct KeyRow {
+            calendar_id: String,
+            google_event_id: String,
+        }
+        let stmt = self
+            .db
+            .prepare("SELECT calendar_id, google_event_id FROM calendar_events WHERE id = ?")
+            .bind_refs(&[D1Type::Text(id)])
+            .map_err(backend)
+            .ok()?;
+        let key: Option<KeyRow> = stmt.first::<KeyRow>(None).await.ok()?;
+        let key = key?;
+        let stored = crate::db::stored_event_span(&self.db, &key.calendar_id, &key.google_event_id)
+            .await
+            .unwrap_or(None)?;
+        Some(DirtySpan {
+            calendar_id: key.calendar_id,
+            span: OwnedSpan::from_row(&stored),
+        })
     }
 
     /// Id for `(calendar_id, google_event_id)`, including soft-deleted rows.

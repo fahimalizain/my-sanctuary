@@ -261,6 +261,9 @@ pub async fn list_events(
                 now_unix,
                 watch_callback_url,
                 snapshot,
+                // The taxonomy loaded above (for paint) also stamps the window
+                // write-through; a failed load degrades to no stamp.
+                taxonomy.as_ref().ok(),
             )
             .await
             {
@@ -502,6 +505,7 @@ pub async fn create_event(
         &user_id,
         &input,
         now_unix,
+        &category_repo,
     )
     .await
     {
@@ -576,6 +580,7 @@ pub async fn update_event(
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
+    let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
     match api_core::update_event_for_user(
         &crate::http::WorkerHttp,
         &calendars,
@@ -586,6 +591,7 @@ pub async fn update_event(
         &id,
         &fields,
         now_unix,
+        &category_repo,
     )
     .await
     {

@@ -1,4 +1,5 @@
 use super::support::*;
+use crate::calendar::apply::EventClassifyCtx;
 use crate::calendar::{
     list_events, list_events_after_refresh_failure, parse_event_time_range, sync_calendar,
 };
@@ -226,6 +227,7 @@ fn sync_skips_calendars_get_when_label_cache_is_filled() {
     for cal in &rows {
         pollster::block_on(sync_calendar(
             &http, &calendars, &events, &FakeOperationRepo::new(), &access(), cal, "2023-11-14T22:13:20Z",
+            &NO_TAXONOMY,
         ))
         .unwrap();
     }
@@ -269,6 +271,7 @@ fn sync_refreshes_stale_label_cache() {
         &access(),
         &cal,
         now,
+        &NO_TAXONOMY,
     ))
     .unwrap();
 
@@ -795,6 +798,7 @@ fn window_steal_before_first_upsert_writes_nothing() {
         "2026-08-01T00:00:00Z",
         "2026-09-01T00:00:00Z",
         "2023-11-14T22:13:20Z",
+        &EventClassifyCtx::none(),
     ));
     assert!(result.is_ok(), "{result:?}");
     assert!(
@@ -843,6 +847,7 @@ fn window_expire_before_tombstone_leaves_row_living() {
         "2026-08-01T00:00:00Z",
         "2026-09-01T00:00:00Z",
         "2023-11-14T22:13:20Z",
+        &EventClassifyCtx::none(),
     ));
     assert!(result.is_ok(), "{result:?}");
     assert!(result.unwrap().is_empty());
@@ -900,6 +905,7 @@ fn window_winner_after_expired_loser_can_write_through() {
         "2026-08-01T00:00:00Z",
         "2026-09-01T00:00:00Z",
         "2023-11-14T22:13:20Z",
+        &EventClassifyCtx::none(),
     ));
     assert!(lose.is_ok(), "{lose:?}");
     assert!(lose.unwrap().is_empty());
@@ -928,6 +934,7 @@ fn window_winner_after_expired_loser_can_write_through() {
         "2026-08-01T00:00:00Z",
         "2026-09-01T00:00:00Z",
         "2023-11-14T22:13:20Z",
+        &EventClassifyCtx::none(),
     ));
     assert!(win.is_ok(), "{win:?}");
     assert!(win.unwrap().is_empty(), "write-through returns empty vec");

@@ -1219,6 +1219,7 @@ pub async fn delete_task(
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
     operations: &dyn CalendarEventOperationRepo,
+    category_repo: &dyn TaskCategoryRepo,
     logs: &dyn TaskLogRepo,
     users: &dyn UserRepo,
     access: Option<&GoogleAccess>,
@@ -1244,8 +1245,18 @@ pub async fn delete_task(
         // focused deletes on a refreshable token); the pointer is cleared even
         // without Google so a soft delete never leaves a ghost pointer.
         if let (Some(http), Some(access)) = (http, access) {
-            stop_running_event(http, calendars, events, operations, logs, access, id, now_unix)
-                .await?;
+            stop_running_event(
+                http,
+                calendars,
+                events,
+                operations,
+                logs,
+                access,
+                id,
+                now_unix,
+                category_repo,
+            )
+            .await?;
         }
         users.set_focused_task_id(user_id, None, now_rfc3339).await?;
     }
@@ -1399,6 +1410,7 @@ pub async fn start_task(
             end_rfc3339,
         ),
         now_unix,
+        category_repo,
     )
     .await?;
     let event = output.event;
@@ -1632,6 +1644,7 @@ async fn stop_or_pause(
         access,
         task_id,
         now_unix,
+        category_repo,
     )
     .await?;
 
@@ -1797,6 +1810,7 @@ async fn complete_or_discard(
         access,
         task_id,
         now_unix,
+        category_repo,
     )
     .await?;
     if is_focused {
@@ -1916,6 +1930,7 @@ async fn latest_started_event(
 /// `list_running_by_user_id`, so a run whose event window already lapsed
 /// still closes. A missing log / empty ids / missing cached row / Google 404
 /// all land on the no-event path: the status flip still happens.
+#[allow(clippy::too_many_arguments)]
 async fn stop_running_event(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1925,6 +1940,7 @@ async fn stop_running_event(
     access: &GoogleAccess,
     task_id: &str,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> Result<(Option<CalendarEvent>, String, Option<String>, Option<String>), TasksError> {
     let snapped_rfc3339 = unix_secs_to_rfc3339(nearest_minute_unix(now_unix));
     let Some(found) = latest_started_event(logs, events, task_id).await? else {
@@ -1948,6 +1964,7 @@ async fn stop_running_event(
         &found.google_event_id,
         &end_rfc3339,
         now_unix,
+        category_repo,
     )
     .await
     {
@@ -2015,6 +2032,7 @@ pub struct ElongateReport {
 ///
 /// Status is deliberately never touched here: IN_PROGRESS rows are the only
 /// work list, and only the exit verbs own the status flip.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_elongate_cron(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -2025,6 +2043,7 @@ pub async fn run_elongate_cron(
     tokens: &dyn TokenRepo,
     oauth: &OAuthConfig,
     now_unix: i64,
+    category_repo: &dyn TaskCategoryRepo,
 ) -> ElongateReport {
     let mut report = ElongateReport::default();
     let running = match tasks.list_in_progress().await {
@@ -2098,6 +2117,7 @@ pub async fn run_elongate_cron(
             &event.google_event_id,
             &unix_secs_to_rfc3339(target_unix),
             now_unix,
+            category_repo,
         )
         .await
         {
@@ -2660,6 +2680,7 @@ fn category_color_hex(taxonomy: &Taxonomy, title: &str) -> Option<String> {
 /// exactly, never a `▶` prefix. The event description is the task's notes
 /// (trimmed), omitted from the insert payload when blank — the same mapping as
 /// `start_task` via [`task_segment_input`].
+#[allow(clippy::too_many_arguments)]
 async fn create_focus_segment(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -2668,6 +2689,7 @@ async fn create_focus_segment(
     logs: &dyn TaskLogRepo,
     access: &GoogleAccess,
     taxonomy: &Taxonomy,
+    category_repo: &dyn TaskCategoryRepo,
     user_id: &str,
     task: &Task,
     focused: bool,
@@ -2709,6 +2731,7 @@ async fn create_focus_segment(
             end_rfc3339,
         ),
         now_unix,
+        category_repo,
     )
     .await?;
     Ok(output.event)
@@ -2793,15 +2816,25 @@ pub async fn focus_task(
 
     // 1. Snap A's living event (end only — the closed chip keeps its flag).
     if let Some(a) = &previous {
-        stop_running_event(http, calendars, events, operations, logs, access, &a.id, now_unix)
-            .await?;
+        stop_running_event(
+            http,
+            calendars,
+            events,
+            operations,
+            logs,
+            access,
+            &a.id,
+            now_unix,
+            category_repo,
+        )
+        .await?;
     }
 
     // 2. Create B′ flagged (or the repaired flagged segment on the
     //    already-focused/no-chip path, which falls through here).
     let b_prime = create_focus_segment(
-        http, calendars, events, operations, logs, access, &taxonomy, user_id, &task, true,
-        now_unix,
+        http, calendars, events, operations, logs, access, &taxonomy, category_repo, user_id,
+        &task, true, now_unix,
     )
     .await?;
     created.push(b_prime.clone());
@@ -2816,8 +2849,8 @@ pub async fn focus_task(
     //    now names the still-running continuation).
     if let Some(a) = &previous {
         let a_prime = create_focus_segment(
-            http, calendars, events, operations, logs, access, &taxonomy, user_id, a, false,
-            now_unix,
+            http, calendars, events, operations, logs, access, &taxonomy, category_repo, user_id,
+            a, false, now_unix,
         )
         .await?;
         created.push(a_prime.clone());
@@ -2839,8 +2872,18 @@ pub async fn focus_task(
     //    flag). The newest event-bearing log still names B_old here — the
     //    `focused` log below is what moves the pointer forward.
     if !already_focused {
-        stop_running_event(http, calendars, events, operations, logs, access, task_id, now_unix)
-            .await?;
+        stop_running_event(
+            http,
+            calendars,
+            events,
+            operations,
+            logs,
+            access,
+            task_id,
+            now_unix,
+            category_repo,
+        )
+        .await?;
     }
 
     // 6. Log `focused` on B with the B′ ids — the newest event-bearing log on
@@ -2928,11 +2971,21 @@ pub async fn delete_focus(
 
     // Snap B (end only — the closed chip keeps its flag), open the unprefixed
     // continuation, clear the pointer, log `unfocused`.
-    stop_running_event(http, calendars, events, operations, logs, access, &task.id, now_unix)
-        .await?;
-    let b_prime = create_focus_segment(
-        http, calendars, events, operations, logs, access, &taxonomy, user_id, &task, false,
+    stop_running_event(
+        http,
+        calendars,
+        events,
+        operations,
+        logs,
+        access,
+        &task.id,
         now_unix,
+        category_repo,
+    )
+    .await?;
+    let b_prime = create_focus_segment(
+        http, calendars, events, operations, logs, access, &taxonomy, category_repo, user_id,
+        &task, false, now_unix,
     )
     .await?;
     users
@@ -4952,8 +5005,8 @@ mod tests {
         let logs = FakeTaskLogRepo::default();
         let users = FakeUserRepo::default();
         let response = pollster::block_on(delete_task(
-            None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &created.id,
-            "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+            None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users, None,
+            &tasks, "u-1", &created.id, "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert!(response.success);
@@ -4964,8 +5017,8 @@ mod tests {
         );
         assert!(matches!(
             pollster::block_on(delete_task(
-                None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &created.id,
-                "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+                None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users,
+                None, &tasks, "u-1", &created.id, "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
@@ -4985,15 +5038,15 @@ mod tests {
         let users = FakeUserRepo::default();
         assert!(matches!(
             pollster::block_on(delete_task(
-                None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-2", &created.id,
-                "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+                None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users,
+                None, &tasks, "u-2", &created.id, "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
         assert!(matches!(
             pollster::block_on(delete_task(
-                None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", "nope",
-                "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+                None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users,
+                None, &tasks, "u-1", "nope", "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
             )),
             Err(TasksError::NotFound)
         ));
@@ -5704,6 +5757,9 @@ mod tests {
                 end_time_zone: event.end_time_zone.clone(),
                 is_all_day: event.is_all_day,
                 raw_json: event.raw_json.clone(),
+                category_id: event.category_id.clone(),
+                is_self_organized: event.is_self_organized,
+                event_type: event.event_type.clone(),
                 created_at: now_rfc3339.to_string(),
                 updated_at: now_rfc3339.to_string(),
                 deleted_at: None,
@@ -6113,6 +6169,9 @@ mod tests {
             end_time_zone: String::new(),
             is_all_day: false,
             raw_json: String::new(),
+            category_id: None,
+            is_self_organized: true,
+            event_type: String::new(),
             created_at: "2026-08-18T00:00:00Z".to_string(),
             updated_at: "2026-08-18T00:00:00Z".to_string(),
             deleted_at: None,
@@ -8421,7 +8480,7 @@ mod tests {
             Some(&http),
             &calendars,
             &events,
-            &ops(), &logs,
+            &ops(), &FakeTaskCategoryRepo::new(), &logs,
             &users,
             Some(&access()),
             &tasks,
@@ -8489,6 +8548,7 @@ mod tests {
     ) -> ElongateReport {
         pollster::block_on(run_elongate_cron(
             http, calendars, events, &ops(), logs, tasks, tokens, &oauth_config(), now_unix,
+            &FakeTaskCategoryRepo::new(),
         ))
     }
 
@@ -10236,8 +10296,8 @@ mod tests {
         let logs = FakeTaskLogRepo::default();
         let users = FakeUserRepo::default();
         let response = pollster::block_on(delete_task(
-            None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &task.id,
-            "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
+            None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users, None,
+            &tasks, "u-1", &task.id, "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert!(response.success);
@@ -10253,8 +10313,8 @@ mod tests {
         let second = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
         pollster::block_on(agenda.delete_by_ref("u-1", AGENDA_KIND_TASK, &second.id)).unwrap();
         let response = pollster::block_on(delete_task(
-            None, &calendars, &events, &ops(), &logs, &users, None, &tasks, "u-1", &second.id,
-            "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
+            None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users, None,
+            &tasks, "u-1", &second.id, "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
         ))
         .unwrap();
         assert!(response.success);
