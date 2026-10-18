@@ -235,6 +235,32 @@ test('rangeFromSlots timed: same slot → SNAP_MINUTES duration', () => {
   assert.equal(r.end.getMinutes(), 1);
 });
 
+test('rangeFromSlots timed: equal slots on a 15-minute step fill 15 minutes', () => {
+  const mon = localDay(2024, 0, 1);
+  const r = rangeFromSlots(slot(mon, 9 * 60), slot(mon, 9 * 60), 'timed', 15);
+  const durMin = (r.end.getTime() - r.start.getTime()) / 60_000;
+  assert.equal(durMin, 15);
+  assert.equal(r.start.getHours(), 9);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getHours(), 9);
+  assert.equal(r.end.getMinutes(), 15);
+});
+
+test('rangeFromSlots timed: explicit step snaps both slots', () => {
+  const mon = localDay(2024, 0, 1);
+  // 10:07 → 10:00 and 11:08 → 11:15 on the 15-minute grid.
+  const r = rangeFromSlots(
+    slot(mon, 10 * 60 + 7),
+    slot(mon, 11 * 60 + 8),
+    'timed',
+    15,
+  );
+  assert.equal(r.start.getHours(), 10);
+  assert.equal(r.start.getMinutes(), 0);
+  assert.equal(r.end.getHours(), 11);
+  assert.equal(r.end.getMinutes(), 15);
+});
+
 // ── rangeFromSlots allday ───────────────────────────────────────────────
 
 test('rangeFromSlots allday: Mon–Wed → Mon 00:00 to Thu 00:00', () => {
@@ -427,6 +453,27 @@ test('resizedRange: fractional minutes snap nearest 1', () => {
   assert.equal(r.end.getMinutes(), 8);
 });
 
+test('resizedRange: active edge snaps to an explicit coarse step', () => {
+  const start = new Date(2024, 0, 1, 10, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // 12:07 on a 15-minute step → 12:00; the fixed start is not re-snapped.
+  const r = resizedRange(start, end, 'end', slot(day, 12 * 60 + 7), 15);
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getHours(), 12);
+  assert.equal(r.end.getMinutes(), 0);
+});
+
+test('resizedRange: coarse step still clamps at the fixed edge (0-min)', () => {
+  const start = new Date(2024, 0, 1, 10, 7, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // 10:03 snaps down to 10:00, before the 10:07 start → clamp, never invert.
+  const r = resizedRange(start, end, 'end', slot(day, 10 * 60 + 3), 15);
+  assert.equal(r.start.getTime(), start.getTime());
+  assert.equal(r.end.getTime(), start.getTime());
+});
+
 test('movedRange: snaps to the 1-minute grid', () => {
   const originalStart = new Date(2024, 0, 1, 9, 0, 0, 0);
   const originalEnd = new Date(2024, 0, 1, 10, 0, 0, 0);
@@ -464,6 +511,27 @@ test('rangeFromSlots timed: snaps to the 1-minute grid', () => {
   assert.equal(r.start.getMinutes(), 7);
   assert.equal(r.end.getHours(), 11);
   assert.equal(r.end.getMinutes(), 7);
+});
+
+test('movedRange: coarse slots keep the minute phase of an off-grid event', () => {
+  const originalStart = new Date(2024, 0, 1, 10, 7, 0, 0);
+  const originalEnd = new Date(2024, 0, 1, 11, 7, 0, 0);
+  const day = localDay(2024, 0, 1);
+  // Grabbed at 10:07 on a 15-minute grid: the slot rounds to 10:00, so the
+  // grab offset is −7. Advancing one cell (10:15) keeps the :07 phase.
+  const held = movedRange(originalStart, originalEnd, slot(day, 10 * 60), -7);
+  assert.equal(held.start.getHours(), 10);
+  assert.equal(held.start.getMinutes(), 7);
+  const moved = movedRange(
+    originalStart,
+    originalEnd,
+    slot(day, 10 * 60 + 15),
+    -7,
+  );
+  assert.equal(moved.start.getHours(), 10);
+  assert.equal(moved.start.getMinutes(), 22);
+  const durMin = (moved.end.getTime() - moved.start.getTime()) / 60_000;
+  assert.equal(durMin, 60);
 });
 
 // ── preview geometry ────────────────────────────────────────────────────
@@ -753,4 +821,17 @@ test('crossedTickBoundary: crossing a boundary ticks in either direction', () =>
 test('crossedTickBoundary: works before the epoch', () => {
   assert.equal(crossedTickBoundary(-60_000, 60_000, 15), true);
   assert.equal(crossedTickBoundary(-120_000, -60_000, 15), false);
+});
+
+test('crossedTickBoundary: ticks on the gesture step', () => {
+  const base = Date.UTC(2026, 0, 5, 10, 0);
+  // 5-minute step: a step-sized move ticks, a sub-step wobble does not.
+  assert.equal(crossedTickBoundary(base + 60_000, base + 4 * 60_000, 5), false);
+  assert.equal(
+    crossedTickBoundary(base + 4 * 60_000, base + 5 * 60_000, 5),
+    true,
+  );
+  // 1-minute step at max zoom: every minute is its own bucket.
+  assert.equal(crossedTickBoundary(base, base + 60_000, 1), true);
+  assert.equal(crossedTickBoundary(base, base + 60_000, 30), false);
 });

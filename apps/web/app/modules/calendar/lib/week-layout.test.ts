@@ -73,8 +73,12 @@ import {
   weekRangeIso,
   snapMinutes,
   PACK_WIDEN_BELOW_MIN,
-  RESIZE_SNAP_MINUTES,
+  SNAP_MIN_PX_FINE,
+  SNAP_MIN_PX_TOUCH,
   SNAP_MINUTES,
+  SNAP_STEP_COARSEST,
+  SNAP_STEP_LADDER,
+  snapStepMinutes,
   minutesFromY,
   dateOnDay,
   defaultWritableCalendar,
@@ -1344,10 +1348,10 @@ test('snapMinutes: nearest 1 minute, clamp 0..1440', () => {
   assert.equal(snapMinutes(15), 15);
 });
 
-test('snapMinutes: optional 1-minute step (resize)', () => {
+test('snapMinutes: optional explicit 1-minute step', () => {
   // nearest 1-minute
-  assert.equal(snapMinutes(10 * 60 + 7.4, RESIZE_SNAP_MINUTES), 607);
-  assert.equal(snapMinutes(10 * 60 + 7.6, RESIZE_SNAP_MINUTES), 608);
+  assert.equal(snapMinutes(10 * 60 + 7.4, 1), 607);
+  assert.equal(snapMinutes(10 * 60 + 7.6, 1), 608);
   assert.equal(snapMinutes(7, 1), 7);
   assert.equal(snapMinutes(8, 1), 8);
   // clamp
@@ -1361,6 +1365,69 @@ test('snapMinutes: explicit 15-minute step still quantizes', () => {
   assert.equal(snapMinutes(8, 15), 15);
   assert.equal(snapMinutes(22, 15), 15);
   assert.equal(snapMinutes(23, 15), 30);
+});
+
+// ── snapStepMinutes ─────────────────────────────────────────────────────
+
+test('snapStepMinutes: touch clears 10px, fine pointers clear ~4px', () => {
+  assert.equal(SNAP_MIN_PX_TOUCH, 10);
+  assert.equal(SNAP_MIN_PX_FINE, HOUR_H_MAX / 60);
+  assert.deepEqual(SNAP_STEP_LADDER, [1, 5, 10, 15, 30]);
+  assert.equal(SNAP_STEP_COARSEST, 30);
+});
+
+test('snapStepMinutes: default and max zoom for a touch', () => {
+  assert.equal(snapStepMinutes(HOUR_H_BASE, 'touch'), 15);
+  assert.equal(snapStepMinutes(HOUR_H_MAX, 'touch'), 5);
+});
+
+test('snapStepMinutes: mouse at the default hour is 5, not 15', () => {
+  // A 5-minute cell is exactly 4px at hourH 48, which already clears the bar.
+  assert.equal(snapStepMinutes(HOUR_H_BASE, 'mouse'), 5);
+  // 4px 5-minute cell vs the ~3.47px 1-minute cell at max zoom: only the
+  // latter two can both be admitted, which is why the bar is HOUR_H_MAX / 60.
+  assert.equal(snapStepMinutes(HOUR_H_MAX, 'mouse'), 1);
+});
+
+test('snapStepMinutes: pen behaves like mouse', () => {
+  assert.equal(snapStepMinutes(HOUR_H_BASE, 'pen'), 5);
+  assert.equal(snapStepMinutes(HOUR_H_MAX, 'pen'), 1);
+});
+
+test('snapStepMinutes: unknown pointer type is treated as fine', () => {
+  assert.equal(snapStepMinutes(HOUR_H_BASE, ''), 5);
+  assert.equal(snapStepMinutes(HOUR_H_BASE, 'unknown'), 5);
+  assert.equal(snapStepMinutes(HOUR_H_MAX, 'unknown'), 1);
+});
+
+test('snapStepMinutes: min zoom coarsens to the ladder end', () => {
+  assert.equal(snapStepMinutes(HOUR_H_MIN, 'touch'), 30);
+  assert.equal(snapStepMinutes(HOUR_H_MIN, 'mouse'), 15);
+});
+
+test('snapStepMinutes: intermediate zooms', () => {
+  assert.equal(snapStepMinutes(60, 'touch'), 10);
+  assert.equal(snapStepMinutes(120, 'touch'), 5);
+  assert.equal(snapStepMinutes(207, 'mouse'), 5);
+});
+
+test('snapStepMinutes: rung boundary is inclusive (>= bar)', () => {
+  // touch: a 10-minute cell is exactly 10px at hourH 60, 9.83px at 59.
+  assert.equal(snapStepMinutes(59, 'touch'), 15);
+  assert.equal(snapStepMinutes(60, 'touch'), 10);
+  // fine: a 1-minute cell is exactly HOUR_H_MAX / 60 px at 208, less at 207.
+  assert.equal(snapStepMinutes(207, 'mouse'), 5);
+  assert.equal(snapStepMinutes(208, 'mouse'), 1);
+});
+
+test('snapStepMinutes: unusable hourH → coarsest rung', () => {
+  assert.equal(snapStepMinutes(NaN, 'touch'), 30);
+  assert.equal(snapStepMinutes(NaN, 'mouse'), 30);
+  assert.equal(snapStepMinutes(Number.POSITIVE_INFINITY, 'mouse'), 30);
+  assert.equal(snapStepMinutes(0, 'mouse'), 30);
+  assert.equal(snapStepMinutes(-48, 'touch'), 30);
+  // Even 30 minutes paints under the touch bar at hourH 1.
+  assert.equal(snapStepMinutes(1, 'touch'), 30);
 });
 
 test('minutesFromY: 88px at hourH=88 → 60', () => {

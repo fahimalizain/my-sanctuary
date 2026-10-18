@@ -32,11 +32,9 @@ import {
 import { tick } from '../lib/haptics';
 import {
   dateOnDay,
-  HAPTIC_TICK_MINUTES,
   minutesFromY,
-  RESIZE_SNAP_MINUTES,
-  SNAP_MINUTES,
   snapMinutes,
+  snapStepMinutes,
   startOfDay,
   type StripLockReason,
 } from '../lib/week-layout';
@@ -91,6 +89,8 @@ export interface CalendarDragApi {
 
 interface Session {
   kind: DragKind;
+  /** Grid step (minutes) for this gesture, from pointerdown; hit-tests with it. */
+  snapStep: number;
   originSlot: DragSlot;
   currentSlot: DragSlot;
   originX: number;
@@ -124,7 +124,7 @@ function slotFromColumn(
   colEl: Element,
   day: Date,
   hourH: number,
-  step = SNAP_MINUTES,
+  step: number,
 ): DragSlot {
   const top = colEl.getBoundingClientRect().top;
   const y = clientY - top;
@@ -136,7 +136,7 @@ function hitTestTimed(
   clientX: number,
   clientY: number,
   hourH: number,
-  step = SNAP_MINUTES,
+  step: number,
 ): DragSlot | null {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return null;
@@ -175,10 +175,11 @@ function hitTestAny(
   clientX: number,
   clientY: number,
   hourH: number,
+  step: number,
 ): { slot: DragSlot; zone: DragZone } | null {
   const allDay = hitTestAllDay(clientX, clientY);
   if (allDay) return { slot: allDay, zone: 'allday' };
-  const timed = hitTestTimed(clientX, clientY, hourH);
+  const timed = hitTestTimed(clientX, clientY, hourH, step);
   if (timed) return { slot: timed, zone: 'timed' };
   return null;
 }
@@ -186,6 +187,7 @@ function hitTestAny(
 function computePreview(session: Session): TimedRange | null {
   const {
     kind,
+    snapStep,
     originZone,
     currentZone,
     originSlot,
@@ -198,7 +200,7 @@ function computePreview(session: Session): TimedRange | null {
   switch (kind) {
     case 'create':
       if (currentZone === 'allday') return toAllDayRange(currentSlot);
-      return rangeFromSlots(originSlot, currentSlot, 'timed');
+      return rangeFromSlots(originSlot, currentSlot, 'timed', snapStep);
     case 'allday-create':
       return rangeFromSlots(originSlot, currentSlot, 'allday');
     case 'move':
@@ -215,6 +217,10 @@ function computePreview(session: Session): TimedRange | null {
         return toAllDayRange(currentSlot);
       }
       if (originZone === 'allday') return toTimedRange(currentSlot);
+      // Deliberately not snapped to `snapStep`: the slot is already quantized
+      // to it and the grab offset carries the event's minute phase, so a
+      // coarse snap here would jump an off-grid 10:07 event onto the grid on
+      // the first move. Snapping the difference keeps the phase.
       return movedRange(
         originalStart,
         originalEnd,
@@ -223,20 +229,30 @@ function computePreview(session: Session): TimedRange | null {
       );
     case 'resize-start':
       if (!originalStart || !originalEnd) return null;
-      return resizedRange(originalStart, originalEnd, 'start', currentSlot);
+      return resizedRange(
+        originalStart,
+        originalEnd,
+        'start',
+        currentSlot,
+        snapStep,
+      );
     case 'resize-end':
       if (!originalStart || !originalEnd) return null;
-      return resizedRange(originalStart, originalEnd, 'end', currentSlot);
+      return resizedRange(
+        originalStart,
+        originalEnd,
+        'end',
+        currentSlot,
+        snapStep,
+      );
     default:
       return null;
   }
 }
 
 /**
- * The instant whose `HAPTIC_TICK_MINUTES` bucket drives haptic ticks: the
- * dragged edge for resizes (the clamped commit, not the raw slot), else the
- * current slot. The bucket is 15 minutes on purpose — the 1-minute snap is
- * too fine to buzz on.
+ * The instant whose `snapStep` bucket drives haptic ticks: the dragged edge
+ * for resizes (the clamped commit, not the raw slot), else the current slot.
  */
 function tickInstantMs(session: Session): number | null {
   if (session.kind === 'resize-start' || session.kind === 'resize-end') {
@@ -261,10 +277,10 @@ function nextSlotFromPoint(
     return slot ? { slot, zone: 'allday' } : null;
   }
   if (session.kind === 'resize-start' || session.kind === 'resize-end') {
-    const slot = hitTestTimed(clientX, clientY, hourH, RESIZE_SNAP_MINUTES);
+    const slot = hitTestTimed(clientX, clientY, hourH, session.snapStep);
     return slot ? { slot, zone: 'timed' } : null;
   }
-  return hitTestAny(clientX, clientY, hourH);
+  return hitTestAny(clientX, clientY, hourH, session.snapStep);
 }
 
 export function useCalendarDrag(
@@ -306,7 +322,7 @@ export function useCalendarDrag(
       if (
         prevMs !== null &&
         nextMs !== null &&
-        crossedTickBoundary(prevMs, nextMs, HAPTIC_TICK_MINUTES)
+        crossedTickBoundary(prevMs, nextMs, s.snapStep)
       ) {
         tick();
       }
@@ -585,10 +601,12 @@ export function useCalendarDrag(
       if (target?.closest('.event-chip')) return;
 
       const col = e.currentTarget;
-      const originSlot = slotFromColumn(e.clientY, col, day, hourH);
+      const snapStep = snapStepMinutes(hourH, e.pointerType);
+      const originSlot = slotFromColumn(e.clientY, col, day, hourH, snapStep);
       beginSession(
         {
           kind: 'create',
+          snapStep,
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -641,10 +659,8 @@ export function useCalendarDrag(
       );
       const kind: DragKind = gesture.kind;
 
-      const step =
-        kind === 'resize-start' || kind === 'resize-end'
-          ? RESIZE_SNAP_MINUTES
-          : SNAP_MINUTES;
+      // One step for the whole gesture, from the zoom and the pointer type.
+      const snapStep = snapStepMinutes(hourH, e.pointerType);
 
       const originalStart = new Date(event.start_time);
       const originalEnd = new Date(event.end_time);
@@ -654,12 +670,12 @@ export function useCalendarDrag(
       const dayAttr = col?.getAttribute('data-day-col');
       const day = parseDayAttr(dayAttr) ?? startOfDay(originalStart);
       const originSlot = col
-        ? slotFromColumn(e.clientY, col, day, hourH, step)
+        ? slotFromColumn(e.clientY, col, day, hourH, snapStep)
         : {
             day: startOfDay(originalStart),
             minutes: snapMinutes(
               originalStart.getHours() * 60 + originalStart.getMinutes(),
-              step,
+              snapStep,
             ),
           };
 
@@ -676,6 +692,7 @@ export function useCalendarDrag(
       beginSession(
         {
           kind,
+          snapStep,
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -710,6 +727,7 @@ export function useCalendarDrag(
       beginSession(
         {
           kind: 'allday-create',
+          snapStep: snapStepMinutes(hourH, e.pointerType),
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -724,7 +742,7 @@ export function useCalendarDrag(
         e,
       );
     },
-    [beginSession],
+    [hourH, beginSession],
   );
 
   const onAllDayChipPointerDown = useCallback(
@@ -745,6 +763,7 @@ export function useCalendarDrag(
       beginSession(
         {
           kind: 'move',
+          snapStep: snapStepMinutes(hourH, e.pointerType),
           originSlot,
           currentSlot: originSlot,
           originX: e.clientX,
@@ -763,7 +782,7 @@ export function useCalendarDrag(
         e,
       );
     },
-    [beginSession],
+    [hourH, beginSession],
   );
 
   const suppressNextClick = useCallback(() => {

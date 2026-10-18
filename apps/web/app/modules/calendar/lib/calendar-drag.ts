@@ -4,7 +4,6 @@
 import {
   DEFAULT_EVENT_DURATION_MIN,
   MINUTES_PER_DAY,
-  RESIZE_SNAP_MINUTES,
   SNAP_MINUTES,
   addDays,
   clampMinutesToDay,
@@ -36,8 +35,8 @@ export interface DragSlot {
   /** Local midnight of the civil day. */
   day: Date;
   /**
-   * Minutes since midnight in [0, 1440].
-   * Create/move snap to `SNAP_MINUTES`; resize snaps to `RESIZE_SNAP_MINUTES`.
+   * Minutes since midnight in [0, 1440], hit-tested on the gesture's zoom step
+   * (`snapStepMinutes`), so create, move, and resize share one grid.
    */
   minutes: number;
 }
@@ -314,14 +313,16 @@ function slotInstant(slot: DragSlot, step = SNAP_MINUTES): Date {
 
 /**
  * Drag-create / all-day-create: order the two slots and enforce min duration.
- * - timed: snapped instants; equal slots → SNAP_MINUTES duration (drag-create
- *   never yields a 0-min event; only resize / inspector edits do)
+ * - timed: snapped instants at `step`; equal slots → `step` minutes, so a drag
+ *   that never leaves its cell still fills one cell of the zoom grid
+ *   (drag-create never yields a 0-min event; only resize / inspector edits do)
  * - allday: earlier day 00:00 → later day + 1 day 00:00 (exclusive end)
  */
 export function rangeFromSlots(
   a: DragSlot,
   b: DragSlot,
   mode: 'timed' | 'allday',
+  step = SNAP_MINUTES,
 ): TimedRange {
   if (mode === 'allday') {
     const dayA = startOfDay(a.day);
@@ -334,13 +335,14 @@ export function rangeFromSlots(
     };
   }
 
-  const tA = slotInstant(a);
-  const tB = slotInstant(b);
+  const minMin = Number.isFinite(step) && step > 0 ? step : SNAP_MINUTES;
+  const tA = slotInstant(a, step);
+  const tB = slotInstant(b, step);
   let start = tA.getTime() <= tB.getTime() ? tA : tB;
   let end = tA.getTime() <= tB.getTime() ? tB : tA;
 
   if (end.getTime() <= start.getTime()) {
-    end = new Date(start.getTime() + SNAP_MINUTES * 60_000);
+    end = new Date(start.getTime() + minMin * 60_000);
   }
 
   return { start, end };
@@ -441,7 +443,7 @@ export function movedRange(
 /**
  * Resize one edge; keep the other fixed. Min duration is 0: dragging past
  * the fixed edge clamps onto it (start === end), never inverts.
- * The active edge snaps to RESIZE_SNAP_MINUTES (may cross days).
+ * The active edge snaps to `step` (default `SNAP_MINUTES`; may cross days).
  * The fixed edge is not re-snapped.
  */
 export function resizedRange(
@@ -449,8 +451,9 @@ export function resizedRange(
   originalEnd: Date,
   edge: 'start' | 'end',
   slot: DragSlot,
+  step = SNAP_MINUTES,
 ): TimedRange {
-  const slotTime = slotInstant(slot, RESIZE_SNAP_MINUTES);
+  const slotTime = slotInstant(slot, step);
 
   if (edge === 'start') {
     const end = originalEnd;

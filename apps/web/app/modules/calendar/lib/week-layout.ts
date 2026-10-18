@@ -25,10 +25,24 @@ export const CHIP_Z_SELECTED = 40;
 export const COL_HEADER_H = 28;
 export const TIME_GUTTER_W = 52; // Notion token is 26; we widen so "12PM" fits
 export const MINUTES_PER_DAY = 1440;
-/** Snap click-to-create, drag-create, and move times to this many minutes. */
+/**
+ * Finest grid step, in minutes, and the default step of `snapMinutes` and the
+ * range helpers. Grid create / move / resize use `snapStepMinutes` instead;
+ * this stays the off-grid cleanup step and the click-create fallback.
+ */
 export const SNAP_MINUTES = 1;
-/** Snap resize active-edge times to this many minutes. */
-export const RESIZE_SNAP_MINUTES = 1;
+/** Grid steps (minutes, fine → coarse) that create / move / resize may use. */
+export const SNAP_STEP_LADDER = [1, 5, 10, 15, 30] as const;
+/** Coarsest ladder rung; also the fallback when even it paints under the bar. */
+export const SNAP_STEP_COARSEST = SNAP_STEP_LADDER[SNAP_STEP_LADDER.length - 1];
+/** Touch steps must paint at least this tall, or a cell is hard to land on. */
+export const SNAP_MIN_PX_TOUCH = 10;
+/**
+ * Mouse / pen minimum, exactly one minute at `HOUR_H_MAX` (~3.47px) so max
+ * zoom unlocks the 1-minute step. A strict 4px bar could not do that: one
+ * minute at max zoom is only ~3.47px tall.
+ */
+export const SNAP_MIN_PX_FINE = HOUR_H_MAX / 60;
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
 /**
@@ -37,11 +51,6 @@ export const DEFAULT_EVENT_DURATION_MIN = 30;
  * pack exactly). It is not the drag grid.
  */
 export const PACK_WIDEN_BELOW_MIN = 15;
-/**
- * Touch-drag haptics fire when the relevant instant crosses this many minutes.
- * Coarser than the 1-minute snap so a drag does not buzz every minute.
- */
-export const HAPTIC_TICK_MINUTES = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -1262,6 +1271,24 @@ export function snapMinutes(min: number, step = SNAP_MINUTES): number {
   if (min >= MINUTES_PER_DAY) return MINUTES_PER_DAY;
   const grid = Number.isFinite(step) && step > 0 ? step : SNAP_MINUTES;
   return Math.round(min / grid) * grid;
+}
+
+/**
+ * Grid step (minutes) for a drag at `hourH`: the smallest ladder rung whose
+ * on-screen height (`step * hourH / 60`) clears the pointer's minimum, so the
+ * grid coarsens as the user zooms out. An unusable `hourH`, or a zoom where
+ * even 30 minutes paints under the bar, gives the coarsest rung.
+ *
+ * The mouse / pen bar is `SNAP_MIN_PX_FINE`, which resolves to 5 minutes at
+ * `HOUR_H_BASE` (that cell is exactly 4px) and 1 minute at `HOUR_H_MAX`.
+ */
+export function snapStepMinutes(hourH: number, pointerType: string): number {
+  if (!Number.isFinite(hourH) || hourH <= 0) return SNAP_STEP_COARSEST;
+  const minPx = pointerType === 'touch' ? SNAP_MIN_PX_TOUCH : SNAP_MIN_PX_FINE;
+  for (const step of SNAP_STEP_LADDER) {
+    if ((step * hourH) / 60 >= minPx) return step;
+  }
+  return SNAP_STEP_COARSEST;
 }
 
 /** Convert a Y offset (px) within the hours area to minutes since midnight. */
