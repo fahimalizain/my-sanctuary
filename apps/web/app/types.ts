@@ -678,3 +678,243 @@ export interface OccurrenceActionResponse {
   occurrence: OccurrenceRecord;
   event: CalendarEvent | null;
 }
+
+// ──────────────────────────────────────────
+// Consistency rules (reports slice 4) — shapes mirror
+// `packages/api-core/src/rules/{score,params,service}.rs`.
+// ──────────────────────────────────────────
+
+// `rules.kind` — the scoring family, immutable after create.
+export type RuleKind =
+  | 'category_total'
+  | 'category_days'
+  | 'category_daily_avg'
+  | 'sleep_duration'
+  | 'sleep_timing';
+
+// The derived phase (never stored). `finished` = a challenge whose `ends_on`
+// is behind the user's civil today; its last strip day is a real verdict.
+export type RulePhase = 'active' | 'paused' | 'finished' | 'archived';
+
+// One strip cell of the 14-day history.
+export type StripState =
+  | 'pass'
+  | 'fail'
+  | 'pending'
+  | 'paused'
+  | 'excluded'
+  | 'off';
+
+export type RuleComparator = 'gte' | 'lte';
+
+export type SleepMetric =
+  | 'bedtime_median'
+  | 'bedtime_stdev'
+  | 'wake_median'
+  | 'wake_stdev';
+
+// The literal `"all_productive"`, or an explicit id list with optional
+// one-level children.
+export type CategorySelector =
+  | 'all_productive'
+  | { ids: string[]; include_children: boolean };
+
+export interface CategoryTotalParams {
+  categories: CategorySelector;
+  window_days: number;
+  comparator: RuleComparator;
+  target_hours: number;
+}
+
+export interface CategoryDaysParams {
+  categories: CategorySelector;
+  window_days: number;
+  min_minutes: number;
+  min_days: number;
+}
+
+// The daily-average travel escape hatch — omitted entirely when unused (the
+// server denies unknown fields and `null` is not the same as absent).
+export interface ExcludeIf {
+  categories: CategorySelector;
+  percent_of_waking: number;
+}
+
+export interface CategoryDailyAvgParams {
+  categories: CategorySelector;
+  window_days: number;
+  /** `0 = Monday … 6 = Sunday`. */
+  weekdays: number[];
+  target_hours: number;
+  exclude_if?: ExcludeIf;
+}
+
+export interface SleepDurationParams {
+  window_days: number;
+  min_nights: number;
+  target_hours: number;
+}
+
+export interface SleepTimingParams {
+  window_days: number;
+  min_nights: number;
+  metric: SleepMetric;
+  comparator: RuleComparator;
+  target_minutes: number;
+}
+
+// The params object of one kind (the `kind` is on the rule, never inside the
+// params — the canonical JSON this client sends carries no tag).
+export type RuleParams =
+  | CategoryTotalParams
+  | CategoryDaysParams
+  | CategoryDailyAvgParams
+  | SleepDurationParams
+  | SleepTimingParams;
+
+export interface StripCell {
+  date: string;
+  state: StripState;
+}
+
+// `category_total` evidence: the rolling window sum ending on each strip day.
+export interface EvidencePoint {
+  date: string;
+  /** `null` when the endpoint itself is paused (the strip cell is `paused`). */
+  hours: number | null;
+}
+
+export interface EvidenceDay {
+  date: string;
+  hit: boolean;
+}
+
+export interface EvidenceWeekday {
+  date: string;
+  hours: number;
+  excluded: boolean;
+}
+
+export interface EvidenceNight {
+  wake_date: string;
+  bed_min_past_noon: number;
+  wake_min_past_midnight: number;
+  hours: number;
+  source: string;
+}
+
+// Internally tagged evidence, `type` = the rule kind.
+export type RuleEvidence =
+  | { type: 'category_total'; points: EvidencePoint[] }
+  | { type: 'category_days'; days: EvidenceDay[] }
+  | { type: 'category_daily_avg'; weekdays: EvidenceWeekday[] }
+  | { type: 'sleep_duration'; nights: EvidenceNight[] }
+  | { type: 'sleep_timing'; nights: EvidenceNight[] };
+
+// One rule's rendered score (`RuleScore` in Rust). `params` is the revision
+// active on the scoreboard's `as_of`; it is `unknown` on purpose — the edit
+// form validates the shape before hydrating (a legacy or hand-edited row must
+// never crash the page).
+export interface RuleScore {
+  id: string;
+  name: string;
+  icon: string;
+  kind: RuleKind;
+  phase: RulePhase;
+  starts_on: string;
+  ends_on: string | null;
+  paused_on: string | null;
+  sort_order: number;
+  condition: string;
+  on_track: boolean;
+  actual_label: string;
+  target_label: string;
+  owed: string;
+  streak: number;
+  best_streak: number;
+  compliance: number | null;
+  params: unknown;
+  strip: StripCell[];
+  evidence: RuleEvidence;
+}
+
+// The envelope returned by GET /api/rules/scoreboard.
+export interface ScoreboardResponse {
+  /** `YYYY-MM-DD` — the civil date every card is scored at. */
+  as_of: string;
+  time_zone: string;
+  /** Headline numerator: passing rules. */
+  on_track: number;
+  /** Headline denominator: `active` rules only (paused rules excluded). */
+  active_rules: number;
+  all_pass_streak: number;
+  best_all_pass_streak: number;
+  reclassifying: boolean;
+  backfilling: boolean;
+  dirty_days: number;
+  /** Phase `active` or `paused` only, by `sort_order` then name. */
+  rules: RuleScore[];
+}
+
+// The envelope returned by GET /api/rules/archive (finished and archived).
+export interface ArchiveRulesResponse {
+  rules: RuleScore[];
+}
+
+// One `pause_periods` row (`rule_id` null = every rule).
+export interface PauseRecord {
+  id: string;
+  rule_id: string | null;
+  from: string;
+  to: string;
+  reason: string;
+  created_at: string;
+}
+
+// The envelope returned by GET /api/pauses.
+export interface PausesResponse {
+  pauses: PauseRecord[];
+}
+
+// The envelope returned by POST /api/pauses.
+export interface PauseResponse {
+  pause: PauseRecord;
+}
+
+// The envelope returned by DELETE /api/pauses/:id.
+export interface DeletePauseResponse {
+  success: boolean;
+}
+
+// The envelope returned by POST /api/rules/reorder.
+export interface ReorderRulesResponse {
+  success: boolean;
+}
+
+// Request body for POST /api/rules. Omit `starts_on` to default to today.
+export interface NewRuleInput {
+  name: string;
+  icon?: string;
+  kind: RuleKind;
+  starts_on?: string;
+  ends_on?: string;
+  params: RuleParams;
+}
+
+// Request body for PATCH /api/rules/:id — every field optional. A present
+// `params` opens a new revision from today; `ends_on: null` (key present)
+// clears the challenge end.
+export interface UpdateRuleInput {
+  name?: string;
+  icon?: string;
+  starts_on?: string;
+  ends_on?: string | null;
+  params?: RuleParams;
+}
+
+// Request body for POST /api/pauses — a global (every rule) period.
+export interface NewPauseInput {
+  from: string;
+  to: string;
+  reason?: string;
+}

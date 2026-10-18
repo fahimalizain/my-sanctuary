@@ -179,6 +179,10 @@ pub struct RuleScore {
     pub streak: i64,
     pub best_streak: i64,
     pub compliance: Option<f64>,
+    /// The params of the revision active on `score_as_of`, as the canonical
+    /// JSON stored in `rule_revisions.params_json`. The client's edit form
+    /// hydrates from this — the scoreboard is its only source.
+    pub params: serde_json::Value,
     pub strip: Vec<StripCell>,
     pub evidence: Evidence,
 }
@@ -955,6 +959,10 @@ impl<'a> Evaluator<'a> {
             } else {
                 Some(passes as f64 / counted_completed as f64)
             },
+            // The canonical JSON round-trips through `serde_json::Value` so the
+            // client reads exactly what a `PATCH` would re-send.
+            params: serde_json::from_str(&revision.params.to_json())
+                .expect("rule params always serialize to JSON"),
             strip,
             evidence: self.evidence(revision, &outcome),
         };
@@ -2240,6 +2248,7 @@ mod tests {
                 "name",
                 "on_track",
                 "owed",
+                "params",
                 "paused_on",
                 "phase",
                 "sort_order",
@@ -2254,6 +2263,14 @@ mod tests {
         assert_eq!(rule["ends_on"], serde_json::Value::Null);
         assert_eq!(rule["actual_label"], "4.5h");
         assert_eq!(rule["condition"], "≥4h / 7d");
+        // The edit form hydrates from the revision active on `score_as_of`.
+        assert_eq!(rule["params"]["target_hours"], 4.0);
+        assert_eq!(rule["params"]["window_days"], 7);
+        assert_eq!(rule["params"]["comparator"], "gte");
+        assert_eq!(
+            rule["params"]["categories"],
+            serde_json::json!({"ids": ["learning"], "include_children": true})
+        );
         assert!(rule["compliance"].is_number());
         assert_eq!(
             rule["strip"][13],

@@ -15,6 +15,14 @@ export const queryKeys = {
   routines: {
     all: ['routines'] as const,
   },
+  rules: {
+    all: ['rules'] as const,
+    scoreboard: () => [...queryKeys.rules.all, 'scoreboard'] as const,
+    archive: () => [...queryKeys.rules.all, 'archive'] as const,
+    // `/api/pauses` lives under `rules` on purpose: every rule mutation
+    // invalidates the pause list, so one prefix invalidation reaches it.
+    pauses: () => [...queryKeys.rules.all, 'pauses'] as const,
+  },
   agenda: {
     all: ['agenda'] as const,
     // Home's two reads (ADR 0004 amendment, ADR 0007): the default window
