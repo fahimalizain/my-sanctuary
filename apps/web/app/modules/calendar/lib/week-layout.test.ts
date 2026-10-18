@@ -47,9 +47,6 @@ import {
   toDateInputValue,
   toTimeInputValue,
   gutterWithRemainder,
-  contrastingInk,
-  hexLuminance,
-  hexToRgba,
   hourGridBackground,
   hourHeight,
   isCompactChip,
@@ -72,7 +69,6 @@ import {
   visibleStartIndex,
   weekRangeIso,
   snapMinutes,
-  PACK_WIDEN_BELOW_MIN,
   SNAP_MINUTES,
   SNAP_STEP_BASE,
   SNAP_STEP_COARSE_LADDER,
@@ -1043,14 +1039,10 @@ test('packDayEvents: example 6 — touching endpoints → separate full-width cl
 });
 
 test('packDayEvents: two 0-min events at the same instant sit side by side', () => {
-  const packed = packDayEvents(
-    [
-      { id: 'a', startMin: 600, endMin: 600 },
-      { id: 'b', startMin: 600, endMin: 600 },
-    ],
-    22.5,
-    PACK_WIDEN_BELOW_MIN,
-  );
+  const packed = packDayEvents([
+    { id: 'a', startMin: 600, endMin: 600 },
+    { id: 'b', startMin: 600, endMin: 600 },
+  ]);
   assert.equal(packed.length, 2);
   for (const p of packed) {
     assert.ok(
@@ -1062,96 +1054,113 @@ test('packDayEvents: two 0-min events at the same instant sit side by side', () 
 });
 
 test('packDayEvents: 0-min at start of another event overlaps; at its end does not', () => {
-  const atStart = packDayEvents(
-    [
-      { id: 'a', startMin: 540, endMin: 600 },
-      { id: 'z', startMin: 540, endMin: 540 },
-    ],
-    22.5,
-  );
+  const atStart = packDayEvents([
+    { id: 'a', startMin: 540, endMin: 600 },
+    { id: 'z', startMin: 540, endMin: 540 },
+  ]);
   const byStart = Object.fromEntries(atStart.map((p) => [p.id, p]));
   assert.ok(byStart.a.widthPercent < 1 + 1e-9);
   assert.notEqual(byStart.a.leftPercent, byStart.z.leftPercent);
 
-  const atEnd = packDayEvents(
-    [
-      { id: 'a', startMin: 540, endMin: 600 },
-      { id: 'z', startMin: 600, endMin: 600 },
-    ],
-    22.5,
-  );
+  const atEnd = packDayEvents([
+    { id: 'a', startMin: 540, endMin: 600 },
+    { id: 'z', startMin: 600, endMin: 600 },
+  ]);
   for (const p of atEnd) {
     assert.equal(p.leftPercent, 0);
     assert.equal(p.widthPercent, 1);
   }
 });
 
-test('packDayEvents: min painted height makes nearby 0-min events collide', () => {
-  const items = [
-    { id: 'a', startMin: 600, endMin: 600 },
-    { id: 'b', startMin: 610, endMin: 610 },
+// Oct 2026: real short chips (5, 4, 3 and 2 min) whose painted CHIP_MIN_H
+// overhangs the event that starts right after them. Touching endpoints do not
+// overlap, so each pair is two full-width clusters. Modelling the
+// unrecorded ends as touching is the point: the old widen turned each of
+// these into a 75% / 50% column split by zoom.
+test('packDayEvents: real touching pairs pack full width off true durations', () => {
+  const pairs: {
+    label: string;
+    items: { id: string; startMin: number; endMin: number }[];
+  }[] = [
+    {
+      label: 'Oct 18 Tafseer Planning → Salat & Istighfar',
+      items: [
+        { id: 'tafseer', startMin: 16 * 60 + 37, endMin: 16 * 60 + 42 },
+        { id: 'salat', startMin: 16 * 60 + 42, endMin: 16 * 60 + 56 },
+      ],
+    },
+    {
+      label: 'Oct 17 Uppa → Agenda Backlog UX Upgrades',
+      items: [
+        { id: 'uppa', startMin: 18 * 60 + 11, endMin: 18 * 60 + 15 },
+        { id: 'agenda', startMin: 18 * 60 + 15, endMin: 18 * 60 + 45 },
+      ],
+    },
+    {
+      label: 'Oct 17 Update Calendar | Scheduling → Personal Finance',
+      items: [
+        {
+          id: 'update-calendar',
+          startMin: 19 * 60 + 37,
+          endMin: 19 * 60 + 40,
+        },
+        { id: 'finance', startMin: 19 * 60 + 40, endMin: 19 * 60 + 53 },
+      ],
+    },
+    {
+      label:
+        'Oct 16 Update Calendar | Scheduling → Calendar View / Fix Test Selection',
+      items: [
+        {
+          id: 'update-calendar',
+          startMin: 19 * 60 + 28,
+          endMin: 19 * 60 + 30,
+        },
+        { id: 'calendar-view', startMin: 19 * 60 + 30, endMin: 20 * 60 },
+      ],
+    },
   ];
-  // True durations: ε only → no overlap, both full width.
-  assert.equal(
-    packDayEvents(items).every((p) => p.widthPercent === 1),
-    true,
-  );
-  // Painted height 22.5 min covers b → they share the row.
-  const packed = packDayEvents(items, 22.5);
-  assert.equal(
-    packed.some((p) => p.widthPercent < 1 + 1e-9 && p.leftPercent > 0),
-    true,
-  );
-});
 
-test('packDayEvents: back-to-back 15-min events keep full width at hourH=48', () => {
-  const packed = packDayEvents(
-    [
-      { id: 'a', startMin: 600, endMin: 615 },
-      { id: 'b', startMin: 615, endMin: 630 },
-    ],
-    (CHIP_MIN_H / 48) * 60,
-    PACK_WIDEN_BELOW_MIN,
-  );
-  for (const p of packed) {
-    assert.equal(p.leftPercent, 0);
-    assert.equal(p.widthPercent, 1);
+  for (const { label, items } of pairs) {
+    const packed = packDayEvents(items);
+    assert.equal(packed.length, 2, label);
+    for (const p of packed) {
+      assertPackClose(
+        p,
+        { leftPercent: 0, widthPercent: 1, layerIndex: 1 },
+        `${label} — ${p.id}`,
+      );
+    }
   }
 });
 
-test('packDayEvents: widen threshold is 15 min, not the 1-min snap', () => {
-  assert.equal(PACK_WIDEN_BELOW_MIN, 15);
+// Notion's column order for identical start + duration varies by day because
+// its store order varies; the key is the incoming order, never title (which
+// would be maghrib, muhasaba, plan — a third order).
+test('packDayEvents: identical start + duration keep input order, not title', () => {
+  const items = (ids: string[]) =>
+    ids.map((id) => ({ id, startMin: 18 * 60 + 30, endMin: 18 * 60 + 45 }));
 
-  // 14 min → widened to the 22.5-min painted height, so it collides with a
-  // neighbour that starts inside that height.
-  const widened = packDayEvents(
-    [
-      { id: 'a', startMin: 600, endMin: 614 },
-      { id: 'b', startMin: 620, endMin: 640 },
-    ],
-    22.5,
-    PACK_WIDEN_BELOW_MIN,
+  const forwardItems = items(['maghrib', 'plan', 'muhasaba']);
+  const beforeSort = forwardItems.map((e) => ({ ...e }));
+  const forward = packDayEvents(forwardItems);
+  assert.deepEqual(beforeSort, forwardItems, 'the caller array is untouched');
+  assert.deepEqual(
+    forward.map((p) => p.id),
+    ['maghrib', 'plan', 'muhasaba'],
+    'emission is startMin order, stable for ties',
   );
-  // Overlap signal from example 2: the later chip peeks, so a widened 14-min
-  // event must leave at least one chip shifted right and narrower than full.
-  assert.ok(
-    widened.some((p) => p.leftPercent > 0 && p.widthPercent < 1),
-    'the 14-min event must widen and collide with its neighbour',
-  );
+  assert.ok(forward[0].leftPercent < forward[1].leftPercent);
+  assert.ok(forward[1].leftPercent < forward[2].leftPercent);
 
-  // 15 min → not widened; it packs exactly and the 620 neighbour clears it.
-  const exact = packDayEvents(
-    [
-      { id: 'a', startMin: 600, endMin: 615 },
-      { id: 'b', startMin: 620, endMin: 640 },
-    ],
-    22.5,
-    PACK_WIDEN_BELOW_MIN,
+  const reversed = packDayEvents(items(['muhasaba', 'maghrib', 'plan']));
+  assert.deepEqual(
+    reversed.map((p) => p.id),
+    ['muhasaba', 'maghrib', 'plan'],
+    'a different incoming order is a different column order',
   );
-  for (const p of exact) {
-    assert.equal(p.leftPercent, 0);
-    assert.equal(p.widthPercent, 1);
-  }
+  assert.ok(reversed[0].leftPercent < reversed[1].leftPercent);
+  assert.ok(reversed[1].leftPercent < reversed[2].leftPercent);
 });
 
 // ── nowLineY ────────────────────────────────────────────────────────────
@@ -1281,41 +1290,6 @@ test('allDaySectionHeight: high lane capped at ALLDAY_MAX (137.5)', () => {
   // lane 6 → 3 + 21*7 + 1 = 151 → clamp 137.5
   assert.equal(allDaySectionHeight(6), ALLDAY_MAX);
   assert.equal(allDaySectionHeight(20), ALLDAY_MAX);
-});
-
-// ── hexToRgba ───────────────────────────────────────────────────────────
-
-test('hexToRgba: #2a5c8a @ 0.22', () => {
-  assert.equal(hexToRgba('#2a5c8a', 0.22), 'rgba(42, 92, 138, 0.22)');
-});
-
-test('hexToRgba: short #rgb expands', () => {
-  assert.equal(hexToRgba('#f00', 0.5), 'rgba(255, 0, 0, 0.5)');
-});
-
-// ── hexLuminance / contrastingInk ───────────────────────────────────────
-
-test('hexLuminance: black ≈ 0, white ≈ 1', () => {
-  assert.ok(Math.abs(hexLuminance('#000000')) < 1e-9);
-  assert.ok(Math.abs(hexLuminance('#ffffff') - 1) < 1e-9);
-});
-
-test('hexLuminance: dark work-blue < 0.55', () => {
-  assert.ok(hexLuminance('#2a5c8a') < 0.55);
-});
-
-test('contrastingInk: dark fill → light ink', () => {
-  assert.equal(contrastingInk('#2a5c8a'), '#fafafa');
-});
-
-test('contrastingInk: light banana → dark ink', () => {
-  assert.equal(contrastingInk('#f6bf26'), '#1a1a1a');
-});
-
-test('contrastingInk: invalid hex still returns a string', () => {
-  const ink = contrastingInk('not-a-hex');
-  assert.equal(typeof ink, 'string');
-  assert.ok(ink.length > 0);
 });
 
 // ── isCompactChip ───────────────────────────────────────────────────────

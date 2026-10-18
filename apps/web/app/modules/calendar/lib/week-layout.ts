@@ -51,12 +51,6 @@ export const SNAP_STEP_COARSEST =
   SNAP_STEP_COARSE_LADDER[SNAP_STEP_COARSE_LADDER.length - 1];
 /** Default duration for a click-created event. */
 export const DEFAULT_EVENT_DURATION_MIN = 30;
-/**
- * Packing widens only events shorter than this many minutes up to the painted
- * chip height. This is the layout contract from 58d443a (15 min and longer
- * pack exactly). It is not the drag grid.
- */
-export const PACK_WIDEN_BELOW_MIN = 15;
 
 // Deterministic palette for event chips. Keyed off a hash of calendar_id
 // (fallback event id) so the same calendar always paints the same color.
@@ -939,65 +933,6 @@ function hashString(s: string): number {
 export function colorForCalendar(calendarId: string): string {
   const hash = hashString(calendarId || 'default');
   return EVENT_COLORS[Math.abs(hash) % EVENT_COLORS.length];
-}
-
-/**
- * Convert `#rgb` / `#rrggbb` to `rgba(r, g, b, alpha)`.
- * Shared by timed chips, all-day chips, and any muted calendar fill.
- */
-export function hexToRgba(hex: string, alpha: number): string {
-  const h = hex.replace('#', '');
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  const n = parseInt(full, 16);
-  const r = (n >> 16) & 255;
-  const g = (n >> 8) & 255;
-  const b = n & 255;
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-/** Parse `#rgb` / `#rrggbb` into 0..255 channels. Invalid → null. */
-function parseHexRgb(hex: string): { r: number; g: number; b: number } | null {
-  const h = hex.replace('#', '');
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  if (!/^[0-9a-fA-F]{6}$/.test(full)) return null;
-  const n = parseInt(full, 16);
-  return {
-    r: (n >> 16) & 255,
-    g: (n >> 8) & 255,
-    b: n & 255,
-  };
-}
-
-/** sRGB channel 0..1 → linear contribution for relative luminance. */
-function srgbToLinear(c: number): number {
-  return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-}
-
-/** Relative luminance 0..1 (sRGB). Invalid hex → 0. */
-export function hexLuminance(hex: string): number {
-  const rgb = parseHexRgb(hex);
-  if (!rgb) return 0;
-  const R = srgbToLinear(rgb.r / 255);
-  const G = srgbToLinear(rgb.g / 255);
-  const B = srgbToLinear(rgb.b / 255);
-  return 0.2126 * R + 0.7152 * G + 0.0722 * B;
-}
-
-/** Ink that contrasts with a solid fill: '#fafafa' if luminance < 0.55, else '#1a1a1a'. */
-export function contrastingInk(hex: string): string {
-  return hexLuminance(hex) < 0.55 ? '#fafafa' : '#1a1a1a';
 }
 
 // Notion chip chrome tokens used by isCompactChip.

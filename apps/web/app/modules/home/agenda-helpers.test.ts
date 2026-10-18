@@ -23,9 +23,11 @@ import {
   agendaDateLabel,
   agendaMoveTarget,
   agendaMoveTargetAt,
+  agendaShortDateLabel,
   appendRankOnStream,
   applyAgendaMove,
   applyOpenTaskReorder,
+  canMoveToBacklog,
   canReschedule,
   crossDaySortOrder,
   dedupeAgendaItems,
@@ -42,6 +44,8 @@ import {
   previousHistoryWindow,
   replaceCachedTask,
   rescheduleMaxDate,
+  reschedulePickerMonth,
+  reschedulePresets,
   splitBacklogSection,
   streamBounds,
   streamItemsOf,
@@ -241,6 +245,111 @@ test('agendaDateLabel: malformed input returns it unchanged', () => {
   assert.equal(agendaDateLabel('', '2026-08-23'), '');
   assert.equal(agendaDateLabel('not-a-date', '2026-08-23'), 'not-a-date');
   assert.equal(agendaDateLabel('2026-13-40', '2026-08-23'), '2026-13-40');
+});
+
+test('agendaShortDateLabel: always absolute, with the year across years', () => {
+  assert.equal(agendaShortDateLabel('2026-08-23', '2026-08-23'), 'Sun 23 Aug');
+  assert.equal(agendaShortDateLabel('2026-08-24', '2026-08-23'), 'Mon 24 Aug');
+  assert.equal(
+    agendaShortDateLabel('2027-01-01', '2026-08-23'),
+    'Fri 1 Jan 2027',
+  );
+  assert.equal(agendaShortDateLabel('2026-13-40', '2026-08-23'), '2026-13-40');
+});
+
+// ── reschedulePresets ─────────────────────────────────────────────────────
+
+test('reschedulePresets: Tomorrow anchors to the SERVER today, not the row', () => {
+  // The old popover used item.local_date + 1: a row three days out moved one
+  // day LATER when “Tomorrow” was picked. Every preset now shifts from today.
+  const row = { ...taskItem('a', 'PLANNED'), local_date: '2026-08-26' };
+  const presets = reschedulePresets(row, TODAY);
+  assert.equal(presets.find((p) => p.id === 'today')?.date, '2026-08-23');
+  assert.equal(presets.find((p) => p.id === 'tomorrow')?.date, '2026-08-24');
+  assert.equal(presets.find((p) => p.id === 'in-a-week')?.date, '2026-08-30');
+});
+
+test('reschedulePresets: hides the current date and every duplicate target', () => {
+  // On a Monday, "Next Monday" and "In a week" are the same date; the first
+  // wins. "Tomorrow" is also next Monday from a Sunday — again, one option.
+  const monday = '2026-08-24';
+  const mondayRow = { ...taskItem('a', 'PLANNED'), local_date: monday };
+  const mondayPresets = reschedulePresets(mondayRow, monday);
+  assert.deepEqual(
+    mondayPresets.map((p) => [p.id, p.date]),
+    [
+      ['tomorrow', '2026-08-25'],
+      ['next-monday', '2026-08-31'],
+    ],
+  );
+
+  const sunday = '2026-08-23';
+  const sundayRow = { ...taskItem('b', 'PLANNED'), local_date: sunday };
+  const sundayPresets = reschedulePresets(sundayRow, sunday);
+  assert.deepEqual(
+    sundayPresets.map((p) => [p.id, p.date]),
+    [
+      ['tomorrow', '2026-08-24'],
+      ['in-a-week', '2026-08-30'],
+    ],
+  );
+});
+
+test('reschedulePresets: Next Monday is the coming Monday, strictly after today', () => {
+  // Wednesday 26 Aug 2026 → the next Monday is 31 Aug (not today, not +7).
+  const wednesday = '2026-08-26';
+  const row = { ...taskItem('a', 'PLANNED'), local_date: '2026-08-28' };
+  const presets = reschedulePresets(row, wednesday);
+  assert.deepEqual(
+    presets.map((p) => [p.id, p.date]),
+    [
+      ['today', '2026-08-26'],
+      ['tomorrow', '2026-08-27'],
+      ['next-monday', '2026-08-31'],
+      ['in-a-week', '2026-09-02'],
+    ],
+  );
+});
+
+test('reschedulePresets: a past row gets distinct Today and Tomorrow targets', () => {
+  // Yesterday + 1 is today; the old control offered two buttons that both
+  // moved to today. Tomorrow must mean today + 1.
+  const row = { ...taskItem('a', 'PLANNED'), local_date: '2026-08-22' };
+  const presets = reschedulePresets(row, TODAY);
+  assert.equal(presets.find((p) => p.id === 'today')?.date, '2026-08-23');
+  assert.equal(presets.find((p) => p.id === 'tomorrow')?.date, '2026-08-24');
+});
+
+test('reschedulePresets: invalid today yields no options', () => {
+  assert.deepEqual(reschedulePresets(taskItem('a', 'PLANNED'), ''), []);
+  assert.deepEqual(
+    reschedulePresets(taskItem('a', 'PLANNED'), 'not-a-date'),
+    [],
+  );
+});
+
+// ── reschedulePickerMonth ────────────────────────────────────────────────
+
+test('reschedulePickerMonth: in-range rows open on their own month', () => {
+  assert.equal(reschedulePickerMonth(TODAY, TODAY), '2026-08');
+  assert.equal(reschedulePickerMonth('2026-09-14', TODAY), '2026-09');
+  assert.equal(reschedulePickerMonth('2036-08-22', TODAY), '2036-08');
+});
+
+test('reschedulePickerMonth: history and backlog rows open on today', () => {
+  assert.equal(reschedulePickerMonth('2026-07-01', TODAY), '2026-08');
+  // The backlog date is today+50y — far past the picker's exclusive 10y line.
+  assert.equal(
+    reschedulePickerMonth(addMonthsClamp(TODAY, 600), TODAY),
+    '2026-08',
+  );
+  // Exactly today+10y is already outside the accepted [today, today+10y).
+  assert.equal(reschedulePickerMonth('2036-08-23', TODAY), '2026-08');
+});
+
+test('reschedulePickerMonth: invalid today yields an empty month', () => {
+  assert.equal(reschedulePickerMonth(TODAY, ''), '');
+  assert.equal(reschedulePickerMonth(TODAY, 'not-a-date'), '');
 });
 
 // ── eachCivilDate ───────────────────────────────────────────────────────
@@ -1299,6 +1408,32 @@ test('canReschedule: a deleted routine\u2019s history never moves', () => {
 
 test('canReschedule: an embedless row (orphan) is never reschedulable', () => {
   assert.equal(canReschedule(item('orphan', 0)), false);
+});
+
+// ── canMoveToBacklog ─────────────────────────────────────────────────────
+
+test('canMoveToBacklog: living tasks only, occurrences never', () => {
+  assert.equal(canMoveToBacklog(taskItem('a', 'OPEN'), TODAY), true);
+  assert.equal(canMoveToBacklog(taskItem('b', 'PLANNED'), TODAY), true);
+  assert.equal(canMoveToBacklog(taskItem('c', 'IN_PROGRESS'), TODAY), false);
+  assert.equal(canMoveToBacklog(taskItem('d', 'COMPLETED'), TODAY), false);
+  assert.equal(canMoveToBacklog(taskItem('e', 'DISCARDED'), TODAY), false);
+  assert.equal(canMoveToBacklog(occurrenceItem('f', 'pending'), TODAY), false);
+  assert.equal(canMoveToBacklog(item('orphan', 0), TODAY), false);
+});
+
+test('canMoveToBacklog: a task already on the backlog date is not offered again', () => {
+  const backlogDate = addMonthsClamp(TODAY, 600);
+  const already = { ...taskItem('a', 'OPEN'), local_date: backlogDate };
+  assert.equal(canMoveToBacklog(already, TODAY), false);
+  // An OPEN row on a near date has not reached the backlog yet.
+  const near = { ...taskItem('b', 'OPEN'), local_date: '2026-08-25' };
+  assert.equal(canMoveToBacklog(near, TODAY), true);
+});
+
+test('canMoveToBacklog: invalid server today hides the destination', () => {
+  assert.equal(canMoveToBacklog(taskItem('a', 'PLANNED'), ''), false);
+  assert.equal(canMoveToBacklog(taskItem('a', 'PLANNED'), 'not-a-date'), false);
 });
 
 // ── isAgendaItemParked ──────────────────────────────────────────────────

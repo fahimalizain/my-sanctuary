@@ -63,6 +63,18 @@ DISCARDED`; an occurrence-kind item parks when its embed status is `done`.
 > agenda reopens via the existing `POST /api/tasks/:id/move`
 > `{ status: "PLANNED" }` (ADR 0002 — no Google write).
 
+> Amendment (2026-10-18): Home's agenda move menu replaces the Tomorrow +
+> native-date pair. It now offers Today, Tomorrow, Next Monday, In a week, a
+> month picker, and — for tasks — Backlog (ADR 0007's `{ backlog: true }`).
+> Every preset shifts from the SERVER's civil today, never from the row's own
+> date: "Tomorrow" is today+1, and options that would be a no-op (the row's
+> current date) or duplicate a previous target are hidden. The month picker is
+> bounded `[today, today+10y−1]` and opens on today's month when the row lies
+> outside that range (history or the backlog date). A successful move shows a
+> transient "Moved to …" notice with a Show action that scrolls to the row;
+> failures keep the existing revert + banner. The old row icon rule is
+> superseded; Skip remains its own control.
+
 > Amendment (2026-08-23): recurrence is **one `routines.rrule` TEXT blob** —
 > exactly two `\n`-separated lines, `DTSTART:YYYYMMDDTHHMMSS` (floating
 > local, no `Z`, no `TZID`) + `RRULE:<body>` (the body may keep a Z-form

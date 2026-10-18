@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import type { CalendarEvent } from '@/app/types';
 import { CHIP_MIN_H } from '../lib/week-layout';
+import { notionEventTheme } from '../lib/event-colors';
 import type { PositionedEvent } from './EventChip';
 import { installDom } from './install-dom';
 
@@ -71,12 +72,16 @@ function makePositioned(
 }
 
 /** Render an unselected chip (no touch handles) and return its root. */
-function mount(positioned: PositionedEvent): HTMLElement {
+function mount(
+  positioned: PositionedEvent,
+  extra: { past?: boolean } = {},
+): HTMLElement {
   render(
     createElement(EventChip, {
       positioned,
       selected: false,
       onSelect: () => {},
+      ...extra,
     }),
   );
   return screen.getByRole('button');
@@ -135,4 +140,74 @@ test('compact chip: title + start time only; tooltip has the full detail', () =>
     chip.getAttribute('title'),
     'Standup · 5:15 AM – 5:30 AM · 15min',
   );
+});
+
+// ── washed Notion tones ─────────────────────────────────────────────────
+
+/** A red fixture no Google→Notion palette would produce for #d50000. */
+function redChip(color = '#d50000'): HTMLElement {
+  const positioned = makePositioned(
+    makeEvent('Red', new Date(2026, 8, 13, 5, 0), new Date(2026, 8, 13, 6, 0)),
+    5 * 60,
+    6 * 60,
+    48,
+  );
+  positioned.color = color;
+  return mount(positioned);
+}
+
+test('chip derives its dark fill from its own hex, not a palette remap', () => {
+  const chip = redChip('#d50000');
+  const { dark } = notionEventTheme('#d50000');
+
+  assert.equal(
+    chip.style.getPropertyValue('--ev-fill-dark'),
+    dark.backgroundSecondary,
+  );
+  assert.notEqual(
+    chip.style.getPropertyValue('--ev-fill-dark'),
+    'rgb(108, 41, 32)',
+    'the ED201D fixture theme must not be substituted',
+  );
+  assert.equal(
+    chip.style.getPropertyValue('--ev-accent-dark'),
+    dark.backgroundPrimary,
+  );
+});
+
+test('clipped body takes the washed fill; the raw hex is not a background', () => {
+  const chip = redChip('#d50000');
+  const body = chip.firstElementChild as HTMLElement;
+
+  assert.equal(body.style.backgroundColor, '', 'no inline raw fill');
+  assert.ok(
+    body.className.includes('bg-[var(--ev-fill)]'),
+    'body paints the washed light fill',
+  );
+  assert.ok(
+    body.className.includes('dark:bg-[var(--ev-fill-dark)]'),
+    'body paints the washed dark fill',
+  );
+});
+
+test('past sets data-past on the root', () => {
+  const positioned = makePositioned(
+    makeEvent('Past', new Date(2026, 8, 13, 5, 0), new Date(2026, 8, 13, 6, 0)),
+    5 * 60,
+    6 * 60,
+    48,
+  );
+  const past = mount(positioned, { past: true });
+  assert.ok(past.hasAttribute('data-past'));
+  assert.equal(past.getAttribute('data-past'), '');
+});
+
+test('omitting past leaves data-past off the root', () => {
+  const positioned = makePositioned(
+    makeEvent('Now', new Date(2026, 8, 13, 5, 0), new Date(2026, 8, 13, 6, 0)),
+    5 * 60,
+    6 * 60,
+    48,
+  );
+  assert.equal(mount(positioned).hasAttribute('data-past'), false);
 });

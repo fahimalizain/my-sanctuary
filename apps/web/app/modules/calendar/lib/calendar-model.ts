@@ -7,8 +7,6 @@ import type { AllDayChip } from '../components/AllDayRow';
 import { toTimedRange, type DragSlot, type TimedRange } from './calendar-drag';
 import type { PositionedEvent } from '../components/EventChip';
 import {
-  CHIP_MIN_H,
-  PACK_WIDEN_BELOW_MIN,
   WEEK_DAYS,
   addDays,
   allDaySectionHeight,
@@ -133,11 +131,13 @@ export function buildAllDayChips(
     startDay: number;
     endDay: number;
     event: CalendarEvent;
+    endMs: number;
   }[] = [];
 
   for (const event of allDayEvents) {
     let first: Date;
     let last: Date;
+    let endMs: number;
 
     if (event.is_all_day) {
       // Stored as UTC midnight of the civil date — use the ISO prefix, not
@@ -151,12 +151,15 @@ export function buildAllDayChips(
         endCivil.getTime() > startCivil.getTime()
           ? addDays(endCivil, -1)
           : startCivil;
+      // Past at local midnight after the last occupied day, not UTC midnight.
+      endMs = addDays(last, 1).getTime();
     } else {
       // Multi-day timed events in the all-day band: local Date conversion.
       const start = new Date(event.start_time);
       const end = new Date(event.end_time);
       first = startOfDay(start);
       last = lastOccupiedCivilDate(start, end);
+      endMs = end.getTime();
     }
 
     let startDay = Math.round((first.getTime() - origin.getTime()) / msPerDay);
@@ -168,7 +171,7 @@ export function buildAllDayChips(
     endDay = Math.max(0, Math.min(lastIdx, endDay));
     if (endDay < startDay) continue;
 
-    inputs.push({ id: event.id, startDay, endDay, event });
+    inputs.push({ id: event.id, startDay, endDay, event, endMs });
   }
 
   const packed = packAllDayLanes(
@@ -191,6 +194,7 @@ export function buildAllDayChips(
       endDay: i.endDay,
       lane,
       color: eventChipColor(i.event),
+      endMs: i.endMs,
     };
   });
 
@@ -237,10 +241,6 @@ export function buildEventsByDay(
         startMin: d.startMin,
         endMin: d.endMin,
       })),
-      (CHIP_MIN_H / hourH) * 60,
-      // Durations under PACK_WIDEN_BELOW_MIN widen to the painted min-chip
-      // height; 15 min and longer pack exactly at their true duration.
-      PACK_WIDEN_BELOW_MIN,
     );
     const packById = new Map(packed.map((p) => [p.id, p]));
 
@@ -259,6 +259,14 @@ export function buildEventsByDay(
         color: eventChipColor(d.event),
       };
     });
+
+    // Paint order only — never a pack tie-break (the pack input above keeps its
+    // incoming order). Equal `layerIndex` stacks by DOM order, so a
+    // later-starting chip must sit later in the array to cover the
+    // CHIP_MIN_H tail of an earlier, shorter chip. Ties keep their order.
+    positioned.sort((a, b) =>
+      a.startMin !== b.startMin ? a.startMin - b.startMin : 0,
+    );
 
     map.set(key, positioned);
   }

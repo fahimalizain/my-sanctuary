@@ -18,14 +18,11 @@ import {
   CHIP_MARGIN_RIGHT,
   CHIP_Z_BASE,
   CHIP_Z_SELECTED,
-  contrastingInk,
   formatEventTime,
   formatEventTimeDetail,
-  hexToRgba,
   isCompactChip,
 } from '../lib/week-layout';
-
-const PREVIEW_FILL_ALPHA = 0.18;
+import { notionEventCssVars } from '../lib/event-colors';
 
 // Primary input is a finger: fat handles replace the hover pills.
 const COARSE_HIDE = '[@media(hover:none)_and_(pointer:coarse)]:hidden';
@@ -36,13 +33,9 @@ const knobClassName =
 
 function TouchHandles({
   height,
-  color,
-  ink,
   onRequestDelete,
 }: {
   height: number;
-  color: string;
-  ink: string;
   /** Omitted for read-only events: no delete handle. */
   onRequestDelete?: () => void;
 }) {
@@ -60,7 +53,6 @@ function TouchHandles({
 
   const g = touchHandleGeometry(width, height);
   const knob = TOUCH_HANDLE_KNOB_PX;
-  const knobStyle = { backgroundColor: color, color: ink };
   const handle = (
     r: HandleRect,
     [cx, cy]: [number, number],
@@ -74,9 +66,12 @@ function TouchHandles({
       aria-hidden
     >
       <span
-        className={knobClassName}
+        className={cn(
+          knobClassName,
+          'bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]',
+          'text-[var(--ev-ink)] dark:text-[var(--ev-ink-dark)]',
+        )}
         style={{
-          ...knobStyle,
           width: knob,
           height: knob,
           left: cx - knob / 2 - r.x,
@@ -146,24 +141,6 @@ function TouchHandles({
   );
 }
 
-/** Mix hex with black ~20% so the left ribbon still reads on a solid body. */
-function darkerRibbon(hex: string): string {
-  const h = hex.replace('#', '');
-  const full =
-    h.length === 3
-      ? h
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : h;
-  const n = parseInt(full, 16);
-  if (Number.isNaN(n)) return hex;
-  const r = Math.round(((n >> 16) & 255) * 0.8);
-  const g = Math.round(((n >> 8) & 255) * 0.8);
-  const b = Math.round((n & 255) * 0.8);
-  return `rgb(${r}, ${g}, ${b})`;
-}
-
 export interface PositionedEvent {
   event: CalendarEvent;
   startMin: number;
@@ -190,6 +167,8 @@ interface EventChipProps {
   ) => void;
   /** Dim while a drag preview is active for this event. */
   dragging?: boolean;
+  /** End instant already passed: title + ribbon dim, fill does not. */
+  past?: boolean;
 }
 
 export const EventChip = memo(function EventChip({
@@ -199,6 +178,7 @@ export const EventChip = memo(function EventChip({
   onRequestDelete,
   onPointerDown,
   dragging = false,
+  past = false,
 }: EventChipProps) {
   const {
     event,
@@ -219,7 +199,6 @@ export const EventChip = memo(function EventChip({
   // tooltip for both layouts (a compact or truncated line hides it otherwise).
   const timeDetail = formatEventTimeDetail(start, end);
   const compact = isCompactChip(height);
-  const ink = contrastingInk(color);
 
   return (
     <div
@@ -228,23 +207,28 @@ export const EventChip = memo(function EventChip({
       className={cn(
         'event-chip group absolute rounded-[6px] pointer-events-auto',
         'cursor-grab active:cursor-grabbing',
+        'text-[var(--ev-title)] dark:text-[var(--ev-title-dark)]',
+        'data-[past]:text-[var(--ev-title-dim)] dark:data-[past]:text-[var(--ev-title-dim-dark)]',
+        // outline (not ring) so the selection ring stays a box-shadow.
+        '[outline-style:solid] outline-1 outline-cream',
         selected && 'ring-1 ring-foreground/25',
         dragging && 'opacity-40',
       )}
       style={{
+        ...notionEventCssVars(color),
         top,
         height,
         left: `${leftPixels}px`,
         marginLeft: `${leftPercent * 100}%`,
         width: `calc(${widthPercent * 100}% - ${leftPixels}px - ${CHIP_MARGIN_RIGHT}px)`,
         zIndex: selected ? CHIP_Z_SELECTED : CHIP_Z_BASE + layerIndex,
-        color: ink,
       }}
       title={`${event.title} · ${timeDetail}`}
       data-event-chip
       data-event-id={event.id}
       data-start-min={startMin}
       data-end-min={endMin}
+      data-past={past ? '' : undefined}
       onPointerDown={(e) => {
         onPointerDown?.(e, event, e.currentTarget);
       }}
@@ -263,10 +247,7 @@ export const EventChip = memo(function EventChip({
       }}
     >
       {/* Clipped body; the root stays unclipped so touch handles can overflow. */}
-      <div
-        className="absolute inset-0 overflow-hidden rounded-[6px]"
-        style={{ backgroundColor: color }}
-      >
+      <div className="absolute inset-0 overflow-hidden rounded-[6px] bg-[var(--ev-fill)] dark:bg-[var(--ev-fill-dark)]">
         {/* Resize handles — 6px hit targets at top/bottom edges */}
         <div
           data-resize="start"
@@ -301,10 +282,13 @@ export const EventChip = memo(function EventChip({
           />
         </div>
 
-        {/* 4px left ribbon — darker shade so it reads on solid fill */}
+        {/* 4px left ribbon — accent tone so it reads on the washed fill */}
         <div
-          className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-          style={{ backgroundColor: darkerRibbon(color) }}
+          className={cn(
+            'absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]',
+            'bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]',
+            'group-data-[past]:bg-[var(--ev-accent-dim)] dark:group-data-[past]:bg-[var(--ev-accent-dim-dark)]',
+          )}
           aria-hidden
         />
         <div
@@ -318,7 +302,13 @@ export const EventChip = memo(function EventChip({
               <span className="truncate text-[11px] font-medium leading-[13px]">
                 {event.title}
               </span>
-              <span className="shrink-0 text-[9px] leading-[11px] opacity-80">
+              <span
+                className={cn(
+                  'shrink-0 text-[9px] leading-[11px]',
+                  'text-[var(--ev-time)] dark:text-[var(--ev-time-dark)]',
+                  'group-data-[past]:text-[var(--ev-time-dim)] dark:group-data-[past]:text-[var(--ev-time-dim-dark)]',
+                )}
+              >
                 {timeLabel}
               </span>
             </>
@@ -327,7 +317,13 @@ export const EventChip = memo(function EventChip({
               <div className="truncate text-[11px] font-medium leading-[13px]">
                 {event.title}
               </div>
-              <div className="mt-0.5 truncate text-[9px] leading-[11px] opacity-80">
+              <div
+                className={cn(
+                  'mt-0.5 truncate text-[9px] leading-[11px]',
+                  'text-[var(--ev-time)] dark:text-[var(--ev-time-dark)]',
+                  'group-data-[past]:text-[var(--ev-time-dim)] dark:group-data-[past]:text-[var(--ev-time-dim-dark)]',
+                )}
+              >
                 {timeDetail}
               </div>
             </>
@@ -335,12 +331,7 @@ export const EventChip = memo(function EventChip({
         </div>
       </div>
       {selected && (
-        <TouchHandles
-          height={height}
-          color={color}
-          ink={ink}
-          onRequestDelete={onRequestDelete}
-        />
+        <TouchHandles height={height} onRequestDelete={onRequestDelete} />
       )}
     </div>
   );
@@ -367,29 +358,33 @@ export const PreviewChip = memo(function PreviewChip({
   const fits = height >= PREVIEW_LABEL_FIT_PX;
   return (
     <div
-      className="absolute overflow-hidden rounded-[6px] pointer-events-none z-[50] opacity-70"
+      className={cn(
+        'absolute overflow-hidden rounded-[6px] pointer-events-none z-[50] opacity-70',
+        'bg-[var(--ev-fill)] dark:bg-[var(--ev-fill-dark)]',
+        'text-[var(--ev-title)] dark:text-[var(--ev-title-dark)]',
+        '[outline-style:solid] outline-1 outline-cream',
+      )}
       style={{
+        ...notionEventCssVars(color),
         top,
         height,
         left: 0,
         right: CHIP_MARGIN_RIGHT,
-        color: 'var(--foreground)',
       }}
       aria-hidden
     >
-      <div
-        className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px]"
-        style={{ backgroundColor: color }}
-      />
-      <div
-        className="h-full min-w-0 pl-2 pr-1 py-px"
-        style={{ backgroundColor: hexToRgba(color, PREVIEW_FILL_ALPHA) }}
-      >
+      <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-[6px] bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]" />
+      <div className="h-full min-w-0 pl-2 pr-1 py-px">
         <div className="truncate text-[11px] font-medium leading-[13px]">
           {title}
         </div>
         {label && fits && (
-          <div className="truncate text-[10px] leading-[13px] tabular-nums opacity-80">
+          <div
+            className={cn(
+              'truncate text-[10px] leading-[13px] tabular-nums',
+              'text-[var(--ev-time)] dark:text-[var(--ev-time-dark)]',
+            )}
+          >
             {label}
           </div>
         )}

@@ -3,6 +3,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from 'react';
@@ -17,6 +18,7 @@ import {
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
 import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
+import { notionEventCssVars } from '../lib/event-colors';
 import { isTempEventId } from '../lib/event-overlays';
 import { DESKTOP_MQ, eventChipSelector } from '../lib/inspector-anchor';
 import {
@@ -605,8 +607,8 @@ function InspectorForm({
         {/* Calendar — swatch + select (writable) or static summary */}
         <div className="flex min-w-0 items-center gap-2">
           <span
-            className="h-2.5 w-2.5 shrink-0 rounded-full"
-            style={{ backgroundColor: swatch }}
+            className="h-2.5 w-2.5 shrink-0 rounded-full bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]"
+            style={{ ...notionEventCssVars(swatch) } as CSSProperties}
             aria-hidden
           />
           {writable ? (
