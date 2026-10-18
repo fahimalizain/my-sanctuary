@@ -30,3 +30,24 @@ export function pickVisibleColumn(
   }
   return picked;
 }
+
+/** Which edges of a scrollport have content clipped past them.
+ *  A 1px epsilon ignores subpixel overflow (a shadow must not appear
+ *  when the list merely fails to divide evenly). */
+export function scrollEdges(
+  scrollTop: number,
+  clientHeight: number,
+  scrollHeight: number,
+): { top: boolean; bottom: boolean } {
+  if (
+    !Number.isFinite(scrollTop) ||
+    !Number.isFinite(clientHeight) ||
+    !Number.isFinite(scrollHeight)
+  ) {
+    return { top: false, bottom: false };
+  }
+  return {
+    top: scrollTop > 1,
+    bottom: scrollTop + clientHeight < scrollHeight - 1,
+  };
+}
