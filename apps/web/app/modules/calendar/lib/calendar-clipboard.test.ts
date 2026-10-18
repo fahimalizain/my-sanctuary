@@ -191,6 +191,7 @@ test('clipboardItemFromEvent: a recurring source is flattened to one one-shot', 
   // …and the create body adds nothing beyond the allowed keys.
   assert.deepEqual(Object.keys(pasteCreateInput(item, 'cal-1')).sort(), [
     'calendar_id',
+    'calendar_id_explicit',
     'end',
     'start',
     'summary',
@@ -261,6 +262,7 @@ test('pasteCreateInput: an all-day item sends is_all_day and never a zone', () =
 
   assert.deepEqual(input, {
     calendar_id: 'dest',
+    calendar_id_explicit: true,
     summary: 'Offsite',
     start: '2026-10-05T00:00:00Z',
     end: '2026-10-06T00:00:00Z',
@@ -268,6 +270,7 @@ test('pasteCreateInput: an all-day item sends is_all_day and never a zone', () =
   });
   assert.deepEqual(Object.keys(input).sort(), [
     'calendar_id',
+    'calendar_id_explicit',
     'end',
     'is_all_day',
     'start',
@@ -283,6 +286,7 @@ test('pasteCreateInput: a timed item with a zone omits is_all_day', () => {
 
   assert.deepEqual(input, {
     calendar_id: 'dest',
+    calendar_id_explicit: true,
     summary: 'Standup',
     start: '2026-10-05T09:00:00.000Z',
     end: '2026-10-05T09:30:00.000Z',
@@ -291,6 +295,7 @@ test('pasteCreateInput: a timed item with a zone omits is_all_day', () => {
   assert.equal('is_all_day' in input, false);
   assert.deepEqual(Object.keys(input).sort(), [
     'calendar_id',
+    'calendar_id_explicit',
     'end',
     'start',
     'start_time_zone',

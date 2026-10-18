@@ -1278,6 +1278,7 @@ fn task_segment_input(
     let notes = task.description.trim();
     NewEventInput {
         calendar_id,
+        calendar_id_explicit: true,
         summary: task.title.clone(),
         description: if notes.is_empty() {
             None

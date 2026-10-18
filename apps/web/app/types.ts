@@ -117,6 +117,12 @@ export interface CalendarRepairResponse {
 export interface NewCalendarEventInput {
   /** Local `GoogleCalendar.id` (not the Google calendar id). */
   calendar_id: string;
+  /**
+   * When true, `calendar_id` is the user's explicit destination (inspector
+   * pick or paste target) and the server must not reroute it. Omitted for a
+   * fresh draft: the server uses the title's category calendar.
+   */
+  calendar_id_explicit?: boolean;
   summary: string;
   description?: string;
   /** RFC 3339 dateTime. */

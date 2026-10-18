@@ -70,8 +70,8 @@ pub use calendar_sync::{
 };
 pub use calendar_color::{
     calendar_fallback_color, color_for_event_title, paint_events, paint_events_default,
-    load_paint_taxonomy, paint_events_for_user, paint_events_with_taxonomy, CalendarEventView,
-    PaintTaxonomy,
+    load_paint_taxonomy, paint_events_for_user, paint_events_with_taxonomy,
+    resolve_event_create_target, CalendarEventView, EventCreateTarget, PaintTaxonomy,
 };
 pub use config::{
     Config, ConfigError, OAuthConfig, DEFAULT_FRONTEND_URL, MIN_SESSION_SECRET_LEN,

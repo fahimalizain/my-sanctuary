@@ -159,6 +159,10 @@ export function useCalendarSession({
   }, []);
   // Prevent a second title-blur from firing another POST for the same draft.
   const draftPersistStartedRef = useRef<Set<string>>(new Set());
+  // Whether the inspector's calendar picker was used for the current draft.
+  // An untouched draft lets the server route to the title's category
+  // calendar; an explicit pick must survive create.
+  const draftCalendarTouchedRef = useRef(false);
   // Cut sources whose delete has begun. Two quick pastes of one cut must
   // DELETE the row once; later pastes just report "nothing to consume".
   const cutRemovalsStartedRef = useRef<Set<string>>(new Set());
@@ -263,6 +267,7 @@ export function useCalendarSession({
       const tempId = newTempEventId();
       const startIso = range.start.toISOString();
       const endIso = range.end.toISOString();
+      draftCalendarTouchedRef.current = false;
 
       const optimistic: CalendarEvent = {
         id: tempId,
@@ -306,6 +311,9 @@ export function useCalendarSession({
     createEvent.mutate(
       {
         calendar_id: event.calendar_id,
+        ...(draftCalendarTouchedRef.current
+          ? { calendar_id_explicit: true }
+          : {}),
         summary: postedSummary,
         ...(postedDescription ? { description: postedDescription } : {}),
         start: startIso,
@@ -341,11 +349,26 @@ export function useCalendarSession({
           queue.clear(tempId);
           upsertCalendarEventInCache(result.event);
 
+          // A category-routed create may land on a calendar the sidebar has
+          // hidden. Reveal the destination so the new chip does not vanish.
+          setSelectedCalendarIds((prev) => {
+            if (prev.has(result.event.calendar_id)) return prev;
+            const next = new Set(prev);
+            next.add(result.event.calendar_id);
+            return next;
+          });
+
           // If the user renamed / moved / annotated the temp event before
           // POST returned, keep those fields under the server id and flush
           // field PATCH first, then calendar MOVE (cannot combine).
           if (after.op === 'upsert') {
             const local = after.event;
+            // The server may have rerouted an untouched draft to the title's
+            // category calendar. Trust that unless the user picked a
+            // calendar in the inspector; a pick must survive create.
+            const calendarId = draftCalendarTouchedRef.current
+              ? local.calendar_id
+              : result.event.calendar_id;
             const flush = buildDraftFlushPatch({
               posted: {
                 summary: postedSummary,
@@ -353,7 +376,7 @@ export function useCalendarSession({
                 start: startIso,
                 end: endIso,
               },
-              local,
+              local: { ...local, calendar_id: calendarId },
               serverCalendarId: result.event.calendar_id,
             });
 
@@ -367,8 +390,10 @@ export function useCalendarSession({
                 is_all_day: local.is_all_day,
                 start_time_zone: local.start_time_zone,
                 end_time_zone: local.end_time_zone,
-                calendar_id: local.calendar_id,
-                color: local.color ?? colorForCalendar(local.calendar_id),
+                calendar_id: calendarId,
+                color: draftCalendarTouchedRef.current
+                  ? (local.color ?? colorForCalendar(calendarId))
+                  : result.event.color,
               });
               // Same per-event chain as inspector edits: field PATCH first,
               // then calendar MOVE, ahead of any later edit.
@@ -505,6 +530,9 @@ export function useCalendarSession({
         selectedEventId === unpersistedDraftId ||
         isTempEventId(selectedEventId)
       ) {
+        // A draft's untouched calendar is the server's default (category
+        // routing); a pick here is the user's explicit destination.
+        draftCalendarTouchedRef.current = true;
         return;
       }
 
