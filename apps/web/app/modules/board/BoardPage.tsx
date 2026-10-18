@@ -20,6 +20,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet';
+import { cn } from '@/lib/utils';
 import { setBoardTasksBusy } from '@/app/background-sync/board-tasks-busy';
 import { TaskModal } from '@/app/components/TaskModal';
 import { useNavigate, useSearch } from '@tanstack/react-router';
@@ -1044,9 +1045,13 @@ export function BoardPage() {
                 column, so this scroller takes exactly the height the header
                 and filters leave over and pans horizontally only
                 (`overflow-y-hidden`) — the vertical scroll lives in each
-                column body. Columns are a fixed 260px, the row stays
-                centered and overflows sideways on narrow screens, and
-                `mb-24` sits the scrollbar just above the floating nav. */
+                column body. Columns are `85vw` below md and a fixed 260px
+                from md up; below md the row snap-scrolls so the next column
+                peeks in, with snapping OFF while a card is dragged so
+                dnd-kit's horizontal auto-scroll can carry it into an
+                off-screen column. The row stays centered and overflows
+                sideways on narrow screens, and `mb-24` sits the scrollbar
+                just above the floating nav. */
         <DndContext
           sensors={sensors}
           collisionDetection={boardCollisionDetection}
@@ -1060,8 +1065,16 @@ export function BoardPage() {
             setDragItems(null);
           }}
         >
-          <div className="mb-24 min-h-0 flex-1 overflow-x-auto overflow-y-hidden pb-2">
-            <div className="mx-auto flex h-full w-max gap-6 px-6">
+          <div
+            className={cn(
+              'mb-24 min-h-0 flex-1 overflow-x-auto overflow-y-hidden pb-2',
+              // mandatory snap fights dnd-kit: it writes scrollLeft every frame and
+              // the browser snaps back, so a card can never reach an off-screen column.
+              activeDrag === null &&
+                'max-md:snap-x max-md:snap-mandatory max-md:scroll-px-4',
+            )}
+          >
+            <div className="mx-auto flex h-full w-max gap-4 px-4 md:gap-6 md:px-6">
               {COLUMNS.map((column) => (
                 <BoardColumnView
                   key={column.status}

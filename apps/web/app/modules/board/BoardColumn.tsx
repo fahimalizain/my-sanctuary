@@ -20,7 +20,12 @@ import { SortableTaskCard } from './TaskCard';
  *  column body that `pointerWithin` measures. Being `flex-1` inside that
  *  bounded section, the list fills the remaining height even with one card,
  *  so the empty space below the cards (and whole empty columns) still
- *  accepts a drop. The cards inside remain a vertical SortableContext. */
+ *  accepts a drop. The cards inside remain a vertical SortableContext.
+ *  `85vw` below md (the scroller snap-scrolls those and the next column
+ *  peeks in) and a fixed 260px from md up, where `snap-start` is inert
+ *  because the scroller is not a snap container — and it is inert during a
+ *  drag at every width, since the scroller only turns snapping on while
+ *  `activeDrag === null`. */
 export function BoardColumnView({
   column,
   tasks,
@@ -60,7 +65,7 @@ export function BoardColumnView({
   return (
     <section
       className={cn(
-        'flex h-full min-h-0 w-[260px] shrink-0 flex-col overflow-hidden rounded-xl border bg-card transition-colors',
+        'flex h-full min-h-0 w-[85vw] shrink-0 snap-start flex-col overflow-hidden rounded-xl border bg-card transition-colors md:w-[260px]',
         overThisColumn
           ? 'border-primary/60 ring-2 ring-primary/20'
           : 'border-border',
