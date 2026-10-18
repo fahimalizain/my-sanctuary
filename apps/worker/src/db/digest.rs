@@ -15,19 +15,22 @@
 
 use api_core::digest::repo::{
     build_digest_category_insert_sql, build_digest_hour_insert_sql, build_digest_night_insert_sql,
-    build_mark_dirty_sql, DigestEventRow, DigestRepo, EventSpan, EventSpanRow, JobStatus,
-    ReclassifyRow, NightInsert, DIGEST_CATEGORY_INSERT_CHUNK_SIZE, DIGEST_CLEAR_DIRTY_SQL,
-    DIGEST_COUNT_DIRTY_SQL, DIGEST_DELETE_CATEGORY_SQL, DIGEST_DELETE_HOURS_SQL,
-    DIGEST_DELETE_NIGHTS_SQL, DIGEST_EARLIEST_EVENT_DATE_SQL, DIGEST_EVENT_SPAN_SQL,
-    DIGEST_HAS_META_SQL, DIGEST_HAS_STALE_META_SQL, DIGEST_HOUR_INSERT_CHUNK_SIZE,
-    DIGEST_JOB_STATUS_SQL, DIGEST_LATEST_ZONE_BEFORE_SQL, DIGEST_LIST_DIRTY_SQL,
-    DIGEST_LOAD_EVENTS_SQL, DIGEST_MARK_DIRTY_CHUNK_SIZE, DIGEST_NIGHT_INSERT_CHUNK_SIZE,
-    DIGEST_PRIMARY_TIME_ZONE_SQL, DIGEST_RECLASSIFY_BATCH_SQL, DIGEST_SET_CATEGORY_SQL,
-    DIGEST_UPSERT_JOB_STATUS_SQL,
-    DIGEST_UPSERT_META_SQL, DIGEST_USERS_WITH_WORK_SQL,
+    build_event_spans_by_google_ids_sql, build_mark_dirty_sql, DigestEventRow, DigestRepo,
+    EventSpan, EventSpanKeyRow, EventSpanRow, JobStatus, NightInsert, ReclassifyRow,
+    DIGEST_CALENDAR_EVENT_SPANS_SQL, DIGEST_CALENDAR_OWNER_SQL, DIGEST_CATEGORY_INSERT_CHUNK_SIZE,
+    DIGEST_CLEAR_DIRTY_SQL, DIGEST_COUNT_DIRTY_SQL, DIGEST_DELETE_CATEGORY_SQL,
+    DIGEST_DELETE_HOURS_SQL, DIGEST_DELETE_NIGHTS_SQL, DIGEST_EARLIEST_EVENT_DATE_SQL,
+    DIGEST_EVENT_SPAN_SQL, DIGEST_HAS_META_SQL, DIGEST_HAS_STALE_META_SQL,
+    DIGEST_HAS_UNSTAMPED_SQL, DIGEST_HOUR_INSERT_CHUNK_SIZE, DIGEST_JOB_STATUS_SQL,
+    DIGEST_LATEST_ZONE_BEFORE_SQL, DIGEST_LIST_DIRTY_SQL, DIGEST_LOAD_EVENTS_SQL,
+    DIGEST_MARK_DIRTY_CHUNK_SIZE, DIGEST_NIGHT_INSERT_CHUNK_SIZE, DIGEST_PRIMARY_TIME_ZONE_SQL,
+    DIGEST_RECLASSIFY_BATCH_SQL, DIGEST_SET_CATEGORY_SQL, DIGEST_SLEEP_TARGET_PARAMS_SQL,
+    DIGEST_UNSTAMPED_BATCH_SQL, DIGEST_UPSERT_JOB_STATUS_SQL, DIGEST_UPSERT_META_SQL,
+    DIGEST_USERS_WITH_WORK_SQL,
 };
-use api_core::digest::{dirty_dates_for_spans, DigestEvent, DayDigest};
-use api_core::digest::repo::DIGEST_CALENDAR_OWNER_SQL;
+use api_core::digest::{
+    dirty_dates_for_spans, sleep_target_secs_from_params, DayDigest, DigestEvent,
+};
 use api_core::repo::RepoError;
 use serde::Deserialize;
 use worker::{D1Database, D1Type};
@@ -53,6 +56,45 @@ struct PresentRow {
     present: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct OwnerRow {
+    user_id: String,
+}
+
+/// The owner of one calendar, or `None` when it is missing/soft-deleted (the
+/// dirty mark is skipped: a calendar write must never fail over bookkeeping).
+pub(crate) async fn calendar_owner(
+    db: &D1Database,
+    calendar_id: &str,
+) -> Result<Option<String>, RepoError> {
+    let stmt = db
+        .prepare(DIGEST_CALENDAR_OWNER_SQL)
+        .bind_refs(&[D1Type::Text(calendar_id)])
+        .map_err(backend)?;
+    let row: Option<OwnerRow> = stmt.first::<OwnerRow>(None).await.map_err(backend)?;
+    Ok(row.map(|row| row.user_id))
+}
+
+/// Marks `dates` dirty for one user, chunked under D1's 100-bind limit — one
+/// statement per chunk, so a whole batch's union costs the fewest round trips
+/// the limit allows.
+pub(crate) async fn mark_dirty_dates(
+    db: &D1Database,
+    user_id: &str,
+    dates: &[String],
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
+    for chunk in dates.chunks(DIGEST_MARK_DIRTY_CHUNK_SIZE) {
+        let (sql, args) = build_mark_dirty_sql(user_id, chunk, now_rfc3339);
+        let stmt = db
+            .prepare(&sql)
+            .bind_refs(&bind_text(&args))
+            .map_err(backend)?;
+        run_stmt(stmt).await?;
+    }
+    Ok(())
+}
+
 /// Best-effort dirty marking for one calendar event write.
 ///
 /// Unions the stored span (when the row already exists) with the incoming
@@ -67,22 +109,10 @@ pub(crate) async fn mark_dirty_for_calendar_event(
     new_span: Option<EventSpan<'_>>,
     now_rfc3339: &str,
 ) -> Result<(), RepoError> {
-    let owner = {
-        let stmt = db
-            .prepare(DIGEST_CALENDAR_OWNER_SQL)
-            .bind_refs(&[D1Type::Text(calendar_id)])
-            .map_err(backend)?;
-        let row: Option<OwnerRow> = stmt
-            .first::<OwnerRow>(None)
-            .await
-            .map_err(backend)?;
-        match row {
-            Some(row) => row.user_id,
-            // A missing/soft-deleted calendar skips the mark.
-            None => return Ok(()),
-        }
+    let Some(owner) = calendar_owner(db, calendar_id).await? else {
+        // A missing/soft-deleted calendar skips the mark.
+        return Ok(());
     };
-
     let mut spans: Vec<EventSpan<'_>> = Vec::new();
     if let Some(span) = old_span {
         spans.push(span.as_span());
@@ -90,19 +120,68 @@ pub(crate) async fn mark_dirty_for_calendar_event(
     if let Some(span) = new_span {
         spans.push(span);
     }
-    let dates = dirty_dates_for_spans(&spans);
+    mark_dirty_span_union(db, &owner, &spans, now_rfc3339).await
+}
+
+/// Marks the union of `spans` dirty for one user (chunked), the shared tail of
+/// every event-write path.
+pub(crate) async fn mark_dirty_span_union(
+    db: &D1Database,
+    user_id: &str,
+    spans: &[EventSpan<'_>],
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
+    let dates = dirty_dates_for_spans(spans);
     if dates.is_empty() {
         return Ok(());
     }
-    for chunk in dates.chunks(DIGEST_MARK_DIRTY_CHUNK_SIZE) {
-        let (sql, args) = build_mark_dirty_sql(&owner, chunk, now_rfc3339);
-        let stmt = db
-            .prepare(&sql)
-            .bind_refs(&bind_text(&args))
-            .map_err(backend)?;
-        run_stmt(stmt).await?;
+    mark_dirty_dates(db, user_id, &dates, now_rfc3339).await
+}
+
+/// Dirty-marks every local date a **soft-deleted** calendar's living events
+/// touch.
+///
+/// The digest drops a soft-deleted calendar's events (`DIGEST_LOAD_EVENTS_SQL`
+/// filters `c.deleted_at IS NULL`), so the days those events used to fill must
+/// be rebuilt once the calendar goes away. One SELECT reads every living span
+/// and the exact per-event union is marked (each event's own zone, ±1 day): a
+/// calendar delete is rare, so the precision is worth more than the cheaper
+/// min/max closed range that would also dirty the days in between.
+///
+/// The owner must be resolved by the caller **before** the soft delete — the
+/// calendar is invisible to [`calendar_owner`] afterwards.
+pub(crate) async fn mark_dirty_for_calendar_delete(
+    db: &D1Database,
+    user_id: &str,
+    calendar_id: &str,
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
+    let stmt = db
+        .prepare(DIGEST_CALENDAR_EVENT_SPANS_SQL)
+        .bind_refs(&[D1Type::Text(calendar_id)])
+        .map_err(backend)?;
+    let rows: Vec<EventSpanRow> = query_vec(stmt).await?;
+    let spans: Vec<EventSpan<'_>> = rows.iter().map(EventSpanRow::as_span).collect();
+    mark_dirty_span_union(db, user_id, &spans, now_rfc3339).await
+}
+
+/// The stored spans of several events of one calendar, in one SELECT
+/// (`google_event_id IN (…)`) — the batch upsert's replacement for one
+/// [`stored_event_span`] per event.
+pub(crate) async fn stored_event_spans(
+    db: &D1Database,
+    calendar_id: &str,
+    google_event_ids: &[String],
+) -> Result<Vec<EventSpanKeyRow>, RepoError> {
+    if google_event_ids.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    let (sql, args) = build_event_spans_by_google_ids_sql(calendar_id, google_event_ids);
+    let stmt = db
+        .prepare(&sql)
+        .bind_refs(&bind_text(&args))
+        .map_err(backend)?;
+    query_vec(stmt).await
 }
 
 /// The stored span of one event, or `None` when the row does not exist.
@@ -121,11 +200,6 @@ pub(crate) async fn stored_event_span(
     stmt.first::<EventSpanRow>(None).await.map_err(backend)
 }
 
-#[derive(Debug, Deserialize)]
-struct OwnerRow {
-    user_id: String,
-}
-
 #[async_trait::async_trait(?Send)]
 impl DigestRepo for D1DigestRepo {
     async fn mark_dirty(
@@ -137,16 +211,7 @@ impl DigestRepo for D1DigestRepo {
         if dates.is_empty() {
             return Ok(());
         }
-        for chunk in dates.chunks(DIGEST_MARK_DIRTY_CHUNK_SIZE) {
-            let (sql, args) = build_mark_dirty_sql(user_id, chunk, now_rfc3339);
-            let stmt = self
-                .db
-                .prepare(&sql)
-                .bind_refs(&bind_text(&args))
-                .map_err(backend)?;
-            run_stmt(stmt).await?;
-        }
-        Ok(())
+        mark_dirty_dates(&self.db, user_id, dates, now_rfc3339).await
     }
 
     async fn list_dirty(&self, user_id: &str, limit: usize) -> Result<Vec<String>, RepoError> {
@@ -406,6 +471,46 @@ impl DigestRepo for D1DigestRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await
+    }
+
+    async fn unstamped_batch(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ReclassifyRow>, RepoError> {
+        let stmt = self
+            .db
+            .prepare(DIGEST_UNSTAMPED_BATCH_SQL)
+            .bind_refs(&[
+                D1Type::Text(user_id),
+                D1Type::Integer(limit.min(i32::MAX as usize) as i32),
+            ])
+            .map_err(backend)?;
+        query_vec(stmt).await
+    }
+
+    async fn has_unstamped_event(&self, user_id: &str) -> Result<bool, RepoError> {
+        let stmt = self
+            .db
+            .prepare(DIGEST_HAS_UNSTAMPED_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row: Option<PresentRow> = stmt.first::<PresentRow>(None).await.map_err(backend)?;
+        Ok(row.is_some())
+    }
+
+    async fn sleep_target_secs(&self, user_id: &str) -> Result<Option<i64>, RepoError> {
+        #[derive(Deserialize)]
+        struct ParamsRow {
+            params_json: String,
+        }
+        let stmt = self
+            .db
+            .prepare(DIGEST_SLEEP_TARGET_PARAMS_SQL)
+            .bind_refs(&[D1Type::Text(user_id)])
+            .map_err(backend)?;
+        let row: Option<ParamsRow> = stmt.first::<ParamsRow>(None).await.map_err(backend)?;
+        Ok(row.and_then(|row| sleep_target_secs_from_params(&row.params_json)))
     }
 
     async fn has_meta(&self, user_id: &str) -> Result<bool, RepoError> {

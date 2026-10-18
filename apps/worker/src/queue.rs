@@ -45,10 +45,11 @@ async fn run_digest_for_user(env: &Env, user_id: &str, now_unix: i64) -> Result<
         console_log!("queue: digest: {error}");
     }
     console_log!(
-        "queue: digest user={} rebuilt={} reclassified={} remaining={}",
+        "queue: digest user={} rebuilt={} reclassified={} kept_dirty={} remaining={}",
         user_id,
         report.rebuilt_days,
         report.reclassified,
+        report.kept_dirty,
         report.remaining
     );
     if report.remaining {

@@ -43,8 +43,9 @@ mod tests;
 
 pub use queue::{DigestJobKind, DigestQueueMessage, WorkerQueueMessage};
 pub use repo::{
-    dirty_dates_for_span, dirty_dates_for_spans, DigestEventRow, DigestRepo, EventSpan,
-    EventSpanRow, JobStatus, ReclassifyRow, DIGEST_MARK_DIRTY_CHUNK_SIZE,
+    build_event_spans_by_google_ids_sql, dirty_dates_for_span, dirty_dates_for_spans,
+    sleep_target_secs_from_params, DigestEventRow, DigestRepo, EventSpan, EventSpanKeyRow,
+    EventSpanRow, JobStatus, ReclassifyRow, DIGEST_EVENT_SPANS_MAX_IDS, DIGEST_MARK_DIRTY_CHUNK_SIZE,
 };
 pub use sleep::{
     bed_minutes_past_noon, marker_kind, resolve_sleep_category_id, wake_minutes_past_midnight,
@@ -128,6 +129,10 @@ pub fn include_event(event: &DigestEvent) -> bool {
     if event.status == "cancelled" {
         return false;
     }
+    // Recurring **masters** only. RRULEs are deliberately never expanded: the
+    // user's weekly script materializes the past occurrences as plain events,
+    // so a master would double-count them, and a future occurrence has no
+    // tracked time to attribute anyway.
     if !event.recurrence.trim().is_empty() {
         return false;
     }
@@ -451,6 +456,12 @@ struct DateAggregate {
 /// `sleep_category_id` comes from the user's `sleep` category; `None` falls
 /// back to [`SYNTHETIC_SLEEP_CATEGORY_ID`].
 ///
+/// `default_sleep_secs` is the user's own `sleep_duration` rule target (the
+/// tick loads it from the latest revision). It is the length an estimated
+/// night gets when its anchors do not clip it. `0` or a negative value falls
+/// back to [`DEFAULT_SLEEP_SECS`] — a caller with no rule, or a nonsense one,
+/// must not produce a zero-length night.
+///
 /// A date's inferred zone is therefore a pure function of **this batch's
 /// votes plus persisted history** — never of which other dirty dates happened
 /// to travel in the same batch.
@@ -461,6 +472,7 @@ pub fn digest_days(
     fallback_tz: &str,
     prior_zone: Option<&str>,
     sleep_category_id: Option<&str>,
+    default_sleep_secs: i64,
 ) -> Vec<DayDigest> {
     let fallback = normalized_zone_name(fallback_tz);
     let prior = prior_zone
@@ -471,6 +483,11 @@ pub fn digest_days(
         .filter(|id| !id.is_empty())
         .unwrap_or(SYNTHETIC_SLEEP_CATEGORY_ID)
         .to_string();
+    let default_sleep_secs = if default_sleep_secs > 0 {
+        default_sleep_secs
+    } else {
+        DEFAULT_SLEEP_SECS
+    };
 
     // ── Filter, date, split, clip ───────────────────────────────────────────
     let mut segments: Vec<Segment> = Vec::new();
@@ -678,7 +695,8 @@ pub fn digest_days(
             zone: &day1_zone,
             anchors: anchors.get(day1).unwrap_or(&empty_anchors),
         };
-        let Some(night) = sleep::estimate_night(bed, wake, &day0_ctx, &day1_ctx) else {
+        let Some(night) = sleep::estimate_night(bed, wake, &day0_ctx, &day1_ctx, default_sleep_secs)
+        else {
             continue;
         };
         let day_zone = resolve_zone(day1, Some(&night.asleep_zone));

@@ -77,7 +77,7 @@ test('dayTickIndexes: every column of a week, first/mid/last otherwise', () => {
 // ── days chart ───────────────────────────────────────────────────────────
 
 function day(date: string, segments: RecordDay['segments']): RecordDay {
-  return { date, segments, untracked_seconds: null };
+  return { date, aggregated: true, segments, untracked_seconds: null };
 }
 
 test('stackDay: a bottom-up stack scaled against a full day', () => {

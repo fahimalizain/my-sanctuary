@@ -146,11 +146,16 @@ fn leaf_seconds_roll_up_to_the_parent_root() {
 // ── 2. the gap day ──────────────────────────────────────────────────────────
 
 #[test]
-fn a_gap_day_is_present_with_a_full_untracked_fill() {
+fn a_gap_day_with_no_aggregate_is_not_a_tracked_zero() {
     let data = RecordData {
         categories: work_tree(),
-        // 2026-10-13 is deliberately missing: a zero day, not a hole.
-        meta: vec![meta("2026-10-12", 3_600), meta("2026-10-14", 3_600)],
+        // 2026-10-13 is deliberately missing: nothing has been computed for it.
+        meta: vec![
+            meta("2026-10-12", 3_600),
+            meta("2026-10-14", 3_600),
+            // Today, computed: no untracked figure because it is still running.
+            meta(AS_OF, 0),
+        ],
         category_seconds: vec![
             secs("2026-10-12", "work", 3_600),
             secs("2026-10-14", "work", 3_600),
@@ -173,13 +178,37 @@ fn a_gap_day_is_present_with_a_full_untracked_fill() {
     let gap = &report.days[1];
     assert_eq!(gap.date, "2026-10-13");
     assert!(gap.segments.is_empty());
-    assert_eq!(gap.untracked_seconds, Some(86_400));
+    assert!(!gap.aggregated, "no daily_meta row: the date is unbuilt");
+    assert_eq!(
+        gap.untracked_seconds, None,
+        "an unbuilt day is not a 24h untracked claim"
+    );
 
-    // A tracked past day subtracts its own seconds.
+    // A tracked past day is aggregated and subtracts its own seconds.
+    assert!(report.days[0].aggregated);
     assert_eq!(report.days[0].untracked_seconds, Some(82_800));
 
-    // Today is still being written: no untracked figure at all.
+    // Today is computed but still being written: no untracked figure at all.
+    assert!(report.days[6].aggregated);
     assert_eq!(report.days[6].untracked_seconds, None);
+}
+
+#[test]
+fn a_computed_zero_day_is_aggregated_and_fully_untracked() {
+    // A `daily_meta` row with `tracked_seconds = 0` is a real answer — the day
+    // was computed and nothing was tracked — so it gets the full fill, unlike a
+    // date with no row at all.
+    let data = RecordData {
+        categories: work_tree(),
+        meta: vec![meta("2026-10-13", 0)],
+        ..RecordData::default()
+    };
+
+    let report = assemble_record(&data, AS_OF, "UTC", RecordRange::Last7, NOW_UNIX);
+    let day = &report.days[1];
+    assert_eq!(day.date, "2026-10-13");
+    assert!(day.aggregated);
+    assert_eq!(day.untracked_seconds, Some(86_400));
 }
 
 // ── 3. ranking share and the previous window ────────────────────────────────

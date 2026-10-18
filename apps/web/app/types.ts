@@ -940,8 +940,13 @@ export interface RecordSegment {
 
 export interface RecordDay {
   date: string;
+  /** `false` when no `daily_meta` row exists: the date is unbuilt, not a zero. */
+  aggregated: boolean;
   segments: RecordSegment[];
-  /** `null` while the day is still being written (it is today in its zone). */
+  /**
+   * `null` while the day is still being written (it is today in its zone) and
+   * for a day with no aggregate at all.
+   */
   untracked_seconds: number | null;
 }
 

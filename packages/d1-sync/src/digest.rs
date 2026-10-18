@@ -12,13 +12,14 @@ use api_core::digest::repo::{
     JobStatus, ReclassifyRow, NightInsert, DIGEST_CATEGORY_INSERT_CHUNK_SIZE,
     DIGEST_CLEAR_DIRTY_SQL, DIGEST_COUNT_DIRTY_SQL, DIGEST_DELETE_CATEGORY_SQL,
     DIGEST_DELETE_HOURS_SQL, DIGEST_DELETE_NIGHTS_SQL, DIGEST_EARLIEST_EVENT_DATE_SQL,
-    DIGEST_EVENT_SPAN_SQL, DIGEST_HAS_META_SQL, DIGEST_HAS_STALE_META_SQL, DIGEST_JOB_STATUS_SQL,
-    DIGEST_LATEST_ZONE_BEFORE_SQL, DIGEST_LIST_DIRTY_SQL, DIGEST_LOAD_EVENTS_SQL,
-    DIGEST_MARK_DIRTY_CHUNK_SIZE, DIGEST_NIGHT_INSERT_CHUNK_SIZE, DIGEST_PRIMARY_TIME_ZONE_SQL,
-    DIGEST_RECLASSIFY_BATCH_SQL, DIGEST_SET_CATEGORY_SQL, DIGEST_UPSERT_JOB_STATUS_SQL,
-    DIGEST_UPSERT_META_SQL, DIGEST_USERS_WITH_WORK_SQL,
+    DIGEST_EVENT_SPAN_SQL, DIGEST_HAS_META_SQL, DIGEST_HAS_STALE_META_SQL,
+    DIGEST_HAS_UNSTAMPED_SQL, DIGEST_JOB_STATUS_SQL, DIGEST_LATEST_ZONE_BEFORE_SQL,
+    DIGEST_LIST_DIRTY_SQL, DIGEST_LOAD_EVENTS_SQL, DIGEST_MARK_DIRTY_CHUNK_SIZE,
+    DIGEST_NIGHT_INSERT_CHUNK_SIZE, DIGEST_PRIMARY_TIME_ZONE_SQL, DIGEST_RECLASSIFY_BATCH_SQL,
+    DIGEST_SET_CATEGORY_SQL, DIGEST_SLEEP_TARGET_PARAMS_SQL, DIGEST_UNSTAMPED_BATCH_SQL,
+    DIGEST_UPSERT_JOB_STATUS_SQL, DIGEST_UPSERT_META_SQL, DIGEST_USERS_WITH_WORK_SQL,
 };
-use api_core::digest::DayDigest;
+use api_core::digest::{sleep_target_secs_from_params, DayDigest};
 use api_core::repo::RepoError;
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -91,11 +92,47 @@ pub fn mark_dirty_spans(
     if dates.is_empty() {
         return Ok(());
     }
+    mark_dirty_dates(conn, user_id, &dates, now_rfc3339)
+}
+
+/// Marks `dates` dirty in chunks under D1's 100-bind limit — one statement per
+/// chunk, so a whole batch's union costs the fewest round trips the limit
+/// allows.
+pub fn mark_dirty_dates(
+    conn: &Connection,
+    user_id: &str,
+    dates: &[String],
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
     for chunk in dates.chunks(DIGEST_MARK_DIRTY_CHUNK_SIZE) {
         let (sql, args) = build_mark_dirty_sql(user_id, chunk, now_rfc3339);
         run_args(conn, &sql, &args)?;
     }
     Ok(())
+}
+
+/// Dirty-marks every local date a **soft-deleted** calendar's living events
+/// touch: the digest drops a soft-deleted calendar's events, so the days those
+/// events used to fill must be rebuilt.
+///
+/// The owner is resolved by the caller **before** the soft-delete (the calendar
+/// is invisible to [`calendar_owner`] afterwards). One SELECT reads every living
+/// span; the exact per-event union (`dirty_dates_for_spans`) is preferred over a
+/// cheaper min/max closed range because a calendar delete is rare and the closed
+/// range would also dirty the days in between.
+pub fn mark_dirty_for_deleted_calendar(
+    conn: &Connection,
+    user_id: &str,
+    calendar_id: &str,
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
+    let rows: Vec<EventSpanRow> = query_vec(
+        conn,
+        api_core::digest::repo::DIGEST_CALENDAR_EVENT_SPANS_SQL,
+        &[&calendar_id],
+    )?;
+    let spans: Vec<EventSpan<'_>> = rows.iter().map(EventSpanRow::as_span).collect();
+    mark_dirty_spans(conn, user_id, &spans, now_rfc3339)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -110,11 +147,7 @@ impl DigestRepo for SqliteDigestRepo {
             return Ok(());
         }
         let conn = lock(&self.db)?;
-        for chunk in dates.chunks(DIGEST_MARK_DIRTY_CHUNK_SIZE) {
-            let (sql, args) = build_mark_dirty_sql(user_id, chunk, now_rfc3339);
-            run_args(&conn, &sql, &args)?;
-        }
-        Ok(())
+        mark_dirty_dates(&conn, user_id, dates, now_rfc3339)
     }
 
     async fn list_dirty(&self, user_id: &str, limit: usize) -> Result<Vec<String>, RepoError> {
@@ -309,6 +342,37 @@ impl DigestRepo for SqliteDigestRepo {
         let conn = lock(&self.db)?;
         let category = category_id.unwrap_or("");
         exec(&conn, DIGEST_SET_CATEGORY_SQL, &[&category, &id])
+    }
+
+    async fn unstamped_batch(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ReclassifyRow>, RepoError> {
+        let conn = lock(&self.db)?;
+        let limit = limit as i64;
+        query_vec(&conn, DIGEST_UNSTAMPED_BATCH_SQL, &[&user_id, &limit])
+    }
+
+    async fn has_unstamped_event(&self, user_id: &str) -> Result<bool, RepoError> {
+        #[derive(Deserialize)]
+        struct PresentRow {
+            #[allow(dead_code)]
+            present: i64,
+        }
+        let conn = lock(&self.db)?;
+        let row: Option<PresentRow> = query_one(&conn, DIGEST_HAS_UNSTAMPED_SQL, &[&user_id])?;
+        Ok(row.is_some())
+    }
+
+    async fn sleep_target_secs(&self, user_id: &str) -> Result<Option<i64>, RepoError> {
+        #[derive(Deserialize)]
+        struct ParamsRow {
+            params_json: String,
+        }
+        let conn = lock(&self.db)?;
+        let row: Option<ParamsRow> = query_one(&conn, DIGEST_SLEEP_TARGET_PARAMS_SQL, &[&user_id])?;
+        Ok(row.and_then(|row| sleep_target_secs_from_params(&row.params_json)))
     }
 
     async fn has_meta(&self, user_id: &str) -> Result<bool, RepoError> {

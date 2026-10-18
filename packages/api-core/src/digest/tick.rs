@@ -17,7 +17,7 @@ use crate::repo::{RepoError, TaskCategoryRepo};
 use crate::time::{civil_date_in_zone, unix_secs_to_rfc3339};
 
 use super::repo::{dirty_dates_for_span, DigestRepo, JobStatus};
-use super::sleep::{resolve_sleep_category_id, ALGO_VERSION};
+use super::sleep::{resolve_sleep_category_id, ALGO_VERSION, DEFAULT_SLEEP_SECS};
 use super::{digest_days, shift_date};
 
 /// Days rebuilt per user per tick.
@@ -67,6 +67,9 @@ pub struct DigestTickReport {
     pub backfill_done: bool,
     /// The reclassify job finished in this tick.
     pub reclassify_done: bool,
+    /// Days that stayed dirty because a reclassify was in flight when the tick
+    /// finished rebuilding (F10). Not an error: the next tick redoes them.
+    pub kept_dirty: usize,
     /// Dirty days or a `running` job remain — the caller should re-enqueue.
     pub remaining: bool,
     pub errors: Vec<String>,
@@ -151,18 +154,26 @@ impl BackfillJob {
 /// Only the job row is written here: the taxonomy load and the stamps belong to
 /// the tick's `run_reclassify`, so a read endpoint (`GET /api/reports/status`,
 /// opening the record) can queue work but can never classify anything.
+///
+/// A `done` job is restarted only when the user still has a living event with
+/// no leaf stamp: the finished scan's stamps are valid, so re-running it would
+/// rewrite nothing (only `has_unstamped_event` can have changed since — an
+/// event synced in after the scan). A `done` job with no nulls left is left
+/// alone.
 async fn ensure_reclassify_job(
     repo: &dyn DigestRepo,
     user_id: &str,
     now_rfc3339: &str,
 ) -> Result<(), RepoError> {
-    let running = repo
-        .job_status(user_id, JOB_RECLASSIFY)
-        .await?
-        .as_ref()
-        .is_some_and(JobStatus::is_running);
-    if running {
+    let status = repo.job_status(user_id, JOB_RECLASSIFY).await?;
+    if status.as_ref().is_some_and(JobStatus::is_running) {
         // Mid-scan: resetting the cursor would restart the whole history.
+        return Ok(());
+    }
+    let done = status.as_ref().is_some_and(|row| row.status == JOB_DONE);
+    if done && !repo.has_unstamped_event(user_id).await? {
+        // A finished scan with nothing left to stamp: restarting it would only
+        // walk the whole history again for no write.
         return Ok(());
     }
     repo.upsert_job_status(user_id, JOB_RECLASSIFY, JOB_RUNNING, "", now_rfc3339)
@@ -464,11 +475,7 @@ async fn run_backfill(
             report.rebuilt_days += outcome.rebuilt;
             // Today's row was clipped at `now`: it stays dirty so the next
             // tick recomputes the tail.
-            if let Err(err) = repo.clear_dirty(user_id, &outcome.clearable).await {
-                report
-                    .errors
-                    .push(format!("digest: clear dirty failed: {err}"));
-            }
+            clear_rebuilt_days(repo, user_id, &outcome.clearable, report).await;
             let next = dates
                 .last()
                 .and_then(|last| shift_date(last, 1))
@@ -492,6 +499,15 @@ async fn run_backfill(
 }
 
 /// Returns `true` when there is nothing left to scan.
+///
+/// The id walk is `e.id > ? ORDER BY e.id`, and ids are random UUIDs: a row
+/// inserted while the scan is walking can sort **before** the cursor and would
+/// never be visited again, so a short batch may not simply finish the job. The
+/// scan is exhausted when a batch comes back short **and** the verification
+/// query ([`DigestRepo::unstamped_batch`]) finds no living event without a
+/// stamp. Verification rows are stamped in this same tick; a full verification
+/// batch keeps the job `running` and rewinds the cursor to the start so the
+/// next tick's walk cannot skip anything.
 async fn run_reclassify(
     repo: &dyn DigestRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -524,13 +540,105 @@ async fn run_reclassify(
             return false;
         }
     };
-    if rows.is_empty() {
+    if !stamp_rows(repo, user_id, &rows, &taxonomy, now_rfc3339, report).await {
+        // A stamp write failed: leave the job `running` with its cursor so the
+        // next tick retries, never advance over the unwritten row.
+        return false;
+    }
+
+    if rows.len() == RECLASSIFY_BATCH_LIMIT {
+        // A full batch: more rows follow the cursor.
+        return advance_reclassify_cursor(repo, user_id, &rows, cursor, now_rfc3339, report).await;
+    }
+
+    // A short batch means the id walk is exhausted — but the walk can have
+    // **skipped** rows: ids are random UUIDs, so a row inserted mid-scan sorts
+    // before the cursor and `e.id > ?` will never visit it again. The job may
+    // only finish once the verification scan finds nothing unstamped.
+    let pending = match repo.unstamped_batch(user_id, RECLASSIFY_BATCH_LIMIT).await {
+        Ok(pending) => pending,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("digest: unstamped verification failed: {err}"));
+            return false;
+        }
+    };
+    if pending.is_empty() {
+        if rows.is_empty() {
+            finish_job(repo, user_id, JOB_RECLASSIFY, now_rfc3339, report).await;
+            report.reclassify_done = true;
+            return true;
+        }
+        // The last walk found rows and nothing is left unstamped: keep the
+        // existing shape (a short batch stays `running`, the next tick's empty
+        // batch finishes it) but let this tick spend the rest of its budget on
+        // dirty days.
+        return advance_reclassify_cursor(repo, user_id, &rows, cursor, now_rfc3339, report).await;
+    }
+
+    // Stamp the hidden rows in this tick: finishing first would leave them
+    // unclassified forever (nothing would ever restamp them).
+    if !stamp_rows(repo, user_id, &pending, &taxonomy, now_rfc3339, report).await {
+        return false;
+    }
+    if pending.len() < RECLASSIFY_BATCH_LIMIT {
+        // Nothing is unstamped any more: the verification was the real end.
         finish_job(repo, user_id, JOB_RECLASSIFY, now_rfc3339, report).await;
         report.reclassify_done = true;
         return true;
     }
+    // A full verification batch: more rows may remain. Rewind the cursor to the
+    // start — the next walk must be able to reach ids that sort before the old
+    // cursor.
+    if let Err(err) = repo
+        .upsert_job_status(user_id, JOB_RECLASSIFY, JOB_RUNNING, "", now_rfc3339)
+        .await
+    {
+        report
+            .errors
+            .push(format!("digest: reclassify rewind failed: {err}"));
+    }
+    false
+}
 
-    for row in &rows {
+/// Advances the reclassify cursor past a short/full walk batch. Returns
+/// `true` only when the walk is exhausted and may hand its budget to a rebuild.
+async fn advance_reclassify_cursor(
+    repo: &dyn DigestRepo,
+    user_id: &str,
+    rows: &[crate::digest::ReclassifyRow],
+    cursor: &str,
+    now_rfc3339: &str,
+    report: &mut DigestTickReport,
+) -> bool {
+    let last_id = rows.last().map(|row| row.id.as_str()).unwrap_or(cursor);
+    if let Err(err) = repo
+        .upsert_job_status(user_id, JOB_RECLASSIFY, JOB_RUNNING, last_id, now_rfc3339)
+        .await
+    {
+        report
+            .errors
+            .push(format!("digest: reclassify advance failed: {err}"));
+        return false;
+    }
+    rows.len() < RECLASSIFY_BATCH_LIMIT
+}
+
+/// Classifies and stamps a batch, marking the days each changed row touches
+/// dirty. Shared by the id walk and the verification scan (same columns).
+///
+/// Returns `false` when a stamp write failed: the caller must leave the job
+/// `running` with its cursor so the row is retried, never finish over it.
+async fn stamp_rows(
+    repo: &dyn DigestRepo,
+    user_id: &str,
+    rows: &[crate::digest::ReclassifyRow],
+    taxonomy: &crate::calendar_color::PaintTaxonomy,
+    now_rfc3339: &str,
+    report: &mut DigestTickReport,
+) -> bool {
+    for row in rows {
         let next = classify_event_leaf(
             &row.title,
             &row.google_calendar_id,
@@ -560,21 +668,7 @@ async fn run_reclassify(
                 .push(format!("digest: dirty mark failed after reclassify: {err}"));
         }
     }
-
-    let last_id = rows.last().map(|row| row.id.as_str()).unwrap_or(cursor);
-    if let Err(err) = repo
-        .upsert_job_status(user_id, JOB_RECLASSIFY, JOB_RUNNING, last_id, now_rfc3339)
-        .await
-    {
-        report
-            .errors
-            .push(format!("digest: reclassify advance failed: {err}"));
-        return false;
-    }
-    // A short batch means the next one is empty: keep the job `running` (the
-    // next tick marks it done) but let this tick spend its remaining budget on
-    // dirty days.
-    rows.len() < RECLASSIFY_BATCH_LIMIT
+    true
 }
 
 async fn run_rebuild(
@@ -614,15 +708,44 @@ async fn run_rebuild(
             // Only days that are already finished may be cleared: today's rows
             // were clipped at `now` and must stay dirty for the next tick, and
             // a future date was not rebuilt at all.
-            if let Err(err) = repo.clear_dirty(user_id, &outcome.clearable).await {
-                report
-                    .errors
-                    .push(format!("digest: clear dirty failed: {err}"));
-            }
+            clear_rebuilt_days(repo, user_id, &outcome.clearable, report).await;
         }
         Err(err) => report
             .errors
             .push(format!("digest: rebuild failed: {err}")),
+    }
+}
+
+/// Clears the days this tick rebuilt, unless a reclassify is in flight.
+///
+/// The status is re-read **here**, not at the top of the tick: a taxonomy edit
+/// can enqueue a restamp while the rebuild is running, and a day rebuilt
+/// against the pre-reclassify stamps must not be marked clean — the next tick
+/// has to redo it once the scan has written the new stamps. Keeping a day
+/// dirty only costs a rebuild, so this errs on the safe side.
+async fn clear_rebuilt_days(
+    repo: &dyn DigestRepo,
+    user_id: &str,
+    dates: &[String],
+    report: &mut DigestTickReport,
+) {
+    if dates.is_empty() {
+        return;
+    }
+    let in_flight = repo
+        .job_status(user_id, JOB_RECLASSIFY)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.is_running());
+    if in_flight {
+        report.kept_dirty += dates.len();
+        return;
+    }
+    if let Err(err) = repo.clear_dirty(user_id, dates).await {
+        report
+            .errors
+            .push(format!("digest: clear dirty failed: {err}"));
     }
 }
 
@@ -696,6 +819,18 @@ async fn rebuild_dates(
             None
         }
     };
+    // The estimated-night length is the user's own `sleep_duration` rule target
+    // (the rule is seeded at 6.5h but editable), read through the digest repo so
+    // this module never depends on the rules service. No rule / a failed read
+    // falls back to `DEFAULT_SLEEP_SECS`.
+    let default_sleep_secs = match repo.sleep_target_secs(user_id).await {
+        Ok(Some(secs)) => secs,
+        Ok(None) => DEFAULT_SLEEP_SECS,
+        Err(err) => {
+            errors.push(format!("digest: sleep target load failed: {err}"));
+            DEFAULT_SLEEP_SECS
+        }
+    };
     // Read every run's prior zone **before** the first write: a zone this pass
     // stores must not change what a later run infers from persisted history.
     let mut plan: Vec<(Vec<String>, Option<String>)> = Vec::with_capacity(runs.len());
@@ -720,6 +855,7 @@ async fn rebuild_dates(
             &fallback_tz,
             prior_zone.as_deref(),
             sleep_category.as_deref(),
+            default_sleep_secs,
         );
         // The expanded neighbours were digested (their segments are shared with
         // the run) but never persisted: only the requested dates are ours.

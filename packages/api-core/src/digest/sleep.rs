@@ -35,8 +35,12 @@ pub const WOKE_TITLE_RE: &str = r"^.*Woke Up.*$";
 /// Longest plausible night: `(0, 16h]` pairs. `16h` exactly pairs; `16h + 1s`
 /// does not.
 pub const SLEEP_PAIR_MAX_SECS: i64 = 16 * 3600;
-/// 6.5h — the estimated-night length. A deliberate user override of
+/// 6.5h — the fallback estimated-night length. A deliberate user override of
 /// `sleep_events.py`'s 8-hour default.
+///
+/// Only the fallback: a rebuild passes the user's `sleep_duration` rule target
+/// ([`digest_days`](super::digest_days)' `default_sleep_secs`) and uses this
+/// constant when the user has no such rule.
 pub const DEFAULT_SLEEP_SECS: i64 = 23_400;
 /// Category id used for synthetic sleep when the user has no `sleep` category.
 /// Starts with `*` so it can never collide with a UUID category id, and is
@@ -333,20 +337,24 @@ pub(crate) struct EstimateDay<'a> {
 }
 
 /// Estimates the night that wakes on `day1`, per `sleep_events.py`'s case
-/// table, with the "missing anchor uses the 6.5h default alone" fix (the
-/// legacy code collapsed cases 1–2 to a zero-length night when the other day
-/// had no events).
+/// table, with the "missing anchor uses the default alone" fix (the legacy
+/// code collapsed cases 1–2 to a zero-length night when the other day had no
+/// events).
 ///
-/// * bed only → `end = min(bed + 6.5h, day1 first event)`, dropped when
+/// `default_sleep_secs` is the caller's estimated-night length — the user's
+/// `sleep_duration` rule target, else [`DEFAULT_SLEEP_SECS`]. The caller
+/// normalizes it, so it is always positive here.
+///
+/// * bed only → `end = min(bed + default, day1 first event)`, dropped when
 ///   `end <= bed`.
-/// * wake only → `start = max(wake - 6.5h, day0 last event end)`, dropped when
-///   `start >= wake`.
+/// * wake only → `start = max(wake - default, day0 last event end)`, dropped
+///   when `start >= wake`.
 /// * neither → **dropped when neither civil date has a real (non-marker)
 ///   event** — a blank date must not invent a night (`sleep_events.py` only
 ///   inserted sleep between days that had events, and a backfill walks every
 ///   date since the first event). Otherwise `start = max(day0 last event end,
-///   day0 21:00 local)`, `end = min(start + 6.5h, day1 first event)`, dropped
-///   when `end <= start`.
+///   day0 21:00 local)`, `end = min(start + default, day1 first event)`,
+///   dropped when `end <= start`.
 ///
 /// The today guard lives in the caller: an in-progress night is not guessed.
 pub(crate) fn estimate_night(
@@ -354,13 +362,14 @@ pub(crate) fn estimate_night(
     wake: Option<&SleepMarker>,
     day0: &EstimateDay<'_>,
     day1_day: &EstimateDay<'_>,
+    default_sleep_secs: i64,
 ) -> Option<EstimatedNight> {
     let bed_instant = bed.map(|marker| marker.start_unix);
     let wake_instant = wake.map(|marker| marker.start_unix);
 
     match (bed_instant, wake_instant) {
         (Some(asleep_unix), None) => {
-            let mut end = asleep_unix + DEFAULT_SLEEP_SECS;
+            let mut end = asleep_unix + default_sleep_secs;
             if let Some(first) = day1_day.anchors.first_start {
                 end = end.min(first);
             }
@@ -377,7 +386,7 @@ pub(crate) fn estimate_night(
             })
         }
         (None, Some(woke_unix)) => {
-            let mut start = woke_unix - DEFAULT_SLEEP_SECS;
+            let mut start = woke_unix - default_sleep_secs;
             if let Some(last) = day0.anchors.last_end {
                 start = start.max(last);
             }
@@ -406,7 +415,7 @@ pub(crate) fn estimate_night(
                 (None, Some(anchor)) => anchor,
                 (None, None) => return None,
             };
-            let mut end = start + DEFAULT_SLEEP_SECS;
+            let mut end = start + default_sleep_secs;
             if let Some(first) = day1_day.anchors.first_start {
                 end = end.min(first);
             }

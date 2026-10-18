@@ -67,6 +67,13 @@ pub struct FakeState {
     pub load_windows: Vec<(String, String)>,
     pub mark_dirty_fails: bool,
     pub rules_broken: Option<String>,
+    /// A taxonomy edit that lands **while** the tick is rebuilding: `replace_day`
+    /// flips the reclassify job back to `running`, so the clear step must see a
+    /// restamp that started mid-rebuild (F10).
+    pub reclassify_on_replace_day: bool,
+    /// The user's `sleep_duration` rule target in seconds (F15); `None` = no
+    /// such rule, so the caller keeps `DEFAULT_SLEEP_SECS`.
+    pub sleep_target: Option<i64>,
 }
 
 pub struct FakeDigestRepo {
@@ -154,6 +161,17 @@ impl DigestRepo for FakeDigestRepo {
         assert_eq!(user_id, state.user_id);
         state.replace_day_calls.push(day.local_date.clone());
         state.days.insert(day.local_date.clone(), day.clone());
+        if state.reclassify_on_replace_day {
+            // A taxonomy edit lands mid-rebuild: the restamp is now in flight
+            // and this tick's stamps may already be stale.
+            state.jobs.insert(
+                JOB_RECLASSIFY.to_string(),
+                JobStatus {
+                    status: JOB_RUNNING.to_string(),
+                    cursor: String::new(),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -241,11 +259,43 @@ impl DigestRepo for FakeDigestRepo {
 
     async fn set_category(&self, id: &str, category_id: Option<&str>) -> Result<(), RepoError> {
         let mut state = self.state.lock().expect("fake lock");
-        state.stamps.insert(
-            id.to_string(),
-            category_id.map(|value| value.to_string()),
-        );
+        let stamp = category_id.map(|value| value.to_string());
+        state.stamps.insert(id.to_string(), stamp.clone());
+        // The verification scan reads the **stored** stamp, so the fake stores
+        // it too — recording the write is not enough.
+        if let Some(row) = state.rows.iter_mut().find(|row| row.id == id) {
+            row.category_id = stamp;
+        }
         Ok(())
+    }
+
+    async fn unstamped_batch(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ReclassifyRow>, RepoError> {
+        let state = self.state.lock().expect("fake lock");
+        assert_eq!(user_id, state.user_id);
+        if state.rules_broken.as_deref() == Some("verify") {
+            return Err(backend("unstamped verification failed"));
+        }
+        Ok(state
+            .rows
+            .iter()
+            .filter(|row| row.category_id.is_none())
+            .take(limit)
+            .map(FakeRow::to_batch_row)
+            .collect())
+    }
+
+    async fn has_unstamped_event(&self, user_id: &str) -> Result<bool, RepoError> {
+        let state = self.state.lock().expect("fake lock");
+        assert_eq!(user_id, state.user_id);
+        Ok(state.rows.iter().any(|row| row.category_id.is_none()))
+    }
+
+    async fn sleep_target_secs(&self, _user_id: &str) -> Result<Option<i64>, RepoError> {
+        Ok(self.state.lock().expect("fake lock").sleep_target)
     }
 
     async fn has_meta(&self, user_id: &str) -> Result<bool, RepoError> {
@@ -1219,7 +1269,7 @@ fn a_failing_sleep_category_read_still_rebuilds() {
 }
 
 #[test]
-fn the_rebuild_is_idempotent() {
+fn a_rebuild_is_idempotent_across_a_changed_event_set() {
     let repo = FakeDigestRepo::new("u-1");
     repo.mutate(|state| {
         state.events = day_events("2026-01-02", "2026-01-02");
@@ -1234,9 +1284,22 @@ fn the_rebuild_is_idempotent() {
     let taxonomy = FakeTaxonomyRepo::empty();
 
     let mut payloads = Vec::new();
-    for _ in 0..2 {
+    for round in 0..2 {
         repo.mutate(|state| {
             state.dirty.insert("2026-01-02".to_string(), "x".to_string());
+            if round == 1 {
+                // A different event set for the second rebuild: an unrelated
+                // event on another date. The stored day must still be identical
+                // — idempotence is not just "the same call twice".
+                state.events.push(event(
+                    "unrelated",
+                    "unrelated",
+                    "2026-01-05T10:00:00Z",
+                    "2026-01-05T11:00:00Z",
+                    "UTC",
+                    Some("work"),
+                ));
+            }
         });
         let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
         assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -1257,9 +1320,175 @@ fn the_rebuild_is_idempotent() {
         2,
         "the dirty day is rebuilt once per tick (today is rebuilt too)"
     );
-    // Running the same day twice leaves byte-identical rows.
+    // The second rebuild digested an extra event and still wrote the same day.
     assert_eq!(payloads[0], payloads[1]);
     assert!(payloads[0].tracked_seconds > 0);
+}
+
+#[test]
+fn a_reclassify_that_starts_mid_rebuild_keeps_the_days_dirty() {
+    // A taxonomy edit from another request can enqueue a restamp while this
+    // tick is writing days. Those days may have been rebuilt from the
+    // pre-reclassify stamps, so clearing them would freeze a stale rollup: the
+    // clear step re-reads the job status and keeps them dirty instead.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state
+            .dirty
+            .insert("2026-01-02".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+        // No reclassify at the top of the tick: it starts inside `replace_day`.
+        state.reclassify_on_replace_day = true;
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.rebuilt_days, 2, "the dirty day and today");
+    assert_eq!(report.kept_dirty, 1, "the finished day stays dirty");
+    assert_eq!(
+        repo.dirty_dates(),
+        vec!["2026-01-02".to_string(), "2026-01-10".to_string()],
+        "a restamp that started mid-rebuild keeps the days dirty"
+    );
+    assert!(report.remaining, "the next tick must redo those days");
+}
+
+#[test]
+fn reclassify_does_not_finish_while_null_category_rows_remain() {
+    // The walk is `e.id > ?`, and ids are random UUIDs: a row that lands during
+    // the scan can sort **before** the cursor and is never visited again. The
+    // verification scan must find it before the job may be called done.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.jobs.insert(
+            JOB_RECLASSIFY.to_string(),
+            JobStatus {
+                status: JOB_RUNNING.to_string(),
+                cursor: "m".to_string(),
+            },
+        );
+        state.rows = vec![
+            // Sorts before the cursor: the walk cannot see it.
+            deep_work_row("a-hidden"),
+            // The walk's last row (a short batch).
+            deep_work_row("z-visible"),
+        ];
+    });
+    let taxonomy = work_taxonomy();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        repo.state().stamps.get("a-hidden"),
+        Some(&Some("work".to_string())),
+        "the hidden row is stamped before the job may finish"
+    );
+    assert_eq!(
+        repo.state().stamps.get("z-visible"),
+        Some(&Some("work".to_string()))
+    );
+    assert!(report.reclassify_done, "nothing unstamped is left");
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY).map(|job| job.status),
+        Some(JOB_DONE.to_string())
+    );
+    // The stamped row's day and its ±1 neighbours were queued for a rebuild —
+    // the whole point of stamping it before finishing.
+    assert_eq!(
+        repo.state().replace_day_calls,
+        vec![
+            "2026-01-01".to_string(),
+            "2026-01-02".to_string(),
+            "2026-01-03".to_string()
+        ],
+        "the hidden row's days are dirty and get rebuilt"
+    );
+}
+
+#[test]
+fn a_done_reclassify_restarts_only_while_unstamped_events_remain() {
+    // Done + a living event with no leaf stamp: the scan must run again — an
+    // event synced in after it finished would otherwise never be classified.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state.rows = vec![deep_work_row("e-1")];
+        state.jobs.insert(JOB_RECLASSIFY.to_string(), done_job());
+    });
+    let job = poll(ensure_backfill_job(&repo, "u-1", "2026-01-10T06:00:00Z")).expect("job");
+    assert!(job.started);
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(running_job()),
+        "an unstamped row restarts the finished scan"
+    );
+
+    // Done + every row stamped: the stamps are valid, so nothing is restarted.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state.rows = vec![FakeRow {
+            category_id: Some("work".to_string()),
+            ..deep_work_row("e-1")
+        }];
+        state.jobs.insert(JOB_RECLASSIFY.to_string(), done_job());
+    });
+    let job = poll(ensure_backfill_job(&repo, "u-1", "2026-01-10T06:00:00Z")).expect("job");
+    assert!(job.started, "the first-run backfill is still due");
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(done_job()),
+        "a finished scan with nothing left is left alone"
+    );
+}
+
+#[test]
+fn the_rebuild_uses_the_users_sleep_duration_target() {
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.primary_tz = Some("Asia/Kolkata".to_string());
+        state.sleep_target = Some(8 * 3600);
+        state.events = vec![
+            event(
+                "last",
+                "last",
+                "2026-01-01T18:00:00+05:30",
+                "2026-01-01T20:00:00+05:30",
+                "Asia/Kolkata",
+                Some("work"),
+            ),
+            event(
+                "first",
+                "first",
+                "2026-01-02T09:00:00+05:30",
+                "2026-01-02T10:00:00+05:30",
+                "Asia/Kolkata",
+                Some("work"),
+            ),
+        ];
+        state
+            .dirty
+            .insert("2026-01-02".to_string(), "x".to_string());
+        state.jobs.insert(JOB_BACKFILL.to_string(), done_job());
+    });
+    let taxonomy = FakeTaxonomyRepo::empty();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let day = repo.state().days.get("2026-01-02").cloned().expect("day");
+    let night = day
+        .nights
+        .iter()
+        .find(|night| night.wake_date == "2026-01-02")
+        .expect("the estimated night");
+    assert_eq!(night.source, SleepSource::EstNone);
+    assert_eq!(
+        night.seconds,
+        8 * 3600,
+        "the rule's target, not the 6.5h fallback"
+    );
 }
 
 #[test]

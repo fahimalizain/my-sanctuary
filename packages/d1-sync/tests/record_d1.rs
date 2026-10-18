@@ -235,7 +235,15 @@ fn d1_record_round_trips_a_report_through_the_service() {
         .find(|day| day.date == "2026-10-13")
         .expect("day");
     assert!(gap.segments.is_empty());
-    assert_eq!(gap.untracked_seconds, Some(86_400));
+    assert!(!gap.aggregated, "no daily_meta row was ever written");
+    assert_eq!(
+        gap.untracked_seconds, None,
+        "an unbuilt day is not a 24h untracked claim"
+    );
+    assert!(
+        saturday.aggregated,
+        "the 17th has a daily_meta row of its own"
+    );
 
     assert_eq!(
         report.days.last().expect("today").untracked_seconds,

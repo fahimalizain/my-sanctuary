@@ -111,10 +111,11 @@ async fn run_digest(env: &Env, now_unix: i64) {
         console_log!("cron: {error}");
     }
     console_log!(
-        "cron: digest user={:?} rebuilt={} reclassified={} remaining={} errors={}",
+        "cron: digest user={:?} rebuilt={} reclassified={} kept_dirty={} remaining={} errors={}",
         report.user_id,
         report.rebuilt_days,
         report.reclassified,
+        report.kept_dirty,
         report.remaining,
         report.errors.len()
     );

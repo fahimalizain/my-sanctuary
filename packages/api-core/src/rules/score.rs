@@ -663,6 +663,14 @@ impl<'a> Evaluator<'a> {
 
     /// Classified, non-sleep seconds on `date` — unclassified (`''`) is not
     /// "classified", so it never counts as waking.
+    ///
+    /// Waking is therefore **classified non-sleep time**: the unclassified
+    /// bucket (`''`) is excluded. This **deliberately differs** from
+    /// `scorer.py`, which treated unclassified time differently (it counted
+    /// toward waking). The denominator only feeds
+    /// `exclude_if.percent_of_waking` — the travel escape hatch — so the
+    /// difference narrows an exclusion test rather than a score; see
+    /// `unclassified_seconds_are_neither_productive_nor_waking`.
     fn waking_seconds(&self, date: &str) -> i64 {
         self.digest
             .category_seconds

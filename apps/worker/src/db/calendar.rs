@@ -4,7 +4,7 @@ use api_core::models::{
     CalendarEvent, CalendarEventOperation, GoogleCalendar, NewCalendar, NewCalendarEvent,
     NewCalendarEventOperation, NewWatchChannel, WatchChannel,
 };
-use api_core::digest::repo::{EventSpan, EventSpanRow};
+use api_core::digest::repo::{EventSpan, EventSpanKeyRow, EventSpanRow};
 use api_core::repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_operation_list_by_statuses_sql,
     build_replica_seen_insert_sql, chunk_events_for_upsert, CalendarEventOperationRepo,
@@ -57,12 +57,25 @@ pub struct D1CalendarEventRepo {
     db: D1Database,
 }
 
-/// One event's dirty-marking inputs, owned so the event can move into the
-/// upsert SQL first.
+/// One stored event's dirty-marking input for the single-event delete paths:
+/// the calendar it belongs to plus the span it leaves behind.
 struct DirtySpan {
     calendar_id: String,
-    old: Option<EventSpanRow>,
-    new: OwnedSpan,
+    span: OwnedSpan,
+}
+
+/// One upsert chunk's dirty-marking inputs, captured **before** the events move
+/// into the upsert SQL.
+///
+/// The owner is resolved **once per chunk** and every stored span comes back in
+/// one `google_event_id IN (…)` SELECT, so a batch costs two reads and one
+/// dirty statement instead of three round trips per event. The batch shares one
+/// calendar (the fenced upsert already binds `chunk[0].calendar_id`), so one
+/// owner is correct; a missing/soft-deleted calendar means no mark at all.
+struct DirtyChunk {
+    user_id: Option<String>,
+    /// Stored spans ∪ incoming spans, in event order.
+    spans: Vec<OwnedSpan>,
 }
 
 /// Owned copy of [`EventSpan`].
@@ -84,6 +97,16 @@ impl OwnedSpan {
     }
 
     fn from_row(row: &EventSpanRow) -> Self {
+        Self {
+            start: row.start_time.clone(),
+            end: row.end_time.clone(),
+            start_tz: row.start_time_zone.clone(),
+            end_tz: row.end_time_zone.clone(),
+        }
+    }
+
+    /// Same span, from the batch lookup's keyed row.
+    fn from_key_row(row: &EventSpanKeyRow) -> Self {
         Self {
             start: row.start_time.clone(),
             end: row.end_time.clone(),
@@ -536,6 +559,11 @@ impl CalendarRepo for D1CalendarRepo {
     }
 
     async fn delete(&self, id: &str, now_rfc3339: &str) -> Result<(), RepoError> {
+        // The owner is read **before** the soft delete: the calendar is
+        // invisible to `DIGEST_CALENDAR_OWNER_SQL` afterwards.
+        let owner = crate::db::calendar_owner(&self.db, id)
+            .await
+            .unwrap_or(None);
         let stmt = self
             .db
             .prepare(CALENDAR_DELETE_SQL)
@@ -545,7 +573,23 @@ impl CalendarRepo for D1CalendarRepo {
                 D1Type::Text(id),
             ])
             .map_err(backend)?;
-        run_stmt(stmt).await
+        let changes = run_stmt_changes(stmt).await?;
+        // Best-effort: a lost dirty mark only delays a rebuild, while a failed
+        // delete loses the calendar. Only a delete that actually happened marks
+        // — a re-delete of an already-deleted calendar is a no-op.
+        if changes > 0 {
+            if let Some(user_id) = owner {
+                if let Err(err) =
+                    crate::db::mark_dirty_for_calendar_delete(&self.db, &user_id, id, now_rfc3339)
+                        .await
+                {
+                    console_log!(
+                        "calendar: digest dirty mark failed for deleted calendar {id}: {err}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn get_calendar_list_sync_token(
@@ -773,8 +817,8 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             ])
             .map_err(backend)?;
         run_stmt(stmt).await?;
-        if let Some(span) = stored {
-            self.mark_dirty(&span.calendar_id, None, Some(span.new.as_span()), now_rfc3339)
+        if let Some(pending) = stored {
+            self.mark_dirty(&pending.calendar_id, None, Some(pending.span.as_span()), now_rfc3339)
                 .await;
         }
         Ok(())
@@ -973,12 +1017,10 @@ impl CalendarEventRepo for D1CalendarEventRepo {
 
         // A lost lease leaves the candidate list empty (the SELECT carries the
         // same lease gate), so nothing is marked for rows the UPDATE did not
-        // touch. Best-effort: `mark_dirty` swallows and logs.
+        // touch. Best-effort: `mark_dirty_for_stored_spans` swallows and logs.
         if held {
-            for span in &spans {
-                self.mark_dirty(calendar_id, None, Some(span.as_span()), now_rfc3339)
-                    .await;
-            }
+            self.mark_dirty_for_stored_spans(calendar_id, &spans, now_rfc3339)
+                .await;
         }
         Ok(held)
     }
@@ -1049,37 +1091,89 @@ impl D1CalendarEventRepo {
 
     /// Dirty-marking inputs for one chunk, captured **before** the events move
     /// into the upsert SQL.
-    async fn gather_dirty(&self, events: &[NewCalendarEvent]) -> Vec<DirtySpan> {
-        let mut pending = Vec::with_capacity(events.len());
-        for event in events {
-            let old = crate::db::stored_event_span(
-                &self.db,
-                &event.calendar_id,
-                &event.google_event_id,
-            )
+    ///
+    /// Batching: one owner lookup and **one** span SELECT (`google_event_id IN
+    /// (…)`) per chunk, not one of each per event. The chunk shares a calendar,
+    /// so the owner is a single answer.
+    async fn gather_dirty(&self, events: &[NewCalendarEvent]) -> DirtyChunk {
+        let Some(first) = events.first() else {
+            return DirtyChunk {
+                user_id: None,
+                spans: Vec::new(),
+            };
+        };
+        let calendar_id = first.calendar_id.as_str();
+        let user_id = crate::db::calendar_owner(&self.db, calendar_id)
             .await
             .unwrap_or(None);
-            pending.push(DirtySpan {
-                calendar_id: event.calendar_id.clone(),
-                old,
-                new: OwnedSpan::from_event(event),
-            });
+        if user_id.is_none() {
+            // Missing/soft-deleted calendar: no mark at all.
+            return DirtyChunk {
+                user_id: None,
+                spans: Vec::new(),
+            };
         }
-        pending
+        let google_event_ids: Vec<String> = events
+            .iter()
+            .map(|event| event.google_event_id.clone())
+            .collect();
+        let stored = crate::db::stored_event_spans(&self.db, calendar_id, &google_event_ids)
+            .await
+            .unwrap_or_default();
+        let mut spans: Vec<OwnedSpan> = Vec::with_capacity(events.len() * 2);
+        for event in events {
+            if let Some(row) = stored
+                .iter()
+                .find(|row| row.google_event_id == event.google_event_id)
+            {
+                spans.push(OwnedSpan::from_key_row(row));
+            }
+            spans.push(OwnedSpan::from_event(event));
+        }
+        DirtyChunk { user_id, spans }
     }
 
     /// Best-effort dirty marking: a failure is logged, never returned. The
     /// Google cache is the source of truth, and a lost mark only delays a
     /// rebuild — while a failed event write loses real data.
-    async fn apply_dirty(&self, pending: &[DirtySpan], now_rfc3339: &str) {
-        for span in pending {
-            self.mark_dirty(
-                &span.calendar_id,
-                span.old.as_ref(),
-                Some(span.new.as_span()),
-                now_rfc3339,
-            )
-            .await;
+    ///
+    /// One statement for the whole chunk: the union of every event's stored and
+    /// incoming spans (`mark_dirty_dates` chunks it under D1's bind limit).
+    async fn apply_dirty(&self, pending: &DirtyChunk, now_rfc3339: &str) {
+        let Some(user_id) = pending.user_id.as_deref() else {
+            return;
+        };
+        let spans: Vec<EventSpan<'_>> = pending.spans.iter().map(OwnedSpan::as_span).collect();
+        if let Err(err) =
+            crate::db::mark_dirty_span_union(&self.db, user_id, &spans, now_rfc3339).await
+        {
+            console_log!("calendar: digest dirty mark failed for {user_id}: {err}");
+        }
+    }
+
+    /// Best-effort dirty marking for a list of **stored** spans of one calendar
+    /// (the absent sweep): one owner lookup and one dirty statement for the
+    /// union of their dates, not one round trip per row.
+    async fn mark_dirty_for_stored_spans(
+        &self,
+        calendar_id: &str,
+        rows: &[EventSpanRow],
+        now_rfc3339: &str,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let Some(user_id) = crate::db::calendar_owner(&self.db, calendar_id)
+            .await
+            .unwrap_or(None)
+        else {
+            return;
+        };
+        let spans: Vec<EventSpan<'_>> = rows.iter().map(EventSpanRow::as_span).collect();
+        if let Err(err) =
+            crate::db::mark_dirty_span_union(&self.db, &user_id, &spans, now_rfc3339).await
+        {
+            console_log!("calendar: digest dirty mark failed for calendar {calendar_id}: {err}");
         }
     }
 
@@ -1125,8 +1219,7 @@ impl D1CalendarEventRepo {
             .unwrap_or(None)?;
         Some(DirtySpan {
             calendar_id: key.calendar_id,
-            old: None,
-            new: OwnedSpan::from_row(&stored),
+            span: OwnedSpan::from_row(&stored),
         })
     }
 

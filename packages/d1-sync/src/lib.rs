@@ -9,7 +9,10 @@ mod record;
 mod repos;
 mod rules;
 
-pub use digest::{calendar_owner, count_rows, event_span, mark_dirty_spans, SqliteDigestRepo};
+pub use digest::{
+    calendar_owner, count_rows, event_span, mark_dirty_dates, mark_dirty_for_deleted_calendar,
+    mark_dirty_spans, SqliteDigestRepo,
+};
 pub use record::{
     seed_category_full, seed_event, seed_hour_seconds, seed_meta, seed_night, SqliteRecordRepo,
 };

@@ -86,10 +86,16 @@ pub struct RecordSegment {
 }
 
 /// One day of the record. `untracked_seconds` is `null` while the day is still
-/// being written (it is today in its own zone).
+/// being written (it is today in its own zone) and `null` for a day with no
+/// aggregate at all (`aggregated == false`): a day nobody computed is not a
+/// 24-hour untracked claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordDay {
     pub date: String,
+    /// Whether a `daily_meta` row exists for the date. `false` = the date was
+    /// zero-filled because nothing has been computed yet — a missing
+    /// aggregate, not a computed zero.
+    pub aggregated: bool,
     pub segments: Vec<RecordSegment>,
     pub untracked_seconds: Option<i64>,
 }
@@ -252,18 +258,25 @@ pub fn assemble_record(
     let mut days: Vec<RecordDay> = Vec::new();
     for date in each_date(&window.from, &window.to) {
         let day_meta = meta.get(date.as_str());
-        // A missing row is a zero day: nothing tracked, so nothing to subtract.
+        // A missing row is **not** a tracked zero: nothing has been computed
+        // for the date yet (`aggregated: false`), so there is no aggregate to
+        // subtract from and no honest untracked figure either.
         let tracked = day_meta.map_or(0, |row| row.tracked_seconds);
         let day_zone = day_meta
             .map(|row| row.time_zone.trim())
             .filter(|zone| !zone.is_empty())
             .unwrap_or(time_zone);
+        let untracked = match day_meta {
+            None => None,
+            Some(_) => untracked_seconds(tracked, &date, day_zone, now_unix),
+        };
         days.push(RecordDay {
+            aggregated: day_meta.is_some(),
             segments: per_date
                 .get(&date)
                 .map(|totals| segments_for(&catalog, totals))
                 .unwrap_or_default(),
-            untracked_seconds: untracked_seconds(tracked, &date, day_zone, now_unix),
+            untracked_seconds: untracked,
             date,
         });
     }

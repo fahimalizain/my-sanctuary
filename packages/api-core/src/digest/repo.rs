@@ -34,9 +34,24 @@ pub const DIGEST_MARK_DIRTY_SQL: &str = "
     ON CONFLICT(user_id, local_date) DO UPDATE SET enqueued_at = excluded.enqueued_at
 ";
 
-/// Rows per dirty-mark statement (3 binds each; 33 rows = 99 binds).
+/// Rows per dirty-mark statement (3 binds each).
+///
+/// The chunk keeps one bind of headroom back (`(100 - 1) / 3 = 33` rows = 99
+/// binds): a statement-level bind added later must not push a full chunk over
+/// D1's 100-parameter limit — the category merge flag taught us that
+/// (`EVENT_UPSERT_PRESERVE_BIND`).
 pub const DIGEST_MARK_DIRTY_COL_COUNT: usize = 3;
-pub const DIGEST_MARK_DIRTY_CHUNK_SIZE: usize = 100 / DIGEST_MARK_DIRTY_COL_COUNT; // 33
+/// Headroom kept back for a future statement-level bind.
+pub const DIGEST_MARK_DIRTY_SPARE_BINDS: usize = 1;
+pub const DIGEST_MARK_DIRTY_CHUNK_SIZE: usize =
+    (100 - DIGEST_MARK_DIRTY_SPARE_BINDS) / DIGEST_MARK_DIRTY_COL_COUNT; // 33
+
+/// Compile-time guard: a full dirty-mark chunk plus its spare bind stays inside
+/// D1's 100-parameter limit.
+const _: () = assert!(
+    DIGEST_MARK_DIRTY_CHUNK_SIZE * DIGEST_MARK_DIRTY_COL_COUNT + DIGEST_MARK_DIRTY_SPARE_BINDS
+        <= 100
+);
 
 /// A day that may be touched by an interval, plus its ±1 calendar-day sleep
 /// neighbours.
@@ -172,10 +187,24 @@ pub const DIGEST_CLEAR_DIRTY_SQL: &str =
 
 /// Users with work: a dirty day, or a job still `running` (so a stuck job is
 /// always picked up again).
+///
+/// Ordered by the **oldest** dirty `enqueued_at`, then `user_id`: without an
+/// `ORDER BY` the same user can be picked tick after tick while everyone else
+/// starves. A user whose only work is a `running` job has no dirty stamp and
+/// sorts after every dirty user (a running job is drained within a tick or two,
+/// so it cannot starve the queue; it is still never dropped).
 pub const DIGEST_USERS_WITH_WORK_SQL: &str = "
-    SELECT user_id FROM dirty_local_days
-    UNION
-    SELECT user_id FROM report_job_status WHERE status = 'running'
+    SELECT user_id, MIN(oldest_dirty) AS oldest_dirty FROM (
+      SELECT user_id, MIN(enqueued_at) AS oldest_dirty
+      FROM dirty_local_days
+      GROUP BY user_id
+      UNION ALL
+      SELECT user_id, NULL AS oldest_dirty
+      FROM report_job_status
+      WHERE status = 'running'
+    )
+    GROUP BY user_id
+    ORDER BY oldest_dirty IS NULL, oldest_dirty, user_id
     LIMIT ?
 ";
 
@@ -508,6 +537,49 @@ pub const DIGEST_RECLASSIFY_BATCH_SQL: &str = "
     LIMIT ?
 ";
 
+/// The next **unstamped** living events for a user, oldest id first — the
+/// verification scan behind [`DIGEST_RECLASSIFY_BATCH_SQL`].
+///
+/// Ids are random UUIDs, so a row inserted while the scan is walking can sort
+/// *before* the cursor and would never be visited again. A short batch
+/// therefore only finishes the job when this comes back empty; the same columns
+/// as the batch query, so the caller stamps both through one path.
+pub const DIGEST_UNSTAMPED_BATCH_SQL: &str = "
+    SELECT
+      e.id AS id,
+      e.title AS title,
+      c.google_calendar_id AS google_calendar_id,
+      e.start_time AS start_time,
+      e.end_time AS end_time,
+      e.start_time_zone AS start_time_zone,
+      e.end_time_zone AS end_time_zone,
+      e.category_id AS category_id
+    FROM calendar_events e
+    JOIN google_calendars c ON c.id = e.calendar_id
+    WHERE c.user_id = ?
+      AND c.deleted_at IS NULL
+      AND e.deleted_at IS NULL
+      AND e.category_id IS NULL
+    ORDER BY e.id
+    LIMIT ?
+";
+
+/// Does the user still have a living event with no leaf stamp?
+///
+/// A `done` reclassify job may only be left alone when this is `false`: a
+/// taxonomy edit that lands after the scan finished must restart it, while a
+/// finished scan with nothing left must not.
+pub const DIGEST_HAS_UNSTAMPED_SQL: &str = "
+    SELECT 1 AS present
+    FROM calendar_events e
+    JOIN google_calendars c ON c.id = e.calendar_id
+    WHERE c.user_id = ?
+      AND c.deleted_at IS NULL
+      AND e.deleted_at IS NULL
+      AND e.category_id IS NULL
+    LIMIT 1
+";
+
 /// One row of a reclassify batch.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ReclassifyRow {
@@ -567,6 +639,122 @@ impl EventSpanRow {
         }
     }
 }
+
+/// One stored span keyed by its Google event id — the batch upsert's
+/// replacement for one [`DIGEST_EVENT_SPAN_SQL`] round-trip per event.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct EventSpanKeyRow {
+    pub google_event_id: String,
+    pub start_time: String,
+    pub end_time: String,
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub start_time_zone: String,
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub end_time_zone: String,
+}
+
+impl EventSpanKeyRow {
+    /// Borrows the row as an [`EventSpan`].
+    pub fn as_span(&self) -> EventSpan<'_> {
+        EventSpan {
+            start_rfc3339: &self.start_time,
+            end_rfc3339: &self.end_time,
+            start_time_zone: &self.start_time_zone,
+            end_time_zone: &self.end_time_zone,
+        }
+    }
+}
+
+/// Ids one span-lookup statement may bind: one bind per id **plus** the
+/// `calendar_id`, with one bind of headroom (`99 + 1 = 100`).
+pub const DIGEST_EVENT_SPANS_SPARE_BINDS: usize = 1;
+pub const DIGEST_EVENT_SPANS_MAX_IDS: usize = 100 - DIGEST_EVENT_SPANS_SPARE_BINDS; // 99
+
+/// Compile-time guard: `calendar_id` + one id per row + the spare bind stays
+/// inside D1's 100-parameter limit.
+const _: () = assert!(DIGEST_EVENT_SPANS_MAX_IDS + DIGEST_EVENT_SPANS_SPARE_BINDS <= 100);
+
+/// Builds the whole chunk's stored-span lookup: `calendar_id` plus
+/// `google_event_id IN (…)`. One statement replaces N per-event SELECTs on the
+/// batch upsert path; the caller maps rows back by `google_event_id`.
+pub fn build_event_spans_by_google_ids_sql(
+    calendar_id: &str,
+    google_event_ids: &[String],
+) -> (String, Vec<String>) {
+    assert!(
+        !google_event_ids.is_empty(),
+        "span lookup chunk must not be empty"
+    );
+    assert!(
+        google_event_ids.len() <= DIGEST_EVENT_SPANS_MAX_IDS,
+        "span lookup chunk exceeds {DIGEST_EVENT_SPANS_MAX_IDS} ids"
+    );
+    let mut sql = String::from(
+        "SELECT google_event_id, start_time, end_time, start_time_zone, end_time_zone
+         FROM calendar_events
+         WHERE calendar_id = ? AND google_event_id IN (",
+    );
+    let mut args: Vec<String> = Vec::with_capacity(google_event_ids.len() + 1);
+    args.push(calendar_id.to_string());
+    for (index, google_event_id) in google_event_ids.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        args.push(google_event_id.clone());
+    }
+    sql.push(')');
+    (sql, args)
+}
+
+/// Every **living** event span of one calendar, for dirty-marking a calendar
+/// soft-delete.
+///
+/// The digest drops a soft-deleted calendar's events (`DIGEST_LOAD_EVENTS_SQL`
+/// filters `c.deleted_at IS NULL`), so the days those events used to fill must
+/// be rebuilt once the calendar goes away. Soft-deleting a calendar is rare, so
+/// the exact per-event union (`dirty_dates_for_spans`, each event's own zone
+/// and ±1 neighbours) is preferred over a cheaper min/max closed range that
+/// would also dirty the days in between. Soft-deleted events are skipped: they
+/// are already out of the digest.
+pub const DIGEST_CALENDAR_EVENT_SPANS_SQL: &str = "
+    SELECT start_time, end_time, start_time_zone, end_time_zone
+    FROM calendar_events
+    WHERE calendar_id = ? AND deleted_at IS NULL
+";
+
+/// `target_hours * 3600`, rounded, from a `sleep_duration` revision's params
+/// JSON. `None` when the JSON is not a usable params object or names no
+/// positive duration — the caller keeps [`super::DEFAULT_SLEEP_SECS`].
+pub fn sleep_target_secs_from_params(params_json: &str) -> Option<i64> {
+    #[derive(Deserialize)]
+    struct SleepDurationParams {
+        target_hours: f64,
+    }
+    let params: SleepDurationParams = serde_json::from_str(params_json).ok()?;
+    if !params.target_hours.is_finite() || params.target_hours <= 0.0 {
+        return None;
+    }
+    Some((params.target_hours * 3600.0).round() as i64)
+}
+
+/// The **latest** `sleep_duration` revision's params JSON for one user.
+///
+/// The estimation default is the user's real number: the rule's target is
+/// seeded at 6.5h but editable, so a rebuild must read it instead of the
+/// constant. Latest revision of the newest revision set wins (`effective_from`
+/// descending, ties by `created_at` then `id` — the rules service's own
+/// "latest wins" rule); archived rules are out of play.
+pub const DIGEST_SLEEP_TARGET_PARAMS_SQL: &str = "
+    SELECT rev.params_json AS params_json
+    FROM rules r
+    JOIN rule_revisions rev ON rev.rule_id = r.id
+    WHERE r.user_id = ?
+      AND r.kind = 'sleep_duration'
+      AND r.status != 'archived'
+    ORDER BY rev.effective_from DESC, rev.created_at DESC, rev.id DESC
+    LIMIT 1
+";
 
 /// A `report_job_status` row.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -658,6 +846,20 @@ pub trait DigestRepo: Send + Sync {
         after_id: &str,
         limit: usize,
     ) -> Result<Vec<ReclassifyRow>, RepoError>;
+    /// The next `limit` living events with **no** leaf stamp, ordered by id —
+    /// the verification scan a finished id walk runs before it may complete.
+    async fn unstamped_batch(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ReclassifyRow>, RepoError>;
+    /// Whether any living event still has no leaf stamp.
+    async fn has_unstamped_event(&self, user_id: &str) -> Result<bool, RepoError>;
+    /// The user's `sleep_duration` target in seconds (`target_hours * 3600`,
+    /// rounded) from the latest non-archived rule, or `None` when they have no
+    /// such rule — the caller falls back to
+    /// [`super::DEFAULT_SLEEP_SECS`].
+    async fn sleep_target_secs(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
     /// Rewrites one event's leaf stamp (`None`/empty clears it to `NULL`).
     async fn set_category(&self, id: &str, category_id: Option<&str>) -> Result<(), RepoError>;
     /// Whether any `daily_meta` row exists for the user.

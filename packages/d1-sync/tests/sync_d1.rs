@@ -919,6 +919,291 @@ fn d1_sweep_absent_if_owner_dirties_the_days_it_deletes() {
 
 // ── Digest tables (slice 2) ─────────────────────────────────────────────────
 
+/// A batch upsert dirties the union of every row's stored span and incoming
+/// span in **one** pass: the chunk resolves the owner once and reads all stored
+/// spans in one `google_event_id IN (…)` SELECT (F6).
+#[test]
+fn d1_batch_upsert_dirties_the_union_of_three_spans() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+    }
+    let digest = h.digest();
+
+    // One event already exists with a **different** stored span, so the batch
+    // has to union the old dates in as well.
+    let mut existing = sample_new_event("g-a", "A");
+    existing.start_time = "2026-09-01T10:00:00Z".to_string();
+    existing.end_time = "2026-09-01T11:00:00Z".to_string();
+    pollster::block_on(h.events.upsert(existing, NOW_RFC)).expect("seed a");
+    pollster::block_on(digest.clear_dirty(
+        "u-1",
+        &[
+            "2026-08-31".to_string(),
+            "2026-09-01".to_string(),
+            "2026-09-02".to_string(),
+        ],
+    ))
+    .expect("clear");
+
+    let mut moved = sample_new_event("g-a", "A moved");
+    moved.start_time = "2026-09-20T10:00:00Z".to_string();
+    moved.end_time = "2026-09-20T11:00:00Z".to_string();
+    let mut b = sample_new_event("g-b", "B");
+    b.start_time = "2026-09-05T10:00:00Z".to_string();
+    b.end_time = "2026-09-05T11:00:00Z".to_string();
+    let mut c = sample_new_event("g-c", "C");
+    c.start_time = "2026-09-10T10:00:00Z".to_string();
+    c.end_time = "2026-09-10T11:00:00Z".to_string();
+
+    pollster::block_on(h.events.upsert_batch(vec![moved, b, c], NOW_RFC)).expect("batch");
+
+    assert_eq!(
+        pollster::block_on(digest.list_dirty("u-1", 20)).expect("dirty"),
+        vec![
+            // A's stored span (read for the whole chunk in one SELECT).
+            "2026-08-31".to_string(),
+            "2026-09-01".to_string(),
+            "2026-09-02".to_string(),
+            // B.
+            "2026-09-04".to_string(),
+            "2026-09-05".to_string(),
+            "2026-09-06".to_string(),
+            // C.
+            "2026-09-09".to_string(),
+            "2026-09-10".to_string(),
+            "2026-09-11".to_string(),
+            // A's incoming span.
+            "2026-09-19".to_string(),
+            "2026-09-20".to_string(),
+            "2026-09-21".to_string(),
+        ],
+        "the 3-row batch dirties the union of the stored and incoming spans"
+    );
+}
+
+/// Soft-deleting a calendar dirties every local date its **living** events used
+/// to fill: the digest stops seeing those events the moment `deleted_at` is set
+/// (F9).
+#[test]
+fn d1_calendar_soft_delete_dirties_its_living_events_days() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        seed_timed_event(
+            &conn,
+            "e-1",
+            "g-1",
+            "2026-09-10T22:00:00Z",
+            "2026-09-10T23:00:00Z",
+            "UTC",
+            None,
+            "confirmed",
+            "",
+        )
+        .expect("event");
+    }
+    let digest = h.digest();
+
+    pollster::block_on(h.calendars.delete("cal-1", NOW_RFC)).expect("delete");
+
+    let stored = pollster::block_on(h.calendars.get_by_id_unfiltered("cal-1"))
+        .expect("read")
+        .expect("row");
+    assert!(stored.deleted_at.is_some(), "the calendar is soft-deleted");
+    assert_eq!(
+        pollster::block_on(digest.list_dirty("u-1", 10)).expect("dirty"),
+        vec![
+            "2026-09-09".to_string(),
+            "2026-09-10".to_string(),
+            "2026-09-11".to_string()
+        ],
+        "the deleted calendar's living event days are dirty"
+    );
+
+    // A second delete is a no-op: the calendar is already gone, so its owner is
+    // no longer resolvable and nothing is re-marked.
+    pollster::block_on(digest.clear_dirty(
+        "u-1",
+        &[
+            "2026-09-09".to_string(),
+            "2026-09-10".to_string(),
+            "2026-09-11".to_string(),
+        ],
+    ))
+    .expect("clear");
+    pollster::block_on(h.calendars.delete("cal-1", NOW_RFC)).expect("delete again");
+    assert!(
+        pollster::block_on(digest.list_dirty("u-1", 10))
+            .expect("dirty")
+            .is_empty(),
+        "an already-deleted calendar marks nothing"
+    );
+}
+
+/// The work order is fair: the user whose dirty day has waited longest goes
+/// first, so one user's backlog cannot starve the others (F14).
+#[test]
+fn d1_users_with_work_orders_by_the_oldest_dirty_stamp() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        conn.execute(
+            "INSERT INTO dirty_local_days (user_id, local_date, enqueued_at) VALUES
+             ('u-1', '2026-09-01', '2026-09-01T00:00:00Z'),
+             ('u-2', '2026-09-02', '2026-09-02T00:00:00Z')",
+            [],
+        )
+        .expect("dirty rows");
+        // u-3 has no dirty day, only a running job: it is picked, but after
+        // every user with real dirty work.
+        conn.execute(
+            "INSERT INTO report_job_status (user_id, kind, status, cursor, updated_at)
+             VALUES ('u-3', 'backfill', 'running', '', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .expect("job row");
+    }
+    let digest = h.digest();
+
+    assert_eq!(
+        pollster::block_on(digest.users_with_work(3)).expect("work"),
+        vec!["u-1".to_string(), "u-2".to_string(), "u-3".to_string()],
+        "oldest dirty stamp first, job-only users last"
+    );
+
+    // Re-stamping u-1's day moves it behind u-2.
+    {
+        let conn = h.db.lock().unwrap();
+        conn.execute(
+            "UPDATE dirty_local_days SET enqueued_at = '2026-09-03T00:00:00Z'
+             WHERE user_id = 'u-1'",
+            [],
+        )
+        .expect("restamp");
+    }
+    assert_eq!(
+        pollster::block_on(digest.users_with_work(3)).expect("work"),
+        vec!["u-2".to_string(), "u-1".to_string(), "u-3".to_string()]
+    );
+}
+
+/// The estimation default is the user's own `sleep_duration` rule target, read
+/// from the rules tables through the digest repo (F15).
+#[test]
+fn d1_sleep_target_reads_the_latest_sleep_duration_revision() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        conn.execute(
+            "INSERT INTO rules (
+               id, user_id, name, icon, kind, status, starts_on, ends_on, paused_on,
+               sort_order, created_at, updated_at
+             ) VALUES ('r-sleep', 'u-1', 'Sleep duration', 'sleep', 'sleep_duration',
+                       'active', '2026-01-01', NULL, NULL, 0, ?1, ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("rule");
+        conn.execute(
+            "INSERT INTO rule_revisions (id, rule_id, effective_from, params_json, created_at)
+             VALUES ('rev-1', 'r-sleep', '2026-01-01',
+                     '{\"window_days\":60,\"min_nights\":14,\"target_hours\":6.5}', ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("revision");
+        conn.execute(
+            "INSERT INTO rule_revisions (id, rule_id, effective_from, params_json, created_at)
+             VALUES ('rev-2', 'r-sleep', '2026-06-01',
+                     '{\"window_days\":60,\"min_nights\":14,\"target_hours\":8}', ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("revision");
+        // An archived rule never wins, even with the newest revision.
+        conn.execute(
+            "INSERT INTO rules (
+               id, user_id, name, icon, kind, status, starts_on, ends_on, paused_on,
+               sort_order, created_at, updated_at
+             ) VALUES ('r-old', 'u-1', 'Old sleep', 'sleep', 'sleep_duration',
+                       'archived', '2025-01-01', NULL, NULL, 1, ?1, ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("archived rule");
+        conn.execute(
+            "INSERT INTO rule_revisions (id, rule_id, effective_from, params_json, created_at)
+             VALUES ('rev-3', 'r-old', '2027-01-01', '{\"target_hours\":9}', ?1)",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("archived revision");
+    }
+    let digest = h.digest();
+
+    assert_eq!(
+        pollster::block_on(digest.sleep_target_secs("u-1")).expect("target"),
+        Some(8 * 3600),
+        "the latest non-archived revision wins"
+    );
+    assert_eq!(
+        pollster::block_on(digest.sleep_target_secs("u-nobody")).expect("target"),
+        None,
+        "no rule ⇒ no target (the caller keeps DEFAULT_SLEEP_SECS)"
+    );
+}
+
+/// The verification scan finds a living, unstamped event whatever its id — the
+/// id walk (`e.id > ?`) can skip one that sorts before its cursor (F11/F14).
+#[test]
+fn d1_unstamped_scan_finds_rows_the_id_cursor_would_skip() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        seed_event(&conn, "e-a", "g-a", None, "confirmed", "").expect("a");
+        seed_event(&conn, "e-b", "g-b", None, "confirmed", "").expect("b");
+        conn.execute(
+            "UPDATE calendar_events SET category_id = 'cat-work' WHERE id = 'e-b'",
+            [],
+        )
+        .expect("stamp b");
+        // A soft-deleted row never counts as pending work.
+        seed_event(&conn, "e-c", "g-c", None, "confirmed", "").expect("c");
+        conn.execute(
+            "UPDATE calendar_events SET deleted_at = ?1 WHERE id = 'e-c'",
+            rusqlite::params![NOW_RFC],
+        )
+        .expect("soft-delete c");
+    }
+    let digest = h.digest();
+
+    let batch = pollster::block_on(digest.unstamped_batch("u-1", 10)).expect("batch");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].id, "e-a");
+    assert_eq!(batch[0].category_id, None);
+    assert!(
+        pollster::block_on(digest.has_unstamped_event("u-1")).expect("has"),
+        "the living unstamped row is pending"
+    );
+    // The walk's cursor is past it: `e.id > 'e-a'` never returns it again.
+    assert!(
+        pollster::block_on(digest.reclassify_batch("u-1", "e-a", 10))
+            .expect("walk")
+            .iter()
+            .all(|row| row.id != "e-a")
+    );
+
+    pollster::block_on(digest.set_category("e-a", Some("cat-work"))).expect("stamp");
+    assert!(
+        !pollster::block_on(digest.has_unstamped_event("u-1")).expect("has"),
+        "nothing unstamped is left"
+    );
+    assert!(pollster::block_on(digest.unstamped_batch("u-1", 10))
+        .expect("batch")
+        .is_empty());
+}
+
 /// Every digest statement must survive the real schema: apply the Worker
 /// migrations, write one day + its dirty mark out of a calendar-event upsert,
 /// then read the rows back.
