@@ -413,6 +413,12 @@ pub struct PatchEventFields {
 pub struct NewEventInput {
     /// Local DB calendar id (`google_calendars.id`), not the Google id.
     pub calendar_id: String,
+    /// When true, `calendar_id` is the caller's explicit destination and is
+    /// never replaced by the title's category calendar. When false/omitted,
+    /// the HTTP create path resolves the category's calendar (pattern →
+    /// category → parent → primary, the task timer rule).
+    #[serde(default)]
+    pub calendar_id_explicit: bool,
     pub summary: String,
     /// Event notes → Google `description`. `None` omits the key from the
     /// insert payload; task timer events carry the task's notes as a

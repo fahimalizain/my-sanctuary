@@ -101,6 +101,9 @@ export function pasteCreateInput(
 
   return {
     calendar_id: calendarId,
+    // A paste keeps its computed destination (source when writable, else the
+    // default); the server must not reroute it by title category.
+    calendar_id_explicit: true,
     summary: item.summary.trim(),
     start: item.start,
     end: item.end,

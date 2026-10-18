@@ -82,14 +82,18 @@ async fn paint_events_with_fallback(
     }
 }
 
-/// Auto-resolves the Google event label for a hand-created calendar event.
+/// Resolves the default calendar and Google event label for a hand-created
+/// calendar event.
 ///
-/// The web create body does not send a color. Use the same title classifier
-/// as the calendar paint path (the local chip color) and stamp the matched
-/// category hex onto the create input when the destination calendar has event
-/// labels. Best-effort: taxonomy or label-cache failures leave the event
-/// uncolored rather than failing the user's write.
-async fn resolve_create_color(
+/// The web create body sends the default writable calendar and no color.
+/// When the caller did not mark `calendar_id` as an explicit choice, route
+/// the event to the title's category calendar (pattern → category → parent →
+/// primary, the task timer rule) and use that category's hex. Then resolve
+/// the hex against the destination calendar's cached `eventLabels`, refreshing
+/// an empty cache once. Best-effort: taxonomy or label-cache failures keep the
+/// requested calendar / leave the event uncolored rather than failing the
+/// write.
+async fn resolve_create_defaults(
     calendars: &crate::db::D1CalendarRepo,
     list_repo: &crate::db::D1TaskListRepo,
     category_repo: &crate::db::D1TaskCategoryRepo,
@@ -98,17 +102,38 @@ async fn resolve_create_color(
     now_unix: i64,
     input: &mut NewEventInput,
 ) {
-    // Explicit `Some` (including an explicit empty string) is the caller's
-    // choice — only hand-created bodies with the field omitted auto-resolve.
-    if input.color_hex.is_some() {
-        return;
+    let taxonomy = match api_core::load_paint_taxonomy(list_repo, category_repo, user_id).await {
+        Ok(taxonomy) => taxonomy,
+        Err(err) => {
+            console_log!("calendar: create taxonomy failed: {err}");
+            return;
+        }
+    };
+
+    // An explicit calendar pick (draft inspector) is never rerouted. A fresh
+    // draft carries the default writable calendar, so the title's category
+    // decides where it lands.
+    if !input.calendar_id_explicit {
+        match calendars.list_by_user_id(user_id).await {
+            Ok(user_cals) => {
+                if let Some(target) =
+                    api_core::resolve_event_create_target(&input.summary, &user_cals, &taxonomy)
+                {
+                    input.calendar_id = target.calendar_id;
+                    if input.color_hex.is_none() {
+                        input.color_hex = target.color_hex;
+                    }
+                }
+            }
+            Err(err) => console_log!("calendar: create target lookup failed: {err}"),
+        }
     }
 
     let cal = match calendars.get_by_id(&input.calendar_id).await {
         Ok(Some(cal)) => cal,
         Ok(None) => return,
         Err(err) => {
-            console_log!("calendar: create color lookup failed: {err}");
+            console_log!("calendar: create lookup failed: {err}");
             return;
         }
     };
@@ -116,21 +141,19 @@ async fn resolve_create_color(
         return;
     }
 
-    let taxonomy = match api_core::load_paint_taxonomy(list_repo, category_repo, user_id).await {
-        Ok(taxonomy) => taxonomy,
-        Err(err) => {
-            console_log!("calendar: create color taxonomy failed: {err}");
-            return;
-        }
-    };
-    let Some(color) = api_core::color_for_event_title(
-        &input.summary,
-        &cal.google_calendar_id,
-        &taxonomy.categories,
-        &taxonomy.matchers,
-    ) else {
+    // Explicit `Some` (including an explicit empty string) is the caller's
+    // choice — only fill an omitted color.
+    if input.color_hex.is_none() {
+        input.color_hex = api_core::color_for_event_title(
+            &input.summary,
+            &cal.google_calendar_id,
+            &taxonomy.categories,
+            &taxonomy.matchers,
+        );
+    }
+    if input.color_hex.is_none() {
         return;
-    };
+    }
 
     // A colored insert resolves the hex against the cached `eventLabels`.
     // Refresh a never-populated cache once; on failure fall back to an
@@ -146,16 +169,17 @@ async fn resolve_create_color(
         .await
         {
             console_log!("calendar: create event-label refresh failed: {err}");
+            input.color_hex = None;
             return;
         }
         // Re-read: some calendars (readers) legitimately have no labels.
         match calendars.get_by_id(&cal.id).await {
             Ok(Some(fresh)) if !fresh.event_labels.is_empty() => {}
-            _ => return,
+            _ => {
+                input.color_hex = None;
+            }
         }
     }
-
-    input.color_hex = Some(color);
 }
 
 /// `GET /api/calendar/events` → 200
@@ -420,13 +444,15 @@ pub async fn repair_calendar(
 /// start_time_zone?}`. `is_all_day: true` writes civil `start.date` /
 /// `end.date` (both start and end must carry a civil date, else 400); the
 /// default timed path keeps `dateTime` and stamps a non-empty trimmed
-/// `start_time_zone` as `timeZone` on both objects. When `color_hex` is
-/// omitted, the title is classified against the user's category taxonomy and
-/// the matched color is written as the Google event label (best-effort: no
-/// match stays uncolored). Journals the outbound insert, creates the event on
-/// Google, then upserts the returned row into the cache. A cache failure after
-/// Google commit is 500 (`CalendarError::Repo`) — never 200 with a phantom
-/// local id.
+/// `start_time_zone` as `timeZone` on both objects. Unless
+/// `calendar_id_explicit` is true, the title is classified against the user's
+/// category taxonomy and the event is inserted into the matched category's
+/// calendar (pattern → category → parent → primary); the matched color is
+/// written as the Google event label. Best-effort: no match falls back to
+/// primary and stays uncolored. Journals the outbound insert, creates the
+/// event on Google, then upserts the returned row into the cache. A cache
+/// failure after Google commit is 500 (`CalendarError::Repo`) — never 200 with
+/// a phantom local id.
 pub async fn create_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -457,7 +483,7 @@ pub async fn create_event(
     let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
     let list_repo = crate::db::D1TaskListRepo::new(d1()?);
     let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
-    resolve_create_color(
+    resolve_create_defaults(
         &calendars,
         &list_repo,
         &category_repo,

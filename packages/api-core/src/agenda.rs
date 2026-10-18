@@ -1537,6 +1537,7 @@ pub async fn start_occurrence(
         user_id,
         &NewEventInput {
             calendar_id: target.calendar_id.clone(),
+            calendar_id_explicit: true,
             summary: resolved_title,
             description: None,
             start: start_rfc3339,

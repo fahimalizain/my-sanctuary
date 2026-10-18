@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::categories::{
-    classify, ensure_taxonomy, CalendarScope, CategoriesError, CategoryWithPatterns,
-    ClassifyOutcome,
+    classify, ensure_taxonomy, first_matching_pattern, CalendarScope, CategoriesError,
+    CategoryWithPatterns, ClassifyOutcome,
 };
 use crate::models::{CalendarEvent, GoogleCalendar, TaskCategory, TaskCategoryPattern};
 use crate::repo::{TaskCategoryRepo, TaskListRepo};
@@ -70,6 +70,93 @@ pub fn color_for_event_title(
         }
         ClassifyOutcome::Untracked { .. } => None,
     }
+}
+
+/// Destination and category color for a hand-created calendar event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCreateTarget {
+    /// Local `google_calendars.id` the event should be inserted into.
+    pub calendar_id: String,
+    /// Category hex painted for that destination, if any.
+    pub color_hex: Option<String>,
+}
+
+/// Resolves the default destination for a hand-created calendar event.
+///
+/// Mirrors the task timer rule (`tasks::resolve_target_calendar`): `wanted`
+/// is the first non-empty of the matched category's first regex-matching
+/// pattern's `google_calendar_id` (a first match without a calendar does not
+/// skip ahead to a later matching pattern), the matched category's
+/// `google_calendar_id`, and the parent root's `google_calendar_id`. A named
+/// but missing or read-only calendar falls back to the user's primary writable
+/// calendar — never to the next inheritance slot. Unmatched / conflicting
+/// titles also fall back to primary.
+///
+/// The returned color is resolved under the target calendar's
+/// [`CalendarScope::Event`] scope, so it matches the chip after the event
+/// lands there (a scoped pattern for another calendar is ignored).
+pub fn resolve_event_create_target(
+    title: &str,
+    calendars: &[GoogleCalendar],
+    taxonomy: &PaintTaxonomy,
+) -> Option<EventCreateTarget> {
+    let category = match classify(title, CalendarScope::Ignore, &taxonomy.matchers) {
+        ClassifyOutcome::Matched { category_id } => taxonomy
+            .categories
+            .iter()
+            .find(|category| category.id == category_id),
+        // Unmatched / conflicting titles have no inheritance chain: the
+        // primary fallback below still runs.
+        ClassifyOutcome::Untracked { .. } => None,
+    };
+    let matcher = category.and_then(|category| {
+        taxonomy
+            .matchers
+            .iter()
+            .find(|matcher| matcher.category_id == category.id)
+    });
+    // One-level tree: `parent_id` is at most a root.
+    let parent = category
+        .and_then(|category| category.parent_id.as_deref())
+        .and_then(|parent_id| {
+            taxonomy
+                .categories
+                .iter()
+                .find(|entry| entry.id == parent_id)
+        });
+    let wanted = matcher
+        .and_then(|matcher| first_matching_pattern(title, CalendarScope::Ignore, matcher))
+        .and_then(|pattern| pattern.google_calendar_id.as_deref())
+        .or_else(|| category.and_then(|category| category.google_calendar_id.as_deref()))
+        .or_else(|| parent.and_then(|parent| parent.google_calendar_id.as_deref()));
+    let target = wanted
+        // A named-but-missing or read-only calendar never falls through to
+        // the next inheritance slot: straight to the user's primary.
+        .and_then(|wanted| {
+            calendars
+                .iter()
+                .find(|cal| cal.google_calendar_id == wanted && is_writable(cal))
+        })
+        .or_else(|| {
+            calendars
+                .iter()
+                .find(|cal| cal.is_primary && is_writable(cal))
+        })?;
+    let color_hex = color_for_event_title(
+        title,
+        &target.google_calendar_id,
+        &taxonomy.categories,
+        &taxonomy.matchers,
+    );
+    Some(EventCreateTarget {
+        calendar_id: target.id.clone(),
+        color_hex,
+    })
+}
+
+/// Owner/writer check shared by the calendar create target rule.
+fn is_writable(calendar: &GoogleCalendar) -> bool {
+    calendar.access_role == "owner" || calendar.access_role == "writer"
 }
 
 /// Map a batch. `google_calendar_id_by_local_id` is local `GoogleCalendar.id`
@@ -319,6 +406,186 @@ mod tests {
             parent_id.map(str::to_string),
             patterns,
         )
+    }
+
+    fn google_calendar(
+        id: &str,
+        google_id: &str,
+        is_primary: bool,
+        access_role: &str,
+    ) -> GoogleCalendar {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "user_id": "u1",
+            "google_calendar_id": google_id,
+            "summary": id,
+            "time_zone": "UTC",
+            "is_primary": is_primary,
+            "access_role": access_role,
+            "sync_enabled": true,
+            "created_at": "2026-08-18T00:00:00Z",
+            "updated_at": "2026-08-18T00:00:00Z"
+        }))
+        .expect("valid GoogleCalendar test fixture")
+    }
+
+    #[test]
+    fn create_target_prefers_pattern_calendar_over_category_and_parent() {
+        let mut parent = category("family", None, "#8e24aa", false);
+        parent.google_calendar_id = Some("family@x.com".to_string());
+        let mut child = category("work", Some("family"), "#4285f4", false);
+        child.google_calendar_id = Some("work@x.com".to_string());
+        let categories = vec![parent, child];
+        let matchers = vec![
+            matcher("family", None, vec![pattern("family", "^Never$", None)]),
+            matcher(
+                "work",
+                Some("family"),
+                vec![pattern("work", "^Work$", Some("deep@x.com"))],
+            ),
+        ];
+        let calendars = vec![
+            google_calendar("cal-primary", "me@x.com", true, "owner"),
+            google_calendar("cal-family", "family@x.com", false, "writer"),
+            google_calendar("cal-work", "work@x.com", false, "owner"),
+            google_calendar("cal-deep", "deep@x.com", false, "owner"),
+        ];
+        let taxonomy = PaintTaxonomy {
+            categories,
+            matchers,
+        };
+
+        let target = resolve_event_create_target("Work", &calendars, &taxonomy)
+            .expect("primary fallback exists");
+        assert_eq!(target.calendar_id, "cal-deep");
+        assert_eq!(target.color_hex.as_deref(), Some("#4285f4"));
+    }
+
+    #[test]
+    fn create_target_missing_or_read_only_named_calendar_goes_primary() {
+        let mut parent = category("family", None, "#8e24aa", false);
+        parent.google_calendar_id = Some("family@x.com".to_string());
+        let mut child = category("work", Some("family"), "#4285f4", false);
+        child.google_calendar_id = Some("work@x.com".to_string());
+        let categories = vec![parent, child];
+        let matchers = vec![
+            matcher("family", None, vec![pattern("family", "^Never$", None)]),
+            matcher(
+                "work",
+                Some("family"),
+                vec![pattern("work", "^Work$", Some("gone@x.com"))],
+            ),
+        ];
+        let calendars = vec![
+            google_calendar("cal-primary", "me@x.com", true, "owner"),
+            google_calendar("cal-family", "family@x.com", false, "writer"),
+            google_calendar("cal-work", "work@x.com", false, "reader"),
+        ];
+        let taxonomy = PaintTaxonomy {
+            categories,
+            matchers,
+        };
+
+        // The pattern names a calendar that is missing: primary, never the
+        // category or parent slot.
+        let target = resolve_event_create_target("Work", &calendars, &taxonomy)
+            .expect("primary fallback exists");
+        assert_eq!(target.calendar_id, "cal-primary");
+    }
+
+    #[test]
+    fn create_target_uses_first_matching_pattern_without_skipping_to_a_later_calendar() {
+        let mut parent = category("family", None, "#8e24aa", false);
+        parent.google_calendar_id = Some("family@x.com".to_string());
+        let mut child = category("work", Some("family"), "#4285f4", false);
+        child.google_calendar_id = Some("work@x.com".to_string());
+        let categories = vec![parent, child];
+        let matchers = vec![
+            matcher("family", None, vec![pattern("family", "^Never$", None)]),
+            matcher(
+                "work",
+                Some("family"),
+                vec![
+                    pattern("work", "^Work$", None),
+                    pattern("work", "^Work [|] Deep$", Some("deep@x.com")),
+                ],
+            ),
+        ];
+        let calendars = vec![
+            google_calendar("cal-primary", "me@x.com", true, "owner"),
+            google_calendar("cal-work", "work@x.com", false, "owner"),
+            google_calendar("cal-deep", "deep@x.com", false, "owner"),
+        ];
+        let taxonomy = PaintTaxonomy {
+            categories,
+            matchers,
+        };
+
+        // The first matching pattern has no calendar; that does not skip to
+        // the later matching pattern. The category slot wins here.
+        let target = resolve_event_create_target("Work", &calendars, &taxonomy)
+            .expect("primary fallback exists");
+        assert_eq!(target.calendar_id, "cal-work");
+        assert_eq!(target.color_hex.as_deref(), Some("#4285f4"));
+    }
+
+    #[test]
+    fn create_target_child_without_category_calendar_inherits_parent() {
+        let mut parent = category("family", None, "#8e24aa", false);
+        parent.google_calendar_id = Some("family@x.com".to_string());
+        let mut child = category("chores", Some("family"), "#4285f4", false);
+        child.google_calendar_id = None;
+        let categories = vec![parent, child];
+        let matchers = vec![
+            matcher("family", None, vec![pattern("family", "^Never$", None)]),
+            matcher(
+                "chores",
+                Some("family"),
+                vec![pattern("chores", "^Chores$", None)],
+            ),
+        ];
+        let calendars = vec![
+            google_calendar("cal-primary", "me@x.com", true, "owner"),
+            google_calendar("cal-family", "family@x.com", false, "owner"),
+        ];
+        let taxonomy = PaintTaxonomy {
+            categories,
+            matchers,
+        };
+
+        let target = resolve_event_create_target("Chores", &calendars, &taxonomy)
+            .expect("primary fallback exists");
+        assert_eq!(target.calendar_id, "cal-family");
+        assert_eq!(target.color_hex.as_deref(), Some("#4285f4"));
+    }
+
+    #[test]
+    fn create_target_untracked_falls_back_to_primary() {
+        let categories = vec![
+            category("work", None, "#4285f4", false),
+            category("untracked", None, "#9e69af", true),
+        ];
+        let matchers = vec![
+            matcher(
+                "work",
+                None,
+                vec![pattern("work", "^Work$", Some("work@x.com"))],
+            ),
+            matcher("untracked", None, vec![pattern("untracked", ".*", None)]),
+        ];
+        let calendars = vec![
+            google_calendar("cal-primary", "me@x.com", true, "owner"),
+            google_calendar("cal-work", "work@x.com", false, "owner"),
+        ];
+        let taxonomy = PaintTaxonomy {
+            categories,
+            matchers,
+        };
+
+        let target = resolve_event_create_target("Lunch", &calendars, &taxonomy)
+            .expect("primary fallback exists");
+        assert_eq!(target.calendar_id, "cal-primary");
+        assert_eq!(target.color_hex, None);
     }
 
     #[test]

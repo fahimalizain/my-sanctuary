@@ -2094,6 +2094,7 @@ pub(crate) const CREATED_JSON: &str = r#"{
 pub(crate) fn input() -> NewEventInput {
     NewEventInput {
         calendar_id: "cal-1".to_string(),
+        calendar_id_explicit: false,
         summary: "New meeting".to_string(),
         description: Some("About things".to_string()),
         start: "2026-08-19T09:00:00Z".to_string(),
