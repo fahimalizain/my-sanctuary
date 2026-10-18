@@ -17,7 +17,7 @@ import {
   type TimedRange,
   ALLDAY_CREATE_HOLD_MS,
   PRECISION_GAIN_GRID,
-  PRECISION_GAIN_SCRUB,
+  SCRUB_RELEASE_LAG_MS,
   allDayGrabOffsetDays,
   autoscrollDelta,
   civilDayShift,
@@ -37,6 +37,7 @@ import {
   rangeFromSlots,
   resolveChipGesture,
   resizedRange,
+  scrubPreviewAt,
   snappedMinuteDelta,
   toAllDayRange,
   toTimedRange,
@@ -202,8 +203,10 @@ interface ModifierKeys {
 }
 
 /**
- * A gutter scrub advances only on pointer move, and the sample list is the
- * gesture's own buffer: `[grab, ...moves]`, capped.
+ * A gutter scrub records samples only on pointer move, and the sample list is
+ * the gesture's own buffer: `[grab, ...moves]`, capped. The painted edge is not
+ * the buffer: it re-reads the lag on the settle timer as well, so a finger that
+ * stops still gets its last sample painted.
  */
 interface ScrubStep {
   samples: PointerSample[];
@@ -457,16 +460,59 @@ function tickInstantMs(session: Session): number | null {
 }
 
 /**
+ * What one step did: the re-snapped session — null when nothing a render would
+ * show changed — and whether the step recorded a scrub sample.
+ */
+interface StepResult {
+  session: Session | null;
+  recorded: boolean;
+}
+
+/**
+ * Re-paint a scrub's preview from the buffer at `at`. Records nothing: the
+ * settle timer calls this on the buffer it already has, once the lag has caught
+ * up with a finger that stopped moving. Null when the gutter would paint the
+ * same range, so the settle costs no render.
+ */
+function scrubSessionAt(
+  session: Session,
+  edge: 'start' | 'end',
+  samples: readonly PointerSample[],
+  at: number,
+  hourH: number,
+): Session | null {
+  const { originalStart, originalEnd } = session;
+  if (!originalStart || !originalEnd) return null;
+
+  const preview = scrubPreviewAt({
+    samples,
+    now: at,
+    hourH,
+    edge,
+    start: originalStart,
+    end: originalEnd,
+  });
+  if (!preview) return null;
+  if (session.scrubPreview && sameRange(preview, session.scrubPreview)) {
+    return null;
+  }
+  return { ...session, scrubPreview: preview };
+}
+
+/**
  * One gutter scrub step. The sample is appended, then the active edge moves by
  * the travel from the grab to the sample the lag says the user is looking at —
- * so a lift-off commits the edge that was on screen.
+ * so a lift-off commits the edge that was on screen. The settle timer re-reads
+ * that lag once the finger stops moving, which is what converges the edge onto
+ * the sample the finger is resting on.
  *
  * The grab is the anchor, never a moving one: an autoscroll moves `contentY` and
  * `scrollTop` together, so `pointerTravelPx` subtracts it back to no travel.
  *
  * Mutates `samples` — the gesture's own buffer, not render state — keeping the
- * grab so the anchor survives the cap. Returns null when nothing the gutter
- * would paint changed, so a move inside the same minute costs no render.
+ * grab so the anchor survives the cap. `recorded` is false when there was
+ * nothing to sample at all (no measurable grid), which is what keeps a caller
+ * from arming a settle for a step that never happened.
  */
 function stepScrub(
   session: Session,
@@ -475,14 +521,16 @@ function stepScrub(
   t: number,
   clientY: number,
   hourH: number,
-): Session | null {
+): StepResult {
   const grab = samples[0];
   const { originalStart, originalEnd } = session;
-  if (!grab || !originalStart || !originalEnd) return null;
+  if (!grab || !originalStart || !originalEnd) {
+    return { session: null, recorded: false };
+  }
 
   const measured = measurePointerAnchor(clientY);
   // No measurable grid: hold the edge still rather than jump on a layout change.
-  if (!measured) return null;
+  if (!measured) return { session: null, recorded: false };
 
   const at = Number.isFinite(t) ? t : performance.now();
   samples.push({ ...measured, t: at });
@@ -490,19 +538,10 @@ function stepScrub(
     samples.splice(1, samples.length - SCRUB_MAX_SAMPLES);
   }
 
-  const lagged = laggedPointer(samples, at) ?? grab;
-  const delta = snappedMinuteDelta(
-    pointerTravelPx(grab, lagged),
-    hourH,
-    PRECISION_GAIN_SCRUB,
-  );
-  // Day shift is always 0 — the gutter has no day axis, so midnight is only the
-  // Date math inside `precisionResize`.
-  const preview = precisionResize(originalStart, originalEnd, edge, delta, 0);
-  if (session.scrubPreview && sameRange(preview, session.scrubPreview)) {
-    return null;
-  }
-  return { ...session, scrubPreview: preview };
+  return {
+    session: scrubSessionAt(session, edge, samples, at, hourH),
+    recorded: true,
+  };
 }
 
 function nextSlotFromPoint(
@@ -676,8 +715,11 @@ function movePrecisionHold(
 
 /**
  * Re-snap an active gesture at a point for the pointer's current modifier state.
- * Returns null when nothing a render would show changed, so a held modifier key
- * repeat, or a precision pointer wobble inside the same minute, costs no render.
+ * `session` is null when nothing a render would show changed, so a held modifier
+ * key repeat, or a precision pointer wobble inside the same minute, costs no
+ * render. `recorded` reports whether a scrub sample was pushed — the step can
+ * record one and still paint nothing yet, and a caller arming a settle timer
+ * needs to know about that sample either way.
  *
  * The origin is rebuilt from `originMinutesRaw` with the live zoom step rather
  * than reused, so a mid-drag zoom change cannot leave the origin lying about
@@ -700,12 +742,12 @@ function stepSession(
   hourH: number,
   didDrag: boolean,
   scrub: ScrubStep,
-): Session | null {
+): StepResult {
   if (isScrubKind(session.kind)) {
     const edge = movableEdge(session.kind);
     return edge
       ? stepScrub(session, edge, scrub.samples, scrub.t, y, hourH)
-      : null;
+      : { session: null, recorded: false };
   }
 
   const { precision, snapStep } = dragGrid(hourH, session.pointerType, keys);
@@ -787,17 +829,20 @@ function stepSession(
     currentSlot.day.getTime() === session.currentSlot.day.getTime() &&
     currentSlot.minutes === session.currentSlot.minutes
   ) {
-    return null;
+    return { session: null, recorded: false };
   }
 
   return {
-    ...session,
-    snapStep,
-    precision,
-    precisionHold,
-    originSlot,
-    currentSlot,
-    currentZone,
+    session: {
+      ...session,
+      snapStep,
+      precision,
+      precisionHold,
+      originSlot,
+      currentSlot,
+      currentZone,
+    },
+    recorded: false,
   };
 }
 
@@ -818,6 +863,16 @@ export function useCalendarDrag(
   const captureTargetRef = useRef<HTMLElement | null>(null);
   /** Gutter scrub samples, `[grab, ...moves]`; empty outside a scrub. */
   const scrubSamplesRef = useRef<PointerSample[]>([]);
+  /**
+   * Pending scrub settle timer: re-runs the lag selection once the finger has
+   * been still for the release lag. 0 when none is armed.
+   */
+  const scrubSettleTimerRef = useRef(0);
+  /**
+   * Bumped by every clear, so a callback armed for an earlier deadline cannot
+   * paint into the session that replaced it.
+   */
+  const scrubSettleGenRef = useRef(0);
   const lastPtrRef = useRef({ x: 0, y: 0 });
   /** Last modifier state read from a pointer or modifier key event. */
   const lastKeysRef = useRef<ModifierKeys>({ metaKey: false, ctrlKey: false });
@@ -827,6 +882,101 @@ export function useCalendarDrag(
 
   const [session, setSession] = useState<Session | null>(null);
   const [didDrag, setDidDrag] = useState(false);
+
+  /**
+   * Paint a re-snapped session, with the touch tick that update earned. Shared
+   * by the pointer path and the scrub settle, so the settle ticks exactly like
+   * the move it catches up with: a touch pointer whose edge crossed a step
+   * boundary, never a mouse. `updated` only ever carries a preview that changed,
+   * so a settle the render would not show does not tick.
+   */
+  const commitSession = useCallback((prev: Session, updated: Session) => {
+    if (prev.pointerType === 'touch' && claimedRef.current) {
+      const prevMs = tickInstantMs(prev);
+      const nextMs = tickInstantMs(updated);
+      if (
+        prevMs !== null &&
+        nextMs !== null &&
+        crossedTickBoundary(prevMs, nextMs, updated.snapStep)
+      ) {
+        tick();
+      }
+    }
+    sessionRef.current = updated;
+    setSession(updated);
+  }, []);
+
+  /**
+   * Cancel the pending scrub settle, disarming as it goes: the generation bump
+   * makes a callback that has already been dispatched a no-op, so an ended
+   * session is never painted into.
+   */
+  const clearScrubSettle = useCallback(() => {
+    scrubSettleGenRef.current += 1;
+    if (scrubSettleTimerRef.current) {
+      window.clearTimeout(scrubSettleTimerRef.current);
+      scrubSettleTimerRef.current = 0;
+    }
+  }, []);
+
+  /**
+   * One settle attempt: re-run the lag selection at `performance.now()` against
+   * the samples already recorded, with nothing new pushed, so a finger that
+   * stopped moving still gets its edge ~`SCRUB_RELEASE_LAG_MS` later. Without it
+   * the lag only ages on pointermove, and a lift-off commits the sample from
+   * before the last move.
+   *
+   * A timer that fired a hair early — the newest sample is still inside the lag —
+   * re-arms for the remainder instead of painting that sample early. Only the
+   * idle path re-arms: a finger that is still moving re-arms through its own
+   * samples, so this can never loop under motion.
+   */
+  const runScrubSettle = useCallback(
+    (generation: number) => {
+      scrubSettleTimerRef.current = 0;
+      if (generation !== scrubSettleGenRef.current) return;
+      const s = sessionRef.current;
+      if (!s || !isScrubKind(s.kind)) return;
+      const samples = scrubSamplesRef.current;
+      const newest = samples[samples.length - 1];
+      if (!newest) return;
+
+      const now = performance.now();
+      const lagged = laggedPointer(samples, now);
+      if (!lagged || lagged.t < newest.t) {
+        scrubSettleTimerRef.current = window.setTimeout(
+          () => runScrubSettle(generation),
+          Math.max(1, newest.t + SCRUB_RELEASE_LAG_MS - now),
+        );
+        return;
+      }
+
+      const edge = movableEdge(s.kind);
+      if (!edge) return;
+      const updated = scrubSessionAt(
+        s,
+        edge,
+        samples,
+        now,
+        optsRef.current.hourH,
+      );
+      if (updated) commitSession(s, updated);
+    },
+    [commitSession],
+  );
+
+  /**
+   * Arm the settle for the sample just recorded, replacing any pending one, so
+   * the deadline always sits `SCRUB_RELEASE_LAG_MS` past the newest sample.
+   */
+  const armScrubSettle = useCallback(() => {
+    clearScrubSettle();
+    const generation = scrubSettleGenRef.current;
+    scrubSettleTimerRef.current = window.setTimeout(
+      () => runScrubSettle(generation),
+      SCRUB_RELEASE_LAG_MS,
+    );
+  }, [clearScrubSettle, runScrubSettle]);
 
   /**
    * Apply a pointer position to the active gesture, re-snapping it at the
@@ -841,7 +991,7 @@ export function useCalendarDrag(
       lastKeysRef.current = keys;
       const s = sessionRef.current;
       if (!s) return;
-      const updated = stepSession(
+      const { session: updated, recorded } = stepSession(
         s,
         clientX,
         clientY,
@@ -850,23 +1000,15 @@ export function useCalendarDrag(
         didDragRef.current,
         { samples: scrubSamplesRef.current, t: t ?? performance.now() },
       );
+      // A scrub records its sample before it paints, and a sample the lag has
+      // not caught up with yet still needs the catch-up — so the settle is armed
+      // off the recording, not off whether the render changed.
+      if (recorded) armScrubSettle();
       // Nothing a render would show changed (e.g. a held key repeat).
       if (!updated) return;
-      if (s.pointerType === 'touch' && claimedRef.current) {
-        const prevMs = tickInstantMs(s);
-        const nextMs = tickInstantMs(updated);
-        if (
-          prevMs !== null &&
-          nextMs !== null &&
-          crossedTickBoundary(prevMs, nextMs, updated.snapStep)
-        ) {
-          tick();
-        }
-      }
-      sessionRef.current = updated;
-      setSession(updated);
+      commitSession(s, updated);
     },
-    [],
+    [armScrubSettle, commitSession],
   );
 
   const stopAutoScroll = useCallback(() => {
@@ -939,6 +1081,9 @@ export function useCalendarDrag(
     ) => {
       // Pinch / multi-touch: never start a session (React runs after capture).
       if (touchesRef.current.latched) return;
+      // A settle left armed by an earlier scrub must not outlive it and paint
+      // into this session's state: every new session starts with a clean slate.
+      clearScrubSettle();
       sessionRef.current = next;
       didDragRef.current = false;
       setSession(next);
@@ -966,10 +1111,14 @@ export function useCalendarDrag(
         startAutoScroll();
       }
     },
-    [startAutoScroll],
+    [clearScrubSettle, startAutoScroll],
   );
 
   const endSession = useCallback(() => {
+    // A late settle must never paint a session that has ended. `pointerup` and
+    // every other exit commit (or drop) the preview already on screen — a lift
+    // inside the lag still drops the movement it never showed.
+    clearScrubSettle();
     stopAutoScroll();
     sessionRef.current = null;
     setSession(null);
@@ -979,7 +1128,7 @@ export function useCalendarDrag(
     captureTargetRef.current = null;
     optsRef.current.unlockStrip('drag');
     document.body.style.userSelect = '';
-  }, [stopAutoScroll]);
+  }, [clearScrubSettle, stopAutoScroll]);
 
   // Track touches at window capture (ahead of React's delegated handlers).
   // A 2nd finger latches multi-touch: drop any session and block new ones
@@ -1195,9 +1344,10 @@ export function useCalendarDrag(
   // Cleanup body style if unmounted mid-drag.
   useEffect(() => {
     return () => {
+      clearScrubSettle();
       document.body.style.userSelect = '';
     };
-  }, []);
+  }, [clearScrubSettle]);
 
   const onColumnPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLElement>, day: Date) => {

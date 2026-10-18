@@ -25,6 +25,7 @@ import {
   precisionResize,
   resolveChipGesture,
   scaledMinuteDelta,
+  scrubPreviewAt,
   snappedMinuteDelta,
   touchHandleGeometry,
   type HandleRect,
@@ -1013,6 +1014,101 @@ test('laggedPointer: the default lag is the scrub release lag', () => {
   const moved = sampleAt(100);
   assert.equal(laggedPointer([grab, moved], 180), moved);
   assert.equal(laggedPointer([grab, moved], 100), grab);
+});
+
+// ── gutter scrub preview at an arbitrary time ───────────────────────────
+
+// hourH 48 at the scrub gain: 8px of travel is a whole minute, so 16px is two.
+const scrubGrab: PointerSample = { contentY: 0, scrollTop: 0, t: 0 };
+const scrubStart = new Date(2024, 0, 1, 9, 0, 0, 0);
+const scrubEnd = new Date(2024, 0, 1, 10, 0, 0, 0);
+
+test('scrubPreviewAt: no samples → null', () => {
+  assert.equal(
+    scrubPreviewAt({
+      samples: [],
+      now: 1000,
+      hourH: HOUR_H_BASE,
+      edge: 'end',
+      start: scrubStart,
+      end: scrubEnd,
+    }),
+    null,
+  );
+});
+
+test('scrubPreviewAt: a non-finite now → null', () => {
+  assert.equal(
+    scrubPreviewAt({
+      samples: [scrubGrab],
+      now: Number.NaN,
+      hourH: HOUR_H_BASE,
+      edge: 'end',
+      start: scrubStart,
+      end: scrubEnd,
+    }),
+    null,
+  );
+});
+
+test('scrubPreviewAt: the resting sample is painted only once it is past the lag', () => {
+  // The finger moved 2 minutes and stopped. The lag decides whose travel the
+  // edge takes, which is why a lift-off inside the lag keeps the grab's edge.
+  const resting: PointerSample = { contentY: 16, scrollTop: 0, t: 1000 };
+  const at = (now: number) =>
+    scrubPreviewAt({
+      samples: [scrubGrab, resting],
+      now,
+      hourH: HOUR_H_BASE,
+      edge: 'end',
+      start: scrubStart,
+      end: scrubEnd,
+    });
+
+  // 0ms old: the grab is what is painted.
+  assert.equal(at(1000)?.end.getTime(), scrubEnd.getTime());
+  // 40ms old: still inside the lag, so a lift here must not take it either.
+  assert.equal(at(1040)?.end.getTime(), scrubEnd.getTime());
+  // Idle past the lag: the settle converges the edge onto the resting finger.
+  const settled = at(1080);
+  assert.equal(
+    settled?.end.getTime(),
+    new Date(2024, 0, 1, 10, 2, 0, 0).getTime(),
+  );
+  assert.equal(settled?.start.getTime(), scrubStart.getTime());
+});
+
+test('scrubPreviewAt: a resting sample that only scrolled is not travel', () => {
+  // contentY and scrollTop both +16: the grid moved under a still finger, so the
+  // edge must not move at all.
+  const rested: PointerSample = { contentY: 16, scrollTop: 16, t: 1000 };
+  const r = scrubPreviewAt({
+    samples: [scrubGrab, rested],
+    now: 1080,
+    hourH: HOUR_H_BASE,
+    edge: 'end',
+    start: scrubStart,
+    end: scrubEnd,
+  });
+  assert.equal(r?.end.getTime(), scrubEnd.getTime());
+});
+
+test('scrubPreviewAt: an old enough start-edge travel moves the start back a minute', () => {
+  // −8px of travel that is past the lag: one minute earlier. The range is wide
+  // enough (9:00–11:00) that the moving start cannot invert past its end.
+  const moved: PointerSample = { contentY: -8, scrollTop: 0, t: 1000 };
+  const start = new Date(2024, 0, 1, 9, 0, 0, 0);
+  const end = new Date(2024, 0, 1, 11, 0, 0, 0);
+  const r = scrubPreviewAt({
+    samples: [scrubGrab, moved],
+    now: 1080,
+    hourH: HOUR_H_BASE,
+    edge: 'start',
+    start,
+    end,
+  });
+  assert.equal(r?.start.getTime(), new Date(2024, 0, 1, 8, 59, 0, 0).getTime());
+  assert.equal(r?.end.getTime(), end.getTime());
 });
 
 // ── preview geometry ────────────────────────────────────────────────────

@@ -723,6 +723,41 @@ export function laggedPointer(
   return newest ?? samples[0] ?? null;
 }
 
+/**
+ * The range a gutter scrub paints at `now`: the active edge moves by the travel
+ * from the grab to the sample the lag says the user is looking at.
+ *
+ * `now` may sit past the newest sample. That is the idle case a settle timer
+ * re-runs: the finger has stopped moving, so the newest sample is no longer
+ * inside the lag and the edge converges onto where the finger rests. Nothing is
+ * sampled here — the range comes out of the samples the caller already has.
+ *
+ * Empty samples, or a non-finite `now` → null. The grab is `samples[0]`.
+ */
+export function scrubPreviewAt(input: {
+  samples: readonly PointerSample[];
+  now: number;
+  hourH: number;
+  edge: 'start' | 'end';
+  start: Date;
+  end: Date;
+  lagMs?: number;
+}): TimedRange | null {
+  const { samples, now, hourH, edge, start, end, lagMs } = input;
+  const grab = samples[0];
+  if (!grab || !Number.isFinite(now)) return null;
+
+  const lagged = laggedPointer(samples, now, lagMs) ?? grab;
+  const delta = snappedMinuteDelta(
+    pointerTravelPx(grab, lagged),
+    hourH,
+    PRECISION_GAIN_SCRUB,
+  );
+  // Day shift is always 0 — the gutter has no day axis, so midnight is only the
+  // Date math inside `precisionResize`.
+  return precisionResize(start, end, edge, delta, 0);
+}
+
 /** What the drag ghost needs to label itself (kept out of DayColumn props). */
 export interface DragPreviewInfo {
   range: TimedRange;
