@@ -104,7 +104,10 @@ function stubRect(
 }
 
 /** jsdom clamps `scrollTop` to 0 on an unscrolled box, so the test owns it. */
-function stubScrollTop(el: HTMLElement, initial: number): { read: () => number } {
+function stubScrollTop(
+  el: HTMLElement,
+  initial: number,
+): { read: () => number } {
   let top = initial;
   Object.defineProperty(el, 'scrollTop', {
     configurable: true,

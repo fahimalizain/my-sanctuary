@@ -885,7 +885,10 @@ function freezeVerticalScroll(scroller: HTMLElement): () => void {
     if (event.cancelable) event.preventDefault();
   };
   scroller.addEventListener('scroll', pin);
-  window.addEventListener('touchmove', block, { capture: true, passive: false });
+  window.addEventListener('touchmove', block, {
+    capture: true,
+    passive: false,
+  });
   window.addEventListener('wheel', block, { capture: true, passive: false });
   return () => {
     scroller.removeEventListener('scroll', pin);
