@@ -35,6 +35,7 @@ import {
 import type {
   AgendaItemRecord,
   OccurrenceRecord,
+  TaskCategorySummary,
   TaskPriority,
   TaskRecord,
 } from '../../types';
@@ -82,9 +83,9 @@ interface AgendaItemRowProps {
   onRenameOccurrence: (item: AgendaItemRecord) => void;
 }
 
-/** Shared icon-button: 28px circle in the mobile action pill, compact on desktop. */
+/** Shared icon-button: 24px circle in the mobile action pill, compact on desktop. */
 const ICON_BTN =
-  'flex h-7 w-7 items-center justify-center rounded-full text-muted-foreground hover:bg-background/80 hover:text-foreground transition-colors flex-shrink-0 sm:h-auto sm:w-auto sm:rounded-md sm:p-1.5 sm:hover:bg-muted';
+  'flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground hover:bg-background/80 hover:text-foreground transition-colors flex-shrink-0 sm:h-auto sm:w-auto sm:rounded-md sm:p-1.5 sm:hover:bg-muted';
 
 const TITLE_TEXT =
   'block min-w-0 truncate text-sm font-medium leading-snug text-foreground';
@@ -135,7 +136,7 @@ function AgendaRowShell({
         <div className="flex min-w-0 flex-1 items-center gap-1 px-2 py-1.5 sm:gap-2.5 sm:px-3 sm:py-2.5">
           {handle}
           {check}
-          <div className="flex min-w-0 flex-1 flex-col ml-1 gap-0.5 sm:flex-row sm:items-center sm:gap-2.5">
+          <div className="flex min-w-0 flex-1 flex-col ml-1 gap-0 sm:flex-row sm:items-center sm:gap-2.5">
             {title}
             {meta}
           </div>
@@ -145,9 +146,12 @@ function AgendaRowShell({
   );
 }
 
+/** Mobile: the meta line tucks up under the title (a small negative top
+ *  margin) so the row reads as two tight lines instead of a tall card; the
+ *  action pill still sets the line height. At sm+ it flattens into the row. */
 function AgendaRowMeta({ children }: { children: ReactNode }) {
   return (
-    <div className="flex items-center gap-1.5 sm:contents">{children}</div>
+    <div className="flex items-center gap-1.5 -mt-1 sm:contents">{children}</div>
   );
 }
 
@@ -164,6 +168,22 @@ function MinutesMark({ minutes }: { minutes: number }) {
   return (
     <span className="flex-shrink-0 text-[11px] tabular-nums text-muted-foreground">
       {minutes} min
+    </span>
+  );
+}
+
+/** The computed category name, muted — the left ribbon carries its color, so
+ *  the text stays quiet. The `untracked` sink is hidden everywhere else in the
+ *  app (Board pills, Routines), so it is hidden here too. Long names truncate
+ *  before the row's action pill ever gets squeezed. */
+function CategoryMark({ category }: { category: TaskCategorySummary }) {
+  if (!category.title || category.is_untracked) return null;
+  return (
+    <span
+      className="min-w-0 flex-shrink truncate text-[11px] text-muted-foreground"
+      title={category.title}
+    >
+      {category.title}
     </span>
   );
 }
@@ -497,6 +517,7 @@ function OccurrenceRow({
       }
       meta={
         <AgendaRowMeta>
+          <CategoryMark category={occurrence.category} />
           <MinutesMark minutes={occurrence.estimated_minutes} />
           {occurrence.status !== 'pending' && (
             <StatusChip
@@ -628,6 +649,7 @@ function TaskRow({
       }
       meta={
         <AgendaRowMeta>
+          <CategoryMark category={task.category} />
           <PriorityMark priority={task.priority} />
           <MinutesMark minutes={task.duration_minutes} />
           {task.status === 'COMPLETED' && (
