@@ -133,7 +133,7 @@ function AgendaRowShell({
     >
       <div className="flex">
         <ColorMark color={color} className="w-1 shrink-0 self-stretch" />
-        <div className="flex min-w-0 flex-1 items-center gap-1 px-2 py-1.5 sm:gap-2.5 sm:px-3 sm:py-2.5">
+        <div className="flex min-w-0 flex-1 items-center gap-1 px-2 pt-2 pb-1 sm:gap-2.5 sm:px-3 sm:py-2.5">
           {handle}
           {check}
           <div className="flex min-w-0 flex-1 flex-col ml-1 gap-0 sm:flex-row sm:items-center sm:gap-2.5">
