@@ -356,6 +356,31 @@ test('buildAllDayChips: midnight→next-midnight one civil day → one chip', ()
   assert.ok(allDayHeight > 0);
 });
 
+test('buildAllDayChips: Google all-day endMs is local midnight after the last day', () => {
+  // Stored end is the exclusive UTC midnight; past must flip at local midnight.
+  const day = new Date(2026, 8, 8);
+  const event = makeEvent({
+    id: 'allday-google',
+    is_all_day: true,
+    start_time: '2026-09-08T00:00:00Z',
+    end_time: '2026-09-09T00:00:00Z',
+  });
+  const { allDayChips } = buildAllDayChips([day], [event], 1);
+  assert.equal(allDayChips[0].endMs, new Date(2026, 8, 9).getTime());
+});
+
+test('buildAllDayChips: timed multi-day endMs is the real end instant', () => {
+  const day = new Date(2026, 8, 8);
+  const end = new Date(2026, 8, 9, 10, 30);
+  const event = makeEvent({
+    id: 'multi-day',
+    start_time: new Date(2026, 8, 8, 9, 0).toISOString(),
+    end_time: end.toISOString(),
+  });
+  const { allDayChips } = buildAllDayChips([day], [event], 1);
+  assert.equal(allDayChips[0].endMs, end.getTime());
+});
+
 test('buildAllDayChips: is_all_day uses ISO prefix (UTC midnight stays civil day)', () => {
   // Replica stores all-day as YYYY-MM-DDT00:00:00Z. In UTC-4 that would be
   // the previous evening via new Date(iso) — chips must still occupy the 13th.

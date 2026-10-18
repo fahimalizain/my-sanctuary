@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { Check, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { GoogleCalendar } from '@/app/types';
@@ -14,6 +14,7 @@ import {
   monthGridStart,
   startOfDay,
 } from '../lib/week-layout';
+import { notionEventCssVars } from '../lib/event-colors';
 
 const MONTH_LABEL = [
   'January',
@@ -250,20 +251,17 @@ export function CalendarSidebar({
                   <span
                     className={cn(
                       'flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors',
+                      'border-[color:var(--ev-accent)] dark:border-[color:var(--ev-accent-dark)]',
                       checked
-                        ? 'border-transparent'
-                        : 'border-border bg-background',
+                        ? 'bg-[var(--ev-accent)] dark:bg-[var(--ev-accent-dark)]'
+                        : 'bg-background',
                     )}
-                    style={
-                      checked
-                        ? { backgroundColor: color, borderColor: color }
-                        : { borderColor: color }
-                    }
+                    style={{ ...notionEventCssVars(color) } as CSSProperties}
                     aria-hidden
                   >
                     {checked && (
                       <Check
-                        className="h-3 w-3 text-white"
+                        className="h-3 w-3 text-[var(--ev-ink)] dark:text-[var(--ev-ink-dark)]"
                         strokeWidth={3}
                         aria-hidden
                       />

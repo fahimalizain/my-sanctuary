@@ -131,11 +131,13 @@ export function buildAllDayChips(
     startDay: number;
     endDay: number;
     event: CalendarEvent;
+    endMs: number;
   }[] = [];
 
   for (const event of allDayEvents) {
     let first: Date;
     let last: Date;
+    let endMs: number;
 
     if (event.is_all_day) {
       // Stored as UTC midnight of the civil date — use the ISO prefix, not
@@ -149,12 +151,15 @@ export function buildAllDayChips(
         endCivil.getTime() > startCivil.getTime()
           ? addDays(endCivil, -1)
           : startCivil;
+      // Past at local midnight after the last occupied day, not UTC midnight.
+      endMs = addDays(last, 1).getTime();
     } else {
       // Multi-day timed events in the all-day band: local Date conversion.
       const start = new Date(event.start_time);
       const end = new Date(event.end_time);
       first = startOfDay(start);
       last = lastOccupiedCivilDate(start, end);
+      endMs = end.getTime();
     }
 
     let startDay = Math.round((first.getTime() - origin.getTime()) / msPerDay);
@@ -166,7 +171,7 @@ export function buildAllDayChips(
     endDay = Math.max(0, Math.min(lastIdx, endDay));
     if (endDay < startDay) continue;
 
-    inputs.push({ id: event.id, startDay, endDay, event });
+    inputs.push({ id: event.id, startDay, endDay, event, endMs });
   }
 
   const packed = packAllDayLanes(
@@ -189,6 +194,7 @@ export function buildAllDayChips(
       endDay: i.endDay,
       lane,
       color: eventChipColor(i.event),
+      endMs: i.endMs,
     };
   });
 
