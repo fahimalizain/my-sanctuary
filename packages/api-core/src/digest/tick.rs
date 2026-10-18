@@ -68,6 +68,12 @@ pub struct DigestTickReport {
 /// row, and the job is neither `running` nor `done`. Never blocks on the
 /// rebuild itself: the tick does the work.
 ///
+/// A **first-run** backfill (no meta yet) also queues the reclassify job: the
+/// cached events carry `NULL` stamps until a taxonomy edit enqueues one, so a
+/// rollup built from them would store the whole history as unclassified and
+/// nothing would ever restamp it. The `algo_version` path deliberately leaves
+/// the stamps alone — they are still valid, only the rollup changed.
+///
 /// Returns the observed status (`None` = no row) and whether *this* call
 /// started it.
 pub async fn ensure_backfill_job(
@@ -85,14 +91,12 @@ pub async fn ensure_backfill_job(
     let done = status.as_ref().is_some_and(|row| row.status == JOB_DONE);
 
     let stale = repo.has_stale_meta(user_id, ALGO_VERSION).await?;
-    let needs_first_run = if stale {
-        true
-    } else if done {
-        false
-    } else {
-        !repo.has_meta(user_id).await? && repo.earliest_event_date(user_id).await?.is_some()
-    };
-    if !needs_first_run {
+    // The two reasons to start are kept apart: only the first one may restamp.
+    let first_run = !stale
+        && !done
+        && !repo.has_meta(user_id).await?
+        && repo.earliest_event_date(user_id).await?.is_some();
+    if !stale && !first_run {
         return Ok(BackfillJob {
             status,
             started: false,
@@ -100,6 +104,9 @@ pub async fn ensure_backfill_job(
     }
     repo.upsert_job_status(user_id, JOB_BACKFILL, JOB_RUNNING, "", now_rfc3339)
         .await?;
+    if first_run {
+        ensure_reclassify_job(repo, user_id, now_rfc3339).await?;
+    }
     Ok(BackfillJob {
         status: Some(JobStatus {
             status: JOB_RUNNING.to_string(),
@@ -128,10 +135,34 @@ impl BackfillJob {
     }
 }
 
+/// Queues the reclassify job from the first event unless it is mid-scan.
+///
+/// Only the job row is written here: the taxonomy load and the stamps belong to
+/// the tick's `run_reclassify`, so a read endpoint (`GET /api/reports/status`,
+/// opening the record) can queue work but can never classify anything.
+async fn ensure_reclassify_job(
+    repo: &dyn DigestRepo,
+    user_id: &str,
+    now_rfc3339: &str,
+) -> Result<(), RepoError> {
+    let running = repo
+        .job_status(user_id, JOB_RECLASSIFY)
+        .await?
+        .as_ref()
+        .is_some_and(JobStatus::is_running);
+    if running {
+        // Mid-scan: resetting the cursor would restart the whole history.
+        return Ok(());
+    }
+    repo.upsert_job_status(user_id, JOB_RECLASSIFY, JOB_RUNNING, "", now_rfc3339)
+        .await
+}
+
 /// The user's digest status, starting the backfill job when it is due.
 ///
 /// This is what `GET /api/reports/status` calls: it never awaits the rebuild,
-/// it only reports (and, at most, *marks*) work.
+/// it only reports (and, at most, *marks*) work — a first-run backfill also
+/// queues the reclassify it depends on (see [`ensure_backfill_job`]).
 pub async fn digest_status(
     repo: &dyn DigestRepo,
     user_id: &str,
@@ -184,10 +215,13 @@ pub async fn run_digest_tick(
 /// Runs the tick for one named user.
 ///
 /// Order of work, highest priority first:
-/// 1. a `running` backfill (or a stale `algo_version`) owns the whole tick;
-/// 2. otherwise a `running` reclassify spends one batch, and — when it is
-///    already drained — the remaining budget goes to dirty days;
-/// 3. otherwise: rebuild up to `budget_days` dirty days.
+/// 1. a `running` reclassify spends one batch **first**, and while it is
+///    unfinished it owns the whole tick: the stamps it writes are what a rollup
+///    reads, so no day may be rebuilt before the scan is done;
+/// 2. once it drains, a `running` backfill (or a stale `algo_version`) gets the
+///    remaining budget;
+/// 3. otherwise: rebuild up to `budget_days` dirty days — including the ones
+///    the reclassify just marked.
 pub async fn run_digest_tick_user(
     repo: &dyn DigestRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -223,21 +257,10 @@ pub async fn run_digest_tick_user(
     };
     let reclassify_running = reclassify_status.as_ref().is_some_and(JobStatus::is_running);
 
-    if backfill.is_running() {
-        let cursor = backfill.cursor().to_string();
-        run_backfill(
-            repo,
-            category_repo,
-            user_id,
-            &cursor,
-            budget_days,
-            now_unix,
-            &now_rfc3339,
-            &mut report,
-        )
-        .await;
-    } else if reclassify_running {
-        let drained = run_reclassify(
+    // A restamp lands before any rollup: a day rebuilt while its events still
+    // carry stale/NULL stamps would store every second as unclassified.
+    let drained = if reclassify_running {
+        run_reclassify(
             repo,
             category_repo,
             user_id,
@@ -248,8 +271,26 @@ pub async fn run_digest_tick_user(
             &now_rfc3339,
             &mut report,
         )
-        .await;
-        if drained {
+        .await
+    } else {
+        true
+    };
+
+    if drained {
+        if backfill.is_running() {
+            let cursor = backfill.cursor().to_string();
+            run_backfill(
+                repo,
+                category_repo,
+                user_id,
+                &cursor,
+                budget_days,
+                now_unix,
+                &now_rfc3339,
+                &mut report,
+            )
+            .await;
+        } else {
             run_rebuild(
                 repo,
                 category_repo,
@@ -260,16 +301,6 @@ pub async fn run_digest_tick_user(
             )
             .await;
         }
-    } else {
-        run_rebuild(
-            repo,
-            category_repo,
-            user_id,
-            budget_days,
-            now_unix,
-            &mut report,
-        )
-        .await;
     }
 
     // Decide whether the caller should come back soon. Recomputed from the

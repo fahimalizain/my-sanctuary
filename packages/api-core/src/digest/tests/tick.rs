@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::repo::{DigestRepo, JobStatus, ReclassifyRow};
 use super::sleep::resolve_sleep_category_id;
 use super::tests::support::{day_events, kolkata_event, tick_now};
-use super::tick::{JOB_BACKFILL, JOB_DONE, JOB_RECLASSIFY, JOB_RUNNING};
+use super::tick::{JOB_BACKFILL, JOB_DONE, JOB_RECLASSIFY, JOB_RUNNING, RECLASSIFY_BATCH_LIMIT};
 use super::*;
 use crate::models::{
     NewTaskCategory, NewTaskCategoryPattern, TaskCategory, TaskCategoryPattern,
@@ -545,12 +545,20 @@ fn dirty_days_are_rebuilt_and_cleared() {
 }
 
 #[test]
-fn a_stale_algo_version_restarts_the_backfill() {
+fn a_stale_algo_version_restarts_the_backfill_but_not_the_reclassify() {
     let repo = FakeDigestRepo::new("u-1");
     repo.mutate(|state| {
         state.events = day_events("2026-01-05", "2026-01-05");
         state.jobs.insert(
             JOB_BACKFILL.to_string(),
+            JobStatus {
+                status: JOB_DONE.to_string(),
+                cursor: String::new(),
+            },
+        );
+        // A finished restamp: its stamps are still valid.
+        state.jobs.insert(
+            JOB_RECLASSIFY.to_string(),
             JobStatus {
                 status: JOB_DONE.to_string(),
                 cursor: String::new(),
@@ -566,6 +574,13 @@ fn a_stale_algo_version_restarts_the_backfill() {
     let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
     assert!(report.backfill_started, "stale meta ⇒ backfill runs again");
     assert_eq!(repo.job(JOB_BACKFILL).map(|job| job.cursor), Some(String::new()));
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY).map(|job| job.status),
+        Some(JOB_DONE.to_string()),
+        "only the rollup changed: the stamps must not be rescanned"
+    );
+    assert_eq!(report.reclassified, 0);
+    assert!(repo.state().stamps.is_empty(), "no stamp was rewritten");
 }
 
 fn stale_day(date: &str) -> DayDigest {
@@ -580,6 +595,119 @@ fn stale_day(date: &str) -> DayDigest {
         hour_seconds: Vec::new(),
         nights: Vec::new(),
     }
+}
+
+/// One unstamped "Deep Work" row, matched by the `work` pattern below.
+fn deep_work_row(id: &str) -> FakeRow {
+    FakeRow {
+        id: id.to_string(),
+        title: "Deep Work".to_string(),
+        google_calendar_id: "primary@example.com".to_string(),
+        start_time: "2026-01-02T10:00:00Z".to_string(),
+        end_time: "2026-01-02T11:00:00Z".to_string(),
+        category_id: None,
+    }
+}
+
+fn running_job() -> JobStatus {
+    JobStatus {
+        status: JOB_RUNNING.to_string(),
+        cursor: String::new(),
+    }
+}
+
+fn work_taxonomy() -> FakeTaxonomyRepo {
+    FakeTaxonomyRepo::with(
+        vec![category("work", "Work", 0)],
+        vec![pattern("work", "^Deep Work$", 0)],
+    )
+}
+
+#[test]
+fn the_first_backfill_also_queues_a_reclassify() {
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+    });
+
+    let job = poll(ensure_backfill_job(&repo, "u-1", "2026-01-10T06:00:00Z")).expect("job");
+
+    assert!(job.started);
+    assert_eq!(repo.job(JOB_BACKFILL), Some(running_job()));
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(running_job()),
+        "the events are unstamped until a taxonomy edit: history is restamped first"
+    );
+}
+
+#[test]
+fn a_running_reclassify_is_not_reset_by_the_first_backfill() {
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state.jobs.insert(
+            JOB_RECLASSIFY.to_string(),
+            JobStatus {
+                status: JOB_RUNNING.to_string(),
+                cursor: "e-9".to_string(),
+            },
+        );
+    });
+
+    let job = poll(ensure_backfill_job(&repo, "u-1", "2026-01-10T06:00:00Z")).expect("job");
+
+    assert!(job.started, "the backfill is still due");
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(JobStatus {
+            status: JOB_RUNNING.to_string(),
+            cursor: "e-9".to_string(),
+        }),
+        "a mid-scan cursor is never rewound to the first event"
+    );
+}
+
+#[test]
+fn an_unfinished_reclassify_holds_the_backfill_until_it_drains() {
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state.jobs.insert(JOB_BACKFILL.to_string(), running_job());
+        state.jobs.insert(JOB_RECLASSIFY.to_string(), running_job());
+        // A full batch: the scan is not finished, so no day may be rolled up.
+        state.rows = (0..RECLASSIFY_BATCH_LIMIT)
+            .map(|index| deep_work_row(&format!("e-{index:03}")))
+            .collect();
+    });
+    let taxonomy = work_taxonomy();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.reclassified, RECLASSIFY_BATCH_LIMIT);
+    assert_eq!(report.rebuilt_days, 0, "no day is rolled up mid-restamp");
+    assert!(
+        repo.state().replace_day_calls.is_empty(),
+        "an unfinished reclassify owns the whole tick"
+    );
+    assert!(!report.backfill_done);
+    assert_eq!(
+        repo.job(JOB_BACKFILL).map(|job| job.cursor),
+        Some(String::new()),
+        "the backfill did not move"
+    );
+    assert!(report.remaining, "the caller must come back");
+
+    // The next tick drains the empty batch and hands the budget to the backfill.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.reclassify_done);
+    assert_eq!(report.reclassified, 0);
+    assert_eq!(report.rebuilt_days, 7, "the backfill finally spends the budget");
+    assert_eq!(
+        repo.job(JOB_BACKFILL).map(|job| job.cursor),
+        Some("2026-01-08".to_string())
+    );
 }
 
 #[test]
@@ -701,12 +829,16 @@ fn status_reports_the_jobs_and_the_dirty_count() {
 
     let status = poll(digest_status(&repo, "u-1", today())).expect("status");
     assert!(status.backfilling, "the first status call starts the backfill");
-    assert!(!status.reclassifying);
+    assert!(
+        status.reclassifying,
+        "the first-run backfill queues the restamp it depends on"
+    );
     assert_eq!(status.dirty_days, 1);
 
     // A second call sees the running job and does not re-derive anything.
     let status = poll(digest_status(&repo, "u-1", today())).expect("status");
     assert!(status.backfilling);
+    assert!(status.reclassifying);
 }
 
 #[test]
