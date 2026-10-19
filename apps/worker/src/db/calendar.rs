@@ -700,8 +700,8 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         events: Vec<NewCalendarEvent>,
         now_rfc3339: &str,
     ) -> Result<(), RepoError> {
-        // Chunk to stay under D1's 100 bound-parameter limit (3 rows of 26
-        // columns + the statement-level category flag per statement); each
+        // Chunk to stay under D1's 100 bound-parameter limit (3 rows of 27
+        // columns + the two statement-level category flags per statement); each
         // chunk is one D1 subrequest. Chunks never mix `preserve_category`
         // (the flag binds once per statement). Mint candidate UUIDs; ON
         // CONFLICT(calendar_id, google_event_id) preserves existing id and
@@ -728,7 +728,8 @@ impl CalendarEventRepo for D1CalendarEventRepo {
             return Ok(true);
         }
         // Same mint-UUID + chunking as upsert_batch; fence binds add 3 params
-        // per statement (plus the category flag) so chunk size stays 3.
+        // per statement (plus the two category-flag binds) so chunk size stays
+        // 3.
         for chunk in chunk_events_for_upsert(&events) {
             let calendar_id = chunk[0].calendar_id.as_str();
             let ids: Vec<String> = (0..chunk.len())

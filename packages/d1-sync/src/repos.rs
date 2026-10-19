@@ -765,8 +765,8 @@ impl CalendarEventRepo for SqliteCalendarEventRepo {
     ) -> Result<(), RepoError> {
         // Mint candidate UUIDs; ON CONFLICT(calendar_id, google_event_id)
         // preserves existing id and sets deleted_at = NULL (no per-event SELECT).
-        // Chunks never mix `preserve_category`: the category flag binds once per
-        // statement.
+        // Chunks never mix `preserve_category`: both category merge guards bind
+        // one statement-level flag.
         let conn = lock(&self.db)?;
         for chunk in chunk_events_for_upsert(&events) {
             let pending = Self::gather_dirty(&conn, chunk);

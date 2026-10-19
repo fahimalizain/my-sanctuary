@@ -606,6 +606,99 @@ fn d1_upsert_preserve_category_keeps_the_stored_stamp() {
     );
 }
 
+/// The write-time upsert records `category_classified` (0022): a real
+/// (stamping) context stores `1`, a `preserve_category` chunk stores `0` for a
+/// **new** row — nothing classified it, so the digest's verification scan may
+/// still pick it up — and keeps whatever the stored row has on conflict.
+#[test]
+fn d1_upsert_records_and_preserves_the_classified_flag() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+    }
+    let flag = |google_event_id: &str| -> i64 {
+        let conn = h.db.lock().unwrap();
+        conn.query_row(
+            "SELECT category_classified FROM calendar_events WHERE google_event_id = ?1",
+            rusqlite::params![google_event_id],
+            |row| row.get(0),
+        )
+        .expect("category_classified column")
+    };
+
+    // A normal write ran the classifier: flag 1 even when nothing matched.
+    let mut stamped = sample_new_event("g-flag", "Stamped");
+    stamped.category_id = None;
+    pollster::block_on(h.events.upsert(stamped, NOW_RFC)).expect("stamping upsert");
+    assert_eq!(flag("g-flag"), 1);
+
+    // A preserving chunk does not clear a stored 1…
+    let mut preserving = sample_new_event("g-flag", "Stamped");
+    preserving.category_id = None;
+    preserving.preserve_category = true;
+    pollster::block_on(h.events.upsert(preserving, NOW_RFC)).expect("preserving upsert");
+    assert_eq!(flag("g-flag"), 1, "a preserving walk keeps a stored 1");
+
+    // …and does not claim a stored 0 either.
+    {
+        let conn = h.db.lock().unwrap();
+        conn.execute(
+            "UPDATE calendar_events SET category_classified = 0 WHERE google_event_id = 'g-flag'",
+            [],
+        )
+        .expect("mark never classified");
+    }
+    let mut preserving = sample_new_event("g-flag", "Stamped");
+    preserving.category_id = None;
+    preserving.preserve_category = true;
+    pollster::block_on(h.events.upsert(preserving, NOW_RFC)).expect("preserving upsert");
+    assert_eq!(flag("g-flag"), 0, "a preserving walk keeps a stored 0");
+
+    // A brand-new row written by a preserving walk is 0: classification did
+    // not run, so the digest must still treat it as pending.
+    let mut fresh = sample_new_event("g-fresh", "Fresh");
+    fresh.category_id = None;
+    fresh.preserve_category = true;
+    pollster::block_on(h.events.upsert(fresh, NOW_RFC)).expect("fresh upsert");
+    assert_eq!(flag("g-fresh"), 0);
+
+    // The fenced (replica-walk) builder carries the same two flags.
+    {
+        let conn = h.db.lock().unwrap();
+        conn.execute(
+            "UPDATE google_calendars
+             SET lease_owner = ?1, lease_expires_at = ?2
+             WHERE id = 'cal-1'",
+            rusqlite::params!["owner-flag", "2099-01-01T00:00:00Z"],
+        )
+        .expect("set lease");
+    }
+    let mut fenced = sample_new_event("g-fenced", "Fenced");
+    fenced.category_id = None;
+    fenced.preserve_category = true;
+    let ok = pollster::block_on(h.events.upsert_batch_if_owner(
+        vec![fenced],
+        "owner-flag",
+        NOW_RFC,
+    ))
+    .expect("fenced upsert");
+    assert!(ok, "live lease must succeed");
+    assert_eq!(flag("g-fenced"), 0, "the fenced builder binds the flag too");
+
+    // Stamping through the fenced path also writes 1 and overwrites.
+    let mut fenced = sample_new_event("g-fenced", "Fenced");
+    fenced.category_id = Some("cat-work".to_string());
+    let ok = pollster::block_on(h.events.upsert_batch_if_owner(
+        vec![fenced],
+        "owner-flag",
+        NOW_RFC,
+    ))
+    .expect("fenced upsert");
+    assert!(ok);
+    assert_eq!(flag("g-fenced"), 1);
+}
+
 fn seed_event(
     conn: &rusqlite::Connection,
     id: &str,
@@ -1153,8 +1246,10 @@ fn d1_sleep_target_reads_the_latest_sleep_duration_revision() {
     );
 }
 
-/// The verification scan finds a living, unstamped event whatever its id — the
-/// id walk (`e.id > ?`) can skip one that sorts before its cursor (F11/F14).
+/// The verification scan finds a living, never-classified event whatever its
+/// id — the id walk (`e.id > ?`) can skip one that sorts before its cursor
+/// (F11/F14). A NULL leaf alone is not pending: it may be a deliberate
+/// no-match, so only `category_classified = 0` counts.
 #[test]
 fn d1_unstamped_scan_finds_rows_the_id_cursor_would_skip() {
     let h = open_harness().expect("harness");
@@ -1175,6 +1270,13 @@ fn d1_unstamped_scan_finds_rows_the_id_cursor_would_skip() {
             rusqlite::params![NOW_RFC],
         )
         .expect("soft-delete c");
+        // `e-a` and the soft-deleted `e-c` were never classified (the column
+        // default is 1: a row written before 0022 is treated as classified).
+        conn.execute(
+            "UPDATE calendar_events SET category_classified = 0 WHERE id IN ('e-a', 'e-c')",
+            [],
+        )
+        .expect("mark never classified");
     }
     let digest = h.digest();
 
@@ -1182,9 +1284,10 @@ fn d1_unstamped_scan_finds_rows_the_id_cursor_would_skip() {
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, "e-a");
     assert_eq!(batch[0].category_id, None);
+    assert_eq!(batch[0].category_classified, 0);
     assert!(
         pollster::block_on(digest.has_unstamped_event("u-1")).expect("has"),
-        "the living unstamped row is pending"
+        "the living never-classified row is pending"
     );
     // The walk's cursor is past it: `e.id > 'e-a'` never returns it again.
     assert!(
@@ -1197,7 +1300,47 @@ fn d1_unstamped_scan_finds_rows_the_id_cursor_would_skip() {
     pollster::block_on(digest.set_category("e-a", Some("cat-work"))).expect("stamp");
     assert!(
         !pollster::block_on(digest.has_unstamped_event("u-1")).expect("has"),
-        "nothing unstamped is left"
+        "nothing never-classified is left"
+    );
+    assert!(pollster::block_on(digest.unstamped_batch("u-1", 10))
+        .expect("batch")
+        .is_empty());
+}
+
+/// A deliberate no-match still marks the row classified: `category_id` stays
+/// SQL NULL, but `category_classified = 1` keeps the verification scan from
+/// rewinding over it forever.
+#[test]
+fn d1_digest_no_match_stamp_sets_the_classified_flag() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().unwrap();
+        seed_user_token_calendar(&conn, SeedOpts::default()).expect("seed");
+        seed_event(&conn, "e-a", "g-a", None, "confirmed", "").expect("a");
+        conn.execute(
+            "UPDATE calendar_events SET category_classified = 0 WHERE id = 'e-a'",
+            [],
+        )
+        .expect("mark never classified");
+    }
+    let digest = h.digest();
+
+    pollster::block_on(digest.set_category("e-a", None)).expect("no-match stamp");
+    {
+        let conn = h.db.lock().unwrap();
+        let (category, classified): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT category_id, category_classified FROM calendar_events WHERE id = 'e-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(category, None, "no match leaves the leaf NULL");
+        assert_eq!(classified, 1, "…but the row counts as classified");
+    }
+    assert!(
+        !pollster::block_on(digest.has_unstamped_event("u-1")).expect("has"),
+        "the no-match row is not pending work"
     );
     assert!(pollster::block_on(digest.unstamped_batch("u-1", 10))
         .expect("batch")
@@ -1441,6 +1584,10 @@ fn d1_digest_loads_events_and_reclassifies_them() {
     assert_eq!(batch[0].google_calendar_id, "primary@example.com");
     assert_eq!(batch[0].title, "Deep Work");
     assert_eq!(batch[0].category_id, None);
+    assert_eq!(
+        batch[0].category_classified, 1,
+        "the write-time upsert classified the row"
+    );
     assert!(
         pollster::block_on(digest.reclassify_batch("u-1", &local_id, 10))
             .expect("batch")
