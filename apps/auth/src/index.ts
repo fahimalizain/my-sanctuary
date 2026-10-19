@@ -1,3 +1,4 @@
+import { handleAuthorizeRequest } from './authorize';
 import { AUTHORIZE_PATH, getAuthorizationServer, type Env } from './server';
 import {
   handleValidateRequest,
@@ -30,13 +31,10 @@ export default {
       return handleInternal(request, env, pathname);
     }
 
-    // Slice 2b replaces this placeholder with the session lookup and consent page. It must be
-    // routed before the library: `parseAuthRequest()` rejects requests to the real endpoint.
+    // The authorization endpoint is this app's own page, so it is routed before the library,
+    // which serves discovery, the token endpoint and revocation.
     if (pathname === AUTHORIZE_PATH) {
-      return new Response('not implemented', {
-        status: 501,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-      });
+      return handleAuthorizeRequest(request, env);
     }
 
     // Discovery, token exchange, refresh and RFC 7009 revocation are the library's.

@@ -35,8 +35,8 @@ MCP_RESOURCES = "https://my-sanctuary.fahimalizain.com/mcp"
 binding = "OAUTH_KV"
 id = "00000000000000000000000000000000"
 
-# The public Worker. Slice 2b's authorization endpoint calls `GET /auth/me` on it to find the
-# logged-in session before rendering consent.
+# The public Worker. The authorization endpoint calls `GET /auth/me` on it to find the logged-in
+# session before rendering consent.
 [[services]]
 binding = "APP"
 service = "my-sanctuary"

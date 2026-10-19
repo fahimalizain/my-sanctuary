@@ -1,10 +1,10 @@
 import { getAuthorizationServer, parseResources, type Env } from './server';
 
 /**
- * Header slice 3's public proxy sets on every request it forwards from the internet, overwriting
- * whatever a client sent. `/internal/*` is reachable only over the `AUTH` service binding, so a
- * request that still carries this header came in through the public Worker: answer 404 so the
- * internal surface stays invisible even if the route is ever exposed by mistake.
+ * Header the public Worker's OAuth proxy sets on every request it forwards from the internet,
+ * overwriting whatever a client sent. `/internal/*` is reachable only over the `AUTH` service
+ * binding, so a request that still carries this header came in through the public Worker: answer
+ * 404 so the internal surface stays invisible even if the route is ever exposed by mistake.
  */
 export const PROXY_HEADER = 'x-sanctuary-proxy';
 
@@ -15,8 +15,8 @@ export const INTERNAL_PREFIX = '/internal';
 export const VALIDATE_PATH = '/internal/validate';
 
 /**
- * The `props` slice 2b stores with a grant via `completeAuthorization()`: the SessionUser fields
- * the public Worker's `/auth/me` returns. Only these four are ever sent back over
+ * The `props` the consent page stores with a grant via `completeAuthorization()`: the SessionUser
+ * fields the public Worker's `/auth/me` returns. Only these four are ever sent back over
  * `/internal/validate`, so a future addition to the stored props is not exposed by accident.
  */
 export interface SessionUser {

@@ -4,7 +4,6 @@
   "projectType": "application",
   "sourceRoot": "apps/auth/src",
   "tags": [],
-  "implicitDependencies": ["worker"],
   "targets": {
     "serve": {
       "executor": "nx:run-commands",

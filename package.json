@@ -1,6 +1,6 @@
 {
   "name": "@org/source",
-  "version": "0.0.373",
+  "version": "0.0.374",
   "license": "MIT",
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true"
@@ -30,6 +30,7 @@
     "nx@22.7.0": true,
     "sharp@0.34.5": true,
     "workerd@1.20260430.1": true,
-    "workerd@1.20260815.1": true
+    "workerd@1.20260815.1": true,
+    "workerd@1.20261019.1": true
   }
 }

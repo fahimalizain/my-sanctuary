@@ -5,12 +5,12 @@ export type Env = Cloudflare.Env;
 
 /**
  * Everything this authorization server can grant, across all its resources. The resource server
- * advertises its own, smaller, up-front baseline; slice 2b's consent page grants a subset of
- * this catalogue per authorization.
+ * advertises its own, smaller, up-front baseline; the consent page grants a subset of this
+ * catalogue per authorization.
  */
 export const SCOPES = ['mcp:read', 'mcp:write', 'offline_access'];
 
-/** The application-owned authorization endpoint (implemented in slice 2b). */
+/** The application-owned authorization endpoint, served by `authorize.ts`. */
 export const AUTHORIZE_PATH = '/oauth/authorize';
 
 /**
@@ -73,7 +73,8 @@ function createAuthorizationServer(
     // Paths are relative to the issuer, which is how the public Worker's proxy forwards them.
     authorizeEndpoint: AUTHORIZE_PATH,
     // The library also serves RFC 7009 revocation here and advertises this URL as
-    // `revocation_endpoint`, so keep it on `/oauth/*` where slice 3's proxy sends traffic.
+    // `revocation_endpoint`, so keep it on `/oauth/*` where the public Worker's proxy sends
+    // traffic.
     tokenEndpoint: '/oauth/token',
     clientRegistrationEndpoint: '/oauth/register',
     scopesSupported: SCOPES,

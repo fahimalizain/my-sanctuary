@@ -1,5 +1,6 @@
-import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
+import { cloudflareTest } from '@cloudflare/vitest-plugin';
 import { defineConfig } from 'vitest/config';
+import { appService } from './test/app-mock.ts';
 
 /**
  * Tests run inside workerd against the real Worker, wired the way production is: the wrangler
@@ -19,11 +20,10 @@ export default defineConfig({
           ISSUER: 'https://my-sanctuary.fahimalizain.com',
           MCP_RESOURCES: 'https://my-sanctuary.fahimalizain.com/mcp',
         },
-        // Miniflare resolves a function-valued service binding to an in-process fetch handler,
-        // which is the test double the `APP` binding needs; its option types only describe the
-        // declarative forms, hence the cast. Slice 2b replaces this with the session lookup.
+        // Miniflare resolves a function-valued service binding to an in-process fetch handler.
+        // Its option types only describe the declarative forms, hence the cast.
         serviceBindings: {
-          APP: (() => Response.json({ user: null })) as unknown as string,
+          APP: appService as unknown as string,
         },
       },
     }),

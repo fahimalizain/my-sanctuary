@@ -16,8 +16,8 @@ declare namespace Cloudflare {
      */
     OAUTH_KV: KVNamespace;
     /**
-     * The public Worker. Slice 2b's authorization endpoint uses it to read the logged-in
-     * session (`GET /auth/me`) before showing the consent page.
+     * The public Worker. The authorization endpoint reads the logged-in session from it
+     * (`GET /auth/me`) before showing the consent page.
      */
     APP: Fetcher;
     /** Canonical issuer advertised in metadata; every endpoint URL is built from it. */

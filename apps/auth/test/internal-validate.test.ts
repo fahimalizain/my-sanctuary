@@ -72,8 +72,8 @@ describe('POST /internal/validate', () => {
   });
 
   it('still serves public paths that carry the proxy header', async () => {
-    // Slice 3 stamps the header on every forwarded public request, so the guard above must only
-    // ever apply to the internal surface.
+    // The public proxy stamps the header on every request it forwards, so the guard above must
+    // only ever apply to the internal surface.
     const metadata = await callWorker(
       '/.well-known/oauth-authorization-server',
       {
@@ -85,6 +85,8 @@ describe('POST /internal/validate', () => {
     });
 
     expect(metadata.status).toBe(200);
-    expect(authorize.status).toBe(501);
+    // The authorization endpoint answers an incomplete request itself, rather than the library
+    // turning it away: it is routed before the library.
+    expect(authorize.status).toBe(400);
   });
 });
