@@ -106,8 +106,9 @@ pub use categories::{
     CategoryView, CategoryWithPatterns, ClassifyOutcome, DeleteCategoryResponse, MAX_PATTERN_LEN,
 };
 pub use oauth::{
-    authorization_url, exchange_and_login, generate_state, HttpClient, HttpError, OAuthError,
-    GOOGLE_AUTH_URL, GOOGLE_TOKEN_URL, GOOGLE_USERINFO_URL, OAUTH_SCOPES,
+    authorization_url, decode_state_cookie, encode_state_cookie, exchange_and_login,
+    generate_state, safe_next_path, HttpClient, HttpError, OAuthError, GOOGLE_AUTH_URL,
+    GOOGLE_TOKEN_URL, GOOGLE_USERINFO_URL, MAX_NEXT_PATH_LEN, OAUTH_SCOPES,
 };
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,

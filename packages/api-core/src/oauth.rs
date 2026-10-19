@@ -135,6 +135,76 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Maximum accepted length of a `next` return path, in bytes.
+///
+/// 2048 bytes encode to at most ~2731 base64url characters, which together
+/// with the 43-character state keeps the state cookie well inside the usual
+/// 4 KiB browser cookie limit.
+pub const MAX_NEXT_PATH_LEN: usize = 2048;
+
+/// Returns `raw` when it is a safe same-origin relative path, otherwise `None`.
+///
+/// Only a path starting with a single `/` is accepted. Rejected: empty
+/// strings, scheme-relative `//host` and `/\host` forms, any backslash,
+/// whitespace or control character (also guards against header injection in
+/// the callback's `Location`), and anything longer than [`MAX_NEXT_PATH_LEN`].
+///
+/// Percent-encoded bytes are accepted verbatim: `/%5Cevil` is a path segment,
+/// not an origin escape, because the redirect target is parsed as a URL path
+/// and never re-decoded into a host.
+pub fn safe_next_path(raw: &str) -> Option<&str> {
+    if raw.is_empty() || raw.len() > MAX_NEXT_PATH_LEN {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    if bytes[0] != b'/' {
+        return None;
+    }
+    // `//host` is scheme-relative and `/\host` is treated as `//host` by some
+    // parsers; neither may leave the origin.
+    if raw.len() > 1 && (bytes[1] == b'/' || bytes[1] == b'\\') {
+        return None;
+    }
+    if raw.contains('\\') {
+        return None;
+    }
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Encodes a state cookie value: `<state>` alone, or
+/// `<state>.<base64url-no-pad(next)>` when a safe `next` is given.
+///
+/// `state` must be base64url without padding (as produced by
+/// [`generate_state`]), so `.` is an unambiguous separator. An unsafe `next`
+/// is dropped, keeping the value byte-identical to the pre-`next` format.
+pub fn encode_state_cookie(state: &str, next: Option<&str>) -> String {
+    match next.and_then(safe_next_path) {
+        None => state.to_string(),
+        Some(next) => format!("{state}.{}", URL_SAFE_NO_PAD.encode(next)),
+    }
+}
+
+/// Splits a state cookie value back into `(state, next)`.
+///
+/// A value without `.` is the legacy/no-next form and yields the whole value
+/// with `None`. The decoded next is re-validated with [`safe_next_path`]
+/// (defence in depth: a tampered cookie can only lose the next, never smuggle
+/// an off-origin redirect). Invalid base64url/UTF-8 tails also yield `None`.
+pub fn decode_state_cookie(value: &str) -> (String, Option<String>) {
+    let Some((state, encoded)) = value.split_once('.') else {
+        return (value.to_string(), None);
+    };
+    let next = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|raw| safe_next_path(&raw).map(str::to_string));
+    (state.to_string(), next)
+}
+
 /// Google's token-endpoint response.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -436,6 +506,113 @@ mod tests {
         // Decodes back to exactly 32 bytes.
         let decoded = URL_SAFE_NO_PAD.decode(&a).unwrap();
         assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn safe_next_path_accepts_same_origin_paths() {
+        assert_eq!(safe_next_path("/"), Some("/"));
+        assert_eq!(safe_next_path("/tasks"), Some("/tasks"));
+        assert_eq!(
+            safe_next_path("/oauth/authorize?client_id=abc&redirect_uri=https%3A%2F%2Fx&state=1"),
+            Some("/oauth/authorize?client_id=abc&redirect_uri=https%3A%2F%2Fx&state=1")
+        );
+        // Percent-encoded backslash stays inside the path (see doc note).
+        assert_eq!(safe_next_path("/%5Cevil"), Some("/%5Cevil"));
+    }
+
+    #[test]
+    fn safe_next_path_rejects_off_origin_and_malformed_values() {
+        for raw in [
+            "",
+            "evil.com",
+            "//evil.com",
+            "/\\evil.com",
+            "/a\\b",
+            "https://evil.com",
+            "http://evil.com/",
+            "javascript:alert(1)",
+            "/foo bar",
+            "/foo\tbar",
+            "/foo\nbar",
+            "/foo\rbar",
+            "/foo\u{7f}bar",
+            "/foo\u{a0}bar",
+        ] {
+            assert_eq!(safe_next_path(raw), None, "must reject {raw:?}");
+        }
+    }
+
+    #[test]
+    fn safe_next_path_caps_length() {
+        let at_limit = format!("/{}", "a".repeat(MAX_NEXT_PATH_LEN - 1));
+        assert_eq!(at_limit.len(), MAX_NEXT_PATH_LEN);
+        assert!(safe_next_path(&at_limit).is_some());
+
+        let over_limit = format!("{at_limit}a");
+        assert_eq!(over_limit.len(), MAX_NEXT_PATH_LEN + 1);
+        assert_eq!(safe_next_path(&over_limit), None);
+    }
+
+    #[test]
+    fn encode_state_cookie_without_next_is_plain_state() {
+        // Byte-identical to the pre-`next` cookie: existing logins keep working.
+        assert_eq!(encode_state_cookie("state-abc", None), "state-abc");
+        // An unsafe next is dropped rather than encoded.
+        assert_eq!(encode_state_cookie("state-abc", Some("//evil.com")), "state-abc");
+    }
+
+    #[test]
+    fn encode_state_cookie_uses_dot_separated_base64url_next() {
+        let next = "/oauth/authorize?client_id=abc&redirect_uri=https%3A%2F%2Fx&state=1";
+        let value = encode_state_cookie("state-abc", Some(next));
+        let (state, encoded) = value.split_once('.').unwrap();
+        assert_eq!(state, "state-abc");
+        assert!(!encoded.contains('='), "no padding: {encoded}");
+        assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap(), next.as_bytes());
+        assert_eq!(
+            decode_state_cookie(&value),
+            ("state-abc".to_string(), Some(next.to_string()))
+        );
+    }
+
+    #[test]
+    fn decode_state_cookie_legacy_value_has_no_next() {
+        assert_eq!(decode_state_cookie("state-abc"), ("state-abc".to_string(), None));
+        assert_eq!(decode_state_cookie(""), (String::new(), None));
+    }
+
+    #[test]
+    fn decode_state_cookie_revalidates_the_next() {
+        for unsafe_next in ["//evil.com", "/\\evil.com", "https://evil.com", "evil.com"] {
+            let tampered = format!("state-abc.{}", URL_SAFE_NO_PAD.encode(unsafe_next));
+            assert_eq!(
+                decode_state_cookie(&tampered),
+                ("state-abc".to_string(), None),
+                "must drop unsafe next {unsafe_next:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_state_cookie_invalid_tail_has_no_next() {
+        // Not base64url.
+        assert_eq!(
+            decode_state_cookie("state-abc.***"),
+            ("state-abc".to_string(), None)
+        );
+        // Extra separator: the tail is no longer valid base64url.
+        assert_eq!(
+            decode_state_cookie("state-abc.a.b"),
+            ("state-abc".to_string(), None)
+        );
+        // Valid base64url but invalid UTF-8.
+        let invalid_utf8 = format!("state-abc.{}", URL_SAFE_NO_PAD.encode([0xff, 0xfe]));
+        assert_eq!(
+            decode_state_cookie(&invalid_utf8),
+            ("state-abc".to_string(), None)
+        );
+        // Empty tail.
+        assert_eq!(decode_state_cookie("state-abc."), ("state-abc".to_string(), None));
     }
 
     #[test]

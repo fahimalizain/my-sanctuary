@@ -1,6 +1,10 @@
 //! `/auth/*` handlers: session `me`/`logout`, plus the Google OAuth login
 //! flow (`/auth/google` → consent screen → `/auth/google/callback`).
 //!
+//! `/auth/google` accepts an optional same-origin `next` return path, carried
+//! through Google in the state cookie so the callback can land back on it
+//! (e.g. an OAuth authorize URL) after login.
+//!
 //! All endpoints are reachable cross-origin when the frontend overrides
 //! `VITE_API_BASE_URL`, so they set CORS headers from `FRONTEND_URL`
 //! (default `http://localhost:5173`, matching the Vite dev proxy). The
@@ -113,17 +117,26 @@ pub fn options(_req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Re
     Ok(response.with_headers(cors_headers(frontend_url(&ctx))?))
 }
 
-/// `GET /auth/google` → 302 to Google's consent screen.
+/// `GET /auth/google?next=/path` → 302 to Google's consent screen.
+///
+/// `next` is an optional same-origin return path (validated by
+/// [`api_core::safe_next_path`]) carried inside the state cookie. Invalid or
+/// missing values behave exactly like a plain login (redirect to
+/// `FRONTEND_URL`).
 ///
 /// Requires `GOOGLE_CREDENTIALS_JSON` to be configured; otherwise responds
 /// 500 "oauth not configured" so `/health` and `/auth/me` keep working.
-pub fn google(_req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
+pub fn google(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
     let Some(config) = ctx.data.as_ref() else {
         return error_response(&ctx, 500, "oauth not configured", false);
     };
     let Some(oauth) = config.oauth.as_ref() else {
         return error_response(&ctx, 500, "oauth not configured", false);
     };
+
+    let url = req.url()?;
+    let next = query_param(&url, "next")
+        .and_then(|raw| api_core::safe_next_path(&raw).map(str::to_string));
 
     let state = api_core::generate_state();
     let location = api_core::authorization_url(oauth, &state);
@@ -135,14 +148,18 @@ pub fn google(_req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Res
     headers.set("Location", &location)?;
     headers.set(
         "Set-Cookie",
-        &oauth_state_cookie_header(&state, config.secure_cookie),
+        &oauth_state_cookie_header(
+            &api_core::encode_state_cookie(&state, next.as_deref()),
+            config.secure_cookie,
+        ),
     )?;
     let response = Response::empty()?.with_status(302).with_headers(headers);
     Ok(response)
 }
 
 /// `GET /auth/google/callback` → exchanges the code, persists user + tokens,
-/// seals the session cookie, and 302s to `FRONTEND_URL`.
+/// seals the session cookie, and 302s to `FRONTEND_URL` — plus the safe
+/// `next` path carried by the state cookie, when there is one.
 pub async fn google_callback(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -152,15 +169,19 @@ pub async fn google_callback(
     let code = query_param(&url, "code");
 
     let cookie_header = req.headers().get("Cookie").ok().flatten();
-    let cookie_state =
+    let cookie_value =
         api_core::cookie_value_from_header(cookie_header.as_deref(), OAUTH_STATE_COOKIE);
 
-    // CSRF check: the state query parameter must match the state cookie set
-    // by `/auth/google` (same origin via the Vite proxy, Path=/).
-    let Some(cookie_state) = cookie_state else {
+    // CSRF check: the state part of the cookie value must match the state
+    // query parameter set by `/auth/google` (same origin via the Vite proxy,
+    // Path=/). The cookie may also carry a `<state>.<base64url(next)>` suffix;
+    // `decode_state_cookie` re-validates the next, so a tampered cookie can
+    // only lose the return path, never redirect off-origin.
+    let Some(cookie_value) = cookie_value else {
         return error_response(&ctx, 400, "invalid state", false);
     };
-    if !ct_eq(cookie_state, query_state.as_deref().unwrap_or("")) {
+    let (cookie_state, next) = api_core::decode_state_cookie(&cookie_value);
+    if !ct_eq(&cookie_state, query_state.as_deref().unwrap_or("")) {
         return error_response(&ctx, 400, "invalid state", false);
     }
     // State matched: from here on every response also expires the state cookie.
@@ -232,7 +253,13 @@ pub async fn google_callback(
     };
 
     let headers = cors_headers(frontend_url(&ctx))?;
-    headers.set("Location", &config.frontend_url)?;
+    // Trim any trailing slash so `FRONTEND_URL` + `next` never doubles it.
+    // Without a next, the redirect is exactly `FRONTEND_URL` as before.
+    let location = match next {
+        Some(next) => format!("{}{next}", config.frontend_url.trim_end_matches('/')),
+        None => config.frontend_url.clone(),
+    };
+    headers.set("Location", &location)?;
     headers.set("Set-Cookie", &clear_oauth_state_cookie_header(&ctx))?;
     headers.append(
         "Set-Cookie",
