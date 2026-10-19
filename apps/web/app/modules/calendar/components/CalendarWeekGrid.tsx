@@ -123,20 +123,18 @@ export function CalendarWeekGrid({
       <div
         ref={scrollerRef}
         data-calendar-scroller
-        className="flex-1 min-h-0 overflow-auto snap-x snap-mandatory [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
-        // Day columns snap (snap-start) to the track's left edge, i.e. just
-        // right of the sticky gutter; padding = gutter keeps them aligned there.
-        // Both axes stay user-scrollable — `overflow-x: hidden` is *not* a way
-        // to rail the strip sideways: on iOS a vertical pan re-evaluates the
-        // mandatory x-snap, the x axis is not user-scrollable, and WebKit
-        // collapses the target to the first snap column (scrollLeft 0, the
-        // oldest overscan day), which the rebase then repeats — the strip flies
-        // backwards through history dates.
-        // The x axis is programmatically driven instead (touch swipe, trackpad
-        // burst, drag autoscroll): `touch-action: pan-y` keeps a touch single
-        // axis, and `useCalendarStrip` rejects any `scrollLeft` the browser
-        // moves on its own.
-        style={{ scrollPaddingLeft: gutterW }}
+        className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+        // One gesture, one axis. The browser may only pan the hours (overflow-y
+        // + `touch-action: pan-y`); the day strip is moved by `useCalendarStrip`
+        // alone, which writes `scrollLeft` — touch swipe, trackpad burst, drag
+        // autoscroll, rebase, park — and lands on a column with its own ease-out
+        // tween. `overflow-x: hidden` is what makes that hold everywhere: the
+        // axis stays programmatically scrollable (the sticky gutter included),
+        // but the browser can never pan it, which `pan-y` alone does not
+        // guarantee on iOS.
+        // No CSS scroll-snap: `snap-x snap-mandatory` re-snapped every
+        // programmatic write, and on iOS an x snap no touch can reach collapsed
+        // `scrollLeft` to the first column. The tween is the only snap.
         onScroll={onScroll}
       >
         {/* Content: sticky headers + all-day + hours strip */}

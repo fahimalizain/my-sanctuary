@@ -57,7 +57,7 @@ import type { CalendarEvent } from '@/app/types';
 
 export interface UseCalendarDragOptions {
   hourH: number;
-  /** Take / release the infinite strip's drag lock (snap off, no rebase). */
+  /** Take / release the infinite strip's drag lock (no rebase). */
   lockStrip: (reason: StripLockReason) => void;
   unlockStrip: (reason: StripLockReason) => void;
   onClickCreate: (slot: DragSlot) => void;
