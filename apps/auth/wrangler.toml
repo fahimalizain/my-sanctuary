@@ -1,0 +1,42 @@
+name = "my-sanctuary-auth"
+main = "src/index.ts"
+compatibility_date = "2026-05-02"
+
+# CIMD (Client ID Metadata Documents) fetches must not resolve hostnames through legacy
+# same-zone routing; the library refuses to accept or advertise CIMD without this flag.
+compatibility_flags = ["global_fetch_strictly_public"]
+
+# Private in both directions: the public `my-sanctuary` Worker forwards `/oauth/*` and
+# `/.well-known/oauth-authorization-server*` here over its `AUTH` service binding, and calls
+# `POST /internal/validate` on the same binding. No routes and no workers.dev URL, so nothing
+# can reach this Worker directly.
+workers_dev = false
+preview_urls = false
+
+[observability]
+enabled = false
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[vars]
+ISSUER = "https://my-sanctuary.fahimalizain.com"
+MCP_RESOURCES = "https://my-sanctuary.fahimalizain.com/mcp"
+
+# Local `wrangler dev` simulates KV in-process, so no namespace is needed for local/dev and
+# tests. The real namespace does not exist yet: create it once with
+# `npx wrangler kv namespace create OAUTH_KV` and paste the returned id here before the first
+# `npx nx deploy auth`. Do NOT invent or reuse another Worker's namespace id — grants and tokens
+# are keyed only by hash, so pointing this at the wrong namespace silently invalidates them.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
+
+# The public Worker. Slice 2b's authorization endpoint calls `GET /auth/me` on it to find the
+# logged-in session before rendering consent.
+[[services]]
+binding = "APP"
+service = "my-sanctuary"

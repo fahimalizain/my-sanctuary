@@ -1,0 +1,56 @@
+{
+  "name": "auth",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/auth/src",
+  "tags": [],
+  "implicitDependencies": ["worker"],
+  "targets": {
+    "serve": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "commands": ["wrangler dev"],
+        "cwd": "apps/auth"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["wrangler deploy --dry-run --outdir dist"],
+        "cwd": "apps/auth"
+      },
+      "outputs": ["{projectRoot}/dist"]
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["tsc --noEmit"],
+        "cwd": "apps/auth"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["eslint ."],
+        "cwd": "apps/auth"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": ["vitest run"],
+        "cwd": "apps/auth"
+      }
+    },
+    "deploy": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["build"],
+      "cache": false,
+      "options": {
+        "commands": ["wrangler deploy"],
+        "cwd": "apps/auth"
+      }
+    }
+  }
+}

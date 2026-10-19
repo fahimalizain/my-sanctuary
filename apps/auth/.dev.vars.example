@@ -1,0 +1,8 @@
+# Local overrides for `npx nx serve auth` / `wrangler dev`.
+# Copy to `.dev.vars` (gitignored) in this directory; `wrangler dev` also reads `.dev.vars` for
+# vars declared in wrangler.toml, so these replace the production ISSUER/MCP_RESOURCES.
+#
+# The library only accepts plain `http` on loopback hosts, so both loopback spellings of the local
+# resource are registered: an MCP client reaches the Worker through whatever the browser used.
+ISSUER=http://localhost:8787
+MCP_RESOURCES=http://localhost:8787/mcp,http://127.0.0.1:8787/mcp
