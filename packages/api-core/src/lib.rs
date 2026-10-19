@@ -30,6 +30,7 @@ pub mod token;
 
 mod config;
 mod health;
+mod oauth_proxy;
 mod session;
 
 pub use agenda::{
@@ -110,6 +111,7 @@ pub use oauth::{
     generate_state, safe_next_path, HttpClient, HttpError, OAuthError, GOOGLE_AUTH_URL,
     GOOGLE_TOKEN_URL, GOOGLE_USERINFO_URL, MAX_NEXT_PATH_LEN, OAUTH_SCOPES,
 };
+pub use oauth_proxy::is_auth_server_path;
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };

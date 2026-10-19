@@ -19,7 +19,9 @@
       "dependsOn": ["^build"],
       "executor": "nx:run-commands",
       "options": {
-        "commands": ["wrangler dev"],
+        "commands": [
+          "wrangler dev -c wrangler.toml -c ../auth/wrangler.toml --local-upstream localhost:8787"
+        ],
         "cwd": "apps/worker"
       }
     },

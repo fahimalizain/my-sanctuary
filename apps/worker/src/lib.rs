@@ -6,6 +6,7 @@ mod cron;
 mod db;
 mod http;
 mod lists;
+mod oauth_proxy;
 mod queue;
 mod reports;
 mod routines;
@@ -72,6 +73,14 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     // `/api/*` is already `run_worker_first`, so this path always hits the Worker.
     if req.path() == "/api/realtime" {
         return user_hub::connect(req, env, config.as_ref()).await;
+    }
+
+    // The OAuth authorization server is a separate, private Worker reached over
+    // the `AUTH` service binding, so the public issuer origin stays this one.
+    // Only its public paths forward — never `/internal/*` — while `/mcp` and
+    // `/.well-known/oauth-protected-resource*` are served here, not there.
+    if api_core::is_auth_server_path(&req.path()) {
+        return oauth_proxy::forward(req, &env).await;
     }
 
     Router::with_data(config)

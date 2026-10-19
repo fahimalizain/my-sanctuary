@@ -34,13 +34,23 @@ binding = "DB"
 database_name = "sanctuary-db"
 database_id = "7fcdb90e-d286-412d-9161-a63e62ebaf44"
 
+# The OAuth 2.1 authorization server for the remote MCP endpoint is its own
+# private Worker (`apps/auth`, no route): `/oauth/*` and
+# `/.well-known/oauth-authorization-server*` are forwarded to it over this
+# binding so discovery and endpoint URLs keep the public issuer origin, and
+# `/mcp` validates bearer tokens through it. Deploy it first — this binding
+# does not resolve until `my-sanctuary-auth` exists.
+[[services]]
+binding = "AUTH"
+service = "my-sanctuary-auth"
+
 [build]
 command = "PATH=\"$HOME/.cargo/bin:$PATH\" worker-build --release"
 
 [assets]
 directory = "../../dist/apps/web"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/auth/*", "/health", "/version"]
+run_worker_first = ["/api/*", "/auth/*", "/health", "/version", "/oauth/*", "/.well-known/*", "/mcp", "/mcp/*"]
 
 [triggers]
 crons = ["*/2 * * * *", "*/15 * * * *"]
