@@ -298,7 +298,10 @@ pub struct NewCalendarEvent {
     /// where blanking the stamp would lose a good classification. A
     /// **successful** load that matches nothing must stay `false`: the title
     /// really is unclassified and `NULL` is the truth. An INSERT of a brand
-    /// new row stores `NULL` either way — there is no prior stamp to keep.
+    /// new row stores `NULL` either way — there is no prior stamp to keep —
+    /// but it also stores `category_classified = 0`, because a preserving write
+    /// never looked at the title; the digest's verification scan may still pick
+    /// that row up (0022).
     pub preserve_category: bool,
     /// Google organizer flag (`organizer.self`, or no organizer → `true`).
     /// Google-owned; bound as `1`/`0`.

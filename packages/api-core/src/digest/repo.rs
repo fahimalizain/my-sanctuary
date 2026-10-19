@@ -527,9 +527,10 @@ pub const DIGEST_HAS_STALE_META_SQL: &str = "
 /// One reclassify batch: every living event of the user whose id sorts after
 /// the cursor, oldest id first.
 ///
-/// `category_id` is read as well as written: the edge case "the id did not
-/// change ⇒ no dirty mark" needs the stored stamp, and re-writing an identical
-/// stamp would only churn.
+/// `category_id` / `category_classified` are read as well as written: the edge
+/// case "the id did not change ⇒ no dirty mark" needs the stored stamp, the
+/// flag says whether the row was ever classified, and re-writing an identical
+/// pair would only churn.
 pub const DIGEST_RECLASSIFY_BATCH_SQL: &str = "
     SELECT
       e.id AS id,
@@ -539,7 +540,8 @@ pub const DIGEST_RECLASSIFY_BATCH_SQL: &str = "
       e.end_time AS end_time,
       e.start_time_zone AS start_time_zone,
       e.end_time_zone AS end_time_zone,
-      e.category_id AS category_id
+      e.category_id AS category_id,
+      e.category_classified AS category_classified
     FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
@@ -550,11 +552,14 @@ pub const DIGEST_RECLASSIFY_BATCH_SQL: &str = "
     LIMIT ?
 ";
 
-/// The next **unstamped** living events for a user, oldest id first — the
-/// verification scan behind [`DIGEST_RECLASSIFY_BATCH_SQL`].
+/// The next living events for a user that were **never classified**, oldest id
+/// first — the verification scan behind [`DIGEST_RECLASSIFY_BATCH_SQL`].
 ///
-/// Ids are random UUIDs, so a row inserted while the scan is walking can sort
-/// *before* the cursor and would never be visited again. A short batch
+/// The pending predicate is `category_classified = 0`, never
+/// `category_id IS NULL`: a title matching no pattern legitimately keeps a
+/// NULL leaf forever, so a NULL leaf on its own means "no match", not "not
+/// scanned". Ids are random UUIDs, so a row inserted while the scan is walking
+/// can sort *before* the cursor and would never be visited again. A short batch
 /// therefore only finishes the job when this comes back empty; the same columns
 /// as the batch query, so the caller stamps both through one path.
 pub const DIGEST_UNSTAMPED_BATCH_SQL: &str = "
@@ -566,22 +571,25 @@ pub const DIGEST_UNSTAMPED_BATCH_SQL: &str = "
       e.end_time AS end_time,
       e.start_time_zone AS start_time_zone,
       e.end_time_zone AS end_time_zone,
-      e.category_id AS category_id
+      e.category_id AS category_id,
+      e.category_classified AS category_classified
     FROM calendar_events e
     JOIN google_calendars c ON c.id = e.calendar_id
     WHERE c.user_id = ?
       AND c.deleted_at IS NULL
       AND e.deleted_at IS NULL
-      AND e.category_id IS NULL
+      AND e.category_classified = 0
     ORDER BY e.id
     LIMIT ?
 ";
 
-/// Does the user still have a living event with no leaf stamp?
+/// Does the user still have a living event that was never classified?
 ///
 /// A `done` reclassify job may only be left alone when this is `false`: a
 /// taxonomy edit that lands after the scan finished must restart it, while a
-/// finished scan with nothing left must not.
+/// finished scan with nothing left must not. `category_classified = 0` — not a
+/// NULL leaf, which a title matching no pattern keeps forever — is the
+/// "pending work" signal.
 pub const DIGEST_HAS_UNSTAMPED_SQL: &str = "
     SELECT 1 AS present
     FROM calendar_events e
@@ -589,7 +597,7 @@ pub const DIGEST_HAS_UNSTAMPED_SQL: &str = "
     WHERE c.user_id = ?
       AND c.deleted_at IS NULL
       AND e.deleted_at IS NULL
-      AND e.category_id IS NULL
+      AND e.category_classified = 0
     LIMIT 1
 ";
 
@@ -609,13 +617,21 @@ pub struct ReclassifyRow {
     pub end_time_zone: String,
     #[serde(default, deserialize_with = "de_optional_empty_string")]
     pub category_id: Option<String>,
+    /// `1` = classified at least once (a real leaf **or** a deliberate
+    /// no-match), `0` = never classified. Only the latter is pending work for
+    /// the verification scan; defaulted so older fixtures still deserialize.
+    #[serde(default)]
+    pub category_classified: i64,
 }
 
-/// Writes the classifier's verdict. `NULLIF(?, '')` turns an empty string into
-/// SQL `NULL`, so a `None` (unclassified) clears a stale stamp. Deliberately
-/// does NOT touch `updated_at`: a re-stamp is not a content change.
+/// Writes the classifier's verdict and marks the row classified.
+/// `NULLIF(?, '')` turns an empty string into SQL `NULL`, so a `None`
+/// (no match) clears a stale stamp while `category_classified = 1` records that
+/// the row was looked at — that is what keeps a NULL leaf out of the
+/// verification scan. Deliberately does NOT touch `updated_at`: a re-stamp is
+/// not a content change.
 pub const DIGEST_SET_CATEGORY_SQL: &str =
-    "UPDATE calendar_events SET category_id = NULLIF(?, '') WHERE id = ? AND deleted_at IS NULL";
+    "UPDATE calendar_events SET category_id = NULLIF(?, ''), category_classified = 1 WHERE id = ? AND deleted_at IS NULL";
 
 /// The stored span of one event, for dirty marking an edit/delete. No
 /// `deleted_at` filter — a resurrected row's old span still matters.
@@ -865,21 +881,25 @@ pub trait DigestRepo: Send + Sync {
         after_id: &str,
         limit: usize,
     ) -> Result<Vec<ReclassifyRow>, RepoError>;
-    /// The next `limit` living events with **no** leaf stamp, ordered by id —
-    /// the verification scan a finished id walk runs before it may complete.
+    /// The next `limit` living events with **no** classification yet
+    /// (`category_classified = 0`), ordered by id — the verification scan a
+    /// finished id walk runs before it may complete. A NULL leaf that was
+    /// already classified is not pending.
     async fn unstamped_batch(
         &self,
         user_id: &str,
         limit: usize,
     ) -> Result<Vec<ReclassifyRow>, RepoError>;
-    /// Whether any living event still has no leaf stamp.
+    /// Whether any living event was never classified (`category_classified =
+    /// 0`).
     async fn has_unstamped_event(&self, user_id: &str) -> Result<bool, RepoError>;
     /// The user's `sleep_duration` target in seconds (`target_hours * 3600`,
     /// rounded) from the latest non-archived rule, or `None` when they have no
     /// such rule — the caller falls back to
     /// [`super::DEFAULT_SLEEP_SECS`].
     async fn sleep_target_secs(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
-    /// Rewrites one event's leaf stamp (`None`/empty clears it to `NULL`).
+    /// Rewrites one event's leaf stamp (`None`/empty clears it to `NULL`) and
+    /// marks the row classified (`category_classified = 1`).
     async fn set_category(&self, id: &str, category_id: Option<&str>) -> Result<(), RepoError>;
     /// Whether any `daily_meta` row exists for the user.
     async fn has_meta(&self, user_id: &str) -> Result<bool, RepoError>;

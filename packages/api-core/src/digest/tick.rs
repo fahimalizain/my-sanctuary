@@ -155,11 +155,11 @@ impl BackfillJob {
 /// the tick's `run_reclassify`, so a read endpoint (`GET /api/reports/status`,
 /// opening the record) can queue work but can never classify anything.
 ///
-/// A `done` job is restarted only when the user still has a living event with
-/// no leaf stamp: the finished scan's stamps are valid, so re-running it would
-/// rewrite nothing (only `has_unstamped_event` can have changed since — an
-/// event synced in after the scan). A `done` job with no nulls left is left
-/// alone.
+/// A `done` job is restarted only when the user still has a living event that
+/// was never classified (`has_unstamped_event`): the finished scan's stamps are
+/// valid, so re-running it would rewrite nothing (only `has_unstamped_event`
+/// can have changed since — an event synced in after the scan). A `done` job
+/// with nothing pending is left alone.
 async fn ensure_reclassify_job(
     repo: &dyn DigestRepo,
     user_id: &str,
@@ -504,10 +504,10 @@ async fn run_backfill(
 /// inserted while the scan is walking can sort **before** the cursor and would
 /// never be visited again, so a short batch may not simply finish the job. The
 /// scan is exhausted when a batch comes back short **and** the verification
-/// query ([`DigestRepo::unstamped_batch`]) finds no living event without a
-/// stamp. Verification rows are stamped in this same tick; a full verification
-/// batch keeps the job `running` and rewinds the cursor to the start so the
-/// next tick's walk cannot skip anything.
+/// query ([`DigestRepo::unstamped_batch`]) finds no living event that was never
+/// classified. Verification rows are stamped in this same tick; a full
+/// verification batch keeps the job `running` and rewinds the cursor to the
+/// start so the next tick's walk cannot skip anything.
 async fn run_reclassify(
     repo: &dyn DigestRepo,
     category_repo: &dyn TaskCategoryRepo,
@@ -554,7 +554,8 @@ async fn run_reclassify(
     // A short batch means the id walk is exhausted — but the walk can have
     // **skipped** rows: ids are random UUIDs, so a row inserted mid-scan sorts
     // before the cursor and `e.id > ?` will never visit it again. The job may
-    // only finish once the verification scan finds nothing unstamped.
+    // only finish once the verification scan finds nothing that was never
+    // classified (a NULL leaf alone means "no pattern matched", not "pending").
     let pending = match repo.unstamped_batch(user_id, RECLASSIFY_BATCH_LIMIT).await {
         Ok(pending) => pending,
         Err(err) => {
@@ -628,6 +629,12 @@ async fn advance_reclassify_cursor(
 /// Classifies and stamps a batch, marking the days each changed row touches
 /// dirty. Shared by the id walk and the verification scan (same columns).
 ///
+/// A row whose verdict did not change is skipped **only** when it was already
+/// classified (`category_classified != 0`): a never-classified row must still
+/// be written through [`DigestRepo::set_category`] so the flag records that it
+/// was looked at — a no-match verdict that stays `NULL` is the whole point of
+/// the flag. Such a write is not a reclassification: no counter, no dirty mark.
+///
 /// Returns `false` when a stamp write failed: the caller must leave the job
 /// `running` with its cursor so the row is retried, never finish over it.
 async fn stamp_rows(
@@ -645,8 +652,10 @@ async fn stamp_rows(
             &taxonomy.categories,
             &taxonomy.matchers,
         );
-        if next == row.category_id {
-            // Unchanged stamp: nothing to write and nothing to rebuild.
+        let changed = next != row.category_id;
+        if !changed && row.category_classified != 0 {
+            // Unchanged verdict on an already-classified row: nothing to write
+            // and nothing to rebuild.
             continue;
         }
         if let Err(err) = repo.set_category(&row.id, next.as_deref()).await {
@@ -654,6 +663,11 @@ async fn stamp_rows(
                 .errors
                 .push(format!("digest: set_category failed for {}: {err}", row.id));
             return false;
+        }
+        if !changed {
+            // First look at a no-match row: the flag is now set, but the
+            // stored verdict did not move, so no day changed.
+            continue;
         }
         report.reclassified += 1;
         let dates = dirty_dates_for_span(

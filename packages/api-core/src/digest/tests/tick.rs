@@ -35,6 +35,9 @@ pub struct FakeRow {
     pub start_time: String,
     pub end_time: String,
     pub category_id: Option<String>,
+    /// `calendar_events.category_classified`: `1` = classified at least once,
+    /// `0` = never classified (the only state the verification scan picks up).
+    pub category_classified: i64,
 }
 
 impl FakeRow {
@@ -48,6 +51,7 @@ impl FakeRow {
             start_time_zone: "UTC".to_string(),
             end_time_zone: "UTC".to_string(),
             category_id: self.category_id.clone(),
+            category_classified: self.category_classified,
         }
     }
 }
@@ -268,10 +272,11 @@ impl DigestRepo for FakeDigestRepo {
         let mut state = self.state.lock().expect("fake lock");
         let stamp = category_id.map(|value| value.to_string());
         state.stamps.insert(id.to_string(), stamp.clone());
-        // The verification scan reads the **stored** stamp, so the fake stores
-        // it too — recording the write is not enough.
+        // The verification scan reads the **stored** verdict and flag, so the
+        // fake stores both — recording the write is not enough.
         if let Some(row) = state.rows.iter_mut().find(|row| row.id == id) {
             row.category_id = stamp;
+            row.category_classified = 1;
         }
         Ok(())
     }
@@ -289,7 +294,7 @@ impl DigestRepo for FakeDigestRepo {
         Ok(state
             .rows
             .iter()
-            .filter(|row| row.category_id.is_none())
+            .filter(|row| row.category_classified == 0)
             .take(limit)
             .map(FakeRow::to_batch_row)
             .collect())
@@ -298,7 +303,7 @@ impl DigestRepo for FakeDigestRepo {
     async fn has_unstamped_event(&self, user_id: &str) -> Result<bool, RepoError> {
         let state = self.state.lock().expect("fake lock");
         assert_eq!(user_id, state.user_id);
-        Ok(state.rows.iter().any(|row| row.category_id.is_none()))
+        Ok(state.rows.iter().any(|row| row.category_classified == 0))
     }
 
     async fn sleep_target_secs(&self, _user_id: &str) -> Result<Option<i64>, RepoError> {
@@ -936,7 +941,8 @@ fn stale_day(date: &str) -> DayDigest {
     }
 }
 
-/// One unstamped "Deep Work" row, matched by the `work` pattern below.
+/// One never-classified "Deep Work" row (flag `0`), matched by the `work`
+/// pattern below.
 fn deep_work_row(id: &str) -> FakeRow {
     FakeRow {
         id: id.to_string(),
@@ -945,6 +951,18 @@ fn deep_work_row(id: &str) -> FakeRow {
         start_time: "2026-01-02T10:00:00Z".to_string(),
         end_time: "2026-01-02T11:00:00Z".to_string(),
         category_id: None,
+        category_classified: 0,
+    }
+}
+
+/// One already-classified row whose title matches no pattern: `category_id`
+/// stays NULL forever (a deliberate no-match), so only the flag keeps it out of
+/// the verification scan.
+fn unmatched_row(id: &str) -> FakeRow {
+    FakeRow {
+        title: "Unmatched".to_string(),
+        category_classified: 1,
+        ..deep_work_row(id)
     }
 }
 
@@ -1094,6 +1112,7 @@ fn reclassify_restamps_changed_rows_and_marks_their_days_dirty() {
                 start_time: "2026-01-02T10:00:00Z".to_string(),
                 end_time: "2026-01-02T11:00:00Z".to_string(),
                 category_id: None,
+                category_classified: 0,
             },
             FakeRow {
                 id: "e-2".to_string(),
@@ -1101,9 +1120,10 @@ fn reclassify_restamps_changed_rows_and_marks_their_days_dirty() {
                 google_calendar_id: "primary@example.com".to_string(),
                 start_time: "2026-01-03T10:00:00Z".to_string(),
                 end_time: "2026-01-03T11:00:00Z".to_string(),
-                // Already stamped with the winning category: no write, no
-                // dirty mark.
+                // Already stamped with the winning category and classified:
+                // no write, no dirty mark.
                 category_id: Some("work".to_string()),
+                category_classified: 1,
             },
         ];
     });
@@ -1163,6 +1183,7 @@ fn a_taxonomy_load_failure_leaves_reclassify_running_and_the_cursor_unmoved() {
             start_time: "2026-01-02T10:00:00Z".to_string(),
             end_time: "2026-01-02T11:00:00Z".to_string(),
             category_id: Some("work".to_string()),
+            category_classified: 1,
         }];
     });
     let taxonomy = FakeTaxonomyRepo::with(
@@ -1366,7 +1387,9 @@ fn a_reclassify_that_starts_mid_rebuild_keeps_the_days_dirty() {
 fn reclassify_does_not_finish_while_null_category_rows_remain() {
     // The walk is `e.id > ?`, and ids are random UUIDs: a row that lands during
     // the scan can sort **before** the cursor and is never visited again. The
-    // verification scan must find it before the job may be called done.
+    // verification scan must find it before the job may be called done. Both
+    // rows are never classified (flag 0) and match the pattern, so the hidden
+    // one is a real pending row, not a no-match NULL.
     let repo = FakeDigestRepo::new("u-1");
     repo.mutate(|state| {
         state.jobs.insert(
@@ -1415,6 +1438,163 @@ fn reclassify_does_not_finish_while_null_category_rows_remain() {
 }
 
 #[test]
+fn reclassify_finishes_when_unmatched_rows_were_already_classified() {
+    // The bug the flag exists for: a title that matches no pattern keeps
+    // `category_id = NULL` forever. With ≥ `RECLASSIFY_BATCH_LIMIT` of those
+    // already scanned, the verification used to read the NULLs as "not
+    // scanned", take a full batch, rewind the cursor and loop the job forever
+    // — the backfill behind it never ran.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.jobs.insert(JOB_RECLASSIFY.to_string(), running_job());
+        state.rows = (0..RECLASSIFY_BATCH_LIMIT)
+            .map(|index| unmatched_row(&format!("e-{index:03}")))
+            .collect();
+    });
+    let taxonomy = work_taxonomy();
+
+    // A full walk batch: the cursor advances and nothing is written.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.reclassified, 0, "no title matches the pattern");
+    assert!(
+        repo.state().stamps.is_empty(),
+        "an already-classified NULL is not rewritten"
+    );
+    assert!(!report.reclassify_done);
+
+    // A short walk and an empty verification: the job drains instead of
+    // rewinding on the NULLs it can never resolve.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        report.reclassify_done,
+        "nothing is pending: those NULLs were classified"
+    );
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY).map(|job| job.status),
+        Some(JOB_DONE.to_string())
+    );
+}
+
+#[test]
+fn a_never_classified_no_match_row_gets_the_flag_without_a_restamp() {
+    // A row the walk reaches for the first time whose title matches nothing:
+    // `category_id` stays NULL, so the only effect is the flag — no dirty mark
+    // and no `reclassified` count, because no stored verdict changed.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.jobs.insert(JOB_RECLASSIFY.to_string(), running_job());
+        state.rows = vec![FakeRow {
+            title: "Unmatched".to_string(),
+            ..deep_work_row("e-1")
+        }];
+    });
+    let taxonomy = work_taxonomy();
+
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.reclassified, 0, "the verdict did not change");
+    assert_eq!(
+        repo.state().stamps.get("e-1"),
+        Some(&None),
+        "the NULL verdict is written so the flag is persisted"
+    );
+    assert_eq!(
+        repo.state()
+            .rows
+            .iter()
+            .find(|row| row.id == "e-1")
+            .map(|row| row.category_classified),
+        Some(1),
+        "the row is now classified (as a deliberate no-match)"
+    );
+    assert!(
+        repo.state().replace_day_calls.is_empty(),
+        "nothing changed, so no day is dirty"
+    );
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(JobStatus {
+            status: JOB_RUNNING.to_string(),
+            cursor: "e-1".to_string(),
+        }),
+        "a short walk advances the cursor and hands the next tick an empty batch"
+    );
+
+    // The next tick's empty batch + empty verification finishes the job.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        report.reclassify_done,
+        "the verification finds nothing pending"
+    );
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY).map(|job| job.status),
+        Some(JOB_DONE.to_string())
+    );
+}
+
+#[test]
+fn a_full_verification_batch_of_unclassified_rows_rewinds_the_cursor() {
+    // The rewind is not dead code: rows that were never classified still
+    // trigger it. They sort before the cursor, so the walk's next pass — from
+    // the rewound cursor — must reach them before the job may finish.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.jobs.insert(
+            JOB_RECLASSIFY.to_string(),
+            JobStatus {
+                status: JOB_RUNNING.to_string(),
+                cursor: "z".to_string(),
+            },
+        );
+        state.rows = (0..RECLASSIFY_BATCH_LIMIT)
+            .map(|index| FakeRow {
+                title: "Unmatched".to_string(),
+                ..deep_work_row(&format!("a-hidden-{index:03}"))
+            })
+            .collect();
+    });
+    let taxonomy = work_taxonomy();
+
+    // A short (empty) walk whose verification is full: every hidden row is
+    // flagged and the cursor rewinds to "" so no id is skipped.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(!report.reclassify_done);
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(JobStatus {
+            status: JOB_RUNNING.to_string(),
+            cursor: String::new(),
+        }),
+        "a full verification batch rewinds the cursor"
+    );
+    assert_eq!(report.reclassified, 0, "no verdict changed, only the flag");
+    let flagged = {
+        let state = repo.state();
+        state.rows.iter().all(|row| row.category_classified == 1)
+    };
+    assert!(flagged, "the verification visited every hidden row");
+
+    // The rewound walk visits them all (a full batch again) and advances.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(!report.reclassify_done);
+    assert_eq!(report.reclassified, 0);
+
+    // Empty walk + empty verification: the job finally finishes.
+    let report = poll(run_digest_tick_user(&repo, &taxonomy, "u-1", 7, today()));
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.reclassify_done);
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY).map(|job| job.status),
+        Some(JOB_DONE.to_string())
+    );
+}
+
+#[test]
 fn a_done_reclassify_restarts_only_while_unstamped_events_remain() {
     // Done + a living event with no leaf stamp: the scan must run again — an
     // event synced in after it finished would otherwise never be classified.
@@ -1429,15 +1609,33 @@ fn a_done_reclassify_restarts_only_while_unstamped_events_remain() {
     assert_eq!(
         repo.job(JOB_RECLASSIFY),
         Some(running_job()),
-        "an unstamped row restarts the finished scan"
+        "a never-classified row restarts the finished scan"
     );
 
-    // Done + every row stamped: the stamps are valid, so nothing is restarted.
+    // Done + an unmatched NULL that was already classified: not pending work,
+    // so a finished scan is not restarted over it.
+    let repo = FakeDigestRepo::new("u-1");
+    repo.mutate(|state| {
+        state.events = day_events("2026-01-02", "2026-01-02");
+        state.rows = vec![unmatched_row("e-1")];
+        state.jobs.insert(JOB_RECLASSIFY.to_string(), done_job());
+    });
+    let job = poll(ensure_backfill_job(&repo, "u-1", "2026-01-10T06:00:00Z")).expect("job");
+    assert!(job.started, "the first-run backfill is still due");
+    assert_eq!(
+        repo.job(JOB_RECLASSIFY),
+        Some(done_job()),
+        "a classified no-match NULL is not pending work"
+    );
+
+    // Done + every row classified (stamped or a deliberate no-match): the
+    // stamps are valid, so nothing is restarted.
     let repo = FakeDigestRepo::new("u-1");
     repo.mutate(|state| {
         state.events = day_events("2026-01-02", "2026-01-02");
         state.rows = vec![FakeRow {
             category_id: Some("work".to_string()),
+            category_classified: 1,
             ..deep_work_row("e-1")
         }];
         state.jobs.insert(JOB_RECLASSIFY.to_string(), done_job());
