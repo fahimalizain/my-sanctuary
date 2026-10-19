@@ -30,7 +30,6 @@ import {
   startOfDay,
   stripDayCount,
   stripRebaseSuppressed,
-  stripSnapDisabled,
   swipeTargetIndex,
   swipeVelocity,
   visibleStartIndex as computeVisibleStartIndex,
@@ -47,30 +46,24 @@ import {
   subscribePeriodLength,
 } from '../period-length-store';
 
-/** Release tween duration (ms): a short ease-out that reads as a snap. */
+/** Release tween duration (ms): the strip's only snap — a short ease-out. */
 const SWIPE_SETTLE_MS = 220;
 
 /** Samples kept per gesture (≈ a second of 60Hz moves); velocity reads the tail. */
 const SWIPE_SAMPLE_LIMIT = 24;
 
 /**
- * Quiet gap (ms) after the last scroll of a native vertical pan before its rail
- * is released. `scrollend` releases it exactly where the browser fires it; this
- * is the fallback for iOS, which does not.
+ * Sub-pixel drift (px). A position within this of a column counts as already
+ * there: the by-hand landing skips its write, and the park below skips a
+ * re-park.
  */
-const VERTICAL_RAIL_SETTLE_MS = 150;
+const COLUMN_EPSILON_PX = 1;
 
 /**
- * `scrollLeft` drift (px) that counts as a real move. A whole pixel: sub-pixel
- * noise from the browser's own rounding must not read as a rejected write.
- */
-const SCROLL_LEFT_GUARD_PX = 1;
-
-/**
- * In-flight horizontal swipe. Pan-y means native touch never moves the strip
- * sideways, so a horizontal gesture is entirely ours: `left0` is where it
- * started, and every move writes `left0` minus the finger travel past the
- * dead zone.
+ * In-flight horizontal swipe. The scroller's x axis belongs to this hook alone
+ * (the browser may only pan the hours), so a committed x gesture is entirely
+ * ours: `left0` is where it started, and every move writes `left0` minus the
+ * finger travel past the dead zone.
  */
 interface SwipeGesture {
   /** First finger position, or null while no gesture is tracked. */
@@ -93,7 +86,6 @@ export interface CalendarStrip {
   periodLength: number;
   handlePeriodChange: (n: number) => void;
   visibleStart: Date;
-  visibleEnd: Date;
   rangeTitle: string;
   today: Date;
   days: Date[];
@@ -193,22 +185,11 @@ export function useCalendarStrip(): CalendarStrip {
   // (init park / jump / rebase compensation). Held lock owners suppress via
   // stripRebaseSuppressed instead, so a rAF release here cannot clobber them.
   const suppressRebaseRef = useRef(false);
-  // `scrollLeft` this hook last committed. The x axis has no user scroll: every
-  // legitimate change is a write of ours, so anything else that moves it is put
-  // back (see `onScrollerScroll`). null until the first park commits a value.
-  const committedLeftRef = useRef<number | null>(null);
   // A column-width change (rotation, window resize, sidebar, PWA viewport) that
   // landed while a lock owner held the strip: the same visible index has to be
   // re-parked at the new width, but not by fighting the owner (see the park
   // layout effect and `flushPendingRepark`).
   const pendingReparkRef = useRef(false);
-  // Vertical rail: a touch that has not committed to x holds `scroll-snap-type`
-  // off until the native pan it may have started has stopped. Deliberately not
-  // a `StripLockReason` — a lock owner drops the swipe and suppresses rebase,
-  // and a native vertical pan must be allowed to do neither.
-  const verticalRailRef = useRef(false);
-  // Timer that releases the rail once a pan has gone quiet (no `scrollend`).
-  const railSettleTimerRef = useRef<number | null>(null);
 
   useLayoutEffect(() => {
     const el = gridColumnRef.current;
@@ -241,41 +222,19 @@ export function useCalendarStrip(): CalendarStrip {
 
   // Latest visible index / column width for callbacks that must not close over
   // a render's values: `visibleStartIdx` is deliberately not a park dependency,
-  // and the deferred re-park runs from `unlockStrip` / `dropSwipe`, after the
-  // render that changed `colW`.
+  // and the deferred re-park runs from `unlockStrip` / `dropSwipe`, which a
+  // gesture handler may still be holding from an earlier render.
   const visibleStartIdxRef = useRef(visibleStartIdx);
   const colWRef = useRef(colW);
   visibleStartIdxRef.current = visibleStartIdx;
   colWRef.current = colW;
 
   // ── Strip lock ownership ──────────────────────────────────────────────
-  // Lock owners (drag / pinch / swipe) that hold the scroller's snap override.
-  // A Set, not a counter: repeat holds are idempotent and releasing one owner
-  // cannot clear another owner's `scroll-snap-type: none`.
+  // Owners (drag / pinch / swipe / wheel) that write `scrollLeft` themselves
+  // (auto-scroll, zoom, the swipe tween). A Set, not a counter: repeat holds are
+  // idempotent and releasing one owner cannot release another's hold. An owner
+  // suppresses rebase and defers a re-park; nothing about CSS depends on it.
   const stripLockReasonsRef = useRef<Set<StripLockReason>>(new Set());
-
-  // `scrollTop` to hold while an x gesture owns the strip (null = free).
-  // The committed-`scrollLeft` guard denies the browser the x axis; this denies
-  // it the y axis for the same gesture, so one finger can only move one axis.
-  const pinTopRef = useRef<number | null>(null);
-
-  /** Apply the scroller's snap override from the currently held owners. */
-  const applyStripLock = useCallback(() => {
-    // CSS scroll-snap re-snaps on every programmatic scrollLeft write, which
-    // would fight the owner's own writes (drag auto-scroll, the swipe tween).
-    // Suspend it while any owner holds the lock; clearing the inline override
-    // re-engages snap and settles on the nearest column. The vertical rail
-    // suspends it too: a touch that has not committed to x must never have
-    // mandatory snap live (see the rail below).
-    const scroller = scrollerRef.current;
-    if (scroller) {
-      scroller.style.scrollSnapType =
-        stripSnapDisabled(stripLockReasonsRef.current) ||
-        verticalRailRef.current
-          ? 'none'
-          : '';
-    }
-  }, []);
 
   // ── Horizontal scroll publishing ──────────────────────────────────────
   // Update the visible start; request a rebase near the edges. Called from the
@@ -289,51 +248,6 @@ export function useCalendarStrip(): CalendarStrip {
 
     const scroller = scrollerRef.current;
     if (!scroller || colW <= 0) return;
-
-    // One axis per gesture: when the swipe owns the strip, the browser's
-    // vertical pan (if any) is undone before anything is published.
-    if (
-      pinTopRef.current !== null &&
-      scroller.scrollTop !== pinTopRef.current
-    ) {
-      scroller.scrollTop = pinTopRef.current;
-    }
-
-    // A native vertical pan is still in flight: push the rail's release out, so
-    // snap cannot come back on while the pan is still moving. (`armRailQuietTimer`
-    // / `settleVerticalRail` are render-scope and this callback is re-created on
-    // a `colW` / `dayCount` / `periodLength` change, so its settle is never stale.)
-    if (verticalRailRef.current) armRailQuietTimer();
-
-    // ── Committed `scrollLeft` guard ────────────────────────────────────
-    // The x axis is programmatically driven: only a write of ours may move it.
-    // iOS moves it anyway — with mandatory x-snap live it re-evaluates the snap
-    // during a vertical pan and, the x axis historically not being
-    // user-scrollable, collapses the target to the first snap column
-    // (`scrollLeft = 0`, the oldest overscan day). Publishing that walks the
-    // window backwards through history. The rail keeps snap away from a touch
-    // that has not committed to x; this guard is the backstop for every other
-    // browser-initiated move, including the writes iOS swallows mid-pan.
-    const committed = committedLeftRef.current;
-    if (stripLockReasonsRef.current.size > 0) {
-      // A locked owner (swipe, wheel burst, drag, pinch) writes `scrollLeft`
-      // itself: adopt its value rather than fight it.
-      committedLeftRef.current = scroller.scrollLeft;
-    } else if (
-      committed !== null &&
-      Math.abs(scroller.scrollLeft - committed) >= SCROLL_LEFT_GUARD_PX
-    ) {
-      // Writing a value back onto itself fires no scroll event, so this cannot
-      // loop: it either lands, or the browser is mid-gesture and ignores it.
-      scroller.scrollLeft = committed;
-      if (Math.abs(scroller.scrollLeft - committed) >= SCROLL_LEFT_GUARD_PX) {
-        // iOS ignored the write (the pan is still live) and re-asserting harder
-        // would only fight it. Publish nothing and request no rebase: the day
-        // must not follow the position the browser threw out. The next scroll
-        // event, or the rail's settle, retries.
-        return;
-      }
-    }
 
     const idx = computeVisibleStartIndex(
       scroller.scrollLeft,
@@ -356,10 +270,11 @@ export function useCalendarStrip(): CalendarStrip {
   }, [colW, dayCount, periodLength]);
 
   // ── Touch swipe gesture ───────────────────────────────────────────────
-  // The scroller is `touch-action: pan-y`: the browser pans the hours
-  // vertically and never touches `scrollLeft`. A horizontal swipe is therefore
-  // ours to drive, which is the only way to have a dead zone — under native 2D
-  // panning the strip moves from the first sideways pixel.
+  // The scroller is `touch-action: pan-y` with no user-scrollable x axis, so
+  // the browser pans the hours and never touches `scrollLeft`. A horizontal
+  // swipe is therefore ours to drive, which is the only way to have a dead
+  // zone — under native 2D panning the strip moves from the first sideways
+  // pixel.
   const swipeRef = useRef<SwipeGesture>({
     origin: null,
     intent: 'pending',
@@ -400,81 +315,6 @@ export function useCalendarStrip(): CalendarStrip {
     }
   }, []);
 
-  // ── Vertical rail ─────────────────────────────────────────────────────
-  // Mandatory x-snap must never be live during a touch that has not committed
-  // to x: on iOS a vertical pan makes WebKit re-evaluate the snap, x is not
-  // user-scrollable, and the snap target collapses to the first column — which
-  // is what the guard above then has to undo, mid-pan, with iOS free to ignore
-  // the write. The rail holds `scroll-snap-type: none` from touchstart until
-  // the pan the browser is running has stopped, and releases through
-  // `scrollend` where it exists and a quiet timer where it does not (iOS).
-
-  const clearRailSettleTimer = () => {
-    if (railSettleTimerRef.current !== null) {
-      clearTimeout(railSettleTimerRef.current);
-      railSettleTimerRef.current = null;
-    }
-  };
-
-  /**
-   * Take the rail for a new touch. Snap goes off before the pan can start, so
-   * the touch never has to reach a decision for mandatory snap to be out of the
-   * way — including while it is still inside the dead zone.
-   */
-  const holdVerticalRail = () => {
-    clearRailSettleTimer();
-    verticalRailRef.current = true;
-    applyStripLock();
-  };
-
-  /**
-   * Give the rail up without publishing. The caller re-applies the snap
-   * override its own state implies (a swipe takes the strip over, the window is
-   * re-parked, or nothing is left to hold).
-   */
-  const releaseVerticalRail = () => {
-    clearRailSettleTimer();
-    verticalRailRef.current = false;
-  };
-
-  /**
-   * The pan has stopped: restore a `scrollLeft` the browser swallowed, let snap
-   * come back, then publish. Publishing from the restored value is what stops a
-   * rebase the pan suppressed from sticking, and what keeps a `scrollLeft` of 0
-   * from ever being read as the visible day.
-   */
-  const settleVerticalRail = () => {
-    clearRailSettleTimer();
-    if (!verticalRailRef.current) return;
-    // A finger that has not lifted yet owns the axis: keep holding.
-    if (swipeRef.current.origin !== null) return;
-    verticalRailRef.current = false;
-    const scroller = scrollerRef.current;
-    const committed = committedLeftRef.current;
-    if (
-      scroller &&
-      committed !== null &&
-      Math.abs(scroller.scrollLeft - committed) >= SCROLL_LEFT_GUARD_PX
-    ) {
-      scroller.scrollLeft = committed;
-    }
-    applyStripLock();
-    onScrollerScroll();
-  };
-
-  /**
-   * Release the rail once the pan has gone quiet, instead of holding snap off
-   * for a fixed window. Re-armed on every scroll while the rail is up, so a pan
-   * that is still moving keeps it; a tap that scrolls nothing releases it too.
-   */
-  const armRailQuietTimer = () => {
-    clearRailSettleTimer();
-    railSettleTimerRef.current = window.setTimeout(() => {
-      railSettleTimerRef.current = null;
-      settleVerticalRail();
-    }, VERTICAL_RAIL_SETTLE_MS);
-  };
-
   /**
    * Land a re-park that a lock owner deferred (`pendingReparkRef`). The index is
    * the visible day, not a rounding of the current pixels: after a column-width
@@ -488,12 +328,8 @@ export function useCalendarStrip(): CalendarStrip {
     const scroller = scrollerRef.current;
     const width = colWRef.current;
     if (!scroller || width <= 0) return false;
-    const target = scrollLeftForIndex(visibleStartIdxRef.current, width);
     suppressRebaseRef.current = true;
-    // Commit before the write, as every other park does: the scroll event it
-    // fires must already see the value the strip is about to be at.
-    committedLeftRef.current = target;
-    scroller.scrollLeft = target;
+    scroller.scrollLeft = scrollLeftForIndex(visibleStartIdxRef.current, width);
     // Declared with the park layout effect below, like the other parks.
     releaseSuppressRebase();
     return true;
@@ -502,45 +338,35 @@ export function useCalendarStrip(): CalendarStrip {
   /**
    * Drop the gesture without moving the strip: another owner took the scroller
    * (drag / pinch / a second finger) or the window was re-parked, so `left0` is
-   * stale. Also cancels a release tween, releases the snap lock, and gives up
-   * the vertical rail — the rail is part of the same gesture state.
+   * stale. Also cancels a release tween and gives up the sideways locks it owns.
    */
   const dropSwipe = useCallback(() => {
     cancelSettle();
     clearWheelSettle();
-    pinTopRef.current = null;
     resetSwipeGesture();
     // Both sideways owners are JS-driven x: dropping one drops the other.
-    let released = stripLockReasonsRef.current.delete('swipe');
-    if (stripLockReasonsRef.current.delete('wheel')) released = true;
-    if (verticalRailRef.current) released = true;
-    releaseVerticalRail();
-    if (released) {
-      // The sideways owners are gone: a re-park they deferred can land. Any
-      // owner still held (a just-claimed drag) keeps holding it back.
-      if (stripLockReasonsRef.current.size === 0) flushPendingRepark();
-      applyStripLock();
-    }
-  }, [applyStripLock, cancelSettle, clearWheelSettle, flushPendingRepark]);
+    stripLockReasonsRef.current.delete('swipe');
+    stripLockReasonsRef.current.delete('wheel');
+    // Any owner still held (a just-claimed drag) keeps a deferred re-park back.
+    if (stripLockReasonsRef.current.size === 0) flushPendingRepark();
+  }, [cancelSettle, clearWheelSettle, flushPendingRepark]);
 
   const lockStrip = useCallback(
     (reason: StripLockReason) => {
       // Drag / pinch write `scrollLeft` themselves (auto-scroll, zoom). A touch
       // swipe in flight would fight those writes, and so would its tween, so it
-      // is dropped here — no tween, no restore.
+      // is dropped here — no tween.
       if (reason !== 'swipe') dropSwipe();
       stripLockReasonsRef.current.add(reason);
-      applyStripLock();
     },
-    [applyStripLock, dropSwipe],
+    [dropSwipe],
   );
 
   /**
    * Park `scrollLeft` on the nearest column, instantly and without a tween.
    * Drag and pinch write `scrollLeft` themselves (auto-scroll, zoom), so they
-   * can hand the strip back between two days; with the guard armed, re-engaging
-   * CSS snap could no longer finish that landing by itself — the guard would
-   * put the mid-column position straight back — so it is finished here.
+   * can hand the strip back between two days; the tween only runs for the
+   * sideways owners (swipe / wheel), so the landing is finished here.
    */
   const alignStripToColumn = useCallback(() => {
     const scroller = scrollerRef.current;
@@ -554,11 +380,8 @@ export function useCalendarStrip(): CalendarStrip {
       ),
       colW,
     );
-    // Sub-pixel drift: snap rounds it and the guard ignores it.
-    if (Math.abs(scroller.scrollLeft - target) < SCROLL_LEFT_GUARD_PX) return;
-    // Commit before the write: the scroll event it fires must see the value the
-    // strip is about to be at, not the mid-column one.
-    committedLeftRef.current = target;
+    // Sub-pixel drift: already on the column, and the write would land nowhere.
+    if (Math.abs(scroller.scrollLeft - target) < COLUMN_EPSILON_PX) return;
     scroller.scrollLeft = target;
   }, [colW, dayCount, periodLength]);
 
@@ -572,32 +395,25 @@ export function useCalendarStrip(): CalendarStrip {
       // old pixels by that width and pick a different day.
       if (stripLockReasonsRef.current.size === 0) {
         const reparked = flushPendingRepark();
-        if (
-          !reparked &&
-          (reason === 'drag' || reason === 'pinch') &&
-          !verticalRailRef.current
-        ) {
+        if (!reparked && (reason === 'drag' || reason === 'pinch')) {
           alignStripToColumn();
         }
       }
-      applyStripLock();
     },
-    [alignStripToColumn, applyStripLock, flushPendingRepark],
+    [alignStripToColumn, flushPendingRepark],
   );
 
   /**
    * Let go of the strip: the gesture is over (or was taken over), so drop the
-   * tween and the snap lock, then publish the day the strip landed on. The
-   * tween ends exactly on a column, so re-engaging snap has nothing to correct;
-   * a rebase the lock suppressed runs from this scroll.
+   * tween and the lock, then publish the day the strip landed on. The tween ends
+   * exactly on a column, so there is nothing left to correct; a rebase the lock
+   * suppressed runs from this scroll.
    */
   const finishSwipe = useCallback(
     (reason: StripLockReason = 'swipe') => {
       cancelSettle();
       clearWheelSettle();
       resetSwipeGesture();
-      // The tween has landed: the vertical axis is free again.
-      pinTopRef.current = null;
       unlockStrip(reason);
       onScrollerScroll();
     },
@@ -605,9 +421,9 @@ export function useCalendarStrip(): CalendarStrip {
   );
 
   /**
-   * Ease `scrollLeft` onto column `target` with snap still off. Snap must stay
-   * off until the strip is exactly on the column: re-engaging it mid-flight
-   * would let the browser pick its own column and fight the tween.
+   * Ease `scrollLeft` onto column `target` under the lock the gesture already
+   * holds. The tween is the strip's only snap: it has to land exactly on the
+   * column, since nothing else will correct a mid-column position.
    */
   const startSettle = useCallback(
     (target: number, reason: StripLockReason = 'swipe') => {
@@ -624,9 +440,6 @@ export function useCalendarStrip(): CalendarStrip {
       const to = scrollLeftForIndex(target, colW);
       const delta = to - from;
       if (Math.abs(delta) < 0.5) {
-        // Commit the landing before the write: the guard must already see `to`
-        // if the scroll event arrives after `finishSwipe` released the lock.
-        committedLeftRef.current = to;
         scroller.scrollLeft = to;
         finishSwipe(reason);
         return;
@@ -639,8 +452,6 @@ export function useCalendarStrip(): CalendarStrip {
         if (startedAt === null) startedAt = now;
         const t = Math.min(1, (now - startedAt) / SWIPE_SETTLE_MS);
         const eased = 1 - (1 - t) ** 3;
-        // Every frame runs while the owner still holds the lock, so the guard
-        // adopts these writes instead of reverting them.
         scroller.scrollLeft = from + delta * eased;
         if (t < 1) {
           settleRafRef.current = requestAnimationFrame(step);
@@ -648,7 +459,6 @@ export function useCalendarStrip(): CalendarStrip {
         }
         settleRafRef.current = null;
         // Land exactly on the column, not on a float.
-        committedLeftRef.current = to;
         scroller.scrollLeft = to;
         finishSwipe(reason);
       };
@@ -685,8 +495,9 @@ export function useCalendarStrip(): CalendarStrip {
 
   // Touch events, not pointer events: the browser fires `pointercancel` the
   // moment native panning starts, so pointer events cannot follow a finger
-  // through a native scroll. All listeners stay passive — never preventDefault,
-  // or the vertical pan stops being native.
+  // through a native scroll. touchstart / touchend stay passive; touchmove is
+  // not, because a gesture that commits to x has to be able to preventDefault
+  // the vertical pan the same touch would otherwise start.
   const onTouchStart = useCallback(
     (e: TouchEvent) => {
       if (e.touches.length !== 1) {
@@ -699,16 +510,11 @@ export function useCalendarStrip(): CalendarStrip {
       const held = stripLockReasonsRef.current;
       if (held.has('drag') || held.has('pinch')) return;
 
-      // Mandatory x-snap goes off before any pan can start, whichever axis this
-      // touch turns out to be: on iOS it is what collapses `scrollLeft` to the
-      // first column the moment the pan is vertical.
-      holdVerticalRail();
-
       const scroller = scrollerRef.current;
       if (!scroller || colW <= 0) return;
 
       // A new touch mid-tween grabs the strip where it is. Cancel the tween but
-      // keep the snap lock: re-engaging snap under the finger would jump.
+      // keep the lock: the strip stays between days under the finger.
       cancelSettle();
       const touch = e.touches[0];
       const gesture = swipeRef.current;
@@ -739,24 +545,24 @@ export function useCalendarStrip(): CalendarStrip {
         if (axis === 'pending') return;
         gesture.intent = axis;
         if (axis === 'x') {
-          // Horizontal: the rail is this gesture's no longer — the swipe takes
-          // the strip off the browser instead. Snap off, or every write would
-          // be re-snapped to a column under the finger. The direction is fixed
-          // here and kept for the whole gesture, so travel stays continuous if
-          // the finger reverses past its origin.
-          releaseVerticalRail();
+          // The direction is fixed here and kept for the whole gesture, so
+          // travel stays continuous if the finger reverses past its origin.
           gesture.lockSign = dx > 0 ? 1 : -1;
-          // One axis per gesture: from the moment the swipe takes over, the
-          // browser's vertical pan is frozen where it is (not rewound, which
-          // would jump the hours back under a diagonal finger).
-          pinTopRef.current = scroller.scrollTop;
           lockStrip('swipe');
         }
       }
-      // Only a horizontal gesture ever moves the strip. A resolved y must not
-      // fall through to the write below: that would page the day on every
-      // vertical move, which is the bug this whole gesture exists to fix.
+      // A y gesture is the browser's: `pan-y` scrolls the hours natively. It
+      // must not fall through to the write below — that would page the day on
+      // every vertical move, which is the bug this whole gesture exists to fix.
       if (gesture.intent !== 'x') return;
+
+      // One gesture, one axis: the swipe owns this touch, so the browser gets
+      // nothing more from it. Cancelling the move is what freezes the hours for
+      // the rest of the gesture — including a diagonal reversal that would
+      // otherwise start a vertical pan halfway through. A move the browser has
+      // already committed to a scroll is non-cancelable: the call would be a
+      // no-op (and Chrome warns about it), so it is skipped.
+      if (e.cancelable) e.preventDefault();
 
       // Subtract the dead zone so the strip starts at `left0` on the threshold
       // and then follows the finger 1:1, with no jump at the origin.
@@ -766,12 +572,6 @@ export function useCalendarStrip(): CalendarStrip {
         maxLeft,
         Math.max(0, gesture.left0 - travel),
       );
-      if (
-        pinTopRef.current !== null &&
-        scroller.scrollTop !== pinTopRef.current
-      ) {
-        scroller.scrollTop = pinTopRef.current;
-      }
       gesture.lastX = touch.clientX;
       gesture.samples.push({ t: e.timeStamp, x: touch.clientX });
       if (gesture.samples.length > SWIPE_SAMPLE_LIMIT) gesture.samples.shift();
@@ -784,12 +584,7 @@ export function useCalendarStrip(): CalendarStrip {
       // Other fingers are still down: wait for the real last lift.
       if (e.touches.length > 0) return;
       const gesture = swipeRef.current;
-      if (gesture.origin === null) {
-        // No tracked gesture, but a touchstart can have bailed between taking
-        // the rail and tracking: the rail still has to release.
-        if (verticalRailRef.current) armRailQuietTimer();
-        return;
-      }
+      if (gesture.origin === null) return;
       const scroller = scrollerRef.current;
       if (!scroller) {
         dropSwipe();
@@ -830,13 +625,9 @@ export function useCalendarStrip(): CalendarStrip {
         );
         return;
       }
-      // A tap, or a vertical gesture that native pan-y already owns. The rail
-      // outlives the finger: the pan this touch may have started is still
-      // running, and snap must stay off until it stops. `dropSwipe` gives the
-      // rail up, so it is re-taken here and released on `scrollend` / quiet.
+      // A tap, or a vertical gesture that native pan-y already owns: nothing to
+      // land, and nothing the strip has to publish.
       dropSwipe();
-      holdVerticalRail();
-      armRailQuietTimer();
     },
     [colW, dayCount, dropSwipe, periodLength, startSettle],
   );
@@ -844,15 +635,11 @@ export function useCalendarStrip(): CalendarStrip {
   // ── Wheel axis gesture ────────────────────────────────────────────────
   // The same sideways dead zone as touch, with no finger to lift: a Mac
   // trackpad adds a little horizontal delta to a vertical two-finger scroll,
-  // the mandatory day snap walks the strip sideways, and there is no release to
-  // settle on. A touch gets its dead zone from `touch-action: pan-y`; a wheel
-  // has no such property, so the handler must drop the sideways part itself:
-  // the delta never reaches the scroller until the burst has accumulated a
-  // deliberate, horizontal-dominant swipe. Until then only the vertical part
-  // applies — re-applied by hand, since preventing the default would otherwise
-  // swallow the scroll the user asked for. Sideways travel dropped in the dead
-  // zone is simply lost, never caught up. A committed x burst is driven here
-  // too (it is the same JS-driven axis the touch swipe uses), and settles on a
+  // and there is no release to settle on. A touch gets its dead zone from
+  // `touch-action: pan-y`; a wheel has no such property, so the handler has to
+  // decide for it — the accumulated burst stays `pending` until it is a
+  // deliberate, horizontal-dominant swipe. A committed x burst is then driven
+  // here (it is the same JS-driven axis the touch swipe uses) and settles on a
   // column once the burst goes quiet.
   const wheelBurstRef = useRef<WheelBurst>(EMPTY_WHEEL_BURST);
 
@@ -879,10 +666,9 @@ export function useCalendarStrip(): CalendarStrip {
       });
       wheelBurstRef.current = burst;
 
-      // `x`: a deliberate sideways burst. It is driven here under the `wheel`
-      // lock — the guard adopts the writes of a held owner — and landed on a
-      // column when it goes quiet. preventDefault also keeps a Mac two-finger
-      // swipe from triggering history navigation.
+      // `x`: a deliberate sideways burst, driven here under the `wheel` lock and
+      // landed on a column when it goes quiet. preventDefault keeps a Mac
+      // two-finger sideways gesture from becoming a history swipe.
       if (burst.axis === 'x') {
         e.preventDefault();
         cancelSettle();
@@ -891,13 +677,21 @@ export function useCalendarStrip(): CalendarStrip {
         armWheelSettle();
         return;
       }
-      // deltaX 0 is an ordinary mouse wheel: exactly the pre-fix behaviour.
-      if (e.deltaX === 0) return;
-
-      // `pending` (dead zone) or `y`: consume the event and apply the vertical
-      // part only, so `scrollLeft` never moves under the day snap.
-      e.preventDefault();
-      if (dyPx !== 0) scroller.scrollBy({ top: dyPx, behavior: 'instant' });
+      // Sideways-dominant but still inside the dead zone: the same gesture the
+      // browser would turn into a history swipe. Consume it and move nothing —
+      // the burst may still commit on a later event, and the pixels dropped here
+      // are the price of the dead zone, exactly as they are for touch.
+      if (
+        burst.axis === 'pending' &&
+        Math.abs(burst.sumX) > Math.abs(burst.sumY)
+      ) {
+        e.preventDefault();
+        return;
+      }
+      // A vertical burst, or a mouse wheel with no deltaX at all, is the
+      // browser's: the vertical scroll stays native (momentum and all), the
+      // sideways drift of a two-finger scroll cannot move an `overflow-x: hidden`
+      // axis, and there is nothing left to re-apply by hand.
     },
     [armWheelSettle, cancelSettle, lockStrip],
   );
@@ -907,19 +701,14 @@ export function useCalendarStrip(): CalendarStrip {
     const scroller = scrollerRef.current;
     if (!scroller) return;
 
-    const opts: AddEventListenerOptions = { passive: true };
-    scroller.addEventListener('touchstart', onTouchStart, opts);
-    scroller.addEventListener('touchmove', onTouchMove, opts);
-    scroller.addEventListener('touchend', onTouchEnd, opts);
-    scroller.addEventListener('touchcancel', onTouchEnd, opts);
-    // `scrollend` is the exact signal that a pan has stopped; iOS does not fire
-    // it, and the rail's quiet timer is the fallback there.
-    const onScrollEnd = () => {
-      if (verticalRailRef.current) settleVerticalRail();
-    };
-    scroller.addEventListener('scrollend', onScrollEnd, opts);
-    // Non-passive, unlike the touch listeners: a vertical burst has to cancel
-    // the sideways component before native snap sees it.
+    scroller.addEventListener('touchstart', onTouchStart, { passive: true });
+    // Non-passive: the swipe preventDefaults its own moves to keep one gesture
+    // on one axis (see `onTouchMove`).
+    scroller.addEventListener('touchmove', onTouchMove, { passive: false });
+    scroller.addEventListener('touchend', onTouchEnd, { passive: true });
+    scroller.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    // Non-passive too: an x burst has to cancel the event before the browser
+    // turns it into a history swipe.
     scroller.addEventListener('wheel', onWheel, { passive: false });
 
     return () => {
@@ -927,9 +716,8 @@ export function useCalendarStrip(): CalendarStrip {
       scroller.removeEventListener('touchmove', onTouchMove);
       scroller.removeEventListener('touchend', onTouchEnd);
       scroller.removeEventListener('touchcancel', onTouchEnd);
-      scroller.removeEventListener('scrollend', onScrollEnd);
       scroller.removeEventListener('wheel', onWheel);
-      // Unmount / relayout: never leave a tween or the snap lock running.
+      // Unmount / relayout: never leave a tween or the lock running.
       dropSwipe();
     };
   }, [dropSwipe, onTouchEnd, onTouchMove, onTouchStart, onWheel]);
@@ -956,11 +744,9 @@ export function useCalendarStrip(): CalendarStrip {
       setWindowStart((prev) =>
         shiftWindowStart(startOfDay(prev), dir, periodLength),
       );
-      // An intentional unowned write: commit the compensated position before it
-      // lands, so the scroll event it fires is not read as a browser-initiated
-      // move and reverted.
+      // An intentional write of ours: nowhere to publish but here, since the
+      // compensated position has not been scrolled to yet.
       const compensated = scroller.scrollLeft + compensation;
-      committedLeftRef.current = compensated;
       scroller.scrollLeft = compensated;
       setVisibleStartIdx(
         computeVisibleStartIndex(compensated, colW, dayCount, periodLength),
@@ -981,9 +767,7 @@ export function useCalendarStrip(): CalendarStrip {
       if (!isStripWidthMeasured(mainWidth)) return;
       didInitScrollRef.current = true;
       suppressRebaseRef.current = true;
-      const parkLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
-      committedLeftRef.current = parkLeft;
-      scroller.scrollLeft = parkLeft;
+      scroller.scrollLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
       setVisibleStartIdx(STRIP_OVERSCAN);
       releaseSuppressRebase();
     }
@@ -992,30 +776,21 @@ export function useCalendarStrip(): CalendarStrip {
     if (pendingScrollLeftRef.current !== null) {
       pendingScrollLeftRef.current = null;
       suppressRebaseRef.current = true;
-      const parkLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
-      committedLeftRef.current = parkLeft;
-      scroller.scrollLeft = parkLeft;
+      scroller.scrollLeft = scrollLeftForIndex(STRIP_OVERSCAN, colW);
       setVisibleStartIdx(STRIP_OVERSCAN);
       releaseSuppressRebase();
     }
 
-    // Column-width change (rotation, window resize, sidebar, PWA viewport).
-    // `committedLeftRef` is pixels, so the columns have moved out from under it
-    // and the guard would put the old pixels back — mid-column at the new width
-    // — fighting the mandatory snap that re-snaps that write while the read-back
-    // is rejected, leaving the strip on a day that was never published. Re-commit
-    // the visible day at the new width instead. The index is the current visible
-    // start, never `round(scrollLeft / colW)`: the old pixels divided by the new
-    // column width is a different day.
+    // Column-width change (rotation, window resize, sidebar, PWA viewport): the
+    // same visible day has to be re-parked at the new width, because the columns
+    // have moved out from under the current pixels. The index is the current
+    // visible start, never `round(scrollLeft / colW)`: the old pixels divided by
+    // the new column width is a different day.
     // Reached only once init has run, with no pending rebase (it returned above)
     // and no pending jump (consumed above); both parks land on the target and
     // fall through to the no-op below.
     const target = scrollLeftForIndex(visibleStartIdxRef.current, colW);
-    if (
-      committedLeftRef.current !== null &&
-      Math.abs(committedLeftRef.current - target) < SCROLL_LEFT_GUARD_PX &&
-      Math.abs(scroller.scrollLeft - target) < SCROLL_LEFT_GUARD_PX
-    ) {
+    if (Math.abs(scroller.scrollLeft - target) < COLUMN_EPSILON_PX) {
       // Already on the column: nothing left to re-park (a resize back to the old
       // width lands here too).
       pendingReparkRef.current = false;
@@ -1023,16 +798,12 @@ export function useCalendarStrip(): CalendarStrip {
     }
     if (stripLockReasonsRef.current.size > 0) {
       // An owner writes `scrollLeft` itself: the re-park waits for the release
-      // that leaves the set empty. The vertical rail is not an owner — it only
-      // holds snap off, and it has to be holding the new column width when it
-      // settles or it would restore the old pixels.
+      // that leaves the set empty (`flushPendingRepark`).
       pendingReparkRef.current = true;
       return;
     }
     pendingReparkRef.current = false;
     suppressRebaseRef.current = true;
-    // Commit before the write, as every other park does.
-    committedLeftRef.current = target;
     scroller.scrollLeft = target;
     releaseSuppressRebase();
   }, [colW, dayCount, mainWidth, periodLength, windowStart, scrollNonce]);
@@ -1061,18 +832,13 @@ export function useCalendarStrip(): CalendarStrip {
       const scroller = scrollerRef.current;
       if (!scroller || colW <= 0) return;
       // Clamped the way the swipe clamps: the browser would clamp the write to
-      // the scrollable range anyway, and the committed value has to be where the
-      // strip can actually land, or the guard would keep re-asserting a position
-      // that does not exist.
+      // the scrollable range anyway, and the published index has to be where the
+      // strip can actually land.
       const maxLeft = scrollLeftForIndex(dayCount - periodLength, colW);
       const nextLeft = Math.min(
         maxLeft,
         Math.max(0, scroller.scrollLeft + deltaPeriods * periodLength * colW),
       );
-      // An intentional unowned write: commit it before it lands, or the guard
-      // reads the scroll event it fires as a browser-initiated move and puts the
-      // old day back.
-      committedLeftRef.current = nextLeft;
       scroller.scrollLeft = nextLeft;
       // onScroll will update visibleStartIdx and rebase if needed.
       onScrollerScroll();
@@ -1116,7 +882,6 @@ export function useCalendarStrip(): CalendarStrip {
     periodLength,
     handlePeriodChange,
     visibleStart,
-    visibleEnd,
     rangeTitle,
     today,
     days,

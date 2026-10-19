@@ -6,6 +6,11 @@
 // measure lands, park is skipped; onScroll then sets visibleStartIdx to 0 so
 // the title shows windowStart … windowStart+6 (e.g. Aug 31–Sep 6) instead of
 // Mon–Sun containing today.
+//
+// The strip obeys one rule: a gesture picks its axis once (after the dead zone)
+// and only that axis moves until the gesture ends. The browser pans the hours
+// (`touch-action: pan-y`); the day strip is written by this hook alone and has
+// no CSS scroll-snap — the release tween is the only snap.
 
 import { after, afterEach, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -82,7 +87,8 @@ function stubClientWidth(el: HTMLElement, width: number): void {
  * behave as they do in a browser. jsdom has no `Touch` constructor, so the
  * points stay plain objects. `time` pins `event.timeStamp` (release velocity
  * is computed from it), which jsdom would otherwise derive from the clock and
- * make nondeterministic.
+ * make nondeterministic. Cancelable, like a touchmove the browser has not
+ * committed to a scroll: the swipe has to be able to preventDefault it.
  */
 function touchEvent(
   type: 'touchstart' | 'touchmove' | 'touchend',
@@ -91,6 +97,7 @@ function touchEvent(
 ): Event {
   const event = new window.TouchEvent(type, {
     touches: points as unknown as Touch[],
+    cancelable: true,
   });
   if (time !== undefined) {
     Object.defineProperty(event, 'timeStamp', {
@@ -182,11 +189,6 @@ function StripHarness({
           stubClientWidth(el, gridWidth);
           // Wide enough that overscan park is within max scroll.
           Object.defineProperty(el, 'scrollWidth', {
-            configurable: true,
-            get: () => 4000,
-          });
-          // Tall enough that a scrollTop pin can be observed.
-          Object.defineProperty(el, 'scrollHeight', {
             configurable: true,
             get: () => 4000,
           });
@@ -299,18 +301,22 @@ test('useCalendarStrip: onScrollerScroll before measured park does not clobber v
 });
 
 // ── Touch swipe ─────────────────────────────────────────────────────────
-// `touch-action: pan-y` means native touch never moves the strip sideways, so
-// a horizontal swipe is driven by hand and can have a dead zone: the strip
-// stays put until the gesture is a deliberate SCROLL_X_THRESHOLD_PX across.
-// While a touch has not committed to x it rides the vertical rail: snap is off
-// from touchstart (mandatory x-snap is what iOS collapses the strip with) and
-// comes back once the native pan is over.
+// The scroller is `touch-action: pan-y` with no user-scrollable x axis, so a
+// vertical gesture is native and the strip never moves sideways. A horizontal
+// swipe is driven by hand and has a dead zone: the strip stays put until the
+// gesture is a deliberate SCROLL_X_THRESHOLD_PX across, and from that moment
+// the swipe owns the touch — every later move is preventDefault-ed, so the
+// same finger cannot start a vertical pan halfway through.
 
 test('useCalendarStrip: a vertical touch never moves the strip sideways', async () => {
-  const strip = await mountParkedStrip();
+  let latest: CalendarStrip | null = null;
+  const strip = await mountParkedStrip((s) => {
+    latest = s;
+  });
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
   const left0 = scroller!.scrollLeft;
+  const start0 = latestStrip(() => latest).visibleStart;
   assert.ok(left0 > 0, 'init park should have scrolled the strip');
 
   await act(async () => {
@@ -318,13 +324,6 @@ test('useCalendarStrip: a vertical touch never moves the strip sideways', async 
       touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
     );
   });
-  // The rail goes up with the finger, before any pan: mandatory snap must not
-  // be live during a touch that has not committed to an axis.
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'the rail takes snap off from touchstart',
-  );
 
   // The first move resolves the gesture to y (dy 40 > 10, dx 5 tiny). Every
   // later move must be ignored, whatever sideways drift the thumb picks up:
@@ -336,77 +335,35 @@ test('useCalendarStrip: a vertical touch never moves the strip sideways', async 
     { x: 295, y: 560, t: 64 }, // dx -5
   ];
   for (const move of moves) {
+    const event = touchEvent(
+      'touchmove',
+      [{ clientX: move.x, clientY: move.y }],
+      move.t,
+    );
     await act(async () => {
-      scroller!.dispatchEvent(
-        touchEvent('touchmove', [{ clientX: move.x, clientY: move.y }], move.t),
-      );
+      scroller!.dispatchEvent(event);
     });
     assert.equal(
       scroller!.scrollLeft,
       left0,
       `a vertical gesture must never write scrollLeft (move to ${move.x}, ${move.y})`,
     );
+    // The vertical pan is the browser's: cancelling it would freeze the hours.
     assert.equal(
-      scroller!.style.scrollSnapType,
-      'none',
-      'the rail keeps snap off for the whole pan',
+      event.defaultPrevented,
+      false,
+      'a y gesture must reach the native pan untouched',
     );
   }
 
-  // The rail outlives the finger: the pan this touch started is still running,
-  // and snap must not come back on mid-pan.
   await act(async () => {
     scroller!.dispatchEvent(touchEvent('touchend', [], 80));
   });
   assert.equal(scroller!.scrollLeft, left0);
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'the rail holds snap off past the finger-up',
+  assert.ok(
+    isSameDay(latestStrip(() => latest).visibleStart, start0),
+    'the visible day must not follow a time scroll',
   );
-
-  await act(async () => {
-    await sleep(250);
-  });
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    '',
-    'the rail releases once the pan has gone quiet',
-  );
-  assert.equal(scroller!.scrollLeft, left0, 'and never moved the strip');
-});
-
-test('useCalendarStrip: the rail releases on scrollend without waiting out a timer', async () => {
-  const strip = await mountParkedStrip();
-  const scroller = strip.scrollerRef.current;
-  assert.ok(scroller);
-  const left0 = scroller!.scrollLeft;
-
-  await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
-    );
-  });
-  await act(async () => {
-    scroller!.dispatchEvent(touchEvent('touchend', [], 40));
-  });
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'the rail holds snap off past the finger-up',
-  );
-
-  // Where the browser fires it, `scrollend` is the exact end of the pan: snap
-  // comes back at once instead of after a fixed quiet window.
-  await act(async () => {
-    scroller!.dispatchEvent(new window.Event('scrollend'));
-  });
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    '',
-    'snap is back as soon as the pan is over',
-  );
-  assert.equal(scroller!.scrollLeft, left0, 'and the strip never moved');
 });
 
 test('useCalendarStrip: a horizontal move under the threshold leaves the strip alone', async () => {
@@ -420,39 +377,35 @@ test('useCalendarStrip: a horizontal move under the threshold leaves the strip a
       touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
     );
   });
-  // 47px sideways: one pixel short of the deliberate swipe.
+  // 47px sideways: one pixel short of the deliberate swipe. The dead zone is
+  // not an axis decision, so the event still reaches the browser.
+  const deadZone = touchEvent(
+    'touchmove',
+    [{ clientX: 253, clientY: 300 }],
+    16,
+  );
   await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchmove', [{ clientX: 253, clientY: 300 }], 16),
-    );
+    scroller!.dispatchEvent(deadZone);
   });
 
   assert.equal(scroller!.scrollLeft, left0, 'the dead zone must not move');
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'the rail is up, but no swipe lock has been taken',
-  );
+  assert.equal(deadZone.defaultPrevented, false, 'nothing is claimed yet');
 
-  // The same touch turning vertical must not move it either, and runs on the
-  // rail until the pan (here: nothing) goes quiet.
+  // The same touch turning vertical must not move it either.
+  const vertical = touchEvent(
+    'touchmove',
+    [{ clientX: 250, clientY: 420 }],
+    32,
+  );
   await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchmove', [{ clientX: 250, clientY: 420 }], 32),
-    );
+    scroller!.dispatchEvent(vertical);
   });
   assert.equal(scroller!.scrollLeft, left0, 'still no day movement');
+  assert.equal(vertical.defaultPrevented, false);
+
   await act(async () => {
     scroller!.dispatchEvent(touchEvent('touchend', [], 200));
   });
-  await act(async () => {
-    await sleep(250);
-  });
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    '',
-    'a tap that scrolled nothing still releases the rail',
-  );
   assert.equal(scroller!.scrollLeft, left0);
 });
 
@@ -473,11 +426,6 @@ test('useCalendarStrip: past the threshold the strip follows minus the dead zone
       touchEvent('touchmove', [{ clientX: 396, clientY: 300 }], 16),
     );
   });
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'snap is off while the finger drives the strip',
-  );
   assert.equal(scroller!.scrollLeft, left0 - 48);
 
   // dx 150 → left0 - 102: continuous with the previous move, no second jump.
@@ -527,7 +475,57 @@ test('useCalendarStrip: after the lock the strip follows 1:1 past the origin', a
   assert.equal(scroller!.scrollLeft, left0 + 58);
 });
 
-test('useCalendarStrip: release tweens onto a column, then re-engages snap', async () => {
+test('useCalendarStrip: an x swipe cancels every later move of its gesture', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const left0 = scroller!.scrollLeft;
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
+    );
+  });
+
+  // Still in the dead zone: not cancelled, and nothing moves.
+  const pending = touchEvent('touchmove', [{ clientX: 280, clientY: 300 }], 8);
+  await act(async () => {
+    scroller!.dispatchEvent(pending);
+  });
+  assert.equal(pending.defaultPrevented, false);
+  assert.equal(scroller!.scrollLeft, left0);
+
+  // dx −60 commits the gesture to x → left0 + 12, and the move is cancelled.
+  const committed = touchEvent(
+    'touchmove',
+    [{ clientX: 240, clientY: 300 }],
+    16,
+  );
+  await act(async () => {
+    scroller!.dispatchEvent(committed);
+  });
+  assert.equal(committed.defaultPrevented, true);
+  assert.equal(scroller!.scrollLeft, left0 + 12);
+
+  // A diagonal move that would classify as y if the axis were re-decided: the
+  // gesture already picked x, so it stays horizontal and stays cancelled.
+  const diagonal = touchEvent(
+    'touchmove',
+    [{ clientX: 290, clientY: 340 }],
+    32,
+  );
+  await act(async () => {
+    scroller!.dispatchEvent(diagonal);
+  });
+  assert.equal(
+    diagonal.defaultPrevented,
+    true,
+    'one gesture, one axis: the browser gets nothing once x is claimed',
+  );
+  assert.equal(scroller!.scrollLeft, left0 - 38);
+});
+
+test('useCalendarStrip: release tweens onto a column', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
@@ -552,11 +550,6 @@ test('useCalendarStrip: release tweens onto a column, then re-engages snap', asy
   await act(async () => {
     scroller!.dispatchEvent(touchEvent('touchend', [], 500));
   });
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'snap stays off until the tween lands',
-  );
 
   await act(async () => {
     await sleep(400);
@@ -573,10 +566,155 @@ test('useCalendarStrip: release tweens onto a column, then re-engages snap', asy
     0,
     'no float left between two days',
   );
+});
+
+test('useCalendarStrip: a flick carries the strip past the nearest column', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 400, clientY: 300 }], 0),
+    );
+  });
+  // Two quick moves to the left, 60px apart in 50ms: the release velocity
+  // projects forward, past where the finger actually left the strip.
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 340, clientY: 300 }], 200),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 280, clientY: 300 }], 250),
+    );
+  });
+  const releasedLeft = scroller!.scrollLeft;
+  const nearestIdx = Math.round(releasedLeft / strip.colW);
+
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', [], 260));
+  });
+  await act(async () => {
+    await sleep(400);
+  });
+
+  assert.equal(scroller!.scrollLeft % strip.colW, 0, 'lands on a column');
+  assert.ok(
+    scroller!.scrollLeft > scrollLeftForIndex(nearestIdx, strip.colW),
+    'a flick carries the strip past the nearest column (later days)',
+  );
+  assert.notEqual(scroller!.scrollLeft, releasedLeft);
+});
+
+test('useCalendarStrip: a swipe that lands on the last column rebases, keeping that day', async () => {
+  let latest: CalendarStrip | null = null;
+  const strip = await mountParkedStrip((s) => {
+    latest = s;
+  });
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const left0 = scroller!.scrollLeft;
+  const start0 = latestStrip(() => latest).visibleStart;
+  const days0 = latestStrip(() => latest).days[0];
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 400, clientY: 300 }], 0),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 300, clientY: 300 }], 16),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 250, clientY: 300 }], 32),
+    );
+  });
+  // A fast flick: the projection clamps at one period, which is the last
+  // column the window can show before it has to slide.
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', [], 40));
+  });
+  await act(async () => {
+    await sleep(400);
+  });
+
+  // The window slid one period and compensated the pixels, so the strip is back
+  // at the park offset — but on the day the swipe actually landed on.
   assert.equal(
-    scroller!.style.scrollSnapType,
-    '',
-    'snap re-engages on landing',
+    scroller!.scrollLeft,
+    left0,
+    'the rebase re-parks at the same offset in the new window',
+  );
+  assert.ok(
+    isSameDay(
+      latestStrip(() => latest).days[0],
+      addDays(days0, strip.periodLength),
+    ),
+    'the rendered window slid one period',
+  );
+  assert.ok(
+    isSameDay(
+      latestStrip(() => latest).visibleStart,
+      addDays(start0, strip.periodLength),
+    ),
+    'the rebase keeps the day the swipe landed on',
+  );
+});
+
+test('useCalendarStrip: a touch that interrupts a tween lifts onto a column', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 240, clientY: 300 }], 16),
+    );
+  });
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', [], 32));
+  });
+  await act(async () => {
+    await sleep(50);
+  });
+
+  // Grab the strip mid-tween: the tween is dropped where it stands, and the
+  // lock stays held so the strip stays between days under the finger.
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchstart', [{ clientX: 500, clientY: 300 }], 200),
+    );
+  });
+  const grabbed = scroller!.scrollLeft;
+  await act(async () => {
+    scroller!.dispatchEvent(
+      touchEvent('touchmove', [{ clientX: 495, clientY: 320 }], 216),
+    );
+  });
+  assert.equal(scroller!.scrollLeft, grabbed, 'a pending move never moves it');
+
+  // Lifting without an axis lands on the nearest column instead of leaving the
+  // strip stranded halfway between two days.
+  await act(async () => {
+    scroller!.dispatchEvent(touchEvent('touchend', [], 220));
+  });
+  await act(async () => {
+    await sleep(400);
+  });
+  assert.equal(
+    scroller!.scrollLeft % strip.colW,
+    0,
+    'the interrupted tween still lands on a column',
   );
 });
 
@@ -596,10 +734,9 @@ test('useCalendarStrip: drag taking the strip drops the swipe mid-gesture', asyn
     );
   });
   const followed = scroller!.scrollLeft;
-  assert.equal(scroller!.style.scrollSnapType, 'none');
 
   // A claimed drag (long-press on a chip) owns scrollLeft now: the swipe is
-  // dropped with no tween, and the drag lock keeps snap off.
+  // dropped with no tween.
   await act(async () => {
     strip.lockStrip('drag');
   });
@@ -607,11 +744,6 @@ test('useCalendarStrip: drag taking the strip drops the swipe mid-gesture', asyn
     scroller!.scrollLeft,
     followed,
     'dropping the swipe must not move the strip',
-  );
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'drag still holds the snap lock',
   );
 
   // A lift after the takeover must not settle the dropped swipe.
@@ -627,13 +759,18 @@ test('useCalendarStrip: drag taking the strip drops the swipe mid-gesture', asyn
     'no release tween runs after the drag took the strip',
   );
 
+  // The drag's own release lands the strip by hand, since no tween ran.
   await act(async () => {
     strip.unlockStrip('drag');
   });
-  assert.equal(scroller!.style.scrollSnapType, '');
+  assert.equal(
+    scroller!.scrollLeft % strip.colW,
+    0,
+    'the drag release lands the strip on a column',
+  );
 });
 
-test('useCalendarStrip: releasing a drag lands the strip on a column before snap returns', async () => {
+test('useCalendarStrip: releasing a drag lands the strip on a column', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
@@ -647,170 +784,14 @@ test('useCalendarStrip: releasing a drag lands the strip on a column before snap
     strip.unlockStrip('drag');
   });
 
-  // Snap alone could no longer finish that landing — the guard would put the
-  // mid-column position straight back — so the strip is aligned by hand.
   assert.equal(
     scroller!.scrollLeft,
     scrollLeftForIndex(2, strip.colW),
     'the nearest column, not the mid-column position autoscroll left',
   );
-  assert.equal(scroller!.style.scrollSnapType, '');
 });
 
-// ── Committed scrollLeft guard ──────────────────────────────────────────
-// The strip's x axis is programmatically driven: only a write of this hook's
-// may move it. `overflow-x: hidden` plus mandatory x-snap broke that on iOS —
-// a vertical pan made WebKit collapse `scrollLeft` to the first snap column
-// (the oldest overscan day), and the strip republished it and rebased
-// backwards through history on every scroll event.
-
-test('useCalendarStrip: a browser scroll to the first column is put back, not published', async () => {
-  let latest: CalendarStrip | null = null;
-  const strip = await mountParkedStrip((s) => {
-    latest = s;
-  });
-  const scroller = strip.scrollerRef.current;
-  assert.ok(scroller);
-  const left0 = scroller!.scrollLeft;
-  assert.ok(left0 > 0, 'init park should have scrolled the strip');
-  const start0 = latestStrip(() => latest).visibleStart;
-  // No touch was dispatched: the guard is unconditional for changes the browser
-  // makes on its own, rail or no rail.
-  assert.equal(scroller!.style.scrollSnapType, '');
-
-  // The browser throwing the strip at history: values on their way to 0, then 0
-  // itself — the first overscan column.
-  for (const collapsed of [left0 - 30, left0 - strip.colW, 0]) {
-    scroller!.scrollLeft = collapsed;
-    await act(async () => {
-      strip.onScrollerScroll();
-    });
-
-    assert.equal(
-      scroller!.scrollLeft,
-      left0,
-      `scrollLeft must return to the parked column (thrown to ${collapsed})`,
-    );
-    assert.ok(
-      isSameDay(latestStrip(() => latest).visibleStart, start0),
-      `the visible day must not follow the browser's scroll (thrown to ${collapsed})`,
-    );
-  }
-  assert.equal(
-    latestStrip(() => latest).visibleStart.getTime(),
-    start0.getTime(),
-    'the fitted period start, not a rebased window',
-  );
-});
-
-test('useCalendarStrip: a vertical pan cannot rewind the strip through history', async () => {
-  let latest: CalendarStrip | null = null;
-  const strip = await mountParkedStrip((s) => {
-    latest = s;
-  });
-  const scroller = strip.scrollerRef.current;
-  assert.ok(scroller);
-  const left0 = scroller!.scrollLeft;
-  assert.ok(left0 > 0, 'init park should have scrolled the strip');
-  const start0 = latestStrip(() => latest).visibleStart;
-
-  await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
-    );
-  });
-  await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchmove', [{ clientX: 303, clientY: 360 }], 16),
-    );
-  });
-  // A pan that has resolved to y owns the hours; the strip's x axis is nobody's
-  // but this hook's. Mid-pan the browser drops the strip on the first snap
-  // column — the oldest overscan day. Publishing that, and rebasing on it, is
-  // the rewind through history.
-  scroller!.scrollLeft = 0;
-  await act(async () => {
-    strip.onScrollerScroll();
-  });
-  assert.equal(scroller!.scrollLeft, left0, 'the strip is put back');
-  assert.equal(
-    latestStrip(() => latest).visibleStart.getTime(),
-    start0.getTime(),
-    'the visible period is the fitted one, not an earlier rebased window',
-  );
-
-  // The pan ends: the rail releases, snap comes back, and the day never moved.
-  await act(async () => {
-    scroller!.dispatchEvent(touchEvent('touchend', [], 100));
-  });
-  await act(async () => {
-    scroller!.dispatchEvent(new window.Event('scrollend'));
-  });
-  assert.equal(scroller!.style.scrollSnapType, '');
-  assert.equal(scroller!.scrollLeft, left0);
-  assert.equal(
-    latestStrip(() => latest).visibleStart.getTime(),
-    start0.getTime(),
-    'still the fitted period after the rail releases',
-  );
-});
-
-test('useCalendarStrip: a corrective write the browser ignores does not move the day', async () => {
-  let latest: CalendarStrip | null = null;
-  const strip = await mountParkedStrip((s) => {
-    latest = s;
-  });
-  const scroller = strip.scrollerRef.current;
-  assert.ok(scroller);
-  const left0 = scroller!.scrollLeft;
-  assert.ok(left0 > 0, 'init park should have scrolled the strip');
-  const start0 = latestStrip(() => latest).visibleStart;
-
-  // iOS ignores programmatic `scrollLeft` writes while a native pan is in
-  // flight: the strip sits at 0 (where the pan collapsed it) and the guard's
-  // correction cannot land yet.
-  let stored = 0;
-  Object.defineProperty(scroller, 'scrollLeft', {
-    configurable: true,
-    get: () => stored,
-    set: (value: number) => {
-      if (value === 0) stored = 0;
-    },
-  });
-
-  try {
-    await act(async () => {
-      strip.onScrollerScroll();
-    });
-    assert.equal(scroller!.scrollLeft, 0, 'the corrective write was swallowed');
-    assert.equal(
-      latestStrip(() => latest).visibleStart.getTime(),
-      start0.getTime(),
-      'a day the browser threw out must not be published',
-    );
-    assert.notEqual(
-      latestStrip(() => latest).visibleStart.getTime(),
-      latestStrip(() => latest).days[0].getTime(),
-      'and certainly not the first overscan day',
-    );
-  } finally {
-    // Never leave the stub installed: the hook keeps reading `scrollLeft`.
-    Reflect.deleteProperty(scroller!, 'scrollLeft');
-  }
-
-  // The pan ends and writes stick again: the next scroll event retries, and the
-  // strip is back on the column it was committed to.
-  await act(async () => {
-    strip.onScrollerScroll();
-  });
-  assert.equal(scroller!.scrollLeft, left0);
-  assert.equal(
-    latestStrip(() => latest).visibleStart.getTime(),
-    start0.getTime(),
-  );
-});
-
-test('useCalendarStrip: shiftPeriod is an intentional write and is not reverted', async () => {
+test('useCalendarStrip: shiftPeriod is a plain write of the strip', async () => {
   // A three-day period: one period away from the parked overscan column stays
   // clear of the rebase threshold, so the write itself is observable (a 7-day
   // shift rebases and re-parks `scrollLeft`, which would hide the assertion).
@@ -828,8 +809,7 @@ test('useCalendarStrip: shiftPeriod is an intentional write and is not reverted'
 
   try {
     // A `scroll` synchronous with the assignment (jsdom fires none by itself):
-    // this is the write the guard must already have committed, or it reads the
-    // pre-shift day out of `committedLeftRef` and puts it back.
+    // the shift must publish the shifted day, not put the old one back.
     let stored = left0;
     Object.defineProperty(scroller, 'scrollLeft', {
       configurable: true,
@@ -847,7 +827,7 @@ test('useCalendarStrip: shiftPeriod is an intentional write and is not reverted'
     assert.equal(
       stored,
       left0 + strip.periodLength * strip.colW,
-      'the shift is a write of ours: the guard must adopt it, not revert it',
+      'the shift writes one period of pixels',
     );
     assert.ok(
       isSameDay(
@@ -868,11 +848,9 @@ test('useCalendarStrip: shiftPeriod is an intentional write and is not reverted'
 });
 
 // ── Column-width changes ────────────────────────────────────────────────
-// `committedLeftRef` is pixels: a rotation, window resize, sidebar or PWA
-// viewport change moves the columns out from under it. The strip has to re-park
-// the same visible index at the new width, or the guard writes the old pixels
-// back — mid-column at the new width — and mandatory snap re-snaps that write
-// while the read-back is rejected, leaving the day nobody published.
+// The park is pixels: a rotation, window resize, sidebar or PWA viewport move
+// the columns out from under it, so the same visible index has to be re-parked
+// at the new width — a re-park of the old pixels rounds to a different day.
 
 /** A ResizeObserver that hands its callback to the test instead of firing it. */
 function captureResizeObserver(): {
@@ -956,23 +934,6 @@ test('useCalendarStrip: a column-width change re-parks on the same visible day',
       start0.getTime(),
       'and the window must not rebase',
     );
-
-    // The regression: mandatory snap re-snaps a stale pixel write, the read-back
-    // differs, and the guard returned without publishing. The old pixels are
-    // thrown back at the strip; the new column is what must be restored.
-    scroller!.scrollLeft = left0;
-    await act(async () => {
-      latestStrip(() => latest).onScrollerScroll();
-    });
-    assert.equal(
-      scroller!.scrollLeft,
-      scrollLeftForIndex(STRIP_OVERSCAN, colW1),
-      'the guard restores the new column, not the old pixels',
-    );
-    assert.ok(
-      isSameDay(latestStrip(() => latest).visibleStart, start0),
-      'still the same visible day',
-    );
   } finally {
     observer.restore();
   }
@@ -1041,82 +1002,14 @@ test('useCalendarStrip: a resize under a held owner waits for the release', asyn
   }
 });
 
-// ── Single-axis gestures ────────────────────────────────────────────────
-// One finger may only move one axis. `overflow-x: hidden` denies the browser
-// the strip's x axis; the vertical pin denies it the y axis while a swipe owns
-// the strip, so a native pan that lands anyway cannot move the hours.
-
-test('useCalendarStrip: a horizontal swipe pins the vertical axis until it settles', async () => {
-  const strip = await mountParkedStrip();
-  const scroller = strip.scrollerRef.current;
-  assert.ok(scroller);
-  const top0 = scroller!.scrollTop;
-
-  await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchstart', [{ clientX: 300, clientY: 300 }], 0),
-    );
-  });
-  await act(async () => {
-    scroller!.dispatchEvent(
-      touchEvent('touchmove', [{ clientX: 400, clientY: 300 }], 16),
-    );
-  });
-  assert.equal(scroller!.style.scrollSnapType, 'none');
-
-  // The browser starts a vertical pan under the swipe: it is undone, not
-  // published, so the gesture stays horizontal.
-  scroller!.scrollTop = top0 + 140;
-  await act(async () => {
-    strip.onScrollerScroll();
-  });
-  assert.equal(scroller!.scrollTop, top0, 'the hours are held for the gesture');
-
-  // The pin outlives the finger: it holds through the release tween.
-  await act(async () => {
-    scroller!.dispatchEvent(touchEvent('touchend', [], 200));
-  });
-  scroller!.scrollTop = top0 + 90;
-  await act(async () => {
-    strip.onScrollerScroll();
-  });
-  assert.equal(scroller!.scrollTop, top0);
-
-  await act(async () => {
-    await sleep(400);
-  });
-  assert.equal(scroller!.style.scrollSnapType, '', 'the tween landed');
-
-  // Once settled the vertical axis is the browser's again.
-  scroller!.scrollTop = top0 + 90;
-  await act(async () => {
-    strip.onScrollerScroll();
-  });
-  assert.equal(scroller!.scrollTop, top0 + 90);
-});
-
 // ── Wheel axis latch ────────────────────────────────────────────────────
-// A Mac trackpad adds a small horizontal delta to a vertical two-finger
-// scroll. Mandatory day snap then walks the strip onto the neighbouring day,
+// A Mac trackpad adds a small horizontal delta to a vertical two-finger scroll,
 // and — unlike a touch gesture — there is no finger-up to settle on. A wheel
-// has no `touch-action`, so the sideways component has to be cancelled by the
-// handler: the burst shares touch's dead zone, and a pending or Y burst is
-// re-applied vertically by hand.
+// has no `touch-action`, so the burst shares touch's dead zone: only a
+// deliberate, horizontal-dominant gesture drives the strip, and a vertical one
+// is left entirely to the browser.
 
-/** jsdom has no Element.scrollBy; mirror the browser's relative vertical write. */
-function stubScrollBy(el: HTMLElement): ScrollToOptions[] {
-  const calls: ScrollToOptions[] = [];
-  Object.defineProperty(el, 'scrollBy', {
-    configurable: true,
-    value: (options: ScrollToOptions) => {
-      calls.push(options);
-      el.scrollTop += options.top ?? 0;
-    },
-  });
-  return calls;
-}
-
-/** Cancelable, as a real wheel over a scroll container is. */
+/** jsdom has no WheelEvent scrolling; the strip's own writes are what we read. */
 function wheelEvent(
   init: {
     deltaX?: number;
@@ -1139,7 +1032,7 @@ test('useCalendarStrip: a ctrl-wheel pinch-zoom is left to the zoom handler', as
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
-  const scrollByCalls = stubScrollBy(scroller!);
+  const left0 = scroller!.scrollLeft;
 
   // Pinch-zoom carries a deltaX too, and useCalendarZoom owns it.
   const zoom = wheelEvent({ ctrlKey: true, deltaX: 3, deltaY: -50 });
@@ -1148,28 +1041,26 @@ test('useCalendarStrip: a ctrl-wheel pinch-zoom is left to the zoom handler', as
   });
 
   assert.equal(zoom.defaultPrevented, false, 'zoom wheels stay untouched here');
-  assert.deepEqual(scrollByCalls, []);
+  assert.equal(scroller!.scrollLeft, left0);
 });
 
-test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', async () => {
+test('useCalendarStrip: a vertical wheel burst is left to the browser', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
-  const scrollByCalls = stubScrollBy(scroller!);
   const left0 = scroller!.scrollLeft;
 
-  // The first event of the burst is in the dead zone: same rules as touch. It
-  // is still consumed, and only its vertical part is re-applied by hand, so no
-  // sideways delta ever reaches the scroller.
+  // The first event of the burst is in the dead zone, with a touch of sideways
+  // drift: the burst is still vertical-dominant, so the event is the browser's.
+  // Its sideways part cannot move the strip (`overflow-x: hidden`) and its
+  // vertical part keeps the native momentum.
   const deadZone = wheelEvent({ deltaX: 2, deltaY: 6 });
   await act(async () => {
     scroller!.dispatchEvent(deadZone);
   });
-  assert.equal(deadZone.defaultPrevented, true, 'dead-zone drift is swallowed');
-  assert.deepEqual(scrollByCalls, [{ top: 6, behavior: 'instant' }]);
+  assert.equal(deadZone.defaultPrevented, false);
 
-  // The accumulated burst now resolves to Y, so every event that carries
-  // sideways drift applies its vertical part only.
+  // The accumulated burst resolves to y, so the rest of it stays native too.
   const events = [
     wheelEvent({ deltaX: 4, deltaY: 40 }),
     wheelEvent({ deltaX: 4, deltaY: 40 }),
@@ -1181,51 +1072,21 @@ test('useCalendarStrip: a vertical wheel burst never moves the strip sideways', 
 
   assert.deepEqual(
     events.map((ev) => ev.defaultPrevented),
-    [true, true, true],
-    'a vertical burst cancels the sideways component',
+    [false, false, false],
+    'a vertical burst is never consumed',
   );
-  assert.deepEqual(scrollByCalls, [
-    { top: 6, behavior: 'instant' },
-    { top: 40, behavior: 'instant' },
-    { top: 40, behavior: 'instant' },
-    { top: 40, behavior: 'instant' },
-  ]);
   assert.equal(scroller!.scrollLeft, left0, 'scrollLeft never moves');
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    '',
-    'a wheel burst holds no snap lock: nothing is left to restore',
-  );
-
-  // A pause starts a new burst, so this one decides its own axis. A committed
-  // horizontal burst is no longer native: the strip cannot be user-scrolled on
-  // x, so the handler takes it and holds snap off until the burst settles.
-  await act(async () => {
-    await sleep(150);
-  });
-  const horizontal = wheelEvent({ deltaX: -60, deltaY: 4 });
-  await act(async () => {
-    scroller!.dispatchEvent(horizontal);
-  });
-  assert.equal(horizontal.defaultPrevented, true, 'a new burst re-decides');
-  assert.equal(
-    scroller!.scrollLeft,
-    left0 - 60,
-    'the x burst drives the strip',
-  );
-  assert.equal(scroller!.style.scrollSnapType, 'none');
-  assert.equal(scrollByCalls.length, 4, 'still no vertical write');
 });
 
-test('useCalendarStrip: a committed horizontal wheel burst drives the strip, then settles', async () => {
+test('useCalendarStrip: a sideways burst inside the dead zone is consumed and moves nothing', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
-  const scrollByCalls = stubScrollBy(scroller!);
   const left0 = scroller!.scrollLeft;
 
-  // Under 48px accumulated: the dead zone drops the sideways delta, and with
-  // no vertical part there is nothing to re-apply.
+  // Sideways-dominant but under the threshold: this is the gesture a Mac would
+  // otherwise turn into a history swipe, so it is cancelled — and the strip
+  // still does not move.
   const deadZone = [
     wheelEvent({ deltaX: -20, deltaY: 0 }),
     wheelEvent({ deltaX: -20, deltaY: 0 }),
@@ -1236,38 +1097,45 @@ test('useCalendarStrip: a committed horizontal wheel burst drives the strip, the
   assert.deepEqual(
     deadZone.map((ev) => ev.defaultPrevented),
     [true, true],
-    'sideways travel under the threshold must not reach the scroller',
+    'a sideways gesture must not escape as a history swipe',
   );
-  assert.deepEqual(scrollByCalls, []);
   assert.equal(scroller!.scrollLeft, left0, 'no horizontal movement yet');
 
-  // 48px at 16:1 commits the burst to x. The strip is not user-scrollable on
-  // that axis, so the handler writes `scrollLeft` itself, under its own snap
-  // lock — no vertical write, no native horizontal scroll.
+  // The next event takes the burst over the threshold: it commits the axis and
+  // the strip follows that event's delta only (the dead zone is never caught up).
+  const committed = wheelEvent({ deltaX: -8, deltaY: 0 });
+  await act(async () => {
+    scroller!.dispatchEvent(committed);
+  });
+  assert.equal(committed.defaultPrevented, true);
+  assert.equal(scroller!.scrollLeft, left0 - 8, 'only the committed delta');
+});
+
+test('useCalendarStrip: a committed horizontal wheel burst drives the strip, then settles', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const left0 = scroller!.scrollLeft;
+
+  // 48px at 16:1 commits the burst to x in a single event. The x axis is not
+  // user-scrollable, so the handler writes `scrollLeft` itself under its own
+  // lock.
   const committed = [
-    wheelEvent({ deltaX: -8, deltaY: 0 }),
-    wheelEvent({ deltaX: -80, deltaY: 2 }),
-    wheelEvent({ deltaX: 10, deltaY: 0 }),
+    wheelEvent({ deltaX: -60, deltaY: 4 }),
+    wheelEvent({ deltaX: -18, deltaY: 0 }),
   ];
   await act(async () => {
     for (const ev of committed) scroller!.dispatchEvent(ev);
   });
   assert.deepEqual(
     committed.map((ev) => ev.defaultPrevented),
-    [true, true, true],
+    [true, true],
     'a committed horizontal burst is consumed and driven by hand',
   );
-  // -8 - 80 + 10 = -78px: the strip followed the burst (deltaX < 0 scrolls
-  // the strip left, towards earlier days).
+  // -60 - 18 = -78px: deltaX < 0 scrolls the strip left, towards earlier days.
   assert.equal(scroller!.scrollLeft, left0 - 78);
-  assert.equal(
-    scroller!.style.scrollSnapType,
-    'none',
-    'snap off while the burst drives the strip',
-  );
-  assert.deepEqual(scrollByCalls, [], 'the x burst never scrolls vertically');
 
-  // A quiet gap lands the burst on a column and re-engages snap.
+  // A quiet gap lands the burst on a column: the wheel has no finger-up.
   await act(async () => {
     await sleep(400);
   });
@@ -1277,14 +1145,13 @@ test('useCalendarStrip: a committed horizontal wheel burst drives the strip, the
     'the settle lands exactly on a column',
   );
   assert.notEqual(scroller!.scrollLeft, left0, 'the burst changed the day');
-  assert.equal(scroller!.style.scrollSnapType, '');
 });
 
 test('useCalendarStrip: a mouse wheel with no deltaX behaves exactly as before', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
-  const scrollByCalls = stubScrollBy(scroller!);
+  const left0 = scroller!.scrollLeft;
 
   // px and line deltas: an ordinary mouse reports deltaX 0, so nothing is
   // intercepted and the browser keeps doing the scrolling.
@@ -1300,33 +1167,33 @@ test('useCalendarStrip: a mouse wheel with no deltaX behaves exactly as before',
     events.map((ev) => ev.defaultPrevented),
     [false, false],
   );
-  assert.deepEqual(scrollByCalls, [], 'no manual write for a pure Y wheel');
+  assert.equal(scroller!.scrollLeft, left0);
 });
 
 test('useCalendarStrip: a wheel burst under a drag owner is left alone', async () => {
   const strip = await mountParkedStrip();
   const scroller = strip.scrollerRef.current;
   assert.ok(scroller);
-  const scrollByCalls = stubScrollBy(scroller!);
+  const left0 = scroller!.scrollLeft;
 
   await act(async () => {
     strip.lockStrip('drag');
   });
-  const during = wheelEvent({ deltaX: 4, deltaY: 40 });
+  const during = wheelEvent({ deltaX: -60, deltaY: 4 });
   await act(async () => {
     scroller!.dispatchEvent(during);
   });
   assert.equal(during.defaultPrevented, false, 'drag writes scrollLeft itself');
-  assert.deepEqual(scrollByCalls, []);
+  assert.equal(scroller!.scrollLeft, left0);
 
-  // Released again: the next burst classifies and the vertical part applies.
+  // Released again: the next burst is classified and driven by the handler.
   await act(async () => {
     strip.unlockStrip('drag');
   });
-  const after = wheelEvent({ deltaX: 4, deltaY: 40 });
+  const after = wheelEvent({ deltaX: -60, deltaY: 4 });
   await act(async () => {
     scroller!.dispatchEvent(after);
   });
   assert.equal(after.defaultPrevented, true);
-  assert.deepEqual(scrollByCalls, [{ top: 40, behavior: 'instant' }]);
+  assert.equal(scroller!.scrollLeft, left0 - 60);
 });

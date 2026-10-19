@@ -162,24 +162,6 @@ export function clampMinutesToDay(
   return { startMin, endMin };
 }
 
-/** Seven local midnights Mon→Sun for the week starting at `weekStart`. */
-export function weekDays(weekStart: Date): Date[] {
-  const start = startOfWeek(weekStart);
-  return Array.from({ length: 7 }, (_, i) => addDays(start, i));
-}
-
-/**
- * Query window: local midnight of week start → local midnight of week start + 7,
- * serialized as absolute UTC instants via toISOString().
- */
-export function weekRangeIso(weekStart: Date): {
-  timeMin: string;
-  timeMax: string;
-} {
-  const start = startOfWeek(weekStart);
-  return rangeIso(start, 7);
-}
-
 /**
  * Query window of `dayCount` local midnights starting at `start`:
  * [start midnight, start + dayCount midnight), as absolute UTC ISO strings.
@@ -296,17 +278,6 @@ export function stripDayCount(periodLength: number = DAYS_PER_PERIOD): number {
 }
 
 /**
- * Day index of the left edge of the viewport (first partially/fully visible
- * column), using floor. Not clamped.
- */
-export function dayIndexFromScroll(scrollLeft: number, colW: number): number {
-  if (!Number.isFinite(scrollLeft) || !Number.isFinite(colW) || colW <= 0) {
-    return 0;
-  }
-  return Math.floor(scrollLeft / colW);
-}
-
-/**
  * Index of the first day of the visible period (snap via round).
  * Clamped so a full period always fits in `[0, dayCount - periodLength]`.
  */
@@ -360,23 +331,14 @@ export function shiftWindowStart(
 
 // ── Strip lock ownership ────────────────────────────────────────────────
 
-/** Gesture owners that can hold the horizontal strip's scroll-snap off. */
+/** Gesture owners that write the horizontal strip's `scrollLeft` themselves. */
 export type StripLockReason = 'drag' | 'pinch' | 'swipe' | 'wheel';
-
-/**
- * Scroll-snap stays `none` while any owner holds the lock.
- * Membership is a Set, not a counter: holding twice and releasing once
- * releases the lock.
- */
-export function stripSnapDisabled(held: ReadonlySet<StripLockReason>): boolean {
-  return held.size > 0;
-}
 
 /**
  * Rebase is suppressed for every owner: each one writes `scrollLeft` itself
  * (drag auto-scroll, pinch zoom, touch swipe, sideways wheel burst), and a
- * rebase write would fight those. A future owner that only holds snap off must
- * be added explicitly.
+ * rebase write would fight those. A future owner that does not write
+ * `scrollLeft` must be added explicitly.
  */
 export function stripRebaseSuppressed(
   held: ReadonlySet<StripLockReason>,
@@ -596,7 +558,7 @@ export const EMPTY_WHEEL_BURST: WheelBurst = {
  *
  * The axis is then latched: momentum keeps arriving after the fingers lift, so
  * a vertical burst that later turns horizontal-heavy must not hand the strip
- * back to native snap mid-gesture.
+ * back to the sideways path mid-gesture.
  *
  * A gap over `WHEEL_BURST_IDLE_MS` starts a fresh burst (sums and axis reset).
  * The comparison is NaN-safe: an unusable timestamp counts as a new burst,
@@ -643,15 +605,6 @@ export function formatDayRangeTitle(first: Date, last: Date): string {
     return `${MONTH_SHORT[sm]} ${sd} – ${MONTH_SHORT[em]} ${ed}, ${sy}`;
   }
   return `${MONTH_SHORT[sm]} ${sd}, ${sy} – ${MONTH_SHORT[em]} ${ed}, ${ey}`;
-}
-
-/**
- * Notion-style week title for the Mon–Sun week containing `weekStart`.
- * Wrapper around formatDayRangeTitle.
- */
-export function formatWeekTitle(weekStart: Date): string {
-  const start = startOfWeek(weekStart);
-  return formatDayRangeTitle(start, addDays(start, 6));
 }
 
 /** Hour gutter label: 1AM…11PM. Hour 0 returns empty (Notion has no midnight label). */
@@ -904,16 +857,9 @@ export function eventHeightPx(
   return Math.max(raw, CHIP_MIN_H);
 }
 
-// Timed packing lives in notion-pack.ts (Notion cascade). Re-export for
-// existing call sites (calendar-model, tests).
-export {
-  packDayEvents,
-  intervalsOverlap,
-  PACK_STEAL_MINUTES,
-  PACK_PEEK_GUTTER,
-  type PackInput,
-  type PackResult,
-} from './notion-pack';
+// Timed packing lives in notion-pack.ts (Notion cascade). Re-exported here
+// because calendar-model imports the packer from this module.
+export { packDayEvents } from './notion-pack';
 
 /** Y position of the now line within the hours area. */
 export function nowLineY(now: Date, hourH: number): number {

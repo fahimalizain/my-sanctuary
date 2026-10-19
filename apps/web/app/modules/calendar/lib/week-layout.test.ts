@@ -32,7 +32,6 @@ import {
   swipeVelocity,
   wheelDeltaPx,
   colWidth,
-  dayIndexFromScroll,
   eventHeightPx,
   eventTopPx,
   fitPeriodStart,
@@ -43,7 +42,6 @@ import {
   formatEventDateLine,
   formatEventDuration,
   formatEventTimeDetail,
-  formatWeekTitle,
   toDateInputValue,
   toTimeInputValue,
   gutterWithRemainder,
@@ -65,9 +63,7 @@ import {
   startOfWeek,
   stripDayCount,
   stripRebaseSuppressed,
-  stripSnapDisabled,
   visibleStartIndex,
-  weekRangeIso,
   snapMinutes,
   SNAP_MINUTES,
   SNAP_STEP_BASE,
@@ -121,36 +117,7 @@ test('startOfWeek: Monday stays on itself at midnight', () => {
   assert.equal(start.getHours(), 0);
 });
 
-// ── weekRangeIso ────────────────────────────────────────────────────────
-
-test('weekRangeIso: 7-day window; timeMax is next Monday midnight', () => {
-  const weekStart = new Date(2026, 8, 7); // Mon Sep 7 local
-  const { timeMin, timeMax } = weekRangeIso(weekStart);
-
-  const min = new Date(timeMin);
-  const max = new Date(timeMax);
-
-  // Round-trip: local midnights of Mon Sep 7 and Mon Sep 14.
-  const expectedMin = new Date(2026, 8, 7, 0, 0, 0, 0);
-  const expectedMax = new Date(2026, 8, 14, 0, 0, 0, 0);
-  assert.equal(min.getTime(), expectedMin.getTime());
-  assert.equal(max.getTime(), expectedMax.getTime());
-
-  // Exactly 7 days apart.
-  assert.equal(max.getTime() - min.getTime(), 7 * 24 * 60 * 60 * 1000);
-});
-
-// ── formatWeekTitle ─────────────────────────────────────────────────────
-
-test('formatWeekTitle: same-month range', () => {
-  // Mon Sep 7 – Sun Sep 13, 2026
-  assert.equal(formatWeekTitle(new Date(2026, 8, 7)), 'Sep 7–13, 2026');
-});
-
-test('formatWeekTitle: cross-month range', () => {
-  // Mon Sep 28 – Sun Oct 4, 2026
-  assert.equal(formatWeekTitle(new Date(2026, 8, 28)), 'Sep 28 – Oct 4, 2026');
-});
+// ── formatDayRangeTitle ─────────────────────────────────────────────────
 
 test('formatDayRangeTitle: Wed–Tue cross-month', () => {
   // Wed Sep 30 – Tue Oct 6, 2026
@@ -291,14 +258,10 @@ test('stripDayCount: period 3 → 3 + 14 = 17', () => {
   assert.equal(stripDayCount(3), 17);
 });
 
-test('dayIndexFromScroll / scrollLeftForIndex round-trip', () => {
+test('scrollLeftForIndex: a column index lands on its left edge', () => {
   const colW = 100;
   for (const idx of [0, 3, 7, 14]) {
-    const left = scrollLeftForIndex(idx, colW);
-    assert.equal(left, idx * colW);
-    assert.equal(dayIndexFromScroll(left, colW), idx);
-    // Mid-column still floors to the same index.
-    assert.equal(dayIndexFromScroll(left + colW / 2 - 1, colW), idx);
+    assert.equal(scrollLeftForIndex(idx, colW), idx * colW);
   }
 });
 
@@ -377,17 +340,6 @@ test('shiftWindowStart: period 3 → ±3 days', () => {
 
 // ── Strip lock ownership ────────────────────────────────────────────────
 
-test('stripSnapDisabled: true while any owner is held', () => {
-  assert.equal(stripSnapDisabled(new Set<StripLockReason>()), false);
-  for (const reason of ['drag', 'pinch', 'swipe', 'wheel'] as const) {
-    assert.equal(stripSnapDisabled(new Set<StripLockReason>([reason])), true);
-  }
-  assert.equal(
-    stripSnapDisabled(new Set<StripLockReason>(['drag', 'pinch'])),
-    true,
-  );
-});
-
 test('stripRebaseSuppressed: every lock owner writes scrollLeft, so none rebases', () => {
   for (const reason of ['drag', 'pinch', 'swipe', 'wheel'] as const) {
     assert.equal(
@@ -408,17 +360,14 @@ test('stripRebaseSuppressed: every lock owner writes scrollLeft, so none rebases
 
 test('strip lock: releasing one owner leaves another owner in effect', () => {
   const held = new Set<StripLockReason>(['drag', 'swipe']);
-  assert.equal(stripSnapDisabled(held), true);
   assert.equal(stripRebaseSuppressed(held), true);
 
   // Drag ends while the swipe owner still holds.
   held.delete('drag');
-  assert.equal(stripSnapDisabled(held), true);
   assert.equal(stripRebaseSuppressed(held), true);
 
-  // Last owner releases → snap re-engages.
+  // Last owner releases → rebase is live again.
   held.delete('swipe');
-  assert.equal(stripSnapDisabled(held), false);
   assert.equal(stripRebaseSuppressed(held), false);
 });
 
@@ -428,13 +377,11 @@ test('strip lock: repeat holds are idempotent', () => {
   held.add('pinch');
   held.add('pinch');
   held.delete('pinch');
-  assert.equal(stripSnapDisabled(held), false);
   assert.equal(stripRebaseSuppressed(held), false);
 });
 
-test('strip lock: empty set means snap enabled and no suppression', () => {
+test('strip lock: empty set suppresses nothing', () => {
   const held: ReadonlySet<StripLockReason> = new Set();
-  assert.equal(stripSnapDisabled(held), false);
   assert.equal(stripRebaseSuppressed(held), false);
 });
 
@@ -675,7 +622,7 @@ test('nextWheelBurst: an idle gap starts a new burst with fresh sums and axis', 
   assert.equal(first.axis, 'y');
 
   // Horizontal-heavy within the same burst: the latch must hold — re-deciding
-  // here would hand the strip back to native snap mid-gesture.
+  // here would hand the strip back to the sideways path mid-gesture.
   const latched = nextWheelBurst(first, { dx: 200, dy: 0, t: 1050 });
   assert.equal(latched.axis, 'y');
   assert.equal(latched.sumX, 200);
@@ -726,7 +673,7 @@ test('nextWheelBurst: latches y past the vertical slop and keeps it', () => {
 
   // Horizontal-heavy momentum within the same burst would classify as x on its
   // own; the latch must hold — re-deciding here would hand the strip back to
-  // native snap mid-gesture.
+  // the sideways path mid-gesture.
   const latched = nextWheelBurst(vertical, { dx: 200, dy: 0, t: 32 });
   assert.equal(latched.axis, 'y');
   assert.equal(latched.sumX, 208);
