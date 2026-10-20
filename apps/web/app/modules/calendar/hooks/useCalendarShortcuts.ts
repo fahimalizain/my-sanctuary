@@ -5,7 +5,7 @@ import {
 } from '../lib/calendar-shortcuts';
 
 export interface CalendarShortcutsOptions {
-  /** Suppress every shortcut, e.g. while a modal dialog owns the keyboard. */
+  /** Suppress every shortcut, e.g. while a pointer drag owns the interaction. */
   suspended: boolean;
   onPeriodChange: (n: number) => void;
   onToday: () => void;
@@ -93,8 +93,8 @@ export function useCalendarShortcuts({
   ]);
 
   useEffect(() => {
-    // A dialog owns the keyboard while it is open: its focused buttons are not
-    // editing targets, so the target check alone would let keys through.
+    // An active pointer drag owns the interaction: its captured pointer is
+    // not an editing target, so the target check alone would let keys through.
     if (suspended) return;
 
     const onKeyDown = (e: KeyboardEvent) => {
