@@ -9,12 +9,8 @@ import { dayNameShort } from '../lib/calendar-model';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
 import { GutterTimes } from './GutterTimes';
 import { type PositionedEvent } from './EventChip';
-import {
-  COL_HEADER_H,
-  STRIP_TRACK_TRANSFORM,
-  isSameDay,
-  isWeekend,
-} from '../lib/week-layout';
+import { COL_HEADER_H, isSameDay, isWeekend } from '../lib/week-layout';
+import type { StripTrackRef } from '../hooks/useCalendarStrip';
 
 /** Stable empty list so DayColumn memo is not busted on empty days. */
 const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
@@ -22,6 +18,8 @@ const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
 export interface CalendarWeekGridProps {
   gridColumnRef: RefObject<HTMLDivElement | null>;
   scrollerRef: RefObject<HTMLDivElement | null>;
+  /** Registers a day track so the strip can translate it. */
+  stripTrackRef: StripTrackRef;
   colW: number;
   gutterW: number;
   trackWidth: number;
@@ -78,6 +76,7 @@ export interface CalendarWeekGridProps {
 export function CalendarWeekGrid({
   gridColumnRef,
   scrollerRef,
+  stripTrackRef,
   colW,
   gutterW,
   trackWidth,
@@ -129,14 +128,14 @@ export function CalendarWeekGrid({
         // + `touch-action: pan-y`); the day strip is moved by `useCalendarStrip`
         // alone — touch swipe, trackpad burst, drag autoscroll, rebase, park —
         // and lands on a column with its own ease-out tween.
-        // The strip is a CSS offset, never `scrollLeft`, and the scroller has no
-        // horizontal scroll range at all: its content is exactly its own width
-        // and each band clips a wider track. On iOS a native vertical pan makes
-        // WebKit report its own x for a non-user-scrollable axis and overwrite a
-        // programmatic `scrollLeft` mid-gesture — the strip then read index 0,
-        // rebased a period back, and rewound the calendar on every vertical
-        // drag. `useCalendarStrip` writes `--strip-x`, which the browser never
-        // touches, and the three tracks below translate by it in one frame.
+        // The strip is an offset on each day track, never `scrollLeft`, and the
+        // scroller has no horizontal scroll range at all: its content is exactly
+        // its own width and each band clips a wider track. On iOS a native
+        // vertical pan makes WebKit report its own x for a non-user-scrollable
+        // axis and overwrite a programmatic `scrollLeft` mid-gesture — the strip
+        // then read index 0, rebased a period back, and rewound the calendar on
+        // every vertical drag. `useCalendarStrip` writes `transform` straight to
+        // the three tracks below, which the browser never touches.
         // No CSS scroll-snap: `snap-x snap-mandatory` re-snapped every
         // programmatic write. The tween is the only snap.
       >
@@ -163,11 +162,12 @@ export function CalendarWeekGrid({
             {/* Track viewport: clips the translated day track */}
             <div className="flex-1 min-w-0 overflow-hidden">
               <div
-                className="flex"
+                ref={stripTrackRef}
+                data-strip-track
+                className="flex will-change-transform"
                 style={{
                   width: trackWidth,
                   height: '100%',
-                  transform: STRIP_TRACK_TRANSFORM,
                 }}
               >
                 {days.map((day) => {
@@ -209,6 +209,7 @@ export function CalendarWeekGrid({
               days={days}
               colWidth={colW}
               gutterWidth={gutterW}
+              stripTrackRef={stripTrackRef}
               height={allDayHeight}
               chips={allDayChips}
               todayIndex={todayIndex}
@@ -245,11 +246,12 @@ export function CalendarWeekGrid({
             {/* Track viewport: clips the translated hours track */}
             <div className="flex-1 min-w-0 overflow-hidden">
               <div
-                className="relative flex"
+                ref={stripTrackRef}
+                data-strip-track
+                className="relative flex will-change-transform"
                 style={{
                   width: trackWidth,
                   height: totalHoursH,
-                  transform: STRIP_TRACK_TRANSFORM,
                 }}
               >
                 {/* Day columns — memoized; drag preview is a sibling overlay */}

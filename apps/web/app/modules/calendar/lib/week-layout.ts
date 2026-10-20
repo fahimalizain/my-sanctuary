@@ -192,20 +192,16 @@ export const STRIP_OVERSCAN = 7;
 export const STRIP_REBASE_THRESHOLD = 3;
 
 /**
- * CSS custom property carrying the day strip's horizontal offset (px), set on
- * the scroller by `useCalendarStrip`. The day tracks translate by it.
+ * Transform for a day track: shift it left by the strip offset `x` (px). All
+ * three bands carry the same offset, so they move together in one frame.
  *
- * This is deliberately not `scrollLeft`: on iOS a native vertical pan makes
- * WebKit report its own x for a non-user-scrollable axis, which overwrites a
- * programmatic `scrollLeft` mid-gesture. The browser never touches a custom
- * property, so the strip can only move when we move it.
+ * `useCalendarStrip` writes this straight to each track element, not through an
+ * inherited custom property: a variable set on the scroller invalidated style
+ * for the whole calendar subtree on every frame of a swipe.
  */
-export const STRIP_X_CSS_VAR = '--strip-x';
-
-/** Transform for a day track: shift it left by the strip offset. All three
- *  bands read the same variable, so they move together in one frame. */
-export const STRIP_TRACK_TRANSFORM =
-  'translate3d(calc(-1 * var(--strip-x, 0px)), 0, 0)';
+export function stripTrackTransform(x: number): string {
+  return `translate3d(${-x}px, 0, 0)`;
+}
 
 /**
  * Clamp a period length to `[MIN_PERIOD_LENGTH, MAX_PERIOD_LENGTH]`.

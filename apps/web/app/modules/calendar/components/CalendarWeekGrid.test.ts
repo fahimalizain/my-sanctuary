@@ -1,20 +1,21 @@
 // The calendar scroller must have no horizontal scroll range: its content is
 // exactly the scroller's own width, and each horizontal band clips a wider day
-// track that is translated by the strip offset (`--strip-x`). That is the fix
-// for the iOS rewind — a hidden x axis let WebKit overwrite `scrollLeft` mid
-// vertical pan.
+// track that is translated by the strip offset. That is the fix for the iOS
+// rewind — a hidden x axis let WebKit overwrite `scrollLeft` mid vertical pan.
 //
 // jsdom computes no layout, so `scrollWidth` cannot meaningfully be compared to
 // `clientWidth` here. This pins the structure that guarantees the invariant
 // instead: no fixed-width content child, a clipping viewport per band, and all
-// three tracks sharing the same transform.
+// three tracks registered on the one strip ref, which writes each track's
+// `transform` directly (never a `transform` in the React style prop, and never
+// an inherited custom property).
 //
 // DOM must exist before the component module is imported.
 
 import { after, afterEach, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement, createRef } from 'react';
-import { addDays, startOfDay, STRIP_TRACK_TRANSFORM } from '../lib/week-layout';
+import { addDays, startOfDay } from '../lib/week-layout';
 import { installDom } from './install-dom';
 
 installDom();
@@ -45,17 +46,24 @@ const GUTTER_W = 52;
 function mountGrid(): {
   scroller: HTMLDivElement;
   days: Date[];
+  registered: HTMLDivElement[];
 } {
   const days = Array.from({ length: DAY_COUNT }, (_, i) =>
     addDays(startOfDay(new Date(2026, 9, 12)), i),
   );
   const scrollerRef = createRef<HTMLDivElement>();
   const gridColumnRef = createRef<HTMLDivElement>();
+  // Stands in for `useCalendarStrip`'s ref: records the tracks it is handed.
+  const registered: HTMLDivElement[] = [];
+  const stripTrackRef = (el: HTMLDivElement | null): void => {
+    if (el) registered.push(el);
+  };
 
   render(
     createElement(CalendarWeekGrid, {
       gridColumnRef,
       scrollerRef,
+      stripTrackRef,
       colW: COL_W,
       gutterW: GUTTER_W,
       trackWidth: DAY_COUNT * COL_W,
@@ -96,7 +104,7 @@ function mountGrid(): {
 
   const scroller = scrollerRef.current;
   assert.ok(scroller, 'the scroller ref must be attached');
-  return { scroller: scroller!, days };
+  return { scroller: scroller!, days, registered };
 }
 
 test('CalendarWeekGrid: the scroller content is never wider than the scroller', () => {
@@ -124,24 +132,36 @@ test('CalendarWeekGrid: the scroller content is never wider than the scroller', 
   assert.ok(content.className.includes('min-h-full'));
 });
 
-test('CalendarWeekGrid: all three day tracks are clipped and share one offset', () => {
-  const { scroller, days } = mountGrid();
+test('CalendarWeekGrid: all three day tracks are clipped and share one ref', () => {
+  const { scroller, days, registered } = mountGrid();
 
-  const tracks = [...scroller.querySelectorAll<HTMLElement>('div')].filter(
-    (el) => el.style.transform === STRIP_TRACK_TRANSFORM,
-  );
+  const tracks = [
+    ...scroller.querySelectorAll<HTMLElement>('[data-strip-track]'),
+  ];
   assert.equal(
     tracks.length,
     3,
     'day headers, all-day band and hours track all translate by the strip',
   );
   assert.equal(
-    new Set(tracks.map((track) => track.style.transform)).size,
-    1,
-    'the bands read the same CSS variable, so they move together',
+    registered.length,
+    3,
+    'every band registers on the strip ref, so one write moves them together',
   );
+  for (const el of registered) {
+    assert.ok(tracks.includes(el), 'the ref is handed the rendered tracks');
+  }
 
   for (const track of tracks) {
+    assert.equal(
+      track.style.transform,
+      '',
+      'the track must not own its transform: a re-render would reset the imperative value',
+    );
+    assert.ok(
+      track.className.includes('will-change-transform'),
+      'each track is its own compositor layer',
+    );
     const viewport = track.parentElement;
     assert.ok(viewport, 'each track sits in its own viewport');
     assert.ok(
