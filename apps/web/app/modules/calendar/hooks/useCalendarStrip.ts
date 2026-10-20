@@ -12,7 +12,6 @@ import {
   EMPTY_WHEEL_BURST,
   SCROLL_X_THRESHOLD_PX,
   STRIP_OVERSCAN,
-  STRIP_X_CSS_VAR,
   WHEEL_BURST_IDLE_MS,
   addDays,
   clampPeriodLength,
@@ -31,6 +30,7 @@ import {
   startOfDay,
   stripDayCount,
   stripRebaseSuppressed,
+  stripTrackTransform,
   swipeTargetIndex,
   swipeVelocity,
   visibleStartIndex as computeVisibleStartIndex,
@@ -83,6 +83,13 @@ interface SwipeGesture {
   samples: SwipeSample[];
 }
 
+/**
+ * Callback ref for a day track that translates with the strip: the day headers,
+ * the all-day band, or the hours track. Detaching returns the React 19 cleanup
+ * that unregisters the element.
+ */
+export type StripTrackRef = (el: HTMLDivElement | null) => void | (() => void);
+
 export interface CalendarStrip {
   periodLength: number;
   handlePeriodChange: (n: number) => void;
@@ -94,6 +101,8 @@ export interface CalendarStrip {
   range: { timeMin: string; timeMax: string };
   gridColumnRef: RefObject<HTMLDivElement | null>;
   scrollerRef: RefObject<HTMLDivElement | null>;
+  /** Register one of the three day tracks the strip translates. */
+  stripTrackRef: StripTrackRef;
   scrollerHeight: number;
   colW: number;
   gutterW: number;
@@ -242,9 +251,27 @@ export function useCalendarStrip(): CalendarStrip {
   // pan makes WebKit report its own x for the (non-user-scrollable) hidden
   // axis and overwrite a programmatic `scrollLeft` with 0 mid-gesture. The
   // strip then published index 0, rebased a period back, and the calendar
-  // rewound through history on every vertical drag. A CSS variable has no such
-  // authority — the browser never touches it.
+  // rewound through history on every vertical drag. A transform written only by
+  // this hook has no such authority — the browser never touches it.
   const stripXRef = useRef(0);
+
+  // The three bands that translate with the strip (day headers, all-day,
+  // hours). Registered by ref so `writeStripX` can move them with no render.
+  const stripTracksRef = useRef<Set<HTMLDivElement>>(new Set());
+
+  /**
+   * Callback ref for a day track. Applying the current offset on attach keeps a
+   * track that mounts (or remounts on a period change) from painting at 0 while
+   * the other bands sit at the strip's position.
+   */
+  const stripTrackRef = useCallback<StripTrackRef>((el) => {
+    if (!el) return;
+    stripTracksRef.current.add(el);
+    el.style.transform = stripTrackTransform(stripXRef.current);
+    return () => {
+      stripTracksRef.current.delete(el);
+    };
+  }, []);
 
   /** Furthest the strip can travel: last index at which a full period fits. */
   const maxStripX = useMemo(
@@ -253,20 +280,24 @@ export function useCalendarStrip(): CalendarStrip {
   );
 
   /**
-   * Write the offset to the DOM only: the three day tracks read it from the
-   * CSS variable, so all bands move together in one frame and React does not
-   * re-render.
+   * Write the offset to the DOM only: each day track carries it as a transform,
+   * so all bands move together in one frame and React does not re-render. One
+   * direct write per track, never an inherited custom property — a variable set
+   * on the scroller invalidated style for the entire calendar subtree on every
+   * move and tween frame, which is what made horizontal swipes lag.
    */
   const writeStripX = useCallback((x: number) => {
     stripXRef.current = x;
-    const scroller = scrollerRef.current;
-    if (scroller) scroller.style.setProperty(STRIP_X_CSS_VAR, `${x}px`);
+    const transform = stripTrackTransform(x);
+    for (const track of stripTracksRef.current) {
+      track.style.transform = transform;
+    }
   }, []);
 
   // ── Strip publishing ──────────────────────────────────────────────────
   // Update the visible start; request a rebase near the edges. A `scrollLeft`
-  // write used to fire a native `scroll` event that ran this; a CSS write does
-  // not, so every offset change publishes explicitly.
+  // write used to fire a native `scroll` event that ran this; a transform write
+  // does not, so every offset change publishes explicitly.
   const publishStripIndex = useCallback(() => {
     // Ignore until init park has run with a measured width. Otherwise the
     // pre-park offset of 0 sets visibleStartIdx to 0 and the title flashes /
@@ -923,6 +954,7 @@ export function useCalendarStrip(): CalendarStrip {
     range,
     gridColumnRef,
     scrollerRef,
+    stripTrackRef,
     scrollerHeight,
     colW,
     gutterW,

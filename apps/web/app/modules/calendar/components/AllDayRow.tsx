@@ -3,12 +3,12 @@ import {
   ALLDAY_CHIP,
   ALLDAY_GAP,
   ALLDAY_PAD,
-  STRIP_TRACK_TRANSFORM,
   isWeekend,
   formatEventDateLine,
   lastOccupiedCivilDate,
 } from '../lib/week-layout';
 import { isEventPast, notionEventCssVars } from '../lib/event-colors';
+import type { StripTrackRef } from '../hooks/useCalendarStrip';
 import { cn } from '@/lib/utils';
 
 export interface AllDayChip {
@@ -40,6 +40,8 @@ export interface AllDayRowProps {
   days: Date[];
   colWidth: number;
   gutterWidth: number;
+  /** Registers the chip track so the strip can translate it. */
+  stripTrackRef: StripTrackRef;
   height: number;
   chips: AllDayChip[];
   /** Highlight today's column index into `days`, or null. */
@@ -65,6 +67,7 @@ export function AllDayRow({
   days,
   colWidth,
   gutterWidth,
+  stripTrackRef,
   height,
   chips,
   todayIndex = null,
@@ -97,11 +100,12 @@ export function AllDayRow({
       {/* Track viewport: clips the translated chip track */}
       <div className="flex-1 min-w-0 overflow-hidden">
         <div
-          className="relative"
+          ref={stripTrackRef}
+          data-strip-track
+          className="relative will-change-transform"
           style={{
             width: trackWidth,
             height: '100%',
-            transform: STRIP_TRACK_TRANSFORM,
           }}
         >
           {/* Column hairlines + weekend / today wash (decorative) */}

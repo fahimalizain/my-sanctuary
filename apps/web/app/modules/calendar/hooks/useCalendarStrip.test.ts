@@ -9,13 +9,13 @@
 //
 // The strip obeys one rule: a gesture picks its axis once (after the dead zone)
 // and only that axis moves until the gesture ends. The browser pans the hours
-// (`touch-action: pan-y`); the day strip is a CSS offset written by this hook
+// (`touch-action: pan-y`); the day strip is a transform written by this hook
 // alone, has no CSS scroll-snap, and the release tween is its only snap.
 //
 // The offset is deliberately not `scrollLeft`: on iOS a native vertical pan
 // used to overwrite a programmatic `scrollLeft` with 0 on the hidden x axis,
-// rewinding the calendar through history. Tests read the offset from the CSS
-// variable the day tracks translate by.
+// rewinding the calendar through history. Tests read the offset back out of the
+// transform every registered day track carries.
 
 import { after, afterEach, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,7 +38,6 @@ let act: typeof import('@testing-library/react').act;
 let fitPeriodStart: typeof import('../lib/week-layout').fitPeriodStart;
 let addDays: typeof import('../lib/week-layout').addDays;
 let STRIP_OVERSCAN: typeof import('../lib/week-layout').STRIP_OVERSCAN;
-let STRIP_X_CSS_VAR: typeof import('../lib/week-layout').STRIP_X_CSS_VAR;
 let DAYS_PER_PERIOD: typeof import('../lib/week-layout').DAYS_PER_PERIOD;
 let isSameDay: typeof import('../lib/week-layout').isSameDay;
 let colWidth: typeof import('../lib/week-layout').colWidth;
@@ -57,7 +56,6 @@ before(async () => {
   fitPeriodStart = layout.fitPeriodStart;
   addDays = layout.addDays;
   STRIP_OVERSCAN = layout.STRIP_OVERSCAN;
-  STRIP_X_CSS_VAR = layout.STRIP_X_CSS_VAR;
   DAYS_PER_PERIOD = layout.DAYS_PER_PERIOD;
   isSameDay = layout.isSameDay;
   colWidth = layout.colWidth;
@@ -78,15 +76,36 @@ after(() => {
   cleanup();
 });
 
+/** `translate3d(<x>px, 0, 0)` as written by the hook — one track's offset. */
+const TRACK_TRANSFORM_RE = /^translate3d\((-?[\d.e+-]+)px, 0, 0\)$/;
+
+/** Strip offset (px) parsed back out of one track's transform. */
+function trackOffset(track: HTMLElement): number {
+  const match = TRACK_TRANSFORM_RE.exec(track.style.transform);
+  assert.ok(
+    match,
+    `a strip track must carry its offset, got "${track.style.transform}"`,
+  );
+  const offset = -Number.parseFloat(match[1]);
+  // `-0` is not `0` under strict equality, and a park at 0 lands on `-0`.
+  return offset === 0 ? 0 : offset;
+}
+
 /**
- * Strip offset (px) the hook applied to the scroller, exactly as the day
- * tracks read it. The scroller never carries a horizontal scroll position.
+ * Strip offset (px) every registered day track carries. The scroller never
+ * carries a horizontal scroll position, and the tracks are written together —
+ * a disagreement is a bug in its own right, so it is asserted on every read.
  */
 function readStripX(scroller: HTMLElement): number {
-  const value = Number.parseFloat(
-    scroller.style.getPropertyValue(STRIP_X_CSS_VAR),
-  );
-  return Number.isFinite(value) ? value : 0;
+  const tracks = [
+    ...scroller.querySelectorAll<HTMLElement>('[data-strip-track]'),
+  ];
+  assert.equal(tracks.length, 3, 'the harness renders all three day tracks');
+  const offsets = tracks.map(trackOffset);
+  for (const offset of offsets) {
+    assert.equal(offset, offsets[0], 'every track must carry the same offset');
+  }
+  return offsets[0];
 }
 
 function stubClientWidth(el: HTMLElement, width: number): void {
@@ -171,6 +190,15 @@ function latestStrip(get: () => CalendarStrip | null): CalendarStrip {
   return strip;
 }
 
+/** One of the three bands a real grid registers; the hook translates it. */
+function StripTrack({
+  trackRef,
+}: {
+  trackRef: CalendarStrip['stripTrackRef'];
+}): ReactElement {
+  return createElement('div', { 'data-strip-track': '', ref: trackRef });
+}
+
 /** Harness attaches strip refs and stubs a measured grid width before paint. */
 function StripHarness({
   onStrip,
@@ -200,16 +228,33 @@ function StripHarness({
         }
       },
     },
-    createElement('div', {
-      ref: (el: HTMLDivElement | null) => {
-        (strip.scrollerRef as { current: HTMLDivElement | null }).current = el;
-        if (el && !scrollerAttached.current) {
-          stubClientWidth(el, gridWidth);
-          scrollerAttached.current = true;
-        }
+    createElement(
+      'div',
+      {
+        ref: (el: HTMLDivElement | null) => {
+          (strip.scrollerRef as { current: HTMLDivElement | null }).current =
+            el;
+          if (el && !scrollerAttached.current) {
+            stubClientWidth(el, gridWidth);
+            scrollerAttached.current = true;
+          }
+        },
+        style: { overflow: 'auto', width: gridWidth },
       },
-      style: { overflow: 'auto', width: gridWidth },
-    }),
+      // The three bands the real grid mounts: day headers, all-day, hours.
+      createElement(StripTrack, {
+        key: 'headers',
+        trackRef: strip.stripTrackRef,
+      }),
+      createElement(StripTrack, {
+        key: 'all-day',
+        trackRef: strip.stripTrackRef,
+      }),
+      createElement(StripTrack, {
+        key: 'hours',
+        trackRef: strip.stripTrackRef,
+      }),
+    ),
   );
 }
 
@@ -311,6 +356,88 @@ test('useCalendarStrip: a mount scroll before the measured park does not clobber
   assert.ok(
     isSameDay(after.visibleStart, fitPeriodStart(new Date(), DAYS_PER_PERIOD)),
   );
+});
+
+// ── Strip tracks ────────────────────────────────────────────────────────
+// The offset reaches the DOM as a `transform` written straight to each of the
+// three registered tracks. It is deliberately not an inherited custom property
+// on the scroller: a variable there invalidated style for the whole calendar
+// subtree — every column, chip and hour line — on every touchmove and tween
+// frame, which is what made horizontal swipes lag.
+
+test('useCalendarStrip: every day track carries the same offset', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const parked = readStripX(scroller!);
+  assert.ok(parked > 0, 'init park should have moved the tracks');
+
+  await act(async () => {
+    strip.scrollStripBy(53);
+  });
+
+  const tracks = [
+    ...scroller!.querySelectorAll<HTMLElement>('[data-strip-track]'),
+  ];
+  assert.equal(tracks.length, 3, 'headers, all-day and hours are registered');
+  assert.deepEqual(
+    tracks.map(trackOffset),
+    [parked + 53, parked + 53, parked + 53],
+    'one write, one offset: the bands move together',
+  );
+});
+
+test('useCalendarStrip: a track registered after a move lands on the current offset', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  const parked = readStripX(scroller!);
+  assert.ok(parked > 0, 'init park should have moved the tracks');
+
+  // A track that mounts (or remounts on a period change) must not paint at 0
+  // while the other bands sit at the strip's position.
+  const late = document.createElement('div');
+  const detach = strip.stripTrackRef(late);
+  assert.equal(trackOffset(late), parked, 'attach applies the current offset');
+
+  await act(async () => {
+    strip.scrollStripBy(40);
+  });
+  assert.equal(trackOffset(late), parked + 40, 'later writes reach it too');
+
+  // React 19 detach: the cleanup unregisters the element.
+  assert.equal(typeof detach, 'function');
+  if (typeof detach === 'function') detach();
+  await act(async () => {
+    strip.scrollStripBy(40);
+  });
+  assert.equal(
+    trackOffset(late),
+    parked + 40,
+    'a detached track is no longer written',
+  );
+});
+
+test('useCalendarStrip: the scroller carries no strip custom property', async () => {
+  const strip = await mountParkedStrip();
+  const scroller = strip.scrollerRef.current;
+  assert.ok(scroller);
+  assert.ok(readStripX(scroller!) > 0, 'the strip must have moved');
+
+  const inlineProps = (el: HTMLElement): string[] =>
+    Array.from({ length: el.style.length }, (_, i) => el.style.item(i));
+  assert.deepEqual(
+    inlineProps(scroller!).filter((name) => name.startsWith('--')),
+    [],
+    'the scroller must not carry an inline custom property',
+  );
+  for (const el of scroller!.querySelectorAll<HTMLElement>('*')) {
+    assert.equal(
+      el.style.getPropertyValue('--strip-x'),
+      '',
+      'the offset may not travel through an inherited variable',
+    );
+  }
 });
 
 // ── iOS vertical pan (regression) ───────────────────────────────────────

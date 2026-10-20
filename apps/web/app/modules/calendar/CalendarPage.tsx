@@ -200,6 +200,7 @@ export function CalendarPage() {
         <CalendarWeekGrid
           gridColumnRef={strip.gridColumnRef}
           scrollerRef={strip.scrollerRef}
+          stripTrackRef={strip.stripTrackRef}
           colW={strip.colW}
           gutterW={strip.gutterW}
           trackWidth={strip.trackWidth}
