@@ -86,7 +86,7 @@ export function AllDayRow({
     >
       {/* Gutter label — fixed: the day track scrolls under its right edge */}
       <div
-        className="shrink-0 flex items-start justify-end pr-1.5 pt-1 border-r border-border/60 bg-cream"
+        className="relative shrink-0 z-30 flex items-start justify-end pr-1.5 pt-1 border-r border-border/60 bg-cream"
         style={{ width: gutterWidth }}
       >
         <span className="text-[10px] leading-none text-muted-foreground select-none">

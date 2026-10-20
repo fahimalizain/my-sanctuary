@@ -148,7 +148,7 @@ export function CalendarWeekGrid({
             style={{ height: COL_HEADER_H }}
           >
             <div
-              className="shrink-0 flex items-center justify-center border-r border-border/60 bg-cream"
+              className="relative shrink-0 z-40 flex items-center justify-center border-r border-border/60 bg-cream"
               style={{ width: gutterW }}
               aria-hidden
             >
@@ -229,7 +229,7 @@ export function CalendarWeekGrid({
           >
             {/* Time gutter — fixed: nothing scrolls sideways under it */}
             <div
-              className="shrink-0 z-30 border-r border-border/60 bg-cream"
+              className="relative shrink-0 z-30 border-r border-border/60 bg-cream"
               style={{ width: gutterW, height: totalHoursH }}
             >
               <GutterTimes

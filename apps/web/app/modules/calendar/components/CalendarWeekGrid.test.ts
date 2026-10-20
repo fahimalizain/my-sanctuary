@@ -167,3 +167,34 @@ test('CalendarWeekGrid: all three day tracks are clipped and share one offset', 
     days.length,
   );
 });
+
+test('CalendarWeekGrid: the hours gutter is the positioning context for its labels', () => {
+  const { scroller } = mountGrid();
+
+  // Column → translated hours track → clipping viewport → hours band.
+  const firstCol = scroller.querySelector('[data-day-col]');
+  assert.ok(firstCol, 'the hours track should render day columns');
+  const hoursBand = firstCol!.parentElement?.parentElement?.parentElement;
+  assert.ok(
+    hoursBand,
+    'the hours track sits in a viewport inside the hours band',
+  );
+  const gutter = hoursBand!.firstElementChild as HTMLElement | null;
+  assert.ok(gutter, 'the hours band starts with the time gutter');
+  assert.equal(gutter!.style.width, `${GUTTER_W}px`);
+
+  // GutterTimes places its hour labels and pills with `absolute right-*`. They
+  // resolve against the nearest positioned ancestor: without `relative` here
+  // that is the hours row, so the labels pin to the far right of the last day.
+  assert.ok(
+    gutter!.className.includes('relative'),
+    'the hours gutter must be a positioned element',
+  );
+  const label = gutter!.querySelector('.absolute');
+  assert.ok(label, 'the absolutely positioned hour labels live in the gutter');
+  assert.match(
+    gutter!.textContent ?? '',
+    /6AM/,
+    'the gutter still renders its hour labels',
+  );
+});
