@@ -59,25 +59,34 @@
 //!   consulted either.
 //! - Every timer Google write snaps to the nearest minute: `start_task`
 //!   creates at `T … T + START_EVENT_MINUTES` (15, independent of
-//!   `duration_minutes`), and all exit verbs
-//!   (`stop_task`/`pause_task`/`complete_task`/`discard_task`) PATCH the
-//!   event's end to snapped `T` (`start + 60s` when `T <= start`, keeping the
-//!   event valid).
+//!   `duration_minutes`), and every exit that closes a **living** timer
+//!   (`stop_task`/`pause_task`, and `complete_task`/`discard_task` only while
+//!   the task is still `IN_PROGRESS`) PATCHes the event's end to snapped `T`
+//!   (`start + 60s` when `T <= start`, keeping the event valid).
+//!   Complete/discard on any other status writes the terminal status and log
+//!   only — a run already closed by stop/pause keeps its end.
 //! - Exit verbs resolve the event to PATCH through the task's **latest
 //!   `started` log** (`calendar_id` + `google_event_id`) — never through the
-//!   running-event window — so a run whose event end already passed still
-//!   closes. Missing log / empty ids / Google 404 → today's idempotent
-//!   status-only flip: OPEN (stop) or PLANNED (pause), terminal status for
-//!   complete/discard.
+//!   running-event window — so an IN_PROGRESS run whose event end already
+//!   passed still closes. Missing log / empty ids / Google 404 → today's
+//!   idempotent status-only flip: OPEN (stop) or PLANNED (pause), terminal
+//!   status for complete/discard.
 //! - Raw timer verbs rank on a **real status transition only** (ADR 0002 §
 //!   Timer verb landings): `/stop` appends OPEN (`max + 1` over the
 //!   mover-excluded living OPEN pile), `/pause` prepends PLANNED, and
 //!   `/complete`/`/discard` prepend their terminal pile. Already in the
 //!   landing status → no re-rank (stop/pause still log; complete/discard
 //!   are the idempotent 200 no-op). `start_task` never ranks.
-//! - `complete_task`/`discard_task` auto-stop a running event first (a
-//!   `stopped` log precedes the terminal log), then set the terminal status.
-//!   Repeating the same terminal action is an idempotent 200 no-op.
+//! - `complete_task`/`discard_task` PATCH the latest started event only while
+//!   the task is still `IN_PROGRESS` (the `stopped` log then precedes the
+//!   terminal log), then set the terminal status. Any other pre-status —
+//!   `OPEN`, `PLANNED`, or terminal → terminal — is status + terminal log
+//!   only: no Google write, no `stopped` log, and no focus clear. **Status is
+//!   the lock**: a living timer exists only while the task is IN_PROGRESS, so
+//!   a leftover event window in the cache never triggers a write.
+//!   `complete_or_discard` is the one implementation — `/complete`,
+//!   `/discard`, and `/move` into a terminal status all run it. Repeating the
+//!   same terminal action is an idempotent 200 no-op.
 //! - **Nothing is terminal** (ADR 0002): start on COMPLETED/DISCARDED is
 //!   allowed — a NEW calendar event opens and history stays. Stop/pause on a
 //!   COMPLETED/DISCARDED task stay invalid as verbs; reopen is the path back.
@@ -1521,9 +1530,11 @@ pub async fn pause_task(
     .await
 }
 
-/// Completes a task: auto-stops a running event first (a `stopped` log
-/// precedes the `completed` log), then sets COMPLETED. Already COMPLETED is
-/// an idempotent 200 no-op.
+/// Completes a task: while the task is still IN_PROGRESS its latest started
+/// event is PATCHed shut first (a `stopped` log precedes the `completed`
+/// log), then the status lands COMPLETED. From any other status this is the
+/// terminal status + log only — an already-closed run keeps its end. Already
+/// COMPLETED is an idempotent 200 no-op.
 ///
 /// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
 /// **prepends Done** (rank 0 — peers shift up). Already COMPLETED → no re-rank.
@@ -1546,15 +1557,18 @@ pub async fn complete_task(
     agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
-        http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-        user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, true, agenda_repo,
+        Some(http), calendars, events, operations, category_repo, task_repo, logs, users,
+        Some(access), user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED,
+        true, agenda_repo,
     )
     .await
 }
 
-/// Discards a task: auto-stops a running event first (a `stopped` log
-/// precedes the `discarded` log), then sets DISCARDED. Already DISCARDED is
-/// an idempotent 200 no-op.
+/// Discards a task: while the task is still IN_PROGRESS its latest started
+/// event is PATCHed shut first (a `stopped` log precedes the `discarded`
+/// log), then the status lands DISCARDED. From any other status this is the
+/// terminal status + log only — an already-closed run keeps its end. Already
+/// DISCARDED is an idempotent 200 no-op.
 ///
 /// Ranking (ADR 0002 § Timer verb landings): on a real transition the task
 /// **prepends Discarded** (rank 0 — peers shift up). Already DISCARDED → no
@@ -1578,8 +1592,9 @@ pub async fn discard_task(
     agenda_repo: &dyn AgendaItemRepo,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
-        http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-        user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, true, agenda_repo,
+        Some(http), calendars, events, operations, category_repo, task_repo, logs, users,
+        Some(access), user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED,
+        true, agenda_repo,
     )
     .await
 }
@@ -1739,14 +1754,25 @@ async fn stop_or_pause(
     })
 }
 
-/// Shared complete/discard machinery (see [`complete_task`]).
+/// The only complete/discard implementation (see [`complete_task`]) — the raw
+/// `/complete` and `/discard` endpoints and `/move` into a terminal status
+/// all run through here.
+///
+/// **Status is the lock.** The auto-stop — PATCH the event the task's latest
+/// `started` log names to snapped now, then the focus exit, then a `stopped`
+/// log — runs only while `task.status == IN_PROGRESS`, the one state that
+/// owns a living timer. Every other pre-status (OPEN/PLANNED, and terminal →
+/// terminal) writes the terminal status + log only: no Google write, no
+/// `stopped` log, and no focus clear (focus is IN_PROGRESS-only, and `/move`'s
+/// idle path never cleared the pointer either). `http`/`access` are `Option`
+/// for that reason: [`require_google`] fires on the IN_PROGRESS branch alone,
+/// so an idle `/move` can pass `None`/`None`.
 ///
 /// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
 /// from the raw endpoints — on a real transition the task prepends its
 /// terminal pile (rank 0, peers shift up); already in the target status the
 /// idempotent no-op above returns the row unchanged. `false` from
-/// [`dispatch_matrix_action`] / [`terminal_transition`] — `/move` places
-/// exactly once afterwards.
+/// [`dispatch_matrix_action`] — `/move` places exactly once afterwards.
 ///
 /// Agenda (ADR 0004 amendment): the idempotent no-op returns above, so a
 /// status write here is always a **real** transition — its single agenda row
@@ -1758,7 +1784,7 @@ async fn stop_or_pause(
 /// A placement failure is swallowed — the status, the log, and the rank are
 /// already committed.
 async fn complete_or_discard(
-    http: &dyn HttpClient,
+    http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
     events: &dyn CalendarEventRepo,
     operations: &dyn CalendarEventOperationRepo,
@@ -1766,7 +1792,7 @@ async fn complete_or_discard(
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
     users: &dyn UserRepo,
-    access: &GoogleAccess,
+    access: Option<&GoogleAccess>,
     user_id: &str,
     task_id: &str,
     now_unix: i64,
@@ -1792,60 +1818,71 @@ async fn complete_or_discard(
     }
 
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
-    // Exiting the focused task is a focus exit (task-focus, slice 3): the
-    // auto-stop snap below already closes the newest focus segment — log
-    // `unfocused` with the snap's ids before the `stopped` log, and clear the
-    // pointer. No new event opens (only the focus verbs open continuations).
-    let user = users.get_by_id(user_id).await?;
-    let is_focused = user.as_ref().and_then(|u| u.focused_task_id.as_deref()) == Some(task_id);
+    // Status is the lock: only an IN_PROGRESS task owns a living timer, so
+    // only that branch touches Google — PATCH the latest started event (even
+    // when its cached end already lapsed), log the focus exit, then the
+    // `stopped` row. Anything else (OPEN/PLANNED, terminal → terminal) writes
+    // the status + terminal log only: yesterday's closed event keeps its end.
+    let patched = if task.status == TASK_STATUS_IN_PROGRESS {
+        let (http, access) = require_google(http, access)?;
+        // Exiting the focused task is a focus exit (task-focus, slice 3): the
+        // auto-stop snap below already closes the newest focus segment — log
+        // `unfocused` with the snap's ids before the `stopped` log, and clear
+        // the pointer. No new event opens (only the focus verbs open
+        // continuations).
+        let user = users.get_by_id(user_id).await?;
+        let is_focused =
+            user.as_ref().and_then(|u| u.focused_task_id.as_deref()) == Some(task_id);
 
-    // Auto-stop: a running event is closed first, and that close is logged
-    // (`stopped`) before the terminal log.
-    let (patched, at, calendar_id, google_event_id) = stop_running_event(
-        http,
-        calendars,
-        events,
-        operations,
-        logs,
-        access,
-        task_id,
-        now_unix,
-        category_repo,
-    )
-    .await?;
-    if is_focused {
+        let (patched, at, calendar_id, google_event_id) = stop_running_event(
+            http,
+            calendars,
+            events,
+            operations,
+            logs,
+            access,
+            task_id,
+            now_unix,
+            category_repo,
+        )
+        .await?;
+        if is_focused {
+            if let Some(_event) = &patched {
+                logs.insert(
+                    NewTaskLog {
+                        task_id: task_id.to_string(),
+                        user_id: user_id.to_string(),
+                        r#type: TASK_LOG_UNFOCUSED.to_string(),
+                        at: at.clone(),
+                        calendar_id: calendar_id.clone(),
+                        google_event_id: google_event_id.clone(),
+                    },
+                    &now_rfc3339,
+                )
+                .await?;
+            }
+            users
+                .set_focused_task_id(user_id, None, &now_rfc3339)
+                .await?;
+        }
         if let Some(_event) = &patched {
             logs.insert(
                 NewTaskLog {
                     task_id: task_id.to_string(),
                     user_id: user_id.to_string(),
-                    r#type: TASK_LOG_UNFOCUSED.to_string(),
-                    at: at.clone(),
-                    calendar_id: calendar_id.clone(),
-                    google_event_id: google_event_id.clone(),
+                    r#type: TASK_LOG_STOPPED.to_string(),
+                    at,
+                    calendar_id,
+                    google_event_id,
                 },
                 &now_rfc3339,
             )
             .await?;
         }
-        users
-            .set_focused_task_id(user_id, None, &now_rfc3339)
-            .await?;
-    }
-    if let Some(_event) = &patched {
-        logs.insert(
-            NewTaskLog {
-                task_id: task_id.to_string(),
-                user_id: user_id.to_string(),
-                r#type: TASK_LOG_STOPPED.to_string(),
-                at,
-                calendar_id,
-                google_event_id,
-            },
-            &now_rfc3339,
-        )
-        .await?;
-    }
+        patched
+    } else {
+        None
+    };
 
     let Some(updated) = task_repo
         .set_status(task_id, target_status, &now_rfc3339)
@@ -2175,8 +2212,10 @@ fn require_google<'a>(
 /// transitions). Reuses the existing timer machinery — start, and the exit
 /// verbs as the INNER unplaced helpers (see [`stop_or_pause`] /
 /// [`complete_or_discard`], `place: false`) — so the Google writes stay in
-/// one place while `/move` still places exactly once; plan/unplan/reopen and
-/// idle complete/discard are pure local transitions + audit logs.
+/// one place while `/move` still places exactly once. Plan/unplan/reopen are
+/// pure local transitions + audit logs; complete/discard go through
+/// [`complete_or_discard`] as well, which PATCHes only while the task is
+/// still IN_PROGRESS — an idle move therefore passes `None`/`None`.
 ///
 /// `http`/`access` are only consumed by the Google-touching arms; the
 /// session-only arms work with both `None` (see [`require_google`]).
@@ -2230,26 +2269,6 @@ async fn dispatch_matrix_action(
             stop_or_pause(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
-                agenda_repo,
-            )
-            .await
-            .map(|response| response.event)
-        }
-        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED) => {
-            let (http, access) = require_google(http, access)?;
-            complete_or_discard(
-                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-                user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
-                agenda_repo,
-            )
-            .await
-            .map(|response| response.event)
-        }
-        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_DISCARDED) => {
-            let (http, access) = require_google(http, access)?;
-            complete_or_discard(
-                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-                user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
                 agenda_repo,
             )
             .await
@@ -2313,20 +2332,26 @@ async fn dispatch_matrix_action(
             }
             Ok(None)
         }
-        // complete / discard from any non-running status: no Google writes.
+        // complete / discard from any non-target status: `complete_or_discard`
+        // PATCHes only while the task is IN_PROGRESS (see its doc); idle and
+        // terminal → terminal legs are status + terminal log only.
         (_, TASK_STATUS_COMPLETED) => {
-            terminal_transition(
+            complete_or_discard(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-                user_id, task_id, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, now_unix, agenda_repo,
+                user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
+                agenda_repo,
             )
             .await
+            .map(|response| response.event)
         }
         (_, TASK_STATUS_DISCARDED) => {
-            terminal_transition(
+            complete_or_discard(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-                user_id, task_id, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, now_unix, agenda_repo,
+                user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
+                agenda_repo,
             )
             .await
+            .map(|response| response.event)
         }
         // The matrix's same-status cells are no-ops/reorders, and reorders
         // are handled by the caller — this defensive fallback is unreachable
@@ -2341,7 +2366,7 @@ async fn dispatch_matrix_action(
 }
 
 /// A pure local status flip + audit log (no Google writes) — the
-/// plan/unplan/reopen/idle-complete/discard legs of the matrix.
+/// plan/unplan/reopen legs of the matrix.
 async fn local_transition(
     task_repo: &dyn TaskRepo,
     logs: &dyn TaskLogRepo,
@@ -2369,87 +2394,6 @@ async fn local_transition(
     )
     .await?;
     Ok(())
-}
-
-/// Complete/discard from a status other than IN_PROGRESS: no Google writes
-/// (set status + terminal log only — idle complete/discard stay local).
-///
-/// Status is the lock: only a task whose **status** is IN_PROGRESS has a
-/// living timer, so a leftover event window in the cache never triggers a
-/// Google auto-stop here. (The matrix already routes true IN_PROGRESS →
-/// COMPLETED/DISCARDED to the inner unplaced [`complete_or_discard`]; this
-/// arm is a backstop only — it never places, `/move` owns the rank.)
-///
-/// Agenda (ADR 0004 amendment): both branches are real complete/discard
-/// transitions. The IN_PROGRESS branch delegates to
-/// [`complete_or_discard`], which places the row itself; the local branch
-/// places only when the loaded status was `OPEN`/`PLANNED` — a terminal →
-/// terminal move (`COMPLETED` → `DISCARDED`, or the reverse) is a real status
-/// change but must not pull the old history row onto today.
-async fn terminal_transition(
-    http: Option<&dyn HttpClient>,
-    calendars: &dyn CalendarRepo,
-    events: &dyn CalendarEventRepo,
-    operations: &dyn CalendarEventOperationRepo,
-    category_repo: &dyn TaskCategoryRepo,
-    task_repo: &dyn TaskRepo,
-    logs: &dyn TaskLogRepo,
-    users: &dyn UserRepo,
-    access: Option<&GoogleAccess>,
-    user_id: &str,
-    task_id: &str,
-    target_status: &str,
-    log_type: &str,
-    now_unix: i64,
-    agenda_repo: &dyn AgendaItemRepo,
-) -> Result<Option<CalendarEvent>, TasksError> {
-    // Status is the lock: a non-IN_PROGRESS row has no living timer, even if
-    // a stale event window lingers in the cache — no Google writes.
-    let Some(task) = task_repo.get_by_id(task_id).await? else {
-        return Err(TasksError::NotFound);
-    };
-    if task.status == TASK_STATUS_IN_PROGRESS {
-        let (http, access) = require_google(http, access)?;
-        // The INNER unplaced helper (see [`complete_or_discard`]): the verb
-        // landing belongs to the raw endpoints only — `/move` places once.
-        let response = complete_or_discard(
-            http,
-            calendars,
-            events,
-            operations,
-            category_repo,
-            task_repo,
-            logs,
-            users,
-            access,
-            user_id,
-            task_id,
-            now_unix,
-            target_status,
-            log_type,
-            false,
-            agenda_repo,
-        )
-        .await?;
-        return Ok(response.event);
-    }
-    local_transition(task_repo, logs, user_id, task_id, target_status, log_type, now_unix).await?;
-    // The local branch is still a real complete/discard when it starts from a
-    // living status: put the one agenda row on civil today (the helper no-ops
-    // when it is already there). Terminal → terminal is excluded — that move
-    // must leave the history row where it is — and IN_PROGRESS went through
-    // `complete_or_discard` above, which placed already.
-    if matches!(task.status.as_str(), TASK_STATUS_OPEN | TASK_STATUS_PLANNED) {
-        if let Err(_) =
-            place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
-        {
-            // Best-effort: the status and the terminal log are committed.
-            // The cron backfills a MISSING OR MISPLACED row; it does not
-            // repair a half-written Google log, so a stale row is the lesser
-            // evil.
-        }
-    }
-    Ok(None)
 }
 
 /// Cross-column (or first-insert-into-a-column) placement: shift the target
@@ -2530,9 +2474,11 @@ async fn reorder_in_place(
 /// conflicts.
 ///
 /// `http`/`access` are `Option` because status-only moves (plan/unplan/
-/// reopen/reorder/idle complete/discard) never touch Google; the worker
-/// passes both only when its `needs_google` gate fires (target IN_PROGRESS,
-/// or leaving IN_PROGRESS).
+/// reopen/reorder and complete/discard of an idle task) never touch Google;
+/// the worker passes both only when its `needs_google` gate fires (target
+/// IN_PROGRESS, or leaving IN_PROGRESS). An idle complete/discard still runs
+/// through [`complete_or_discard`], which demands Google access only on its
+/// IN_PROGRESS branch.
 ///
 /// Validation: unknown `status` → 400; negative `sort_order` → 400 (`None`
 /// is not negative); missing/other-user/soft-deleted task → 404.
@@ -2540,10 +2486,9 @@ async fn reorder_in_place(
 /// Agenda (ADR 0007): real lifecycle transitions move the task's single
 /// agenda row according to the **landing status**. A real start, plan
 /// (`OPEN` → `PLANNED`), reopen → `PLANNED`, and a move into a terminal
-/// status from a living one (via
-/// [`complete_or_discard`]/[`terminal_transition`]) put that row on civil
-/// today; unplan (`PLANNED` → `OPEN`), a stop (`IN_PROGRESS` → `OPEN`), and
-/// reopen → `OPEN` put it on the backlog date (today+50y). Pause, reorder,
+/// status from a living one (via [`complete_or_discard`]) put that row on
+/// civil today; unplan (`PLANNED` → `OPEN`), a stop (`IN_PROGRESS` → `OPEN`),
+/// and reopen → `OPEN` put it on the backlog date (today+50y). Pause, reorder,
 /// the terminal → IN_PROGRESS start arm, and terminal → terminal moves never
 /// place.
 pub async fn move_task(
@@ -7523,6 +7468,128 @@ mod tests {
         assert_eq!(inserted[1].google_event_id.as_deref(), Some("g-1"));
     }
 
+    /// The cached `end_time` of the event Google named `google_event_id`
+    /// (`g-1` for every timer start) — the regression checks below read it to
+    /// prove a closed run was not rewritten.
+    fn stored_end(events: &FakeEventRepo, google_event_id: &str) -> String {
+        events
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| event.google_event_id == google_event_id)
+            .map(|event| event.end_time.clone())
+            .expect("event cached")
+    }
+
+    #[test]
+    fn complete_after_closed_run_does_not_rewrite_event() {
+        // Status is the lock: work yesterday, stop it (the event's end is
+        // correct), then complete today — the closed event keeps yesterday's
+        // end instead of being PATCHed to today's now.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
+        drop(_start_http);
+
+        // Stop 10 minutes later (22:23:20 → snapped 22:23:00).
+        let stop_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
+        )]);
+        let users = FakeUserRepo::default();
+        pollster::block_on(stop_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, stop_unix, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(
+            stored_end(&events, "g-1"),
+            "2023-11-14T22:23:00Z",
+            "the stop closed yesterday's event"
+        );
+
+        // Complete a day later. The scripted patch route turns a regression
+        // into an assertion failure rather than only an unscripted-URL panic.
+        let complete_unix = NOW_UNIX + 86_400;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T23:13:00Z"),
+        )]);
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, complete_unix, &agenda,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert!(response.event.is_none(), "no Google write for a closed run");
+        assert!(
+            http.patches.lock().unwrap().is_empty(),
+            "complete must not PATCH a stopped run"
+        );
+        assert_eq!(
+            stored_end(&events, "g-1"),
+            "2023-11-14T22:23:00Z",
+            "the closed event keeps its stop end"
+        );
+        // Log order: started, stopped (the yesterday stop), completed — no
+        // second `stopped` from the complete.
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "stopped", "completed"], "{inserted:?}");
+    }
+
+    #[test]
+    fn complete_lapsed_in_progress_window_still_patches() {
+        // An IN_PROGRESS task owns a living timer even when its cached event
+        // window already lapsed: complete PATCHes via the latest `started`
+        // log exactly like stop does.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
+        drop(_start_http);
+
+        // Expire the cached window: the event ended 10 minutes ago.
+        {
+            let mut stored = events.stored.lock().unwrap();
+            let event = stored.iter_mut().find(|row| row.task_id == task.id).unwrap();
+            event.end_time = "2023-11-14T22:03:00Z".to_string();
+        }
+
+        // Complete at 22:13:20: snapped T = 22:13:00 == start → end =
+        // start + 60 = 22:14:00 — the PATCH happens regardless of the stale
+        // end.
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:14:00Z"),
+        )]);
+        let users = FakeUserRepo::default();
+        let response = pollster::block_on(complete_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert_eq!(response.event.unwrap().end_time, "2023-11-14T22:14:00Z");
+        let patches = http.patches.lock().unwrap();
+        assert_eq!(patches.len(), 1, "lapsed IN_PROGRESS window still closes");
+        let (_, body) = patches.first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["end"]["dateTime"], "2023-11-14T22:14:00Z");
+        drop(patches);
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "stopped", "completed"], "{inserted:?}");
+    }
+
     #[test]
     fn complete_while_not_running_completes_without_google_call() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
@@ -7670,6 +7737,63 @@ mod tests {
         let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
         assert_eq!(types, vec!["started", "stopped", "discarded"]);
         assert_eq!(http.patches.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discard_after_closed_run_does_not_rewrite_event() {
+        // Same lock as complete: a paused run is already closed, so a discard
+        // the next day writes the terminal status + log only.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
+        drop(_start_http);
+
+        // Pause 10 minutes later (22:23:20 → snapped 22:23:00).
+        let pause_unix = NOW_UNIX + 600;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:23:00Z"),
+        )]);
+        let users = FakeUserRepo::default();
+        pollster::block_on(pause_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, pause_unix, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(
+            stored_end(&events, "g-1"),
+            "2023-11-14T22:23:00Z",
+            "the pause closed yesterday's event"
+        );
+
+        let discard_unix = NOW_UNIX + 86_400;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T23:13:00Z"),
+        )]);
+        let response = pollster::block_on(discard_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, discard_unix, &agenda,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
+        assert!(response.event.is_none(), "no Google write for a closed run");
+        assert!(
+            http.patches.lock().unwrap().is_empty(),
+            "discard must not PATCH a paused run"
+        );
+        assert_eq!(
+            stored_end(&events, "g-1"),
+            "2023-11-14T22:23:00Z",
+            "the closed event keeps its pause end"
+        );
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "paused", "discarded"], "{inserted:?}");
     }
 
     #[test]
@@ -9214,6 +9338,173 @@ mod tests {
         assert!(response.event.is_some(), "stop leg returns the patched event");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_STOPPED, "{inserted:?}");
+    }
+
+    #[test]
+    fn move_open_to_completed_after_closed_run_does_not_patch() {
+        // `/move` into Done uses the same `complete_or_discard`: a run already
+        // closed by stop keeps its end, and the move still places.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
+        drop(_start_http);
+
+        // Stop 5 minutes later (22:18:20 → snapped 22:18:00).
+        let stop_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+        )]);
+        let users = FakeUserRepo::default();
+        pollster::block_on(stop_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &task.id, stop_unix, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(
+            stored_end(&events, "g-1"),
+            "2023-11-14T22:18:00Z",
+            "the stop closed the event"
+        );
+
+        // The idle move the next day: a scripted patch route turns a
+        // regression into an assertion failure, not only an unscripted panic.
+        let complete_unix = NOW_UNIX + 86_400;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T23:13:00Z"),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events, &ops(),
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            &users,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            complete_unix,
+            &MoveTaskInput {
+                status: TASK_STATUS_COMPLETED.to_string(),
+                sort_order: Some(0),
+            }, &agenda,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert!(response.event.is_none(), "idle move touches no Google event");
+        assert!(
+            http.patches.lock().unwrap().is_empty(),
+            "idle move must not PATCH a stopped run"
+        );
+        assert_eq!(
+            stored_end(&events, "g-1"),
+            "2023-11-14T22:18:00Z",
+            "the closed event keeps its stop end"
+        );
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "stopped", "completed"], "{inserted:?}");
+
+        // A second, independently-closed run: the idle move must not call
+        // `require_google`, so `http` is Some and `access` is None.
+        let second = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &second.id);
+        drop(_start_http);
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&second.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+        )]);
+        pollster::block_on(stop_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &second.id, stop_unix, &agenda,
+        ))
+        .unwrap();
+
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&second.id, NOW_SNAPPED, "2023-11-14T23:13:00Z"),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events, &ops(),
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            &users,
+            None,
+            "u-1",
+            &second.id,
+            complete_unix,
+            &MoveTaskInput {
+                status: TASK_STATUS_COMPLETED.to_string(),
+                sort_order: Some(0),
+            }, &agenda,
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        assert!(response.event.is_none());
+        assert!(
+            http.patches.lock().unwrap().is_empty(),
+            "an idle move with no access still completes without Google"
+        );
+    }
+
+    #[test]
+    fn move_in_progress_to_completed_still_patches() {
+        // The IN_PROGRESS branch is unchanged: the living event closes, the
+        // `stopped` log precedes `completed`, and the move still places.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = work_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
+        drop(_start_http);
+
+        let complete_unix = NOW_UNIX + 300;
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:18:00Z"),
+        )]);
+        let users = FakeUserRepo::default();
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events, &ops(),
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            &users,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            complete_unix,
+            &MoveTaskInput {
+                status: TASK_STATUS_COMPLETED.to_string(),
+                sort_order: Some(0),
+            }, &agenda,
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
+        let event = response.event.expect("IN_PROGRESS → COMPLETED still PATCHes");
+        assert_eq!(event.end_time, "2023-11-14T22:18:00Z", "PATCH end snaps");
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "the exit patches once");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "stopped", "completed"], "{inserted:?}");
     }
 
     #[test]
