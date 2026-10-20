@@ -340,7 +340,7 @@ test('shiftWindowStart: period 3 → ±3 days', () => {
 
 // ── Strip lock ownership ────────────────────────────────────────────────
 
-test('stripRebaseSuppressed: every lock owner writes scrollLeft, so none rebases', () => {
+test('stripRebaseSuppressed: every lock owner moves the strip, so none rebases', () => {
   for (const reason of ['drag', 'pinch', 'swipe', 'wheel'] as const) {
     assert.equal(
       stripRebaseSuppressed(new Set<StripLockReason>([reason])),

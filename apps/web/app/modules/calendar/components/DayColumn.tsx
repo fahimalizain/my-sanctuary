@@ -112,7 +112,6 @@ export const DayColumn = memo(function DayColumn({
 export interface TimedPreviewLayerProps {
   days: Date[];
   colW: number;
-  gutterW: number;
   trackWidth: number;
   totalHoursH: number;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
@@ -122,13 +121,13 @@ export interface TimedPreviewLayerProps {
 }
 
 /**
- * Single sibling overlay for drag ghosts. Isolated so DayColumn memo is not
- * busted when preview geometry updates on every pointermove.
+ * Single sibling overlay for drag ghosts, inside the translated hours track so
+ * the ghosts move with the columns. Isolated so DayColumn memo is not busted
+ * when preview geometry updates on every pointermove.
  */
 export const TimedPreviewLayer = memo(function TimedPreviewLayer({
   days,
   colW,
-  gutterW,
   trackWidth,
   totalHoursH,
   timedPreviewByDay,
@@ -155,7 +154,7 @@ export const TimedPreviewLayer = memo(function TimedPreviewLayer({
     <div
       className="absolute pointer-events-none z-20"
       style={{
-        left: gutterW,
+        left: 0,
         top: 0,
         width: trackWidth,
         height: totalHoursH,
@@ -182,8 +181,8 @@ export const TimedPreviewLayer = memo(function TimedPreviewLayer({
               title={previewTitle}
               label={day === labelDay ? label : null}
             />
-            {/* No second label beside the ghost: the gutter is sticky, so its
-                pills stay clear of the pointer for mouse and touch alike. */}
+            {/* No second label beside the ghost: the gutter does not move, so
+                its pills stay clear of the pointer for mouse and touch alike. */}
           </div>
         );
       })}
