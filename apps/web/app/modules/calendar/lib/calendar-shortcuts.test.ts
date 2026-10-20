@@ -99,21 +99,21 @@ test('resolveCalendarShortcut: c and Shift+c create a draft', () => {
   assert.deepEqual(resolve('C', { shiftKey: true }), { type: 'create' });
 });
 
-test('resolveCalendarShortcut: Backspace and Delete request the delete dialog', () => {
+test('resolveCalendarShortcut: Backspace and Delete request a deferred delete', () => {
   for (const key of ['Backspace', 'Delete']) {
     assert.deepEqual(resolve(key), { type: 'requestDelete' }, `key ${key}`);
   }
 });
 
 test('resolveCalendarShortcut: holding create or delete does not repeat', () => {
-  // A held key must not open a stack of drafts or dialogs.
+  // A held key must not open a stack of drafts or deletes.
   for (const key of ['c', 'C', 'Backspace', 'Delete']) {
     assert.equal(resolve(key, { repeat: true }), null, `key ${key}`);
   }
 });
 
 test('resolveCalendarShortcut: delete chords are never ours', () => {
-  // Cmd/Ctrl/Alt+Backspace stays a browser/OS delete, not our dialog.
+  // Cmd/Ctrl/Alt+Backspace stays a browser/OS delete, not ours.
   assert.equal(resolve('Backspace', { metaKey: true }), null);
   assert.equal(resolve('Backspace', { ctrlKey: true }), null);
   assert.equal(resolve('Backspace', { altKey: true }), null);

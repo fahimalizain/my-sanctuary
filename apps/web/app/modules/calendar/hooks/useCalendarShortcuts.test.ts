@@ -174,11 +174,11 @@ test('useCalendarShortcuts: a suspended page ignores shortcuts', () => {
   assert.equal(event.defaultPrevented, false);
 });
 
-test('useCalendarShortcuts: shortcuts resume when the dialog closes', () => {
+test('useCalendarShortcuts: shortcuts resume when suspension ends', () => {
   const { calls, setSuspended } = mountHarness(true);
 
   press('t');
-  assert.deepEqual(calls, [], 'the delete dialog owns the keyboard');
+  assert.deepEqual(calls, [], 'a suspended page ignores keys');
 
   setSuspended(false);
   press('t');
