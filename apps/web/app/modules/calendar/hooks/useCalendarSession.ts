@@ -41,6 +41,17 @@ import { isPersistableDraftTitle } from '../lib/event-draft';
 import { DESKTOP_MQ } from '../lib/inspector-anchor';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
 import { buildDraftFlushPatch } from '../lib/event-patch-queue';
+import {
+  DELETE_UNDO_MS,
+  commitPendingDelete,
+  noteCreateFailed,
+  noteCreateSucceeded,
+  pendingDeleteTitle,
+  requestPendingDelete,
+  undoPendingDelete,
+  type CommitEffect,
+  type PendingDeleteState,
+} from '../lib/pending-delete';
 import { setPatchWriteErrorListener } from '../lib/patch-write-error';
 import { repairCalendar } from '@/lib/api/calendar';
 import {
@@ -193,6 +204,108 @@ export function useCalendarSession({
     return () => setPatchWriteErrorListener(null);
   }, [reportWriteError]);
 
+  // Deferred delete: the event leaves the grid now, the DELETE waits out the
+  // undo toast. The record also lives in a ref so the timer, Undo and a
+  // create POST returning mid-grace all read one synchronous state; the React
+  // copy only drives the toast.
+  const [pendingDelete, setPendingDelete] = useState<PendingDeleteState>(null);
+  const pendingDeleteRef = useRef<PendingDeleteState>(null);
+  const deleteTimerRef = useRef<number | null>(null);
+
+  // Mutation and queue identities change on every render / overlay bump, so
+  // the stable handlers below read them through refs.
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const deleteEventRef = useRef(deleteEvent);
+  deleteEventRef.current = deleteEvent;
+
+  const clearDeleteTimer = useCallback(() => {
+    if (deleteTimerRef.current === null) return;
+    window.clearTimeout(deleteTimerRef.current);
+    deleteTimerRef.current = null;
+  }, []);
+
+  /** Apply the machine's commit instruction. Never touches React state. */
+  const runCommitEffect = useCallback(
+    async (effect: CommitEffect) => {
+      if (effect.kind === 'none') return;
+
+      if (effect.kind === 'clear-temp-overlay') {
+        // clear (not remove): a create POST still in flight sees the empty
+        // overlay and DELETEs the row it just made — that is the commit.
+        queueRef.current.clear(effect.id);
+        return;
+      }
+
+      const id = effect.id;
+      // Cancel queued/in-flight PATCHes now, not during the undo window, so a
+      // write that lands in the meantime still refreshes the cached row.
+      queueRef.current.cancelPatch(id);
+      try {
+        await deleteEventRef.current.mutateAsync(id);
+        removeCalendarEventFromCache(id);
+        queueRef.current.clear(id);
+      } catch (err) {
+        // Clear the delete overlay so the event reappears from the server.
+        queueRef.current.clear(id);
+        reportWriteError("Couldn't delete event", err);
+      }
+    },
+    [reportWriteError],
+  );
+
+  const commitDeleteNow = useCallback(() => {
+    clearDeleteTimer();
+    const outcome = commitPendingDelete(pendingDeleteRef.current);
+    if (outcome.effect.kind === 'none') return;
+    pendingDeleteRef.current = outcome.next;
+    setPendingDelete(outcome.next);
+    void runCommitEffect(outcome.effect);
+  }, [clearDeleteTimer, runCommitEffect]);
+
+  const startDeleteTimer = useCallback(() => {
+    clearDeleteTimer();
+    deleteTimerRef.current = window.setTimeout(commitDeleteNow, DELETE_UNDO_MS);
+  }, [clearDeleteTimer, commitDeleteNow]);
+
+  /**
+   * Remove a cut source whose paste succeeded. Shared by the paste path and
+   * Undo of a parked paste, which owes the removal the create would have
+   * done. False means there was nothing left to remove.
+   */
+  const removeCutSource = useCallback(
+    async (cutId: string): Promise<boolean> => {
+      if (isTempEventId(cutId)) return false;
+      // Second paste of the same cut: the first one already started the
+      // delete, so report false rather than claim a second removal.
+      if (cutRemovalsStartedRef.current.has(cutId)) return false;
+      cutRemovalsStartedRef.current.add(cutId);
+
+      queueRef.current.cancelPatch(cutId);
+      queueRef.current.remove(cutId);
+      setSelectedEventId((prev) => {
+        if (prev !== cutId) return prev;
+        setFocusTitleOnOpen(false);
+        return null;
+      });
+
+      try {
+        await deleteEventRef.current.mutateAsync(cutId);
+        removeCalendarEventFromCache(cutId);
+        queueRef.current.clear(cutId);
+      } catch (err) {
+        // Clear the delete overlay so the source reappears from the server.
+        queueRef.current.clear(cutId);
+        cutRemovalsStartedRef.current.delete(cutId);
+        reportWriteError("Couldn't remove the cut event", err);
+        return false;
+      }
+
+      return true;
+    },
+    [reportWriteError],
+  );
+
   const writableCalendar = useMemo(
     () => defaultWritableCalendar(calendars),
     [calendars],
@@ -225,6 +338,134 @@ export function useCalendarSession({
     if (!selectedEvent) return undefined;
     return calendars.find((c) => c.id === selectedEvent.calendar_id);
   }, [calendars, selectedEvent]);
+
+  // The deferred-delete handler re-binds only with the selection (like the old
+  // confirm id), not on every overlay bump; it reads the live event here.
+  const selectedEventRef = useRef<CalendarEvent | null>(null);
+  selectedEventRef.current = selectedEvent;
+
+  /**
+   * Deferred delete for the selection: hide it, close the inspector, and let
+   * the toast's Undo window run. Nothing is sent until the timer fires.
+   */
+  const requestDelete = useCallback(() => {
+    const id = selectedEventId;
+    const event = selectedEventRef.current;
+    if (!id || !event) return;
+
+    clearWriteError();
+
+    const outcome = requestPendingDelete(pendingDeleteRef.current, {
+      id,
+      event,
+      draftId: unpersistedDraftIdRef.current === id ? id : null,
+    });
+    const record = outcome.next;
+    // Same event asked for twice while its toast runs: already hidden.
+    if (outcome.hide === 'none' || !record || record.phase !== 'pending') {
+      return;
+    }
+
+    if (outcome.commitPrevious) {
+      // One toast (and one timer) at a time: the previous grace window ends
+      // now and sends its DELETE before this one starts.
+      pendingDeleteRef.current = outcome.commitPrevious.next;
+      setPendingDelete(outcome.commitPrevious.next);
+      void runCommitEffect(outcome.commitPrevious.effect);
+    }
+
+    pendingDeleteRef.current = record;
+    setPendingDelete(record);
+
+    if (outcome.hide === 'overlay-delete') {
+      // Hide the chip, but leave queued PATCHes alone until commit: one that
+      // lands during grace must still refresh the cached row underneath.
+      queueRef.current.remove(id);
+    } else if (record.draftId) {
+      // Temp chip: paint is suppressed, and its overlay must survive so an
+      // in-flight create's success can ghost-delete after a commit. Forget
+      // the draft id now so later select / close paths cannot queue.clear it
+      // and trigger that DELETE before the toast ends.
+      setDraftId(null);
+    }
+
+    // Close the inspector without closeInspector(): that discards the open
+    // draft, and queue.clear would ghost-delete an in-flight create.
+    setSelectedEventId(null);
+    setFocusTitleOnOpen(false);
+
+    startDeleteTimer();
+  }, [
+    selectedEventId,
+    clearWriteError,
+    runCommitEffect,
+    setDraftId,
+    startDeleteTimer,
+  ]);
+
+  /**
+   * Undo the pending delete. Restores frontend state only — the deleted event
+   * itself was never sent. Resolves with the cut source Undo actually removed
+   * (a parked paste), so the page can clear that cut from the clipboard the
+   * same way a normal paste does; null when no cut was removed.
+   */
+  const undoDelete = useCallback(async (): Promise<string | null> => {
+    const outcome = undoPendingDelete(pendingDeleteRef.current);
+    clearDeleteTimer();
+    if (outcome.restore.kind === 'none') return null;
+
+    const { restore } = outcome;
+    if (
+      restore.kind === 'clear-delete-overlay' ||
+      restore.kind === 'reveal-server'
+    ) {
+      // Drop only the delete overlay we placed (a PATCH that landed during
+      // grace shows through from the cache). unhide-temp needs nothing: its
+      // upsert overlay was never removed.
+      if (queueRef.current.getOverlay(restore.id)?.op === 'delete') {
+        queueRef.current.clear(restore.id);
+      }
+    }
+
+    pendingDeleteRef.current = outcome.next;
+    setPendingDelete(outcome.next);
+
+    if (outcome.draftId) setDraftId(outcome.draftId);
+    if (outcome.selectId) setSelectedEventId(outcome.selectId);
+    setFocusTitleOnOpen(false);
+
+    // A parked paste's cut source is still owed: the create succeeded, so
+    // Undo finishes the removal a normal paste success would have done. Only
+    // a real removal reports the id; a failure leaves it retryable.
+    const cutId = outcome.removeCutSource;
+    if (!cutId) return null;
+    try {
+      return (await removeCutSource(cutId)) ? cutId : null;
+    } catch {
+      return null;
+    }
+  }, [clearDeleteTimer, removeCutSource, setDraftId]);
+
+  // A real unmount commits the pending delete: the toast goes with the page,
+  // and an overlay delete left in the app-wide provider would hide the event
+  // forever with no Undo. Strict mode re-runs the effect, so the microtask
+  // must see the ref still false — a remount sets it true synchronously first.
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      queueMicrotask(() => {
+        if (mountedRef.current) return;
+        clearDeleteTimer();
+        const current = pendingDeleteRef.current;
+        if (!current) return;
+        const outcome = commitPendingDelete(current);
+        pendingDeleteRef.current = outcome.next;
+        void runCommitEffect(outcome.effect);
+      });
+    };
+  }, [clearDeleteTimer, runCommitEffect]);
 
   const discardUnpersistedDraft = useCallback(() => {
     const id = unpersistedDraftIdRef.current;
@@ -311,6 +552,51 @@ export function useCalendarSession({
     draftPersistStartedRef.current.add(tempId);
     clearWriteError();
 
+    // If the user renamed / moved / annotated the temp event before POST
+    // returned, keep those fields under the server id and flush field PATCH
+    // first, then calendar MOVE (cannot combine). Shared by the normal reveal
+    // and by a parked row (hidden until Undo or the timer decides).
+    const flushDraftEdits = (
+      serverEvent: CalendarEvent,
+      local: CalendarEvent,
+    ) => {
+      // The server may have rerouted an untouched draft to the title's
+      // category calendar. Trust that unless the user picked a calendar in
+      // the inspector; a pick must survive create.
+      const calendarId = draftCalendarTouchedRef.current
+        ? local.calendar_id
+        : serverEvent.calendar_id;
+      const flush = buildDraftFlushPatch({
+        posted: {
+          summary: postedSummary,
+          description: postedDescription,
+          start: startIso,
+          end: endIso,
+        },
+        local: { ...local, calendar_id: calendarId },
+        serverCalendarId: serverEvent.calendar_id,
+      });
+
+      if (!flush) return;
+      queue.upsert({
+        ...serverEvent,
+        title: local.title,
+        description: local.description,
+        start_time: local.start_time,
+        end_time: local.end_time,
+        is_all_day: local.is_all_day,
+        start_time_zone: local.start_time_zone,
+        end_time_zone: local.end_time_zone,
+        calendar_id: calendarId,
+        color: draftCalendarTouchedRef.current
+          ? (local.color ?? colorForCalendar(calendarId))
+          : serverEvent.color,
+      });
+      // Same per-event chain as inspector edits: field PATCH first, then
+      // calendar MOVE, ahead of any later edit.
+      queue.enqueuePatch(serverEvent.id, flush);
+    };
+
     createEvent.mutate(
       {
         calendar_id: event.calendar_id,
@@ -326,6 +612,57 @@ export function useCalendarSession({
         onSuccess: (result) => {
           draftPersistStartedRef.current.delete(tempId);
           const after = queue.getOverlay(tempId);
+          const created = noteCreateSucceeded(pendingDeleteRef.current, {
+            tempId,
+            serverId: result.event.id,
+          });
+
+          // Still inside the undo window: keep the new row hidden behind the
+          // toast and park its server id, so the timer or Undo owns it. Do
+          // not DELETE yet and do not select the server id.
+          if (created.kind === 'park') {
+            pendingDeleteRef.current = created.next;
+            setPendingDelete(created.next);
+            queue.clear(tempId);
+            upsertCalendarEventInCache(result.event);
+            if (unpersistedDraftIdRef.current === tempId) {
+              setDraftId(null);
+            }
+
+            // A category-routed create may land on a calendar the sidebar has
+            // hidden. Reveal the destination so Undo can actually show the
+            // chip, exactly as a normal create success would.
+            setSelectedCalendarIds((prev) => {
+              if (prev.has(result.event.calendar_id)) return prev;
+              const next = new Set(prev);
+              next.add(result.event.calendar_id);
+              return next;
+            });
+
+            if (after?.op === 'upsert') {
+              flushDraftEdits(result.event, after.event);
+            }
+            // Hide last: the toast still offers Undo, so no row may paint
+            // between the cache write and the delete overlay.
+            queue.remove(result.event.id);
+            return;
+          }
+
+          // The timer fired while the POST was in flight: the chip is gone,
+          // so this create must delete the row it just made (same ghost rule
+          // as a discarded draft).
+          if (created.kind === 'ghost-delete') {
+            pendingDeleteRef.current = created.next;
+            setPendingDelete(created.next);
+            queue.clear(tempId);
+            if (unpersistedDraftIdRef.current === tempId) {
+              setDraftId(null);
+            }
+            void deleteEvent.mutateAsync(result.event.id).then(() => {
+              removeCalendarEventFromCache(result.event.id);
+            });
+            return;
+          }
 
           // User deleted / discarded while create was in flight — do not
           // cache-write; DELETE the just-created server event so Google has
@@ -361,51 +698,20 @@ export function useCalendarSession({
             return next;
           });
 
-          // If the user renamed / moved / annotated the temp event before
-          // POST returned, keep those fields under the server id and flush
-          // field PATCH first, then calendar MOVE (cannot combine).
           if (after.op === 'upsert') {
-            const local = after.event;
-            // The server may have rerouted an untouched draft to the title's
-            // category calendar. Trust that unless the user picked a
-            // calendar in the inspector; a pick must survive create.
-            const calendarId = draftCalendarTouchedRef.current
-              ? local.calendar_id
-              : result.event.calendar_id;
-            const flush = buildDraftFlushPatch({
-              posted: {
-                summary: postedSummary,
-                description: postedDescription,
-                start: startIso,
-                end: endIso,
-              },
-              local: { ...local, calendar_id: calendarId },
-              serverCalendarId: result.event.calendar_id,
-            });
-
-            if (flush) {
-              queue.upsert({
-                ...result.event,
-                title: local.title,
-                description: local.description,
-                start_time: local.start_time,
-                end_time: local.end_time,
-                is_all_day: local.is_all_day,
-                start_time_zone: local.start_time_zone,
-                end_time_zone: local.end_time_zone,
-                calendar_id: calendarId,
-                color: draftCalendarTouchedRef.current
-                  ? (local.color ?? colorForCalendar(calendarId))
-                  : result.event.color,
-              });
-              // Same per-event chain as inspector edits: field PATCH first,
-              // then calendar MOVE, ahead of any later edit.
-              queue.enqueuePatch(result.event.id, flush);
-            }
+            flushDraftEdits(result.event, after.event);
           }
         },
         onError: (err) => {
           draftPersistStartedRef.current.delete(tempId);
+          // No server row exists to undo; a pending delete for this draft is
+          // stale, so drop it (and its timer) with the overlay.
+          const next = noteCreateFailed(pendingDeleteRef.current, tempId);
+          if (next !== pendingDeleteRef.current) {
+            pendingDeleteRef.current = next;
+            setPendingDelete(next);
+            clearDeleteTimer();
+          }
           queue.clear(tempId);
           if (unpersistedDraftIdRef.current === tempId) {
             setDraftId(null);
@@ -422,6 +728,7 @@ export function useCalendarSession({
       },
     );
   }, [
+    clearDeleteTimer,
     clearWriteError,
     createEvent,
     deleteEvent,
@@ -550,54 +857,9 @@ export function useCalendarSession({
     ],
   );
 
-  const handleDeleteEvent = useCallback(async () => {
-    if (!selectedEventId) return;
-    const id = selectedEventId;
-
-    clearWriteError();
-
-    // Draft or in-flight create: drop overlay only — never DELETE a missing
-    // server row. If POST is in flight, clear makes onSuccess DELETE it.
-    if (
-      isTempEventId(id) ||
-      id === unpersistedDraftIdRef.current ||
-      id === unpersistedDraftId
-    ) {
-      queue.cancelPatch(id);
-      queue.clear(id);
-      if (unpersistedDraftIdRef.current === id || unpersistedDraftId === id) {
-        setDraftId(null);
-      }
-      setSelectedEventId(null);
-      setFocusTitleOnOpen(false);
-      return;
-    }
-
-    // Chip gone now; close inspector immediately. Cancel queued/in-flight
-    // PATCHes so they neither 404 nor resurrect the row in the cache.
-    queue.cancelPatch(id);
-    queue.remove(id);
-    setSelectedEventId(null);
-    setFocusTitleOnOpen(false);
-
-    try {
-      await deleteEvent.mutateAsync(id);
-      removeCalendarEventFromCache(id);
-      queue.clear(id);
-    } catch (err) {
-      // Clear delete overlay so the event reappears from the server list.
-      queue.clear(id);
-      reportWriteError("Couldn't delete event", err);
-    }
-  }, [
-    selectedEventId,
-    unpersistedDraftId,
-    queue,
-    deleteEvent,
-    setDraftId,
-    clearWriteError,
-    reportWriteError,
-  ]);
+  // The inspector's overflow Delete, the touch handle and Backspace/Delete all
+  // take the deferred path: hide now, send the DELETE when the toast expires.
+  const handleDeleteEvent = requestDelete;
 
   /**
    * Clipboard payload for the selected event, cut-aware.
@@ -703,6 +965,50 @@ export function useCalendarSession({
           pasteCreateInput(item, destinationId),
         );
 
+        const created = noteCreateSucceeded(pendingDeleteRef.current, {
+          tempId,
+          serverId: result.event.id,
+          cutSourceId: item.cutSourceId,
+        });
+
+        // The paste's delete toast is still up: park the server id, keep the
+        // new row hidden, and leave the cut source alone. Undo owes the
+        // source removal; letting the toast expire abandons the paste.
+        if (created.kind === 'park') {
+          pendingDeleteRef.current = created.next;
+          setPendingDelete(created.next);
+          queue.clear(tempId);
+          upsertCalendarEventInCache(result.event);
+          // Undo must be able to show the chip, so reveal the destination
+          // even when the sidebar had that calendar checked off.
+          setSelectedCalendarIds((prev) => {
+            if (prev.has(result.event.calendar_id)) return prev;
+            const next = new Set(prev);
+            next.add(result.event.calendar_id);
+            return next;
+          });
+          queue.remove(result.event.id);
+          return false;
+        }
+
+        // Grace expired while the POST was in flight: the chip is gone, so
+        // this create must remove the row it just made (same ghost rule as a
+        // discarded paste).
+        if (created.kind === 'ghost-delete') {
+          pendingDeleteRef.current = created.next;
+          setPendingDelete(created.next);
+          queue.clear(tempId);
+          setSelectedEventId((prev) => {
+            if (prev !== tempId) return prev;
+            setFocusTitleOnOpen(false);
+            return null;
+          });
+          void deleteEvent.mutateAsync(result.event.id).then(() => {
+            removeCalendarEventFromCache(result.event.id);
+          });
+          return false;
+        }
+
         // User cut / deleted / discarded the chip while the POST was in
         // flight — do not cache-write; DELETE the just-created server row so
         // Google has no ghost. Same discard branch as persistDraft.
@@ -730,6 +1036,13 @@ export function useCalendarSession({
         queue.clear(tempId);
         upsertCalendarEventInCache(result.event);
       } catch (err) {
+        // The create failed, so a pending delete for this temp id is stale.
+        const next = noteCreateFailed(pendingDeleteRef.current, tempId);
+        if (next !== pendingDeleteRef.current) {
+          pendingDeleteRef.current = next;
+          setPendingDelete(next);
+          clearDeleteTimer();
+        }
         queue.clear(tempId);
         setSelectedEventId((prev) => {
           if (prev !== tempId) return prev;
@@ -742,45 +1055,20 @@ export function useCalendarSession({
       }
 
       const cutId = item.cutSourceId;
-      // Not a cut (or a temp source with no persisted row): no source was
-      // deleted, so the page has nothing to clear.
-      if (!cutId || isTempEventId(cutId)) return false;
-      // Second paste of the same cut: the first one already started the
-      // delete, so report false rather than claim a second removal.
-      if (cutRemovalsStartedRef.current.has(cutId)) return false;
-      cutRemovalsStartedRef.current.add(cutId);
-
-      // Same steps as the persisted branch of handleDeleteEvent — keep the
-      // two in sync. Only the selection check differs: the paste already
-      // moved it to the new chip, so the source is usually not selected.
-      queue.cancelPatch(cutId);
-      queue.remove(cutId);
-      setSelectedEventId((prev) => {
-        if (prev !== cutId) return prev;
-        setFocusTitleOnOpen(false);
-        return null;
-      });
-
-      try {
-        await deleteEvent.mutateAsync(cutId);
-        removeCalendarEventFromCache(cutId);
-        queue.clear(cutId);
-      } catch (err) {
-        // Clear the delete overlay so the source reappears from the server.
-        queue.clear(cutId);
-        cutRemovalsStartedRef.current.delete(cutId);
-        reportWriteError("Couldn't remove the cut event", err);
-        return false;
-      }
-
-      return true;
+      // Not a cut: no source was deleted, so the page has nothing to clear.
+      if (!cutId) return false;
+      // A temp source has no server row and a second paste of the same cut
+      // must not claim another removal; the helper reports both as false.
+      return removeCutSource(cutId);
     },
     [
       calendars,
+      clearDeleteTimer,
       clearWriteError,
       createEvent,
       deleteEvent,
       queue,
+      removeCutSource,
       reportWriteError,
     ],
   );
@@ -814,15 +1102,30 @@ export function useCalendarSession({
     });
   }, []);
 
+  // A temp delete is hidden by suppressing paint, never by an overlay delete:
+  // its upsert must survive so an in-flight create's onSuccess can see it.
+  // Once a create parks a server id the delete overlay takes over.
+  const hiddenTempId =
+    pendingDelete?.phase === 'pending' && pendingDelete.serverId === null
+      ? pendingDelete.hiddenId
+      : null;
+
   // Overlay first, then calendar-visibility filter.
   const visibleEvents = useMemo(() => {
     return overlaidEvents.filter((e) => {
+      if (e.id === hiddenTempId) return false;
       if (!selectionReady) return true;
       if (selectedCalendarIds.has(e.calendar_id)) return true;
       if (!knownCalendarIds.has(e.calendar_id)) return true;
       return false;
     });
-  }, [overlaidEvents, selectedCalendarIds, knownCalendarIds, selectionReady]);
+  }, [
+    overlaidEvents,
+    hiddenTempId,
+    selectedCalendarIds,
+    knownCalendarIds,
+    selectionReady,
+  ]);
 
   const { timedEvents, allDayEvents } = useMemo(() => {
     const timed: CalendarEvent[] = [];
@@ -1242,6 +1545,11 @@ export function useCalendarSession({
     handleSaveCalendar,
     handleDeleteEvent,
     isDeleting: deleteEvent.isPending,
+
+    // Deferred delete / undo toast. The title is null when no toast is owed;
+    // a blank title is '' and still renders ("untitled event").
+    pendingDeleteTitle: pendingDeleteTitle(pendingDelete),
+    undoDelete,
 
     // In-memory clipboard (Cmd/Ctrl+C / X / V / D)
     cutForClipboard,

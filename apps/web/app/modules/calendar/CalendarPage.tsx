@@ -1,9 +1,9 @@
-import { useCallback, useLayoutEffect, useState } from 'react';
+import { useLayoutEffect, useState } from 'react';
 import { CalendarHeader } from './components/CalendarHeader';
 import { CalendarSidebar } from './components/CalendarSidebar';
 import { CalendarSyncBanner } from './components/CalendarSyncBanner';
 import { CalendarWeekGrid } from './components/CalendarWeekGrid';
-import { DeleteEventDialog } from './components/DeleteEventDialog';
+import { DeleteEventToast } from './components/DeleteEventToast';
 import {
   EventInspector,
   isCalendarWritable,
@@ -35,34 +35,27 @@ export function CalendarPage() {
 
   useHideNavOnLateHours(strip.scrollerRef, session.hourH, session.allDayHeight);
 
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   // In-memory clipboard for Cmd/Ctrl+C / X / V. Page state on purpose: this is
   // not the system clipboard, so copying an event never touches the OS.
   const [clipboard, setClipboard] = useState<CalendarClipboardItem | null>(
     null,
   );
-  const selectedId = session.selectedEvent?.id ?? null;
-  // The dialog belongs to the selection it was opened for.
-  const confirmOpen =
-    confirmDeleteId !== null && confirmDeleteId === selectedId;
 
   const canTouchDelete =
     session.selectedEvent !== null &&
     isCalendarWritable(session.selectedEventCalendar);
 
-  // Stable across drag/now re-renders so memoized DayColumns keep their props;
-  // it only changes with the selection.
-  const requestDelete = useCallback(
-    () => setConfirmDeleteId(selectedId),
-    [selectedId],
-  );
+  // The session's handler re-binds only with the selection (not on drag/now
+  // re-renders), so memoized DayColumns keep their props like before.
+  const requestDelete = session.handleDeleteEvent;
 
-  // One page-level keymap: the strip no longer listens on its own. The delete
-  // dialog and an active pointer drag suspend it (their focused buttons are not
-  // editing targets, so the target check alone would let keys through); Escape
-  // during a drag stays with the capture-phase handler inside useCalendarDrag.
+  // One page-level keymap: the strip no longer listens on its own. An active
+  // pointer drag suspends it (its captured pointer is not an editing target,
+  // so the target check alone would let keys through); Escape during a drag
+  // stays with the capture-phase handler inside useCalendarDrag. The undo
+  // toast deliberately does not suspend the keyboard.
   useCalendarShortcuts({
-    suspended: confirmOpen || session.isDragging,
+    suspended: session.isDragging,
     onPeriodChange: strip.handlePeriodChange,
     onToday: strip.goToToday,
     onShiftPeriod: strip.shiftPeriod,
@@ -259,16 +252,26 @@ export function CalendarPage() {
         )}
       </div>
 
-      <DeleteEventDialog
-        open={confirmOpen}
-        title={session.selectedEvent?.title ?? ''}
-        isDeleting={session.isDeleting}
-        onCancel={() => setConfirmDeleteId(null)}
-        onConfirm={() => {
-          setConfirmDeleteId(null);
-          void session.handleDeleteEvent();
-        }}
-      />
+      {/* Deferred delete: the event is already hidden; Undo restores it and
+          the session sends the DELETE only when this toast times out. */}
+      {session.pendingDeleteTitle !== null && (
+        <DeleteEventToast
+          title={session.pendingDeleteTitle}
+          onUndo={() => {
+            // Mirrors the paste .then above: undoing a parked cut is the
+            // moment its source removal actually happens, so drop that cut id
+            // unless a newer copy replaced the clipboard meanwhile.
+            void session.undoDelete().then((removedCutId) => {
+              if (!removedCutId) return;
+              setClipboard((prev) =>
+                prev && prev.cutSourceId === removedCutId
+                  ? { ...prev, cutSourceId: null }
+                  : prev,
+              );
+            });
+          }}
+        />
+      )}
     </div>
   );
 }
