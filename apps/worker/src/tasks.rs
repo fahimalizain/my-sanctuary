@@ -509,13 +509,13 @@ timer_action!(
 timer_action!(
     complete_task,
     api_core::complete_task,
-    "POST /api/tasks/:id/complete → 200 `{\"task\":{...},\"event\":{...}|null}`. Auto-stops a running event first (`stopped` then `completed` logs); idempotent 200 for already COMPLETED tasks."
+    "POST /api/tasks/:id/complete → 200 `{\"task\":{...},\"event\":{...}|null}`. PATCHes the latest started event to now only while the task is still IN_PROGRESS (`stopped` then `completed` logs); otherwise it writes the terminal status + `completed` log and leaves the already-closed event's end alone. Idempotent 200 for already COMPLETED tasks."
 );
 
 timer_action!(
     discard_task,
     api_core::discard_task,
-    "POST /api/tasks/:id/discard → 200 `{\"task\":{...},\"event\":{...}|null}`. Auto-stops a running event first (`stopped` then `discarded` logs); idempotent 200 for already DISCARDED tasks."
+    "POST /api/tasks/:id/discard → 200 `{\"task\":{...},\"event\":{...}|null}`. PATCHes the latest started event to now only while the task is still IN_PROGRESS (`stopped` then `discarded` logs); otherwise it writes the terminal status + `discarded` log and leaves the already-closed event's end alone. Idempotent 200 for already DISCARDED tasks."
 );
 
 /// Serializes a `TaskActionResponse` (or maps the error).
