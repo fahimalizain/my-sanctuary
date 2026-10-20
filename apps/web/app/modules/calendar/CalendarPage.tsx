@@ -30,6 +30,7 @@ export function CalendarPage() {
     scrollerRef: strip.scrollerRef,
     lockStrip: strip.lockStrip,
     unlockStrip: strip.unlockStrip,
+    scrollStripBy: strip.scrollStripBy,
   });
 
   useHideNavOnLateHours(strip.scrollerRef, session.hourH, session.allDayHeight);
@@ -199,8 +200,6 @@ export function CalendarPage() {
         <CalendarWeekGrid
           gridColumnRef={strip.gridColumnRef}
           scrollerRef={strip.scrollerRef}
-          onScroll={strip.onScrollerScroll}
-          contentWidth={strip.contentWidth}
           colW={strip.colW}
           gutterW={strip.gutterW}
           trackWidth={strip.trackWidth}

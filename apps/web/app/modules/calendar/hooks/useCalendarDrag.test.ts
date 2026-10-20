@@ -39,11 +39,15 @@ after(() => {
   cleanup();
 });
 
-function Harness(props: { api: { current: CalendarDragApi | null } }) {
+function Harness(props: {
+  api: { current: CalendarDragApi | null };
+  scrollStripBy?: (dx: number) => void;
+}) {
   const drag = useCalendarDrag({
     hourH: 48,
     lockStrip: () => {},
     unlockStrip: () => {},
+    scrollStripBy: props.scrollStripBy ?? (() => {}),
     onClickCreate: () => {},
     onDragCreate: () => {},
     onMove: () => {},
@@ -55,10 +59,12 @@ function Harness(props: { api: { current: CalendarDragApi | null } }) {
   return null;
 }
 
-async function mountDrag(): Promise<CalendarDragApi> {
+async function mountDrag(
+  scrollStripBy?: (dx: number) => void,
+): Promise<CalendarDragApi> {
   const api: { current: CalendarDragApi | null } = { current: null };
   await act(async () => {
-    render(createElement(Harness, { api }));
+    render(createElement(Harness, { api, scrollStripBy }));
   });
   assert.ok(api.current);
   return api.current;
@@ -388,6 +394,54 @@ test('a grid drag still autoscrolls and does not swallow the wheel', async () =>
     assert.ok(
       grid.readTop() > top,
       'holding the pointer on the bottom edge scrolls the hours',
+    );
+
+    await act(async () => {
+      drag.cancel();
+    });
+  } finally {
+    grid.remove();
+    frames.restore();
+  }
+});
+
+test('a grid drag autoscrolls the day strip through the strip, not scrollLeft', async () => {
+  const frames = stubAnimationFrame();
+  const grid = mountGrid(80);
+  const dxs: number[] = [];
+  try {
+    const drag = await mountDrag((dx) => dxs.push(dx));
+    await act(async () => {
+      drag.onColumnPointerDown(
+        pointerDown(grid.col, 80, 300),
+        new Date(2026, 9, 18),
+      );
+    });
+
+    // Left edge: the pointer is inside the horizontal autoscroll zone.
+    await act(async () => {
+      window.dispatchEvent(
+        new window.PointerEvent('pointermove', {
+          pointerId: 1,
+          clientX: 2,
+          clientY: 300,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+    frames.flush(1);
+
+    assert.ok(dxs.length > 0, 'the left edge must autoscroll the day strip');
+    assert.ok(
+      dxs.every((dx) => dx < 0),
+      'dragging at the left edge moves the strip towards earlier days',
+    );
+    // The strip is a transform: the scroller itself has no horizontal scroll.
+    assert.equal(
+      grid.scroller.scrollLeft,
+      0,
+      'autoscroll must not touch the scroller scrollLeft',
     );
 
     await act(async () => {

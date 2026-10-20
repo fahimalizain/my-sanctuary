@@ -9,7 +9,12 @@ import { dayNameShort } from '../lib/calendar-model';
 import { DayColumn, TimedPreviewLayer } from './DayColumn';
 import { GutterTimes } from './GutterTimes';
 import { type PositionedEvent } from './EventChip';
-import { COL_HEADER_H, isSameDay, isWeekend } from '../lib/week-layout';
+import {
+  COL_HEADER_H,
+  STRIP_TRACK_TRANSFORM,
+  isSameDay,
+  isWeekend,
+} from '../lib/week-layout';
 
 /** Stable empty list so DayColumn memo is not busted on empty days. */
 const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
@@ -17,8 +22,6 @@ const EMPTY_DAY_EVENTS: PositionedEvent[] = [];
 export interface CalendarWeekGridProps {
   gridColumnRef: RefObject<HTMLDivElement | null>;
   scrollerRef: RefObject<HTMLDivElement | null>;
-  onScroll: () => void;
-  contentWidth: number;
   colW: number;
   gutterW: number;
   trackWidth: number;
@@ -75,8 +78,6 @@ export interface CalendarWeekGridProps {
 export function CalendarWeekGrid({
   gridColumnRef,
   scrollerRef,
-  onScroll,
-  contentWidth,
   colW,
   gutterW,
   trackWidth,
@@ -126,26 +127,28 @@ export function CalendarWeekGrid({
         className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto [touch-action:pan-y] [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
         // One gesture, one axis. The browser may only pan the hours (overflow-y
         // + `touch-action: pan-y`); the day strip is moved by `useCalendarStrip`
-        // alone, which writes `scrollLeft` — touch swipe, trackpad burst, drag
-        // autoscroll, rebase, park — and lands on a column with its own ease-out
-        // tween. `overflow-x: hidden` is what makes that hold everywhere: the
-        // axis stays programmatically scrollable (the sticky gutter included),
-        // but the browser can never pan it, which `pan-y` alone does not
-        // guarantee on iOS.
+        // alone — touch swipe, trackpad burst, drag autoscroll, rebase, park —
+        // and lands on a column with its own ease-out tween.
+        // The strip is a CSS offset, never `scrollLeft`, and the scroller has no
+        // horizontal scroll range at all: its content is exactly its own width
+        // and each band clips a wider track. On iOS a native vertical pan makes
+        // WebKit report its own x for a non-user-scrollable axis and overwrite a
+        // programmatic `scrollLeft` mid-gesture — the strip then read index 0,
+        // rebased a period back, and rewound the calendar on every vertical
+        // drag. `useCalendarStrip` writes `--strip-x`, which the browser never
+        // touches, and the three tracks below translate by it in one frame.
         // No CSS scroll-snap: `snap-x snap-mandatory` re-snapped every
-        // programmatic write, and on iOS an x snap no touch can reach collapsed
-        // `scrollLeft` to the first column. The tween is the only snap.
-        onScroll={onScroll}
+        // programmatic write. The tween is the only snap.
       >
-        {/* Content: sticky headers + all-day + hours strip */}
-        <div style={{ width: contentWidth, minHeight: '100%' }}>
+        {/* Content: exactly the scroller's width, so there is no x scroll range */}
+        <div className="min-h-full">
           {/* Day headers — sticky top */}
           <div
             className="sticky top-0 z-20 flex bg-cream border-b border-border"
-            style={{ height: COL_HEADER_H, width: contentWidth }}
+            style={{ height: COL_HEADER_H }}
           >
             <div
-              className="shrink-0 sticky left-0 top-0 z-40 flex items-center justify-center border-r border-border/60 bg-cream"
+              className="shrink-0 flex items-center justify-center border-r border-border/60 bg-cream"
               style={{ width: gutterW }}
               aria-hidden
             >
@@ -157,35 +160,47 @@ export function CalendarWeekGrid({
                 </span>
               )}
             </div>
-            {days.map((day) => {
-              const isToday = isSameDay(day, today);
-              return (
-                <div
-                  key={day.toISOString()}
-                  className="shrink-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
-                  style={{ width: colW }}
-                >
-                  <span
-                    className={cn(
-                      'text-[11px] font-medium uppercase tracking-wide',
-                      isToday ? 'text-primary' : 'text-muted-foreground',
-                    )}
-                  >
-                    {dayNameShort(day)}
-                  </span>
-                  <span
-                    className={cn(
-                      'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
-                      isToday
-                        ? 'bg-primary text-primary-foreground'
-                        : 'text-foreground',
-                    )}
-                  >
-                    {day.getDate()}
-                  </span>
-                </div>
-              );
-            })}
+            {/* Track viewport: clips the translated day track */}
+            <div className="flex-1 min-w-0 overflow-hidden">
+              <div
+                className="flex"
+                style={{
+                  width: trackWidth,
+                  height: '100%',
+                  transform: STRIP_TRACK_TRANSFORM,
+                }}
+              >
+                {days.map((day) => {
+                  const isToday = isSameDay(day, today);
+                  return (
+                    <div
+                      key={day.toISOString()}
+                      className="shrink-0 flex items-center justify-center gap-1 border-r border-border/40 last:border-r-0"
+                      style={{ width: colW }}
+                    >
+                      <span
+                        className={cn(
+                          'text-[11px] font-medium uppercase tracking-wide',
+                          isToday ? 'text-primary' : 'text-muted-foreground',
+                        )}
+                      >
+                        {dayNameShort(day)}
+                      </span>
+                      <span
+                        className={cn(
+                          'inline-flex h-6 w-6 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums',
+                          isToday
+                            ? 'bg-primary text-primary-foreground'
+                            : 'text-foreground',
+                        )}
+                      >
+                        {day.getDate()}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
 
           {/* All-day band — sticky under headers */}
@@ -207,14 +222,14 @@ export function CalendarWeekGrid({
             />
           </div>
 
-          {/* Hours: sticky left gutter + day columns */}
+          {/* Hours: fixed gutter + translated day columns */}
           <div
             className={cn('relative flex', isDragging && 'select-none')}
-            style={{ height: totalHoursH, width: contentWidth }}
+            style={{ height: totalHoursH }}
           >
-            {/* Time gutter */}
+            {/* Time gutter — fixed: nothing scrolls sideways under it */}
             <div
-              className="shrink-0 sticky left-0 z-30 border-r border-border/60 bg-cream"
+              className="shrink-0 z-30 border-r border-border/60 bg-cream"
               style={{ width: gutterW, height: totalHoursH }}
             >
               <GutterTimes
@@ -227,47 +242,59 @@ export function CalendarWeekGrid({
               />
             </div>
 
-            {/* Day columns — memoized; drag preview is a sibling overlay */}
-            {days.map((day) => {
-              const isTodayCol = isSameDay(day, today);
-              const dayKey = day.toDateString();
-              const dayEvents = eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
+            {/* Track viewport: clips the translated hours track */}
+            <div className="flex-1 min-w-0 overflow-hidden">
+              <div
+                className="relative flex"
+                style={{
+                  width: trackWidth,
+                  height: totalHoursH,
+                  transform: STRIP_TRACK_TRANSFORM,
+                }}
+              >
+                {/* Day columns — memoized; drag preview is a sibling overlay */}
+                {days.map((day) => {
+                  const isTodayCol = isSameDay(day, today);
+                  const dayKey = day.toDateString();
+                  const dayEvents = eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
 
-              return (
-                <DayColumn
-                  key={day.toISOString()}
-                  day={day}
+                  return (
+                    <DayColumn
+                      key={day.toISOString()}
+                      day={day}
+                      colW={colW}
+                      totalHoursH={totalHoursH}
+                      hourH={hourH}
+                      hourGridBg={hourGridBg}
+                      events={dayEvents}
+                      selectedEventId={selectedEventId}
+                      draggingEventId={draggingEventId}
+                      isToday={isTodayCol}
+                      isWeekend={isWeekend(day)}
+                      showNow={isTodayCol}
+                      now={isTodayCol ? now : undefined}
+                      nowMs={now.getTime()}
+                      onColumnPointerDown={onColumnPointerDown}
+                      onChipPointerDown={onChipPointerDown}
+                      onSelectChip={onSelectChip}
+                      onRequestDelete={onRequestDelete}
+                    />
+                  );
+                })}
+
+                {/* Inside the track so the ghosts stay on their columns */}
+                <TimedPreviewLayer
+                  days={days}
                   colW={colW}
+                  trackWidth={trackWidth}
                   totalHoursH={totalHoursH}
-                  hourH={hourH}
-                  hourGridBg={hourGridBg}
-                  events={dayEvents}
-                  selectedEventId={selectedEventId}
-                  draggingEventId={draggingEventId}
-                  isToday={isTodayCol}
-                  isWeekend={isWeekend(day)}
-                  showNow={isTodayCol}
-                  now={isTodayCol ? now : undefined}
-                  nowMs={now.getTime()}
-                  onColumnPointerDown={onColumnPointerDown}
-                  onChipPointerDown={onChipPointerDown}
-                  onSelectChip={onSelectChip}
-                  onRequestDelete={onRequestDelete}
+                  timedPreviewByDay={timedPreviewByDay}
+                  previewInfo={previewInfo}
+                  previewColor={previewColor}
+                  previewTitle={previewTitle}
                 />
-              );
-            })}
-
-            <TimedPreviewLayer
-              days={days}
-              colW={colW}
-              gutterW={gutterW}
-              trackWidth={trackWidth}
-              totalHoursH={totalHoursH}
-              timedPreviewByDay={timedPreviewByDay}
-              previewInfo={previewInfo}
-              previewColor={previewColor}
-              previewTitle={previewTitle}
-            />
+              </div>
+            </div>
           </div>
         </div>
       </div>

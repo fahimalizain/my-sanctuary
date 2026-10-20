@@ -69,6 +69,8 @@ export interface CalendarSessionInput {
   scrollerRef: RefObject<HTMLElement | null>;
   lockStrip: (reason: StripLockReason) => void;
   unlockStrip: (reason: StripLockReason) => void;
+  /** Drag autoscroll: move the day strip sideways by `dx` px. */
+  scrollStripBy: (dx: number) => void;
 }
 
 /**
@@ -84,6 +86,7 @@ export function useCalendarSession({
   scrollerRef,
   lockStrip,
   unlockStrip,
+  scrollStripBy,
 }: CalendarSessionInput) {
   const eventsQuery = useCalendarEventsQuery(timeMin, timeMax);
   const events = eventsQuery.data?.events ?? [];
@@ -1018,6 +1021,7 @@ export function useCalendarSession({
     hourH,
     lockStrip,
     unlockStrip,
+    scrollStripBy,
     onClickCreate: (slot) => {
       if (closeSelectionOnMobile()) return;
       beginDraft(clickCreateTimesFromSlot(slot));

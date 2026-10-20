@@ -60,6 +60,11 @@ export interface UseCalendarDragOptions {
   /** Take / release the infinite strip's drag lock (no rebase). */
   lockStrip: (reason: StripLockReason) => void;
   unlockStrip: (reason: StripLockReason) => void;
+  /**
+   * Move the day strip sideways (autoscroll). The strip is a transform, not a
+   * native scroll, so the scroller's own `scrollLeft` is never touched.
+   */
+  scrollStripBy: (dx: number) => void;
   onClickCreate: (slot: DragSlot) => void;
   onDragCreate: (range: TimedRange) => void;
   onMove: (eventId: string, range: TimedRange) => void;
@@ -1083,7 +1088,7 @@ export function useCalendarDrag(
     const { x, y } = lastPtrRef.current;
     const dx = autoscrollDelta(x, rect.left, rect.right);
     const dy = autoscrollDelta(y, rect.top, rect.bottom);
-    if (dx !== 0) scroller.scrollLeft += dx;
+    if (dx !== 0) optsRef.current.scrollStripBy(dx);
     if (dy !== 0) scroller.scrollTop += dy;
     if (dx !== 0 || dy !== 0) applyPoint(x, y, lastKeysRef.current);
     autoScrollRafRef.current = requestAnimationFrame(tickAutoScroll);

@@ -192,6 +192,22 @@ export const STRIP_OVERSCAN = 7;
 export const STRIP_REBASE_THRESHOLD = 3;
 
 /**
+ * CSS custom property carrying the day strip's horizontal offset (px), set on
+ * the scroller by `useCalendarStrip`. The day tracks translate by it.
+ *
+ * This is deliberately not `scrollLeft`: on iOS a native vertical pan makes
+ * WebKit report its own x for a non-user-scrollable axis, which overwrites a
+ * programmatic `scrollLeft` mid-gesture. The browser never touches a custom
+ * property, so the strip can only move when we move it.
+ */
+export const STRIP_X_CSS_VAR = '--strip-x';
+
+/** Transform for a day track: shift it left by the strip offset. All three
+ *  bands read the same variable, so they move together in one frame. */
+export const STRIP_TRACK_TRANSFORM =
+  'translate3d(calc(-1 * var(--strip-x, 0px)), 0, 0)';
+
+/**
  * Clamp a period length to `[MIN_PERIOD_LENGTH, MAX_PERIOD_LENGTH]`.
  * Non-finite values fall back to `DAYS_PER_PERIOD` (7).
  */
@@ -295,7 +311,7 @@ export function visibleStartIndex(
   return clamp(Math.round(scrollLeft / colW), 0, maxStart);
 }
 
-/** scrollLeft that aligns column `index` with the left edge of the track. */
+/** Strip offset (px) that aligns column `index` with the left edge of the track. */
 export function scrollLeftForIndex(index: number, colW: number): number {
   if (!Number.isFinite(index) || !Number.isFinite(colW) || colW <= 0) {
     return 0;
@@ -331,14 +347,14 @@ export function shiftWindowStart(
 
 // ── Strip lock ownership ────────────────────────────────────────────────
 
-/** Gesture owners that write the horizontal strip's `scrollLeft` themselves. */
+/** Gesture owners that move the horizontal strip themselves. */
 export type StripLockReason = 'drag' | 'pinch' | 'swipe' | 'wheel';
 
 /**
- * Rebase is suppressed for every owner: each one writes `scrollLeft` itself
+ * Rebase is suppressed for every owner: each one moves the strip itself
  * (drag auto-scroll, pinch zoom, touch swipe, sideways wheel burst), and a
- * rebase write would fight those. A future owner that does not write
- * `scrollLeft` must be added explicitly.
+ * rebase compensation would fight those moves. A future owner that does not
+ * move the strip must be added explicitly.
  */
 export function stripRebaseSuppressed(
   held: ReadonlySet<StripLockReason>,
@@ -445,7 +461,7 @@ export function swipeVelocity(
 export interface SwipeRelease {
   /** Index of the column the finger landed on. */
   startIdx: number;
-  /** `scrollLeft` when the finger lifted. */
+  /** Strip offset (px) when the finger lifted. */
   scrollLeft: number;
   /** Finger velocity in px/ms; positive = moving right (towards earlier days). */
   velocity: number;
