@@ -257,7 +257,19 @@ export function CalendarPage() {
       {session.pendingDeleteTitle !== null && (
         <DeleteEventToast
           title={session.pendingDeleteTitle}
-          onUndo={session.undoDelete}
+          onUndo={() => {
+            // Mirrors the paste .then above: undoing a parked cut is the
+            // moment its source removal actually happens, so drop that cut id
+            // unless a newer copy replaced the clipboard meanwhile.
+            void session.undoDelete().then((removedCutId) => {
+              if (!removedCutId) return;
+              setClipboard((prev) =>
+                prev && prev.cutSourceId === removedCutId
+                  ? { ...prev, cutSourceId: null }
+                  : prev,
+              );
+            });
+          }}
         />
       )}
     </div>

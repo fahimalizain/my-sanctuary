@@ -403,11 +403,16 @@ export function useCalendarSession({
     startDeleteTimer,
   ]);
 
-  /** Undo the pending delete. Restores frontend state only; nothing was sent. */
-  const undoDelete = useCallback(() => {
+  /**
+   * Undo the pending delete. Restores frontend state only — the deleted event
+   * itself was never sent. Resolves with the cut source Undo actually removed
+   * (a parked paste), so the page can clear that cut from the clipboard the
+   * same way a normal paste does; null when no cut was removed.
+   */
+  const undoDelete = useCallback(async (): Promise<string | null> => {
     const outcome = undoPendingDelete(pendingDeleteRef.current);
     clearDeleteTimer();
-    if (outcome.restore.kind === 'none') return;
+    if (outcome.restore.kind === 'none') return null;
 
     const { restore } = outcome;
     if (
@@ -430,8 +435,15 @@ export function useCalendarSession({
     setFocusTitleOnOpen(false);
 
     // A parked paste's cut source is still owed: the create succeeded, so
-    // Undo finishes the removal a normal paste success would have done.
-    if (outcome.removeCutSource) void removeCutSource(outcome.removeCutSource);
+    // Undo finishes the removal a normal paste success would have done. Only
+    // a real removal reports the id; a failure leaves it retryable.
+    const cutId = outcome.removeCutSource;
+    if (!cutId) return null;
+    try {
+      return (await removeCutSource(cutId)) ? cutId : null;
+    } catch {
+      return null;
+    }
   }, [clearDeleteTimer, removeCutSource, setDraftId]);
 
   // A real unmount commits the pending delete: the toast goes with the page,
