@@ -103,6 +103,27 @@ pub async fn notify_user(env: &Env, user_id: &str, calendar_id: Option<&str>) {
     }
 }
 
+/// The Worker adapter for [`api_core::RealtimeNotify`]: every journaled
+/// calendar write funnels its hint through this, which delegates to
+/// [`notify_user`]. `worker::Env` is `Send + Sync` (worker 0.8 `unsafe impl`),
+/// so the adapter can be handed out as a `&dyn` reference.
+pub struct UserHubNotify<'a> {
+    env: &'a worker::Env,
+}
+
+impl<'a> UserHubNotify<'a> {
+    pub fn new(env: &'a worker::Env) -> Self {
+        Self { env }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a> api_core::RealtimeNotify for UserHubNotify<'a> {
+    async fn calendar_changed(&self, user_id: &str, calendar_id: Option<&str>) {
+        notify_user(self.env, user_id, calendar_id).await;
+    }
+}
+
 /// One hibernatable isolate per user (`id_from_name(user_id)`).
 ///
 /// Sockets are accepted via `accept_web_socket` so the DO can sleep while

@@ -496,6 +496,7 @@ pub async fn create_event(
         &mut input,
     )
     .await;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     match api_core::create_event(
         &crate::http::WorkerHttp,
         &calendars,
@@ -506,18 +507,13 @@ pub async fn create_event(
         &input,
         now_unix,
         &category_repo,
+        &notify,
     )
     .await
     {
         Ok(output) => {
             // create_event never returns Ok with cache_error set (issue #50).
             let event = paint_single_event(&ctx, &user_id, output.event).await?;
-            let _ = crate::user_hub::notify_user(
-                &ctx.env,
-                &user_id,
-                Some(&event.event.calendar_id),
-            )
-            .await;
             let response = Response::from_json(&api_core::CreateEventResponse {
                 event,
                 source: output.source,
@@ -581,6 +577,7 @@ pub async fn update_event(
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
     let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     match api_core::update_event_for_user(
         &crate::http::WorkerHttp,
         &calendars,
@@ -592,18 +589,13 @@ pub async fn update_event(
         &fields,
         now_unix,
         &category_repo,
+        &notify,
     )
     .await
     {
         Ok(output) => {
             // Journaled patch never returns Ok with cache_error set (issue #50).
             let event = paint_single_event(&ctx, &user_id, output.event).await?;
-            let _ = crate::user_hub::notify_user(
-                &ctx.env,
-                &user_id,
-                Some(&event.event.calendar_id),
-            )
-            .await;
             let response = Response::from_json(&api_core::CreateEventResponse {
                 event,
                 source: output.source,
@@ -655,6 +647,7 @@ pub async fn delete_event(
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     match api_core::delete_event_for_user(
         &crate::http::WorkerHttp,
         &calendars,
@@ -664,11 +657,11 @@ pub async fn delete_event(
         &user_id,
         &id,
         now_unix,
+        &notify,
     )
     .await
     {
         Ok(()) => {
-            let _ = crate::user_hub::notify_user(&ctx.env, &user_id, None).await;
             let response = Response::from_json(&api_core::DeleteEventResponse { success: true })?;
             Ok(response
                 .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))

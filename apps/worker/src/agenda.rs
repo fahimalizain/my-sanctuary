@@ -471,6 +471,7 @@ pub async fn patch_occurrence(
     let calendars = calendars_d1(&ctx)?;
     let events = events_d1(&ctx)?;
     let operations = operations_d1(&ctx)?;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::patch_occurrence(
         http,
         needs_google.then(|| &calendars as &dyn api_core::CalendarRepo),
@@ -485,6 +486,7 @@ pub async fn patch_occurrence(
         id,
         &updates,
         now_unix,
+        &notify,
     )
     .await;
     match result {
@@ -525,6 +527,7 @@ pub async fn start_occurrence(
     let calendars = calendars_d1(&ctx)?;
     let events = events_d1(&ctx)?;
     let operations = operations_d1(&ctx)?;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::start_occurrence(
         &crate::http::WorkerHttp,
         &calendars,
@@ -539,6 +542,7 @@ pub async fn start_occurrence(
         &user_id,
         id,
         now_unix,
+        &notify,
     )
     .await;
     match result {
@@ -605,6 +609,7 @@ macro_rules! occurrence_exit {
             let calendars = calendars_d1(&ctx)?;
             let events = events_d1(&ctx)?;
             let operations = operations_d1(&ctx)?;
+            let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
             let result = $service(
                 http,
                 needs_google.then(|| &calendars as &dyn api_core::CalendarRepo),
@@ -618,6 +623,7 @@ macro_rules! occurrence_exit {
                 &user.id,
                 id,
                 now_unix,
+                &notify,
             )
             .await;
             match result {

@@ -8,7 +8,7 @@
 
 use super::apply::{map_cached_event, row_from_new_event, EventClassifyCtx};
 use super::google::encode_path_segment;
-use super::journal::{parse_google_event, payload_fingerprint};
+use super::journal::{notify_after_cache_applied, parse_google_event, payload_fingerprint};
 use super::write::CreateEventOutput;
 use super::{CalendarError, GOOGLE_EVENTS_BASE_URL};
 use crate::models::{
@@ -159,6 +159,7 @@ pub(crate) async fn move_event_with_journal(
     dest_local_id: &str,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     if !is_writable_role(&source.access_role) {
         return Err(CalendarError::Invalid(
@@ -303,6 +304,11 @@ pub(crate) async fn move_event_with_journal(
     let _ = calendars.bump_dirty_requested(&source.id, &now_rfc3339).await;
     let _ = calendars.bump_dirty_requested(&dest.id, &now_rfc3339).await;
 
+    // Both ends of the move changed locally (the row left `source` and landed
+    // in `dest`), so both views must refetch.
+    notify_after_cache_applied(notify, &source.user_id, &source.id).await;
+    notify_after_cache_applied(notify, &source.user_id, &dest.id).await;
+
     Ok(CreateEventOutput {
         event: row_from_new_event(new_event, id, &now_rfc3339),
         source: "google".to_string(),
@@ -326,6 +332,7 @@ pub(crate) async fn patch_event_fields_with_journal(
     fields: &PatchEventFields,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     let payload = build_patch_payload(fields);
     if payload.is_empty() {
@@ -452,6 +459,8 @@ pub(crate) async fn patch_event_fields_with_journal(
 
     let _ = calendars.bump_dirty_requested(&cal.id, &now_rfc3339).await;
 
+    notify_after_cache_applied(notify, &cal.user_id, &cal.id).await;
+
     Ok(CreateEventOutput {
         event: row_from_new_event(new_event, id, &now_rfc3339),
         source: "google".to_string(),
@@ -470,6 +479,7 @@ pub(crate) async fn delete_event_with_journal(
     google_event_id: &str,
     local_id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<(), CalendarError> {
     let Some(cal) = calendars.get_by_id(calendar_id).await? else {
         return Err(CalendarError::NotFound);
@@ -598,6 +608,8 @@ pub(crate) async fn delete_event_with_journal(
         .await?;
 
     let _ = calendars.bump_dirty_requested(&cal.id, &now_rfc3339).await;
+
+    notify_after_cache_applied(notify, &cal.user_id, &cal.id).await;
     Ok(())
 }
 
