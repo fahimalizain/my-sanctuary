@@ -112,7 +112,7 @@ pub use oauth::{
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
-pub use realtime::{RealtimeKind, RealtimeMessage};
+pub use realtime::{RealtimeKind, RealtimeMessage, RealtimeNotify};
 pub use record::{
     assemble_record, record_report, EstimatedNight, HeatmapRow, RankingRow, RecordCategoryRow,
     RecordCategorySecondsRow, RecordData, RecordDay, RecordDaySecondsRow, RecordError,

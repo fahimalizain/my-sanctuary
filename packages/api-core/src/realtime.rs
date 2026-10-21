@@ -1,6 +1,7 @@
 //! Wire protocol for user-hub realtime hints.
 //! JSON only. No Worker / Durable Object types.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +25,62 @@ impl RealtimeMessage {
             kind: RealtimeKind::CalendarChanged,
             calendar_id,
         }
+    }
+}
+
+/// Fan-out port for `calendar.changed`.
+///
+/// `#[async_trait(?Send)]` because this must be `&dyn`-compatible and the
+/// Worker adapter awaits `notify_user` (`worker::Fetch` futures are `!Send`
+/// on wasm). Same reason as [`crate::oauth::HttpClient`].
+///
+/// The method returns `()` on purpose: a realtime hint must never be able to
+/// fail a write. The Worker adapter calls `crate::user_hub::notify_user`,
+/// which already swallows every error.
+#[async_trait(?Send)]
+pub trait RealtimeNotify: Send + Sync {
+    /// Tells every open client of `user_id` that its calendar view is stale.
+    /// `calendar_id` is the **local** calendar id when the change is scoped.
+    async fn calendar_changed(&self, user_id: &str, calendar_id: Option<&str>);
+}
+
+#[cfg(test)]
+pub(crate) struct NoopNotify;
+
+#[cfg(test)]
+#[async_trait(?Send)]
+impl RealtimeNotify for NoopNotify {
+    async fn calendar_changed(&self, _user_id: &str, _calendar_id: Option<&str>) {}
+}
+
+#[cfg(test)]
+pub(crate) fn noop_notify() -> &'static dyn RealtimeNotify {
+    static NOOP: NoopNotify = NoopNotify;
+    &NOOP
+}
+
+/// Records every `calendar_changed` call as `(user_id, calendar_id)`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingNotify {
+    pub(crate) calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+}
+
+#[cfg(test)]
+impl RecordingNotify {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(test)]
+#[async_trait(?Send)]
+impl RealtimeNotify for RecordingNotify {
+    async fn calendar_changed(&self, user_id: &str, calendar_id: Option<&str>) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((user_id.to_string(), calendar_id.map(str::to_string)));
     }
 }
 

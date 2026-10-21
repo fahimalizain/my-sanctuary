@@ -126,6 +126,7 @@ pub(crate) async fn create_event_with_journal(
     input: &NewEventInput,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     let Some(cal) = calendars.get_by_id(&input.calendar_id).await? else {
         return Err(CalendarError::NotFound);
@@ -305,11 +306,33 @@ pub(crate) async fn create_event_with_journal(
     // Best-effort dirty bump — do not fail a successful create.
     let _ = calendars.bump_dirty_requested(&cal.id, &now_rfc3339).await;
 
+    notify_after_cache_applied(notify, &cal.user_id, &cal.id).await;
+
     Ok(CreateEventOutput {
         event: row_from_new_event(new_event, local_id, &now_rfc3339),
         source: "google".to_string(),
         cache_error: None,
     })
+}
+
+/// Notify open clients after a journaled write's local row is durable.
+///
+/// Do **not** move this onto [`crate::repo::CalendarEventRepo`]. `upsert` /
+/// `delete_by_google_event_id` / batch upserts are also the replica walk; one
+/// notify per row would storm the socket. Repair and restamp use that repo
+/// too. Replica sync, the queue consumer, and the 15-minute fallback cron keep
+/// their own single notify on publish. Do not enqueue `CALENDAR_SYNC` here —
+/// the dirty bump is unchanged; the browser only re-reads D1.
+///
+/// Called only on a **success** tail (status `cache_applied`, after the
+/// best-effort dirty bump): a failed Google call or a failed cache apply must
+/// not hint a refetch that would still show the old row.
+pub(crate) async fn notify_after_cache_applied(
+    notify: &dyn crate::realtime::RealtimeNotify,
+    user_id: &str,
+    calendar_id: &str,
+) {
+    notify.calendar_changed(user_id, Some(calendar_id)).await;
 }
 
 pub(crate) fn parse_google_event(bytes: &[u8], context: &str) -> Result<GoogleEvent, CalendarError> {

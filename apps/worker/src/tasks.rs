@@ -322,6 +322,7 @@ pub async fn delete_task(
         .and_then(|row| row.focused_task_id);
     let is_focused = focused_task_id.as_deref() == Some(id);
     let repos = timer_d1(&ctx)?;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let (http, access) = if is_focused {
         let (_user_id, access) = match timer_access(&req, &ctx).await? {
             Ok(gated) => gated,
@@ -350,6 +351,7 @@ pub async fn delete_task(
         &now_rfc3339,
         now_unix,
         &agenda_d1(&ctx)?,
+        &notify,
     )
     .await
     {
@@ -434,6 +436,7 @@ pub async fn start_task(
     };
     let repos = timer_d1(&ctx)?;
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::start_task(
         &crate::http::WorkerHttp,
         &repos.calendars,
@@ -448,6 +451,7 @@ pub async fn start_task(
         id,
         now_unix,
         &agenda_d1(&ctx)?,
+        &notify,
     )
     .await;
     respond_action(&ctx, result)
@@ -473,6 +477,7 @@ macro_rules! timer_action {
             let repos = timer_d1(&ctx)?;
             let users = users_d1(&ctx)?;
             let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+            let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
             let result = $path(
                 &crate::http::WorkerHttp,
                 &repos.calendars,
@@ -487,6 +492,7 @@ macro_rules! timer_action {
                 id,
                 now_unix,
                 &agenda_d1(&ctx)?,
+                &notify,
             )
             .await;
             respond_action(&ctx, result)
@@ -570,6 +576,7 @@ pub async fn move_task(
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let repos = timer_d1(&ctx)?;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
 
     // Load the task BEFORE choosing the gate: a missing/soft-deleted/
     // other-user task is a plain 404, never a 401.
@@ -614,6 +621,7 @@ pub async fn move_task(
         now_unix,
         &input,
         &agenda_d1(&ctx)?,
+        &notify,
     )
     .await;
     match result {
@@ -667,6 +675,7 @@ pub async fn focus_task(
     };
     let repos = timer_d1(&ctx)?;
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::focus_task(
         &crate::http::WorkerHttp,
         &repos.calendars,
@@ -681,6 +690,7 @@ pub async fn focus_task(
         &user_id,
         id,
         now_unix,
+        &notify,
     )
     .await;
     respond_focus(&ctx, result)
@@ -703,6 +713,7 @@ pub async fn delete_focus(
     };
     let repos = timer_d1(&ctx)?;
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::delete_focus(
         &crate::http::WorkerHttp,
         &repos.calendars,
@@ -715,6 +726,7 @@ pub async fn delete_focus(
         &access,
         &user_id,
         now_unix,
+        &notify,
     )
     .await;
     respond_focus(&ctx, result)

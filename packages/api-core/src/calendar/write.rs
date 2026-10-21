@@ -119,6 +119,7 @@ pub async fn create_event(
     input: &NewEventInput,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     super::journal::create_event_with_journal(
         http,
@@ -130,6 +131,7 @@ pub async fn create_event(
         input,
         now_unix,
         category_repo,
+        notify,
     )
     .await
 }
@@ -183,6 +185,7 @@ pub async fn patch_event_fields(
     fields: &PatchEventFields,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     super::write_journal::patch_event_fields_with_journal(
         http,
@@ -195,6 +198,7 @@ pub async fn patch_event_fields(
         fields,
         now_unix,
         category_repo,
+        notify,
     )
     .await
 }
@@ -212,6 +216,7 @@ pub async fn patch_event(
     end_rfc3339: &str,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     patch_event_fields(
         http,
@@ -232,6 +237,7 @@ pub async fn patch_event(
         },
         now_unix,
         category_repo,
+        notify,
     )
     .await
 }
@@ -249,6 +255,7 @@ pub async fn patch_event_summary(
     summary: &str,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     patch_event_fields(
         http,
@@ -269,6 +276,7 @@ pub async fn patch_event_summary(
         },
         now_unix,
         category_repo,
+        notify,
     )
     .await
 }
@@ -294,6 +302,7 @@ pub async fn update_event_for_user(
     fields: &PatchEventFields,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CreateEventOutput, CalendarError> {
     let has_other = fields.start.is_some()
         || fields.end.is_some()
@@ -328,6 +337,7 @@ pub async fn update_event_for_user(
             dest_local_id,
             now_unix,
             category_repo,
+            notify,
         )
         .await;
     }
@@ -356,6 +366,7 @@ pub async fn update_event_for_user(
         fields,
         now_unix,
         category_repo,
+        notify,
     )
     .await
 }
@@ -376,6 +387,7 @@ pub async fn delete_event(
     google_event_id: &str,
     local_id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<(), CalendarError> {
     super::write_journal::delete_event_with_journal(
         http,
@@ -387,6 +399,7 @@ pub async fn delete_event(
         google_event_id,
         local_id,
         now_unix,
+        notify,
     )
     .await
 }
@@ -402,6 +415,7 @@ pub async fn delete_event_for_user(
     user_id: &str,
     event_id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<(), CalendarError> {
     let (cal, event) = lookup_owned_event(calendars, events, user_id, event_id).await?;
     delete_event(
@@ -414,6 +428,7 @@ pub async fn delete_event_for_user(
         &event.google_event_id,
         &event.id,
         now_unix,
+        notify,
     )
     .await
 }

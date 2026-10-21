@@ -252,6 +252,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     // Every tick (*/2 and */15): grow living IN_PROGRESS events — tasks and
     // in_progress occurrences alike (slice 6), so a running occurrence's
     // one-shot log never looks finished either.
+    let notify = crate::user_hub::UserHubNotify::new(&env);
     let elongate = api_core::run_elongate_cron(
         &crate::http::WorkerHttp,
         &calendars,
@@ -263,6 +264,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &oauth,
         now_unix,
         &categories,
+        &notify,
     )
     .await;
     for error in &elongate.errors {
@@ -278,6 +280,7 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         &oauth,
         now_unix,
         &categories,
+        &notify,
     )
     .await;
     for error in &elongate_occurrences.errors {

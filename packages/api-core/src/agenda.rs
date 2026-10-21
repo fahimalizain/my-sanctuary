@@ -1366,6 +1366,7 @@ pub async fn patch_occurrence(
     id: &str,
     updates: &UpdateOccurrence,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<OccurrenceResponse, AgendaError> {
     if updates.title.is_none() {
         return Err(AgendaError::Invalid("nothing to update".to_string()));
@@ -1421,6 +1422,7 @@ pub async fn patch_occurrence(
                 &resolved_after,
                 now_unix,
                 category_repo,
+                notify,
             )
             .await;
             match output {
@@ -1477,6 +1479,7 @@ pub async fn start_occurrence(
     user_id: &str,
     id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<OccurrenceActionResponse, AgendaError> {
     let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
     let routine = routine_repo
@@ -1559,6 +1562,7 @@ pub async fn start_occurrence(
         },
         now_unix,
         category_repo,
+        notify,
     )
     .await?;
     let event = output.event;
@@ -1601,10 +1605,11 @@ pub async fn complete_occurrence(
     user_id: &str,
     id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<OccurrenceResponse, AgendaError> {
     exit_occurrence(
         http, calendars, events, operations, access, list_repo, category_repo, routine_repo,
-        occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_DONE,
+        occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_DONE, notify,
     )
     .await
 }
@@ -1630,10 +1635,11 @@ pub async fn skip_occurrence(
     user_id: &str,
     id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<OccurrenceResponse, AgendaError> {
     exit_occurrence(
         http, calendars, events, operations, access, list_repo, category_repo, routine_repo,
-        occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_SKIPPED,
+        occurrence_repo, user_id, id, now_unix, OCCURRENCE_STATUS_SKIPPED, notify,
     )
     .await
 }
@@ -1660,6 +1666,7 @@ pub async fn pause_occurrence(
     user_id: &str,
     id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<OccurrenceResponse, AgendaError> {
     let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
     match occurrence.status.as_str() {
@@ -1682,6 +1689,7 @@ pub async fn pause_occurrence(
                         occurrence.google_event_id.as_deref().expect("checked above"),
                         now_unix,
                         category_repo,
+                        notify,
                     )
                     .await?;
                 }
@@ -1764,6 +1772,7 @@ async fn exit_occurrence(
     id: &str,
     now_unix: i64,
     target_status: &str,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<OccurrenceResponse, AgendaError> {
     let occurrence = load_occurrence_for_user(occurrence_repo, routine_repo, user_id, id).await?;
     if occurrence.status == target_status {
@@ -1792,6 +1801,7 @@ async fn exit_occurrence(
                 occurrence.google_event_id.as_deref().expect("checked above"),
                 now_unix,
                 category_repo,
+                notify,
             )
             .await?;
         }
@@ -1818,6 +1828,7 @@ async fn close_occurrence_event(
     google_event_id: &str,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<(), AgendaError> {
     // The cached row supplies the `start` for the invert guard; a missing
     // cache row still snaps (the guard falls back to `now`, so the PATCH is
@@ -1846,6 +1857,7 @@ async fn close_occurrence_event(
         &unix_secs_to_rfc3339(end_unix),
         now_unix,
         category_repo,
+        notify,
     )
     .await
     {
@@ -2076,6 +2088,7 @@ pub async fn run_elongate_occurrences(
     oauth: &OAuthConfig,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> ElongateReport {
     let mut report = ElongateReport::default();
     let running = match occurrences.list_in_progress().await {
@@ -2161,6 +2174,7 @@ pub async fn run_elongate_occurrences(
             &unix_secs_to_rfc3339(target_unix),
             now_unix,
             category_repo,
+            notify,
         )
         .await
         {
@@ -2408,6 +2422,7 @@ mod tests {
         UpdateTaskCategory, UpdateTaskList,
     };
     use crate::oauth::{HttpClient, HttpError};
+    use crate::realtime::{noop_notify, RecordingNotify};
     use crate::routines::{
         create_routine, delete_routine, occurrence_dates, update_routine, DeleteRoutineResponse,
         RoutineResponse, RoutinesError,
@@ -4589,6 +4604,7 @@ mod tests {
             user_id,
             id,
             NOW_UNIX,
+            noop_notify(),
         ))
     }
 
@@ -4602,6 +4618,7 @@ mod tests {
             user_id,
             id,
             NOW_UNIX,
+            noop_notify(),
         ))
     }
 
@@ -4626,6 +4643,7 @@ mod tests {
             user_id,
             id,
             NOW_UNIX,
+            noop_notify(),
         ))
     }
 
@@ -4645,6 +4663,7 @@ mod tests {
             id,
             updates,
             NOW_UNIX,
+            noop_notify(),
         ))
     }
 
@@ -4861,6 +4880,7 @@ mod tests {
             user_id,
             id,
             NOW_UNIX,
+            noop_notify(),
         ))
     }
 
@@ -7647,6 +7667,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7733,6 +7754,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7797,6 +7819,7 @@ mod tests {
             "u-1",
             "occ-1",
             evening,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(
@@ -7822,6 +7845,7 @@ mod tests {
             "u-1",
             "occ-1",
             evening,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.occurrence.status, OCCURRENCE_STATUS_IN_PROGRESS);
@@ -7966,6 +7990,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7997,6 +8022,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(
@@ -8083,6 +8109,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8155,6 +8182,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8224,6 +8252,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8286,6 +8315,7 @@ mod tests {
             "u-1",
             "occ-1",
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8324,6 +8354,7 @@ mod tests {
                 title: Some("Fajr Chips".to_string()),
             },
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8362,6 +8393,7 @@ mod tests {
                 title: Some("Fajr Chips".to_string()),
             },
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8396,6 +8428,7 @@ mod tests {
                 title: Some("Fajr Chips".to_string()),
             },
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8434,6 +8467,7 @@ mod tests {
                 title: Some("Fajr Qadha".to_string()),
             },
             NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8457,6 +8491,7 @@ mod tests {
         calendars: &FakeCalendarRepo,
         events: &FakeEventRepo,
         occurrences: &FakeOccurrenceRepo,
+        notify: &dyn crate::realtime::RealtimeNotify,
     ) -> ElongateReport {
         pollster::block_on(run_elongate_occurrences(
             http,
@@ -8468,6 +8503,7 @@ mod tests {
             &oauth_config(),
             elongate_now(),
             &FakeTaskCategoryRepo::new(),
+            notify,
         ))
     }
 
@@ -8514,11 +8550,28 @@ mod tests {
         ))
         .unwrap();
 
-        let report = elongate(&http, &calendars, &events, &repos.occurrences);
+        let notify = RecordingNotify::new();
+        let report = elongate(
+            &http,
+            &calendars,
+            &events,
+            &repos.occurrences,
+            &notify,
+        );
 
         assert_eq!(report.occurrences_elongated, 1);
         assert_eq!(report.elongated, 0, "task counter untouched");
         assert!(report.errors.is_empty());
+        // The journaled PATCH's success tail notifies open clients exactly
+        // once — proof the port is threaded through the */2 cron rather than
+        // dropped as a no-op inside `run_elongate_occurrences`.
+        assert_eq!(
+            *notify.calls.lock().unwrap(),
+            vec![(
+                "u-1".to_string(),
+                Some("cal-primary@example.com".to_string())
+            )]
+        );
         let patches = http.patches.lock().unwrap();
         assert_eq!(patches.len(), 1);
         let body: serde_json::Value = serde_json::from_str(&patches[0].1).unwrap();
@@ -8570,7 +8623,7 @@ mod tests {
         ))
         .unwrap();
 
-        let report = elongate(&http, &calendars, &events, &repos.occurrences);
+        let report = elongate(&http, &calendars, &events, &repos.occurrences, noop_notify());
 
         assert_eq!(report.occurrences_elongated, 0);
         assert_eq!(report.skipped, 1, "never shrink");
@@ -8587,7 +8640,7 @@ mod tests {
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
 
-        let report = elongate(&http, &calendars, &events, &repos.occurrences);
+        let report = elongate(&http, &calendars, &events, &repos.occurrences, noop_notify());
 
         assert_eq!(report.occurrences_elongated, 0);
         assert_eq!(report.skipped, 1);

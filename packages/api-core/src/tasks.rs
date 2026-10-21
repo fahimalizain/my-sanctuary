@@ -1238,6 +1238,7 @@ pub async fn delete_task(
     now_rfc3339: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<DeleteTaskResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(id).await? else {
         return Err(TasksError::NotFound);
@@ -1264,6 +1265,7 @@ pub async fn delete_task(
                 id,
                 now_unix,
                 category_repo,
+                notify,
             )
             .await?;
         }
@@ -1373,6 +1375,7 @@ pub async fn start_task(
     task_id: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -1420,6 +1423,7 @@ pub async fn start_task(
         ),
         now_unix,
         category_repo,
+        notify,
     )
     .await?;
     let event = output.event;
@@ -1487,10 +1491,11 @@ pub async fn stop_task(
     task_id: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-        user_id, task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true, agenda_repo,
+        user_id, task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, true, agenda_repo, notify,
     )
     .await
 }
@@ -1522,10 +1527,11 @@ pub async fn pause_task(
     task_id: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     stop_or_pause(
         http, calendars, events, operations, category_repo, task_repo, logs, users, access,
-        user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true, agenda_repo,
+        user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, true, agenda_repo, notify,
     )
     .await
 }
@@ -1555,11 +1561,12 @@ pub async fn complete_task(
     task_id: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         Some(http), calendars, events, operations, category_repo, task_repo, logs, users,
         Some(access), user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED,
-        true, agenda_repo,
+        true, agenda_repo, notify,
     )
     .await
 }
@@ -1590,11 +1597,12 @@ pub async fn discard_task(
     task_id: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     complete_or_discard(
         Some(http), calendars, events, operations, category_repo, task_repo, logs, users,
         Some(access), user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED,
-        true, agenda_repo,
+        true, agenda_repo, notify,
     )
     .await
 }
@@ -1634,6 +1642,7 @@ async fn stop_or_pause(
     target_status: &str,
     place: bool,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -1660,6 +1669,7 @@ async fn stop_or_pause(
         task_id,
         now_unix,
         category_repo,
+        notify,
     )
     .await?;
 
@@ -1800,6 +1810,7 @@ async fn complete_or_discard(
     log_type: &str,
     place: bool,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<TaskActionResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -1844,6 +1855,7 @@ async fn complete_or_discard(
             task_id,
             now_unix,
             category_repo,
+            notify,
         )
         .await?;
         if is_focused {
@@ -1978,6 +1990,7 @@ async fn stop_running_event(
     task_id: &str,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<(Option<CalendarEvent>, String, Option<String>, Option<String>), TasksError> {
     let snapped_rfc3339 = unix_secs_to_rfc3339(nearest_minute_unix(now_unix));
     let Some(found) = latest_started_event(logs, events, task_id).await? else {
@@ -2002,6 +2015,7 @@ async fn stop_running_event(
         &end_rfc3339,
         now_unix,
         category_repo,
+        notify,
     )
     .await
     {
@@ -2081,6 +2095,7 @@ pub async fn run_elongate_cron(
     oauth: &OAuthConfig,
     now_unix: i64,
     category_repo: &dyn TaskCategoryRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> ElongateReport {
     let mut report = ElongateReport::default();
     let running = match tasks.list_in_progress().await {
@@ -2155,6 +2170,7 @@ pub async fn run_elongate_cron(
             &unix_secs_to_rfc3339(target_unix),
             now_unix,
             category_repo,
+            notify,
         )
         .await
         {
@@ -2236,6 +2252,7 @@ async fn dispatch_matrix_action(
     to: &str,
     now_unix: i64,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<Option<CalendarEvent>, TasksError> {
     // `to == IN_PROGRESS` is always start. Same-status cells never dispatch
     // here — the caller runs them as no-ops/reorders — so `from` is never
@@ -2245,7 +2262,7 @@ async fn dispatch_matrix_action(
             let (http, access) = require_google(http, access)?;
             start_task(
                 http, calendars, events, operations, list_repo, category_repo, task_repo, logs,
-                access, user_id, task_id, now_unix, agenda_repo,
+                access, user_id, task_id, now_unix, agenda_repo, notify,
             )
             .await
             .map(|response| response.event)
@@ -2259,7 +2276,7 @@ async fn dispatch_matrix_action(
             stop_or_pause(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_LOG_STOPPED, TASK_STATUS_OPEN, false,
-                agenda_repo,
+                agenda_repo, notify,
             )
             .await
             .map(|response| response.event)
@@ -2269,7 +2286,7 @@ async fn dispatch_matrix_action(
             stop_or_pause(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
-                agenda_repo,
+                agenda_repo, notify,
             )
             .await
             .map(|response| response.event)
@@ -2339,7 +2356,7 @@ async fn dispatch_matrix_action(
             complete_or_discard(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_STATUS_COMPLETED, TASK_LOG_COMPLETED, false,
-                agenda_repo,
+                agenda_repo, notify,
             )
             .await
             .map(|response| response.event)
@@ -2348,7 +2365,7 @@ async fn dispatch_matrix_action(
             complete_or_discard(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_STATUS_DISCARDED, TASK_LOG_DISCARDED, false,
-                agenda_repo,
+                agenda_repo, notify,
             )
             .await
             .map(|response| response.event)
@@ -2507,6 +2524,7 @@ pub async fn move_task(
     now_unix: i64,
     input: &MoveTaskInput,
     agenda_repo: &dyn AgendaItemRepo,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<MoveTaskResponse, TasksError> {
     if !is_valid_task_status(&input.status) {
         return Err(TasksError::Invalid("unknown task status".to_string()));
@@ -2581,7 +2599,7 @@ pub async fn move_task(
         };
         let event = dispatch_matrix_action(
             http, calendars, events, operations, list_repo, category_repo, task_repo, logs, users,
-            access, user_id, task_id, &task.status, &input.status, now_unix, agenda_repo,
+            access, user_id, task_id, &task.status, &input.status, now_unix, agenda_repo, notify,
         )
         .await?;
         let row = place_at(task_repo, user_id, task_id, &input.status, rank).await?;
@@ -2639,6 +2657,7 @@ async fn create_focus_segment(
     task: &Task,
     focused: bool,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<CalendarEvent, TasksError> {
     let t_unix = nearest_minute_unix(now_unix);
     let start_rfc3339 = unix_secs_to_rfc3339(t_unix);
@@ -2677,6 +2696,7 @@ async fn create_focus_segment(
         ),
         now_unix,
         category_repo,
+        notify,
     )
     .await?;
     Ok(output.event)
@@ -2716,6 +2736,7 @@ pub async fn focus_task(
     user_id: &str,
     task_id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<FocusTaskResponse, TasksError> {
     let Some(task) = task_repo.get_by_id(task_id).await? else {
         return Err(TasksError::NotFound);
@@ -2771,6 +2792,7 @@ pub async fn focus_task(
             &a.id,
             now_unix,
             category_repo,
+            notify,
         )
         .await?;
     }
@@ -2779,7 +2801,7 @@ pub async fn focus_task(
     //    already-focused/no-chip path, which falls through here).
     let b_prime = create_focus_segment(
         http, calendars, events, operations, logs, access, &taxonomy, category_repo, user_id,
-        &task, true, now_unix,
+        &task, true, now_unix, notify,
     )
     .await?;
     created.push(b_prime.clone());
@@ -2795,7 +2817,7 @@ pub async fn focus_task(
     if let Some(a) = &previous {
         let a_prime = create_focus_segment(
             http, calendars, events, operations, logs, access, &taxonomy, category_repo, user_id,
-            a, false, now_unix,
+            a, false, now_unix, notify,
         )
         .await?;
         created.push(a_prime.clone());
@@ -2827,6 +2849,7 @@ pub async fn focus_task(
             task_id,
             now_unix,
             category_repo,
+            notify,
         )
         .await?;
     }
@@ -2880,6 +2903,7 @@ pub async fn delete_focus(
     access: &GoogleAccess,
     user_id: &str,
     now_unix: i64,
+    notify: &dyn crate::realtime::RealtimeNotify,
 ) -> Result<FocusTaskResponse, TasksError> {
     let Some(user) = users.get_by_id(user_id).await? else {
         return Ok(FocusTaskResponse {
@@ -2926,11 +2950,12 @@ pub async fn delete_focus(
         &task.id,
         now_unix,
         category_repo,
+        notify,
     )
     .await?;
     let b_prime = create_focus_segment(
         http, calendars, events, operations, logs, access, &taxonomy, category_repo, user_id,
-        &task, false, now_unix,
+        &task, false, now_unix, notify,
     )
     .await?;
     users
@@ -3246,6 +3271,7 @@ mod tests {
         UpdateTaskList, User,
     };
     use crate::oauth::{HttpClient, HttpError};
+    use crate::realtime::{noop_notify, RecordingNotify};
     use crate::repo::{
         CalendarEventRepo, CalendarRepo, TaskCategoryRepo, TaskLogRepo, TokenRepo, UserRepo,
     };
@@ -4952,6 +4978,7 @@ mod tests {
         let response = pollster::block_on(delete_task(
             None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users, None,
             &tasks, "u-1", &created.id, "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert!(response.success);
@@ -4964,6 +4991,7 @@ mod tests {
             pollster::block_on(delete_task(
                 None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users,
                 None, &tasks, "u-1", &created.id, "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -4985,6 +5013,7 @@ mod tests {
             pollster::block_on(delete_task(
                 None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users,
                 None, &tasks, "u-2", &created.id, "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -4992,6 +5021,7 @@ mod tests {
             pollster::block_on(delete_task(
                 None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users,
                 None, &tasks, "u-1", "nope", "2026-08-18T02:00:00Z", NOW_UNIX, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -6168,6 +6198,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6256,6 +6287,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6295,6 +6327,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6321,6 +6354,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6360,6 +6394,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6406,6 +6441,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6458,6 +6494,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6507,6 +6544,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6555,6 +6593,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6614,6 +6653,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6660,6 +6700,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6699,6 +6740,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6743,6 +6785,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
@@ -6771,6 +6814,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let (url, _) = http.posts.lock().unwrap().first().unwrap().clone();
@@ -6793,6 +6837,7 @@ mod tests {
         let err = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(m) if m == "no writable calendar"));
@@ -6828,6 +6873,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &first.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6840,6 +6886,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &second.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.id, second.id);
@@ -6876,6 +6923,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6883,6 +6931,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.id, task.id);
@@ -6921,6 +6970,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &second.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
@@ -6955,6 +7005,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -6983,6 +7034,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7006,6 +7058,7 @@ mod tests {
             pollster::block_on(start_task(
                 &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
                 &access(), "u-2", &task.id, NOW_UNIX, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -7013,6 +7066,7 @@ mod tests {
             pollster::block_on(start_task(
                 &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
                 &access(), "u-1", "nope", NOW_UNIX, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -7030,6 +7084,7 @@ mod tests {
         let err = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::GoogleApi(_)), "got {err:?}");
@@ -7061,6 +7116,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7074,6 +7130,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7110,6 +7167,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7124,6 +7182,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7152,6 +7211,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7185,6 +7245,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7205,6 +7266,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7236,6 +7298,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7249,6 +7312,7 @@ mod tests {
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7267,6 +7331,7 @@ mod tests {
         let restarted = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, pause_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(restarted.task.status, TASK_STATUS_IN_PROGRESS);
@@ -7286,6 +7351,7 @@ mod tests {
         let err = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::Invalid(_)), "got {err:?}");
@@ -7313,6 +7379,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &a.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7341,6 +7408,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7377,6 +7445,7 @@ mod tests {
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7409,6 +7478,7 @@ mod tests {
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7441,6 +7511,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7453,6 +7524,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, complete_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7504,6 +7576,7 @@ mod tests {
         pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(
@@ -7523,6 +7596,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, complete_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7574,6 +7648,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7604,6 +7679,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7628,12 +7704,14 @@ mod tests {
         pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         // Second complete: no-op, still 200.
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
@@ -7659,6 +7737,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7688,6 +7767,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
@@ -7717,6 +7797,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7729,6 +7810,7 @@ mod tests {
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, discard_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7760,6 +7842,7 @@ mod tests {
         pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, pause_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(
@@ -7777,6 +7860,7 @@ mod tests {
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, discard_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7809,6 +7893,7 @@ mod tests {
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7832,16 +7917,19 @@ mod tests {
         let complete_other = complete_task(
             &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-2",
             &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         );
         assert!(matches!(pollster::block_on(complete_other), Err(TasksError::NotFound)));
         let discard_other = discard_task(
             &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-2",
             &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         );
         assert!(matches!(pollster::block_on(discard_other), Err(TasksError::NotFound)));
         let complete_missing = complete_task(
             &http, &calendars, &events, &ops, &categories, &tasks, &logs, &users, &access, "u-1",
             "nope", NOW_UNIX, &agenda,
+            noop_notify(),
         );
         assert!(matches!(pollster::block_on(complete_missing), Err(TasksError::NotFound)));
     }
@@ -7884,6 +7972,7 @@ mod tests {
         pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), lists, categories, tasks, &logs, &users,
             &access(), "u-1", task_id, focus_unix,
+            noop_notify(),
         ))
         .unwrap();
         (http, calendars, events, logs, users)
@@ -7902,6 +7991,7 @@ mod tests {
         let err = pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(
@@ -7925,6 +8015,7 @@ mod tests {
             pollster::block_on(focus_task(
                 &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
                 &access(), "u-2", &task.id, NOW_UNIX,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -7932,6 +8023,7 @@ mod tests {
             pollster::block_on(focus_task(
                 &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
                 &access(), "u-1", "nope", NOW_UNIX,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -7952,6 +8044,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_start, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -7978,6 +8071,7 @@ mod tests {
         let response = pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, focus_unix,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8061,6 +8155,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_start, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8088,6 +8183,7 @@ mod tests {
         pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, focus_unix,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8113,6 +8209,7 @@ mod tests {
         let response = pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, NOW_UNIX + 600,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8156,6 +8253,7 @@ mod tests {
         let response = pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, repair_unix,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8199,6 +8297,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_a, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &a.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let http_b = FakeHttp::new(vec![(
@@ -8209,6 +8308,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8240,6 +8340,7 @@ mod tests {
         let response = pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, switch_unix,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8321,6 +8422,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_a, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &a.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let http_b = FakeHttp::new(vec![(
@@ -8331,6 +8433,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let users = FakeUserRepo::focused(&a.id);
@@ -8346,6 +8449,7 @@ mod tests {
         let err = pollster::block_on(focus_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, switch_unix,
+            noop_notify(),
         ))
         .unwrap_err();
         assert!(matches!(err, TasksError::GoogleApi(_)), "got {err:?}");
@@ -8381,6 +8485,7 @@ mod tests {
         let response = pollster::block_on(delete_focus(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", delete_unix,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8446,6 +8551,7 @@ mod tests {
         let response = pollster::block_on(delete_focus(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", delete_unix,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8478,6 +8584,7 @@ mod tests {
         let response = pollster::block_on(delete_focus(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", NOW_UNIX,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8506,6 +8613,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8548,6 +8656,7 @@ mod tests {
         pollster::block_on(focus_task(
             &focus_http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             &access(), "u-1", &a.id, focus_unix,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(users.pointer().as_deref(), Some(a.id.as_str()));
@@ -8560,6 +8669,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, focus_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8573,6 +8683,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &stop_http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &b.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -8612,6 +8723,7 @@ mod tests {
             &task.id,
             "2023-11-14T22:23:20Z",
             delete_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -8669,10 +8781,11 @@ mod tests {
         tasks: &FakeTaskRepo,
         tokens: &FakeTokenRepo,
         now_unix: i64,
+        notify: &dyn crate::realtime::RealtimeNotify,
     ) -> ElongateReport {
         pollster::block_on(run_elongate_cron(
             http, calendars, events, &ops(), logs, tasks, tokens, &oauth_config(), now_unix,
-            &FakeTaskCategoryRepo::new(),
+            &FakeTaskCategoryRepo::new(), notify,
         ))
     }
 
@@ -8691,11 +8804,24 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
         )]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let notify = RecordingNotify::new();
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, &notify,
+        );
 
         assert_eq!(report.elongated, 1);
         assert_eq!(report.skipped, 0);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // The journaled PATCH's success tail notifies open clients exactly
+        // once — proof the port is threaded through the */2 cron rather than
+        // dropped as a no-op inside `run_elongate_cron`.
+        assert_eq!(
+            *notify.calls.lock().unwrap(),
+            vec![(
+                "u-1".to_string(),
+                Some("cal-primary@example.com".to_string())
+            )]
+        );
         // now 22:13:20 + 5 min = 22:18:20 → ceil 22:20:00Z, persisted UTC Z.
         let (url, body) = http.patches.lock().unwrap().first().unwrap().clone();
         assert!(url.contains("primary%40example.com/events/g-1"), "{url}");
@@ -8722,12 +8848,19 @@ mod tests {
         // No routes: any HTTP call would panic "no route for …".
         let http = FakeHttp::new(vec![]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let notify = RecordingNotify::new();
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, &notify,
+        );
 
         assert_eq!(report.elongated, 0);
         assert_eq!(report.skipped, 1);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(http.patches.lock().unwrap().is_empty(), "no PATCH");
+        assert!(
+            notify.calls.lock().unwrap().is_empty(),
+            "a skipped elongate (never-shrink) writes nothing, so it hints nothing"
+        );
         assert_eq!(
             pollster::block_on(tasks.get_by_id(&task.id)).unwrap().unwrap().status,
             TASK_STATUS_IN_PROGRESS
@@ -8745,7 +8878,9 @@ mod tests {
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
         let http = FakeHttp::new(vec![]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 0);
         assert_eq!(report.skipped, 1, "never shrink");
@@ -8770,7 +8905,9 @@ mod tests {
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
         let http = FakeHttp::new(vec![]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 0);
         assert_eq!(report.skipped, 1);
@@ -8797,7 +8934,9 @@ mod tests {
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
         let http = FakeHttp::new(vec![]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 0);
         assert_eq!(report.skipped, 1);
@@ -8818,7 +8957,9 @@ mod tests {
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
         let http = FakeHttp::new(vec![]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 0);
         assert_eq!(report.skipped, 1);
@@ -8837,7 +8978,9 @@ mod tests {
         let tokens = FakeTokenRepo::with(vec![fresh_token("u-1", "at-1")]);
         let http = FakeHttp::new(vec![("/events/g-1", 404, r#"{"error":"not found"}"#)]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 0);
         assert_eq!(report.skipped, 1, "404 is a skip, not an error");
@@ -8865,7 +9008,9 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
         )]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 1);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -8890,7 +9035,9 @@ mod tests {
             &patched_event_json(&task.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
         )]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 1, "empty TZ behaves as UTC");
         let (_, body) = http.patches.lock().unwrap().first().unwrap().clone();
@@ -8943,7 +9090,9 @@ mod tests {
             &patched_event_json_for("g-2", &task_b.id, NOW_SNAPPED, "2023-11-14T22:20:00Z"),
         )]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 1, "u-2's event extended despite u-1's failure");
         assert_eq!(report.skipped, 0);
@@ -9017,7 +9166,9 @@ mod tests {
             ),
         ]);
 
-        let report = elongate(&http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX);
+        let report = elongate(
+            &http, &calendars, &events, &logs, &tasks, &tokens, NOW_UNIX, noop_notify(),
+        );
 
         assert_eq!(report.elongated, 2, "both IN_PROGRESS rows grow");
         assert_eq!(report.skipped, 0);
@@ -9064,6 +9215,7 @@ mod tests {
                 sort_order,
             },
             agenda,
+            noop_notify(),
         ))
     }
 
@@ -9088,6 +9240,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), lists, categories, tasks, &logs,
             &access(), "u-1", task_id, NOW_UNIX, agenda,
+            noop_notify(),
         ))
         .unwrap();
         (http, calendars, events, logs)
@@ -9287,6 +9440,7 @@ mod tests {
                 status: TASK_STATUS_PLANNED.to_string(),
                 sort_order: Some(0),
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -9330,6 +9484,7 @@ mod tests {
                 status: TASK_STATUS_OPEN.to_string(),
                 sort_order: Some(4),
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -9361,6 +9516,7 @@ mod tests {
         pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(
@@ -9394,6 +9550,7 @@ mod tests {
                 status: TASK_STATUS_COMPLETED.to_string(),
                 sort_order: Some(0),
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -9426,6 +9583,7 @@ mod tests {
         pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &second.id, stop_unix, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -9451,6 +9609,7 @@ mod tests {
                 status: TASK_STATUS_COMPLETED.to_string(),
                 sort_order: Some(0),
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
@@ -9495,6 +9654,7 @@ mod tests {
                 status: TASK_STATUS_COMPLETED.to_string(),
                 sort_order: Some(0),
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -9545,6 +9705,7 @@ mod tests {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
                 sort_order: Some(0),
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.id, second.id);
@@ -9638,6 +9799,7 @@ mod tests {
                 status: TASK_STATUS_IN_PROGRESS.to_string(),
                 sort_order: None,
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.id, task.id);
@@ -9668,6 +9830,7 @@ mod tests {
         pollster::block_on(start_task(
             &http_b, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &b.id, NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let a = pollster::block_on(tasks.get_by_id(&a.id)).unwrap().unwrap();
@@ -9721,6 +9884,7 @@ mod tests {
         let err = pollster::block_on(move_task(
             Some(&http), &calendars, &events, &ops(), &lists,             &categories, &tasks, &logs, &users, None,
             "u-1", &task.id, NOW_UNIX, &unknown, &agenda,
+            noop_notify(),
         ))
         .unwrap_err();
         let message = match &err {
@@ -9736,6 +9900,7 @@ mod tests {
         let err = pollster::block_on(move_task(
             Some(&http), &calendars, &events, &ops(), &lists,             &categories, &tasks, &logs, &users, None,
             "u-1", &task.id, NOW_UNIX, &negative, &agenda,
+            noop_notify(),
         ))
         .unwrap_err();
         let message = match &err {
@@ -9765,6 +9930,7 @@ mod tests {
             pollster::block_on(move_task(
                 Some(&http), &calendars, &events, &ops(), &lists,                 &categories, &tasks, &logs, &users,
                 None, "u-2", &task.id, NOW_UNIX, &input, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -9772,6 +9938,7 @@ mod tests {
             pollster::block_on(move_task(
                 Some(&http), &calendars, &events, &ops(), &lists,                 &categories, &tasks, &logs, &users,
                 None, "u-1", "nope", NOW_UNIX, &input, &agenda,
+                noop_notify(),
             )),
             Err(TasksError::NotFound)
         ));
@@ -9906,6 +10073,7 @@ mod tests {
                 status: TASK_STATUS_PLANNED.to_string(),
                 sort_order: None,
             }, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -10071,6 +10239,7 @@ mod tests {
         let response = pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_COMPLETED);
@@ -10089,6 +10258,7 @@ mod tests {
         pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 2 * 86_400, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let rows = agenda.rows("u-1");
@@ -10114,6 +10284,7 @@ mod tests {
         let response = pollster::block_on(discard_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
@@ -10157,6 +10328,7 @@ mod tests {
                 sort_order: Some(0),
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -10170,6 +10342,7 @@ mod tests {
                 sort_order: Some(0),
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
@@ -10209,6 +10382,7 @@ mod tests {
                 sort_order: Some(0),
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
@@ -10242,6 +10416,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
@@ -10272,6 +10447,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -10297,6 +10473,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
 
@@ -10308,6 +10485,7 @@ mod tests {
         let response = pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert!(response.event.is_none(), "no second event");
@@ -10339,6 +10517,7 @@ mod tests {
                 sort_order: Some(0),
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
@@ -10354,6 +10533,7 @@ mod tests {
                 sort_order: Some(1),
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.sort_order, 1);
@@ -10386,6 +10566,7 @@ mod tests {
                 sort_order: Some(0),
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -10413,6 +10594,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let row = agenda.rows("u-1").pop().unwrap();
@@ -10426,6 +10608,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 300, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN, "stop still lands OPEN");
@@ -10453,6 +10636,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let patch = FakeHttp::new(vec![(
@@ -10463,6 +10647,7 @@ mod tests {
         pollster::block_on(stop_task(
             &patch, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 300, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let row = agenda.rows("u-1").pop().unwrap();
@@ -10474,6 +10659,7 @@ mod tests {
         let response = pollster::block_on(stop_task(
             &patch, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 600, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -10500,6 +10686,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let row = agenda.rows("u-1").pop().unwrap();
@@ -10521,6 +10708,7 @@ mod tests {
                 sort_order: None,
             },
             &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
@@ -10547,6 +10735,7 @@ mod tests {
         pollster::block_on(start_task(
             &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         let row = agenda.rows("u-1").pop().unwrap();
@@ -10562,6 +10751,7 @@ mod tests {
         let response = pollster::block_on(pause_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 300, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED, "pause still lands PLANNED");
@@ -10589,6 +10779,7 @@ mod tests {
         let response = pollster::block_on(delete_task(
             None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users, None,
             &tasks, "u-1", &task.id, "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert!(response.success);
@@ -10606,6 +10797,7 @@ mod tests {
         let response = pollster::block_on(delete_task(
             None, &calendars, &events, &ops(), &FakeTaskCategoryRepo::new(), &logs, &users, None,
             &tasks, "u-1", &second.id, "2026-08-23T10:00:00Z", AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
         ))
         .unwrap();
         assert!(response.success);
