@@ -619,6 +619,52 @@ export function formatDayRangeTitle(first: Date, last: Date): string {
   return `${MONTH_SHORT[sm]} ${sd}, ${sy} – ${MONTH_SHORT[em]} ${ed}, ${ey}`;
 }
 
+// ── ISO 8601 week numbers ───────────────────────────────────────────────
+
+/**
+ * ISO 8601 week-numbering year and week (1–53) for the local civil date.
+ *
+ * Week 1 is the week containing the first Thursday of the year; weeks run
+ * Monday…Sunday, matching `startOfWeek` / `WEEK_DAYS`. The civil Y-M-D is
+ * copied into `Date.UTC` first so a DST transition can never shift the day.
+ */
+export function isoWeek(date: Date): { weekYear: number; week: number } {
+  const d = new Date(
+    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()),
+  );
+  // Thursday is day 4 of the ISO week: moving there lands in the week-year the
+  // week belongs to (this is what makes Jan 1 sometimes belong to the week 53
+  // of the previous year).
+  const jsDay = d.getUTCDay(); // 0 = Sun … 6 = Sat
+  d.setUTCDate(d.getUTCDate() + 4 - (jsDay === 0 ? 7 : jsDay));
+  const weekYear = d.getUTCFullYear();
+  const yearStartMs = Date.UTC(weekYear, 0, 1);
+  const week = Math.ceil(((d.getTime() - yearStartMs) / 86_400_000 + 1) / 7);
+  return { weekYear, week };
+}
+
+/** ISO week number (1–53) for the local civil date. */
+export function isoWeekNumber(date: Date): number {
+  return isoWeek(date).week;
+}
+
+/**
+ * Label for an inclusive civil-day range. Callers pass the visible period
+ * (1–7 contiguous days). Endpoints are enough: a span that long covers at
+ * most two ISO weeks.
+ *   same ISO week (number AND week-year) → "Week 43"
+ *   otherwise, chronological → "Week 43–44" or, across New Year, "Week 52–1"
+ *     (also "Week 53–1")
+ */
+export function formatWeekLabel(first: Date, last: Date): string {
+  const start = isoWeek(first);
+  const end = isoWeek(last);
+  if (start.weekYear === end.weekYear && start.week === end.week) {
+    return `Week ${start.week}`;
+  }
+  return `Week ${start.week}–${end.week}`;
+}
+
 /** Hour gutter label: 1AM…11PM. Hour 0 returns empty (Notion has no midnight label). */
 export function formatHourLabel(hour0to23: number): string {
   if (hour0to23 <= 0 || hour0to23 > 23) return '';

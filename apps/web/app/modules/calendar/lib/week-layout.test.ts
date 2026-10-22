@@ -36,6 +36,7 @@ import {
   eventTopPx,
   fitPeriodStart,
   formatDayRangeTitle,
+  formatWeekLabel,
   applyStartDate,
   applyEndTime,
   applyStartTime,
@@ -50,6 +51,8 @@ import {
   isCompactChip,
   isMultiDay,
   isStripWidthMeasured,
+  isoWeek,
+  isoWeekNumber,
   monthGridDays,
   monthGridStart,
   nowLineY,
@@ -1624,4 +1627,80 @@ test('applyAllDayStartDate: shifts exclusive end by same day delta', () => {
   assert.ok(next);
   assert.equal(next!.startIso, '2026-09-15T00:00:00Z');
   assert.equal(next!.endIso, '2026-09-16T00:00:00Z');
+});
+
+// ── ISO 8601 week numbers ───────────────────────────────────────────────
+
+test('isoWeek: Thu 1 Jan 2026 is week 1 of 2026', () => {
+  assert.deepEqual(isoWeek(new Date(2026, 0, 1)), { weekYear: 2026, week: 1 });
+});
+
+test('isoWeek: Mon 29 Dec 2025 belongs to week 1 of 2026', () => {
+  assert.deepEqual(isoWeek(new Date(2025, 11, 29)), {
+    weekYear: 2026,
+    week: 1,
+  });
+});
+
+test('isoWeek: Sun 28 Dec 2025 is week 52 of 2025', () => {
+  assert.deepEqual(isoWeek(new Date(2025, 11, 28)), {
+    weekYear: 2025,
+    week: 52,
+  });
+});
+
+test('isoWeek: Thu 31 Dec 2026 is week 53 of 2026', () => {
+  assert.deepEqual(isoWeek(new Date(2026, 11, 31)), {
+    weekYear: 2026,
+    week: 53,
+  });
+});
+
+test('isoWeek: Fri 1 Jan 2027 still belongs to week 53 of 2026', () => {
+  assert.deepEqual(isoWeek(new Date(2027, 0, 1)), { weekYear: 2026, week: 53 });
+});
+
+test('isoWeek: Fri 1 Jan 2021 belongs to week 53 of 2020', () => {
+  assert.deepEqual(isoWeek(new Date(2021, 0, 1)), { weekYear: 2020, week: 53 });
+});
+
+test('isoWeekNumber: Thu 22 Oct 2026 is 43', () => {
+  assert.equal(isoWeekNumber(new Date(2026, 9, 22)), 43);
+});
+
+test('formatWeekLabel: Mon 19 – Fri 23 Oct 2026 is Week 43', () => {
+  const label = formatWeekLabel(new Date(2026, 9, 19), new Date(2026, 9, 23));
+  assert.equal(label, 'Week 43');
+});
+
+test('formatWeekLabel: a range crossing Sunday reads Week 43–44', () => {
+  // Thu 22 Oct 2026 – Mon 26 Oct 2026 spans the Sunday boundary.
+  const label = formatWeekLabel(new Date(2026, 9, 22), new Date(2026, 9, 26));
+  assert.equal(label, 'Week 43–44');
+});
+
+test('formatWeekLabel: a single civil day is its own week', () => {
+  assert.equal(
+    formatWeekLabel(new Date(2026, 8, 8), new Date(2026, 8, 8)),
+    'Week 37',
+  );
+});
+
+test('formatWeekLabel: Dec 28 2026 – Jan 3 2027 is one ISO week, Week 53', () => {
+  // The week of Mon Dec 28 2026 runs to Sun Jan 3 2027 and is week 53 of 2026:
+  // both endpoints share the ISO week, so no range is emitted at all.
+  const label = formatWeekLabel(new Date(2026, 11, 28), new Date(2027, 0, 3));
+  assert.equal(label, 'Week 53');
+});
+
+test('formatWeekLabel: New Year boundary reads Week 53–1, never Week 53–54', () => {
+  // Tue 29 Dec 2026 (week 53 of 2026) – Mon 4 Jan 2027 (week 1 of 2027).
+  const label = formatWeekLabel(new Date(2026, 11, 29), new Date(2027, 0, 4));
+  assert.equal(label, 'Week 53–1');
+});
+
+test('formatWeekLabel: another New Year boundary reads Week 52–1', () => {
+  // Tue 28 Dec 2021 (week 52 of 2021) – Mon 3 Jan 2022 (week 1 of 2022).
+  const label = formatWeekLabel(new Date(2021, 11, 28), new Date(2022, 0, 3));
+  assert.equal(label, 'Week 52–1');
 });
