@@ -147,6 +147,7 @@ export function CalendarPage() {
     <div className="h-[100dvh] bg-cream flex flex-col">
       <CalendarHeader
         rangeTitle={strip.rangeTitle}
+        weekLabel={strip.weekLabel}
         isRefreshing={session.isRefreshing}
         periodLength={strip.periodLength}
         onPeriodChange={strip.handlePeriodChange}

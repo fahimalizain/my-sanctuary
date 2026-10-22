@@ -19,6 +19,7 @@ import {
   colWidth as computeColWidth,
   fitPeriodStart,
   formatDayRangeTitle,
+  formatWeekLabel,
   gutterWithRemainder,
   isSameDay,
   isStripWidthMeasured,
@@ -95,6 +96,8 @@ export interface CalendarStrip {
   handlePeriodChange: (n: number) => void;
   visibleStart: Date;
   rangeTitle: string;
+  /** ISO week of the visible period: "Week 43" / "Week 43–44". */
+  weekLabel: string;
   today: Date;
   days: Date[];
   dayCount: number;
@@ -168,6 +171,11 @@ export function useCalendarStrip(): CalendarStrip {
   );
   const rangeTitle = useMemo(
     () => formatDayRangeTitle(visibleStart, visibleEnd),
+    [visibleStart, visibleEnd],
+  );
+  // ISO week of the same period; a swipe across Sunday spans two weeks.
+  const weekLabel = useMemo(
+    () => formatWeekLabel(visibleStart, visibleEnd),
     [visibleStart, visibleEnd],
   );
 
@@ -948,6 +956,7 @@ export function useCalendarStrip(): CalendarStrip {
     handlePeriodChange,
     visibleStart,
     rangeTitle,
+    weekLabel,
     today,
     days,
     dayCount,

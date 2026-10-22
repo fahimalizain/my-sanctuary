@@ -4,6 +4,7 @@ import { ViewSelector } from './ViewSelector';
 
 export interface CalendarHeaderProps {
   rangeTitle: string;
+  weekLabel: string;
   isRefreshing: boolean;
   periodLength: number;
   onPeriodChange: (n: number) => void;
@@ -14,6 +15,7 @@ export interface CalendarHeaderProps {
 
 export function CalendarHeader({
   rangeTitle,
+  weekLabel,
   isRefreshing,
   periodLength,
   onPeriodChange,
@@ -23,8 +25,11 @@ export function CalendarHeader({
 }: CalendarHeaderProps) {
   return (
     <header className="h-12 shrink-0 flex items-center gap-2 px-3 sm:px-4 border-b border-border/60">
-      <h1 className="font-heading text-base sm:text-lg font-semibold text-foreground truncate min-w-0 flex-1">
-        {rangeTitle}
+      <h1 className="flex min-w-0 flex-1 items-baseline gap-2 font-heading text-base font-semibold text-foreground sm:text-lg">
+        <span className="truncate">{rangeTitle}</span>
+        <span className="shrink-0 text-sm font-normal text-muted-foreground tabular-nums">
+          {weekLabel}
+        </span>
       </h1>
 
       {isRefreshing && (
