@@ -109,6 +109,13 @@ export interface EventInspectorProps {
   onDelete: () => void | Promise<void>;
   isDeleting?: boolean;
   /**
+   * The event is local-only because its create POST failed: show the inline
+   * "Not saved" notice with a retry action.
+   */
+  isUnsaved?: boolean;
+  /** Re-POST the unsaved event as it stands now. */
+  onRetrySave?: () => void;
+  /**
    * While a drag is in progress, hide the inspector visually without
    * unmounting (unmount would call onClose and discard a draft).
    */
@@ -293,6 +300,9 @@ interface InspectorFormProps {
   onDelete: () => void | Promise<void>;
   isDeleting: boolean;
   writable: boolean;
+  /** Local-only event whose create failed: inline retry notice. */
+  isUnsaved: boolean;
+  onRetrySave?: () => void;
 }
 
 const timeInputClassName =
@@ -324,6 +334,8 @@ function InspectorForm({
   onDelete,
   isDeleting,
   writable,
+  isUnsaved,
+  onRetrySave,
 }: InspectorFormProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -429,6 +441,25 @@ function InspectorForm({
       </div>
 
       <div className="flex-1 min-h-0 space-y-3 overflow-y-auto px-3 py-3">
+        {/* A failed create never loses the event: it stays local-only and can
+            be re-POSTed from here (or from the write-error banner). */}
+        {isUnsaved ? (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-dashed border-border px-2 py-1.5">
+            <span className="text-xs text-muted-foreground">Not saved</span>
+            {onRetrySave ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-xs"
+                onClick={onRetrySave}
+              >
+                Retry
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+
         {/* Title — large, unlabeled */}
         {writable ? (
           <input
@@ -665,6 +696,8 @@ export function EventInspector({
   onSaveCalendar,
   onDelete,
   isDeleting = false,
+  isUnsaved = false,
+  onRetrySave,
   isDragging = false,
 }: EventInspectorProps) {
   const [title, setTitle] = useState(event.title);
@@ -896,6 +929,8 @@ export function EventInspector({
       onDelete={onDelete}
       isDeleting={isDeleting}
       writable={writable}
+      isUnsaved={isUnsaved}
+      onRetrySave={onRetrySave}
     />
   );
 

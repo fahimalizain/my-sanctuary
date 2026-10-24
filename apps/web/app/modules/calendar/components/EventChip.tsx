@@ -169,6 +169,8 @@ interface EventChipProps {
   dragging?: boolean;
   /** End instant already passed: title + ribbon dim, fill does not. */
   past?: boolean;
+  /** Local-only event whose create failed: dashed outline, retryable. */
+  unsaved?: boolean;
 }
 
 export const EventChip = memo(function EventChip({
@@ -179,6 +181,7 @@ export const EventChip = memo(function EventChip({
   onPointerDown,
   dragging = false,
   past = false,
+  unsaved = false,
 }: EventChipProps) {
   const {
     event,
@@ -210,7 +213,12 @@ export const EventChip = memo(function EventChip({
         'text-[var(--ev-title)] dark:text-[var(--ev-title-dark)]',
         'data-[past]:text-[var(--ev-title-dim)] dark:data-[past]:text-[var(--ev-title-dim-dark)]',
         // outline (not ring) so the selection ring stays a box-shadow.
-        '[outline-style:solid] outline-1 outline-cream',
+        'outline-1',
+        // A failed create is local-only: dashed (in a visible tone) so it
+        // reads as "not saved yet" instead of blending into real chips.
+        unsaved
+          ? 'outline-muted-foreground [outline-style:dashed]'
+          : 'outline-cream [outline-style:solid]',
         selected && 'ring-1 ring-foreground/25',
         dragging && 'opacity-40',
       )}
@@ -226,6 +234,7 @@ export const EventChip = memo(function EventChip({
       title={`${event.title} · ${timeDetail}`}
       data-event-chip
       data-event-id={event.id}
+      data-unsaved={unsaved ? '' : undefined}
       data-start-min={startMin}
       data-end-min={endMin}
       data-past={past ? '' : undefined}

@@ -1,13 +1,13 @@
-// Unit tests for the per-event PATCH chain (ordering, coalescing, revert).
+// Unit tests for the per-event PATCH chain (ordering, coalescing, no-op skip).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
 import {
-  buildDraftFlushPatch,
+  buildCreateFlushPatch,
   EventPatchQueue,
   mergeEventPatch,
-  revertFailedPatch,
+  postedFieldsFromCreate,
   toWirePatch,
   type EventPatch,
 } from './event-patch-queue';
@@ -33,9 +33,15 @@ interface Call {
   reject: (err: unknown) => void;
 }
 
-function harness() {
+function harness(
+  prepare?: (
+    id: string,
+    patch: EventPatch,
+  ) => { patch: EventPatch; skipped: EventPatch },
+) {
   const calls: Call[] = [];
   const log: string[] = [];
+  const skipped: Array<{ id: string; patch: EventPatch }> = [];
   const queue = new EventPatchQueue({
     send: (id, input) =>
       new Promise<CalendarEvent>((resolve, reject) => {
@@ -46,6 +52,10 @@ function harness() {
           reject,
         });
       }),
+    prepare,
+    onSkipped: (id, patch) => {
+      skipped.push({ id, patch });
+    },
     onSuccess: (id, sent, _ev, idle) => {
       log.push(`ok:${id}:${Object.keys(sent).join(',')}:${idle}`);
     },
@@ -53,7 +63,7 @@ function harness() {
       log.push(`err:${id}:${Object.keys(sent).join(',')}:${idle}`);
     },
   });
-  return { queue, calls, log };
+  return { queue, calls, log, skipped };
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -115,7 +125,6 @@ test('different events run in parallel', () => {
   queue.enqueue('e2', { summary: 'B' });
   assert.equal(calls.length, 2);
 });
-
 test('drag-style times patch merges with a pending inspector edit', async () => {
   const { queue, calls } = harness();
   queue.enqueue('e1', { description: 'x' });
@@ -150,37 +159,65 @@ test('failure does not stop later queued edits; idle flag is accurate', async ()
   assert.deepEqual(log, ['err:e1:summary:false', 'ok:e1:summary:true']);
 });
 
-test('revertFailedPatch: reverts failed fields not superseded by a newer edit', () => {
-  const base = makeEvent();
-  // Title still holds the failed value; description was edited afterwards.
-  const overlay = makeEvent({ title: 'A', description: 'newer' });
-  const reverted = revertFailedPatch(overlay, base, {
-    summary: 'A',
-    description: 'older',
+test('prepare: a no-op patch sends nothing and reports the skipped fields', async () => {
+  const { queue, calls, skipped, log } = harness((_id, patch) => ({
+    patch: {},
+    skipped: patch,
+  }));
+  queue.enqueue('e1', { summary: 'Same' });
+  await tick();
+
+  assert.deepEqual(calls, [], 'nothing is sent');
+  assert.deepEqual(skipped, [{ id: 'e1', patch: { summary: 'Same' } }]);
+  assert.deepEqual(log, [], 'a skipped patch is not a success');
+  assert.equal(queue.isBusy('e1'), false);
+});
+
+test('prepare: only the fields the server does not hold are sent', async () => {
+  const { queue, calls, skipped } = harness((_id, patch) => {
+    const send: EventPatch = { ...patch };
+    const drop: EventPatch = {};
+    if (send.summary === 'Same') {
+      drop.summary = send.summary;
+      delete send.summary;
+    }
+    return { patch: send, skipped: drop };
   });
-  assert.equal(reverted.title, 'Old');
-  assert.equal(reverted.description, 'newer');
+  queue.enqueue('e1', { summary: 'Same', description: 'D' });
+  await tick();
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].input, { description: 'D' });
+  assert.deepEqual(skipped, [{ id: 'e1', patch: { summary: 'Same' } }]);
 });
 
-test('revertFailedPatch: failed move restores calendar and color', () => {
-  const base = makeEvent({ color: '#111' });
-  const overlay = makeEvent({ calendar_id: 'cal-2', color: '#222' });
-  const reverted = revertFailedPatch(overlay, base, { calendar_id: 'cal-2' });
-  assert.equal(reverted.calendar_id, 'cal-1');
-  assert.equal(reverted.color, '#111');
+test('prepare: a skipped field patch still drains the queued calendar move', async () => {
+  const { queue, calls } = harness((_id, patch) => {
+    const send: EventPatch = { ...patch };
+    const drop: EventPatch = {};
+    if (send.summary === 'Same') {
+      drop.summary = send.summary;
+      delete send.summary;
+    }
+    if (send.calendar_id === 'cal-1') {
+      drop.calendar_id = send.calendar_id;
+      delete send.calendar_id;
+    }
+    return { patch: send, skipped: drop };
+  });
+  queue.enqueue('e1', { summary: 'Same', calendar_id: 'cal-1' });
+  await tick();
+
+  // Both are no-ops: the field request is skipped, the move is skipped, and
+  // the chain is idle rather than stuck.
+  assert.deepEqual(calls, []);
+  assert.equal(queue.isBusy('e1'), false);
 });
 
-test('revertFailedPatch: superseded failure leaves the overlay alone', () => {
-  const base = makeEvent();
-  const overlay = makeEvent({ title: 'B' });
-  const reverted = revertFailedPatch(overlay, base, { summary: 'A' });
-  assert.equal(reverted.title, 'B');
-});
-
-test('buildDraftFlushPatch: null when nothing changed since create', () => {
+test('buildCreateFlushPatch: null when nothing changed since create', () => {
   const local = makeEvent({ title: 'T', description: '' });
   assert.equal(
-    buildDraftFlushPatch({
+    buildCreateFlushPatch({
       posted: {
         summary: 'T',
         description: '',
@@ -194,14 +231,14 @@ test('buildDraftFlushPatch: null when nothing changed since create', () => {
   );
 });
 
-test('buildDraftFlushPatch: collects title, times, zone and move', () => {
+test('buildCreateFlushPatch: collects title, times, zone and move', () => {
   const local = makeEvent({
     title: 'Renamed',
     end_time: '2026-09-13T07:00:00.000Z',
     start_time_zone: 'UTC',
     calendar_id: 'cal-2',
   });
-  const patch = buildDraftFlushPatch({
+  const patch = buildCreateFlushPatch({
     posted: {
       summary: 'T',
       description: '',
@@ -220,6 +257,183 @@ test('buildDraftFlushPatch: collects title, times, zone and move', () => {
   });
 });
 
+// A paste's POST carries the flag and zone, so the flush must diff against
+// that baseline instead of re-sending them (or, worse, dropping them).
+test('buildCreateFlushPatch: an untouched all-day paste is not re-patched', () => {
+  const local = makeEvent({ is_all_day: true });
+  assert.equal(
+    buildCreateFlushPatch({
+      posted: {
+        summary: 'Old',
+        description: '',
+        start: local.start_time,
+        end: local.end_time,
+        isAllDay: true,
+      },
+      local,
+      serverCalendarId: 'cal-1',
+    }),
+    null,
+  );
+});
+
+test('buildCreateFlushPatch: an untouched zoned paste is not re-patched', () => {
+  const local = makeEvent({
+    start_time_zone: 'Europe/Berlin',
+    end_time_zone: 'Europe/Berlin',
+  });
+  assert.equal(
+    buildCreateFlushPatch({
+      posted: {
+        summary: 'Old',
+        description: '',
+        start: local.start_time,
+        end: local.end_time,
+        startTimeZone: 'Europe/Berlin',
+      },
+      local,
+      serverCalendarId: 'cal-1',
+    }),
+    null,
+  );
+});
+
+test('buildCreateFlushPatch: moving an all-day paste keeps the flag', () => {
+  const local = makeEvent({
+    is_all_day: true,
+    start_time: '2026-09-14T00:00:00.000Z',
+    end_time: '2026-09-15T00:00:00.000Z',
+  });
+  const patch = buildCreateFlushPatch({
+    posted: {
+      summary: 'Old',
+      description: '',
+      start: '2026-09-13T00:00:00.000Z',
+      end: '2026-09-14T00:00:00.000Z',
+      isAllDay: true,
+    },
+    local,
+    serverCalendarId: 'cal-1',
+  });
+  // Without the flag the server would store this as a timed row.
+  assert.deepEqual(patch, {
+    start: local.start_time,
+    end: local.end_time,
+    is_all_day: true,
+  });
+});
+
+test('buildCreateFlushPatch: all-day → timed sends the explicit false', () => {
+  const local = makeEvent({ title: 'Old' });
+  const patch = buildCreateFlushPatch({
+    posted: {
+      summary: 'Old',
+      description: '',
+      start: '2026-09-13T00:00:00.000Z',
+      end: '2026-09-14T00:00:00.000Z',
+      isAllDay: true,
+    },
+    local,
+    serverCalendarId: 'cal-1',
+  });
+  assert.deepEqual(patch, {
+    start: local.start_time,
+    end: local.end_time,
+    is_all_day: false,
+  });
+});
+
+test('buildCreateFlushPatch: timed → all-day sends the flag with times', () => {
+  const local = makeEvent({
+    is_all_day: true,
+    start_time_zone: '',
+    end_time_zone: '',
+  });
+  const patch = buildCreateFlushPatch({
+    posted: {
+      summary: 'Old',
+      description: '',
+      start: local.start_time,
+      end: local.end_time,
+    },
+    local,
+    serverCalendarId: 'cal-1',
+  });
+  assert.deepEqual(patch, {
+    start: local.start_time,
+    end: local.end_time,
+    is_all_day: true,
+  });
+});
+
+test('buildCreateFlushPatch: clearing a pasted zone supersedes it', () => {
+  const local = makeEvent({
+    start_time_zone: '',
+    end_time_zone: '',
+    start_time: '2026-09-13T09:00:00.000Z',
+  });
+  const patch = buildCreateFlushPatch({
+    posted: {
+      summary: 'Old',
+      description: '',
+      start: '2026-09-13T05:00:00.000Z',
+      end: '2026-09-13T06:00:00.000Z',
+      startTimeZone: 'Europe/Berlin',
+    },
+    local,
+    serverCalendarId: 'cal-1',
+  });
+  // '' is the queue's cleared marker; the wire request omits the zone.
+  assert.deepEqual(patch, {
+    start: local.start_time,
+    end: local.end_time,
+    start_time_zone: '',
+  });
+  assert.deepEqual(toWirePatch(patch!), {
+    start: local.start_time,
+    end: local.end_time,
+  });
+});
+
+test('postedFieldsFromCreate: baseline mirrors the POST body', () => {
+  assert.deepEqual(
+    postedFieldsFromCreate({
+      calendar_id: 'cal-1',
+      calendar_id_explicit: true,
+      summary: 'Copy',
+      start: '2026-09-13T05:00:00.000Z',
+      end: '2026-09-13T06:00:00.000Z',
+      is_all_day: true,
+    }),
+    {
+      summary: 'Copy',
+      description: '',
+      start: '2026-09-13T05:00:00.000Z',
+      end: '2026-09-13T06:00:00.000Z',
+      isAllDay: true,
+      startTimeZone: '',
+    },
+  );
+  assert.deepEqual(
+    postedFieldsFromCreate({
+      calendar_id: 'cal-1',
+      summary: 'Copy',
+      description: 'notes',
+      start: '2026-09-13T05:00:00.000Z',
+      end: '2026-09-13T06:00:00.000Z',
+      start_time_zone: 'UTC',
+    }),
+    {
+      summary: 'Copy',
+      description: 'notes',
+      start: '2026-09-13T05:00:00.000Z',
+      end: '2026-09-13T06:00:00.000Z',
+      isAllDay: false,
+      startTimeZone: 'UTC',
+    },
+  );
+});
+
 test('temp flush then a later user edit stay ordered on the server id', async () => {
   const { queue, calls } = harness();
   const local = makeEvent({
@@ -227,7 +441,7 @@ test('temp flush then a later user edit stay ordered on the server id', async ()
     title: 'Renamed',
     calendar_id: 'cal-2',
   });
-  const flush = buildDraftFlushPatch({
+  const flush = buildCreateFlushPatch({
     posted: {
       summary: 'T',
       description: '',

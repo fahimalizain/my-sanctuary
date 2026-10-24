@@ -31,6 +31,8 @@ type EventInspectorProps = {
   onSaveCalendar: (calendarId: string) => void | Promise<void>;
   onDelete: () => void | Promise<void>;
   isDeleting?: boolean;
+  isUnsaved?: boolean;
+  onRetrySave?: () => void;
   isDragging?: boolean;
 };
 
@@ -803,4 +805,46 @@ test('mobile: expanded sheet has a grabber that collapses to peek', () => {
   fireEvent.click(screen.getByLabelText('Collapse drawer'));
   assert.equal(spies.closeCalls.length, 0);
   assert.ok(screen.getByLabelText('Expand event details'));
+});
+
+// ── unsaved creates ─────────────────────────────────────────────────────
+
+function mountUnsaved(onRetrySave: () => void, isUnsaved = true) {
+  const spies = makeSpies();
+  const event = makeEvent({ id: 'e-unsaved' });
+  render(
+    createElement(EventInspector, {
+      event,
+      calendar: makeCalendar(),
+      calendars: defaultCalendars(),
+      onClose: spies.onClose,
+      onSaveTitle: spies.onSaveTitle,
+      onSaveDescription: spies.onSaveDescription,
+      onSaveTimes: spies.onSaveTimes,
+      onSaveAllDay: spies.onSaveAllDay,
+      onSaveTimeZone: spies.onSaveTimeZone,
+      onSaveCalendar: spies.onSaveCalendar,
+      onDelete: spies.onDelete,
+      isUnsaved,
+      onRetrySave,
+    }),
+  );
+  return { spies, event };
+}
+
+test('an unsaved event says so and retries from the inspector', () => {
+  let retries = 0;
+  mountUnsaved(() => {
+    retries += 1;
+  });
+
+  assert.ok(screen.getByText('Not saved'));
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+  assert.equal(retries, 1, 'the retry action is wired');
+});
+
+test('a saved event shows no unsaved notice', () => {
+  mountUnsaved(() => {}, false);
+  assert.equal(screen.queryByText('Not saved'), null);
+  assert.equal(screen.queryByRole('button', { name: 'Retry' }), null);
 });

@@ -7,7 +7,6 @@ import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
 import {
   commitPendingDelete,
-  noteCreateFailed,
   noteCreateSucceeded,
   pendingDeleteTitle,
   requestPendingDelete,
@@ -200,12 +199,6 @@ test('create success for an unrelated temp id is not ours to delete', () => {
 
   assert.equal(result.kind, 'none');
   assert.equal(result.next, other, 'the other pending delete is untouched');
-});
-
-test('create failure drops a pending record and leaves an unrelated one', () => {
-  const pending = temp('tmp_1');
-  assert.equal(noteCreateFailed(pending, 'tmp_1'), null, 'stale undo gone');
-  assert.equal(noteCreateFailed(pending, 'tmp_9'), pending);
 });
 
 // ── Paste cut source ────────────────────────────────────────────────────

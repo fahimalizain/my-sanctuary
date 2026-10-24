@@ -23,6 +23,10 @@ import {
 } from './calendar-events-cache';
 import { queryKeys } from './keys';
 import { queryClient, RANGE_QUERY_GC_TIME_MS } from '@/lib/queryClient';
+import {
+  nextCalendarStamp,
+  stampCalendarServerReadWindow,
+} from '@/app/modules/calendar/lib/calendar-server-reads';
 
 export {
   applyCalendarEventRemove,
@@ -40,7 +44,17 @@ export {
 export function calendarEventsQueryOptions(timeMin: string, timeMax: string) {
   return queryOptions({
     queryKey: queryKeys.calendar.events(timeMin, timeMax),
-    queryFn: ({ signal }) => listCalendarEvents({ timeMin, timeMax, signal }),
+    // Stamp the read when the request STARTS: the local change layer only
+    // retires acknowledged intent on a read that began after the ack (a GET
+    // that began earlier can carry a row that predates the write). The stamp
+    // hangs off the window, not the rows, so structural sharing can keep row
+    // identity across identical refetches.
+    queryFn: async ({ signal }) => {
+      const stamp = nextCalendarStamp();
+      const data = await listCalendarEvents({ timeMin, timeMax, signal });
+      stampCalendarServerReadWindow(timeMin, timeMax, stamp);
+      return data;
+    },
     placeholderData: keepPreviousData,
     gcTime: RANGE_QUERY_GC_TIME_MS,
   });

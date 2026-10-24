@@ -22,6 +22,8 @@ export interface AllDayChip {
   color: string;
   /** End instant (ms), for the past tick. Layout data only, not stored color. */
   endMs: number;
+  /** Local-only event whose create failed: dashed chip, retryable. */
+  unsaved?: boolean;
 }
 
 export interface AllDayPreview {
@@ -148,12 +150,14 @@ export function AllDayRow({
             const selected = chip.id === selectedEventId;
             const dragging = chip.id === draggingEventId;
             const past = isEventPast(chip.endMs, nowMs);
+            const unsaved = chip.unsaved === true;
 
             return (
               <div
                 key={chip.id}
                 data-allday-chip
                 data-event-id={chip.id}
+                data-unsaved={unsaved ? '' : undefined}
                 role="button"
                 tabIndex={0}
                 className={cn(
@@ -161,7 +165,12 @@ export function AllDayRow({
                   'bg-[var(--ev-fill)] dark:bg-[var(--ev-fill-dark)]',
                   'text-[var(--ev-title)] dark:text-[var(--ev-title-dark)]',
                   'data-[past]:text-[var(--ev-title-dim)] dark:data-[past]:text-[var(--ev-title-dim-dark)]',
-                  '[outline-style:solid] outline-1 outline-cream',
+                  'outline-1',
+                  // A failed create is local-only: dashed, so it reads as
+                  // "not saved yet" instead of blending into real chips.
+                  unsaved
+                    ? 'outline-muted-foreground [outline-style:dashed]'
+                    : 'outline-cream [outline-style:solid]',
                   selected && 'ring-1 ring-foreground/25',
                   dragging && 'opacity-40',
                 )}

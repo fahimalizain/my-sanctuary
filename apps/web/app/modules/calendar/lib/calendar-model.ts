@@ -23,6 +23,9 @@ import {
   startOfDay,
 } from './week-layout';
 
+/** Stable default so callers without unsaved creates never rebuild chips. */
+const EMPTY_UNSAVED_IDS: ReadonlySet<string> = new Set();
+
 /** Mon-based short name for a local date (WEEK_DAYS is Mon→Sun). */
 export function dayNameShort(date: Date): string {
   const jsDay = date.getDay(); // 0 = Sun … 6 = Sat
@@ -110,11 +113,13 @@ export function eventChipColor(event: CalendarEvent): string {
 /**
  * Pack all-day events into lane chips for the rendered strip window.
  * Returns chips plus the band height driven by the highest occupied lane.
+ * `unsavedIds` marks local events whose create failed (dashed chip).
  */
 export function buildAllDayChips(
   days: Date[],
   allDayEvents: CalendarEvent[],
   dayCount: number,
+  unsavedIds: ReadonlySet<string> = EMPTY_UNSAVED_IDS,
 ): { allDayChips: AllDayChip[]; allDayHeight: number } {
   const origin = days[0];
   if (!origin) {
@@ -195,6 +200,7 @@ export function buildAllDayChips(
       lane,
       color: eventChipColor(i.event),
       endMs: i.endMs,
+      unsaved: unsavedIds.has(i.id),
     };
   });
 
