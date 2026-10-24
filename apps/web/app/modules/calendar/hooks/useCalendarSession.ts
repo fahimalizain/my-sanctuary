@@ -163,6 +163,8 @@ export function useCalendarSession({
   const [focusTitleOnOpen, setFocusTitleOnOpen] = useState(false);
   // Local-only draft (overlay upsert, no POST yet). Ref is the source of
   // truth inside stable callbacks; state mirrors it for React identity.
+  // Released the moment a create POST is sent: from then on the event is real
+  // and only the deferred delete may remove it.
   const [unpersistedDraftId, setUnpersistedDraftId] = useState<string | null>(
     null,
   );
@@ -171,12 +173,11 @@ export function useCalendarSession({
     unpersistedDraftIdRef.current = id;
     setUnpersistedDraftId(id);
   }, []);
-  // Prevent a second title-blur from firing another POST for the same draft.
-  const draftPersistStartedRef = useRef<Set<string>>(new Set());
-  // Whether the inspector's calendar picker was used for the current draft.
+  // Temp ids whose inspector calendar picker was used (before or during their
+  // create POST). Per id so concurrent creates never read one another's pick.
   // An untouched draft lets the server route to the title's category
   // calendar; an explicit pick must survive create.
-  const draftCalendarTouchedRef = useRef(false);
+  const draftCalendarPicksRef = useRef<Set<string>>(new Set());
   // Cut sources whose delete has begun. Two quick pastes of one cut must
   // DELETE the row once; later pastes just report "nothing to consume".
   const cutRemovalsStartedRef = useRef<Set<string>>(new Set());
@@ -470,9 +471,11 @@ export function useCalendarSession({
   const discardUnpersistedDraft = useCallback(() => {
     const id = unpersistedDraftIdRef.current;
     if (!id) return;
-    // clear (not remove): never on the server; if POST is in flight, empty
-    // overlay makes create onSuccess DELETE the just-created server row.
+    // clear (not remove): the chip was never on the server. A draft whose
+    // create POST is already sent has released its id, so this can only drop
+    // a pre-POST overlay — never DELETE a row that was just created.
     queue.clear(id);
+    draftCalendarPicksRef.current.delete(id);
     setDraftId(null);
   }, [queue, setDraftId]);
 
@@ -505,13 +508,13 @@ export function useCalendarSession({
       const prevDraftId = unpersistedDraftIdRef.current;
       if (prevDraftId) {
         queue.clear(prevDraftId);
+        draftCalendarPicksRef.current.delete(prevDraftId);
         setDraftId(null);
       }
 
       const tempId = newTempEventId();
       const startIso = range.start.toISOString();
       const endIso = range.end.toISOString();
-      draftCalendarTouchedRef.current = false;
 
       const optimistic: CalendarEvent = {
         id: tempId,
@@ -541,15 +544,16 @@ export function useCalendarSession({
     const latest = queue.getOverlay(tempId);
     if (!latest || latest.op !== 'upsert') return;
     if (!isPersistableDraftTitle(latest.event.title)) return;
-    if (draftPersistStartedRef.current.has(tempId)) return;
 
     const event = latest.event;
     const postedSummary = event.title.trim();
     const postedDescription = event.description ?? '';
     const startIso = event.start_time;
     const endIso = event.end_time;
+    // A pick made before the send is the explicit destination this POST
+    // carries; one made while it flies is a local edit flushDraftEdits moves.
+    const calendarPickedAtSend = draftCalendarPicksRef.current.has(tempId);
 
-    draftPersistStartedRef.current.add(tempId);
     clearWriteError();
 
     // If the user renamed / moved / annotated the temp event before POST
@@ -560,10 +564,14 @@ export function useCalendarSession({
       serverEvent: CalendarEvent,
       local: CalendarEvent,
     ) => {
+      // Read the pick again: one made while the POST was in flight must
+      // survive create. Keyed by temp id, so a newer draft's pick cannot leak
+      // into this create's flush.
+      const calendarPicked = draftCalendarPicksRef.current.has(tempId);
       // The server may have rerouted an untouched draft to the title's
       // category calendar. Trust that unless the user picked a calendar in
       // the inspector; a pick must survive create.
-      const calendarId = draftCalendarTouchedRef.current
+      const calendarId = calendarPicked
         ? local.calendar_id
         : serverEvent.calendar_id;
       const flush = buildDraftFlushPatch({
@@ -588,7 +596,7 @@ export function useCalendarSession({
         start_time_zone: local.start_time_zone,
         end_time_zone: local.end_time_zone,
         calendar_id: calendarId,
-        color: draftCalendarTouchedRef.current
+        color: calendarPicked
           ? (local.color ?? colorForCalendar(calendarId))
           : serverEvent.color,
       });
@@ -597,12 +605,17 @@ export function useCalendarSession({
       queue.enqueuePatch(serverEvent.id, flush);
     };
 
+    // The POST is about to be sent: the event is real from here on, so release
+    // the draft id. Every discard path (empty click, Escape, another chip, a
+    // new draft) keys on it and can no longer empty this overlay — which would
+    // turn create onSuccess into a ghost DELETE of the row it just made.
+    // Later edits to this temp id are overlay-only and flushed on success.
+    setDraftId(null);
+
     createEvent.mutate(
       {
         calendar_id: event.calendar_id,
-        ...(draftCalendarTouchedRef.current
-          ? { calendar_id_explicit: true }
-          : {}),
+        ...(calendarPickedAtSend ? { calendar_id_explicit: true } : {}),
         summary: postedSummary,
         ...(postedDescription ? { description: postedDescription } : {}),
         start: startIso,
@@ -610,7 +623,7 @@ export function useCalendarSession({
       },
       {
         onSuccess: (result) => {
-          draftPersistStartedRef.current.delete(tempId);
+          draftCalendarPicksRef.current.delete(tempId);
           const after = queue.getOverlay(tempId);
           const created = noteCreateSucceeded(pendingDeleteRef.current, {
             tempId,
@@ -625,9 +638,6 @@ export function useCalendarSession({
             setPendingDelete(created.next);
             queue.clear(tempId);
             upsertCalendarEventInCache(result.event);
-            if (unpersistedDraftIdRef.current === tempId) {
-              setDraftId(null);
-            }
 
             // A category-routed create may land on a calendar the sidebar has
             // hidden. Reveal the destination so Undo can actually show the
@@ -655,23 +665,19 @@ export function useCalendarSession({
             pendingDeleteRef.current = created.next;
             setPendingDelete(created.next);
             queue.clear(tempId);
-            if (unpersistedDraftIdRef.current === tempId) {
-              setDraftId(null);
-            }
             void deleteEvent.mutateAsync(result.event.id).then(() => {
               removeCalendarEventFromCache(result.event.id);
             });
             return;
           }
 
-          // User deleted / discarded while create was in flight — do not
+          // Defensive: an emptied overlay means the chip was removed while
+          // the POST was in flight (now only a committed temp delete does
+          // that, and noteCreateSucceeded catches it first). Do not
           // cache-write; DELETE the just-created server event so Google has
           // no ghost.
           if (!after || after.op === 'delete') {
             queue.clear(tempId);
-            if (unpersistedDraftIdRef.current === tempId) {
-              setDraftId(null);
-            }
             void deleteEvent.mutateAsync(result.event.id).then(() => {
               removeCalendarEventFromCache(result.event.id);
             });
@@ -683,9 +689,6 @@ export function useCalendarSession({
           setSelectedEventId((prev) =>
             prev === tempId ? result.event.id : prev,
           );
-          if (unpersistedDraftIdRef.current === tempId) {
-            setDraftId(null);
-          }
           queue.clear(tempId);
           upsertCalendarEventInCache(result.event);
 
@@ -703,7 +706,7 @@ export function useCalendarSession({
           }
         },
         onError: (err) => {
-          draftPersistStartedRef.current.delete(tempId);
+          draftCalendarPicksRef.current.delete(tempId);
           // No server row exists to undo; a pending delete for this draft is
           // stale, so drop it (and its timer) with the overlay.
           const next = noteCreateFailed(pendingDeleteRef.current, tempId);
@@ -713,9 +716,6 @@ export function useCalendarSession({
             clearDeleteTimer();
           }
           queue.clear(tempId);
-          if (unpersistedDraftIdRef.current === tempId) {
-            setDraftId(null);
-          }
           setSelectedEventId((prev) => {
             if (prev === tempId) {
               setFocusTitleOnOpen(false);
@@ -841,8 +841,10 @@ export function useCalendarSession({
         isTempEventId(selectedEventId)
       ) {
         // A draft's untouched calendar is the server's default (category
-        // routing); a pick here is the user's explicit destination.
-        draftCalendarTouchedRef.current = true;
+        // routing); a pick here is the user's explicit destination. Keyed by
+        // temp id so it survives until the create settles (and a concurrent
+        // draft's pick never reaches this create's flush).
+        draftCalendarPicksRef.current.add(selectedEventId);
         return;
       }
 
@@ -865,35 +867,39 @@ export function useCalendarSession({
    * Clipboard payload for the selected event, cut-aware.
    *
    * A persisted source stays on the grid: the delete happens on paste, so a
-   * cancelled chord never costs the event. A temp / unpersisted draft has no
-   * server row, so it is discarded here and the payload is a plain copy.
+   * cancelled chord never costs the event. An open unpersisted draft has no
+   * server row, so it is discarded here and the payload is a plain copy. A
+   * temp id whose create POST is already sent is a real event as well, so the
+   * source stays and the payload is a plain copy too.
    */
   const cutForClipboard = useCallback((): CalendarClipboardItem | null => {
     const event = selectedEvent;
     const item = clipboardItemFromEvent(event);
     if (!event || !item) return null;
 
-    // No server row to delete later: drop that one chip now. clear (not
-    // remove) keeps the in-flight POST's onSuccess DELETE behaviour — the
-    // same discard branch persistDraft uses for a vanished draft. Only this
-    // id is touched, so a different open draft survives the cut.
-    if (
-      isTempEventId(event.id) ||
+    const isOpenDraft =
       event.id === unpersistedDraftIdRef.current ||
-      event.id === unpersistedDraftId
-    ) {
+      event.id === unpersistedDraftId;
+
+    // No server row to delete later: drop that one chip now. clear (not
+    // remove) is enough for a pre-POST overlay. Only this id is touched, so a
+    // different open draft survives the cut.
+    if (isOpenDraft) {
       queue.cancelPatch(event.id);
       queue.clear(event.id);
-      if (
-        event.id === unpersistedDraftIdRef.current ||
-        event.id === unpersistedDraftId
-      ) {
-        setDraftId(null);
-      }
+      draftCalendarPicksRef.current.delete(event.id);
+      setDraftId(null);
       setSelectedEventId(null);
       setFocusTitleOnOpen(false);
       return item;
     }
+
+    // Temp id with a create POST in flight (or a pasted chip): the draft id
+    // was released at send, so this is a real event. It has no server id to
+    // cut yet, so keep the source and hand back a plain copy — clearing it
+    // here would make create onSuccess DELETE the row, losing the event if
+    // the user never pastes.
+    if (isTempEventId(event.id)) return item;
 
     // Read-only calendar: leave the event alone and let the chord through
     // to the browser rather than pretend it was cut.

@@ -59,7 +59,11 @@ export interface RequestPendingDeleteInput {
   id: string;
   /** Overlaid event, so the toast title matches what the user saw. */
   event: CalendarEvent;
-  /** The open unpersisted draft id when this delete is that draft. */
+  /**
+   * The open unpersisted draft id when this delete is that draft. A draft
+   * whose create POST is already sent is no longer one (the session releases
+   * the id at send), so Undo must not turn it back into a draft.
+   */
   draftId: string | null;
 }
 
@@ -100,7 +104,8 @@ export function requestPendingDelete(
     // for the create POST (if any) to return one.
     serverId: temp ? null : input.id,
     // Only the open local draft needs its id back on undo. A pasted temp id
-    // is not a draft and must not be treated as one.
+    // is not a draft and must not be treated as one — same for a draft whose
+    // create POST is in flight (it already released its draft id).
     draftId: temp ? input.draftId : null,
     cutSourceId: null,
     event: input.event,
