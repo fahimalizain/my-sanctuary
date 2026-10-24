@@ -1,90 +1,44 @@
 // Success / error policy for one settled entry of the per-event PATCH chain.
-// React-free so it can be unit-tested and so the queue's owner (now the
-// app-wide CalendarEventsProvider) can keep its handlers stable.
+// React-free so it can be unit-tested and so the queue's owner (the app-wide
+// CalendarEventsProvider) can keep its handlers stable.
+//
+// The layer is the durable copy of what the user asked for: a settled PATCH
+// never removes intent. Success only records which value the server accepted
+// (and its clock stamp), so a later server *read* can retire that field. A
+// failure keeps the intent painted and unacknowledged — a failed edit is the
+// user's data, not something to silently revert.
 
 import type { CalendarEvent } from '@/app/types';
-import { revertFailedPatch, type EventPatch } from './event-patch-queue';
-import type { EventOverlay } from './event-overlays';
-
-/** Overlay still matches server response for fields we paint optimistically. */
-function overlayMatchesServerEvent(
-  overlay: CalendarEvent,
-  server: CalendarEvent,
-): boolean {
-  return (
-    overlay.title === server.title &&
-    overlay.description === server.description &&
-    overlay.start_time === server.start_time &&
-    overlay.end_time === server.end_time &&
-    Boolean(overlay.is_all_day) === Boolean(server.is_all_day) &&
-    (overlay.start_time_zone?.trim() || '') ===
-      (server.start_time_zone?.trim() || '') &&
-    (overlay.end_time_zone?.trim() || '') ===
-      (server.end_time_zone?.trim() || '') &&
-    overlay.calendar_id === server.calendar_id
-  );
-}
+import type { EventChangeLayer } from './event-change-layer';
+import type { EventPatch } from './event-patch-queue';
 
 /**
- * A PATCH succeeded: fold the authoritative row into the durable cache, then
- * drop the overlay once nothing else is pending and it still paints exactly
- * what the server returned. A delete overlay stays (the delete owns the id).
- * `idle` false means more edits are queued, so the overlay must stay on top.
+ * A PATCH succeeded: fold the authoritative row into the durable cache and
+ * acknowledge the values that were sent. The intent stays painted — a response
+ * to our own write is not a server read, so it may never retire a field.
  */
-export function reconcilePatchSuccess(args: {
-  id: string;
-  event: CalendarEvent;
-  idle: boolean;
-  getOverlay: (id: string) => EventOverlay | undefined;
-  clear: (id: string) => void;
-  upsertCache: (event: CalendarEvent) => void;
-}): void {
-  const { id, event, idle, getOverlay, clear, upsertCache } = args;
-
-  upsertCache(event);
-  // Later patches are still queued: keep the overlay painted over them.
-  if (!idle) return;
-  const latest = getOverlay(id);
-  if (
-    !latest ||
-    (latest.op === 'upsert' && overlayMatchesServerEvent(latest.event, event))
-  ) {
-    clear(id);
-  }
-}
-
-/**
- * A PATCH failed: revert only the failed fields, and only those not
- * superseded by a newer edit, back to the last known server row. The base
- * comes from the query cache (`findServerEvent`), not the page's events
- * array — the page may be gone after navigation. A delete overlay is never
- * reverted. The caller reports the write error itself.
- */
-export function reconcilePatchError(args: {
+export function settlePatchSuccess(args: {
+  layer: EventChangeLayer;
   id: string;
   sent: EventPatch;
-  idle: boolean;
-  getOverlay: (id: string) => EventOverlay | undefined;
-  clear: (id: string) => void;
-  upsert: (event: CalendarEvent) => void;
-  findServerEvent: (id: string) => CalendarEvent | undefined;
+  event: CalendarEvent;
+  /** Stamp of the acknowledgment (shared read/write clock). */
+  stamp: number;
+  upsertCache: (event: CalendarEvent) => void;
 }): void {
-  const { id, sent, idle, getOverlay, clear, upsert, findServerEvent } = args;
+  const { layer, id, sent, event, stamp, upsertCache } = args;
+  layer.acknowledge(id, sent, stamp);
+  upsertCache(event);
+}
 
-  const latest = getOverlay(id);
-  if (latest?.op !== 'upsert') return;
-
-  const base = findServerEvent(id);
-  if (!base) {
-    // Nothing to revert to: with nothing queued the overlay would be a lie.
-    if (idle) clear(id);
-    return;
-  }
-
-  const reverted = revertFailedPatch(latest.event, base, sent);
-  if (idle && overlayMatchesServerEvent(reverted, base)) {
-    clear(id);
-  } else if (!overlayMatchesServerEvent(reverted, latest.event)) {
-    upsert(reverted);
-  }
+/**
+ * A PATCH failed: keep the intent, mark it unsent/retryable. The caller
+ * reports the write error; `retryFailedPatches` (or the next edit on this
+ * event) re-sends exactly the fields the server has not accepted.
+ */
+export function settlePatchFailure(args: {
+  layer: EventChangeLayer;
+  id: string;
+}): void {
+  args.layer.noteFailure(args.id);
 }

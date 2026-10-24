@@ -1,12 +1,13 @@
-// Unit tests for the settled-patch policy (cache write, overlay clear/revert).
-// No DOM and no API client: every collaborator is a plain callback.
+// Unit tests for the settled-patch policy: success acknowledges (and keeps)
+// intent, failure keeps it retryable, and only a later server read retires a
+// field.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
-import type { EventOverlay } from './event-overlays';
-import { reconcilePatchError, reconcilePatchSuccess } from './event-patch-sync';
-import type { EventPatch } from './event-patch-queue';
+import { stampCalendarServerRead } from './calendar-server-reads';
+import { EventChangeLayer } from './event-change-layer';
+import { settlePatchFailure, settlePatchSuccess } from './event-patch-sync';
 
 function makeEvent(overrides: Partial<CalendarEvent> = {}): CalendarEvent {
   return {
@@ -22,218 +23,117 @@ function makeEvent(overrides: Partial<CalendarEvent> = {}): CalendarEvent {
   };
 }
 
-function upsertOverlay(event: CalendarEvent): EventOverlay {
-  return { op: 'upsert', event };
+function serverLookup(
+  ...rows: CalendarEvent[]
+): (id: string) => CalendarEvent | undefined {
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return (id) => byId.get(id);
 }
 
-const deleteOverlay: EventOverlay = { op: 'delete', id: 'e1' };
-
-/** Records every callback the helper is allowed to make. */
 function recorder() {
-  const cleared: string[] = [];
-  const upserted: CalendarEvent[] = [];
   const cached: CalendarEvent[] = [];
-  return { cleared, upserted, cached };
+  return {
+    cached,
+    upsertCache: (event: CalendarEvent) => cached.push(event),
+  };
 }
 
-test('success: idle overlay matching the server row is cleared', () => {
+test('success: acknowledges the sent values, caches the row, keeps the paint', () => {
+  const base = makeEvent();
+  const layer = new EventChangeLayer(serverLookup(base));
+  layer.edit('e1', { summary: 'New' });
   const rec = recorder();
-  const server = makeEvent({ title: 'Renamed' });
+  const server = makeEvent({ title: 'New' });
 
-  reconcilePatchSuccess({
+  settlePatchSuccess({
+    layer,
     id: 'e1',
+    sent: { summary: 'New' },
     event: server,
-    idle: true,
-    getOverlay: () => upsertOverlay(makeEvent({ title: 'Renamed' })),
-    clear: (id) => rec.cleared.push(id),
-    upsertCache: (event) => rec.cached.push(event),
+    stamp: 2,
+    upsertCache: rec.upsertCache,
   });
 
-  assert.deepEqual(rec.cached, [server], 'authoritative row is cached');
-  assert.deepEqual(rec.cleared, ['e1']);
+  assert.deepEqual(rec.cached, [server], 'the authoritative row is cached');
+  assert.equal(
+    layer.getOverlay('e1')?.op,
+    'upsert',
+    'a write response is not a server read: it never retires intent',
+  );
+  assert.equal(layer.unsentPatch('e1'), null, 'the value is acknowledged');
+
+  // Only a read that started after the ack settles the field.
+  const agreed = makeEvent({ title: 'New' });
+  stampCalendarServerRead([agreed], 3);
+  assert.equal(layer.paint([agreed])[0].title, 'New');
+  assert.equal(layer.size, 0);
 });
 
-test('success: not idle keeps the overlay for the queued edits', () => {
-  const rec = recorder();
-  const server = makeEvent({ title: 'Renamed' });
-
-  reconcilePatchSuccess({
-    id: 'e1',
-    event: server,
-    idle: false,
-    getOverlay: () => upsertOverlay(makeEvent({ title: 'Renamed' })),
-    clear: (id) => rec.cleared.push(id),
-    upsertCache: (event) => rec.cached.push(event),
-  });
-
-  assert.deepEqual(rec.cached, [server]);
-  assert.deepEqual(rec.cleared, [], 'a later patch still owns this id');
-});
-
-test('success: idle overlay the server row does not match is left alone', () => {
+test('success: an ack of an older value does not cover a newer edit', () => {
+  const layer = new EventChangeLayer(serverLookup(makeEvent()));
+  layer.edit('e1', { summary: 'A' });
+  layer.edit('e1', { summary: 'B' });
   const rec = recorder();
 
-  reconcilePatchSuccess({
+  // The request that landed carried A; B was typed while it flew.
+  settlePatchSuccess({
+    layer,
     id: 'e1',
-    event: makeEvent({ title: 'Server title' }),
-    idle: true,
-    getOverlay: () => upsertOverlay(makeEvent({ title: 'Newer local title' })),
-    clear: (id) => rec.cleared.push(id),
-    upsertCache: (event) => rec.cached.push(event),
+    sent: { summary: 'A' },
+    event: makeEvent({ title: 'A' }),
+    stamp: 2,
+    upsertCache: rec.upsertCache,
   });
 
-  assert.equal(rec.cached.length, 1);
-  assert.deepEqual(rec.cleared, []);
+  assert.deepEqual(
+    layer.unsentPatch('e1'),
+    { summary: 'B' },
+    'B still needs the server',
+  );
 });
 
-test('success: a delete overlay is never cleared by a field response', () => {
+test('failure: the intent stays painted and retryable, cache untouched', () => {
+  const base = makeEvent();
+  const layer = new EventChangeLayer(serverLookup(base));
+  layer.edit('e1', { summary: 'New' });
   const rec = recorder();
 
-  reconcilePatchSuccess({
-    id: 'e1',
-    event: makeEvent(),
-    idle: true,
-    getOverlay: () => deleteOverlay,
-    clear: (id) => rec.cleared.push(id),
-    upsertCache: (event) => rec.cached.push(event),
-  });
+  settlePatchFailure({ layer, id: 'e1' });
 
-  assert.equal(rec.cached.length, 1);
-  assert.deepEqual(rec.cleared, []);
+  assert.deepEqual(rec.cached, [], 'a failure has no row to cache');
+  assert.equal(layer.paint([base])[0].title, 'New');
+  assert.deepEqual(layer.unsentPatch('e1'), { summary: 'New' });
+  assert.equal(layer.hasFailedWrites(), true);
 });
 
-test('success: no overlay still clears the stale id', () => {
+test('failure: a read cannot retire a value the server never accepted', () => {
+  const base = makeEvent();
+  const layer = new EventChangeLayer(serverLookup(base));
+  layer.edit('e1', { summary: 'New' });
+  settlePatchFailure({ layer, id: 'e1' });
+
+  const remote = makeEvent({ title: 'Old' });
+  stampCalendarServerRead([remote], 9);
+  assert.equal(layer.paint([remote])[0].title, 'New');
+  assert.equal(layer.hasFailedWrites(), true);
+});
+
+test('success/failure leave a delete intent alone', () => {
+  const layer = new EventChangeLayer(serverLookup(makeEvent()));
+  layer.remove('e1');
   const rec = recorder();
 
-  reconcilePatchSuccess({
+  settlePatchSuccess({
+    layer,
     id: 'e1',
-    event: makeEvent(),
-    idle: true,
-    getOverlay: () => undefined,
-    clear: (id) => rec.cleared.push(id),
-    upsertCache: (event) => rec.cached.push(event),
+    sent: { summary: 'New' },
+    event: makeEvent({ title: 'New' }),
+    stamp: 2,
+    upsertCache: rec.upsertCache,
   });
+  settlePatchFailure({ layer, id: 'e1' });
 
-  assert.deepEqual(rec.cleared, ['e1']);
-});
-
-test('error: upsert with no server row clears only when idle', () => {
-  const sent: EventPatch = { summary: 'Renamed' };
-
-  for (const idle of [true, false]) {
-    const rec = recorder();
-    reconcilePatchError({
-      id: 'e1',
-      sent,
-      idle,
-      getOverlay: () => upsertOverlay(makeEvent({ title: 'Renamed' })),
-      clear: (id) => rec.cleared.push(id),
-      upsert: (event) => rec.upserted.push(event),
-      findServerEvent: () => undefined,
-    });
-    assert.deepEqual(rec.cleared, idle ? ['e1'] : []);
-    assert.deepEqual(rec.upserted, []);
-  }
-});
-
-test('error: a reverted patch matching the server row is cleared', () => {
-  const rec = recorder();
-  const base = makeEvent({ title: 'Old' });
-
-  reconcilePatchError({
-    id: 'e1',
-    sent: { summary: 'Renamed' },
-    idle: true,
-    getOverlay: () => upsertOverlay(makeEvent({ title: 'Renamed' })),
-    clear: (id) => rec.cleared.push(id),
-    upsert: (event) => rec.upserted.push(event),
-    findServerEvent: (id) => (id === 'e1' ? base : undefined),
-  });
-
-  assert.deepEqual(rec.cleared, ['e1']);
-  assert.deepEqual(rec.upserted, []);
-});
-
-test('error: superseded field leaves the overlay alone', () => {
-  const rec = recorder();
-  const base = makeEvent({ title: 'Old' });
-
-  reconcilePatchError({
-    id: 'e1',
-    sent: { summary: 'Failed title' },
-    idle: true,
-    // Title was edited again while the failed request was in flight.
-    getOverlay: () => upsertOverlay(makeEvent({ title: 'Newest title' })),
-    clear: (id) => rec.cleared.push(id),
-    upsert: (event) => rec.upserted.push(event),
-    findServerEvent: () => base,
-  });
-
-  assert.deepEqual(rec.cleared, []);
-  assert.deepEqual(rec.upserted, [], 'revert is a no-op for that field');
-});
-
-test('error: a partial revert repaints the overlay with the reverted row', () => {
-  const rec = recorder();
-  const base = makeEvent({ title: 'Old', description: '' });
-
-  reconcilePatchError({
-    id: 'e1',
-    // The description edit came later, so only the title reverts.
-    sent: { summary: 'Renamed', description: 'failed note' },
-    idle: true,
-    getOverlay: () =>
-      upsertOverlay(
-        makeEvent({ title: 'Renamed', description: 'a newer note' }),
-      ),
-    clear: (id) => rec.cleared.push(id),
-    upsert: (event) => rec.upserted.push(event),
-    findServerEvent: () => base,
-  });
-
-  assert.deepEqual(rec.cleared, [], 'reverted row still differs from base');
-  assert.equal(rec.upserted.length, 1);
-  assert.equal(rec.upserted[0]?.title, 'Old');
-  assert.equal(rec.upserted[0]?.description, 'a newer note');
-});
-
-test('error: not idle keeps a reverted row instead of clearing it', () => {
-  const rec = recorder();
-  const base = makeEvent({ title: 'Old' });
-
-  reconcilePatchError({
-    id: 'e1',
-    sent: { summary: 'Renamed' },
-    idle: false,
-    getOverlay: () => upsertOverlay(makeEvent({ title: 'Renamed' })),
-    clear: (id) => rec.cleared.push(id),
-    upsert: (event) => rec.upserted.push(event),
-    findServerEvent: () => base,
-  });
-
-  assert.deepEqual(rec.cleared, [], 'nothing is idle, so keep painting');
-  assert.equal(rec.upserted.length, 1);
-  assert.equal(rec.upserted[0]?.title, 'Old');
-});
-
-test('error: a delete overlay is never reverted', () => {
-  const rec = recorder();
-  let lookups = 0;
-
-  reconcilePatchError({
-    id: 'e1',
-    sent: { summary: 'Renamed' },
-    idle: true,
-    getOverlay: () => deleteOverlay,
-    clear: (id) => rec.cleared.push(id),
-    upsert: (event) => rec.upserted.push(event),
-    findServerEvent: () => {
-      lookups += 1;
-      return makeEvent();
-    },
-  });
-
-  assert.deepEqual(rec.cleared, []);
-  assert.deepEqual(rec.upserted, []);
-  assert.equal(lookups, 0, 'the delete owns the id; no base lookup needed');
+  assert.deepEqual(layer.paint([makeEvent()]), [], 'the delete still owns it');
+  assert.deepEqual(layer.getOverlay('e1'), { op: 'delete', id: 'e1' });
+  assert.equal(rec.cached.length, 1, 'the row is cached under the delete');
 });

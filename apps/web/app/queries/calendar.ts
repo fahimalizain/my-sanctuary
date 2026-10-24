@@ -23,6 +23,10 @@ import {
 } from './calendar-events-cache';
 import { queryKeys } from './keys';
 import { queryClient, RANGE_QUERY_GC_TIME_MS } from '@/lib/queryClient';
+import {
+  nextCalendarStamp,
+  stampCalendarServerRead,
+} from '@/app/modules/calendar/lib/calendar-server-reads';
 
 export {
   applyCalendarEventRemove,
@@ -40,8 +44,22 @@ export {
 export function calendarEventsQueryOptions(timeMin: string, timeMax: string) {
   return queryOptions({
     queryKey: queryKeys.calendar.events(timeMin, timeMax),
-    queryFn: ({ signal }) => listCalendarEvents({ timeMin, timeMax, signal }),
+    // Stamp the read when the request STARTS: the local change layer only
+    // retires acknowledged intent on a read that began after the ack (a GET
+    // that began earlier can carry a row that predates the write).
+    queryFn: async ({ signal }) => {
+      const stamp = nextCalendarStamp();
+      const data = await listCalendarEvents({ timeMin, timeMax, signal });
+      stampCalendarServerRead(data.events, stamp);
+      return data;
+    },
     placeholderData: keepPreviousData,
+    // The read stamp must stay attached to the rows the GET produced. With
+    // structural sharing on, a refetch that returns identical data keeps the
+    // previous row objects (and their older stamps), so an agreeing read could
+    // never retire the intent it just confirmed. A week of events is small;
+    // correctness of the stamp is worth the extra identities.
+    structuralSharing: false,
     gcTime: RANGE_QUERY_GC_TIME_MS,
   });
 }

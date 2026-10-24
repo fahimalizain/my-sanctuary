@@ -168,12 +168,13 @@ export function CalendarPage() {
             {session.writeError}
           </p>
           <div className="flex shrink-0 items-center gap-3">
-            {session.canRetryUnsavedCreates && (
-              // The failed create is still on the grid, so this re-POSTs it
-              // instead of only reporting that it was lost.
+            {session.canRetryWrites && (
+              // A failed create is still on the grid and a failed PATCH keeps
+              // its edit painted, so this saves both instead of only
+              // reporting that they were lost.
               <button
                 type="button"
-                onClick={session.retryUnsavedCreates}
+                onClick={session.retryWrites}
                 className="text-foreground underline underline-offset-2 hover:text-primary"
               >
                 Retry

@@ -13,6 +13,7 @@ import { after, afterEach, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createElement,
+  useState,
   type ComponentType,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -32,9 +33,12 @@ installDom();
 
 type SessionModule = typeof import('./useCalendarSession');
 type Session = ReturnType<SessionModule['useCalendarSession']>;
+type QueueModule = typeof import('../events-context');
+type Queue = ReturnType<QueueModule['useCalendarEventsQueue']>;
 
 let useCalendarSession: SessionModule['useCalendarSession'];
 let CalendarEventsProvider: ComponentType<{ children?: ReactNode }>;
+let useCalendarEventsQueue: QueueModule['useCalendarEventsQueue'];
 let QueryClientProvider: ComponentType<{
   client: QueryClient;
   children?: ReactNode;
@@ -82,8 +86,27 @@ interface PendingPost {
   fail: (message?: string) => void;
 }
 
+interface PendingPatch {
+  id: string;
+  body: PatchCalendarEventInput;
+  /** Answer with the merged server row (or an explicit one). */
+  respondWith: (event?: CalendarEvent) => void;
+  fail: (message?: string) => void;
+}
+
+interface PendingGet {
+  /** Resolve this events GET with `events`. */
+  respondWith: (events: CalendarEvent[]) => void;
+}
+
 let requests: Request[] = [];
 let pendingPosts: PendingPost[] = [];
+/** Keep PATCH responses unresolved so a test can order them against GETs. */
+let holdPatches = false;
+let pendingPatches: PendingPatch[] = [];
+/** Keep events GET responses unresolved for the stale-read race. */
+let holdGets = false;
+let pendingGets: PendingGet[] = [];
 /** Server rows the events GET returns; tests that need a chip seed one here. */
 let seededEvents: CalendarEvent[] = [];
 /** Rows the fake API has stored: creates land here, PATCHes merge into them. */
@@ -187,6 +210,15 @@ function respond(
   requests.push({ method, path, body });
 
   if (method === 'GET' && path === '/api/calendar/events') {
+    if (holdGets) {
+      return new Promise<Response>((resolve) => {
+        pendingGets.push({
+          respondWith: (events) => {
+            resolve(json({ events, source: 'window', sync: EMPTY_SYNC }));
+          },
+        });
+      });
+    }
     return json({ events: seededEvents, source: 'window', sync: EMPTY_SYNC });
   }
   if (method === 'GET' && path === '/api/calendar/calendars') {
@@ -197,10 +229,27 @@ function respond(
   }
   if (method === 'PATCH') {
     const id = path.split('/').pop() ?? 'patched';
-    return json({
-      event: patchedEvent(id, (body ?? {}) as PatchCalendarEventInput),
-      source: 'google',
-    });
+    const input = (body ?? {}) as PatchCalendarEventInput;
+    if (holdPatches) {
+      return new Promise<Response>((resolve) => {
+        pendingPatches.push({
+          id,
+          body: input,
+          respondWith: (event) => {
+            resolve(
+              json({
+                event: event ?? patchedEvent(id, input),
+                source: 'google',
+              }),
+            );
+          },
+          fail: (message = 'patch failed') => {
+            resolve(json({ error: message }, 500));
+          },
+        });
+      });
+    }
+    return json({ event: patchedEvent(id, input), source: 'google' });
   }
   if (method === 'DELETE') return json({ success: true });
   return json({ error: 'unexpected' }, 404);
@@ -246,7 +295,7 @@ async function armDeleteCommit(session: Session): Promise<() => void> {
 }
 
 interface HarnessProps {
-  api: { current: Session | null };
+  api: SessionRef;
   days: Date[];
   scrollerRef: RefObject<HTMLElement | null>;
 }
@@ -267,6 +316,33 @@ function Harness({ api, days, scrollerRef }: HarnessProps): null {
   return null;
 }
 
+/** Reads the provider's queue without being part of the page. */
+function QueueProbe({ target }: { target: { current: Queue | null } }): null {
+  target.current = useCalendarEventsQueue();
+  return null;
+}
+
+/**
+ * Mounts/unmounts only the page, so the app-wide provider (and everything it
+ * owns: local change layer, aliases, unsaved creates) survives like it does
+ * when the calendar route is left and entered again.
+ */
+interface PageControl {
+  setMounted: ((mounted: boolean) => void) | null;
+}
+
+function PageHost({
+  api,
+  days,
+  scrollerRef,
+  control,
+}: HarnessProps & { control: PageControl }): ReactNode {
+  const [mounted, setMounted] = useState(true);
+  control.setMounted = setMounted;
+  if (!mounted) return null;
+  return createElement(Harness, { api, days, scrollerRef });
+}
+
 const DAY = new Date(2026, 9, 18);
 
 /** A timed draft range on the test day. */
@@ -283,12 +359,27 @@ function hourRange(
   };
 }
 
-/** Live session ref: every render writes the newest API into it. */
-type SessionRef = { current: Session | null };
+/**
+ * Live session ref: every render writes the newest API into it. `queue` is the
+ * provider's queue (the layer's public seam), and the page can be unmounted
+ * and remounted while the provider stays up.
+ */
+interface SessionRef {
+  current: Session | null;
+  queue: { current: Queue | null };
+  unmountPage: () => Promise<void>;
+  remountPage: () => Promise<void>;
+}
 
 async function mountSession(): Promise<SessionRef> {
-  const api: SessionRef = { current: null };
+  const api = {
+    current: null,
+    queue: { current: null },
+    unmountPage: async () => {},
+    remountPage: async () => {},
+  } as SessionRef;
   const scrollerRef: RefObject<HTMLElement | null> = { current: null };
+  const control: PageControl = { setMounted: null };
 
   await act(async () => {
     render(
@@ -298,7 +389,13 @@ async function mountSession(): Promise<SessionRef> {
         createElement(
           CalendarEventsProvider,
           null,
-          createElement(Harness, { api, days: [DAY], scrollerRef }),
+          createElement(QueueProbe, { target: api.queue }),
+          createElement(PageHost, {
+            api,
+            days: [DAY],
+            scrollerRef,
+            control,
+          }),
         ),
       ),
     );
@@ -308,7 +405,26 @@ async function mountSession(): Promise<SessionRef> {
     assert.ok(api.current);
     assert.equal(api.current.isLoading, false);
     assert.equal(api.current.calendars.length, CALENDARS.length);
+    assert.ok(api.queue.current);
   });
+
+  api.unmountPage = async () => {
+    await act(async () => {
+      control.setMounted?.(false);
+    });
+    api.current = null;
+    await settle();
+  };
+
+  api.remountPage = async () => {
+    await act(async () => {
+      control.setMounted?.(true);
+    });
+    await waitFor(() => {
+      assert.ok(api.current);
+      assert.equal(api.current.isLoading, false);
+    });
+  };
 
   return api;
 }
@@ -551,6 +667,7 @@ before(async () => {
   CalendarEventsProvider = provider.CalendarEventsProvider as ComponentType<{
     children?: ReactNode;
   }>;
+  useCalendarEventsQueue = provider.useCalendarEventsQueue;
 
   const queries = await import('@/app/queries/calendar');
   findCachedCalendarEvent = queries.findCachedCalendarEvent;
@@ -579,6 +696,10 @@ afterEach(async () => {
   await resetQueryClient();
   requests = [];
   pendingPosts = [];
+  holdPatches = false;
+  pendingPatches = [];
+  holdGets = false;
+  pendingGets = [];
   seededEvents = [];
   serverRows = new Map();
 });
@@ -1311,7 +1432,7 @@ test('a failed create keeps the chip, its fields and the selection', async () =>
     'the failure is reported',
   );
   assert.match(session.current!.writeError ?? '', /create failed/);
-  assert.equal(session.current!.canRetryUnsavedCreates, true);
+  assert.equal(session.current!.canRetryWrites, true);
 });
 
 test('a failed create survives Escape, an empty click, another chip and a new draft', async () => {
@@ -1454,7 +1575,7 @@ test('a failed paste keeps its copy and an explicit retry lands it', async () =>
   );
   assert.equal(session.current!.selectedEvent?.id, tempId);
   assert.ok(session.current!.unsavedEventIds.has(tempId));
-  assert.equal(session.current!.canRetryUnsavedCreates, true);
+  assert.equal(session.current!.canRetryWrites, true);
   assert.deepEqual(patchRequests(), []);
 
   // The inspector's Retry re-POSTs the copy as it stands now.
@@ -1663,4 +1784,371 @@ test('cutting a failed create drops it locally; the payload is a plain copy', as
   assert.equal(session.current!.unsavedEventIds.size, 0);
   assert.deepEqual(deleteRequests(), []);
   assert.deepEqual(patchRequests(), []);
+});
+
+// ── The local change layer: a server read may not undo local intent ──────
+//
+// A PATCH is acknowledged by its own response, but only a *server read* that
+// started after that ack may retire the intent. A GET that started before the
+// ack can resolve after it with the pre-write row (gap-8): it must neither
+// retire the intent nor repaint the old value.
+
+/** A seeded server row for the layer tests. */
+function seededEvent(
+  id: string,
+  overrides: Partial<CalendarEvent> = {},
+): CalendarEvent {
+  return {
+    id,
+    calendar_id: 'cal-1',
+    google_event_id: `google-${id}`,
+    title: 'Event',
+    description: '',
+    start_time: new Date(2026, 9, 18, 9, 0, 0, 0).toISOString(),
+    end_time: new Date(2026, 9, 18, 10, 0, 0, 0).toISOString(),
+    last_synced_at: '2026-10-18T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+/** Start an events refetch and return its held response. */
+async function startHeldGet(session: Session): Promise<PendingGet> {
+  holdGets = true;
+  await act(async () => {
+    session.retry();
+  });
+  await waitFor(() => assert.equal(pendingGets.length, 1));
+  return pendingGets[0];
+}
+
+test('a stale GET resolving after the PATCH ack cannot repaint the old value', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+
+  // The PATCH is sent and held, so the GET below starts before its ack.
+  holdPatches = true;
+  await act(async () => {
+    session.current!.handleSaveTitle('New');
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 1));
+  const staleGet = await startHeldGet(session.current!);
+
+  // The PATCH lands: acknowledged, cached, still painted.
+  await act(async () => {
+    pendingPatches[0].respondWith();
+  });
+  await settle();
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'New');
+  assert.ok(session.queue.current!.getOverlay('e1'), 'the intent is kept');
+
+  // The GET that started first now resolves with the pre-write row.
+  await act(async () => {
+    staleGet.respondWith([seededEvent('e1', { title: 'Old' })]);
+  });
+  await settle();
+
+  assert.equal(
+    findCachedCalendarEvent(queryClient, 'e1')?.title,
+    'Old',
+    'the stale read really did overwrite the cache',
+  );
+  assert.equal(
+    paintedEvent(session.current!, 'e1')?.title,
+    'New',
+    'the local intent still paints over the stale row',
+  );
+  assert.equal(
+    session.current!.selectedEvent?.title,
+    'New',
+    'the inspector follows the paint',
+  );
+});
+
+test('a GET that started after the ack and agrees retires the intent', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+  await act(async () => {
+    session.current!.handleSaveTitle('New');
+  });
+  await settle();
+  assert.equal(patchRequests().length, 1);
+  assert.ok(session.queue.current!.getOverlay('e1'));
+
+  // The server now holds the write; a read started after the ack confirms it.
+  const row = serverRows.get('e1');
+  assert.equal(row?.title, 'New');
+  const agreedGet = await startHeldGet(session.current!);
+  await act(async () => {
+    agreedGet.respondWith([row]);
+  });
+  await settle();
+
+  assert.equal(
+    paintedEvent(session.current!, 'e1')?.title,
+    'New',
+    'the display is unchanged',
+  );
+  assert.equal(
+    session.queue.current!.getOverlay('e1'),
+    undefined,
+    'agreement retires the field: no local intent is left',
+  );
+});
+
+test('a GET that started after the ack and disagrees lets the server win', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+  await act(async () => {
+    session.current!.handleSaveTitle('New');
+  });
+  await settle();
+  assert.equal(patchRequests().length, 1);
+
+  // A read after the ack that does not carry our value: a remote edit, or a
+  // server that refused to keep it. Retire so the mismatch cannot mask every
+  // later change forever.
+  const remoteGet = await startHeldGet(session.current!);
+  await act(async () => {
+    remoteGet.respondWith([seededEvent('e1', { title: 'Remote' })]);
+  });
+  await settle();
+
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'Remote');
+  assert.equal(session.queue.current!.getOverlay('e1'), undefined);
+});
+
+test('an edit whose value already equals the server row sends no PATCH', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Lunch' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+
+  await act(async () => {
+    session.current!.handleSaveTitle('Lunch');
+  });
+  await settle();
+
+  assert.deepEqual(patchRequests(), [], 'a no-op edit is never sent');
+  assert.equal(
+    paintedEvent(session.current!, 'e1')?.title,
+    'Lunch',
+    'the display still shows the value',
+  );
+  assert.equal(
+    session.queue.current!.getOverlay('e1'),
+    undefined,
+    'the no-op intent is settled without a request',
+  );
+});
+
+test('rapid edits while a PATCH is in flight squash into one request', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old', description: '' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+
+  holdPatches = true;
+  await act(async () => {
+    session.current!.handleSaveTitle('A');
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 1));
+  assert.deepEqual(pendingPatches[0].body, { summary: 'A' });
+
+  // Two more edits while the first request is in flight: both coalesce.
+  await act(async () => {
+    session.current!.handleSaveDescription('note');
+  });
+  await act(async () => {
+    session.current!.handleSaveTitle('B');
+  });
+  assert.equal(pendingPatches.length, 1, 'still one request in flight');
+
+  await act(async () => {
+    pendingPatches[0].respondWith();
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 2));
+  assert.deepEqual(pendingPatches[1].body, {
+    summary: 'B',
+    description: 'note',
+  });
+
+  await act(async () => {
+    pendingPatches[1].respondWith();
+  });
+  await settle();
+  assert.equal(pendingPatches.length, 2, 'no third request');
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'B');
+  assert.equal(paintedEvent(session.current!, 'e1')?.description, 'note');
+});
+
+test('a failed PATCH keeps the edit painted and the banner Retry re-sends it', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+
+  holdPatches = true;
+  await act(async () => {
+    session.current!.handleSaveTitle('New');
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 1));
+  await act(async () => {
+    pendingPatches[0].fail('boom');
+  });
+  await settle();
+
+  assert.equal(
+    paintedEvent(session.current!, 'e1')?.title,
+    'New',
+    'a failed edit is kept, never reverted',
+  );
+  assert.match(session.current!.writeError ?? '', /Couldn't save event/);
+  assert.match(session.current!.writeError ?? '', /boom/);
+  assert.equal(session.current!.canRetryWrites, true);
+
+  // The banner Retry re-sends exactly the kept intent.
+  await act(async () => {
+    session.current!.retryWrites();
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 2));
+  assert.deepEqual(pendingPatches[1].body, { summary: 'New' });
+  assert.equal(session.current!.writeError, null, 'the banner clears');
+
+  await act(async () => {
+    pendingPatches[1].respondWith();
+  });
+  await settle();
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'New');
+  assert.equal(session.current!.canRetryWrites, false);
+  assert.equal(
+    session.queue.current!.getOverlay('e1')?.op,
+    'upsert',
+    'the acknowledged intent stays painted until a read retires it',
+  );
+});
+
+test('an unsaved create survives unmounting and remounting the page', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+
+  // Edit while the POST flies, then fail it: the local row keeps everything.
+  await act(async () => {
+    session.current!.handleSaveDescription('Bring the form');
+  });
+  pendingPosts[0].fail();
+  await settle();
+  assert.ok(session.current!.unsavedEventIds.has(tempId));
+
+  // Leave the calendar route and come back. The provider stays mounted; the
+  // page is a new session with new state.
+  await session.unmountPage();
+  await session.remountPage();
+
+  assert.deepEqual(
+    paintedIds(session.current!),
+    [tempId],
+    'the unsaved chip is still on the grid',
+  );
+  assert.ok(
+    session.current!.unsavedEventIds.has(tempId),
+    'the unsaved marker survives the page',
+  );
+  assert.equal(
+    paintedEvent(session.current!, tempId)?.title,
+    'Dentist',
+    'the typed title survives too',
+  );
+  assert.equal(
+    paintedEvent(session.current!, tempId)?.description,
+    'Bring the form',
+  );
+
+  // And the retry still re-POSTs its current local state.
+  let retried: Promise<boolean> | null = null;
+  await act(async () => {
+    retried = session.current!.retryUnsavedCreate(tempId);
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 2));
+  assert.equal(pendingPosts[1].body.summary, 'Dentist');
+  assert.equal(pendingPosts[1].body.description, 'Bring the form');
+
+  await act(async () => {
+    pendingPosts[1].respondWith(createdEvent(pendingPosts[1].body, 'srv-1'));
+  });
+  await act(async () => {
+    await retried!;
+  });
+  await settle();
+
+  assert.deepEqual(paintedIds(session.current!), ['srv-1']);
+  assert.equal(session.current!.unsavedEventIds.size, 0);
+  assert.deepEqual(deleteRequests(), []);
+});
+
+test('dragging an unsaved create retries its POST with the moved times', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+  pendingPosts[0].fail();
+  await settle();
+
+  const event = session.current!.selectedEvent!;
+  assert.equal(event.id, tempId);
+  const hourH = session.current!.hourH;
+  const startMin = minutesOf(event.start_time);
+  const endMin = minutesOf(event.end_time);
+  const grabY = yForMinutes((startMin + endMin) / 2, hourH);
+  const dom = mountChipDom(tempId, startMin, endMin, hourH);
+  try {
+    await act(async () => {
+      chipPointerDown(session.current!, event, dom.chipEl, grabY);
+    });
+    // +120 minutes of travel from the mid-chip grab moves 9:00 to 11:00.
+    await movePointer(yForMinutes((startMin + endMin) / 2 + 120, hourH));
+    await dropPointer(yForMinutes((startMin + endMin) / 2 + 120, hourH));
+  } finally {
+    dom.remove();
+  }
+
+  // The drop is a save: an unsaved create re-POSTs with its current times.
+  await waitFor(() => assert.equal(pendingPosts.length, 2));
+  assert.equal(pendingPosts[1].body.summary, 'Dentist');
+  assert.equal(
+    pendingPosts[1].body.start,
+    new Date(2026, 9, 18, 11, 0, 0, 0).toISOString(),
+  );
+
+  pendingPosts[1].respondWith(createdEvent(pendingPosts[1].body, 'srv-1'));
+  await settle();
+  assert.deepEqual(paintedIds(session.current!), ['srv-1']);
+  assert.equal(
+    paintedEvent(session.current!, 'srv-1')?.start_time,
+    pendingPosts[1].body.start,
+  );
+  assert.equal(session.current!.unsavedEventIds.size, 0);
 });

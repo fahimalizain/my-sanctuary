@@ -39,6 +39,20 @@ export interface EventPatchQueueHandlers {
   /** Perform one PATCH and resolve with the authoritative server event. */
   send(id: string, input: EventPatch): Promise<CalendarEvent>;
   /**
+   * Final say over a squashed patch, right before it is sent. The layer drops
+   * fields the latest known server row already holds (no-op skip) and reports
+   * them through `onSkipped`; an empty result sends nothing.
+   */
+  prepare?(
+    id: string,
+    patch: EventPatch,
+  ): {
+    patch: EventPatch;
+    skipped: EventPatch;
+  };
+  /** Fields dropped by `prepare` because the server already holds them. */
+  onSkipped?(id: string, skipped: EventPatch): void;
+  /**
    * A request succeeded. `idle` is true when nothing else is pending for this
    * id, so the caller may drop its overlay if it matches the server row.
    */
@@ -119,10 +133,31 @@ export class EventPatchQueue {
     this.running.add(id);
     try {
       for (let sent = this.take(id); sent; sent = this.take(id)) {
+        // The layer has the final say: a field the server already holds is a
+        // no-op. It is reported (so the layer can retire it) and nothing is
+        // sent when the whole squashed patch is a no-op.
+        let prepared: { patch: EventPatch; skipped: EventPatch } = {
+          patch: sent,
+          skipped: {},
+        };
+        try {
+          prepared = this.handlers.prepare?.(id, sent) ?? prepared;
+        } catch {
+          /* a throwing hook must not wedge the chain: send the patch as-is */
+        }
+        if (!isEmpty(prepared.skipped)) {
+          try {
+            this.handlers.onSkipped?.(id, prepared.skipped);
+          } catch {
+            /* the next request still goes out */
+          }
+        }
+        if (isEmpty(prepared.patch)) continue;
+
         let event: CalendarEvent | null = null;
         let failure: { err: unknown } | null = null;
         try {
-          event = await this.handlers.send(id, toWirePatch(sent));
+          event = await this.handlers.send(id, toWirePatch(prepared.patch));
         } catch (err) {
           failure = { err };
         }
@@ -130,8 +165,11 @@ export class EventPatchQueue {
         const idle = !this.pending.has(id);
         // A throwing handler must not wedge the chain.
         try {
-          if (failure) this.handlers.onError(id, sent, failure.err, idle);
-          else this.handlers.onSuccess(id, sent, event!, idle);
+          if (failure) {
+            this.handlers.onError(id, prepared.patch, failure.err, idle);
+          } else {
+            this.handlers.onSuccess(id, prepared.patch, event!, idle);
+          }
         } catch {
           /* next request still goes out */
         }
@@ -140,71 +178,6 @@ export class EventPatchQueue {
       this.running.delete(id);
     }
   }
-}
-
-/** True when the overlay still holds the value this patch key would write. */
-function overlayHolds(
-  ev: CalendarEvent,
-  key: keyof EventPatch,
-  patch: EventPatch,
-): boolean {
-  switch (key) {
-    case 'summary':
-      return ev.title === patch.summary;
-    case 'description':
-      return (ev.description ?? '') === patch.description;
-    case 'start':
-      return ev.start_time === patch.start;
-    case 'end':
-      return ev.end_time === patch.end;
-    case 'is_all_day':
-      return Boolean(ev.is_all_day) === patch.is_all_day;
-    case 'start_time_zone':
-      return (ev.start_time_zone?.trim() || '') === patch.start_time_zone;
-    case 'calendar_id':
-      return ev.calendar_id === patch.calendar_id;
-  }
-}
-
-/**
- * Revert the fields of a failed patch on the overlay, using `base` (last known
- * server row). Each field reverts only while the overlay still holds the
- * failed value; a newer edit to that field is left alone.
- */
-export function revertFailedPatch(
-  overlay: CalendarEvent,
-  base: CalendarEvent,
-  failed: EventPatch,
-): CalendarEvent {
-  const next = { ...overlay };
-  const revert = (key: keyof EventPatch, apply: () => void) => {
-    if (failed[key] === undefined) return;
-    if (overlayHolds(overlay, key, failed)) apply();
-  };
-  revert('summary', () => {
-    next.title = base.title;
-  });
-  revert('description', () => {
-    next.description = base.description;
-  });
-  revert('start', () => {
-    next.start_time = base.start_time;
-  });
-  revert('end', () => {
-    next.end_time = base.end_time;
-  });
-  revert('is_all_day', () => {
-    next.is_all_day = base.is_all_day;
-  });
-  revert('start_time_zone', () => {
-    next.start_time_zone = base.start_time_zone;
-    next.end_time_zone = base.end_time_zone;
-  });
-  revert('calendar_id', () => {
-    next.calendar_id = base.calendar_id;
-    next.color = base.color;
-  });
-  return next;
 }
 
 export interface CreateFlushInput {
