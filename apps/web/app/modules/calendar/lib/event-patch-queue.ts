@@ -1,4 +1,8 @@
-import type { CalendarEvent, PatchCalendarEventInput } from '@/app/types';
+import type {
+  CalendarEvent,
+  NewCalendarEventInput,
+  PatchCalendarEventInput,
+} from '@/app/types';
 
 /**
  * Pending field edits for one event. Same shape as the PATCH body, except
@@ -203,14 +207,9 @@ export function revertFailedPatch(
   return next;
 }
 
-export interface DraftFlushInput {
-  /** Values the create POST carried. */
-  posted: {
-    summary: string;
-    description: string;
-    start: string;
-    end: string;
-  };
+export interface CreateFlushInput {
+  /** Values the create POST carried, i.e. what the server already stored. */
+  posted: PostedEventFields;
   /** Overlay (local) event as it stands when create returns. */
   local: CalendarEvent;
   /** Calendar the server created the event in. */
@@ -218,16 +217,55 @@ export interface DraftFlushInput {
 }
 
 /**
- * Fields the user changed on a temp-id event while its create POST was in
- * flight. Create is timed-only with no zone, so all-day / zone always count
- * as differing. Null when nothing needs flushing.
+ * The fields a create POST carried, used as the flush baseline. A draft always
+ * posts a timed, zoneless row; a paste posts whatever the clipboard item was,
+ * so all-day and time-zone writes are part of the baseline too.
  */
-export function buildDraftFlushPatch(
-  input: DraftFlushInput,
+export interface PostedEventFields {
+  summary: string;
+  description: string;
+  start: string;
+  end: string;
+  /** All-day flag the POST carried; absent/false means a timed row. */
+  isAllDay?: boolean;
+  /** Zone the POST carried (timed only); '' / absent means none. */
+  startTimeZone?: string;
+}
+
+/** Baseline for a create body: exactly the values the server received. */
+export function postedFieldsFromCreate(
+  input: NewCalendarEventInput,
+): PostedEventFields {
+  return {
+    summary: input.summary,
+    description: input.description ?? '',
+    start: input.start,
+    end: input.end,
+    isAllDay: input.is_all_day === true,
+    startTimeZone: input.start_time_zone ?? '',
+  };
+}
+
+/**
+ * Fields the user changed on a temp-id event while its create POST was in
+ * flight. Null when nothing needs flushing.
+ *
+ * The diff is against what the POST actually carried — a paste may have
+ * created an all-day or zoned row, and re-sending those fields for an
+ * untouched copy would be a redundant (and for `is_all_day`, wrong) write.
+ * Times travel with the flag / zone whenever any of the three changed: the
+ * server reads them together, and a flag flip needs both edges to be
+ * meaningful.
+ */
+export function buildCreateFlushPatch(
+  input: CreateFlushInput,
 ): EventPatch | null {
   const { posted, local, serverCalendarId } = input;
-  const zone = local.start_time_zone?.trim() || '';
   const allDay = Boolean(local.is_all_day);
+  const postedAllDay = Boolean(posted.isAllDay);
+  // An all-day row carries civil dates; a zone on either side is ignored.
+  const zone = allDay ? '' : local.start_time_zone?.trim() || '';
+  const postedZone = postedAllDay ? '' : posted.startTimeZone?.trim() || '';
 
   const patch: EventPatch = {};
   if (local.title !== posted.summary) patch.summary = local.title;
@@ -236,15 +274,24 @@ export function buildDraftFlushPatch(
   }
   // All-day conversion always needs start/end + flag together.
   if (
-    allDay ||
-    zone !== '' ||
+    allDay !== postedAllDay ||
+    zone !== postedZone ||
     local.start_time !== posted.start ||
     local.end_time !== posted.end
   ) {
     patch.start = local.start_time;
     patch.end = local.end_time;
-    if (allDay) patch.is_all_day = true;
-    if (zone && !allDay) patch.start_time_zone = zone;
+    // An all-day row must keep its flag on any patch that carries times or
+    // the server would store it as timed; a flip back needs the explicit
+    // false for the same reason.
+    if (allDay) {
+      patch.is_all_day = true;
+    } else if (postedAllDay) {
+      patch.is_all_day = false;
+    }
+    // '' is the queue's "cleared" marker (stripped from the wire request):
+    // it supersedes a zone the create carried.
+    if (!allDay && zone !== postedZone) patch.start_time_zone = zone;
   }
   // The queue sends the field request first, then the (exclusive) move.
   if (local.calendar_id !== serverCalendarId) {

@@ -20,6 +20,7 @@ import {
   resetEventOverlays,
   type EventOverlay,
 } from './lib/event-overlays';
+import { EventIdAliases } from './lib/event-id-aliases';
 import { EventPatchQueue, type EventPatch } from './lib/event-patch-queue';
 import {
   reconcilePatchError,
@@ -47,6 +48,15 @@ export interface CalendarEventsQueue {
   enqueuePatch(id: string, patch: EventPatch): void;
   /** Drop queued edits and ignore the in-flight result for this id. */
   cancelPatch(id: string): void;
+  /**
+   * Follow a temp create id to the server row it became. Any gesture or
+   * callback that started before the create returned (a drag session, a
+   * queued inspector blur, a stale selection) still holds the temp id, and
+   * every write must land on the server row.
+   */
+  resolveId(id: string): string;
+  /** Remember the server id a temp create id became. */
+  recordIdAlias(tempId: string, serverId: string): void;
 }
 
 const CalendarEventsContext = createContext<CalendarEventsQueue>({
@@ -59,6 +69,8 @@ const CalendarEventsContext = createContext<CalendarEventsQueue>({
   apply: (server) => server,
   enqueuePatch: () => {},
   cancelPatch: () => {},
+  resolveId: (id) => id,
+  recordIdAlias: () => {},
 });
 
 /**
@@ -191,12 +203,30 @@ export function CalendarEventsProvider({
     patchQueueRef.current?.cancel(id);
   }, []);
 
+  // Temp → server id aliases live next to the overlay: both describe events
+  // this client created before the server had a row for them. Stable lookups
+  // so handlers can read them without re-binding on every overlay bump.
+  const idAliasesRef = useRef<EventIdAliases | null>(null);
+  if (!idAliasesRef.current) idAliasesRef.current = new EventIdAliases();
+
+  const resolveId = useCallback(
+    (id: string): string => idAliasesRef.current?.resolve(id) ?? id,
+    [],
+  );
+
+  const recordIdAlias = useCallback((tempId: string, serverId: string) => {
+    idAliasesRef.current?.record(tempId, serverId);
+  }, []);
+
   // Provider survives logout; clear overlays on identity change so they
   // never leak across accounts (queryClient.clear does not touch this map).
   // Cancel queued/in-flight patches first: a response that resumes after
   // logout must not paint the previous account's event back onto the overlay.
+  // Aliases go too: a temp id from the previous account must not resolve into
+  // this account's server ids.
   useEffect(() => {
     patchQueueRef.current?.cancelAll();
+    idAliasesRef.current?.reset();
     reset();
   }, [accountId, reset]);
 
@@ -211,6 +241,8 @@ export function CalendarEventsProvider({
       apply,
       enqueuePatch,
       cancelPatch,
+      resolveId,
+      recordIdAlias,
     }),
     [
       version,
@@ -222,6 +254,8 @@ export function CalendarEventsProvider({
       apply,
       enqueuePatch,
       cancelPatch,
+      resolveId,
+      recordIdAlias,
     ],
   );
 
