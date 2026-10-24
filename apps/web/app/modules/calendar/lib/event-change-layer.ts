@@ -10,8 +10,9 @@
 // never our own PATCH / create response):
 //
 //   1. the field must have been acknowledged by a successful write, and
-//   2. the painted row must come from a read that STARTED after that ack
-//      (read and ack stamps share one monotonic clock).
+//   2. the painted events window must come from a read that STARTED after that
+//      ack (read and ack stamps share one monotonic clock; the session passes
+//      the current window's stamp into paint()).
 //
 // A read that started before the ack is stale: it retires nothing, and it
 // cannot repaint over the intent either. A read that started after the ack
@@ -23,7 +24,6 @@
 // React-free: the provider owns the state and wires the cache lookup.
 
 import type { CalendarEvent, PatchCalendarEventInput } from '@/app/types';
-import { calendarServerReadStamp } from './calendar-server-reads';
 import { applyEventOverlays, type EventOverlay } from './event-overlays';
 import { mergeEventPatch, type EventPatch } from './event-patch-queue';
 import { colorForCalendar } from './week-layout';
@@ -261,9 +261,20 @@ export class EventChangeLayer {
   }
 
   /**
+   * Apply field intent to a local-only row (temp create) in place. Handlers
+   * use this instead of re-painting a full row from a render snapshot, so a
+   * stale closure cannot revert a field another handler just changed.
+   */
+  editLocal(id: string, patch: EventPatch): void {
+    const entry = this.byId.get(id);
+    if (!entry?.localEvent) return;
+    entry.localEvent = applyEventIntent(entry.localEvent, patch);
+  }
+
+  /**
    * Record field intent. Last write wins per field, with the same all-day
    * rules the PATCH queue used (a pending zone is dropped once the row is
-   * all-day). Returns the entry's unsent fields for the caller to enqueue.
+   * all-day). The caller sends the entry's `unsentPatch` through the queue.
    */
   edit(id: string, patch: EventPatch): void {
     if (Object.keys(patch).length === 0) return;
@@ -354,11 +365,12 @@ export class EventChangeLayer {
 
   /**
    * Paint the visible server list over the local layer, retiring acknowledged
-   * fields whose painted row comes from a read that started after their ack.
-   * Retirement runs here because this is the only place the painted row and
-   * its read stamp meet: a field is never retired by a row we are not showing.
+   * fields whose painted window comes from a read that started after their
+   * ack. Retirement runs here because this is the only place the painted row
+   * and its window's read stamp meet: a field is never retired by a read the
+   * caller is not showing.
    */
-  paint(server: CalendarEvent[]): CalendarEvent[] {
+  paint(server: CalendarEvent[], readStamp = 0): CalendarEvent[] {
     if (this.byId.size === 0) return server;
 
     const overlays: EventOverlay[] = [];
@@ -372,7 +384,7 @@ export class EventChangeLayer {
         overlays.push({ op: 'delete', id: row.id });
         continue;
       }
-      const live = this.retireForRow(row.id, row, entry);
+      const live = this.retireForRow(row.id, entry, readStamp);
       if (!live) continue;
       overlays.push({
         op: 'upsert',
@@ -392,16 +404,15 @@ export class EventChangeLayer {
   }
 
   /**
-   * Retire the fields of `entry` that a server read has settled. A read that
-   * started before the ack is stale and retires nothing (and the caller keeps
-   * painting the intent over it).
+   * Retire the fields of `entry` that a server read has settled. A window read
+   * that started before the ack is stale and retires nothing (and the caller
+   * keeps painting the intent over it).
    */
   private retireForRow(
     id: string,
-    row: CalendarEvent,
     entry: ChangeEntry,
+    readStamp: number,
   ): ChangeEntry | undefined {
-    const readStamp = calendarServerReadStamp(row);
     if (readStamp === 0 || entry.acked.size === 0) return entry;
 
     for (const [field, ack] of entry.acked) {

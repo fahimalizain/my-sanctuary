@@ -2081,6 +2081,12 @@ test('an unsaved create survives unmounting and remounting the page', async () =
     paintedEvent(session.current!, tempId)?.description,
     'Bring the form',
   );
+  assert.match(
+    session.current!.writeError ?? '',
+    /aren't saved yet/,
+    'the banner comes back with the page',
+  );
+  assert.equal(session.current!.canRetryWrites, true);
 
   // And the retry still re-POSTs its current local state.
   let retried: Promise<boolean> | null = null;
@@ -2151,4 +2157,131 @@ test('dragging an unsaved create retries its POST with the moved times', async (
     pendingPosts[1].body.start,
   );
   assert.equal(session.current!.unsavedEventIds.size, 0);
+});
+
+test('an identical refetch keeps row identity and still retires agreeing intent', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+  await act(async () => {
+    session.current!.handleSaveTitle('New');
+  });
+  await settle();
+  assert.equal(patchRequests().length, 1);
+
+  // The cache now holds our PATCH response; keep the row object.
+  const before = findCachedCalendarEvent(queryClient, 'e1');
+  assert.equal(before?.title, 'New');
+  assert.ok(session.queue.current!.getOverlay('e1'));
+
+  // A GET that returns the same values: structural sharing keeps the cached
+  // object identities, yet the window stamp still advances and retires.
+  const sameGet = await startHeldGet(session.current!);
+  await act(async () => {
+    sameGet.respondWith([before!]);
+  });
+  await settle();
+
+  assert.equal(
+    findCachedCalendarEvent(queryClient, 'e1'),
+    before,
+    'structural sharing is on: the cached row keeps its identity',
+  );
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'New');
+  assert.equal(
+    session.queue.current!.getOverlay('e1'),
+    undefined,
+    'the agreeing read retires the intent despite the shared identity',
+  );
+});
+
+test('the events query does not disable structural sharing', async () => {
+  const { calendarEventsQueryOptions } = await import('@/app/queries/calendar');
+  const options = calendarEventsQueryOptions('min', 'max');
+  // Read stamps live per window, not per row, so identical refetches may keep
+  // their objects.
+  assert.equal(options.structuralSharing, undefined);
+});
+
+test('two edits from the same stale render both survive', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old', description: '' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+
+  holdPatches = true;
+  await act(async () => {
+    // No render between them: both handlers close over the same snapshot.
+    // Field-level intent means the second cannot revert the first.
+    session.current!.handleSaveTitle('New');
+    session.current!.handleSaveDescription('note');
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 1));
+  assert.deepEqual(pendingPatches[0].body, { summary: 'New' });
+
+  await act(async () => {
+    pendingPatches[0].respondWith();
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 2));
+  assert.deepEqual(
+    pendingPatches[1].body,
+    { description: 'note' },
+    'the follow-up request must not carry a reverted title',
+  );
+
+  await act(async () => {
+    pendingPatches[1].respondWith();
+  });
+  await settle();
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'New');
+  assert.equal(paintedEvent(session.current!, 'e1')?.description, 'note');
+});
+
+test('a remount restores the banner and Retry for a failed PATCH', async () => {
+  seededEvents = [seededEvent('e1', { title: 'Old' })];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.selectEvent('e1');
+  });
+
+  holdPatches = true;
+  await act(async () => {
+    session.current!.handleSaveTitle('New');
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 1));
+  await act(async () => {
+    pendingPatches[0].fail('boom');
+  });
+  await settle();
+  assert.equal(session.current!.canRetryWrites, true);
+
+  // Leave and come back: the provider still holds the kept intent, so the
+  // strip and its Retry must not disappear with the page's state.
+  await session.unmountPage();
+  await session.remountPage();
+
+  assert.match(session.current!.writeError ?? '', /aren't saved yet/);
+  assert.equal(
+    paintedEvent(session.current!, 'e1')?.title,
+    'New',
+    'the failed edit is still painted',
+  );
+  assert.equal(session.current!.canRetryWrites, true);
+
+  await act(async () => {
+    session.current!.retryWrites();
+  });
+  await waitFor(() => assert.equal(pendingPatches.length, 2));
+  assert.deepEqual(pendingPatches[1].body, { summary: 'New' });
+
+  await act(async () => {
+    pendingPatches[1].respondWith();
+  });
+  await settle();
+  assert.equal(paintedEvent(session.current!, 'e1')?.title, 'New');
+  assert.equal(session.current!.writeError, null, 'the banner clears');
+  assert.equal(session.current!.canRetryWrites, false);
 });

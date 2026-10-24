@@ -36,6 +36,7 @@ import {
   eventChipColor,
 } from '../lib/calendar-model';
 import { hourLabelStep } from '../lib/calendar-zoom';
+import { calendarServerReadStamp } from '../lib/calendar-server-reads';
 import { isPersistableDraftTitle } from '../lib/event-draft';
 import { DESKTOP_MQ } from '../lib/inspector-anchor';
 import { isTempEventId, newTempEventId } from '../lib/event-overlays';
@@ -245,6 +246,27 @@ export function useCalendarSession({
     return () => setPatchWriteErrorListener(null);
   }, [reportPatchError]);
 
+  // Leaving and re-entering the calendar keeps failed writes in the provider
+  // (kept PATCH intent, unsaved creates). Restore the strip once per mount so
+  // the Retry they already had does not silently disappear — but only once, so
+  // Dismiss stays dismissed.
+  const writeBannerRestoredRef = useRef(false);
+  useEffect(() => {
+    if (writeBannerRestoredRef.current) return;
+    writeBannerRestoredRef.current = true;
+    const retryCreates = queue.unsavedEventIds.size > 0;
+    const retryPatches = queue.hasFailedWrites;
+    if (!retryCreates && !retryPatches) return;
+    setWriteError(
+      (prev) =>
+        prev ?? {
+          message: "Some changes aren't saved yet",
+          retryCreates,
+          retryPatches,
+        },
+    );
+  }, [queue]);
+
   // Deferred delete: the event leaves the grid now, the DELETE waits out the
   // undo toast. The record also lives in a ref so the timer, Undo and a
   // create POST returning mid-grace all read one synchronous state; the React
@@ -366,8 +388,15 @@ export function useCalendarSession({
     setSelectionReady(true);
   }, [calendars, selectionReady]);
 
-  // Overlay first so inspector shows optimistic create/move/resize.
-  const overlaidEvents = useMemo(() => queue.apply(events), [queue, events]);
+  // Overlay first so inspector shows optimistic create/move/resize. The
+  // window's read stamp is what paint() retires acknowledged intent on; it
+  // changes on every completed GET, including one whose data React Query kept
+  // by structural sharing, so the memo re-runs and agreement still retires.
+  const eventsReadStamp = calendarServerReadStamp(timeMin, timeMax);
+  const overlaidEvents = useMemo(
+    () => queue.apply(events, eventsReadStamp),
+    [queue, events, eventsReadStamp],
+  );
 
   const selectedEvent = useMemo(() => {
     if (!selectedEventId) return null;
@@ -623,23 +652,10 @@ export function useCalendarSession({
       });
 
       if (!flush) return;
-      queue.upsert({
-        ...serverEvent,
-        title: local.title,
-        description: local.description,
-        start_time: local.start_time,
-        end_time: local.end_time,
-        is_all_day: local.is_all_day,
-        start_time_zone: local.start_time_zone,
-        end_time_zone: local.end_time_zone,
-        calendar_id: calendarId,
-        color: calendarPicked
-          ? (local.color ?? colorForCalendar(calendarId))
-          : serverEvent.color,
-      });
-      // Same per-event chain as inspector edits: field PATCH first, then
-      // calendar MOVE, ahead of any later edit.
-      queue.enqueuePatch(serverEvent.id, flush);
+      // Field-level intent under the server id: same per-event chain as
+      // inspector edits (field PATCH first, then the exclusive calendar MOVE),
+      // and a stale snapshot can never repaint another field.
+      queue.edit(serverEvent.id, flush);
     },
     [queue],
   );
@@ -975,13 +991,13 @@ export function useCalendarSession({
       // A create that returned between the render and this blur leaves a temp
       // id in the selection; the alias names the row the write must reach.
       const id = resolveId(selectedEventId);
-      const current = overlaidEvents.find((e) => e.id === id);
-      if (!current) return;
+      if (!overlaidEvents.some((e) => e.id === id)) return;
 
       clearWriteError();
 
-      // Paint immediately.
-      queue.upsert({ ...current, title: summary });
+      // Field-level intent only: the provider reads the live row, so a stale
+      // render snapshot can never revert a field another handler just changed.
+      queue.edit(id, { summary });
 
       // Unpersisted draft: title blur is the sole persist trigger.
       if (id === queue.getDraftId()) {
@@ -994,10 +1010,7 @@ export function useCalendarSession({
       // Never a PATCH against a temp id.
       if (isTempEventId(id)) {
         retryIfUnsaved(id);
-        return;
       }
-
-      queue.enqueuePatch(id, { summary });
     },
     [
       selectedEventId,
@@ -1014,13 +1027,11 @@ export function useCalendarSession({
     (description: string) => {
       if (!selectedEventId) return;
       const id = resolveId(selectedEventId);
-      const current = overlaidEvents.find((e) => e.id === id);
-      if (!current) return;
+      if (!overlaidEvents.some((e) => e.id === id)) return;
 
       clearWriteError();
 
-      // Paint immediately.
-      queue.upsert({ ...current, description });
+      queue.edit(id, { description });
 
       // Unpersisted draft: paint overlay and try persist. Create stays gated
       // by isPersistableDraftTitle — description-only empty-title drafts do
@@ -1034,10 +1045,7 @@ export function useCalendarSession({
       // still in flight keeps the overlay-only edit and flushes on success.
       if (isTempEventId(id)) {
         retryIfUnsaved(id);
-        return;
       }
-
-      queue.enqueuePatch(id, { description });
     },
     [
       selectedEventId,
@@ -1060,12 +1068,9 @@ export function useCalendarSession({
 
       clearWriteError();
 
-      // Paint immediately (color follows destination calendar).
-      queue.upsert({
-        ...current,
-        calendar_id: calendarId,
-        color: colorForCalendar(calendarId),
-      });
+      // One field: the provider paints the move (color follows the
+      // destination) and, for a server id, sends the exclusive move.
+      queue.edit(id, { calendar_id: calendarId });
 
       // Ensure destination is visible so the chip does not vanish.
       setSelectedCalendarIds((prev) => {
@@ -1078,17 +1083,14 @@ export function useCalendarSession({
       // Unpersisted draft, unsaved create or temp id: overlay only. A pick made
       // while the create flies is flushed as a MOVE after any field PATCH; a
       // pick on an unsaved create becomes the retry POST's explicit destination.
-      if (id === queue.getDraftId() || isTempEventId(id)) {
+      if (isTempEventId(id)) {
         // A draft's untouched calendar is the server's default (category
         // routing); a pick here is the user's explicit destination. Keyed by
         // temp id so it survives until the create settles (and a concurrent
         // draft's pick never reaches this create's flush).
         queue.markCalendarPicked(id);
-        if (isTempEventId(id)) retryIfUnsaved(id);
-        return;
+        retryIfUnsaved(id);
       }
-
-      queue.enqueuePatch(id, { calendar_id: calendarId });
     },
     [
       selectedEventId,
@@ -1379,28 +1381,21 @@ export function useCalendarSession({
         overlaidEvents.find((e) => e.id === id) ??
         events.find((e) => e.id === id);
       if (!current) return;
-      const next: CalendarEvent = {
-        ...current,
-        start_time: range.start.toISOString(),
-        end_time: range.end.toISOString(),
-      };
+
       clearWriteError();
-      // Paint immediately; PATCH follows unless the id is still temp (a create
-      // in flight, or an unsaved create whose retry will carry the times).
-      queue.upsert(next);
+      // Field-level intent only: paint the two edges over the live row (or
+      // update a temp row in place) and PATCH them for a server id.
+      queue.edit(id, {
+        start: range.start.toISOString(),
+        end: range.end.toISOString(),
+      });
 
       // Still a temp id: no server row yet — a create in flight flushes these
       // times on success; an unsaved create re-POSTs now, so a drag is not
       // silently lost if the user never opens the inspector again.
       if (isTempEventId(id)) {
         retryIfUnsaved(id);
-        return;
       }
-
-      queue.enqueuePatch(id, {
-        start: next.start_time,
-        end: next.end_time,
-      });
     },
     [overlaidEvents, events, resolveId, queue, clearWriteError, retryIfUnsaved],
   );
@@ -1428,33 +1423,24 @@ export function useCalendarSession({
     (next: { isAllDay: boolean; startIso: string; endIso: string }) => {
       if (!selectedEventId) return;
       const id = resolveId(selectedEventId);
-      const current = overlaidEvents.find((e) => e.id === id);
-      if (!current) return;
+      if (!overlaidEvents.some((e) => e.id === id)) return;
 
       clearWriteError();
 
-      const painted: CalendarEvent = {
-        ...current,
-        is_all_day: next.isAllDay,
-        start_time: next.startIso,
-        end_time: next.endIso,
-        // All-day is civil dates; clear zones on the overlay when switching on.
-        ...(next.isAllDay ? { start_time_zone: '', end_time_zone: '' } : {}),
-      };
-      queue.upsert(painted);
-
-      // Temp / draft: overlay only. A create in flight flushes the field PATCH
-      // on success; an unsaved create re-POSTs with this flag and its times.
-      if (id === queue.getDraftId() || isTempEventId(id)) {
-        if (isTempEventId(id)) retryIfUnsaved(id);
-        return;
-      }
-
-      queue.enqueuePatch(id, {
+      // One field-level write. The provider clears the painted zones when the
+      // flag goes on (all-day carries civil dates), and sends the flag with
+      // its two edges, which the API reads together.
+      queue.edit(id, {
         is_all_day: next.isAllDay,
         start: next.startIso,
         end: next.endIso,
       });
+
+      // Temp / draft: overlay only. A create in flight flushes the field PATCH
+      // on success; an unsaved create re-POSTs with this flag and its times.
+      if (isTempEventId(id)) {
+        retryIfUnsaved(id);
+      }
     },
     [
       selectedEventId,
@@ -1471,34 +1457,24 @@ export function useCalendarSession({
     (timeZone: string, startIso: string, endIso: string) => {
       if (!selectedEventId) return;
       const id = resolveId(selectedEventId);
-      const current = overlaidEvents.find((e) => e.id === id);
-      if (!current) return;
+      if (!overlaidEvents.some((e) => e.id === id)) return;
 
       const zone = timeZone.trim();
       clearWriteError();
 
-      const painted: CalendarEvent = {
-        ...current,
-        start_time: startIso,
-        end_time: endIso,
-        start_time_zone: zone,
-        end_time_zone: zone,
-      };
-      queue.upsert(painted);
-
-      if (id === queue.getDraftId() || isTempEventId(id)) {
-        // A zone is part of the retried create body (its full local state).
-        if (isTempEventId(id)) retryIfUnsaved(id);
-        return;
-      }
-
-      // Empty zone = Local: queue keeps '' so it supersedes an earlier pending
-      // zone, and the wire request omits timeZone on Google.
-      queue.enqueuePatch(id, {
+      // Empty zone = Local: the layer keeps '' so it supersedes an earlier
+      // pending zone, and the wire request omits timeZone on Google. The times
+      // always travel with it.
+      queue.edit(id, {
         start: startIso,
         end: endIso,
         start_time_zone: zone,
       });
+
+      if (isTempEventId(id)) {
+        // A zone is part of the retried create body (its full local state).
+        retryIfUnsaved(id);
+      }
     },
     [
       selectedEventId,

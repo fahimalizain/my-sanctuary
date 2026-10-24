@@ -42,8 +42,12 @@ export interface CalendarEventsQueue {
   reset(): void;
   /** Current paint for id (intent, local create row or delete). */
   getOverlay(id: string): EventOverlay | undefined;
-  /** Apply the local change layer to a server list. */
-  apply(server: CalendarEvent[]): CalendarEvent[];
+  /**
+   * Apply the local change layer to a server list. `readStamp` is the start
+   * stamp of the window read that produced the list (0 when unknown): only a
+   * read that started after an ack may retire that field.
+   */
+  apply(server: CalendarEvent[], readStamp?: number): CalendarEvent[];
   /** Serialize one PATCH for an event through the app-wide queue. */
   enqueuePatch(id: string, patch: EventPatch): void;
   /** Drop queued edits and ignore the in-flight result for this id. */
@@ -184,9 +188,14 @@ export function CalendarEventsProvider({
 
   const edit = useCallback(
     (id: string, patch: EventPatch) => {
-      // A temp row is painted wholesale and never PATCHed; its create path
-      // owns it until the server id exists.
-      if (isTempEventId(id)) return;
+      // A temp row is a local-only create: update its live row in place (never
+      // a stale render snapshot) and never PATCH it. Its create path owns it
+      // until the server id exists.
+      if (isTempEventId(id)) {
+        layer.editLocal(id, patch);
+        bump();
+        return;
+      }
       layer.edit(id, patch);
       const send = layer.unsentPatch(id);
       if (send) patchQueueRef.current?.enqueue(id, send);
@@ -223,9 +232,10 @@ export function CalendarEventsProvider({
   );
 
   const apply = useCallback(
-    (server: CalendarEvent[]): CalendarEvent[] => layer.paint(server),
+    (server: CalendarEvent[], readStamp = 0): CalendarEvent[] =>
+      layer.paint(server, readStamp),
     // Re-bind when the layer changes so consumer memos that depend on `apply`
-    // re-run (paint also retires fields a server read has settled).
+    // re-run (paint also retires fields a window read has settled).
     [layer, version],
   );
 

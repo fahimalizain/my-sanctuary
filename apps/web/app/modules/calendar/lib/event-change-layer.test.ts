@@ -4,7 +4,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
-import { stampCalendarServerRead } from './calendar-server-reads';
 import { applyEventIntent, EventChangeLayer } from './event-change-layer';
 
 function makeEvent(overrides: Partial<CalendarEvent> = {}): CalendarEvent {
@@ -29,17 +28,16 @@ function serverLookup(
   return (id) => byId.get(id);
 }
 
-/** A server read of `events` that STARTED at `stamp`. */
-function read(stamp: number, ...events: CalendarEvent[]): CalendarEvent[] {
-  stampCalendarServerRead(events, stamp);
-  return events;
-}
-
+/**
+ * The row painted for a window read that STARTED at `readStamp` (0: no read
+ * behind these rows, e.g. our own PATCH response).
+ */
 function paintedTitle(
   layer: EventChangeLayer,
   server: CalendarEvent[],
+  readStamp = 0,
 ): string {
-  return layer.paint(server)[0]?.title ?? '';
+  return layer.paint(server, readStamp)[0]?.title ?? '';
 }
 
 // ── Display ────────────────────────────────────────────────────────────
@@ -204,8 +202,8 @@ test('retire: a read that started after the ack and agrees drops the field', () 
   layer.edit('e1', { summary: 'New' });
   layer.acknowledge('e1', { summary: 'New' }, 2);
 
-  const agreed = read(3, makeEvent({ title: 'New' }));
-  assert.equal(paintedTitle(layer, agreed), 'New');
+  const agreed = [makeEvent({ title: 'New' })];
+  assert.equal(paintedTitle(layer, agreed, 3), 'New');
   assert.equal(layer.size, 0, 'agreement retires; the display is unchanged');
   assert.equal(layer.getOverlay('e1'), undefined);
 });
@@ -217,9 +215,9 @@ test('retire: a stale read (started before the ack) neither retires nor repaints
 
   // The GET started at 1, before the PATCH was acknowledged; it resolves
   // later and still carries the pre-write row (the gap-8 race).
-  const stale = read(1, makeEvent({ title: 'Old' }));
+  const stale = [makeEvent({ title: 'Old' })];
 
-  assert.equal(paintedTitle(layer, stale), 'New');
+  assert.equal(paintedTitle(layer, stale, 1), 'New');
   assert.equal(layer.size, 1);
   assert.ok(layer.getOverlay('e1'), 'the intent is kept for the next read');
 });
@@ -229,8 +227,8 @@ test('retire: a read that started after the ack and disagrees lets the server wi
   layer.edit('e1', { summary: 'New' });
   layer.acknowledge('e1', { summary: 'New' }, 2);
 
-  const remote = read(3, makeEvent({ title: 'Remote' }));
-  assert.equal(paintedTitle(layer, remote), 'Remote');
+  const remote = [makeEvent({ title: 'Remote' })];
+  assert.equal(paintedTitle(layer, remote, 3), 'Remote');
   assert.equal(layer.size, 0, 'a post-ack disagreement must not mask forever');
 });
 
@@ -239,8 +237,8 @@ test('retire: an unacknowledged field survives every read', () => {
   layer.edit('e1', { summary: 'New' });
   // No acknowledge(): the write never landed.
 
-  const remote = read(9, makeEvent({ title: 'Old' }));
-  assert.equal(paintedTitle(layer, remote), 'New');
+  const remote = [makeEvent({ title: 'Old' })];
+  assert.equal(paintedTitle(layer, remote, 9), 'New');
   assert.ok(layer.getOverlay('e1'));
 });
 
@@ -251,19 +249,19 @@ test('retire: a newer local value is not retired by an ack of the older one', ()
   layer.edit('e1', { summary: 'B' });
 
   // The read agrees with the acknowledged value, not the current intent.
-  const agreed = read(3, makeEvent({ title: 'A' }));
-  assert.equal(paintedTitle(layer, agreed), 'B');
+  const agreed = [makeEvent({ title: 'A' })];
+  assert.equal(paintedTitle(layer, agreed, 3), 'B');
   assert.deepEqual(layer.unsentPatch('e1'), { summary: 'B' });
 });
 
-test('retire: rows with no read stamp (our own write echo) never retire', () => {
+test('retire: no window read (our own write echo) never retires', () => {
   const layer = new EventChangeLayer(serverLookup(makeEvent()));
   layer.edit('e1', { summary: 'New' });
   layer.acknowledge('e1', { summary: 'New' }, 2);
 
-  // A PATCH response cached by the provider carries no read stamp.
+  // A PATCH response cached by the provider advances no window stamp.
   const echo = makeEvent({ title: 'New' });
-  assert.equal(paintedTitle(layer, [echo]), 'New');
+  assert.equal(paintedTitle(layer, [echo], 0), 'New');
   assert.ok(layer.getOverlay('e1'), 'our own write is not a server read');
 });
 

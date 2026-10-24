@@ -5,7 +5,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CalendarEvent } from '@/app/types';
-import { stampCalendarServerRead } from './calendar-server-reads';
 import { EventChangeLayer } from './event-change-layer';
 import { settlePatchFailure, settlePatchSuccess } from './event-patch-sync';
 
@@ -62,10 +61,9 @@ test('success: acknowledges the sent values, caches the row, keeps the paint', (
   );
   assert.equal(layer.unsentPatch('e1'), null, 'the value is acknowledged');
 
-  // Only a read that started after the ack settles the field.
+  // Only a window read that started after the ack settles the field.
   const agreed = makeEvent({ title: 'New' });
-  stampCalendarServerRead([agreed], 3);
-  assert.equal(layer.paint([agreed])[0].title, 'New');
+  assert.equal(layer.paint([agreed], 3)[0].title, 'New');
   assert.equal(layer.size, 0);
 });
 
@@ -113,8 +111,7 @@ test('failure: a read cannot retire a value the server never accepted', () => {
   settlePatchFailure({ layer, id: 'e1' });
 
   const remote = makeEvent({ title: 'Old' });
-  stampCalendarServerRead([remote], 9);
-  assert.equal(layer.paint([remote])[0].title, 'New');
+  assert.equal(layer.paint([remote], 9)[0].title, 'New');
   assert.equal(layer.hasFailedWrites(), true);
 });
 
