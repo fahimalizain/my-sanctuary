@@ -48,7 +48,6 @@ import {
 import {
   DELETE_UNDO_MS,
   commitPendingDelete,
-  noteCreateFailed,
   noteCreateSucceeded,
   pendingDeleteTitle,
   requestPendingDelete,
@@ -57,6 +56,13 @@ import {
   type PendingDeleteState,
 } from '../lib/pending-delete';
 import { setPatchWriteErrorListener } from '../lib/patch-write-error';
+import {
+  UnsavedCreates,
+  canRetryUnsavedCreate,
+  createRetryInput,
+  retryableUnsavedIds,
+  type UnsavedCreate,
+} from '../lib/unsaved-creates';
 import { repairCalendar } from '@/lib/api/calendar';
 import {
   repairTargetCalendarId,
@@ -94,6 +100,21 @@ export interface CalendarSessionInput {
  * emptied overlay), `revealed` is the normal case where the chip keeps it.
  */
 type CreateSettlement = 'revealed' | 'parked' | 'discarded';
+
+/** The quiet write-error banner. */
+interface WriteErrorState {
+  message: string;
+  /** The failure was a create POST, so its unsaved event can still be retried. */
+  retryCreates: boolean;
+}
+
+/** Banner line for a failed write: `base: detail` when the error has one. */
+function describeWriteError(base: string, err: unknown): string {
+  if (err instanceof Error && err.message.trim()) {
+    return `${base}: ${err.message}`;
+  }
+  return base;
+}
 
 /**
  * Events query, calendar filter, inspector, mutations, drag, packing, and
@@ -200,19 +221,57 @@ export function useCalendarSession({
   // DELETE the row once; later pastes just report "nothing to consume".
   const cutRemovalsStartedRef = useRef<Set<string>>(new Set());
 
+  // Failed creates: local-only events the server has no row for. They keep
+  // painting from the overlay (nothing clears them) and are marked in the grid,
+  // so an empty click / Escape / another chip / a new draft can never drop what
+  // the user typed. The ref is the source of truth inside stable callbacks;
+  // state mirrors the ids for paint and for the retry affordances.
+  const unsavedCreatesRef = useRef<UnsavedCreates | null>(null);
+  if (!unsavedCreatesRef.current) {
+    unsavedCreatesRef.current = new UnsavedCreates();
+  }
+  const [unsavedEventIds, setUnsavedEventIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  // One retry POST per temp id at a time: a save made while it flies paints
+  // overlay-only and flushes on success, exactly like the first create.
+  const retryingCreateIdsRef = useRef<Set<string>>(new Set());
+
+  const syncUnsavedIds = useCallback(() => {
+    setUnsavedEventIds(new Set(unsavedCreatesRef.current?.ids() ?? []));
+  }, []);
+
+  const markUnsavedCreate = useCallback(
+    (record: UnsavedCreate) => {
+      unsavedCreatesRef.current?.mark(record);
+      syncUnsavedIds();
+    },
+    [syncUnsavedIds],
+  );
+
+  /** Forget a settled / dropped create: its id no longer paints as unsaved. */
+  const forgetUnsavedCreate = useCallback(
+    (tempId: string) => {
+      const had = unsavedCreatesRef.current?.clear(tempId) ?? false;
+      draftCalendarPicksRef.current.delete(tempId);
+      if (had) syncUnsavedIds();
+    },
+    [syncUnsavedIds],
+  );
+
   const createEvent = useCreateCalendarEvent();
   const deleteEvent = useDeleteCalendarEvent();
 
-  // Quiet notice for failed writes (distinct from sync health banner).
-  const [writeError, setWriteError] = useState<string | null>(null);
+  // Quiet notice for failed writes (distinct from sync health banner). A
+  // create failure also owns a retry action: its event is still on the grid.
+  const [writeError, setWriteError] = useState<WriteErrorState | null>(null);
   const clearWriteError = useCallback(() => setWriteError(null), []);
 
   const reportWriteError = useCallback((base: string, err: unknown) => {
-    if (err instanceof Error && err.message.trim()) {
-      setWriteError(`${base}: ${err.message}`);
-      return;
-    }
-    setWriteError(base);
+    setWriteError({
+      message: describeWriteError(base, err),
+      retryCreates: false,
+    });
   }, []);
 
   // The PATCH queue outlives this page, so its late failures come back
@@ -253,6 +312,9 @@ export function useCalendarSession({
         // clear (not remove): a create POST still in flight sees the empty
         // overlay and DELETEs the row it just made — that is the commit.
         queueRef.current.clear(effect.id);
+        // A temp id with no server row has nothing left to retry: forgetting
+        // the record would otherwise keep a phantom "unsaved" event alive.
+        forgetUnsavedCreate(effect.id);
         return;
       }
 
@@ -270,7 +332,7 @@ export function useCalendarSession({
         reportWriteError("Couldn't delete event", err);
       }
     },
-    [reportWriteError],
+    [forgetUnsavedCreate, reportWriteError],
   );
 
   const commitDeleteNow = useCallback(() => {
@@ -662,7 +724,12 @@ export function useCalendarSession({
       // flight must survive create. Keyed by temp id, so a newer draft's pick
       // cannot leak into this create's flush.
       const calendarPicked = draftCalendarPicksRef.current.has(tempId);
-      draftCalendarPicksRef.current.delete(tempId);
+      // The row exists now (or is being ghost-deleted): either way this id is
+      // settled, so no unsaved marker and no retry may outlive it.
+      forgetUnsavedCreate(tempId);
+      // A create-failure banner was about this POST (a first attempt or a
+      // retry); a landed create clears it. A PATCH error is left alone.
+      setWriteError((prev) => (prev?.retryCreates ? null : prev));
 
       // A cut may name a row whose own create returned since the chord; an
       // unresolved temp source stays temp and is never deleted.
@@ -759,6 +826,7 @@ export function useCalendarSession({
       deleteEvent,
       dropSelectionIf,
       flushCreateEdits,
+      forgetUnsavedCreate,
       queue,
       recordIdAlias,
       resolveId,
@@ -767,27 +835,124 @@ export function useCalendarSession({
   );
 
   /**
-   * A create POST failed. No server row exists, so the temp paint, its
-   * deferred delete and the selection all go. A cut that named this temp id
-   * simply has nothing left to remove.
+   * A create POST failed. There is no server row to fall back on, so the temp
+   * chip keeps painting exactly what the user left there — title, description,
+   * times, all-day / zone and calendar, including edits made while the POST
+   * was in flight — and becomes a retryable unsaved event.
+   *
+   * Nothing is cleared and nothing is deselected: a failure must never cost
+   * the event. A "delete" already in its undo window keeps owning the paint
+   * (Undo brings the chip back as unsaved); a delete that already committed
+   * cleared the overlay, so there is nothing left to keep.
    */
   const finishCreateFailure = useCallback(
-    (tempId: string, err: unknown) => {
-      draftCalendarPicksRef.current.delete(tempId);
-      // No server row exists to undo; a pending delete for this draft is
-      // stale, so drop it (and its timer) with the overlay.
-      const next = noteCreateFailed(pendingDeleteRef.current, tempId);
-      if (next !== pendingDeleteRef.current) {
-        pendingDeleteRef.current = next;
-        setPendingDelete(next);
-        clearDeleteTimer();
+    (tempId: string, err: unknown, input: NewCalendarEventInput) => {
+      const overlay = queue.getOverlay(tempId);
+      if (overlay?.op === 'upsert') {
+        // Keep the paint and the calendar pick: the retry body is built from
+        // this overlay, so every field the user sees is what gets POSTed.
+        markUnsavedCreate({ tempId, input });
+      } else {
+        forgetUnsavedCreate(tempId);
       }
-      queue.clear(tempId);
-      dropSelectionIf(tempId);
-      reportWriteError("Couldn't create event", err);
+      setWriteError({
+        message: describeWriteError("Couldn't create event", err),
+        retryCreates: true,
+      });
     },
-    [clearDeleteTimer, dropSelectionIf, queue, reportWriteError],
+    [forgetUnsavedCreate, markUnsavedCreate, queue],
   );
+
+  /**
+   * Re-POST one unsaved event. The body is its current local state, so edits
+   * made while it was unsaved travel with the retry, and the settlement is the
+   * same one a draft / paste create uses (alias, cache write, overlay flush of
+   * anything typed during this POST).
+   */
+  const retryUnsavedCreate = useCallback(
+    async (tempId: string): Promise<boolean> => {
+      const record = unsavedCreatesRef.current?.get(tempId);
+      if (!record) return false;
+
+      const hidden = pendingDeleteRef.current;
+      const gate = {
+        hiddenId: hidden?.phase === 'pending' ? hidden.hiddenId : null,
+        inFlight: retryingCreateIdsRef.current,
+      };
+      if (!canRetryUnsavedCreate(tempId, gate)) return false;
+
+      // The chip may have been cut / deleted since the failure.
+      const overlay = queue.getOverlay(tempId);
+      if (!overlay || overlay.op !== 'upsert') {
+        forgetUnsavedCreate(tempId);
+        return false;
+      }
+
+      const input = createRetryInput({
+        failed: record.input,
+        local: overlay.event,
+        calendarPicked: draftCalendarPicksRef.current.has(tempId),
+      });
+      if (!input) return false;
+
+      retryingCreateIdsRef.current.add(tempId);
+      try {
+        const result = await createEvent.mutateAsync(input);
+        finishCreateSuccess({
+          tempId,
+          serverEvent: result.event,
+          posted: postedFieldsFromCreate(input),
+          // A retried paste deliberately carries no cut source: the clipboard
+          // still holds that cut, and deleting the source here would consume
+          // something the user never pasted again (the page could not even
+          // clear the item). The source stays until a fresh paste.
+        });
+        return true;
+      } catch (err) {
+        // Still unsaved: keep the paint (now with this attempt's body flags).
+        finishCreateFailure(tempId, err, input);
+        return false;
+      } finally {
+        retryingCreateIdsRef.current.delete(tempId);
+      }
+    },
+    [
+      createEvent,
+      finishCreateFailure,
+      finishCreateSuccess,
+      forgetUnsavedCreate,
+      queue,
+    ],
+  );
+
+  /**
+   * A save landed on a temp id. An unsaved create re-POSTs the event as it
+   * stands now; a create still in flight keeps its overlay-only edit and lets
+   * its onSuccess flush. Non-temp ids are not ours: false lets the caller keep
+   * its overlay-only branch.
+   */
+  const retryIfUnsaved = useCallback(
+    (id: string): boolean => {
+      if (!unsavedCreatesRef.current?.has(id)) return false;
+      void retryUnsavedCreate(id);
+      return true;
+    },
+    [retryUnsavedCreate],
+  );
+
+  /** Banner Retry: re-POST every unsaved event the undo toast is not hiding. */
+  const retryUnsavedCreates = useCallback(() => {
+    const hidden = pendingDeleteRef.current;
+    const ids = retryableUnsavedIds(unsavedCreatesRef.current?.ids() ?? [], {
+      hiddenId: hidden?.phase === 'pending' ? hidden.hiddenId : null,
+      inFlight: retryingCreateIdsRef.current,
+    });
+    void (async () => {
+      for (const id of ids) {
+        await retryUnsavedCreate(id);
+      }
+    })();
+  }, [retryUnsavedCreate]);
 
   const persistDraft = useCallback(() => {
     const tempId = unpersistedDraftIdRef.current;
@@ -831,7 +996,7 @@ export function useCalendarSession({
           posted: postedFieldsFromCreate(input),
         });
       },
-      onError: (err) => finishCreateFailure(tempId, err),
+      onError: (err) => finishCreateFailure(tempId, err, input),
     });
   }, [
     clearWriteError,
@@ -862,8 +1027,13 @@ export function useCalendarSession({
         return;
       }
 
-      // Still a temp id: the create is in flight and its success flushes.
-      if (isTempEventId(id)) return;
+      // Still a temp id: an unsaved create re-POSTs with this edit; a create
+      // still in flight keeps the overlay-only edit and flushes on success.
+      // Never a PATCH against a temp id.
+      if (isTempEventId(id)) {
+        retryIfUnsaved(id);
+        return;
+      }
 
       queue.enqueuePatch(id, { summary });
     },
@@ -874,6 +1044,7 @@ export function useCalendarSession({
       overlaidEvents,
       queue,
       persistDraft,
+      retryIfUnsaved,
       clearWriteError,
     ],
   );
@@ -898,8 +1069,12 @@ export function useCalendarSession({
         return;
       }
 
-      // Still a temp id: the create is in flight and its success flushes.
-      if (isTempEventId(id)) return;
+      // Still a temp id: an unsaved create re-POSTs with this edit; a create
+      // still in flight keeps the overlay-only edit and flushes on success.
+      if (isTempEventId(id)) {
+        retryIfUnsaved(id);
+        return;
+      }
 
       queue.enqueuePatch(id, { description });
     },
@@ -910,6 +1085,7 @@ export function useCalendarSession({
       overlaidEvents,
       queue,
       persistDraft,
+      retryIfUnsaved,
       clearWriteError,
     ],
   );
@@ -939,8 +1115,9 @@ export function useCalendarSession({
         return next;
       });
 
-      // Unpersisted draft or temp id: overlay only. A pick made while the
-      // create flies is flushed as a MOVE after any field PATCH.
+      // Unpersisted draft, unsaved create or temp id: overlay only. A pick made
+      // while the create flies is flushed as a MOVE after any field PATCH; a
+      // pick on an unsaved create becomes the retry POST's explicit destination.
       if (
         id === unpersistedDraftIdRef.current ||
         id === unpersistedDraftId ||
@@ -951,6 +1128,7 @@ export function useCalendarSession({
         // temp id so it survives until the create settles (and a concurrent
         // draft's pick never reaches this create's flush).
         draftCalendarPicksRef.current.add(id);
+        if (isTempEventId(id)) retryIfUnsaved(id);
         return;
       }
 
@@ -962,6 +1140,7 @@ export function useCalendarSession({
       unpersistedDraftId,
       overlaidEvents,
       queue,
+      retryIfUnsaved,
       clearWriteError,
     ],
   );
@@ -975,7 +1154,9 @@ export function useCalendarSession({
    *
    * A persisted source stays on the grid: the delete happens on paste, so a
    * cancelled chord never costs the event. An open unpersisted draft has no
-   * server row, so it is discarded here and the payload is a plain copy.
+   * server row, so it is discarded here and the payload is a plain copy. An
+   * unsaved create is local-only in the same way — a cut takes it off the grid
+   * (nothing is sent, now or on paste).
    *
    * A temp id whose create is still in flight is a real event as well. It
    * keeps its chip, and the cut is settled on paste: the alias names the
@@ -1007,6 +1188,18 @@ export function useCalendarSession({
       return item;
     }
 
+    // Unpersisted by failure, not by draft: the chip is local-only too, so the
+    // cut takes it (and its retry record) off the grid. There is no POST in
+    // flight that a cleared overlay could turn into a ghost DELETE.
+    if (unsavedCreatesRef.current?.has(id)) {
+      queue.cancelPatch(id);
+      queue.clear(id);
+      forgetUnsavedCreate(id);
+      setSelectedEventId(null);
+      setFocusTitleOnOpen(false);
+      return item;
+    }
+
     // Read-only calendar: leave the event alone and let the chord through
     // to the browser rather than pretend it was cut.
     if (!isCalendarWritable(selectedEventCalendar)) return null;
@@ -1022,6 +1215,7 @@ export function useCalendarSession({
     resolveId,
     unpersistedDraftId,
     queue,
+    forgetUnsavedCreate,
     setDraftId,
   ]);
 
@@ -1042,7 +1236,10 @@ export function useCalendarSession({
         calendars,
       );
       if (!destinationId) {
-        setWriteError('No calendar to paste into');
+        setWriteError({
+          message: 'No calendar to paste into',
+          retryCreates: false,
+        });
         return false;
       }
 
@@ -1092,8 +1289,9 @@ export function useCalendarSession({
           cutSourceId: item.cutSourceId,
         });
       } catch (err) {
-        finishCreateFailure(tempId, err);
-        // The cut source was never touched, so a failed paste costs nothing.
+        // The copy stays on the grid as an unsaved event (kept, retryable);
+        // the cut source was never touched, so a failed paste costs nothing.
+        finishCreateFailure(tempId, err, input);
         return false;
       }
 
@@ -1198,8 +1396,8 @@ export function useCalendarSession({
 
   // All-day chips first so we know band height for hour stretch.
   const { allDayChips, allDayHeight } = useMemo(
-    () => buildAllDayChips(days, allDayEvents, dayCount),
-    [days, allDayEvents, dayCount],
+    () => buildAllDayChips(days, allDayEvents, dayCount, unsavedEventIds),
+    [days, allDayEvents, dayCount, unsavedEventIds],
   );
 
   // Headers + all-day are sticky inside the scroller; hours fill the rest.
@@ -1242,10 +1440,13 @@ export function useCalendarSession({
         end_time: range.end.toISOString(),
       };
       clearWriteError();
-      // Paint immediately; PATCH follows (unless the create is still in flight).
+      // Paint immediately; PATCH follows unless the id is still temp (a create
+      // in flight, or an unsaved create whose retry will carry the times).
       queue.upsert(next);
 
-      // Still a temp id: no server row yet — create onSuccess will flush times.
+      // Still a temp id: no server row yet — a create in flight flushes these
+      // times on success; an unsaved create keeps them until its next save or
+      // explicit retry (a drag is a gesture, not a save, so it never POSTs).
       if (isTempEventId(id)) return;
 
       queue.enqueuePatch(id, {
@@ -1256,7 +1457,11 @@ export function useCalendarSession({
     [overlaidEvents, events, resolveId, queue, clearWriteError],
   );
 
-  /** Inspector time/date edits — same overlay + PATCH path as drag/resize. */
+  /**
+   * Inspector time/date edits — same overlay + PATCH path as drag/resize, but
+   * an explicit save: an unsaved create re-POSTs with the new times (a chip
+   * drag stays local; its times travel with the next retry).
+   */
   const handleSaveTimes = useCallback(
     (startIso: string, endIso: string) => {
       if (!selectedEventId) return;
@@ -1264,8 +1469,9 @@ export function useCalendarSession({
       const end = new Date(endIso);
       if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return;
       handleMoveOrResize(selectedEventId, { start, end });
+      retryIfUnsaved(resolveId(selectedEventId));
     },
-    [selectedEventId, handleMoveOrResize],
+    [selectedEventId, handleMoveOrResize, retryIfUnsaved, resolveId],
   );
 
   /** Inspector all-day toggle / all-day date shift. */
@@ -1288,12 +1494,14 @@ export function useCalendarSession({
       };
       queue.upsert(painted);
 
-      // Temp / draft: overlay only; the create success flushes the field PATCH.
+      // Temp / draft: overlay only. A create in flight flushes the field PATCH
+      // on success; an unsaved create re-POSTs with this flag and its times.
       if (
         id === unpersistedDraftIdRef.current ||
         id === unpersistedDraftId ||
         isTempEventId(id)
       ) {
+        if (isTempEventId(id)) retryIfUnsaved(id);
         return;
       }
 
@@ -1309,6 +1517,7 @@ export function useCalendarSession({
       unpersistedDraftId,
       overlaidEvents,
       queue,
+      retryIfUnsaved,
       clearWriteError,
     ],
   );
@@ -1338,6 +1547,8 @@ export function useCalendarSession({
         id === unpersistedDraftId ||
         isTempEventId(id)
       ) {
+        // A zone is part of the retried create body (its full local state).
+        if (isTempEventId(id)) retryIfUnsaved(id);
         return;
       }
 
@@ -1355,13 +1566,15 @@ export function useCalendarSession({
       unpersistedDraftId,
       overlaidEvents,
       queue,
+      retryIfUnsaved,
       clearWriteError,
     ],
   );
 
   const handleEmptyClick = useCallback(() => {
     // Desktop empty-cell click: discard an open draft only. Leave a real
-    // selected event (and its inspector) alone.
+    // selected event, and an unsaved create (a failed POST is not a draft),
+    // alone with its inspector.
     const hadDraft = unpersistedDraftIdRef.current !== null;
     discardUnpersistedDraft();
     if (hadDraft) {
@@ -1554,8 +1767,17 @@ export function useCalendarSession({
     eventsEmpty,
     sync,
     healthBanner,
-    writeError,
+    writeError: writeError?.message ?? null,
     clearWriteError,
+    // A create failure keeps its event, so the banner (and the inspector) can
+    // re-POST it instead of only reporting the loss.
+    canRetryUnsavedCreates:
+      writeError?.retryCreates === true && unsavedEventIds.size > 0,
+    retryUnsavedCreate,
+    retryUnsavedCreates,
+    // Ids painted as local-only events whose create failed; the grid marks
+    // them and the inspector offers "Not saved — Retry".
+    unsavedEventIds,
 
     // Sidebar
     calendars,

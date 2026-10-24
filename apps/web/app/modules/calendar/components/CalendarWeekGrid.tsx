@@ -62,6 +62,8 @@ export interface CalendarWeekGridProps {
   isDragging: boolean;
   /** Precision modifier is live: show the 1-minute grid badge. */
   precisionSnap: boolean;
+  /** Local-only chips whose create failed (dashed outline), by event id. */
+  unsavedEventIds?: ReadonlySet<string>;
   timedPreviewByDay: Map<string, { top: number; height: number }>;
   previewInfo: DragPreviewInfo | null;
   previewColor: string;
@@ -104,6 +106,7 @@ export function CalendarWeekGrid({
   onChipSelect,
   isDragging,
   precisionSnap,
+  unsavedEventIds,
   timedPreviewByDay,
   previewInfo,
   previewColor,
@@ -280,6 +283,7 @@ export function CalendarWeekGrid({
                       onChipPointerDown={onChipPointerDown}
                       onSelectChip={onSelectChip}
                       onRequestDelete={onRequestDelete}
+                      unsavedEventIds={unsavedEventIds}
                     />
                   );
                 })}

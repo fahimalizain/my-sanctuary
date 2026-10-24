@@ -397,3 +397,40 @@ test('buildAllDayChips: is_all_day uses ISO prefix (UTC midnight stays civil day
   assert.equal(allDayChips[0].startDay, 0);
   assert.equal(allDayChips[0].endDay, 0);
 });
+
+test('buildAllDayChips: unsaved ids mark only their own chip', () => {
+  const day = new Date(2026, 8, 8);
+  const saved = makeEvent({
+    id: 'allday-saved',
+    is_all_day: true,
+    start_time: '2026-09-08T00:00:00Z',
+    end_time: '2026-09-09T00:00:00Z',
+  });
+  const unsaved = makeEvent({
+    id: 'allday-unsaved',
+    is_all_day: true,
+    start_time: '2026-09-09T00:00:00Z',
+    end_time: '2026-09-10T00:00:00Z',
+  });
+  const { allDayChips } = buildAllDayChips(
+    [day, new Date(2026, 8, 9)],
+    [saved, unsaved],
+    2,
+    new Set([unsaved.id]),
+  );
+  const byId = new Map(allDayChips.map((chip) => [chip.id, chip]));
+  assert.equal(byId.get('allday-saved')?.unsaved, false);
+  assert.equal(byId.get('allday-unsaved')?.unsaved, true);
+});
+
+test('buildAllDayChips: no unsaved set means no chip is marked', () => {
+  const day = new Date(2026, 8, 8);
+  const event = makeEvent({
+    id: 'allday-1',
+    is_all_day: true,
+    start_time: '2026-09-08T00:00:00Z',
+    end_time: '2026-09-09T00:00:00Z',
+  });
+  const { allDayChips } = buildAllDayChips([day], [event], 1);
+  assert.equal(allDayChips[0].unsaved, false);
+});

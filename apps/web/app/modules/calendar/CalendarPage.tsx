@@ -167,13 +167,26 @@ export function CalendarPage() {
           <p className="selectable text-muted-foreground truncate">
             {session.writeError}
           </p>
-          <button
-            type="button"
-            onClick={session.clearWriteError}
-            className="shrink-0 text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
-          >
-            Dismiss
-          </button>
+          <div className="flex shrink-0 items-center gap-3">
+            {session.canRetryUnsavedCreates && (
+              // The failed create is still on the grid, so this re-POSTs it
+              // instead of only reporting that it was lost.
+              <button
+                type="button"
+                onClick={session.retryUnsavedCreates}
+                className="text-foreground underline underline-offset-2 hover:text-primary"
+              >
+                Retry
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={session.clearWriteError}
+              className="text-muted-foreground hover:text-foreground underline-offset-2 hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
 
@@ -222,6 +235,7 @@ export function CalendarPage() {
           onChipSelect={session.handleSelectChip}
           isDragging={session.isDragging}
           precisionSnap={session.precisionSnap}
+          unsavedEventIds={session.unsavedEventIds}
           timedPreviewByDay={session.timedPreviewByDay}
           previewInfo={session.previewInfo}
           previewColor={session.previewColor}
@@ -248,6 +262,11 @@ export function CalendarPage() {
             onSaveCalendar={session.handleSaveCalendar}
             onDelete={session.handleDeleteEvent}
             isDeleting={session.isDeleting}
+            isUnsaved={session.unsavedEventIds.has(session.selectedEvent.id)}
+            onRetrySave={() => {
+              const id = session.selectedEventId;
+              if (id) void session.retryUnsavedCreate(id);
+            }}
             isDragging={session.isDragging}
           />
         )}

@@ -80,7 +80,9 @@ export interface RequestOutcome {
 /**
  * Start a deferred delete. Persisted ids get a delete overlay; temp ids are
  * only filtered out of the paint because removing their overlay would make an
- * in-flight create's onSuccess DELETE the server row immediately.
+ * in-flight create's onSuccess DELETE the server row immediately — and a
+ * failed create must keep its overlay so Undo can restore it and a retry can
+ * read its fields.
  */
 export function requestPendingDelete(
   current: PendingDeleteState,
@@ -121,7 +123,8 @@ export function requestPendingDelete(
 /**
  * Commit the pending delete. A persisted row (or a parked create result) is
  * DELETEd; a temp id with no server row only drops its overlay — if its POST
- * is still in flight, that onSuccess becomes the delete.
+ * is still in flight, that onSuccess becomes the delete, and a failed create's
+ * retry record is dropped by the session at the same moment.
  */
 export function commitPendingDelete(
   current: PendingDeleteState,
@@ -268,19 +271,6 @@ export function noteCreateSucceeded(
   }
 
   return { kind: 'none', next: current, serverId };
-}
-
-/**
- * The temp id's create failed while its delete was pending. The create error
- * path already clears the overlay and reports, so the undo record is stale:
- * drop it (and the tombstone) rather than let a later timeout act on it.
- */
-export function noteCreateFailed(
-  current: PendingDeleteState,
-  tempId: string,
-): PendingDeleteState {
-  if (!current) return current;
-  return current.tempId === tempId ? null : current;
 }
 
 /** Toast title for the pending delete, or null when no toast is owed. */

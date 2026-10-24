@@ -74,7 +74,7 @@ function makePositioned(
 /** Render an unselected chip (no touch handles) and return its root. */
 function mount(
   positioned: PositionedEvent,
-  extra: { past?: boolean } = {},
+  extra: { past?: boolean; unsaved?: boolean } = {},
 ): HTMLElement {
   render(
     createElement(EventChip, {
@@ -210,4 +210,34 @@ test('omitting past leaves data-past off the root', () => {
     48,
   );
   assert.equal(mount(positioned).hasAttribute('data-past'), false);
+});
+
+// ── unsaved creates ─────────────────────────────────────────────────────
+
+test('an unsaved chip is dashed and marked; a saved chip is not', () => {
+  const positioned = makePositioned(
+    makeEvent(
+      'Not saved',
+      new Date(2026, 8, 13, 5, 0),
+      new Date(2026, 8, 13, 6, 0),
+    ),
+    5 * 60,
+    6 * 60,
+    48,
+  );
+  const unsaved = mount(positioned, { unsaved: true });
+  assert.equal(unsaved.getAttribute('data-unsaved'), '');
+  assert.ok(
+    unsaved.className.includes('[outline-style:dashed]'),
+    'the chip reads as local-only',
+  );
+  assert.ok(
+    !unsaved.className.includes('[outline-style:solid]'),
+    'never both outline styles',
+  );
+
+  cleanup();
+  const saved = mount(positioned);
+  assert.equal(saved.hasAttribute('data-unsaved'), false);
+  assert.ok(saved.className.includes('[outline-style:solid]'));
 });

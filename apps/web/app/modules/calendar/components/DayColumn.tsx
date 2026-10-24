@@ -34,6 +34,8 @@ export interface DayColumnProps {
   onSelectChip: (eventId: string) => void;
   /** Delete for the selected chip (touch handle); undefined if read-only. */
   onRequestDelete?: () => void;
+  /** Local-only chips whose create failed (dashed outline), by event id. */
+  unsavedEventIds?: ReadonlySet<string>;
 }
 
 /**
@@ -58,6 +60,7 @@ export const DayColumn = memo(function DayColumn({
   onChipPointerDown,
   onSelectChip,
   onRequestDelete,
+  unsavedEventIds,
 }: DayColumnProps) {
   return (
     <div
@@ -86,6 +89,7 @@ export const DayColumn = memo(function DayColumn({
           onPointerDown={onChipPointerDown}
           dragging={draggingEventId === p.event.id}
           past={isEventPast(Date.parse(p.event.end_time), nowMs)}
+          unsaved={unsavedEventIds?.has(p.event.id) ?? false}
         />
       ))}
 

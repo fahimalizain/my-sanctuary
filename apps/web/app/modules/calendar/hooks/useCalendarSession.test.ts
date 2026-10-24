@@ -78,6 +78,8 @@ interface Request {
 interface PendingPost {
   body: NewCalendarEventInput;
   respondWith: (event: CalendarEvent) => void;
+  /** Answer the POST with an API error response, as a failed create does. */
+  fail: (message?: string) => void;
 }
 
 let requests: Request[] = [];
@@ -165,6 +167,9 @@ function postCreate(body: NewCalendarEventInput): Promise<Response> {
         serverRows.set(event.id, event);
         resolve(json({ event, source: 'google' }));
       },
+      fail: (message = 'create failed') => {
+        resolve(json({ error: message }, 500));
+      },
     });
   });
 }
@@ -214,6 +219,30 @@ async function settle(): Promise<void> {
   for (let i = 0; i < 5; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
+}
+
+/**
+ * Delete the selection with `window.setTimeout` stubbed, so the deferred
+ * delete's undo timer is captured instead of waiting DELETE_UNDO_MS. Returns
+ * the callback that commits the delete.
+ */
+async function armDeleteCommit(session: Session): Promise<() => void> {
+  const realSetTimeout = window.setTimeout;
+  const captured: { fire: (() => void) | null } = { fire: null };
+  window.setTimeout = ((cb: TimerHandler) => {
+    if (typeof cb === 'function') captured.fire = cb as () => void;
+    return 0;
+  }) as typeof window.setTimeout;
+  try {
+    await act(async () => {
+      session.handleDeleteEvent();
+    });
+  } finally {
+    window.setTimeout = realSetTimeout;
+  }
+  await settle();
+  assert.ok(captured.fire, 'the undo timer was armed');
+  return captured.fire;
 }
 
 interface HarnessProps {
@@ -1215,4 +1244,423 @@ test('a cut whose source create has not returned is left for a later paste', asy
     paintedIds(session.current!).sort(),
     ['srv-1', 'srv-2', OTHER_EVENT.id].sort(),
   );
+});
+
+// ── A failed create is an unsaved event, never a loss ────────────────────
+//
+// The POST is the only thing that failed: no server row exists, so the temp
+// chip must keep every field it holds (including edits made while the POST was
+// in flight), stay selected, and survive the discard paths that belong to
+// drafts. Its next save — or the banner / inspector Retry — re-POSTs its
+// current local state through the same create path.
+
+test('a failed create keeps the chip, its fields and the selection', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+
+  // Edits made while the POST flies are local to the temp chip.
+  await act(async () => {
+    session.current!.handleSaveDescription('Bring the form');
+  });
+  const moved = hourRange(11, 12);
+  await act(async () => {
+    session.current!.handleSaveTimes(
+      moved.start.toISOString(),
+      moved.end.toISOString(),
+    );
+  });
+  assert.deepEqual(patchRequests(), [], 'no PATCH without a server id');
+
+  pendingPosts[0].fail();
+  await settle();
+
+  assert.deepEqual(deleteRequests(), [], 'a failed create sends no DELETE');
+  assert.deepEqual(patchRequests(), [], 'nothing PATCHes a temp id');
+  assert.deepEqual(
+    paintedIds(session.current!),
+    [tempId],
+    'the chip stays on the grid',
+  );
+  assert.equal(
+    session.current!.selectedEventId,
+    tempId,
+    'the inspector stays on it',
+  );
+  assert.ok(
+    session.current!.unsavedEventIds.has(tempId),
+    'the chip is marked unsaved',
+  );
+
+  const painted = paintedEvent(session.current!, tempId);
+  assert.ok(painted);
+  assert.equal(painted.title, 'Dentist');
+  assert.equal(painted.description, 'Bring the form');
+  assert.equal(painted.start_time, moved.start.toISOString());
+  assert.equal(painted.end_time, moved.end.toISOString());
+
+  assert.match(
+    session.current!.writeError ?? '',
+    /Couldn't create event/,
+    'the failure is reported',
+  );
+  assert.match(session.current!.writeError ?? '', /create failed/);
+  assert.equal(session.current!.canRetryUnsavedCreates, true);
+});
+
+test('a failed create survives Escape, an empty click, another chip and a new draft', async () => {
+  seededEvents = [OTHER_EVENT];
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+  pendingPosts[0].fail();
+  await settle();
+
+  // Escape (inspector close) only discards an open draft.
+  await act(async () => {
+    session.current!.closeInspector();
+  });
+  assert.deepEqual(
+    paintedIds(session.current!).sort(),
+    [tempId, OTHER_EVENT.id].sort(),
+    'Escape keeps it',
+  );
+  assert.equal(session.current!.selectedEventId, null);
+
+  // Desktop empty-cell click.
+  await clickEmptyCell(session.current!);
+  assert.ok(
+    paintedIds(session.current!).includes(tempId),
+    'an empty click keeps it',
+  );
+
+  // Selecting another chip.
+  await act(async () => {
+    session.current!.selectEvent(OTHER_EVENT.id);
+  });
+  assert.ok(
+    paintedIds(session.current!).includes(tempId),
+    'another chip keeps it',
+  );
+
+  // A new draft replaces the previous *draft*, never an unsaved event.
+  await act(async () => {
+    session.current!.beginDraft(hourRange(13, 14));
+  });
+  const draftId = session.current!.selectedEventId!;
+  assert.notEqual(draftId, tempId);
+  assert.deepEqual(
+    paintedIds(session.current!).sort(),
+    [tempId, OTHER_EVENT.id, draftId].sort(),
+    'both chips are painted',
+  );
+
+  // Discarding the new draft leaves the unsaved event untouched.
+  await clickEmptyCell(session.current!);
+  assert.deepEqual(
+    paintedIds(session.current!).sort(),
+    [tempId, OTHER_EVENT.id].sort(),
+  );
+  assert.ok(session.current!.unsavedEventIds.has(tempId));
+  assert.equal(paintedEvent(session.current!, tempId)?.title, 'Dentist');
+  assert.deepEqual(patchRequests(), []);
+});
+
+test('saving a failed draft retries with its current fields and remaps', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+
+  // Description typed while the POST was in flight: it survives the failure
+  // and the retry carries it.
+  await act(async () => {
+    session.current!.handleSaveDescription('Bring the form');
+  });
+  pendingPosts[0].fail();
+  await settle();
+  assert.equal(
+    paintedEvent(session.current!, tempId)?.description,
+    'Bring the form',
+  );
+
+  // The next title save is the retry trigger.
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist 2');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 2));
+
+  const posted = pendingPosts[1].body;
+  assert.deepEqual(posted, {
+    calendar_id: 'cal-1',
+    summary: 'Dentist 2',
+    description: 'Bring the form',
+    start: paintedEvent(session.current!, tempId)!.start_time,
+    end: paintedEvent(session.current!, tempId)!.end_time,
+  });
+
+  pendingPosts[1].respondWith(createdEvent(posted, 'srv-1'));
+  await settle();
+
+  assert.deepEqual(
+    patchRequests(),
+    [],
+    'the retry body already carried every field',
+  );
+  assert.deepEqual(paintedIds(session.current!), ['srv-1']);
+  assert.equal(
+    session.current!.selectedEventId,
+    'srv-1',
+    'the selection follows the row',
+  );
+  assert.equal(
+    paintedEvent(session.current!, 'srv-1')?.title,
+    'Dentist 2',
+    'the chip keeps the retried fields',
+  );
+  assert.equal(session.current!.unsavedEventIds.size, 0, 'no marker is left');
+  assert.equal(session.current!.writeError, null, 'the failure banner clears');
+  assert.deepEqual(deleteRequests(), []);
+});
+
+test('a failed paste keeps its copy and an explicit retry lands it', async () => {
+  seededEvents = [OTHER_EVENT];
+  const session = await mountSession();
+  const tempId = await duplicateChip(session);
+
+  pendingPosts[0].fail('duplicate failed');
+  await settle();
+
+  assert.ok(
+    paintedEvent(session.current!, tempId),
+    'the copy stays on the grid',
+  );
+  assert.equal(session.current!.selectedEvent?.id, tempId);
+  assert.ok(session.current!.unsavedEventIds.has(tempId));
+  assert.equal(session.current!.canRetryUnsavedCreates, true);
+  assert.deepEqual(patchRequests(), []);
+
+  // The inspector's Retry re-POSTs the copy as it stands now.
+  let retry: Promise<boolean> | null = null;
+  await act(async () => {
+    retry = session.current!.retryUnsavedCreate(tempId);
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 2));
+  assert.deepEqual(
+    pendingPosts[1].body,
+    pendingPosts[0].body,
+    'an untouched copy retries the same body, explicit calendar included',
+  );
+
+  pendingPosts[1].respondWith(createdEvent(pendingPosts[1].body, 'srv-1'));
+  let retried = false;
+  await act(async () => {
+    retried = await retry!;
+  });
+  await settle();
+
+  assert.equal(retried, true, 'the retry reports that it landed');
+
+  assert.deepEqual(
+    paintedIds(session.current!).sort(),
+    ['srv-1', OTHER_EVENT.id].sort(),
+  );
+  assert.equal(session.current!.selectedEventId, 'srv-1');
+  assert.equal(session.current!.unsavedEventIds.size, 0);
+  assert.equal(session.current!.writeError, null);
+  assert.deepEqual(deleteRequests(), []);
+  assert.deepEqual(patchRequests(), []);
+});
+
+test('a retried paste leaves the cut source alone', async () => {
+  seededEvents = [OTHER_EVENT];
+  const session = await mountSession();
+
+  await act(async () => {
+    session.current!.selectEvent(OTHER_EVENT.id);
+  });
+  let item: CalendarClipboardItem | null = null;
+  await act(async () => {
+    item = session.current!.cutForClipboard();
+  });
+  const cut = item as CalendarClipboardItem | null;
+  assert.ok(cut);
+  assert.equal(cut.cutSourceId, OTHER_EVENT.id);
+
+  // Paste, then fail its create: the source was never touched.
+  let paste: Promise<boolean> | null = null;
+  await act(async () => {
+    paste = session.current!.pasteFromClipboard(cut);
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+  pendingPosts[0].fail();
+  let removed = true;
+  await act(async () => {
+    removed = await paste!;
+  });
+  await settle();
+  assert.equal(removed, false, 'a failed paste costs nothing');
+  assert.deepEqual(deleteRequests(), []);
+  assert.ok(paintedIds(session.current!).includes(OTHER_EVENT.id));
+
+  const copyId = session.current!.selectedEventId!;
+  assert.ok(copyId.startsWith('tmp_'));
+
+  // The retry creates the copy but deliberately does not consume the cut:
+  // the clipboard still holds that source, so deleting it here would be a
+  // removal the page could not even reflect.
+  await act(async () => {
+    session.current!.retryUnsavedCreates();
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 2));
+  pendingPosts[1].respondWith(createdEvent(pendingPosts[1].body, 'srv-2'));
+  await settle();
+
+  assert.deepEqual(deleteRequests(), [], 'the cut source stays');
+  assert.ok(
+    paintedIds(session.current!).includes(OTHER_EVENT.id),
+    'the source chip is still painted',
+  );
+  assert.ok(paintedIds(session.current!).includes('srv-2'));
+});
+
+test('deleting a failed create commits locally and undo restores it', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+  pendingPosts[0].fail();
+  await settle();
+
+  // Delete hides the chip behind the undo toast; nothing is sent.
+  await act(async () => {
+    session.current!.handleDeleteEvent();
+  });
+  assert.deepEqual(paintedIds(session.current!), [], 'the chip is hidden');
+  assert.notEqual(session.current!.pendingDeleteTitle, null);
+  assert.deepEqual(deleteRequests(), []);
+
+  // Undo restores the chip as the same unsaved event.
+  await act(async () => {
+    await session.current!.undoDelete();
+  });
+  assert.deepEqual(paintedIds(session.current!), [tempId]);
+  assert.equal(session.current!.selectedEventId, tempId);
+  assert.ok(
+    session.current!.unsavedEventIds.has(tempId),
+    'it comes back retryable',
+  );
+
+  // Delete again and let the grace window commit: a local clear, no request.
+  const commit = await armDeleteCommit(session.current!);
+  await act(async () => {
+    commit();
+  });
+  await settle();
+
+  assert.deepEqual(paintedIds(session.current!), [], 'the local event is gone');
+  assert.equal(session.current!.unsavedEventIds.size, 0);
+  assert.equal(session.current!.pendingDeleteTitle, null);
+  assert.deepEqual(deleteRequests(), [], 'no server row to DELETE');
+  assert.deepEqual(patchRequests(), []);
+  assert.equal(pendingPosts.length, 1, 'no retry was sent');
+});
+
+test('a create that fails behind an undo toast still comes back as unsaved', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  const tempId = session.current!.selectedEventId!;
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+
+  // Delete before the POST returns: the temp chip is hidden by suppressing
+  // paint and the undo toast owns it.
+  await act(async () => {
+    session.current!.handleDeleteEvent();
+  });
+  assert.deepEqual(paintedIds(session.current!), []);
+
+  // The POST fails while the toast is still up: nothing is deleted, and the
+  // undo record is still valid (there was never a server row).
+  pendingPosts[0].fail();
+  await settle();
+  assert.notEqual(session.current!.pendingDeleteTitle, null);
+  assert.deepEqual(deleteRequests(), []);
+
+  // Undo brings the chip back as an unsaved event, not as a draft.
+  await act(async () => {
+    await session.current!.undoDelete();
+  });
+  assert.deepEqual(paintedIds(session.current!), [tempId]);
+  assert.equal(session.current!.selectedEventId, tempId);
+  assert.ok(session.current!.unsavedEventIds.has(tempId));
+
+  // A retry lands it like any other create.
+  await act(async () => {
+    session.current!.retryUnsavedCreates();
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 2));
+  pendingPosts[1].respondWith(createdEvent(pendingPosts[1].body, 'srv-1'));
+  await settle();
+
+  assert.deepEqual(paintedIds(session.current!), ['srv-1']);
+  assert.equal(session.current!.unsavedEventIds.size, 0);
+  assert.deepEqual(deleteRequests(), []);
+});
+
+test('cutting a failed create drops it locally; the payload is a plain copy', async () => {
+  const session = await mountSession();
+  await act(async () => {
+    session.current!.beginDraft(hourRange(9, 10));
+  });
+  assert.ok(session.current!.selectedEventId, 'the draft chip is selected');
+  await act(async () => {
+    session.current!.handleSaveTitle('Dentist');
+  });
+  await waitFor(() => assert.equal(pendingPosts.length, 1));
+  pendingPosts[0].fail();
+  await settle();
+
+  let item: CalendarClipboardItem | null = null;
+  await act(async () => {
+    item = session.current!.cutForClipboard();
+  });
+  const cut = item as CalendarClipboardItem | null;
+  assert.ok(cut);
+  assert.equal(
+    cut.cutSourceId,
+    null,
+    'a local-only event has no row to cut on paste',
+  );
+  assert.deepEqual(paintedIds(session.current!), [], 'the chip is gone');
+  assert.equal(session.current!.selectedEventId, null);
+  assert.equal(session.current!.unsavedEventIds.size, 0);
+  assert.deepEqual(deleteRequests(), []);
+  assert.deepEqual(patchRequests(), []);
 });
