@@ -45,6 +45,9 @@ pub enum CheckpointResult {
     MissingSyncToken,
     LeaseLost,
     LeaseBusy,
+    /// Walk stopped on the invocation budget before a terminal page.
+    /// Not a failure: the lease is released and cron/queue retry later.
+    Yielded,
     Error,
     #[default]
     NotAttempted,

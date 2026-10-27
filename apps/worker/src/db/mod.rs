@@ -57,7 +57,7 @@ use api_core::repo::{
     USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL,
 };
 use serde::Deserialize;
-use worker::{D1Database, D1PreparedStatement, D1Type};
+use worker::{D1Database, D1PreparedStatement, D1Result, D1Type};
 
 /// Current time as an RFC 3339 UTC string, from the JS clock.
 pub(crate) fn now_rfc3339() -> String {
@@ -82,6 +82,36 @@ pub(crate) async fn run_stmt(stmt: D1PreparedStatement) -> Result<(), RepoError>
 /// meta is missing. Used by fenced lease / success writes.
 pub(crate) async fn run_stmt_changes(stmt: D1PreparedStatement) -> Result<usize, RepoError> {
     let result = stmt.run().await.map_err(backend)?;
+    result_changes(&result)
+}
+
+/// Binds all-string args and returns the prepared statement, unexecuted, so
+/// callers can [`D1Database::batch`] a page of writes into one round trip.
+pub(crate) fn prepare_text(
+    db: &D1Database,
+    sql: &str,
+    args: &[String],
+) -> Result<D1PreparedStatement, RepoError> {
+    let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
+    db.prepare(sql).bind_refs(&refs).map_err(backend)
+}
+
+/// One D1 round trip for `statements`. Empty input does not call D1.
+/// A failed statement fails the batch; callers still check per-statement
+/// `changes` when a zero-row fence means "lost lease" rather than an error.
+pub(crate) async fn run_batch(
+    db: &D1Database,
+    statements: Vec<D1PreparedStatement>,
+) -> Result<Vec<D1Result>, RepoError> {
+    if statements.is_empty() {
+        return Ok(Vec::new());
+    }
+    db.batch(statements).await.map_err(backend)
+}
+
+/// D1 `changes`, or `rows_written` when `changes` is absent. Errors if the
+/// statement itself failed.
+pub(crate) fn result_changes(result: &D1Result) -> Result<usize, RepoError> {
     if !result.success() {
         return Err(RepoError::Backend(result.error().unwrap_or_default()));
     }

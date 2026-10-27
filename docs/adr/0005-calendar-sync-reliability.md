@@ -214,10 +214,26 @@ permanent.
 
 ## Residual risk
 
-- Merge-full ghosts remain until a later incremental cancel (or operator
-  action); there is no mark-and-sweep.
-- Lease renew uses the caller’s fixed `now`, so a walk longer than the 90s TTL
-  can be stolen mid-flight.
+- Merge-full ghosts remain until the terminal sweep of a **completed**
+  rebuild (`sweep_absent_if_owner`). A rebuild that yields or is killed
+  before the last page does not sweep.
+- Lease **renewal** uses a fresh wall clock. The initial grant does too
+  (2026-10-27): it used to be `tick_start + 90s`, so a calendar late in a
+  long tick acquired an already-expired lease and recorded `lost_lease`.
+  The SQL fence still compares expiry to the `now` captured before the
+  page, not to the clock when D1 executes.
+- A merge-full does not persist Google's `pageToken`. Past
+  `REPLICA_WALK_BUDGET_SECS` (11 minutes from the invocation stamp) the
+  walk yields, releases the lease, and the next tick starts at page 1.
+  Page-token checkpointing was rejected: a sweep hours later can tombstone
+  an event created after the walk had already passed that page. Rebuilds
+  run after incremental siblings so they don't starve the tick. D1 page
+  applies are batched (one round trip per statement group) so an 18k-event
+  calendar can finish inside the budget.
+- `begin_replica_reseed` clears `last_error_code` (not streak, not
+  `next_retry_at`). A stale `lost_lease` was masking `rebuilding` in the
+  banner. The UI also prefers `rebuilding` over `lost_lease` for rows
+  written before that clear.
 - Window instances (`singleEvents=true` ids) and replica masters share
   `calendar_events` but different `google_event_id`s — both are valid rows
   under the natural key. Unmodified expansions are hidden from GET when a

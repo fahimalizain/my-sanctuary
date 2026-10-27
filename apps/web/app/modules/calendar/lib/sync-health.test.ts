@@ -225,6 +225,23 @@ test('degraded: stale ready is still degraded', () => {
   assert.equal(repairTargetCalendarId(banner), 'cal-personal');
 });
 
+test('degraded: rebuilding wins over a stale lost_lease', () => {
+  const banner = selectSyncHealthBanner({
+    ...base,
+    sync: sync(
+      health({
+        calendar_id: 'cal-personal',
+        state: 'rebuilding',
+        error_code: 'lost_lease',
+      }),
+    ),
+  });
+  assert.equal(banner.kind, 'degraded');
+  assert.equal(banner.message, 'Personal Goals is rebuilding');
+  assert.equal(banner.showRetry, true);
+  assert.equal(banner.calendarId, 'cal-personal');
+});
+
 test('degraded: rebuilding', () => {
   const banner = selectSyncHealthBanner({
     ...base,

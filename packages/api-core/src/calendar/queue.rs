@@ -155,11 +155,13 @@ pub async fn run_queue_sync(
                 diagnostic,
             }
         }
-        Ok(SyncCalendarOutcome::LeaseBusy) => {
-            // Every bump has its own message; the lease holder performs the
-            // follow-up re-enqueue on still-dirty. Do not Retry with delay
-            // (bypasses backoff, exhausts max_retries against walks that can
-            // exceed 90s).
+        Ok(SyncCalendarOutcome::LeaseBusy) | Ok(SyncCalendarOutcome::Yielded) => {
+            // LeaseBusy: every bump has its own message; the lease holder
+            // performs the follow-up re-enqueue on still-dirty.
+            // Yielded: the budget ran out before a terminal page. Retrying
+            // the message would hot-loop a multi-minute rebuild. Cron owns
+            // the next attempt. Do not Retry with delay (bypasses backoff,
+            // exhausts max_retries against walks that can exceed 90s).
             QueueSyncReport {
                 action: QueueSyncAction::Ack,
                 published: false,

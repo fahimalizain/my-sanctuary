@@ -39,7 +39,10 @@ use api_core::repo::{
 use serde::Deserialize;
 use worker::{console_log, D1Database, D1Type};
 
-use super::{backend, now_rfc3339, query_vec, run_stmt, run_stmt_changes};
+use super::{
+    backend, now_rfc3339, prepare_text, query_vec, result_changes, run_batch, run_stmt,
+    run_stmt_changes,
+};
 
 /// `google_calendars` table persistence.
 pub struct D1CalendarRepo {
@@ -67,11 +70,11 @@ struct DirtySpan {
 /// One upsert chunk's dirty-marking inputs, captured **before** the events move
 /// into the upsert SQL.
 ///
-/// The owner is resolved **once per chunk** and every stored span comes back in
-/// one `google_event_id IN (…)` SELECT, so a batch costs two reads and one
-/// dirty statement instead of three round trips per event. The batch shares one
-/// calendar (the fenced upsert already binds `chunk[0].calendar_id`), so one
-/// owner is correct; a missing/soft-deleted calendar means no mark at all.
+/// The owner is resolved **once per page** and stored spans come back in
+/// bind-limited `google_event_id IN (…)` SELECTs, not one of each per
+/// 3-row upsert. The page shares one calendar (the fenced upsert binds
+/// `chunk[0].calendar_id`), so one owner is correct; a missing/soft-deleted
+/// calendar means no mark at all.
 struct DirtyChunk {
     user_id: Option<String>,
     /// Stored spans ∪ incoming spans, in event order.
@@ -727,15 +730,19 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         if events.is_empty() {
             return Ok(true);
         }
-        // Same mint-UUID + chunking as upsert_batch; fence binds add 3 params
-        // per statement (plus the two category-flag binds) so chunk size stays
-        // 3.
+        // One owner lookup and chunked span reads for the whole page, then
+        // every fenced 3-row upsert in a single D1 batch. Sequential
+        // round trips (about four per 3 rows) made an 18k-event merge-full
+        // unable to finish before the cron isolate was killed.
+        // Statements stay at 3 rows: the 100-bind limit is unchanged, and
+        // each statement keeps its WHERE EXISTS owner/expiry fence.
+        let pending = self.gather_dirty(&events).await;
+        let mut stmts = Vec::new();
         for chunk in chunk_events_for_upsert(&events) {
             let calendar_id = chunk[0].calendar_id.as_str();
             let ids: Vec<String> = (0..chunk.len())
                 .map(|_| uuid::Uuid::new_v4().to_string())
                 .collect();
-            let pending = self.gather_dirty(chunk).await;
             let (sql, args) = build_event_upsert_if_owner_sql(
                 chunk,
                 now_rfc3339,
@@ -743,13 +750,17 @@ impl CalendarEventRepo for D1CalendarEventRepo {
                 calendar_id,
                 lease_owner,
             );
-            let changes = self.run_upsert_changes(&sql, &args).await?;
-            if changes == 0 {
+            stmts.push(prepare_text(&self.db, &sql, &args)?);
+        }
+        let results = run_batch(&self.db, stmts).await?;
+        for result in &results {
+            if result_changes(result)? == 0 {
                 // Lease missing/stolen/expired: INSERT SELECT wrote nothing.
+                // Do not dirty-mark rows that were not written.
                 return Ok(false);
             }
-            self.apply_dirty(&pending, now_rfc3339).await;
         }
+        self.apply_dirty(&pending, now_rfc3339).await;
         Ok(true)
     }
 
@@ -948,10 +959,15 @@ impl CalendarEventRepo for D1CalendarEventRepo {
         if google_event_ids.is_empty() {
             return Ok(());
         }
+        let mut stmts = Vec::new();
         for chunk in google_event_ids.chunks(REPLICA_SEEN_INSERT_CHUNK_SIZE) {
             let (sql, args) =
                 build_replica_seen_insert_sql(calendar_id, run_id, chunk, now_rfc3339);
-            self.run_upsert(&sql, &args).await?;
+            stmts.push(prepare_text(&self.db, &sql, &args)?);
+        }
+        let results = run_batch(&self.db, stmts).await?;
+        for result in &results {
+            result_changes(result)?;
         }
         Ok(())
     }
@@ -1083,19 +1099,12 @@ impl D1CalendarEventRepo {
         run_stmt(stmt).await
     }
 
-    /// Like [`Self::run_upsert`] but returns D1 `changes` (rows written).
-    async fn run_upsert_changes(&self, sql: &str, args: &[String]) -> Result<usize, RepoError> {
-        let refs: Vec<D1Type> = args.iter().map(|arg| D1Type::Text(arg)).collect();
-        let stmt = self.db.prepare(sql).bind_refs(&refs).map_err(backend)?;
-        run_stmt_changes(stmt).await
-    }
-
-    /// Dirty-marking inputs for one chunk, captured **before** the events move
+    /// Dirty-marking inputs for a page, captured **before** the events move
     /// into the upsert SQL.
     ///
-    /// Batching: one owner lookup and **one** span SELECT (`google_event_id IN
-    /// (…)`) per chunk, not one of each per event. The chunk shares a calendar,
-    /// so the owner is a single answer.
+    /// One owner lookup for the page (every replica page is one calendar)
+    /// and span SELECTs chunked under D1's bind limit — not one owner lookup
+    /// and one span SELECT per 3-row upsert.
     async fn gather_dirty(&self, events: &[NewCalendarEvent]) -> DirtyChunk {
         let Some(first) = events.first() else {
             return DirtyChunk {
@@ -1118,9 +1127,13 @@ impl D1CalendarEventRepo {
             .iter()
             .map(|event| event.google_event_id.clone())
             .collect();
-        let stored = crate::db::stored_event_spans(&self.db, calendar_id, &google_event_ids)
-            .await
-            .unwrap_or_default();
+        let mut stored = Vec::new();
+        for chunk in google_event_ids.chunks(api_core::digest::DIGEST_EVENT_SPANS_MAX_IDS) {
+            let Ok(rows) = crate::db::stored_event_spans(&self.db, calendar_id, chunk).await else {
+                continue;
+            };
+            stored.extend(rows);
+        }
         let mut spans: Vec<OwnedSpan> = Vec::with_capacity(events.len() * 2);
         for event in events {
             if let Some(row) = stored

@@ -9,10 +9,11 @@
 //! - **Never advance `sync_token` past uncommitted work.** Pages are applied as
 //!   they arrive; the terminal `nextSyncToken` is published only via
 //!   [`CalendarRepo::record_sync_success_if_owner`] after the last page commits.
-//! - **One fenced owner per calendar.** Acquire a lease before the walk; cheap
-//!   in-memory fence before each page; apply upserts/tombstones via SQL-fenced
-//!   `*_if_owner` writes on `google_calendars.lease_owner` / expiry; renew after
-//!   apply; publish the cursor only via
+//! - **One fenced owner per calendar.** Acquire a lease before the walk from
+//!   a fresh wall clock (not the cron tick's start); renew **before** each
+//!   page so the SQL fence timestamp sits inside the new TTL; apply
+//!   upserts/tombstones via SQL-fenced `*_if_owner` writes; publish the
+//!   cursor only via
 //!   [`CalendarRepo::record_sync_success_if_owner`]. A lost owner must not write
 //!   rows or publish a cursor.
 //! - **410 is merge-full, not truncate.** Drop the in-memory token/page cursor
@@ -60,8 +61,26 @@ use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339, Clock};
 use crate::token::GoogleAccess;
 use std::collections::HashSet;
 
-/// Replica lease lifetime (seconds). Renewed after each applied page.
+/// Replica lease lifetime (seconds). Renewed before each page is applied,
+/// from a fresh wall clock — not from the cron tick's start.
 pub const REPLICA_LEASE_TTL_SECS: i64 = 90;
+
+/// Stop starting another Google page this long after the invocation's
+/// `now_unix`. A cron isolate is killed at about 15 minutes with no
+/// unwind, so the walk must release its lease itself and leave the tick
+/// time to finish (sibling calendars, watch renewal, agenda fill).
+pub const REPLICA_WALK_BUDGET_SECS: i64 = 11 * 60;
+
+/// How [`sync_replica`] stopped when it did not return an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaWalkFinish {
+    /// Terminal `nextSyncToken` was published under the lease.
+    Published,
+    /// Budget elapsed before a terminal page. No failure was recorded.
+    /// The caller releases the lease and leaves health as the walk left
+    /// it (`rebuilding` once a reseed has been stamped).
+    Yielded,
+}
 
 /// Max bytes retained in `calendar_event_quarantine.replay_payload` (64 KiB).
 const QUARANTINE_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
@@ -81,7 +100,9 @@ fn quarantine_replay_payload(body: &[u8]) -> String {
 ///
 /// Caller must already hold the lease as `lease_owner`, have stamped
 /// `record_sync_attempt`, and have run the event-label backfill. On `Err`, the
-/// caller records failure and releases the lease.
+/// caller records failure and releases the lease. On
+/// [`ReplicaWalkFinish::Yielded`] the caller releases the lease and does
+/// **not** record a failure.
 ///
 /// `cal` must be a **fresh** re-read after lease acquire (cursor + fingerprint),
 /// not a stale request-path snapshot.
@@ -94,6 +115,10 @@ fn quarantine_replay_payload(body: &[u8]) -> String {
 /// upsert **overwrites** the column). Production callers must pass a real
 /// context — [`EventClassifyCtx::preserve`] only when the taxonomy load
 /// failed (it keeps any stored stamp instead of blanking it).
+///
+/// `deadline_unix` is an absolute Unix second. When `clock` reaches it
+/// before a fetch, the walk returns [`ReplicaWalkFinish::Yielded`] without
+/// recording a failure. Pass `invocation_now + REPLICA_WALK_BUDGET_SECS`.
 pub async fn sync_replica(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -104,8 +129,9 @@ pub async fn sync_replica(
     lease_owner: &str,
     clock: &dyn Clock,
     report: &mut ReplicaApplyReport,
+    deadline_unix: i64,
     ctx: &EventClassifyCtx<'_>,
-) -> Result<(), CalendarError> {
+) -> Result<ReplicaWalkFinish, CalendarError> {
     let fingerprint = replica_query_fingerprint();
     // Empty stored fingerprint is compatible with an existing token (do not
     // invalidate production cursors). Only a non-empty mismatch, or a durable
@@ -154,6 +180,14 @@ pub async fn sync_replica(
     report.phase = ReplicaWalkPhase::Fetch;
 
     loop {
+        if clock.now_unix() >= deadline_unix {
+            // Voluntary stop. A platform kill would skip release_lease and
+            // the rest of the cron tick. Health stays rebuilding when a
+            // reseed was already stamped; the next tick starts again.
+            report.checkpoint = CheckpointResult::Yielded;
+            report.phase = ReplicaWalkPhase::Release;
+            return Ok(ReplicaWalkFinish::Yielded);
+        }
         let url = google_events_url(
             &cal.google_calendar_id,
             token.as_deref(),
@@ -234,10 +268,26 @@ pub async fn sync_replica(
             }
         };
 
-        // Fence before apply: lost/expired owner must not write rows or token.
-        // Fresh wall clock so a multi-page walk longer than TTL still holds.
+        // Renew before apply so the fence timestamp is inside a fresh TTL.
+        // The SQL compares `lease_expires_at` to this captured `now`, not to
+        // wall time when D1 runs, so the grant has to outlive the page.
         report.phase = ReplicaWalkPhase::Apply;
         let now = clock.now_rfc3339();
+        let renew_expires = lease_expires_at(&now);
+        let renewed = match calendars
+            .renew_lease(&cal.id, lease_owner, &renew_expires, &now)
+            .await
+        {
+            Ok(renewed) => renewed,
+            Err(err) => {
+                report.checkpoint = CheckpointResult::Error;
+                return Err(err.into());
+            }
+        };
+        if !renewed {
+            report.checkpoint = CheckpointResult::LeaseLost;
+            return Err(CalendarError::Invalid("lost replica lease".into()));
+        }
         if let Err(err) = ensure_lease_held(calendars, &cal.id, lease_owner, &now).await {
             report.checkpoint = CheckpointResult::LeaseLost;
             return Err(err);
@@ -322,27 +372,9 @@ pub async fn sync_replica(
             }
         }
 
-        // Successful 2xx page applied.
+        // Successful 2xx page applied. The lease was renewed before the
+        // writes; the next iteration renews again before the next page.
         report.pages = report.pages.saturating_add(1);
-
-        // Fresh wall clock on every renew so a walk longer than TTL extends
-        // the lease (not frozen at walk-start + 90s).
-        let now = clock.now_rfc3339();
-        let renew_expires = lease_expires_at(&now);
-        let renewed = match calendars
-            .renew_lease(&cal.id, lease_owner, &renew_expires, &now)
-            .await
-        {
-            Ok(r) => r,
-            Err(err) => {
-                report.checkpoint = CheckpointResult::Error;
-                return Err(err.into());
-            }
-        };
-        if !renewed {
-            report.checkpoint = CheckpointResult::LeaseLost;
-            return Err(CalendarError::Invalid("lost replica lease".into()));
-        }
 
         if let Some(next) = page.next_page_token.filter(|t| !t.is_empty()) {
             page_token = Some(next);
@@ -418,7 +450,7 @@ pub async fn sync_replica(
         // Poison page is gone once we published a terminal token.
         let _ = events.clear_quarantine_for_calendar(&cal.id).await;
         report.checkpoint = CheckpointResult::Published;
-        return Ok(());
+        return Ok(ReplicaWalkFinish::Published);
     }
 }
 
