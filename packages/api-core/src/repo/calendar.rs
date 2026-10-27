@@ -609,12 +609,15 @@ pub const CALENDAR_RECORD_SYNC_CONTENTION_SQL: &str = "
 ";
 
 /// Mark merge-full / reseed in-flight. Sets `full_sync_requested` and
-/// `sync_status = 'rebuilding'`. Does **not** touch `sync_token`, success
-/// stamps, error/streak, dirty gens, or lease. Binds: now, id.
+/// `sync_status = 'rebuilding'`, and clears `last_error_code` so a stale
+/// `lost_lease` does not keep masking the rebuild in the banner. Does
+/// **not** touch `sync_token`, success stamps, `failure_streak`,
+/// `next_retry_at`, dirty gens, or lease. Binds: now, id.
 pub const CALENDAR_BEGIN_REPLICA_RESEED_SQL: &str = "
     UPDATE google_calendars
     SET full_sync_requested = 1,
         sync_status = 'rebuilding',
+        last_error_code = '',
         updated_at = ?
     WHERE id = ? AND deleted_at IS NULL
 ";
@@ -2542,13 +2545,13 @@ mod tests {
         let sql = CALENDAR_BEGIN_REPLICA_RESEED_SQL;
         assert!(sql.contains("full_sync_requested = 1"), "{sql}");
         assert!(sql.contains("sync_status = 'rebuilding'"), "{sql}");
+        assert!(sql.contains("last_error_code = ''"), "{sql}");
         assert!(sql.contains("updated_at = ?"), "{sql}");
         assert!(sql.contains("WHERE id = ? AND deleted_at IS NULL"), "{sql}");
         assert!(!sql.contains("sync_token"), "{sql}");
         assert!(!sql.contains("last_success_at"), "{sql}");
         assert!(!sql.contains("last_synced_at"), "{sql}");
         assert!(!sql.contains("last_attempt_at"), "{sql}");
-        assert!(!sql.contains("last_error_code"), "{sql}");
         assert!(!sql.contains("failure_streak"), "{sql}");
         assert!(!sql.contains("lease_owner"), "{sql}");
         assert!(!sql.contains("dirty_"), "{sql}");

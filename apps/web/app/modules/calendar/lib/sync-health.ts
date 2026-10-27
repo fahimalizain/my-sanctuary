@@ -89,14 +89,22 @@ export function repairTargetCalendarId(
 }
 
 function degradedMessage(name: string, health: CalendarSyncHealth): string {
+  // A rebuild stamps `rebuilding` and clears the error, but a killed
+  // isolate can leave a stale `lost_lease` on a row that is already
+  // rebuilding. The state is the truth; don't say we're waiting on
+  // another sync.
+  if (health.state === 'rebuilding') {
+    if (health.error_code && health.error_code !== 'lost_lease') {
+      return `${name} is rebuilding (${health.error_code})`;
+    }
+    return `${name} is rebuilding`;
+  }
   if (health.error_code === 'lost_lease') {
     return `${name} is waiting on another sync and will retry automatically`;
   }
   let base: string;
   if (health.state === 'retrying') {
     base = `${name} is retrying`;
-  } else if (health.state === 'rebuilding') {
-    base = `${name} is rebuilding`;
   } else {
     base = `${name} is out of date`;
   }

@@ -1,7 +1,22 @@
 use super::support::*;
+use crate::calendar::cron::calendars_replica_order;
 use crate::calendar::{replica_due, run_fallback_cron};
 use crate::repo::CalendarRepo;
 use crate::time::unix_secs_to_rfc3339;
+
+#[test]
+fn rebuilds_run_after_incrementals_and_keep_relative_order() {
+    let mut first = calendar("cal-a", "a@example.com", true);
+    first.summary = "General".to_string();
+    let mut rebuild = calendar("cal-b", "b@example.com", true);
+    rebuild.summary = "Personal Goals".to_string();
+    rebuild.full_sync_requested = true;
+    let mut later = calendar("cal-c", "c@example.com", true);
+    later.summary = "Work".to_string();
+    let ordered = calendars_replica_order(vec![first, rebuild, later]);
+    let ids: Vec<&str> = ordered.iter().map(|cal| cal.id.as_str()).collect();
+    assert_eq!(ids, vec!["cal-a", "cal-c", "cal-b"]);
+}
 
 // ──────────────────────────────────────────
 // Leftover watch-channel stop (cron tail)

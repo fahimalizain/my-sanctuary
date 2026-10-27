@@ -7,7 +7,9 @@ use super::diagnostics::{
 };
 use super::labels::ensure_event_labels;
 use super::repair::repair_inflight_operations;
-use super::replica::{lease_expires_at, mint_lease_owner, sync_replica};
+use super::replica::{
+    lease_expires_at, mint_lease_owner, sync_replica, ReplicaWalkFinish, REPLICA_WALK_BUDGET_SECS,
+};
 use super::sync::{
     classify_sync_error, next_retry_rfc3339, refresh_watch_coverage, replica_state_for_error,
     CalendarReplicaState, SyncErrorCode,
@@ -67,6 +69,10 @@ pub enum SyncCalendarOutcome {
     Published,
     /// Foreign unexpired lease; quiet skip, not a failure, not a publish.
     LeaseBusy,
+    /// Walk stopped on the invocation budget before a terminal page.
+    /// Lease released, no failure recorded, not a publish. Cron continues
+    /// the tick; the next one retries. Queue acks so it does not hot-loop.
+    Yielded,
 }
 
 /// Whether a sync-enabled calendar should start a replica walk this tick.
@@ -130,6 +136,18 @@ pub fn replica_due(cal: &GoogleCalendar, now_unix: i64) -> bool {
     let retry_due = retry_unix.is_some_and(|retry| retry <= now_unix);
 
     dirty || success_stale || retry_due
+}
+
+/// Incremental calendars first, `full_sync_requested` rebuilds last.
+///
+/// Order within each group stays as `list_by_user_id` returned it
+/// (`is_primary DESC, summary ASC`). A rebuild that runs up to the walk
+/// budget must not sit in front of a sibling that can publish this tick.
+pub(crate) fn calendars_replica_order(cals: Vec<GoogleCalendar>) -> Vec<GoogleCalendar> {
+    let (rebuilds, rest): (Vec<_>, Vec<_>) = cals.into_iter().partition(|cal| cal.full_sync_requested);
+    let mut ordered = rest;
+    ordered.extend(rebuilds);
+    ordered
 }
 
 /// The fallback cron (ADR 0001 § Fallback cron + ADR 0005 V3): per user,
@@ -387,6 +405,9 @@ pub async fn run_fallback_cron_with_clock(
                 continue;
             }
         };
+        // Rebuilds last. A merge-full can occupy the rest of the budget;
+        // siblings that only need an incremental must publish first.
+        let user_cals = calendars_replica_order(user_cals);
 
         for cal in &user_cals {
             let due = replica_due(cal, now_unix);
@@ -418,8 +439,9 @@ pub async fn run_fallback_cron_with_clock(
                             .published
                             .push((cal.user_id.clone(), cal.id.clone()));
                     }
-                    Ok(SyncCalendarOutcome::LeaseBusy) => {
-                        // Quiet skip — not a failure, not a publish.
+                    Ok(SyncCalendarOutcome::LeaseBusy) | Ok(SyncCalendarOutcome::Yielded) => {
+                        // Quiet skip — not a failure, not a publish. Yielded
+                        // already released its lease; the next tick retries.
                     }
                     Err(CalendarError::GoogleNotFound) => {
                         report.errors.push(format!(
@@ -790,8 +812,10 @@ pub async fn sync_calendar(
 /// Like [`sync_calendar`], but returns a structured [`ReplicaWalkDiagnostic`]
 /// alongside the outcome for logging / CronReport.
 ///
-/// `now_rfc3339` stamps attempt / lease-acquire at walk start. `clock` is
-/// read again on every replica page so lease renewals use fresh wall time.
+/// `now_rfc3339` / `now_unix` are the invocation stamp (due-ness, the walk
+/// budget, diagnostics). Lease acquire, failure `next_retry`, and page
+/// renewals read `clock` so a tick that has already been running does not
+/// grant an already-expired lease.
 pub async fn sync_calendar_traced(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -840,6 +864,10 @@ pub async fn sync_calendar_traced(
             report.checkpoint = CheckpointResult::LeaseBusy;
             None
         }
+        Ok(SyncCalendarOutcome::Yielded) => {
+            // sync_replica already stamped Yielded and Release.
+            None
+        }
         Err(err) => {
             let code = match err {
                 CalendarError::InvalidResponse(msg)
@@ -881,14 +909,18 @@ async fn sync_calendar_traced_inner(
     report: &mut ReplicaApplyReport,
     category_repo: &dyn TaskCategoryRepo,
 ) -> Result<SyncCalendarOutcome, CalendarError> {
+    // Wall clock, not the invocation stamp. A tick that spent its first
+    // minutes on earlier calendars must not grant `tick_start + 90s`
+    // (already expired) or treat a dead lease as still held.
+    let acquire_now = clock.now_rfc3339();
     calendars
-        .record_sync_attempt(&cal.id, now_rfc3339)
+        .record_sync_attempt(&cal.id, &acquire_now)
         .await?;
 
     let owner = mint_lease_owner();
-    let expires = lease_expires_at(now_rfc3339);
+    let expires = lease_expires_at(&acquire_now);
     let acquired = calendars
-        .try_acquire_lease(&cal.id, &owner, now_rfc3339, &expires)
+        .try_acquire_lease(&cal.id, &owner, &acquire_now, &expires)
         .await?;
     if !acquired {
         // Another owner is working this calendar — not a failure.
@@ -917,7 +949,8 @@ async fn sync_calendar_traced_inner(
             // A failed load must not blank a good stamp.
             None => EventClassifyCtx::preserve(),
         };
-        sync_replica(
+        let deadline_unix = now_unix.saturating_add(REPLICA_WALK_BUDGET_SECS);
+        match sync_replica(
             http,
             calendars,
             events,
@@ -927,16 +960,23 @@ async fn sync_calendar_traced_inner(
             &owner,
             clock,
             report,
+            deadline_unix,
             &ctx,
         )
-        .await?;
-        Ok::<i64, CalendarError>(dirty_snapshot)
+        .await?
+        {
+            ReplicaWalkFinish::Published => Ok(Some(dirty_snapshot)),
+            ReplicaWalkFinish::Yielded => Ok(None),
+        }
     }
     .await;
 
-    // Always release, even when the body failed.
+    // Always release, even when the body failed or yielded. A platform
+    // kill never reaches this line — the budget above is what keeps the
+    // isolate alive long enough to get here.
+    let release_now = clock.now_rfc3339();
     let _ = calendars
-        .release_lease(&cal.id, &owner, now_rfc3339)
+        .release_lease(&cal.id, &owner, &release_now)
         .await;
     if report.phase != ReplicaWalkPhase::Done {
         // Mark release unless the walk already finished cleanly inside
@@ -946,6 +986,7 @@ async fn sync_calendar_traced_inner(
             CheckpointResult::Published
                 | CheckpointResult::MissingSyncToken
                 | CheckpointResult::LeaseLost
+                | CheckpointResult::Yielded
                 | CheckpointResult::Error
         ) {
             // Keep the walk's terminal phase (Checkpoint/Apply/Fetch).
@@ -955,7 +996,7 @@ async fn sync_calendar_traced_inner(
     }
 
     match body_result {
-        Ok(dirty_snapshot) => {
+        Ok(Some(dirty_snapshot)) => {
             // After a successful publish: advance applied to the generation-at-start.
             // If this write fails, surface the error (replica is idempotent; cron
             // retries). Do not pretend applied advanced.
@@ -964,6 +1005,7 @@ async fn sync_calendar_traced_inner(
                 .await?;
             Ok(SyncCalendarOutcome::Published)
         }
+        Ok(None) => Ok(SyncCalendarOutcome::Yielded),
         Err(err) => {
             let code = match &err {
                 CalendarError::InvalidResponse(msg)
@@ -978,7 +1020,11 @@ async fn sync_calendar_traced_inner(
             if report.checkpoint == CheckpointResult::NotAttempted {
                 report.checkpoint = CheckpointResult::Error;
             }
-            match persist_sync_failure(calendars, cal, code, now_unix, now_rfc3339).await {
+            // Fresh clock: next_retry must not be stamped with the tick
+            // start, which may already be minutes behind.
+            let fail_unix = clock.now_unix();
+            let fail_now = clock.now_rfc3339();
+            match persist_sync_failure(calendars, cal, code, fail_unix, &fail_now).await {
                 Ok(()) => Err(err),
                 Err(persist_err) => Err(persist_err),
             }

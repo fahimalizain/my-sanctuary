@@ -1,11 +1,11 @@
 use super::support::*;
-use crate::calendar::diagnostics::{ReplicaWalkMeta, ReplicaWalkTrigger};
-use crate::calendar::replica::lease_expires_at;
+use crate::calendar::diagnostics::{CheckpointResult, ReplicaWalkMeta, ReplicaWalkTrigger};
+use crate::calendar::replica::{lease_expires_at, REPLICA_WALK_BUDGET_SECS};
 use crate::calendar::{
     list_events, sync_calendar, sync_calendar_traced, CalendarError, SyncCalendarOutcome,
 };
 use crate::repo::CalendarRepo;
-use crate::time::{unix_secs_to_rfc3339, Clock};
+use crate::time::{unix_secs_to_rfc3339, CellClock, Clock};
 use std::cell::Cell;
 
 #[test]
@@ -1732,4 +1732,130 @@ fn replica_lease_expiry_advances_with_wall_time_on_long_walk() {
         "after release, late acquire must succeed; lease={:?}",
         calendars.stored.lock().unwrap()[0].lease_owner
     );
+}
+
+/// A lease that is still inside `tick_start + 90s` but already expired on
+/// the wall clock must be stolen. Granting from the tick stamp left Work2
+/// recording `lost_lease` after earlier calendars had used up the TTL.
+#[test]
+fn lease_acquire_uses_wall_clock_not_tick_start() {
+    let start = unix_secs_to_rfc3339(NOW_UNIX);
+    let wall = NOW_UNIX + 120;
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "old-tok".to_string();
+    cal.last_synced_at = Some(start.clone());
+    cal.last_success_at = Some(start.clone());
+    cal.initial_sync_complete = true;
+    cal.sync_status = "ready".to_string();
+    cal.lease_owner = "stuck-owner".to_string();
+    // Valid against the tick stamp (`start`), expired against wall (`start+120`).
+    cal.lease_expires_at = Some(lease_expires_at(&start));
+
+    let http = FakeHttp::new(vec![(
+        "/events",
+        200,
+        r#"{"items":[],"nextSyncToken":"st-stolen"}"#,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let clock = CellClock {
+        now_unix: Cell::new(wall),
+    };
+
+    let result = pollster::block_on(sync_calendar_traced(
+        &http,
+        &calendars,
+        &FakeEventRepo::new(),
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        &start,
+        &clock,
+        ReplicaWalkMeta {
+            run_id: "run-steal".into(),
+            trigger: ReplicaWalkTrigger::Cron,
+            deployed_version: String::new(),
+            started_unix_ms: NOW_UNIX.saturating_mul(1000),
+        },
+        &NO_TAXONOMY,
+    ));
+
+    assert!(
+        matches!(result.outcome, Ok(SyncCalendarOutcome::Published)),
+        "wall clock must steal the expired lease, got {:?}",
+        result.outcome
+    );
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].sync_token, "st-stolen");
+    assert!(stored[0].lease_owner.is_empty());
+    assert_eq!(stored[0].sync_status, "ready");
+}
+
+/// Past the invocation budget the walk must not fetch, must not publish,
+/// must not record a failure, and must release the lease. Reseed still
+/// clears a stale `lost_lease` so the banner can say rebuilding.
+#[test]
+fn walk_yields_at_budget_without_recording_failure() {
+    let start = unix_secs_to_rfc3339(NOW_UNIX);
+    let mut cal = calendar("cal-1", "primary@example.com", true);
+    cal.sync_token = "keep-me".to_string();
+    cal.full_sync_requested = true;
+    cal.sync_status = "ready".to_string();
+    cal.last_error_code = "lost_lease".to_string();
+    cal.last_synced_at = Some(start.clone());
+    cal.last_success_at = Some(start.clone());
+    cal.initial_sync_complete = true;
+
+    let http = FakeHttp::new(vec![(
+        "/events",
+        200,
+        r#"{"items":[{"id":"should-not-fetch","summary":"X","start":{"dateTime":"2026-08-18T09:00:00Z"},"end":{"dateTime":"2026-08-18T09:30:00Z"}}],"nextSyncToken":"nope"}"#,
+    )]);
+    let calendars = FakeCalendarRepo::with(vec![cal.clone()]);
+    let events = FakeEventRepo::new();
+    // Deadline is tick start + budget. Clock is already there, so the
+    // first fetch must not run.
+    let clock = CellClock {
+        now_unix: Cell::new(NOW_UNIX + REPLICA_WALK_BUDGET_SECS),
+    };
+
+    let result = pollster::block_on(sync_calendar_traced(
+        &http,
+        &calendars,
+        &events,
+        &FakeOperationRepo::new(),
+        &access(),
+        &cal,
+        &start,
+        &clock,
+        ReplicaWalkMeta {
+            run_id: "run-yield".into(),
+            trigger: ReplicaWalkTrigger::Cron,
+            deployed_version: String::new(),
+            started_unix_ms: NOW_UNIX.saturating_mul(1000),
+        },
+        &NO_TAXONOMY,
+    ));
+
+    assert!(
+        matches!(result.outcome, Ok(SyncCalendarOutcome::Yielded)),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(result.diagnostic.checkpoint, CheckpointResult::Yielded);
+    assert!(
+        http.gets.lock().unwrap().is_empty(),
+        "yield must happen before events.list"
+    );
+    let stored = calendars.stored.lock().unwrap();
+    assert_eq!(stored[0].sync_token, "keep-me", "must not publish");
+    assert_eq!(stored[0].sync_status, "rebuilding");
+    assert!(stored[0].full_sync_requested);
+    assert!(
+        stored[0].last_error_code.is_empty(),
+        "reseed clears stale lost_lease"
+    );
+    assert!(stored[0].lease_owner.is_empty(), "yield releases the lease");
+    assert_eq!(stored[0].last_success_at.as_deref(), Some(start.as_str()));
+    assert_eq!(stored[0].failure_streak, 0);
+    assert!(events.stored.lock().unwrap().is_empty());
 }

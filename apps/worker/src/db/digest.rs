@@ -84,13 +84,16 @@ pub(crate) async fn mark_dirty_dates(
     dates: &[String],
     now_rfc3339: &str,
 ) -> Result<(), RepoError> {
+    let mut stmts = Vec::new();
     for chunk in dates.chunks(DIGEST_MARK_DIRTY_CHUNK_SIZE) {
         let (sql, args) = build_mark_dirty_sql(user_id, chunk, now_rfc3339);
-        let stmt = db
-            .prepare(&sql)
-            .bind_refs(&bind_text(&args))
-            .map_err(backend)?;
-        run_stmt(stmt).await?;
+        stmts.push(super::prepare_text(db, &sql, &args)?);
+    }
+    // One round trip for the whole union. Each statement stays under the
+    // bind limit; the batch is what removes the per-chunk RTT.
+    let results = super::run_batch(db, stmts).await?;
+    for result in &results {
+        super::result_changes(result)?;
     }
     Ok(())
 }

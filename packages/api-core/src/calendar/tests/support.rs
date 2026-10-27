@@ -916,9 +916,11 @@ impl CalendarRepo for FakeCalendarRepo {
     ) -> Result<(), RepoError> {
         let mut stored = self.stored.lock().unwrap();
         if let Some(cal) = stored.iter_mut().find(|cal| cal.id == id) {
-            // Do not touch sync_token.
+            // Do not touch sync_token, streak, or next_retry. Clear the
+            // error so a stale lost_lease does not mask the rebuild.
             cal.full_sync_requested = true;
             cal.sync_status = "rebuilding".to_string();
+            cal.last_error_code.clear();
             cal.updated_at = now_rfc3339.to_string();
         }
         Ok(())
