@@ -1,27 +1,34 @@
-// Home — the agenda as an infinite run of days, then a Backlog section
-// (ADR 0004 amendment, slice 5; ADR 0007, slice 6). One vertically scrolling
-// run of civil days inside its own scroll container: opening the page lands on
-// the server's `anchor_date` (the oldest past day that still has something
-// pending), scroll UP for history, DOWN to the end of today+6. There is NO
-// future page — each loaded page paints its own `from…to`, so a history page
-// and a later anchor never get gap-filled into a wall of empty days. The cache
-// itself is two reads (`queries/agenda.ts`): the default window
-// (`anchor_date … today+6` plus the backlog) is a plain query, and history is
-// a second, lazy query keyed by the anchor it walks behind — so a refetch can
-// never drop today. Each day keeps the two piles (living rows ranked by
-// `sort_order`, then the muted Completed dump), plus a sticky header; a past
-// day with pending work shows an amber count and a one-tap "Move all to
-// today". Under the last day sits the **Backlog**: the dated future stretch
-// (grouped by day), then the `OPEN` rows one Board-ordered list. Dragging a row
-// onto today or a later stream day reschedules it (`/reschedule` with the
-// target rank — an `OPEN` task becomes `PLANNED`); a same-day drop is the old
-// `/move` reorder; dragging a row into the Backlog drops it (`{ backlog: true
-// }` → `OPEN` on today+50y), and dragging one OPEN row onto another is the
-// Board's task `/move` so Home and Board share one order. Occurrences and
-// running tasks are never dropped there. The old header date picker, the
-// add-task picker and remove-from-day are gone — tasks are born on the Board,
-// and a task's row follows the task's own lifecycle. A row's calendar menu
-// offers today-relative presets, a month picker and (for tasks) Backlog.
+// Home — the agenda as an infinite run of days, then TWO warehouse sections,
+// Planned above Backlog (ADR 0004 amendment, slice 5; ADR 0007, slice 6; ADR
+// 0009, slice 7). One vertically scrolling run of civil days inside its own
+// scroll container: opening the page lands on the server's `anchor_date` (the
+// oldest past day that still has something pending), scroll UP for history,
+// DOWN to the end of today+6. There is NO future page — each loaded page paints
+// its own `from…to`, so a history page and a later anchor never get gap-filled
+// into a wall of empty days. The cache itself is two reads
+// (`queries/agenda.ts`): the default window (`anchor_date … today+6` plus the
+// backlog) is a plain query, and history is a second, lazy query keyed by the
+// anchor it walks behind — so a refetch can never drop today. Each day keeps
+// the two piles (living rows ranked by `sort_order`, then the muted Completed
+// dump), plus a sticky header; a past day with pending work shows an amber
+// count and a one-tap "Move all to today". Under the last day sit the two
+// warehouses: **Planned** (the `PLANNED` rows at the sentinel, in the Planned
+// column's Board order) and then the **Backlog** (the dated future stretch
+// grouped by day, then the `OPEN` rows at the sentinel in the Open column's
+// Board order). Dragging a row onto today or a later stream day reschedules it
+// (`/reschedule` with the target rank — an `OPEN` task becomes `PLANNED`); a
+// same-day drop is the old `/move` reorder. Dragging into Backlog drops a row
+// (`{ backlog: true }` → `OPEN` on today+50y, still the unplan), dragging into
+// Planned plans an `OPEN` row (`/move { status: 'PLANNED' }` with no rank — it
+// never lands on today, the row parks on the sentinel), and dragging a dated
+// `PLANNED` row there unschedules it (`{ unschedule: true }`: status, log and
+// Board rank all untouched). Dragging inside one warehouse is that column's
+// Board task `/move`, so Home and Board share one order per column;
+// occurrences and running tasks are never dropped there. The old header date
+// picker, the add-task picker and remove-from-day are gone — tasks are born on
+// the Board, and a task's row follows the task's own lifecycle. A row's
+// calendar menu offers today-relative presets, a month picker and (for tasks)
+// Unschedule / Backlog.
 // Built on the existing task/occurrence
 // actions (complete, skip, reopen, start, pause, rename, TaskModal, error
 // banner, move notice, optimistic `['tasks']` patches) and reschedule/complete
@@ -102,20 +109,25 @@ import {
   appendRankOnStream,
   applyAgendaMove,
   applyOpenTaskReorder,
+  canUnschedule,
   crossDaySortOrder,
   dedupeAgendaItems,
+  backlogStretchesForRebuild,
   eachCivilDate,
   groupItemsByDate,
   historyPageZero,
   isAgendaItemPending,
   isOpenBacklogTask,
+  isPlannedBacklogTask,
   moveItemToBacklog,
   moveStreamItem,
   openTaskMoveTargetAt,
   partitionAgendaItems,
+  planOpenItem,
   replaceCachedTask,
   splitBacklogSection,
   streamItemsOf,
+  unscheduleItem,
   updateStreamItem,
 } from './agenda-helpers';
 import type {
@@ -136,6 +148,10 @@ import type {
 const DAY_ID_PREFIX = 'day-';
 /** The Backlog section's droppable id — a constant, never a `day-` id. */
 const BACKLOG_DROPPABLE_ID = 'backlog';
+/** The Planned section's droppable id — a constant, never a `day-` id and
+ *  never the sentinel date: a day header at 2076 would be a future droppable
+ *  and the API would 400 the reschedule it implies. */
+const PLANNED_DROPPABLE_ID = 'planned';
 /** A dated stretch group inside the Backlog (past today+6 … today+10y−1). */
 const BACKLOG_DAY_ID_PREFIX = 'backlog-day-';
 
@@ -160,6 +176,9 @@ function currentAnchor(): string {
 interface AgendaRowHandlers {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
   onMoveToBacklog: (item: AgendaItemRecord) => void;
+  /** Park a dated `PLANNED` row in the Planned warehouse (`{ unschedule: true
+   *  }`, ADR 0009) — never a status change. Task rows only. */
+  onUnschedule: (item: AgendaItemRecord) => void;
   onCompleteTask: (item: AgendaItemRecord) => void;
   onStartTask: (item: AgendaItemRecord) => void;
   onPauseTask: (item: AgendaItemRecord) => void;
@@ -176,8 +195,12 @@ interface AgendaRowHandlers {
 interface ActionNotice {
   message: string;
   itemId: string;
-  /** Set for a date move; omitted for a backlog drop. */
+  /** Set for a date move; omitted for a warehouse move. */
   date?: string;
+  /** Set by the warehouse moves so Show falls back to the RIGHT section header
+   *  when the row itself is not mounted (a Planned move never scrolls to the
+   *  Backlog header, and vice versa). */
+  section?: 'planned' | 'backlog';
 }
 
 /** Can a drag grab this row? Living work only: open tasks (OPEN | PLANNED |
@@ -349,6 +372,83 @@ function AgendaDay({
   );
 }
 
+/** The Planned warehouse (ADR 0009): every `PLANNED` row parked at/after the
+ *  10-year horizon, in the Planned column's Board order — the server already
+ *  sorted it, so it is never re-sorted here. Always visible, so an empty
+ *  section still accepts a drop; a drop ON the section means "the end of the
+ *  Planned list", exactly like a day container. Reordering is the Board's
+ *  `POST /api/tasks/:id/move { status: 'PLANNED', sort_order }`, never the
+ *  agenda's `/move`. It sits immediately ABOVE the Backlog and owns nothing
+ *  else: dated `PLANNED` rows stay in their day groups in the stream. */
+function PlannedSection({
+  serverToday,
+  planned,
+  handlers,
+  highlightedItemId,
+}: {
+  serverToday: string;
+  planned: AgendaItemRecord[];
+  handlers: AgendaRowHandlers;
+  highlightedItemId: string | null;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: PLANNED_DROPPABLE_ID });
+
+  const renderRow = (entry: AgendaItemRecord) =>
+    isAgendaRowDraggable(entry) ? (
+      <SortableAgendaItemRow
+        key={entry.id}
+        item={entry}
+        serverToday={serverToday}
+        highlighted={highlightedItemId === entry.id}
+        {...handlers}
+      />
+    ) : (
+      <AgendaItemRow
+        key={entry.id}
+        item={entry}
+        isDragging={false}
+        showHandle={false}
+        serverToday={serverToday}
+        highlighted={highlightedItemId === entry.id}
+        {...handlers}
+      />
+    );
+
+  return (
+    <section ref={setNodeRef} id={PLANNED_DROPPABLE_ID} aria-label="Planned">
+      <header className="sticky top-0 z-10 flex items-center gap-2 border-b border-border/60 bg-cream/95 px-1 py-2 backdrop-blur">
+        <h2 className="font-heading text-sm font-semibold text-foreground">
+          Planned
+        </h2>
+      </header>
+
+      <div
+        className={
+          isOver
+            ? 'min-h-10 rounded-lg bg-primary/5 px-1 py-2 ring-1 ring-primary/20 transition-colors'
+            : 'min-h-10 px-1 py-2 transition-colors'
+        }
+      >
+        {planned.length === 0 && (
+          <p className="px-1 py-1.5 text-sm italic text-muted-foreground/70">
+            Nothing planned
+          </p>
+        )}
+        {planned.length > 0 && (
+          <SortableContext
+            items={planned
+              .filter(isAgendaRowDraggable)
+              .map((entry) => entry.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className="space-y-2">{planned.map(renderRow)}</div>
+          </SortableContext>
+        )}
+      </div>
+    </section>
+  );
+}
+
 /** The Backlog (ADR 0007): everything past the day stream, in the two
  *  stretches the server returns — dated rows grouped by their own day (a
  *  same-day drop reorders through the agenda `/move`; a drop onto another
@@ -356,7 +456,9 @@ function AgendaDay({
  *  one of them is `>= today`), then the `OPEN` rows as ONE Board-ordered list
  *  (reordering them is the Board's task `/move`, never the agenda). The section
  *  itself is the droppable that sends a row back to the backlog, so an empty
- *  section still accepts a drop. */
+ *  section still accepts a drop. Warehoused Planned rows (ADR 0009) live in
+ *  their own section above; dated Planned rows still render in their day
+ *  groups here. */
 function BacklogSection({
   serverToday,
   dated,
@@ -512,9 +614,10 @@ export function HomePage() {
     [pages],
   );
   const byDate = useMemo(() => groupItemsByDate(items), [items]);
-  // The Backlog (ADR 0007): the DEFAULT read's `backlog` array (a history read
-  // always answers with an empty one), split into the dated stretch (grouped by
-  // day) and the OPEN stretch (server order = Board order).
+  // The two warehouses (ADR 0007, ADR 0009): the DEFAULT read's `backlog`
+  // array (a history read always answers with an empty one), split into the
+  // dated stretch (grouped by day), the Planned stretch and the OPEN stretch —
+  // both warehouse stretches in their column's Board order, as served.
   const backlogItems = useMemo(
     () => dedupeAgendaItems(currentPage?.backlog ?? []),
     [currentPage],
@@ -620,23 +723,29 @@ export function HomePage() {
   const moveAgendaItemMutation = useMoveAgendaItem();
   const rescheduleAgendaItemMutation = useRescheduleAgendaItem();
 
-  /** The OPEN stretch of the Backlog as the cache holds it right now (server
-   *  order, which is the Board's `tasks.sort_order` order). */
-  const openBacklogRowsOf = (data: AgendaPages | undefined) =>
-    splitBacklogSection(
+  /** One warehouse's rows as the cache holds them right now (server order,
+   *  which is that Board column's `tasks.sort_order` order). */
+  const warehouseRowsOf = (
+    data: AgendaPages | undefined,
+    status: 'OPEN' | 'PLANNED',
+  ) => {
+    const split = splitBacklogSection(
       dedupeAgendaItems(
         (data?.pages ?? []).flatMap((page) => page.backlog ?? []),
       ),
       serverToday,
-    ).open;
+    );
+    return status === 'OPEN' ? split.open : split.planned;
+  };
 
   /** dnd-kit drop resolution. Same-day → the old `/move` reorder; across days
-   *  → `/reschedule` with the target day's rank; the Backlog section (or an
-   *  OPEN-backlog row) → a backlog drop; two OPEN-backlog rows → the Board's
-   *  task `/move`. Past days are never drop targets (the API 400s), an
-   *  `in_progress` occurrence may only reorder inside its own day, and an
-   *  `IN_PROGRESS` task cannot change day at all (the API 400s — pause
-   *  first). */
+   *  → `/reschedule` with the target day's rank; the Planned warehouse (its
+   *  section or a Planned row) → plan / unschedule / the Planned column's
+   *  Board reorder; the Backlog (its section or an OPEN row) → a backlog drop
+   *  or the Open column's Board reorder. Past days are never drop targets (the
+   *  API 400s), an `in_progress` occurrence may only reorder inside its own
+   *  day, and an `IN_PROGRESS` / terminal task or an occurrence never enters
+   *  either warehouse. */
   const handleDragEnd = (event: DragEndEvent) => {
     setActiveDrag(null);
     const { active, over } = event;
@@ -647,9 +756,8 @@ export function HomePage() {
     const dragged = itemsNow.find((entry) => entry.id === activeId);
     if (!dragged) return;
 
-    const isOpenRow = (entry: AgendaItemRecord) =>
-      isOpenBacklogTask(entry, serverToday);
-    const draggedIsOpen = isOpenRow(dragged);
+    const draggedIsOpen = isOpenBacklogTask(dragged, serverToday);
+    const draggedIsPlanned = isPlannedBacklogTask(dragged, serverToday);
 
     // The on-screen sortable list holds the DRAGGABLE rows only — dnd-kit
     // resolves a same-day drop index against that, never the full pile
@@ -670,29 +778,86 @@ export function HomePage() {
 
     const overItem = itemsNow.find((entry) => entry.id === overId) ?? null;
 
-    // 1. Backlog drop: the section itself, or an OPEN-backlog row for a row
-    //    that is not itself in that stretch. Occurrences and a running task
-    //    never go there; an already-OPEN row already sits in the stretch.
-    if (
+    // Which warehouse is the drop aimed at? The section itself, or one of its
+    // own rows. Resolved up front so the Planned branch sits ahead of the
+    // backlog drop: a Planned row's `local_date` is the sentinel, and letting
+    // it fall through to the cross-day branch would reschedule it onto 2076 —
+    // which the API 400s.
+    const plannedTarget =
+      overId === PLANNED_DROPPABLE_ID ||
+      (overItem !== null && isPlannedBacklogTask(overItem, serverToday));
+    const openTarget =
       overId === BACKLOG_DROPPABLE_ID ||
-      (overItem !== null && isOpenRow(overItem) && !draggedIsOpen)
-    ) {
+      (overItem !== null && isOpenBacklogTask(overItem, serverToday));
+
+    // 1. The Planned warehouse (ADR 0009): a same-status reorder through the
+    //    Board, a plan from an OPEN row, or an unschedule from a dated row.
+    //    Occurrences, a running task and terminal cards are rejected on BOTH
+    //    warehouse targets.
+    if (plannedTarget) {
       if (dragged.kind !== 'task' || !dragged.task) return;
-      if (dragged.task.status === 'IN_PROGRESS') return;
-      if (draggedIsOpen) return;
-      void handleBacklogDrop(dragged);
+      if (
+        dragged.task.status === 'IN_PROGRESS' ||
+        dragged.task.status === 'COMPLETED' ||
+        dragged.task.status === 'DISCARDED'
+      ) {
+        return;
+      }
+      if (draggedIsPlanned) {
+        const planned = warehouseRowsOf(readStream(), 'PLANNED');
+        const fromIndex = planned.findIndex((entry) => entry.id === dragged.id);
+        // A drop on the section itself means "the end of the Planned list",
+        // exactly like a day container.
+        const toIndex = overItem
+          ? planned.findIndex((entry) => entry.id === overItem.id)
+          : planned.length - 1;
+        const target = openTaskMoveTargetAt(planned, fromIndex, toIndex);
+        if (target === null) return;
+        void handleWarehouseReorder(
+          dragged,
+          'PLANNED',
+          planned,
+          toIndex,
+          target,
+        );
+        return;
+      }
+      if (dragged.task.status === 'OPEN') {
+        void handlePlanDrop(dragged);
+        return;
+      }
+      if (dragged.task.status === 'PLANNED') {
+        // A dated (or past) PLANNED row: the warehouse, not a status change.
+        void handleUnschedule(dragged);
+      }
       return;
     }
 
-    // 2. Two OPEN-backlog rows: Home and the Board share one Open order, so
-    //    this is the Board's task `/move`, never the agenda reorder.
-    if (draggedIsOpen && overItem && isOpenRow(overItem)) {
-      const open = openBacklogRowsOf(readStream());
-      const fromIndex = open.findIndex((entry) => entry.id === dragged.id);
-      const toIndex = open.findIndex((entry) => entry.id === overItem.id);
-      const target = openTaskMoveTargetAt(open, fromIndex, toIndex);
-      if (target === null) return;
-      void handleOpenBacklogMove(dragged, open, toIndex, target);
+    // 2. The Backlog (ADR 0007): the section itself, or an OPEN row. An
+    //    already-OPEN row already sits in the stretch, so a drop on the
+    //    section is a no-op; over another OPEN row it is the Board's reorder.
+    if (openTarget) {
+      if (dragged.kind !== 'task' || !dragged.task) return;
+      if (
+        dragged.task.status === 'IN_PROGRESS' ||
+        dragged.task.status === 'COMPLETED' ||
+        dragged.task.status === 'DISCARDED'
+      ) {
+        return;
+      }
+      if (draggedIsOpen) {
+        if (!overItem) return;
+        const open = warehouseRowsOf(readStream(), 'OPEN');
+        const fromIndex = open.findIndex((entry) => entry.id === dragged.id);
+        const toIndex = open.findIndex((entry) => entry.id === overItem.id);
+        const target = openTaskMoveTargetAt(open, fromIndex, toIndex);
+        if (target === null) return;
+        void handleWarehouseReorder(dragged, 'OPEN', open, toIndex, target);
+        return;
+      }
+      if (dragged.task.status === 'OPEN' || dragged.task.status === 'PLANNED') {
+        void handleBacklogDrop(dragged);
+      }
       return;
     }
 
@@ -717,8 +882,8 @@ export function HomePage() {
     }
 
     // 4. A drop over another row: same civil day → the agenda reorder (the
-    //    Board rank only owns the OPEN stretch, handled above); a different
-    //    day → reschedule onto it.
+    //    Board rank only owns the two warehouse stretches, handled above); a
+    //    different day → reschedule onto it.
     if (!overItem) return;
     if (overItem.local_date === dragged.local_date) {
       const sortable = sortableSameDay();
@@ -871,6 +1036,7 @@ export function HomePage() {
       setActionNotice({
         message: 'Moved to Backlog',
         itemId: data.item.id,
+        section: 'backlog',
       });
     } catch (err) {
       patchStream(() => snapshot);
@@ -879,64 +1045,175 @@ export function HomePage() {
     }
   };
 
-  /** Reorder one OPEN-backlog row onto another row's slot (ADR 0007): the
-   *  Board's own `POST /api/tasks/:id/move { status: 'OPEN', sort_order }`, so
-   *  Home and the Board never disagree on the Open order. The optimistic paint
-   *  mirrors the server's `reorder_in_place` over EVERY OPEN embed in the
-   *  backlog — the mover takes the sent rank and its peers shift one — and
-   *  reorders the list where the user dropped it; the shared `['tasks']` cache
-   *  gets the same peer shift on success, so the Board's Open column follows.
-   *  A failure restores the snapshot and banners. */
-  const handleOpenBacklogMove = async (
+  /** Drop a row into the Planned warehouse (ADR 0009): the Board's
+   *  `POST /api/tasks/:id/move { status: 'PLANNED' }` with **no rank** — the
+   *  plan appends the task to the Planned column server-side and parks its
+   *  agenda row on the backlog sentinel, never on civil today. (The hovered
+   *  card's rank would be a same-status reorder of that column, not an
+   *  append.) Painted optimistically with the SAME month clamp the server uses,
+   *  then merged with the authoritative task, whose status and Board rank both
+   *  land in the shared `['tasks']` cache. A failure restores the snapshot and
+   *  banners; `useMoveTask` invalidates the stream on settle — never awaited,
+   *  so the rollback cannot race it. */
+  const handlePlanDrop = async (item: AgendaItemRecord) => {
+    const task = item.task;
+    if (!task || task.status !== 'OPEN' || !serverToday) return;
+    const snapshot = readStream();
+    patchStream((current) =>
+      planOpenItem(
+        current,
+        item.id,
+        addMonthsClamp(serverToday, 600),
+        serverToday,
+      ),
+    );
+    setActionError(null);
+    try {
+      const data = await moveTaskMutation.mutateAsync({
+        id: task.id,
+        input: { status: 'PLANNED' } satisfies MoveTaskInput,
+      });
+      mergeRow(item.id, (entry) =>
+        entry.task ? { ...entry, task: data.task } : entry,
+      );
+      setTasksCache((prev) => replaceCachedTask(prev, data.task));
+      setActionNotice({
+        message: 'Moved to Planned',
+        itemId: item.id,
+        section: 'planned',
+      });
+    } catch (err) {
+      patchStream(() => snapshot);
+      setActionNotice(null);
+      setActionError(err instanceof Error ? err.message : 'Move failed');
+    }
+  };
+
+  /** Unschedule a dated `PLANNED` row (ADR 0009): `{ unschedule: true }` keeps
+   *  the task `PLANNED`, writes no task log and does NOT re-rank the Planned
+   *  column — only the agenda row travels to the backlog sentinel, appended.
+   *  Painted optimistically with `unscheduleItem`, merged with the
+   *  authoritative row on success; a failure restores the snapshot and
+   *  banners. Occurrences, `OPEN` rows and terminal cards never get here. */
+  const handleUnschedule = async (item: AgendaItemRecord) => {
+    if (!canUnschedule(item, serverToday)) return;
+    const snapshot = readStream();
+    patchStream((current) =>
+      unscheduleItem(
+        current,
+        item.id,
+        addMonthsClamp(serverToday, 600),
+        serverToday,
+      ),
+    );
+    setActionError(null);
+    try {
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: item.id,
+        input: { unschedule: true },
+      });
+      mergeRow(data.item.id, () => data.item);
+      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+      setActionNotice({
+        message: 'Moved to Planned',
+        itemId: data.item.id,
+        section: 'planned',
+      });
+    } catch (err) {
+      patchStream(() => snapshot);
+      setActionNotice(null);
+      setActionError(err instanceof Error ? err.message : 'Move failed');
+    }
+  };
+
+  /** Reorder one warehouse row onto another row's slot (ADR 0007 for OPEN,
+   *  ADR 0009 for PLANNED): the Board's own
+   *  `POST /api/tasks/:id/move { status, sort_order }`, so Home and the Board
+   *  never disagree on a column's order. The optimistic paint mirrors the
+   *  server's `reorder_in_place` over every task embed that shares that
+   *  column's rank space — the mover takes the sent rank and its peers shift
+   *  one — reorders the stretch where the user dropped it, and rebuilds the
+   *  page's backlog as dated ++ planned ++ open, so a Planned reorder can never
+   *  leave the planned rows after the open ones. A PLANNED reorder also shifts
+   *  the dated `PLANNED` rows (same column, same rank space). The shared
+   *  `['tasks']` cache gets the same peer shift on success, so the Board's
+   *  column follows. A failure restores the snapshot and banners. */
+  const handleWarehouseReorder = async (
     item: AgendaItemRecord,
-    open: AgendaItemRecord[],
+    status: 'OPEN' | 'PLANNED',
+    rows: AgendaItemRecord[],
     toIndex: number,
     target: number,
   ) => {
     const task = item.task;
-    const fromIndex = open.findIndex((entry) => entry.id === item.id);
+    const fromIndex = rows.findIndex((entry) => entry.id === item.id);
     if (!task || fromIndex < 0 || toIndex < 0) return;
-    // The new OPEN order — dnd-kit's own array move, so the row lands where
-    // the user dropped it.
-    const reordered = arrayMove(open, fromIndex, toIndex);
+    // The new order — dnd-kit's own array move, so the row lands where the
+    // user dropped it.
+    const reordered = arrayMove(rows, fromIndex, toIndex);
     const order = new Map(reordered.map((entry, index) => [entry.id, index]));
-    const openIds = new Set(open.map((entry) => entry.id));
-    // The Board's same-status reorder over the OPEN embeds: without the peer
-    // shift a second drop before the settle refetch would compute its rank
-    // from stale neighbours.
-    const shiftedRanks = new Map(
-      applyOpenTaskReorder(
-        open.flatMap((entry) => (entry.task ? [entry.task] : [])),
-        task.id,
-        target,
-      ).map((entry) => [entry.id, entry.sort_order]),
-    );
     const snapshot = readStream();
+    // The task embeds sharing this column's rank space. OPEN reorders only
+    // touch the stretch; a PLANNED reorder is the whole Planned column, so the
+    // dated PLANNED rows (they live in `items` / the dated backlog) shift too.
+    const peerTasks =
+      status === 'PLANNED'
+        ? streamItemsOf(snapshot).flatMap((entry) =>
+            entry.task && entry.task.status === 'PLANNED' ? [entry.task] : [],
+          )
+        : rows.flatMap((entry) => (entry.task ? [entry.task] : []));
+    const shiftedRanks = new Map(
+      applyOpenTaskReorder(peerTasks, task.id, target).map((entry) => [
+        entry.id,
+        entry.sort_order,
+      ]),
+    );
+    /** `entry` with its shifted Board rank, or the same reference when its
+     *  task is not part of this column (or kept its rank). */
+    const withRank = (entry: AgendaItemRecord): AgendaItemRecord => {
+      const rank = entry.task ? shiftedRanks.get(entry.task.id) : null;
+      if (!entry.task || rank == null || rank === entry.task.sort_order) {
+        return entry;
+      }
+      return { ...entry, task: { ...entry.task, sort_order: rank } };
+    };
+    const inDroppedOrder = (entries: AgendaItemRecord[]) =>
+      entries
+        .slice()
+        .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+        .map(withRank);
     patchStream((current) => {
       if (!current) return current;
       return {
         ...current,
         pages: current.pages.map((page) => {
+          const items = page.items.map(withRank);
           const backlog = page.backlog ?? [];
-          if (!backlog.some((entry) => entry.id === item.id)) return page;
-          // Dated rows keep their places ahead of the OPEN stretch; only the
-          // OPEN rows take the new order and the shifted ranks.
-          const rest = backlog.filter((entry) => !openIds.has(entry.id));
-          const openRows = backlog
-            .filter((entry) => openIds.has(entry.id))
-            .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
-            .map((entry) => {
-              const rank = entry.task ? shiftedRanks.get(entry.task.id) : null;
-              if (
-                !entry.task ||
-                rank == null ||
-                rank === entry.task.sort_order
-              ) {
-                return entry;
-              }
-              return { ...entry, task: { ...entry.task, sort_order: rank } };
-            });
-          return { ...page, backlog: [...rest, ...openRows] };
+          if (!backlog.some((entry) => entry.id === item.id)) {
+            // Only a PLANNED reorder changes rows off the mover's page (the
+            // dated PLANNED ranks); keep the reference when nothing moved.
+            return items.some((entry, index) => entry !== page.items[index])
+              ? { ...page, items }
+              : page;
+          }
+          // Dated rows keep their places ahead of both warehouses; only the
+          // reordered stretch takes the new order. The rebuild preserves rows
+          // that belong to neither warehouse pile (a stale optimistic
+          // `IN_PROGRESS` at the horizon) instead of dropping them.
+          const split = backlogStretchesForRebuild(backlog, serverToday);
+          return {
+            ...page,
+            items,
+            backlog: [
+              ...split.dated.map(withRank),
+              ...(status === 'PLANNED'
+                ? inDroppedOrder(split.planned)
+                : split.planned.map(withRank)),
+              ...(status === 'OPEN'
+                ? inDroppedOrder(split.open)
+                : split.open.map(withRank)),
+            ],
+          };
         }),
       };
     });
@@ -944,13 +1221,13 @@ export function HomePage() {
     try {
       const data = await moveTaskMutation.mutateAsync({
         id: task.id,
-        input: { status: 'OPEN', sort_order: target } satisfies MoveTaskInput,
+        input: { status, sort_order: target } satisfies MoveTaskInput,
       });
       mergeRow(item.id, (entry) =>
         entry.task ? { ...entry, task: data.task } : entry,
       );
       // Patch the shared tasks cache: the same peer shift, then the mover's
-      // authoritative row, so Board/Lists never read a stale Open order.
+      // authoritative row, so Board/Lists never read a stale column order.
       setTasksCache((prev) =>
         applyOpenTaskReorder(prev, data.task.id, data.task.sort_order).map(
           (entry) => (entry.id === data.task.id ? data.task : entry),
@@ -1485,7 +1762,8 @@ export function HomePage() {
 
   /** Success notice's Show: find the moved row (it has a stable DOM id) and
    *  scroll it into view inside the stream, then ring it briefly. The day
-   *  header / dated Backlog group / Backlog are fallbacks only. */
+   *  header / dated Backlog group are fallbacks, then the warehouse section the
+   *  move named — a Planned move never scrolls to the Backlog header. */
   const showDestination = (notice: ActionNotice) => {
     let target = document.getElementById(`agenda-item-${notice.itemId}`);
     if (!target && notice.date) {
@@ -1494,7 +1772,13 @@ export function HomePage() {
     if (!target && notice.date) {
       target = document.getElementById(backlogDayElementId(notice.date));
     }
-    if (!target) target = document.getElementById(BACKLOG_DROPPABLE_ID);
+    if (!target) {
+      target = document.getElementById(
+        notice.section === 'planned'
+          ? PLANNED_DROPPABLE_ID
+          : BACKLOG_DROPPABLE_ID,
+      );
+    }
     if (!target) return;
     const isRow = target.id.startsWith('agenda-item-');
     target.scrollIntoView({ block: isRow ? 'center' : 'start' });
@@ -1779,6 +2063,7 @@ export function HomePage() {
   const handlers: AgendaRowHandlers = {
     onReschedule: (entry, date) => void handleCrossDayMove(entry, date),
     onMoveToBacklog: (entry) => void handleBacklogDrop(entry),
+    onUnschedule: (entry) => void handleUnschedule(entry),
     onCompleteTask: (entry) => void handleCompleteTask(entry),
     onStartTask: (entry) => void handleStartTask(entry),
     onPauseTask: (entry) => void handlePauseTask(entry),
@@ -1971,10 +2256,18 @@ export function HomePage() {
                       />
                     ))}
 
-                    {/* Under the last stream day: the Backlog (ADR 0007) —
-                        dated rows grouped by day, then the Board-ordered OPEN
-                        stretch. It is its own drop target, so an empty backlog
-                        still accepts a row. */}
+                    {/* Under the last stream day: the two warehouses (ADR
+                        0007, ADR 0009) — Planned first, then the Backlog
+                        (dated rows grouped by day, then the Board-ordered OPEN
+                        stretch). Each is its own drop target, so an empty
+                        warehouse still accepts a row. */}
+                    <PlannedSection
+                      serverToday={serverToday}
+                      planned={backlogSplit.planned}
+                      handlers={handlers}
+                      highlightedItemId={flashItemId}
+                    />
+
                     <BacklogSection
                       serverToday={serverToday}
                       dated={backlogSplit.dated}

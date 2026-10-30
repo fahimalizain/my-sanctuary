@@ -1,9 +1,10 @@
 // Pure helpers for Home's agenda stream (ADR 0004 amendment — slice 5, ADR
-// 0007 — slice 6): the day label, the move presets / picker bounds, the
-// reorder rank math, the living / Completed dump split, the backlog split, the
-// date-window walk, and the optimistic edits over React Query's infinite
-// `{ pages }` cache. Kept React-free so `node:test` can cover them
-// (HomePage.tsx is presentational glue on top).
+// 0007 — slice 6, ADR 0009 — slice 7): the day label, the move presets /
+// picker bounds, the reorder rank math, the living / Completed dump split, the
+// backlog split into its dated / Planned / Open stretches, the date-window
+// walk, and the optimistic edits over React Query's infinite `{ pages }` cache.
+// Kept React-free so `node:test` can cover them (HomePage.tsx is presentational
+// glue on top).
 
 import type { InfiniteData } from '@tanstack/react-query';
 import type {
@@ -301,28 +302,90 @@ export function isOpenBacklogTask(
   );
 }
 
-/** Splits the server's `backlog` array into its two stretches (ADR 0007)
- *  WITHOUT re-sorting the dated stretch: `dated` is `local_date` before the
- *  10-year line (already `local_date`, `sort_order`, `created_at` asc), `open`
- *  is the rest that reads as an `OPEN` task in Board order. Anything left (a
- *  `PLANNED` / `IN_PROGRESS` row the self-heal has not pulled back yet) is
- *  omitted — the server omits it too, and it is not an OPEN reorder target. */
+/** True when the row is part of the **Planned** warehouse (ADR 0009): a
+ *  `PLANNED` task whose row sits on/past the 10-year line — the mirror of
+ *  `isOpenBacklogTask` one status over. Those rows are ordered by the Board's
+ *  `tasks.sort_order` (the Planned column), never by the agenda's
+ *  `sort_order`, and a reorder is the Board's same-status task `/move`. A
+ *  malformed/absent `today` claims nothing. */
+export function isPlannedBacklogTask(
+  item: AgendaItemRecord,
+  today: string,
+): boolean {
+  if (!today || !isCivilDateValid(today)) return false;
+  if (item.kind !== 'task' || !item.task) return false;
+  return (
+    item.task.status === 'PLANNED' &&
+    item.local_date >= addMonthsClamp(today, 120)
+  );
+}
+
+/** Splits the server's `backlog` array into its THREE stretches (ADR 0007,
+ *  ADR 0009) WITHOUT re-sorting either warehouse: `dated` is `local_date`
+ *  before the 10-year line (already `local_date`, `sort_order`, `created_at`
+ *  asc), `planned` is the rest that reads as a `PLANNED` task in Planned-column
+ *  Board order, and `open` is the rest that reads as an `OPEN` task in
+ *  Open-column Board order. Anything left (an `IN_PROGRESS` / terminal /
+ *  embedless row at the horizon) is omitted — the server omits it too, and it
+ *  is not a reorder target. A malformed `today` yields three empty stretches.
+ *  Both warehouses keep the server's encounter order: the read is already in
+ *  Board order (ties by task id), and client-sorting would silently disagree
+ *  with the Board. */
 export function splitBacklogSection(
   items: AgendaItemRecord[],
   today: string,
-): { dated: AgendaItemRecord[]; open: AgendaItemRecord[] } {
+): {
+  dated: AgendaItemRecord[];
+  planned: AgendaItemRecord[];
+  open: AgendaItemRecord[];
+} {
   const horizon =
     today && isCivilDateValid(today) ? addMonthsClamp(today, 120) : '';
   const dated: AgendaItemRecord[] = [];
+  const planned: AgendaItemRecord[] = [];
   const open: AgendaItemRecord[] = [];
   for (const item of items) {
     if (horizon && item.local_date < horizon) {
       dated.push(item);
+    } else if (isPlannedBacklogTask(item, today)) {
+      planned.push(item);
     } else if (isOpenBacklogTask(item, today)) {
       open.push(item);
     }
   }
-  return { dated, open };
+  return { dated, planned, open };
+}
+
+/** The three stretches as the optimistic edits REBUILD a `backlog` array
+ *  (ADR 0009): same predicates as `splitBacklogSection`, except that a row
+ *  belonging to neither warehouse pile (a stale `IN_PROGRESS` / terminal /
+ *  embedless row at the horizon — the server omits those) rides along with the
+ *  dated stretch instead of being dropped, so a rebuild never loses a row. */
+export function backlogStretchesForRebuild(
+  items: AgendaItemRecord[],
+  today: string,
+): {
+  dated: AgendaItemRecord[];
+  planned: AgendaItemRecord[];
+  open: AgendaItemRecord[];
+} {
+  const split = splitBacklogSection(items, today);
+  const kept = new Set(
+    [...split.dated, ...split.planned, ...split.open].map((entry) => entry.id),
+  );
+  return {
+    dated: [...split.dated, ...items.filter((entry) => !kept.has(entry.id))],
+    planned: split.planned,
+    open: split.open,
+  };
+}
+
+/** The Planned column's Board order (ADR 0009): `tasks.sort_order` asc, ties
+ *  by task id — the same order the read applies server-side. */
+function byPlannedBoardOrder(a: AgendaItemRecord, b: AgendaItemRecord): number {
+  const rank = (a.task?.sort_order ?? 0) - (b.task?.sort_order ?? 0);
+  if (rank !== 0) return rank;
+  return (a.task?.id ?? a.id).localeCompare(b.task?.id ?? b.id);
 }
 
 /** Work that is still ahead of the user on its day — the amber "N pending"
@@ -518,6 +581,126 @@ export function moveItemToBacklog(
   return { ...data, pages };
 }
 
+/** The optimistic mirror of `reschedule { unschedule: true }` (ADR 0009): a
+ *  dated `PLANNED` row leaves its day and parks in the **Planned** warehouse
+ *  without a status change, a task log or a Board re-rank — so `task` (status
+ *  AND `sort_order`) is kept byte-for-byte and only `local_date` moves to
+ *  `sentinelDate`. The row is removed from every page's `items` and `backlog`
+ *  and re-inserted into the backlog of the page with the greatest `to` (the
+ *  default read, same target as `moveItemToBacklog`) as
+ *  `dated ++ planned ++ open`: the dated stretch keeps encounter order, the
+ *  Planned rows — the mover included — are re-laid in Board order
+ *  (`tasks.sort_order`, ties by task id) because the row is appended at
+ *  `max + 1` server-side, and the OPEN stretch keeps its own order after them.
+ *  `today` is needed to tell a dated `PLANNED` row (still `dated`) from a
+ *  warehoused one. Returns the same reference when the id is missing (or no
+ *  page is loaded). */
+export function unscheduleItem(
+  data: AgendaStreamData | undefined,
+  id: string,
+  sentinelDate: string,
+  today: string,
+): AgendaStreamData | undefined {
+  if (!data || data.pages.length === 0) return data;
+  const item = [...streamItems(data), ...backlogItems(data)].find(
+    (entry) => entry.id === id,
+  );
+  if (!item) return data;
+  const target = data.pages.reduce((best, page) =>
+    page.to > best.to ? page : best,
+  );
+  const moved: AgendaItemRecord = { ...item, local_date: sentinelDate };
+  const stretches = backlogStretchesForRebuild(
+    (target.backlog ?? []).filter((entry) => entry.id !== id),
+    today,
+  );
+  const planned = [...stretches.planned, moved].sort(byPlannedBoardOrder);
+  const pages = data.pages.map((page) => {
+    const items = page.items.filter((entry) => entry.id !== id);
+    const backlog = (page.backlog ?? []).filter((entry) => entry.id !== id);
+    if (page !== target) {
+      return items.length !== page.items.length ||
+        backlog.length !== (page.backlog?.length ?? 0)
+        ? { ...page, items, backlog }
+        : page;
+    }
+    return {
+      ...page,
+      items,
+      backlog: [...stretches.dated, ...planned, ...stretches.open],
+    };
+  });
+  return { ...data, pages };
+}
+
+/** The optimistic mirror of a **plan** (`POST /api/tasks/:id/move {
+ *  status: 'PLANNED' }` with no rank, ADR 0009): an `OPEN` task becomes
+ *  `PLANNED` with the appended Planned-column rank (`max + 1` over every other
+ *  `PLANNED` embed in the loaded cache, else 0) and its one agenda row parks in
+ *  the Planned warehouse instead of on civil today. A row already at/after the
+ *  horizon is left where it is — sentinel and exact-horizon parking are both
+ *  valid, and the server does not retarget them — so even its agenda
+ *  `sort_order` is untouched; a row below the horizon takes `sentinelDate`.
+ *  The row leaves every page's `items` and `backlog` and lands at the END of
+ *  the Planned stretch of the greatest-`to` page (dated ++ planned ++ open).
+ *  Anything that is not an `OPEN` task (an already-planned row, an occurrence,
+ *  an orphan) returns the same reference, as does a missing id. */
+export function planOpenItem(
+  data: AgendaStreamData | undefined,
+  id: string,
+  sentinelDate: string,
+  today: string,
+): AgendaStreamData | undefined {
+  if (!data || data.pages.length === 0) return data;
+  const item = [...streamItems(data), ...backlogItems(data)].find(
+    (entry) => entry.id === id,
+  );
+  if (!item || !item.task || item.task.status !== 'OPEN') return data;
+  const horizon =
+    today && isCivilDateValid(today) ? addMonthsClamp(today, 120) : '';
+  const plannedRanks = [...streamItems(data), ...backlogItems(data)]
+    .filter((entry) => entry.id !== id && entry.task?.status === 'PLANNED')
+    .map((entry) => entry.task?.sort_order ?? 0);
+  const appendRank = plannedRanks.reduce(
+    (rank, value) => Math.max(rank, value + 1),
+    0,
+  );
+  const warehoused = !!horizon && item.local_date >= horizon;
+  const moved: AgendaItemRecord = {
+    ...item,
+    local_date: warehoused ? item.local_date : sentinelDate,
+    task: { ...item.task, status: 'PLANNED', sort_order: appendRank },
+  };
+  const target = data.pages.reduce((best, page) =>
+    page.to > best.to ? page : best,
+  );
+  const stretches = backlogStretchesForRebuild(
+    (target.backlog ?? []).filter((entry) => entry.id !== id),
+    today,
+  );
+  const pages = data.pages.map((page) => {
+    const items = page.items.filter((entry) => entry.id !== id);
+    const backlog = (page.backlog ?? []).filter((entry) => entry.id !== id);
+    if (page !== target) {
+      return items.length !== page.items.length ||
+        backlog.length !== (page.backlog?.length ?? 0)
+        ? { ...page, items, backlog }
+        : page;
+    }
+    return {
+      ...page,
+      items,
+      backlog: [
+        ...stretches.dated,
+        ...stretches.planned,
+        moved,
+        ...stretches.open,
+      ],
+    };
+  });
+  return { ...data, pages };
+}
+
 /** The absolute rank `POST /api/agenda/items/:id/move { sort_order }` should
  *  carry for one up/down step. The server shifts every peer at/after the
  *  target rank up one and lands the item on it, so:
@@ -565,17 +748,18 @@ export function agendaMoveTargetAt(
     : items[toIndex].sort_order + 1;
 }
 
-/** The absolute Board rank `POST /api/tasks/:id/move { status: 'OPEN',
- *  sort_order }` should carry to land an OPEN-backlog row at `fromIndex` on
- *  the slot now held by `toIndex`. The rank is the task's own
- *  `tasks.sort_order` (ADR 0007 — Home and the Board share one Open order),
- *  never the agenda row's, and it is the HOVERED row's rank in BOTH
- *  directions: a same-status `/move` is `reorder_in_place`
- *  (packages/api-core/src/tasks.rs), which shifts the hovered row away from
- *  the slot and lands the mover on it — the `+ 1` of the agenda's
- *  "land after the row" rule would put the mover past the hovered card. `null`
- *  when either index is out of range, they are equal, or either row has no
- *  task embed. */
+/** The absolute Board rank `POST /api/tasks/:id/move { status, sort_order }`
+ *  should carry to land an OPEN **or PLANNED** warehouse row at `fromIndex` on
+ *  the slot now held by `toIndex` (the math is status-keyed: the caller passes
+ *  the stretch for the status it is reordering). The rank is the task's own
+ *  `tasks.sort_order` (ADR 0007 — Home and the Board share one Open order;
+ *  ADR 0009 — and one Planned order), never the agenda row's, and it is the
+ *  HOVERED row's rank in BOTH directions: a same-status `/move` is
+ *  `reorder_in_place` (packages/api-core/src/tasks.rs), which shifts the
+ *  hovered row away from the slot and lands the mover on it — the `+ 1` of the
+ *  agenda's "land after the row" rule would put the mover past the hovered
+ *  card. `null` when either index is out of range, they are equal, or either
+ *  row has no task embed. */
 export function openTaskMoveTargetAt(
   items: AgendaItemRecord[],
   fromIndex: number,
@@ -602,7 +786,9 @@ export function openTaskMoveTargetAt(
  *  OTHER task in the mover's status shifts away from the vacated slot —
  *  `[new, old)` up by one when the mover drops above (`new < old`), `(old,
  *  new]` down by one when it drops below (`new > old`). Tasks in any other
- *  status keep their ranks. `new === old` writes nothing, and a missing mover
+ *  status keep their ranks. The math is status-keyed, so it serves both
+ *  warehouses: `OPEN` (ADR 0007) and `PLANNED` (ADR 0009 — the same Planned
+ *  column the Board shows). `new === old` writes nothing, and a missing mover
  *  returns the input array unchanged. */
 export function applyOpenTaskReorder(
   tasks: TaskRecord[],
@@ -706,11 +892,15 @@ export function canReschedule(item: AgendaItemRecord): boolean {
   return false;
 }
 
-/** Backlog as a destination (ADR 0007): tasks only, living work only, and
- *  never the row that already sits on the backlog date. An `OPEN` task on a
- *  near date can still be dropped (the row moves; no status change), while a
- *  `PLANNED` / `IN_PROGRESS` row is the real transition. Occurrences have no
- *  backlog, and terminal cards are never invited back into it. */
+/** Backlog as a destination (ADR 0007, ADR 0009): tasks only, living work
+ *  only. An `OPEN` task already parked on the backlog sentinel is never
+ *  offered the drop again (it is already there), but a `PLANNED` row at/past
+ *  the horizon still is — that drop UNPLANS it (`{ backlog: true }` flips it
+ *  to `OPEN` and appends the Open column), so it is a real transition even
+ *  though the row barely moves. An `OPEN` task on a near date can still be
+ *  dropped (the row moves; no status change), while a `PLANNED` row is the
+ *  real transition. Occurrences have no backlog, and terminal cards are never
+ *  invited back into it. */
 export function canMoveToBacklog(
   item: AgendaItemRecord,
   today: string,
@@ -725,6 +915,22 @@ export function canMoveToBacklog(
     return false;
   }
   return !isOpenBacklogTask(item, today);
+}
+
+/** Unschedule as a destination (ADR 0009): a **dated** `PLANNED` task — its row
+ *  sits before the 10-year line, past dates included — can be parked in the
+ *  Planned warehouse without touching its status, its Board rank or the logs.
+ *  A row already at/after the horizon is the warehouse itself (the server
+ *  answers 200 as a no-op), and everything the API 400s stays hidden: an
+ *  `OPEN` row (use Backlog / plan instead), a running task, a terminal card,
+ *  an occurrence, an orphan. A malformed/absent `today` offers nothing. */
+export function canUnschedule(item: AgendaItemRecord, today: string): boolean {
+  if (!today || !isCivilDateValid(today)) return false;
+  if (item.kind !== 'task' || !item.task) return false;
+  return (
+    item.task.status === 'PLANNED' &&
+    item.local_date < addMonthsClamp(today, 120)
+  );
 }
 
 /** True when the row belongs under the Completed dump: a task embed in a

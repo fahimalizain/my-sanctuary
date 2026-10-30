@@ -3,6 +3,14 @@
 Status: Accepted
 Date: 2026-10-17
 
+> Superseded in part by ADR 0009 (2026-10-30): `OPEN → PLANNED` (including
+> create into Planned) parks the row on the backlog sentinel instead of civil
+> today, unless the row is already at/after the 10-year horizon. The backlog read is three stretches (dated,
+> Planned warehouse, Open warehouse). Reschedule gains
+> `{ "unschedule": true }`. A `PLANNED` row at/after the horizon is valid and
+> the self-heal does not pull it to today. See
+> `docs/adr/0009-planned-agenda-section.md`.
+
 ## Context
 
 Home (ADR 0006) puts every living task on exactly one agenda row, and that row
@@ -32,8 +40,8 @@ real day.
 
 **Keeps from ADR 0006 (still valid — 0006 owns these):**
 
-- One agenda row per living task; terminal tasks have none; soft-delete
-  hard-deletes the row.
+- One agenda row per living task, and a terminal task keeps its history row
+  (terminal → terminal leaves it); soft-delete hard-deletes the row.
 - `GET /api/agenda` is a pure read. The fill (`*/15` and routine create/edit)
   is what materializes occurrences. Occurrence horizon stays today … today+6.
 - Anchor: oldest **past** date that still holds a pending item, else today.
@@ -58,23 +66,23 @@ backlog date) moves nothing.
 today+50y, computed at write time (below), not a stored constant. "Appended"
 is `max(sort_order)+1` on the destination pile.
 
-| Event                                                                                      | Status →                                                                                            | Row date                                             |
-| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| create (`POST /api/tasks` always creates `OPEN`)                                           | `OPEN`                                                                                              | backlog date (today+50y), appended                   |
-| create into Planned (the web creates `OPEN`, then `POST /api/tasks/:id/move` to `PLANNED`) | `PLANNED`                                                                                           | today, appended — the `/move` is the real transition |
-| plan (`OPEN` → `PLANNED`, `/move`)                                                         | `PLANNED`                                                                                           | today, appended                                      |
-| unplan (`PLANNED` → `OPEN`, `/move`)                                                       | `OPEN`                                                                                              | backlog date, appended                               |
-| real start (`/start`, or `/move` → `IN_PROGRESS`)                                          | `IN_PROGRESS`                                                                                       | today, appended                                      |
-| pause (`IN_PROGRESS` → `PLANNED`)                                                          | `PLANNED`                                                                                           | unchanged                                            |
-| stop (`/stop`, and Board drag In Progress → Open, which is `/move`)                        | `OPEN`                                                                                              | backlog date, appended                               |
-| real complete / discard                                                                    | terminal                                                                                            | today, appended                                      |
-| reopen → `OPEN`                                                                            | `OPEN`                                                                                              | backlog date, appended                               |
-| reopen → `PLANNED`                                                                         | `PLANNED`                                                                                           | today, appended                                      |
-| reschedule a task onto a date in `[today, today+10y)`                                      | `OPEN` becomes `PLANNED` and writes a `planned` task log; `PLANNED` stays `PLANNED` with no new log | that date                                            |
-| drop into the backlog section                                                              | `OPEN`; a real `PLANNED` → `OPEN` writes an `unplanned` task log; already `OPEN` writes no log      | backlog date                                         |
-| reorder, title edit                                                                        | unchanged                                                                                           | unchanged                                            |
-| soft delete                                                                                | —                                                                                                   | row hard-deleted                                     |
-| terminal → terminal                                                                        | unchanged status class                                                                              | unchanged (history row stays)                        |
+| Event                                                                                      | Status →                                                                                            | Row date                                                               |
+| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| create (`POST /api/tasks` always creates `OPEN`)                                           | `OPEN`                                                                                              | backlog date (today+50y), appended                                     |
+| create into Planned (the web creates `OPEN`, then `POST /api/tasks/:id/move` to `PLANNED`) | `PLANNED`                                                                                           | backlog date, appended — the `/move` is the real transition (ADR 0009) |
+| plan (`OPEN` → `PLANNED`, `/move`)                                                         | `PLANNED`                                                                                           | backlog date, appended (ADR 0009)                                      |
+| unplan (`PLANNED` → `OPEN`, `/move`)                                                       | `OPEN`                                                                                              | backlog date, appended                                                 |
+| real start (`/start`, or `/move` → `IN_PROGRESS`)                                          | `IN_PROGRESS`                                                                                       | today, appended                                                        |
+| pause (`IN_PROGRESS` → `PLANNED`)                                                          | `PLANNED`                                                                                           | unchanged                                                              |
+| stop (`/stop`, and Board drag In Progress → Open, which is `/move`)                        | `OPEN`                                                                                              | backlog date, appended                                                 |
+| real complete / discard                                                                    | terminal                                                                                            | today, appended                                                        |
+| reopen → `OPEN`                                                                            | `OPEN`                                                                                              | backlog date, appended                                                 |
+| reopen → `PLANNED`                                                                         | `PLANNED`                                                                                           | today, appended                                                        |
+| reschedule a task onto a date in `[today, today+10y)`                                      | `OPEN` becomes `PLANNED` and writes a `planned` task log; `PLANNED` stays `PLANNED` with no new log | that date                                                              |
+| drop into the backlog section                                                              | `OPEN`; a real `PLANNED` → `OPEN` writes an `unplanned` task log; already `OPEN` writes no log      | backlog date                                                           |
+| reorder, title edit                                                                        | unchanged                                                                                           | unchanged                                                              |
+| soft delete                                                                                | —                                                                                                   | row hard-deleted                                                       |
+| terminal → terminal                                                                        | unchanged status class                                                                              | unchanged (history row stays)                                          |
 
 Placement stays **best-effort** after the status and log writes, same as 0006:
 a failure must not 500 a transition whose Google write already landed. The

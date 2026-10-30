@@ -114,27 +114,32 @@
 //! A same-status cross-card drag (including IN_PROGRESS → IN_PROGRESS with a
 //! rank) is a pure reorder — In Progress is a real pile, not a singleton.
 //!
-//! Agenda (ADR 0007): a task owns **one** agenda row, and its civil day
-//! follows the task's **status**. `OPEN` rows sit on the **backlog date** —
-//! civil today + 50 years via [`crate::agenda::backlog_local_date`] — out of
-//! the day stream; every other living row sits on a real day, and the
-//! lifecycle transitions that land there (a real start, plan, reopen →
-//! `PLANNED`, a real complete/discard) put it on **civil today** (the primary
-//! calendar's date via [`crate::agenda::user_today`], appended at the pile's
-//! `max + 1`; an existing row travels, the destination's ranks never
-//! reshuffle). Unplan, a real stop, and reopen → `OPEN` return the row to the
-//! backlog date. Soft delete removes the row. Pause, reorder, an
-//! already-IN_PROGRESS start, an already-OPEN stop, and title edits leave the
-//! row alone. Placement is **best-effort** and runs after the status/log
-//! writes: the `*/15` fill repairs a missing or misplaced row, while a 500 on
-//! an already-committed transition would make the client retry a write that
-//! landed (and can never repair a half-written Google log).
+//! Agenda (ADR 0007, amended by ADR 0009): a task owns **one** agenda row,
+//! and its civil day follows the task's **status**. `OPEN` rows sit on the
+//! **backlog date** — civil today + 50 years via
+//! [`crate::agenda::backlog_local_date`] — out of the day stream. Plan
+//! (`OPEN` → `PLANNED`) no longer invents civil today: a row below the
+//! 10-year horizon (or a missing one) is parked on the backlog date, appended
+//! ([`ensure_task_planned_unscheduled`]), while a row already at/after the
+//! horizon is left alone. Reopen → `PLANNED`, a real start, and a real
+//! complete/discard still land on **civil today** (the primary calendar's
+//! date via [`crate::agenda::user_today`], appended at the pile's `max + 1`;
+//! an existing row travels, the destination's ranks never reshuffle). Unplan,
+//! a real stop, and reopen → `OPEN` return the row to the backlog date. Soft
+//! delete removes the row. Pause, reorder, an already-IN_PROGRESS start, an
+//! already-OPEN stop, and title edits leave the row alone. Placement is
+//! **best-effort** and runs after the status/log writes: the `*/15` fill
+//! repairs a missing or misplaced row, while a 500 on an already-committed
+//! transition would make the client retry a write that landed (and can never
+//! repair a half-written Google log).
 
 use std::collections::HashMap;
 
 use thiserror::Error;
 
-use crate::agenda::{backlog_local_date, user_today, AgendaError, AGENDA_KIND_TASK};
+use crate::agenda::{
+    backlog_local_date, planning_horizon_date, user_today, AgendaError, AGENDA_KIND_TASK,
+};
 use crate::calendar::{create_event, patch_event, CalendarError};
 use crate::categories::{
     classify, classify_detailed, ensure_taxonomy, first_matching_index, first_matching_pattern,
@@ -845,10 +850,12 @@ fn placement_error(err: AgendaError) -> TasksError {
 /// never a UTC computation here and never the browser.
 ///
 /// Called on **real** lifecycle transitions that land a task on a real day:
-/// a start, a real complete/discard, plan (`OPEN` → `PLANNED`), and reopen →
-/// `PLANNED`. Idempotent, so a caller that cannot be sure the transition was
-/// real may still call it. The callers decide whether a failure propagates —
-/// the lifecycle write is already committed, so they usually swallow it.
+/// a start, a real complete/discard, and reopen → `PLANNED`. Idempotent, so a
+/// caller that cannot be sure the transition was real may still call it. The
+/// callers decide whether a failure propagates — the lifecycle write is
+/// already committed, so they usually swallow it. Plan (`OPEN` → `PLANNED`)
+/// is **not** one of them since ADR 0009: it parks the row on the backlog
+/// date ([`ensure_task_planned_unscheduled`]).
 pub(crate) async fn place_task_on_today(
     agenda_repo: &dyn AgendaItemRepo,
     calendars: &dyn CalendarRepo,
@@ -882,6 +889,44 @@ pub(crate) async fn place_task_on_backlog(
         .await
         .map_err(placement_error)?;
     let backlog = backlog_local_date(&today).map_err(placement_error)?;
+    place_task_on(agenda_repo, user_id, task_id, &backlog).await
+}
+
+/// Parks the task's single agenda row on the **backlog date** when a plan
+/// lands it off the calendar (ADR 0009), and leaves an already-warehoused row
+/// alone.
+///
+/// Plan (`OPEN` → `PLANNED`) is not a real-day transition any more: a task
+/// the user never dated must not invent civil today. A missing row — or one
+/// below the 10-year horizon, i.e. a day the stream can still render — moves
+/// to the backlog date, appended on arrival. A row already at/after the
+/// horizon is left **byte-for-byte** alone: no date change, no rank churn, no
+/// `updated_at` bump. Yesterday's backlog date and exactly `today+10y` are
+/// both valid parking spots.
+///
+/// Deliberately **not** [`place_task_on_backlog`]: that helper always
+/// retargets today's exact `+50y` sentinel and would churn a row that is
+/// already past the line.
+pub(crate) async fn ensure_task_planned_unscheduled(
+    agenda_repo: &dyn AgendaItemRepo,
+    calendars: &dyn CalendarRepo,
+    user_id: &str,
+    task_id: &str,
+    now_unix: i64,
+) -> Result<(), TasksError> {
+    let (today, _time_zone) = user_today(calendars, user_id, now_unix)
+        .await
+        .map_err(placement_error)?;
+    let horizon = planning_horizon_date(&today).map_err(placement_error)?;
+    let backlog = backlog_local_date(&today).map_err(placement_error)?;
+    if let Some(row) = agenda_repo
+        .get_by_ref(user_id, AGENDA_KIND_TASK, task_id)
+        .await?
+    {
+        if row.local_date.as_str() >= horizon.as_str() {
+            return Ok(());
+        }
+    }
     place_task_on(agenda_repo, user_id, task_id, &backlog).await
 }
 
@@ -2298,16 +2343,22 @@ async fn dispatch_matrix_action(
                 now_unix,
             )
             .await?;
-            // Plan is a real OPEN → PLANNED transition (ADR 0007): the task's
-            // one agenda row leaves the backlog and lands on civil today,
-            // appended. Best-effort — the status and the `planned` log are
-            // already committed.
-            if let Err(_) =
-                place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+            // Plan is a real OPEN → PLANNED transition (ADR 0009): the task
+            // does NOT land on civil today — the user never dated it. A row
+            // below the 10-year horizon (or a missing one) is parked on the
+            // backlog date, appended; a row already at/after the horizon is
+            // left alone (no date change, no rank churn). Best-effort — the
+            // status and the `planned` log are already committed.
+            if let Err(_) = ensure_task_planned_unscheduled(
+                agenda_repo, calendars, user_id, task_id, now_unix,
+            )
+            .await
             {
-                // The cron's task backfill repairs a MISSING OR MISPLACED row;
-                // a failed placement up to 15 minutes late is the accepted
-                // window.
+                // The cron's task backfill repairs a MISSING row (a rowless
+                // PLANNED task lands on the sentinel, never today), but it
+                // leaves every existing PLANNED row alone — a failed placement
+                // onto a dated row therefore stays there as a dated plan. The
+                // accepted window.
             }
             Ok(None)
         }
@@ -10496,7 +10547,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_moves_to_today_then_reorder_and_title_edits_leave_it_alone() {
+    fn plan_parks_the_row_on_the_backlog_date_then_reorder_and_title_edits_leave_it_alone() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
         let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
         let row = agenda.rows("u-1").pop().unwrap();
@@ -10507,8 +10558,9 @@ mod tests {
         let logs = FakeTaskLogRepo::default();
         let users = FakeUserRepo::default();
 
-        // OPEN → PLANNED (plan) is a real transition: the row leaves the
-        // backlog for civil today, appended (today's pile was empty → rank 0).
+        // OPEN → PLANNED (plan) is a real transition, but it does NOT invent
+        // civil today (ADR 0009): the row leaves the past date for the backlog
+        // sentinel, appended (that pile was empty → rank 0).
         let response = pollster::block_on(move_task(
             None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             None, "u-1", &task.id, AGENDA_NOW_UNIX,
@@ -10521,7 +10573,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_PLANNED);
-        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_TODAY, "plan moves the row");
+        assert_eq!(
+            agenda.rows("u-1")[0].local_date, AGENDA_BACKLOG,
+            "plan parks the row on the sentinel, never today and never the old past day"
+        );
         assert_eq!(agenda.rows("u-1")[0].sort_order, 0);
 
         // Same-status reorder (a PLANNED → PLANNED drop): never places.
@@ -10537,7 +10592,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(response.task.sort_order, 1);
-        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_TODAY);
+        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_BACKLOG);
         assert_eq!(agenda.rows("u-1")[0].sort_order, 0, "the agenda order is untouched");
 
         // A title edit (PATCH) never places either.
@@ -10553,11 +10608,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(agenda.rows("u-1").len(), 1);
-        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_TODAY);
+        assert_eq!(agenda.rows("u-1")[0].local_date, AGENDA_BACKLOG);
         assert_eq!(agenda.rows("u-1")[0].sort_order, 0);
 
-        // PLANNED → OPEN (unplan) is the real transition back: the row
-        // returns to the backlog date, appended.
+        // PLANNED → OPEN (unplan) is the real transition back: the row returns
+        // to the backlog date, appended. It is already there, so it is not
+        // reshuffled — the rank stays 0.
         let response = pollster::block_on(move_task(
             None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
             None, "u-1", &task.id, AGENDA_NOW_UNIX,
@@ -10575,7 +10631,129 @@ mod tests {
             AGENDA_BACKLOG,
             "unplan returns to the backlog"
         );
-        assert_eq!(agenda.rows("u-1")[0].sort_order, 0, "the backlog pile was empty");
+        assert_eq!(agenda.rows("u-1")[0].sort_order, 0, "already there: not reshuffled");
+    }
+
+    #[test]
+    fn plan_leaves_a_row_already_at_the_horizon_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        // Exactly ON the horizon is already warehouse territory, and it is
+        // deliberately NOT the sentinel: a mistaken `place_task_on_backlog`
+        // would retarget it to 2076-08-23.
+        agenda.move_row(&row.id, "2036-08-23", 4);
+        {
+            let mut stored = agenda.stored.lock().unwrap();
+            let stored_row = stored.iter_mut().find(|stored| stored.id == row.id).unwrap();
+            stored_row.updated_at = "2026-08-22T11:22:33Z".to_string();
+        }
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        let inserted = logs.inserted.lock().unwrap();
+        assert_eq!(inserted.len(), 1, "the plan is still logged");
+        assert_eq!(inserted[0].r#type, TASK_LOG_PLANNED);
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row.id, "the same row, never re-placed");
+        assert_eq!(rows[0].local_date, "2036-08-23", "not retargeted to the sentinel");
+        assert_eq!(rows[0].sort_order, 4, "no rank churn");
+        assert_eq!(rows[0].updated_at, "2026-08-22T11:22:33Z", "no write at all");
+    }
+
+    #[test]
+    fn plan_leaves_a_row_on_an_old_sentinel_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        // Yesterday's +50y sentinel is still warehouse territory: a mistaken
+        // retarget would move it to today's exact 2076-08-23 and churn its
+        // rank.
+        agenda.move_row(&row.id, "2076-08-22", 4);
+        {
+            let mut stored = agenda.stored.lock().unwrap();
+            let stored_row = stored.iter_mut().find(|stored| stored.id == row.id).unwrap();
+            stored_row.updated_at = "2026-08-22T11:22:33Z".to_string();
+        }
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        let response = pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(logs.inserted.lock().unwrap().len(), 1, "the plan is logged");
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, row.id, "the same row, never re-placed");
+        assert_eq!(rows[0].local_date, "2076-08-22", "not retargeted");
+        assert_eq!(rows[0].sort_order, 4, "no rank churn");
+        assert_eq!(rows[0].updated_at, "2026-08-22T11:22:33Z", "no write at all");
+    }
+
+    #[test]
+    fn plan_from_a_missing_row_places_one_on_the_backlog_date() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda
+            .stored
+            .lock()
+            .unwrap()
+            .retain(|stored| stored.id != row.id);
+        assert!(agenda.rows("u-1").is_empty(), "rowless fixture");
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1, "the best-effort placement still ran");
+        assert_eq!(rows[0].ref_id, task.id);
+        assert_eq!(rows[0].local_date, AGENDA_BACKLOG, "the sentinel, never today");
+        assert_eq!(rows[0].sort_order, 0, "appended on the empty backlog pile");
     }
 
     #[test]
