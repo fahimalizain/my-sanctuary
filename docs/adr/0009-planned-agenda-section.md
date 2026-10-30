@@ -13,7 +13,7 @@ Date: 2026-10-30
 
 ADR 0007 gave every living task exactly one agenda row and moved that row onto
 civil today whenever the task became `PLANNED`. A drag on Home, or on the
-Board's Planned column (`POST /api/tasks/:id/move`), therefore *invented* a
+Board's Planned column (`POST /api/tasks/:id/move`), therefore _invented_ a
 day the user never chose: a task dragged out of Backlog appeared in today's
 stream as if it had been scheduled.
 
@@ -28,14 +28,14 @@ SQL migration.
 
 ### Where a `PLANNED` row sits (delta vs ADR 0007)
 
-| Event | Status → | Row date |
-| --- | --- | --- |
-| plan (`OPEN` → `PLANNED`, `/move`) | `PLANNED` | backlog date (today+50y), appended — unless the row is already `>= today+10y`, in which case the row is left alone |
-| create into Planned (web: create `OPEN`, then `/move` to `PLANNED`) | `PLANNED` | backlog date — the plan arm; no longer today |
-| pause (`IN_PROGRESS` → `PLANNED`) | `PLANNED` | unchanged (ADR 0007) |
-| reopen → `PLANNED` | `PLANNED` | today, appended (ADR 0007, unchanged) |
-| reschedule a task onto a date in `[today, today+10y)` | `OPEN` → `PLANNED`; `PLANNED` stays (ADR 0007) | that date (ADR 0007, unchanged) |
-| `{ "unschedule": true }` on a `PLANNED` task | `PLANNED` | backlog date, appended — unless the row is already `>= today+10y` (200 no-op) |
+| Event                                                               | Status →                                       | Row date                                                                                                           |
+| ------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| plan (`OPEN` → `PLANNED`, `/move`)                                  | `PLANNED`                                      | backlog date (today+50y), appended — unless the row is already `>= today+10y`, in which case the row is left alone |
+| create into Planned (web: create `OPEN`, then `/move` to `PLANNED`) | `PLANNED`                                      | backlog date — the plan arm; no longer today                                                                       |
+| pause (`IN_PROGRESS` → `PLANNED`)                                   | `PLANNED`                                      | unchanged (ADR 0007)                                                                                               |
+| reopen → `PLANNED`                                                  | `PLANNED`                                      | today, appended (ADR 0007, unchanged)                                                                              |
+| reschedule a task onto a date in `[today, today+10y)`               | `OPEN` → `PLANNED`; `PLANNED` stays (ADR 0007) | that date (ADR 0007, unchanged)                                                                                    |
+| `{ "unschedule": true }` on a `PLANNED` task                        | `PLANNED`                                      | backlog date, appended — unless the row is already `>= today+10y` (200 no-op)                                      |
 
 Plan is still a **real** transition: the status flip and the `planned` task
 log always happen. Only the agenda row is allowed to be a no-op. `IN_PROGRESS

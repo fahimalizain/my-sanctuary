@@ -1100,9 +1100,7 @@ test('unscheduleItem: a row outside both warehouses survives the rebuild', () =>
   const dated = taskItemAt('p', 'PLANNED', '2026-08-25', 3);
   const stale = taskItemAt('r', 'IN_PROGRESS', HORIZON, 0);
   const data = {
-    pages: [
-      page('2026-08-23', '2026-08-29', [dated], { backlog: [stale] }),
-    ],
+    pages: [page('2026-08-23', '2026-08-29', [dated], { backlog: [stale] })],
     pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
   };
   const next = unscheduleItem(data, 'p', BACKLOG_DATE, TODAY);
@@ -1195,9 +1193,7 @@ test('planOpenItem: a row outside both warehouses survives the rebuild', () => {
   const dated = taskItemAt('o', 'OPEN', '2026-08-25', 2);
   const stale = taskItemAt('r', 'IN_PROGRESS', HORIZON, 0);
   const data = {
-    pages: [
-      page('2026-08-23', '2026-08-29', [dated], { backlog: [stale] }),
-    ],
+    pages: [page('2026-08-23', '2026-08-29', [dated], { backlog: [stale] })],
     pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
   };
   const next = planOpenItem(data, 'o', BACKLOG_DATE, TODAY);

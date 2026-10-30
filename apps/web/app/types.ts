@@ -72,9 +72,7 @@ export interface CalendarEvent {
 }
 
 export type CalendarSyncAggregateStatus =
-  | 'ready'
-  | 'degraded'
-  | 'authorization_required';
+  'ready' | 'degraded' | 'authorization_required';
 
 export type CalendarReplicaState =
   | 'never_initialized'
@@ -85,10 +83,7 @@ export type CalendarReplicaState =
   | 'disabled';
 
 export type CalendarWatchCoverage =
-  | 'missing'
-  | 'expiring'
-  | 'no_successor'
-  | 'covered';
+  'missing' | 'expiring' | 'no_successor' | 'covered';
 
 export interface CalendarSyncHealth {
   calendar_id: string;
@@ -377,11 +372,7 @@ export type ClassifyResponse =
 // "IN_PROGRESS", stop → "OPEN", pause → "PLANNED" (since ADR 0002),
 // complete/discard → their terminal states.
 export type TaskStatus =
-  | 'OPEN'
-  | 'PLANNED'
-  | 'IN_PROGRESS'
-  | 'COMPLETED'
-  | 'DISCARDED';
+  'OPEN' | 'PLANNED' | 'IN_PROGRESS' | 'COMPLETED' | 'DISCARDED';
 
 export interface TaskRecord {
   id: string;
@@ -708,26 +699,17 @@ export type RulePhase = 'active' | 'paused' | 'finished' | 'archived';
 
 // One strip cell of the 14-day history.
 export type StripState =
-  | 'pass'
-  | 'fail'
-  | 'pending'
-  | 'paused'
-  | 'excluded'
-  | 'off';
+  'pass' | 'fail' | 'pending' | 'paused' | 'excluded' | 'off';
 
 export type RuleComparator = 'gte' | 'lte';
 
 export type SleepMetric =
-  | 'bedtime_median'
-  | 'bedtime_stdev'
-  | 'wake_median'
-  | 'wake_stdev';
+  'bedtime_median' | 'bedtime_stdev' | 'wake_median' | 'wake_stdev';
 
 // The literal `"all_productive"`, or an explicit id list with optional
 // one-level children.
 export type CategorySelector =
-  | 'all_productive'
-  | { ids: string[]; include_children: boolean };
+  'all_productive' | { ids: string[]; include_children: boolean };
 
 export interface CategoryTotalParams {
   categories: CategorySelector;
