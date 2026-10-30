@@ -51,7 +51,7 @@ that fails honestly.
 
 - Success and JSON-RPC error responses are `Content-Type: application/json`.
   There is no SSE stream, no `Mcp-Session-Id`, and no session store.
-- A notification, or a client JSON-RPC *response*, gets HTTP 202 with an empty
+- A notification, or a client JSON-RPC _response_, gets HTTP 202 with an empty
   body. `notifications/initialized` is the one clients actually send;
   `notifications/cancelled` is a no-op 202; any other notification is also 202.
   With no session there is nothing to cancel and nothing to acknowledge.
@@ -176,8 +176,7 @@ is never reflected.
 
 `/api/mcp` has its own OPTIONS handler: `Allow-Headers` exactly
 `Authorization, Content-Type, Accept, Mcp-Protocol-Version`, `Allow-Methods`
-`POST, OPTIONS`, `Allow-Origin` set to `FRONTEND_URL`, credentials true, status
-204. The same `Allow-Origin` is put on the POST, 401, and 403 responses so a
+`POST, OPTIONS`, `Allow-Origin` set to `FRONTEND_URL`, credentials true, status 204. The same `Allow-Origin` is put on the POST, 401, and 403 responses so a
 preflighted browser call can read them.
 
 `auth::cors_headers` is not widened. It deliberately does not advertise
