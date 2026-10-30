@@ -20,9 +20,9 @@ cookie-only: a bearer key must never mint or revoke keys.
 Remote agents — Claude, MCP Inspector, curl scripts — need a tool surface rather
 than raw REST. This Worker is not an OAuth authorization server, so the only
 credential an agent can hold is an API key. This ADR records the accepted
-design. Nothing is implemented yet; later slices build the protocol core in
-`packages/api-core`, the endpoint in `apps/worker`, the read tools, and the
-write tools against this document.
+design, and that design is now implemented: the protocol lives in the `mcp`
+module of `packages/api-core`, the endpoint in `apps/worker`, and the v1 tools
+are served on `POST /api/mcp` (PR #128).
 
 ## Decision
 
@@ -112,10 +112,10 @@ Clients must not start an OAuth flow; the message tells a human what to do.
 
 Tools do not call `api_core` service functions directly. They issue in-process
 sub-requests to the same REST routes the web app uses. The
-`Router::with_data(config)…` chain in `apps/worker/src/lib.rs` (today lines
-78–199) is hoisted into a single router constructor that both the fetch entry
-point and the MCP endpoint use. A tool then builds a request by hand and runs
-that router.
+`Router::with_data(config)…` chain lives in `fn router` in
+`apps/worker/src/lib.rs`, and both the fetch entry point and the MCP
+sub-requests build their router through that constructor. A tool then builds a
+request by hand and runs that router.
 
 The request URL must be absolute because web_sys `Request` requires one; a
 dummy origin such as `https://sanctuary.internal` plus the path and query
@@ -213,22 +213,22 @@ happens to be HTML. No `WWW-Authenticate` is sent anywhere.
 Every tool sets all three annotation hints. "Read-only" here means **no
 user-facing mutation** — see the note after the table.
 
-| Tool                     | readOnlyHint | destructiveHint | idempotentHint | Route and purpose                                                    |
-| ------------------------ | ------------ | --------------- | -------------- | -------------------------------------------------------------------- |
-| `now`                    | true         | false           | true           | `GET /auth/me` + `GET /api/agenda`; today and time zone              |
-| `list_tasks`             | true         | false           | true           | `GET /api/tasks`; cap 100                                            |
-| `get_agenda`             | true         | false           | true           | `GET /api/agenda`; cap 80 items, 40 backlog rows                     |
-| `list_events`            | true         | false           | true           | `GET /api/calendar/events`; cap 100                                  |
-| `list_calendars`         | true         | false           | true           | `GET /api/calendar/calendars`; cap 50                                |
-| `reports_status`         | true         | false           | true           | `GET /api/reports/status`                                            |
-| `rules_scoreboard`       | true         | false           | true           | `GET /api/rules/scoreboard`                                          |
-| `classify_title`         | true         | false           | true           | `GET /api/tasks/classify`                                            |
-| `create_task`            | false        | false           | false          | `POST /api/tasks`                                                    |
-| `update_task`            | false        | false           | true           | `PATCH /api/tasks/:id`; no status field                              |
-| `move_task`              | false        | true            | true           | `POST /api/tasks/:id/move`; `status` only                            |
-| `move_agenda_item`       | false        | false           | true           | `POST /api/agenda/items/:id/move`; `sort_order`                      |
-| `reschedule_agenda_item` | false        | false           | true           | `POST /api/agenda/items/:id/reschedule`; date and/or `backlog: true` |
-| `create_event`           | false        | false           | false          | `POST /api/calendar/events`                                          |
+| Tool                     | readOnlyHint | destructiveHint | idempotentHint | Route and purpose                                                                                             |
+| ------------------------ | ------------ | --------------- | -------------- | ------------------------------------------------------------------------------------------------------------- |
+| `now`                    | true         | false           | true           | `GET /auth/me` + `GET /api/agenda`; today and time zone                                                       |
+| `list_tasks`             | true         | false           | true           | `GET /api/tasks`; cap 100                                                                                     |
+| `get_agenda`             | true         | false           | true           | `GET /api/agenda`; cap 80 items, 40 backlog rows                                                              |
+| `list_events`            | true         | false           | true           | `GET /api/calendar/events`; cap 100                                                                           |
+| `list_calendars`         | true         | false           | true           | `GET /api/calendar/calendars`; cap 50                                                                         |
+| `reports_status`         | true         | false           | true           | `GET /api/reports/status`                                                                                     |
+| `rules_scoreboard`       | true         | false           | true           | `GET /api/rules/scoreboard`                                                                                   |
+| `classify_title`         | true         | false           | true           | `GET /api/tasks/classify`                                                                                     |
+| `create_task`            | false        | false           | false          | `POST /api/tasks`                                                                                             |
+| `update_task`            | false        | false           | true           | `PATCH /api/tasks/:id`; no status field                                                                       |
+| `move_task`              | false        | true            | true           | `POST /api/tasks/:id/move`; `status` only                                                                     |
+| `move_agenda_item`       | false        | false           | true           | `POST /api/agenda/items/:id/move`; `sort_order`                                                               |
+| `reschedule_agenda_item` | false        | false           | true           | `POST /api/agenda/items/:id/reschedule`; `date` with optional `sort_order`, or `backlog: true` (rank ignored) |
+| `create_event`           | false        | false           | false          | `POST /api/calendar/events`                                                                                   |
 
 Per tool:
 
@@ -256,7 +256,8 @@ Per tool:
   `description`, `is_all_day`, `start_time_zone`, and `calendar_id`. When
   `calendar_id` is omitted it resolves the primary calendar's local id and
   sends `calendar_id_explicit: false`, so title classification can still
-  retarget and colour the event. When `calendar_id` is set it sends
+  retarget and colour the event. When `calendar_id` is set it is the local `id`
+  from `list_calendars`, not `google_calendar_id`, and the tool sends
   `calendar_id_explicit: true`. `task_id`, `routine_id`, `occurrence_id`,
   focus, and `color_hex` are not exposed.
 
@@ -266,10 +267,23 @@ Per tool:
 means "an agent may call this without asking the user to confirm", which is
 exactly the intended contract. Do not "fix" these hints to false later.
 
-**Result size.** A tool result whose compact JSON exceeds 64 KiB becomes
-`isError` with a short "result too large" message, rather than a truncated
-blob that is no longer valid JSON. The per-tool caps should make that
-unreachable.
+**Result size.** A tool result whose compact JSON exceeds 64 KiB is still
+`isError` with a short "result too large" message, never a truncated blob that
+is no longer valid JSON. That backstop stays, but the row caps do not make it
+unreachable: tasks 100, agenda items 80, backlog 40, events 100, calendars 50
+are row counts, not a byte cap, and long titles alone can cross 64 KiB. So each
+list tool also shrinks itself:
+
+- `list_tasks` drops tasks from the tail until the compact JSON fits, and sets
+  `truncated` / `omitted`.
+- `get_agenda` drops backlog rows first, then window items, and sets that
+  side's `truncated_*` / `omitted_*`.
+- `rules_scoreboard` has no row cap: it sheds `evidence`, then `strip`, then
+  whole rules from the end, and sets top-level `truncated: true`. The flag is
+  written before the fit check, so its own bytes count.
+
+A payload that already fits is not marked truncated by this budget — the list
+tools still report `truncated: false` when the row cap dropped nothing.
 
 **Validation boundaries.** An argument validation failure inside a known tool
 is `isError`, not `-32602`. `-32602` is reserved for protocol-level invalid
@@ -303,5 +317,5 @@ bad `initialize` params.
   existing REST routes, not a second implementation of them.
 - The endpoint is stateless, so it scales with the Worker and needs no Durable
   Object, KV, or D1 table of its own.
-- Later slices add: the protocol module and `ToolExecutor` trait, the endpoint
-  and its CORS/auth gates, the read tools, and the write tools.
+- The protocol, the endpoint, and the v1 tools are in place; what is still out
+  of scope is section 9.
