@@ -8,8 +8,9 @@
 //!
 //! Tool execution goes back through the REST router as an in-process
 //! sub-request (ADR 0009 §4), restricted to [`api_core::mcp::allow_subrequest`].
-//! The eight read tools are implemented here; the six write tools still answer
-//! "not implemented" until the next slice.
+//! All fourteen v1 tools are implemented here: eight reads and six writes.
+//! Argument mistakes and upstream failures — including a Google 401 — are
+//! failed tool results, never an MCP HTTP error.
 
 use api_core::mcp::{McpResponse, ToolExecution, ToolExecutor, SUPPORTED_PROTOCOL_VERSIONS};
 use worker::*;
@@ -116,7 +117,7 @@ struct RestExecutor {
 impl ToolExecutor for RestExecutor {
     async fn execute(&self, name: &str, arguments: &serde_json::Value) -> ToolExecution {
         // Every known tool reaches one method; a bad argument is a failed tool
-        // result, never a JSON-RPC error. The six write tools land in slice 5.
+        // result, never a JSON-RPC error.
         match name {
             "now" => self.now().await,
             "list_tasks" => self.list_tasks().await,
@@ -126,6 +127,12 @@ impl ToolExecutor for RestExecutor {
             "reports_status" => self.reports_status().await,
             "rules_scoreboard" => self.rules_scoreboard().await,
             "classify_title" => self.classify_title(arguments).await,
+            "create_task" => self.create_task(arguments).await,
+            "update_task" => self.update_task(arguments).await,
+            "move_task" => self.move_task(arguments).await,
+            "move_agenda_item" => self.move_agenda_item(arguments).await,
+            "reschedule_agenda_item" => self.reschedule_agenda_item(arguments).await,
+            "create_event" => self.create_event(arguments).await,
             _ => ToolExecution::Failed("not implemented".to_string()),
         }
     }
@@ -296,6 +303,164 @@ impl RestExecutor {
         }
     }
 
+    /// `create_task`: one `POST /api/tasks`. Every call creates a row, so the
+    /// tool is not idempotent and nothing here dedupes it.
+    async fn create_task(&self, arguments: &serde_json::Value) -> ToolExecution {
+        match api_core::mcp::build_create_task(arguments) {
+            Ok(body) => {
+                self.write(
+                    Method::Post,
+                    "/api/tasks".to_string(),
+                    &body,
+                    api_core::mcp::project_task_result,
+                )
+                .await
+            }
+            Err(message) => ToolExecution::Failed(message),
+        }
+    }
+
+    /// `update_task`: `PATCH /api/tasks/:id`. The body never carries a status;
+    /// that is `move_task`'s verb (ADR 0009 §8).
+    async fn update_task(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let (id, body) = match api_core::mcp::build_update_task(arguments) {
+            Ok(pair) => pair,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let path = match safe_path("/api/tasks/", &id, "") {
+            Ok(path) => path,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        self.write(
+            Method::Patch,
+            path,
+            &body,
+            api_core::mcp::project_task_result,
+        )
+        .await
+    }
+
+    /// `move_task`: `POST /api/tasks/:id/move` with `status` only, so the route
+    /// applies its own default rank.
+    async fn move_task(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let (id, body) = match api_core::mcp::build_move_task(arguments) {
+            Ok(pair) => pair,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let path = match safe_path("/api/tasks/", &id, "/move") {
+            Ok(path) => path,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        self.write(
+            Method::Post,
+            path,
+            &body,
+            api_core::mcp::project_move_result,
+        )
+        .await
+    }
+
+    /// `move_agenda_item`: `POST /api/agenda/items/:id/move` with the target
+    /// rank.
+    async fn move_agenda_item(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let (id, body) = match api_core::mcp::build_move_agenda_item(arguments) {
+            Ok(pair) => pair,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let path = match safe_path("/api/agenda/items/", &id, "/move") {
+            Ok(path) => path,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        self.write(
+            Method::Post,
+            path,
+            &body,
+            api_core::mcp::project_agenda_item_result,
+        )
+        .await
+    }
+
+    /// `reschedule_agenda_item`: `POST /api/agenda/items/:id/reschedule` with a
+    /// date or `backlog: true`, never both.
+    async fn reschedule_agenda_item(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let (id, body) = match api_core::mcp::build_reschedule_agenda_item(arguments) {
+            Ok(pair) => pair,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let path = match safe_path("/api/agenda/items/", &id, "/reschedule") {
+            Ok(path) => path,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        self.write(
+            Method::Post,
+            path,
+            &body,
+            api_core::mcp::project_agenda_item_result,
+        )
+        .await
+    }
+
+    /// `create_event`: resolve the primary calendar only when the caller did
+    /// not name one, then `POST /api/calendar/events`.
+    ///
+    /// A failed calendar list short-circuits: posting to an id the tool guessed
+    /// would be worse than the failure. The `calendar_id_explicit` flag is
+    /// `false` only for that resolved primary, so title classification can
+    /// still retarget the event (ADR 0009 §8).
+    async fn create_event(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let (calendar_id, explicit) = match api_core::mcp::create_event_calendar(arguments) {
+            Ok(Some(calendar_id)) => (calendar_id, true),
+            Ok(None) => {
+                let calendars = match self
+                    .rest(Method::Get, "/api/calendar/calendars", &[], None)
+                    .await
+                {
+                    ToolExecution::Ok(value) => value,
+                    failed => return failed,
+                };
+                match api_core::mcp::primary_calendar_id(&calendars) {
+                    Ok(calendar_id) => (calendar_id, false),
+                    Err(message) => return ToolExecution::Failed(message),
+                }
+            }
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let body = match api_core::mcp::create_event_body(arguments, &calendar_id, explicit) {
+            Ok(body) => body,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        self.write(
+            Method::Post,
+            "/api/calendar/events".to_string(),
+            &body,
+            api_core::mcp::project_created_event,
+        )
+        .await
+    }
+
+    /// One write sub-request: the JSON body, no query, then `project` over the
+    /// 2xx body.
+    ///
+    /// A [`ToolExecution::Failed`] from [`Self::rest`] is returned unchanged, so
+    /// a Google 401 keeps the exact re-auth message `tool_outcome_from_upstream`
+    /// produced and never becomes an MCP HTTP 401. The body is never logged.
+    async fn write(
+        &self,
+        method: Method,
+        path: String,
+        body: &serde_json::Value,
+        project: fn(&serde_json::Value) -> Result<serde_json::Value, String>,
+    ) -> ToolExecution {
+        let bytes = match serde_json::to_vec(body) {
+            Ok(bytes) => bytes,
+            Err(_) => return ToolExecution::Failed("invalid body".to_string()),
+        };
+        match self.rest(method, &path, &[], Some(&bytes)).await {
+            ToolExecution::Ok(value) => projected(project(&value)),
+            failed => failed,
+        }
+    }
+
     /// Issues one in-process sub-request through the REST router (ADR 0009 §4)
     /// and returns its status and body text.
     pub(crate) async fn call_rest(
@@ -388,6 +553,19 @@ fn projected(result: Result<serde_json::Value, String>) -> ToolExecution {
         Ok(value) => ToolExecution::Ok(value),
         Err(message) => ToolExecution::Failed(message),
     }
+}
+
+/// Builds `{prefix}{id}{suffix}`, refusing an id that is not a safe path
+/// segment.
+///
+/// The argument builder already checked the id; this re-check is deliberate.
+/// Nothing interpolated into a sub-request URL is trusted twice (ADR 0009 §4),
+/// and `invalid id` is the message an agent can act on.
+fn safe_path(prefix: &str, id: &str, suffix: &str) -> Result<String, String> {
+    if !api_core::mcp::is_safe_id(id) {
+        return Err("invalid id".to_string());
+    }
+    Ok(format!("{prefix}{id}{suffix}"))
 }
 
 /// One request header, treating a `Headers::get` failure as absent.

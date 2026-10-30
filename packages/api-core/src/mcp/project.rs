@@ -57,7 +57,7 @@ fn date_argument(value: &Value, name: &str) -> Result<String, String> {
 }
 
 /// `YYYY-MM-DD`, bytes only — no calendar validation.
-fn is_date_shape(value: &str) -> bool {
+pub(crate) fn is_date_shape(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 10
         && bytes[4] == b'-'
@@ -240,7 +240,7 @@ fn mark_truncated(
 
 /// One slim task, or `None` when the row is not an object (a malformed row is
 /// skipped, never a reason to fail the whole list).
-fn slim_task(value: &Value) -> Option<Value> {
+pub(crate) fn slim_task(value: &Value) -> Option<Value> {
     let task = value.as_object()?;
     Some(json!({
         "id": text(task, "id"),
@@ -257,7 +257,7 @@ fn slim_task(value: &Value) -> Option<Value> {
 }
 
 /// One slim agenda row, or `None` when the row is not an object.
-fn slim_agenda_item(value: &Value) -> Option<Value> {
+pub(crate) fn slim_agenda_item(value: &Value) -> Option<Value> {
     let item = value.as_object()?;
     Some(json!({
         "id": text(item, "id"),
@@ -293,7 +293,7 @@ fn slim_occurrence(value: &Value) -> Option<Value> {
 ///
 /// The REST event is flat — every `CalendarEvent` field plus the painted
 /// `color` on the same object — not nested under an `event` key.
-fn slim_event(value: &Value) -> Option<Value> {
+pub(crate) fn slim_event(value: &Value) -> Option<Value> {
     let event = value.as_object()?;
     Some(json!({
         "id": text(event, "id"),

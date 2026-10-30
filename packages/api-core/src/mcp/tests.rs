@@ -1594,3 +1594,549 @@ fn every_projector_rejects_a_missing_or_non_array_list() {
         Err("unexpected calendars response".to_string())
     );
 }
+
+// ──────────────────────────────────────────
+// Write tools: argument builders
+// ──────────────────────────────────────────
+
+/// A minimal valid `create_event` argument object.
+fn event_arguments() -> Value {
+    json!({
+        "summary": "Focus block",
+        "start": "2026-02-01T09:00:00Z",
+        "end": "2026-02-01T09:30:00Z",
+    })
+}
+
+#[test]
+fn build_create_task_keeps_only_the_fields_that_were_set() {
+    let body = build_create_task(&json!({ "title": "Ship it" })).expect("built");
+    assert_eq!(keys(&body), vec!["title"]);
+    assert_eq!(body["title"], json!("Ship it"));
+
+    // An empty string is a value; a null is an omission.
+    let body = build_create_task(&json!({
+        "title": "Ship it",
+        "description": "",
+        "duration_minutes": 30,
+        "priority": "high",
+        "difficulty": null,
+    }))
+    .expect("built");
+    assert_eq!(
+        keys(&body),
+        vec!["description", "duration_minutes", "priority", "title"]
+    );
+    assert_eq!(body["description"], json!(""));
+    assert_eq!(body["duration_minutes"], json!(30));
+    assert_eq!(body["priority"], json!("high"));
+
+    // A negative duration is the route's domain 400, not the builder's.
+    let body = build_create_task(&json!({ "title": "x", "duration_minutes": -5 })).expect("built");
+    assert_eq!(body["duration_minutes"], json!(-5));
+}
+
+#[test]
+fn build_create_task_requires_a_non_empty_title() {
+    for arguments in [
+        json!({}),
+        json!({ "title": "" }),
+        json!({ "title": 3 }),
+        json!({ "title": null }),
+    ] {
+        assert_eq!(
+            build_create_task(&arguments),
+            Err("title is required".to_string()),
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
+fn build_create_task_sends_status_to_move_task() {
+    assert_eq!(
+        build_create_task(&json!({ "title": "x", "status": "PLANNED" })),
+        Err("status changes go through move_task".to_string())
+    );
+    // Presence is the trigger, even with a null value: status is not a field of
+    // this tool at all.
+    assert_eq!(
+        build_create_task(&json!({ "title": "x", "status": null })),
+        Err("status changes go through move_task".to_string())
+    );
+}
+
+#[test]
+fn build_create_task_rejects_non_integer_and_unknown_fields() {
+    assert_eq!(
+        build_create_task(&json!({ "title": "x", "duration_minutes": 1.5 })),
+        Err("duration_minutes must be an integer".to_string())
+    );
+    assert_eq!(
+        build_create_task(&json!({ "title": "x", "nope": 1 })),
+        Err("unknown field: nope".to_string())
+    );
+    for field in ["description", "priority", "difficulty"] {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("title".to_string(), json!("x"));
+        arguments.insert(field.to_string(), json!(1));
+        assert_eq!(
+            build_create_task(&Value::Object(arguments)),
+            Err(format!("{field} must be a string")),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn build_update_task_requires_an_id_and_a_change() {
+    assert_eq!(
+        build_update_task(&json!({ "id": "t1" })),
+        Err("nothing to update".to_string())
+    );
+    for arguments in [json!({ "title": "x" }), json!({ "id": 7, "title": "x" })] {
+        assert_eq!(
+            build_update_task(&arguments),
+            Err("id is required".to_string()),
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
+fn build_update_task_rejects_an_unsafe_id() {
+    for id in ["../x", "/api/keys", "", "a b"] {
+        assert_eq!(
+            build_update_task(&json!({ "id": id, "title": "x" })),
+            Err("invalid id".to_string()),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        build_move_task(&json!({ "id": "../x", "status": "PLANNED" })),
+        Err("invalid id".to_string())
+    );
+}
+
+#[test]
+fn build_update_task_sends_no_id_and_no_status() {
+    let (id, body) =
+        build_update_task(&json!({ "id": "t1", "title": "New", "duration_minutes": 20 }))
+            .expect("built");
+    assert_eq!(id, "t1");
+    assert_eq!(keys(&body), vec!["duration_minutes", "title"]);
+    assert!(body.get("id").is_none());
+    assert_eq!(
+        build_update_task(&json!({ "id": "t1", "status": "COMPLETED" })),
+        Err("status changes go through move_task".to_string())
+    );
+}
+
+#[test]
+fn build_move_task_sends_status_only() {
+    let (id, body) = build_move_task(&json!({ "id": "t1", "status": "PLANNED" })).expect("built");
+    assert_eq!(id, "t1");
+    assert_eq!(body, json!({ "status": "PLANNED" }));
+    assert_eq!(keys(&body), vec!["status"]);
+}
+
+#[test]
+fn build_move_task_rejects_sort_order_before_the_unknown_scan() {
+    assert_eq!(
+        build_move_task(&json!({ "id": "t1", "status": "PLANNED", "sort_order": 3 })),
+        Err("move_task does not take sort_order".to_string())
+    );
+    assert_eq!(
+        build_move_task(&json!({ "id": "t1", "status": "PLANNED", "nope": 1 })),
+        Err("unknown field: nope".to_string())
+    );
+}
+
+#[test]
+fn build_move_task_accepts_exactly_the_five_statuses() {
+    for status in ["OPEN", "PLANNED", "IN_PROGRESS", "COMPLETED", "DISCARDED"] {
+        let (_, body) = build_move_task(&json!({ "id": "t1", "status": status })).expect("built");
+        assert_eq!(body, json!({ "status": status }));
+    }
+    for status in ["open", "DONE", "", "PLANNED "] {
+        assert_eq!(
+            build_move_task(&json!({ "id": "t1", "status": status })),
+            Err("status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string()),
+            "{status}"
+        );
+    }
+    assert_eq!(
+        build_move_task(&json!({ "id": "t1" })),
+        Err("status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string())
+    );
+    assert_eq!(
+        build_move_task(&json!({ "id": "t1", "status": null })),
+        Err("status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string())
+    );
+}
+
+#[test]
+fn build_move_agenda_item_requires_a_non_negative_rank() {
+    assert_eq!(
+        build_move_agenda_item(&json!({ "id": "i1", "sort_order": 2 })),
+        Ok(("i1".to_string(), json!({ "sort_order": 2 })))
+    );
+    assert_eq!(
+        build_move_agenda_item(&json!({ "id": "i1", "sort_order": -1 })),
+        Err("sort_order must be >= 0".to_string())
+    );
+    // Missing, null, and non-integer are one message: there is no append
+    // default on this route.
+    for arguments in [
+        json!({ "id": "i1" }),
+        json!({ "id": "i1", "sort_order": null }),
+        json!({ "id": "i1", "sort_order": "2" }),
+    ] {
+        assert_eq!(
+            build_move_agenda_item(&arguments),
+            Err("sort_order is required".to_string()),
+            "{arguments}"
+        );
+    }
+    assert_eq!(
+        build_move_agenda_item(&json!({ "id": "i1", "sort_order": 2, "date": "2026-02-01" })),
+        Err("unknown field: date".to_string())
+    );
+}
+
+#[test]
+fn build_reschedule_agenda_item_backlog_drops_the_date_and_rank() {
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "backlog": true, "sort_order": 4 })),
+        Ok(("i1".to_string(), json!({ "backlog": true })))
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "backlog": true, "date": "2026-02-01" })),
+        Err("date is omitted when backlog is true".to_string())
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(
+            &json!({ "id": "i1", "backlog": "yes", "date": "2026-02-01" })
+        ),
+        Err("backlog must be a boolean".to_string())
+    );
+}
+
+#[test]
+fn build_reschedule_agenda_item_dated_body_has_no_backlog() {
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "date": "2026-02-01" })),
+        Ok(("i1".to_string(), json!({ "date": "2026-02-01" })))
+    );
+    let (_, body) =
+        build_reschedule_agenda_item(&json!({ "id": "i1", "date": "2026-02-01", "sort_order": 1 }))
+            .expect("built");
+    assert_eq!(keys(&body), vec!["date", "sort_order"]);
+    assert!(body.get("backlog").is_none());
+
+    // `backlog: false` behaves exactly like an absent flag.
+    let (_, body) = build_reschedule_agenda_item(
+        &json!({ "id": "i1", "date": "2026-02-01", "backlog": false }),
+    )
+    .expect("built");
+    assert_eq!(keys(&body), vec!["date"]);
+}
+
+#[test]
+fn build_reschedule_agenda_item_requires_a_date_or_backlog() {
+    for arguments in [json!({ "id": "i1" }), json!({ "id": "i1", "date": null })] {
+        assert_eq!(
+            build_reschedule_agenda_item(&arguments),
+            Err("date is required, or set backlog true".to_string()),
+            "{arguments}"
+        );
+    }
+    // Only the shape is checked: a month that does not exist is the route's 400.
+    let (_, body) =
+        build_reschedule_agenda_item(&json!({ "id": "i1", "date": "2026-13-01" })).expect("built");
+    assert_eq!(body["date"], json!("2026-13-01"));
+
+    for arguments in [
+        json!({ "id": "i1", "date": "2026-2-01" }),
+        json!({ "id": "i1", "date": 20260201 }),
+        json!({ "id": "i1", "date": "2026-02-01T00:00:00Z" }),
+    ] {
+        assert_eq!(
+            build_reschedule_agenda_item(&arguments),
+            Err("date must be YYYY-MM-DD".to_string()),
+            "{arguments}"
+        );
+    }
+    assert_eq!(
+        build_reschedule_agenda_item(
+            &json!({ "id": "i1", "date": "2026-02-01", "sort_order": -1 })
+        ),
+        Err("sort_order must be >= 0".to_string())
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(
+            &json!({ "id": "i1", "date": "2026-02-01", "sort_order": 1.5 })
+        ),
+        Err("sort_order must be an integer".to_string())
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "date": "2026-02-01", "nope": 1 })),
+        Err("unknown field: nope".to_string())
+    );
+}
+
+#[test]
+fn create_event_rejects_task_routine_and_colour_fields() {
+    for key in [
+        "task_id",
+        "routine_id",
+        "occurrence_id",
+        "color_hex",
+        "sanctuary_focus",
+        "priority",
+        "difficulty",
+    ] {
+        let mut arguments = event_arguments();
+        arguments[key] = json!("x");
+        assert_eq!(
+            create_event_calendar(&arguments),
+            Err(
+                "create_event does not accept task, routine, occurrence, or color fields"
+                    .to_string()
+            ),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn create_event_calendar_reports_whether_a_calendar_was_named() {
+    let mut arguments = event_arguments();
+    assert_eq!(create_event_calendar(&arguments), Ok(None));
+    arguments["calendar_id"] = json!(null);
+    assert_eq!(create_event_calendar(&arguments), Ok(None));
+    arguments["calendar_id"] = json!("cal1");
+    assert_eq!(
+        create_event_calendar(&arguments),
+        Ok(Some("cal1".to_string()))
+    );
+    for bad in [json!("../x"), json!(""), json!(7)] {
+        arguments["calendar_id"] = bad.clone();
+        assert_eq!(
+            create_event_calendar(&arguments),
+            Err("invalid calendar_id".to_string()),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn create_event_requires_summary_start_and_end() {
+    for key in ["summary", "start", "end"] {
+        let mut missing = event_arguments();
+        missing[key] = Value::Null;
+        assert_eq!(
+            create_event_calendar(&missing),
+            Err("summary, start, and end are required".to_string()),
+            "{key}"
+        );
+        let mut blank = event_arguments();
+        blank[key] = json!("");
+        assert_eq!(
+            create_event_calendar(&blank),
+            Err("summary, start, and end are required".to_string()),
+            "{key}"
+        );
+    }
+
+    let mut arguments = event_arguments();
+    arguments["nope"] = json!(1);
+    assert_eq!(
+        create_event_calendar(&arguments),
+        Err("unknown field: nope".to_string())
+    );
+
+    let mut arguments = event_arguments();
+    arguments["is_all_day"] = json!("yes");
+    assert_eq!(
+        create_event_calendar(&arguments),
+        Err("is_all_day must be a boolean".to_string())
+    );
+    for field in ["description", "start_time_zone"] {
+        let mut arguments = event_arguments();
+        arguments[field] = json!(4);
+        assert_eq!(
+            create_event_calendar(&arguments),
+            Err(format!("{field} must be a string")),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn create_event_body_flags_an_explicit_calendar() {
+    let arguments = event_arguments();
+    let body = create_event_body(&arguments, "primary-1", false).expect("built");
+    assert_eq!(body["calendar_id"], json!("primary-1"));
+    assert_eq!(body["calendar_id_explicit"], json!(false));
+    assert_eq!(
+        keys(&body),
+        vec![
+            "calendar_id",
+            "calendar_id_explicit",
+            "end",
+            "start",
+            "summary"
+        ]
+    );
+
+    let mut explicit = event_arguments();
+    explicit["calendar_id"] = json!("cal1");
+    let calendar_id = create_event_calendar(&explicit)
+        .expect("valid")
+        .expect("named calendar");
+    let body = create_event_body(&explicit, &calendar_id, true).expect("built");
+    assert_eq!(body["calendar_id"], json!("cal1"));
+    assert_eq!(body["calendar_id_explicit"], json!(true));
+    // The arguments' `calendar_id` key is not copied through as-is.
+    assert_eq!(keys(&body).len(), 5);
+
+    let mut optional = event_arguments();
+    optional["description"] = json!("notes");
+    optional["is_all_day"] = json!(true);
+    optional["start_time_zone"] = json!("Asia/Kolkata");
+    let body = create_event_body(&optional, "cal1", true).expect("built");
+    assert_eq!(body["description"], json!("notes"));
+    assert_eq!(body["is_all_day"], json!(true));
+    assert_eq!(body["start_time_zone"], json!("Asia/Kolkata"));
+    assert!(body.get("task_id").is_none());
+}
+
+#[test]
+fn primary_calendar_id_picks_the_flagged_row() {
+    let body = json!({
+        "calendars": [
+            { "id": "cal-1", "is_primary": false },
+            { "id": "cal-2", "is_primary": true },
+            { "id": "cal-3", "is_primary": true },
+        ]
+    });
+    assert_eq!(primary_calendar_id(&body), Ok("cal-2".to_string()));
+
+    // An unsafe primary id is skipped, never interpolated.
+    let body = json!({
+        "calendars": [
+            { "id": "../x", "is_primary": true },
+            { "id": "cal-2", "is_primary": true },
+        ]
+    });
+    assert_eq!(primary_calendar_id(&body), Ok("cal-2".to_string()));
+
+    for body in [
+        json!({ "calendars": [{ "id": "cal-1", "is_primary": false }] }),
+        json!({ "calendars": [{ "id": "../x", "is_primary": true }] }),
+        json!({ "calendars": [] }),
+        json!({}),
+        json!({ "calendars": "nope" }),
+    ] {
+        assert_eq!(
+            primary_calendar_id(&body),
+            Err("no primary calendar".to_string()),
+            "{body}"
+        );
+    }
+}
+
+// ──────────────────────────────────────────
+// Write tools: response projectors
+// ──────────────────────────────────────────
+
+#[test]
+fn project_task_result_keeps_only_the_slim_row() {
+    let projected = project_task_result(&json!({ "task": rest_task("t1") })).expect("projected");
+    assert_eq!(keys(&projected), vec!["task"]);
+    assert_eq!(projected["task"]["id"], json!("t1"));
+    assert!(projected["task"].get("description").is_none());
+    assert!(projected["task"].get("user_id").is_none());
+
+    assert_eq!(
+        project_task_result(&json!({ "task": null })),
+        Err("unexpected task response".to_string())
+    );
+    assert_eq!(
+        project_task_result(&json!({})),
+        Err("unexpected task response".to_string())
+    );
+}
+
+#[test]
+fn project_move_result_copies_a_null_event_as_null() {
+    let projected =
+        project_move_result(&json!({ "task": rest_task("t1"), "event": null })).expect("projected");
+    assert_eq!(projected["event"], Value::Null);
+    assert_eq!(projected["task"]["id"], json!("t1"));
+
+    // An absent event is the same null.
+    let absent = project_move_result(&json!({ "task": rest_task("t1") })).expect("projected");
+    assert_eq!(absent["event"], Value::Null);
+
+    // A real event keeps the slim shape; a missing `color` is "", not a failure.
+    let mut event = rest_event(0);
+    event.as_object_mut().expect("object").remove("color");
+    let projected = project_move_result(&json!({ "task": rest_task("t1"), "event": event }))
+        .expect("projected");
+    assert_eq!(projected["event"]["id"], json!("e0"));
+    assert_eq!(projected["event"]["color"], json!(""));
+
+    assert_eq!(
+        project_move_result(&json!({ "event": rest_event(0) })),
+        Err("unexpected task response".to_string())
+    );
+}
+
+#[test]
+fn project_agenda_item_result_keeps_the_slim_item() {
+    let projected =
+        project_agenda_item_result(&json!({ "item": task_agenda_item(1) })).expect("projected");
+    assert_eq!(keys(&projected), vec!["item"]);
+    assert_eq!(projected["item"]["id"], json!("i1"));
+    assert_eq!(projected["item"]["task"]["id"], json!("t1"));
+    assert!(projected["item"].get("user_id").is_none());
+
+    assert_eq!(
+        project_agenda_item_result(&json!({ "item": "nope" })),
+        Err("unexpected agenda response".to_string())
+    );
+    assert_eq!(
+        project_agenda_item_result(&json!({})),
+        Err("unexpected agenda response".to_string())
+    );
+}
+
+#[test]
+fn project_created_event_drops_sync_and_raw_json() {
+    let mut event = rest_event(0);
+    event["sync"] = json!({ "state": "healthy" });
+    event["raw_json"] = json!({ "google": "payload" });
+
+    let projected =
+        project_created_event(&json!({ "event": event, "source": "google" })).expect("projected");
+    assert_eq!(keys(&projected), vec!["event", "source"]);
+    assert_eq!(projected["source"], json!("google"));
+    assert_eq!(projected["event"]["id"], json!("e0"));
+    assert!(projected["event"].get("sync").is_none());
+    assert!(projected["event"].get("raw_json").is_none());
+    assert!(projected["event"].get("google_event_id").is_none());
+
+    let projected = project_created_event(&json!({ "event": rest_event(0) })).expect("projected");
+    assert_eq!(projected["source"], json!(""));
+
+    assert_eq!(
+        project_created_event(&json!({ "event": null })),
+        Err("unexpected event response".to_string())
+    );
+    assert_eq!(
+        project_created_event(&json!({})),
+        Err("unexpected event response".to_string())
+    );
+}
