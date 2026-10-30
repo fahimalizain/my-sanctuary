@@ -1,5 +1,6 @@
 mod auth;
 mod agenda;
+mod api_keys;
 mod calendar;
 mod categories;
 mod cron;
@@ -146,6 +147,13 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .get_async("/api/reports/record", reports::record)
         .options("/api/reports/status", auth::options)
         .options("/api/reports/record", auth::options)
+        // Cookie-session only: a bearer-only request is 401 by design, so a
+        // leaked key can never mint or revoke keys.
+        .get_async("/api/keys", api_keys::list_keys)
+        .post_async("/api/keys", api_keys::create_key)
+        .delete_async("/api/keys/:id", api_keys::revoke_key)
+        .options("/api/keys", auth::options)
+        .options("/api/keys/:id", auth::options)
         .get_async("/api/rules/scoreboard", rules::scoreboard)
         .get_async("/api/rules/archive", rules::archive)
         .post_async("/api/rules", rules::create_rule)

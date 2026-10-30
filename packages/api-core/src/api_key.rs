@@ -72,6 +72,12 @@ pub enum ApiKeyError {
     /// 400 — `expires_on` is before the user's today.
     #[error("expiry is in the past")]
     PastExpiry,
+    /// 404 — no living key with that id belongs to the user.
+    ///
+    /// Unknown ids, other users' keys, and already-revoked keys all collapse
+    /// here so ownership is never leaked as a different status.
+    #[error("api key not found")]
+    NotFound,
     /// 409 — the user already holds [`MAX_ACTIVE_API_KEYS`] living keys.
     #[error("too many active API keys")]
     TooManyKeys,
@@ -435,6 +441,98 @@ pub struct CreateApiKeyInput {
 }
 
 // ──────────────────────────────────────────
+// Services
+// ──────────────────────────────────────────
+
+/// `POST /api/keys` → the new key's view plus its one-time secret.
+///
+/// Order matters: validation first, then the [`MAX_ACTIVE_API_KEYS`] guard,
+/// and only then entropy and the insert — a rejected request never burns
+/// randomness or writes a row. `id`, `now_unix`, `today`, and `zone` are all
+/// supplied by the caller (the Worker stamps `worker::Date::now()`; `today`
+/// and `zone` are [`crate::rules::today`]'s output), so this stays clock-free
+/// and unit-testable without D1.
+///
+/// `secret` is present exactly once, here: only [`NewApiKey::key_hash`] and
+/// the display prefix are persisted.
+pub async fn create_api_key(
+    repo: &dyn ApiKeyRepo,
+    user_id: &str,
+    input: CreateApiKeyInput,
+    id: &str,
+    now_unix: i64,
+    today: &str,
+    zone: &str,
+) -> Result<CreateApiKeyResponse, ApiKeyError> {
+    let name = validate_api_key_name(&input.name)?;
+    let (expires_on, expires_at) = match input.expires_on.as_deref() {
+        Some(raw) => {
+            validate_expires_on(raw, today)?;
+            (
+                Some(raw.to_string()),
+                Some(expiry_instant_rfc3339(raw, zone)?),
+            )
+        }
+        None => (None, None),
+    };
+    if repo.count_active(user_id).await? >= MAX_ACTIVE_API_KEYS {
+        return Err(ApiKeyError::TooManyKeys);
+    }
+
+    let generated = generate_api_key()?;
+    let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
+    let row = repo
+        .insert(NewApiKey {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            name,
+            key_hash: generated.hash,
+            key_prefix: generated.key_prefix,
+            expires_on,
+            expires_at,
+            created_at: now_rfc3339.clone(),
+            updated_at: now_rfc3339,
+        })
+        .await?;
+    Ok(CreateApiKeyResponse {
+        key: ApiKeyView::from(row),
+        secret: generated.secret,
+    })
+}
+
+/// `GET /api/keys` → every living key of `user_id`, newest first.
+///
+/// Rows are projected through [`ApiKeyView`], so `key_hash` and `user_id`
+/// never reach the client. Expired-but-unrevoked keys are listed too: the
+/// user needs to see (and delete) them.
+pub async fn list_api_keys(
+    repo: &dyn ApiKeyRepo,
+    user_id: &str,
+) -> Result<ApiKeysResponse, ApiKeyError> {
+    let rows = repo.list_by_user_id(user_id).await?;
+    Ok(ApiKeysResponse {
+        keys: rows.iter().map(ApiKeyView::from).collect(),
+    })
+}
+
+/// `DELETE /api/keys/:id` → `{"success":true}`.
+///
+/// Soft delete scoped to the owner. A second revoke changes no row and is
+/// [`ApiKeyError::NotFound`], as is an unknown id or another user's key.
+pub async fn revoke_api_key(
+    repo: &dyn ApiKeyRepo,
+    user_id: &str,
+    id: &str,
+    now_rfc3339: &str,
+) -> Result<DeleteApiKeyResponse, ApiKeyError> {
+    if repo.soft_delete(id, user_id, now_rfc3339).await? {
+        Ok(DeleteApiKeyResponse { success: true })
+    } else {
+        Err(ApiKeyError::NotFound)
+    }
+}
+
+// ──────────────────────────────────────────
 // SQL
 // ──────────────────────────────────────────
 
@@ -540,6 +638,8 @@ pub trait ApiKeyRepo: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     fn sample_key() -> ApiKey {
@@ -1018,5 +1118,478 @@ mod tests {
         assert!(API_KEY_MARK_USED_SQL.contains("deleted_at IS NULL"));
         assert!(API_KEY_MARK_USED_SQL.contains("last_used_at IS NULL OR last_used_at <= ?"));
         assert_eq!(API_KEY_MARK_USED_SQL.matches('?').count(), 3);
+    }
+
+    // ── services: fake repo ─────────────────────────────────────────────
+
+    /// In-memory [`ApiKeyRepo`]: the service tests need real row bookkeeping
+    /// (count, insert, soft delete) without D1.
+    struct FakeApiKeyRepo {
+        rows: Mutex<Vec<ApiKey>>,
+        inserted: Mutex<Vec<NewApiKey>>,
+    }
+
+    impl FakeApiKeyRepo {
+        fn new() -> Self {
+            Self {
+                rows: Mutex::new(Vec::new()),
+                inserted: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Seeds `count` living keys for `user_id`, oldest first.
+        fn with_keys(user_id: &str, count: usize) -> Self {
+            let repo = Self::new();
+            for index in 1..=count {
+                repo.seed(ApiKey {
+                    id: format!("key-{index}"),
+                    user_id: user_id.to_string(),
+                    name: format!("Key {index}"),
+                    key_hash: hash_api_key(&format!("sk_secret-key-{index}")),
+                    key_prefix: format!("sk_prefix{index:02}"),
+                    expires_on: None,
+                    expires_at: None,
+                    last_used_at: None,
+                    created_at: format!("2026-10-{index:02}T08:00:00Z"),
+                    updated_at: format!("2026-10-{index:02}T08:00:00Z"),
+                    deleted_at: None,
+                });
+            }
+            repo
+        }
+
+        fn seed(&self, row: ApiKey) {
+            self.rows.lock().unwrap().push(row);
+        }
+
+        /// Number of rows the service asked to insert.
+        fn insert_count(&self) -> usize {
+            self.inserted.lock().unwrap().len()
+        }
+
+        /// The stored row for `id`, living or not.
+        fn row(&self, id: &str) -> ApiKey {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing row {id}"))
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ApiKeyRepo for FakeApiKeyRepo {
+        async fn list_by_user_id(&self, user_id: &str) -> Result<Vec<ApiKey>, RepoError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .cloned()
+                .collect())
+        }
+
+        async fn count_active(&self, user_id: &str) -> Result<i64, RepoError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
+                .count() as i64)
+        }
+
+        async fn insert(&self, key: NewApiKey) -> Result<ApiKey, RepoError> {
+            let row = ApiKey {
+                id: key.id.clone(),
+                user_id: key.user_id.clone(),
+                name: key.name.clone(),
+                key_hash: key.key_hash.clone(),
+                key_prefix: key.key_prefix.clone(),
+                expires_on: key.expires_on.clone(),
+                expires_at: key.expires_at.clone(),
+                last_used_at: None,
+                created_at: key.created_at.clone(),
+                updated_at: key.updated_at.clone(),
+                deleted_at: None,
+            };
+            self.inserted.lock().unwrap().push(key);
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(row)
+        }
+
+        async fn soft_delete(
+            &self,
+            id: &str,
+            user_id: &str,
+            now_rfc3339: &str,
+        ) -> Result<bool, RepoError> {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.id == id && row.user_id == user_id && row.deleted_at.is_none())
+            else {
+                return Ok(false);
+            };
+            row.deleted_at = Some(now_rfc3339.to_string());
+            row.updated_at = now_rfc3339.to_string();
+            Ok(true)
+        }
+
+        async fn authenticate(
+            &self,
+            key_hash: &str,
+            now_rfc3339: &str,
+        ) -> Result<Option<ApiKeyOwner>, RepoError> {
+            // Unused by these services; kept honest so slice 3's tests can
+            // rely on it. The real query joins `users`; the fake synthesizes
+            // the identity from the owning user id.
+            let row = self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row.key_hash == key_hash
+                        && row.deleted_at.is_none()
+                        && row
+                            .expires_at
+                            .as_deref()
+                            .is_none_or(|expires_at| expires_at > now_rfc3339)
+                })
+                .cloned();
+            Ok(row.map(|row| ApiKeyOwner {
+                key_id: row.id,
+                last_used_at: row.last_used_at,
+                user: SessionUser {
+                    id: row.user_id.clone(),
+                    email: format!("{}@example.com", row.user_id),
+                    name: "Test User".to_string(),
+                    picture: String::new(),
+                },
+            }))
+        }
+
+        async fn mark_used(
+            &self,
+            _id: &str,
+            _cutoff_rfc3339: &str,
+            _now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            Ok(())
+        }
+    }
+
+    fn create_input(name: &str, expires_on: Option<&str>) -> CreateApiKeyInput {
+        CreateApiKeyInput {
+            name: name.to_string(),
+            expires_on: expires_on.map(str::to_string),
+        }
+    }
+
+    /// Timestamp used by the service tests; also the RFC 3339 form of [`NOW`].
+    const NOW: i64 = 1_793_350_800;
+    const NOW_RFC3339: &str = "2026-10-30T09:00:00Z";
+
+    // ── services: create ────────────────────────────────────────────────
+
+    #[test]
+    fn create_trims_the_name_and_returns_a_one_time_secret() {
+        let repo = FakeApiKeyRepo::new();
+        let response = pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("  Laptop  ", None),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .expect("create");
+
+        assert_eq!(response.key.id, "key-new");
+        assert_eq!(response.key.name, "Laptop");
+        assert_eq!(response.key.created_at, NOW_RFC3339);
+        assert_eq!(response.key.expires_on, None);
+        assert_eq!(response.key.expires_at, None);
+        assert_eq!(response.key.last_used_at, None);
+        assert!(response.secret.starts_with(API_KEY_PREFIX));
+        assert!(is_well_formed_api_key(&response.secret));
+        assert_eq!(
+            response.key.key_prefix,
+            response.secret[..API_KEY_DISPLAY_PREFIX_LEN]
+        );
+
+        let stored = repo.row("key-new");
+        assert_eq!(stored.user_id, "u-1");
+        assert_eq!(stored.name, "Laptop");
+        assert_eq!(stored.key_prefix, response.key.key_prefix);
+        // Only the hash is persisted — never the secret itself.
+        assert_eq!(stored.key_hash, hash_api_key(&response.secret));
+        assert_ne!(stored.key_hash, response.secret);
+        assert_eq!(stored.created_at, NOW_RFC3339);
+        assert_eq!(stored.updated_at, NOW_RFC3339);
+        assert_eq!(stored.deleted_at, None);
+        assert_eq!(repo.insert_count(), 1);
+    }
+
+    #[test]
+    fn create_stores_the_expiry_instant_for_the_users_zone() {
+        let repo = FakeApiKeyRepo::new();
+        let response = pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Phone", Some("2026-11-12")),
+            "key-new",
+            NOW,
+            "2026-11-12",
+            "Asia/Kolkata",
+        ))
+        .expect("create");
+
+        assert_eq!(response.key.expires_on.as_deref(), Some("2026-11-12"));
+        // The chosen day is inclusive: local midnight starting 2026-11-13.
+        assert_eq!(
+            response.key.expires_at.as_deref(),
+            Some("2026-11-12T18:30:00Z")
+        );
+        assert_eq!(
+            repo.row("key-new").expires_at.as_deref(),
+            Some("2026-11-12T18:30:00Z")
+        );
+    }
+
+    #[test]
+    fn create_rejects_a_bad_name_without_writing() {
+        let repo = FakeApiKeyRepo::new();
+        let too_long = "n".repeat(MAX_API_KEY_NAME_LEN + 1);
+        for bad in ["", "   ", "\t", too_long.as_str()] {
+            let err = pollster::block_on(create_api_key(
+                &repo,
+                "u-1",
+                create_input(bad, None),
+                "key-new",
+                NOW,
+                "2026-10-30",
+                "UTC",
+            ))
+            .expect_err("invalid name");
+            assert!(
+                matches!(err, ApiKeyError::InvalidName(_)),
+                "{bad:?} → {err:?}"
+            );
+        }
+        assert_eq!(repo.insert_count(), 0);
+    }
+
+    #[test]
+    fn create_rejects_invalid_and_past_dates_without_writing() {
+        let repo = FakeApiKeyRepo::new();
+        let err = pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Laptop", Some("2026-02-31")),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .expect_err("impossible date");
+        assert_eq!(err, ApiKeyError::InvalidExpiry);
+
+        let err = pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Laptop", Some("2026-10-29")),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .expect_err("past date");
+        assert_eq!(err, ApiKeyError::PastExpiry);
+        assert_eq!(repo.insert_count(), 0);
+
+        // Today itself is allowed: the key lives through the whole day.
+        let response = pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Laptop", Some("2026-10-30")),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .expect("today expires");
+        assert_eq!(
+            response.key.expires_at.as_deref(),
+            Some("2026-10-31T00:00:00Z")
+        );
+        assert_eq!(repo.insert_count(), 1);
+    }
+
+    #[test]
+    fn create_enforces_the_active_key_cap() {
+        let repo = FakeApiKeyRepo::with_keys("u-1", MAX_ACTIVE_API_KEYS as usize);
+        let err = pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Laptop", None),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .expect_err("at the cap");
+        assert_eq!(err, ApiKeyError::TooManyKeys);
+        assert_eq!(repo.insert_count(), 0);
+
+        // Another user's keys never count against this one.
+        let other = FakeApiKeyRepo::with_keys("u-2", MAX_ACTIVE_API_KEYS as usize);
+        assert!(pollster::block_on(create_api_key(
+            &other,
+            "u-1",
+            create_input("Laptop", None),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn create_allows_the_last_slot_and_revoked_keys_free_one() {
+        let repo = FakeApiKeyRepo::with_keys("u-1", MAX_ACTIVE_API_KEYS as usize - 1);
+        assert!(pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Laptop", None),
+            "key-new",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .is_ok());
+        // Now exactly at the cap; revoking frees a slot again.
+        assert_eq!(
+            pollster::block_on(create_api_key(
+                &repo,
+                "u-1",
+                create_input("Tablet", None),
+                "key-extra",
+                NOW,
+                "2026-10-30",
+                "UTC",
+            )),
+            Err(ApiKeyError::TooManyKeys)
+        );
+        pollster::block_on(revoke_api_key(&repo, "u-1", "key-1", NOW_RFC3339)).expect("revoke");
+        assert!(pollster::block_on(create_api_key(
+            &repo,
+            "u-1",
+            create_input("Tablet", None),
+            "key-extra",
+            NOW,
+            "2026-10-30",
+            "UTC",
+        ))
+        .is_ok());
+    }
+
+    // ── services: list ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_maps_views_and_never_leaks_hashes() {
+        let repo = FakeApiKeyRepo::with_keys("u-1", 2);
+        // Another user's key and a revoked one are both invisible.
+        repo.seed(ApiKey {
+            id: "key-other".to_string(),
+            user_id: "u-2".to_string(),
+            ..sample_key()
+        });
+        repo.seed(ApiKey {
+            id: "key-dead".to_string(),
+            deleted_at: Some(NOW_RFC3339.to_string()),
+            ..sample_key()
+        });
+
+        let response = pollster::block_on(list_api_keys(&repo, "u-1")).expect("list");
+        let ids: Vec<&str> = response.keys.iter().map(|key| key.id.as_str()).collect();
+        assert_eq!(ids, vec!["key-1", "key-2"]);
+
+        let json = serde_json::to_string(&response).expect("json");
+        assert!(!json.contains("key_hash"), "{json}");
+        assert!(!json.contains(&repo.row("key-1").key_hash), "{json}");
+        assert!(!json.contains("sk_secret-key-1"), "{json}");
+        assert!(!json.contains("user_id"), "{json}");
+        assert_eq!(response.keys[0].name, "Key 1");
+        assert_eq!(response.keys[0].key_prefix, "sk_prefix01");
+    }
+
+    #[test]
+    fn list_is_empty_for_a_user_without_keys() {
+        let repo = FakeApiKeyRepo::with_keys("u-2", 1);
+        let response = pollster::block_on(list_api_keys(&repo, "u-1")).expect("list");
+        assert!(response.keys.is_empty());
+    }
+
+    // ── services: revoke ────────────────────────────────────────────────
+
+    #[test]
+    fn revoke_soft_deletes_the_owners_key() {
+        let repo = FakeApiKeyRepo::with_keys("u-1", 2);
+        let response =
+            pollster::block_on(revoke_api_key(&repo, "u-1", "key-1", NOW_RFC3339)).expect("revoke");
+        assert!(response.success);
+
+        let row = repo.row("key-1");
+        assert_eq!(row.deleted_at.as_deref(), Some(NOW_RFC3339));
+        assert_eq!(row.updated_at, NOW_RFC3339);
+
+        let list = pollster::block_on(list_api_keys(&repo, "u-1")).expect("list");
+        let ids: Vec<&str> = list.keys.iter().map(|key| key.id.as_str()).collect();
+        assert_eq!(ids, vec!["key-2"]);
+    }
+
+    #[test]
+    fn revoke_unknown_and_other_user_keys_is_not_found() {
+        let repo = FakeApiKeyRepo::with_keys("u-1", 1);
+        repo.seed(ApiKey {
+            id: "key-other".to_string(),
+            user_id: "u-2".to_string(),
+            ..sample_key()
+        });
+
+        assert_eq!(
+            pollster::block_on(revoke_api_key(&repo, "u-1", "missing", NOW_RFC3339)),
+            Err(ApiKeyError::NotFound)
+        );
+        assert_eq!(
+            pollster::block_on(revoke_api_key(&repo, "u-1", "key-other", NOW_RFC3339)),
+            Err(ApiKeyError::NotFound)
+        );
+        // Ownership is not leaked: the other user's row is untouched.
+        assert_eq!(repo.row("key-other").deleted_at, None);
+    }
+
+    #[test]
+    fn revoke_is_not_idempotent() {
+        let repo = FakeApiKeyRepo::with_keys("u-1", 1);
+        pollster::block_on(revoke_api_key(&repo, "u-1", "key-1", NOW_RFC3339)).expect("revoke");
+        assert_eq!(
+            pollster::block_on(revoke_api_key(
+                &repo,
+                "u-1",
+                "key-1",
+                "2026-10-31T09:00:00Z"
+            )),
+            Err(ApiKeyError::NotFound)
+        );
+        // The original stamp stands: a repeat revoke never rewrites the row.
+        assert_eq!(repo.row("key-1").deleted_at.as_deref(), Some(NOW_RFC3339));
     }
 }

@@ -46,14 +46,14 @@ pub use agenda_fill::{
     OCCURRENCE_HORIZON_DAYS,
 };
 pub use api_key::{
-    expiry_instant_rfc3339, generate_api_key, hash_api_key, is_well_formed_api_key,
-    parse_authorization_header, should_touch_last_used, validate_api_key_name, validate_expires_on,
-    ActiveKeyCountRow, ApiKey, ApiKeyError, ApiKeyOwner, ApiKeyOwnerRow, ApiKeyRepo, ApiKeyView,
-    ApiKeysResponse, AuthorizationHeader, CreateApiKeyInput, CreateApiKeyResponse,
-    DeleteApiKeyResponse, GeneratedApiKey, NewApiKey, API_KEY_AUTHENTICATE_SQL,
-    API_KEY_COUNT_ACTIVE_SQL, API_KEY_DISPLAY_PREFIX_LEN, API_KEY_INSERT_SQL,
-    API_KEY_LIST_BY_USER_ID_SQL, API_KEY_MARK_USED_SQL, API_KEY_PREFIX, API_KEY_SOFT_DELETE_SQL,
-    LAST_USED_TOUCH_SECS, MAX_ACTIVE_API_KEYS, MAX_API_KEY_NAME_LEN,
+    create_api_key, expiry_instant_rfc3339, generate_api_key, hash_api_key, is_well_formed_api_key,
+    list_api_keys, parse_authorization_header, revoke_api_key, should_touch_last_used,
+    validate_api_key_name, validate_expires_on, ActiveKeyCountRow, ApiKey, ApiKeyError,
+    ApiKeyOwner, ApiKeyOwnerRow, ApiKeyRepo, ApiKeyView, ApiKeysResponse, AuthorizationHeader,
+    CreateApiKeyInput, CreateApiKeyResponse, DeleteApiKeyResponse, GeneratedApiKey, NewApiKey,
+    API_KEY_AUTHENTICATE_SQL, API_KEY_COUNT_ACTIVE_SQL, API_KEY_DISPLAY_PREFIX_LEN,
+    API_KEY_INSERT_SQL, API_KEY_LIST_BY_USER_ID_SQL, API_KEY_MARK_USED_SQL, API_KEY_PREFIX,
+    API_KEY_SOFT_DELETE_SQL, LAST_USED_TOUCH_SECS, MAX_ACTIVE_API_KEYS, MAX_API_KEY_NAME_LEN,
 };
 pub use calendar::{
     classify_operator_warning, create_event, decide_webhook, delete_event, delete_event_for_user,
