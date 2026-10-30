@@ -65,6 +65,10 @@ interface AgendaItemRowProps {
   /** Drop a task back into the Backlog (`{ backlog: true }`) — HomePage owns
    *  the optimistic paint + success notice. Never offered for occurrences. */
   onMoveToBacklog: (item: AgendaItemRecord) => void;
+  /** Park a dated `PLANNED` task in the Planned warehouse (`{ unschedule: true
+   *  }`, ADR 0009) — the status, the Board rank and the logs are untouched.
+   *  Never offered for occurrences. */
+  onUnschedule: (item: AgendaItemRecord) => void;
   /** Briefly ring the row after the success notice's "Show" scrolled to it. */
   highlighted?: boolean;
   onCompleteTask: (item: AgendaItemRecord) => void;
@@ -510,6 +514,7 @@ function TaskRow({
   serverToday,
   onReschedule,
   onMoveToBacklog,
+  onUnschedule,
   highlighted,
   domId,
   onComplete,
@@ -526,6 +531,7 @@ function TaskRow({
   serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onMoveToBacklog: AgendaItemRowProps['onMoveToBacklog'];
+  onUnschedule: AgendaItemRowProps['onUnschedule'];
   highlighted: boolean;
   domId: string;
   onComplete: () => void;
@@ -600,6 +606,7 @@ function TaskRow({
                 triggerClassName={ICON_BTN}
                 onReschedule={onReschedule}
                 onMoveToBacklog={() => onMoveToBacklog(item)}
+                onUnschedule={() => onUnschedule(item)}
               />
             )}
           </AgendaRowActions>
@@ -647,6 +654,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         serverToday={props.serverToday}
         onReschedule={props.onReschedule}
         onMoveToBacklog={props.onMoveToBacklog}
+        onUnschedule={props.onUnschedule}
         highlighted={highlighted}
         domId={domId}
         onComplete={() => props.onCompleteTask(item)}

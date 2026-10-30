@@ -233,18 +233,23 @@ pub async fn fill_occurrence_horizon(
 ///   date; `OPEN` with no row → one is inserted there. An `OPEN` row already
 ///   at `>=` the horizon is left alone, even when its date is not exactly
 ///   today's backlog date (yesterday's backlog date is still past the line).
-/// - `PLANNED` / `IN_PROGRESS` with a row dated `>=` the horizon → the row
-///   moves to today; with no row → one is inserted on today. A dated future
-///   row in `[today, horizon)` and a past row are never touched (a past
-///   `PLANNED` row can still pin the anchor). Nothing is rewritten just to
-///   normalize it onto exactly today's backlog date.
-/// - The arrivals are appended in **board order** per destination:
-///   `IN_PROGRESS` first, then `PLANNED`, each by `tasks.sort_order` with ties
-///   broken by task id ascending; `OPEN` by `tasks.sort_order`, ties by id.
-///   Ranks start at `max_sort_order(destination) + 1` (0 when that pile is
-///   empty) and increase by one in that order. Rows already correctly on the
-///   destination keep their ranks — moving and inserting share one counter, so
-///   a healed `PLANNED` row and a rowless `IN_PROGRESS` land as one board.
+/// - `PLANNED` with no row → one is inserted on the backlog date (ADR 0009: a
+///   planned task the user never dated is warehouse work, never today). Any
+///   existing `PLANNED` row is left alone — past, dated future, and at/after
+///   the horizon are all valid (a `PLANNED` row past the line is no longer a
+///   misplacement).
+/// - `IN_PROGRESS` with a row dated `>=` the horizon → the row moves to
+///   today; with no row → one is inserted on today. A dated future row in
+///   `[today, horizon)` and a past row are never touched (a past
+///   `IN_PROGRESS` row can still pin the anchor). Nothing is rewritten just
+///   to normalize it onto exactly today's backlog date.
+/// - The arrivals are appended in **board order** per destination: the today
+///   pile holds only `IN_PROGRESS`, the backlog pile `PLANNED` first and then
+///   `OPEN`, each by `tasks.sort_order` with ties broken by task id
+///   ascending. Ranks start at `max_sort_order(destination) + 1` (0 when that
+///   pile is empty) and increase by one in that order. Rows already correctly
+///   on the destination keep their ranks — moving and inserting share one
+///   counter, so a healed row and a rowless task land as one board.
 ///
 /// Idempotent: a second pass with nothing missing or misplaced writes nothing
 /// (no `insert_many`, no `set_local_date`).
@@ -285,16 +290,28 @@ pub async fn ensure_task_items(
     for task in &tasks {
         let row = rows_by_task.get(task.id.as_str()).copied();
         match (task.status.as_str(), row) {
-            (TASK_STATUS_OPEN, None) => backlog_pile.push((task, None)),
-            (TASK_STATUS_OPEN, Some(row)) if row.local_date.as_str() < horizon.as_str() => {
-                backlog_pile.push((task, Some(row)));
-            }
-            (TASK_STATUS_OPEN, Some(_)) => {}
-            (_, None) => today_pile.push((task, None)),
-            (_, Some(row)) if row.local_date.as_str() >= horizon.as_str() => {
+            // OPEN is warehouse work whatever its row says: a rowless task or
+            // a row still inside the horizon moves to the sentinel; a row
+            // already at/after the horizon is left alone.
+            (TASK_STATUS_OPEN, Some(row)) if row.local_date.as_str() >= horizon.as_str() => {}
+            (TASK_STATUS_OPEN, row) => backlog_pile.push((task, row)),
+            // PLANNED is a warehouse status since ADR 0009: a rowless task is
+            // parked on the sentinel, and ANY existing row (past, dated
+            // future, or at/after the horizon) is valid and left alone.
+            (TASK_STATUS_PLANNED, None) => backlog_pile.push((task, None)),
+            (TASK_STATUS_PLANNED, Some(_)) => {}
+            // IN_PROGRESS is a real-day status: a rowless task lands on
+            // today, and a row parked at/after the horizon is healed there.
+            (TASK_STATUS_IN_PROGRESS, None) => today_pile.push((task, None)),
+            (TASK_STATUS_IN_PROGRESS, Some(row))
+                if row.local_date.as_str() >= horizon.as_str() =>
+            {
                 today_pile.push((task, Some(row)));
             }
-            (_, Some(_)) => {}
+            // Already correct: an IN_PROGRESS row still inside the horizon
+            // (terminal statuses never reach here — `status_rank` dropped them
+            // above).
+            _ => {}
         }
     }
 
@@ -304,7 +321,8 @@ pub async fn ensure_task_items(
 }
 
 /// Appends one destination pile after that date's current max rank, in board
-/// order.
+/// order (the today pile holds only `IN_PROGRESS`; the backlog pile holds
+/// `PLANNED` then `OPEN`, ADR 0009).
 ///
 /// A task that already holds a row travels with
 /// [`AgendaItemRepo::set_local_date`]; the rowless ones are collected and
@@ -384,8 +402,8 @@ pub struct AgendaFillReport {
 
 /// The agenda fill cron (the `*/15 * * * *` tick): for each affected user,
 /// materialize the occurrence horizon and place or repair every living task's
-/// single agenda row (`OPEN` on the backlog date, everything else on today —
-/// [`ensure_task_items`], ADR 0007).
+/// single agenda row (`OPEN` and `PLANNED` on the backlog date, `IN_PROGRESS`
+/// on today — [`ensure_task_items`], ADR 0007 / 0009).
 ///
 /// The work list is the sorted, deduped union of
 /// [`RoutineRepo::list_user_ids_with_living_routines`] and

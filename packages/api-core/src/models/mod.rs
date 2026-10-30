@@ -661,27 +661,38 @@ pub struct MoveAgendaItemInput {
     pub sort_order: i64,
 }
 
-/// Request body for `POST /api/agenda/items/:id/reschedule` (ADR 0007): a
-/// dated reschedule (`{ "date": "YYYY-MM-DD", "sort_order"?: n }`) or a
-/// backlog drop (`{ "backlog": true }`). The service rejects both together.
+/// Request body for `POST /api/agenda/items/:id/reschedule` (ADR 0007,
+/// amended by ADR 0009): a dated reschedule
+/// (`{ "date": "YYYY-MM-DD", "sort_order"?: n }`), a backlog drop
+/// (`{ "backlog": true }`), or an unschedule (`{ "unschedule": true }`). The
+/// service rejects the forms in combination.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RescheduleAgendaItemInput {
     /// Local civil date `YYYY-MM-DD` the slot moves to — a real day inside
-    /// `[today, today+10y)`. Absent when `backlog` is true. Present-but-blank
-    /// is still a date and fails `date must be YYYY-MM-DD`.
+    /// `[today, today+10y)`. Absent when `backlog` or `unschedule` is true.
+    /// Present-but-blank is still a date and fails `date must be YYYY-MM-DD`
+    /// unless one of those forms is set (both ignore a blank date).
     #[serde(default)]
     pub date: Option<String>,
     /// Optional landing rank inside the target day's pile. Absent/null →
     /// append at `max+1` (0 when empty); a named rank first shifts that day's
     /// peers at/after it up one (same gap semantics as `/move`). Never used
     /// on a same-date call — same-day placement is `/move` — nor on a backlog
-    /// drop (Open-column order is the Board's `tasks.sort_order`).
+    /// drop or an unschedule (Planned/Open order is the Board's
+    /// `tasks.sort_order`).
     #[serde(default)]
     pub sort_order: Option<i64>,
     /// Drop the task into the backlog. Mutually exclusive with a non-blank
-    /// `date`.
+    /// `date` and with `unschedule`.
     #[serde(default)]
     pub backlog: bool,
+    /// Park a dated `PLANNED` task's row on the backlog sentinel: the status
+    /// stays `PLANNED`, no `task_logs` row is written, the Board rank is not
+    /// touched, and the row moves to the sentinel unless it is already
+    /// `>= today+10y` (200 no-op). Mutually exclusive with a non-blank `date`
+    /// and with `backlog`. `sort_order` is ignored on this path.
+    #[serde(default)]
+    pub unschedule: bool,
 }
 
 
@@ -1004,18 +1015,21 @@ mod tests {
         assert_eq!(input.date.as_deref(), Some("2026-08-24"));
         assert_eq!(input.sort_order, None);
         assert!(!input.backlog);
+        assert!(!input.unschedule);
 
         let input: RescheduleAgendaItemInput =
             serde_json::from_str(r#"{"date":"2026-08-24","sort_order":2}"#).unwrap();
         assert_eq!(input.date.as_deref(), Some("2026-08-24"));
         assert_eq!(input.sort_order, Some(2));
         assert!(!input.backlog);
+        assert!(!input.unschedule);
 
         // The backlog drop carries no date at all.
         let input: RescheduleAgendaItemInput = serde_json::from_str(r#"{"backlog":true}"#).unwrap();
         assert_eq!(input.date, None);
         assert_eq!(input.sort_order, None);
         assert!(input.backlog);
+        assert!(!input.unschedule);
 
         // A named rank parses; the service ignores it on this path.
         let input: RescheduleAgendaItemInput =
@@ -1023,5 +1037,22 @@ mod tests {
         assert_eq!(input.date, None);
         assert_eq!(input.sort_order, Some(3));
         assert!(input.backlog);
+        assert!(!input.unschedule);
+
+        // The unschedule form (ADR 0009) is the third shape: no date, no
+        // rank, `backlog` stays false. The service owns the combination
+        // errors.
+        let input: RescheduleAgendaItemInput =
+            serde_json::from_str(r#"{"unschedule":true}"#).unwrap();
+        assert_eq!(input.date, None);
+        assert_eq!(input.sort_order, None);
+        assert!(!input.backlog);
+        assert!(input.unschedule);
+
+        // A blank date is still "no target" on this path.
+        let input: RescheduleAgendaItemInput =
+            serde_json::from_str(r#"{"unschedule":true,"date":"  "}"#).unwrap();
+        assert_eq!(input.date.as_deref(), Some("  "));
+        assert!(input.unschedule);
     }
 }

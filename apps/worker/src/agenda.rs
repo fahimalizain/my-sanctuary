@@ -310,15 +310,21 @@ pub async fn move_agenda_item(
 
 /// `POST /api/agenda/items/:id/reschedule` → 200 `{"item":{...}}`. Body:
 /// `{date, sort_order?}` (`date` is `YYYY-MM-DD`, today … today+10y-1, and
-/// `sort_order` is the optional landing rank) or `{backlog: true}` (drop the
-/// task into the backlog; `date` must be absent, `sort_order` is ignored).
+/// `sort_order` is the optional landing rank), `{backlog: true}` (drop the
+/// task into the backlog; `date` must be absent, `sort_order` is ignored), or
+/// `{unschedule: true}` (park a dated `PLANNED` task's row on the backlog
+/// sentinel; `date` must be absent, `sort_order` is ignored).
 /// Relocates the slot to that day — the occurrence moves its agenda item only
-/// (no exdate anywhere; `pending | skipped` only, never into the backlog), a
-/// task reschedule plans it (`OPEN` → `PLANNED` + a `planned` task_logs row +
-/// the Planned column; `PLANNED` stays put; running/terminal → 400), and a
-/// backlog drop returns it to `OPEN` on the backlog date (`unplanned` row +
-/// the Open column; an already-`OPEN` task writes nothing). Same date is a
-/// 200 no-op. Session-only: no Google write of any kind.
+/// (no exdate anywhere; `pending | skipped` only, never into the backlog and
+/// never unscheduled), a task reschedule plans it (`OPEN` → `PLANNED` + a
+/// `planned` task_logs row + the Planned column; `PLANNED` stays put;
+/// running/terminal → 400), a backlog drop returns it to `OPEN` on the backlog
+/// date (`unplanned` row + the Open column; an already-`OPEN` task writes
+/// nothing), and an unschedule keeps it `PLANNED` with **no** `task_logs` row
+/// and **no** Board re-rank, moving the row to the sentinel unless it is
+/// already `>= today+10y` (200 no-op). `OPEN` / `IN_PROGRESS` / terminal tasks
+/// and occurrences cannot be unscheduled (400). Same date is a 200 no-op.
+/// Session-only: no Google write of any kind.
 pub async fn reschedule_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -352,6 +358,7 @@ pub async fn reschedule_agenda_item(
         input.date.as_deref(),
         input.sort_order,
         input.backlog,
+        input.unschedule,
         focused_task_id.as_deref(),
     )
     .await

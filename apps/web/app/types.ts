@@ -602,9 +602,12 @@ export interface AgendaItemRecord {
 // itself.
 export interface AgendaResponse {
   items: AgendaItemRecord[];
-  // Rows past the day stream (ADR 0007): the dated stretch `today+6 <
-  // local_date < today+10y`, then `OPEN` tasks whose row date is `≥ today+10y`
-  // in Board order. Empty on a history read.
+  // Rows past the day stream — THREE stretches (ADR 0007, ADR 0009): the dated
+  // stretch `today+6 < local_date < today+10y` in the range query's order
+  // (never re-sorted), then `PLANNED` tasks whose row date is `≥ today+10y` in
+  // Planned-column Board order (`tasks.sort_order`, ties by task id), then
+  // `OPEN` tasks at/after that line in Open-column Board order. `IN_PROGRESS`
+  // tasks and occurrences at the horizon are absent. Empty on a history read.
   backlog: AgendaItemRecord[];
   // `YYYY-MM-DD` — the resolved inclusive window start (never the raw query).
   from: string;
@@ -642,21 +645,28 @@ export interface MoveAgendaItemInput {
   sort_order: number;
 }
 
-// Request body for POST /api/agenda/items/:id/reschedule (ADR 0007) — either
-// the local civil date (`YYYY-MM-DD`) the slot relocates to, or
-// `{ backlog: true }` to drop it into the backlog (never both). `sort_order`
-// is optional on the date path: a named rank shifts the target date's peers
-// at/after it up one, an omitted one appends at `max + 1`. Occurrences move
-// only while `pending | skipped` (skipped → pending; in_progress/done → 400);
-// a task reschedule is a status transition — `OPEN` becomes `PLANNED`, an
-// `IN_PROGRESS` task 400s (pause first). Same date → 200 no-op; a past date
-// 400s. A backlog drop never carries `date`: occurrences and `IN_PROGRESS`
-// tasks 400, a `PLANNED` task becomes `OPEN`, an already-`OPEN` row on the
-// backlog date is a no-op.
+// Request body for POST /api/agenda/items/:id/reschedule (ADR 0007, ADR 0009)
+// — one of three bodies: the local civil date (`YYYY-MM-DD`) the slot
+// relocates to, `{ backlog: true }` to drop it into the backlog, or
+// `{ unschedule: true }` to park a dated `PLANNED` row in the Planned
+// warehouse. They are mutually exclusive (a non-blank `date` and either flag →
+// 400). `sort_order` is optional on the date path: a named rank shifts the
+// target date's peers at/after it up one, an omitted one appends at `max + 1`.
+// Occurrences move only while `pending | skipped` (skipped → pending;
+// in_progress/done → 400); a task reschedule is a status transition — `OPEN`
+// becomes `PLANNED`, an `IN_PROGRESS` task 400s (pause first). Same date → 200
+// no-op; a past date 400s. A backlog drop never carries `date`: occurrences
+// and `IN_PROGRESS` tasks 400, a `PLANNED` task becomes `OPEN`, an already-
+// `OPEN` row on the backlog date is a no-op. `unschedule` never carries a
+// date either: it keeps the task `PLANNED`, writes no log and does not re-rank
+// the Planned column, and moves only the row to the backlog sentinel — a row
+// already at/after the 10-year horizon is a 200 no-op. `OPEN`, `IN_PROGRESS`,
+// terminal tasks and occurrences 400.
 export interface RescheduleAgendaItemInput {
   date?: string;
   sort_order?: number;
   backlog?: boolean;
+  unschedule?: boolean;
 }
 
 // The envelope returned by PATCH /api/occurrences/:id,

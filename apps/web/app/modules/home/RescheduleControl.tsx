@@ -1,9 +1,9 @@
 // Move-to-day menu for one agenda row (ADR 0004 amendment — reschedule,
-// ADR 0007 — bounds / backlog): the calendar icon opens a compact menu with
-// presets anchored to the SERVER's civil today, a month picker, and — for
-// tasks — the Backlog. Every choice fires immediately; HomePage owns the
-// optimistic move, the failure banner and the success notice. Presentational
-// only.
+// ADR 0007 — bounds / backlog, ADR 0009 — unschedule): the calendar icon opens
+// a compact menu with presets anchored to the SERVER's civil today, a month
+// picker, and — for tasks — Unschedule (a dated `PLANNED` row) and Backlog.
+// Every choice fires immediately; HomePage owns the optimistic move, the
+// failure banner and the success notice. Presentational only.
 //
 // The presets deliberately shift from `serverToday`, never from the row's own
 // date. "Tomorrow" on a row three days out must move it to TOMORROW, not one
@@ -16,6 +16,7 @@ import {
   Calendar,
   CalendarClock,
   CalendarDays,
+  CalendarOff,
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react';
@@ -32,6 +33,7 @@ import {
   agendaDateLabel,
   agendaShortDateLabel,
   canMoveToBacklog,
+  canUnschedule,
   rescheduleMaxDate,
   reschedulePickerMonth,
   reschedulePresets,
@@ -89,6 +91,9 @@ export interface RescheduleControlProps {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
   /** Available for task rows only; omitted for occurrences. */
   onMoveToBacklog?: (item: AgendaItemRecord) => void;
+  /** Available for task rows only; omitted for occurrences. Offered on a
+   *  DATED `PLANNED` row (ADR 0009), never on one already in the warehouse. */
+  onUnschedule?: (item: AgendaItemRecord) => void;
 }
 
 export function RescheduleControl({
@@ -98,6 +103,7 @@ export function RescheduleControl({
   triggerClassName,
   onReschedule,
   onMoveToBacklog,
+  onUnschedule,
 }: RescheduleControlProps) {
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<'menu' | 'calendar'>('menu');
@@ -132,9 +138,11 @@ export function RescheduleControl({
     currentRelative === currentAbsolute
       ? currentAbsolute
       : `${currentRelative} · ${currentAbsolute}`;
-  // Anything at/after today+10y is the backlog sentinel (today+50y), even if a
-  // self-heal has not pulled a PLANNED row back yet. The picker's max is
-  // today+10y−1, so this is exactly the "outside the date range" test.
+  // Anything at/after today+10y is a warehouse sentinel (today+50y, or exactly
+  // the horizon). The picker's max is today+10y−1, so this is exactly the
+  // "outside the date range" test. Which warehouse a sentinel means depends on
+  // the STATUS (ADR 0009): a PLANNED row lives in Planned, an OPEN row in
+  // Backlog.
   const beyondDateRange =
     !!serverToday && !!maxDate && item.local_date > maxDate;
   const inDatedBacklog =
@@ -142,9 +150,12 @@ export function RescheduleControl({
     !beyondDateRange &&
     item.local_date > addCivilDays(serverToday, 6);
   const currentLabel = beyondDateRange
-    ? 'Backlog'
+    ? item.task?.status === 'PLANNED'
+      ? 'Planned'
+      : 'Backlog'
     : `${baseCurrentLabel}${inDatedBacklog ? ' · Backlog' : ''}`;
   const canBacklog = !!onMoveToBacklog && canMoveToBacklog(item, serverToday);
+  const canUnscheduleItem = !!onUnschedule && canUnschedule(item, serverToday);
   const openTaskHint = item.task?.status === 'OPEN';
 
   const choose = (date: string) => {
@@ -165,6 +176,13 @@ export function RescheduleControl({
     setView('menu');
     wasCalendarRef.current = false;
     onMoveToBacklog?.(item);
+  };
+
+  const handleUnschedule = () => {
+    setOpen(false);
+    setView('menu');
+    wasCalendarRef.current = false;
+    onUnschedule?.(item);
   };
 
   return (
@@ -248,21 +266,34 @@ export function RescheduleControl({
               </p>
             )}
 
-            {canBacklog && (
+            {(canUnscheduleItem || canBacklog) && (
               <>
                 <div className="my-1 h-px bg-border/70" />
-                <button
-                  type="button"
-                  onClick={handleBacklog}
-                  aria-label={`Move ${label} to the backlog`}
-                  className={MENU_ROW}
-                >
-                  <Archive className="h-4 w-4 shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate">Backlog</span>
-                  <span className="shrink-0 text-[11px] text-muted-foreground">
-                    No date
-                  </span>
-                </button>
+                {canUnscheduleItem && (
+                  <button
+                    type="button"
+                    onClick={handleUnschedule}
+                    aria-label={`Unschedule ${label}`}
+                    className={MENU_ROW}
+                  >
+                    <CalendarOff className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate">Unschedule</span>
+                  </button>
+                )}
+                {canBacklog && (
+                  <button
+                    type="button"
+                    onClick={handleBacklog}
+                    aria-label={`Move ${label} to the backlog`}
+                    className={MENU_ROW}
+                  >
+                    <Archive className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate">Backlog</span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      No date
+                    </span>
+                  </button>
+                )}
               </>
             )}
           </div>
