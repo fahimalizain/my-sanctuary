@@ -1,7 +1,8 @@
 //! `/api/agenda/*` + `/api/occurrences/*` handlers (ADR 0004).
 //!
-//! Session-gated via the session cookie — like `/api/lists/*` and
-//! `/api/routines`. The Google-touching verbs gate on a refreshable token:
+//! Session-gated via the session cookie or an API key bearer — like
+//! `/api/lists/*` and `/api/routines`. The Google-touching verbs gate on a
+//! refreshable token:
 //! `/start` always, pause/complete/skip **when the occurrence is `in_progress`
 //! with stored ids** (load first, like the focused delete), and the title
 //! PATCH **when a chip exists** (`google_event_id` set). Everything else is
@@ -158,16 +159,10 @@ fn tokens_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::
     Ok(crate::db::D1TokenRepo::new(db))
 }
 
-/// Session user id + OAuth config, or `None` — the Google gate's session
-/// check (missing session or missing OAuth config both mean 401).
-fn session_and_oauth<'a>(
-    req: &Request,
-    ctx: &'a RouteContext<Option<api_core::Config>>,
-) -> Option<(String, &'a OAuthConfig)> {
-    let user = crate::auth::session_user(req, ctx.data.as_ref())?;
-    let config = ctx.data.as_ref()?;
-    let oauth = config.oauth.as_ref()?;
-    Some((user.id, oauth))
+/// OAuth config for the Google gate, or `None` — the caller has already
+/// authenticated, so a missing config or a missing grant both stay 401.
+fn google_access<'a>(ctx: &'a RouteContext<Option<api_core::Config>>) -> Option<&'a OAuthConfig> {
+    ctx.data.as_ref()?.oauth.as_ref()
 }
 
 /// Refreshes the user's Google access token. `None` when the stored token
@@ -224,7 +219,7 @@ async fn focused_task_id(
 /// (the old `?date=` parameter is ignored). The response carries the
 /// server-computed `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let (from, to) = {
@@ -278,7 +273,7 @@ pub async fn move_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -328,7 +323,7 @@ pub async fn reschedule_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -382,7 +377,7 @@ pub async fn move_day_to_today(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(date) = ctx.param("date") else {
@@ -427,7 +422,7 @@ pub async fn patch_occurrence(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -452,11 +447,11 @@ pub async fn patch_occurrence(
     }
     let needs_google = occurrence.google_event_id.is_some() && occurrence.calendar_id.is_some();
     let (http, access) = if needs_google {
-        let Some((user_id, oauth)) = session_and_oauth(&req, &ctx) else {
+        let Some(oauth) = google_access(&ctx) else {
             return unauthorized(&ctx);
         };
         let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-        let Some(access) = refresh_access(&tokens_d1(&ctx)?, oauth, &user_id, now_unix).await else {
+        let Some(access) = refresh_access(&tokens_d1(&ctx)?, oauth, &user.id, now_unix).await else {
             return unauthorized(&ctx);
         };
         (
@@ -512,7 +507,10 @@ pub async fn start_occurrence(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+    let Some(oauth) = google_access(&ctx) else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -520,7 +518,7 @@ pub async fn start_occurrence(
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let tokens = tokens_d1(&ctx)?;
-    let Some(access) = refresh_access(&tokens, oauth, &user_id, now_unix).await else {
+    let Some(access) = refresh_access(&tokens, oauth, &user.id, now_unix).await else {
         return unauthorized(&ctx);
     };
 
@@ -539,7 +537,7 @@ pub async fn start_occurrence(
         &occurrences_d1(&ctx)?,
         &agenda_d1(&ctx)?,
         &access,
-        &user_id,
+        &user.id,
         id,
         now_unix,
         &notify,
@@ -566,7 +564,7 @@ macro_rules! occurrence_exit {
             req: Request,
             ctx: RouteContext<Option<api_core::Config>>,
         ) -> Result<Response> {
-            let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+            let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
                 return unauthorized(&ctx);
             };
             let Some(id) = ctx.param("id") else {
@@ -588,12 +586,12 @@ macro_rules! occurrence_exit {
                 && occurrence.google_event_id.is_some()
                 && occurrence.calendar_id.is_some();
             let (http, access) = if needs_google {
-                let Some((user_id, oauth)) = session_and_oauth(&req, &ctx) else {
+                let Some(oauth) = google_access(&ctx) else {
                     return unauthorized(&ctx);
                 };
                 let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
                 let Some(access) =
-                    refresh_access(&tokens_d1(&ctx)?, oauth, &user_id, now_unix).await
+                    refresh_access(&tokens_d1(&ctx)?, oauth, &user.id, now_unix).await
                 else {
                     return unauthorized(&ctx);
                 };
@@ -669,7 +667,7 @@ pub async fn reopen_occurrence(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {

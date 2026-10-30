@@ -1,11 +1,19 @@
 //! `/auth/*` handlers: session `me`/`logout`, plus the Google OAuth login
 //! flow (`/auth/google` → consent screen → `/auth/google/callback`).
 //!
+//! Two credentials reach the data routes: the sealed session cookie set by the
+//! OAuth callback and an `Authorization: Bearer sk_…` API key. [`authenticate`]
+//! is the single gate both paths go through — a header, when present, wins over
+//! the cookie and fails closed if unusable. API keys target non-browser
+//! clients, so CORS deliberately does not advertise `Authorization` in
+//! `Access-Control-Allow-Headers`; the web app keeps using the cookie.
+//!
 //! All endpoints are reachable cross-origin when the frontend overrides
 //! `VITE_API_BASE_URL`, so they set CORS headers from `FRONTEND_URL`
 //! (default `http://localhost:5173`, matching the Vite dev proxy). The
 //! same-origin proxy path does not need CORS but is unaffected by it.
 
+use api_core::ApiKeyRepo;
 use worker::*;
 
 /// Name of the CSRF/state cookie set by `/auth/google` and cleared on callback.
@@ -90,9 +98,79 @@ pub(crate) fn session_user(req: &Request, config: Option<&api_core::Config>) -> 
     api_core::unseal(&config.session_secret, token, now).ok()
 }
 
+/// The request's identity: an API key bearer when an `Authorization` header is
+/// present, otherwise the session cookie.
+///
+/// Dispatch is on the header alone, so the two credential types never mix:
+/// [`Absent`](api_core::AuthorizationHeader::Absent) is the existing cookie
+/// path (zero extra D1 reads), while a present-but-unusable header is
+/// [`Malformed`](api_core::AuthorizationHeader::Malformed) or an unrecognized/
+/// expired/revoked key — both `None`, never a silent downgrade to the cookie.
+///
+/// A D1 failure on the bearer path is logged and also reported as `None`: a
+/// 401 for a caller whose key cannot be verified right now is the safe answer,
+/// and the alternative (a 500) would have to be threaded through every data
+/// route's `Option<SessionUser>` gate.
+pub(crate) async fn authenticate(
+    req: &Request,
+    ctx: &RouteContext<Option<api_core::Config>>,
+) -> Option<api_core::SessionUser> {
+    let header = req.headers().get("Authorization").ok().flatten();
+    match api_core::parse_authorization_header(header.as_deref()) {
+        api_core::AuthorizationHeader::Absent => session_user(req, ctx.data.as_ref()),
+        api_core::AuthorizationHeader::Malformed => None,
+        api_core::AuthorizationHeader::Bearer(secret) => bearer_user(secret, ctx).await,
+    }
+}
+
+/// Resolves an API key secret to its owner, touching `last_used_at` at most
+/// once per [`api_core::LAST_USED_TOUCH_SECS`].
+///
+/// The shape check runs before hashing and D1, so a cookie-shaped value sent
+/// as a bearer is rejected without a round trip.
+async fn bearer_user(
+    secret: &str,
+    ctx: &RouteContext<Option<api_core::Config>>,
+) -> Option<api_core::SessionUser> {
+    if !api_core::is_well_formed_api_key(secret) {
+        return None;
+    }
+    let Ok(db) = ctx.d1("DB") else {
+        console_log!("auth: api key auth unavailable: d1 binding not configured");
+        return None;
+    };
+    let repo = crate::db::D1ApiKeyRepo::new(db);
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let now = api_core::unix_secs_to_rfc3339(now_unix);
+    match repo
+        .authenticate(&api_core::hash_api_key(secret), &now)
+        .await
+    {
+        Ok(Some(owner)) => {
+            if api_core::should_touch_last_used(owner.last_used_at.as_deref(), now_unix) {
+                // Best-effort: a failed stamp must not fail the request.
+                let cutoff =
+                    api_core::unix_secs_to_rfc3339(now_unix - api_core::LAST_USED_TOUCH_SECS);
+                if let Err(err) = repo.mark_used(&owner.key_id, &cutoff, &now).await {
+                    console_log!("auth: api key last-used update failed: {err}");
+                }
+            }
+            Some(owner.user)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            console_log!("auth: api key lookup failed: {err}");
+            None
+        }
+    }
+}
+
 /// `GET /auth/me` → 200 `{"user":null}` (logged out) or `{"user":{...}}`.
-pub fn me(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
-    let user = session_user(&req, ctx.data.as_ref());
+///
+/// Goes through [`authenticate`], so a client can verify a key by calling this
+/// with `Authorization: Bearer sk_…`.
+pub async fn me(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
+    let user = authenticate(&req, &ctx).await;
     let response = Response::from_json(&api_core::MeResponse { user })?;
     Ok(response.with_headers(json_headers(frontend_url(&ctx))?))
 }

@@ -78,7 +78,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     Router::with_data(config)
         .get("/health", health)
         .get("/version", version)
-        .get("/auth/me", auth::me)
+        .get_async("/auth/me", auth::me)
         .post("/auth/logout", auth::logout)
         .get("/auth/google", auth::google)
         .get_async("/auth/google/callback", auth::google_callback)

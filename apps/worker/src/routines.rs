@@ -1,7 +1,7 @@
 //! `/api/routines/*` handlers: standing-routine CRUD (ADR 0004).
 //!
-//! Session-gated via the session cookie only — like `/api/lists/*` and
-//! `/api/tasks` CRUD; routine endpoints never touch Google (no token refresh,
+//! Session-gated via the session cookie or an API key bearer — like
+//! `/api/lists/*` and `/api/tasks` CRUD; routine endpoints never touch Google (no token refresh,
 //! no RRULE ever leaves Sanctuary). The orchestration lives in
 //! `api_core::routines` (pure, unit-tested); this file extracts the session
 //! user, wires the D1 repos, and maps errors to HTTP responses.
@@ -101,7 +101,7 @@ pub async fn list_routines(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
 
@@ -130,7 +130,7 @@ pub async fn create_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
 
@@ -169,7 +169,7 @@ pub async fn update_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -210,7 +210,7 @@ pub async fn delete_routine(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {

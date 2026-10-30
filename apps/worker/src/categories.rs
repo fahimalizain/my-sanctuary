@@ -1,6 +1,7 @@
 //! `/api/categories/*` handlers: category CRUD for the one-level taxonomy.
 //!
-//! Session-gated via the session cookie only — like `/api/lists/*`. The
+//! Session-gated via the session cookie or an API key bearer — like
+//! `/api/lists/*`. The
 //! orchestration lives in `api_core::categories` (pure, unit-tested); this
 //! file extracts the session user, wires the D1 repo, and maps errors to HTTP
 //! responses.
@@ -118,7 +119,7 @@ pub async fn list_categories(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     match api_core::categories::list_categories(&d1(&ctx)?, &user.id).await {
@@ -139,7 +140,7 @@ pub async fn create_category(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let input: NewTaskCategoryInput = match req.json().await {
@@ -168,7 +169,7 @@ pub async fn update_category(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -198,7 +199,7 @@ pub async fn delete_category(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {

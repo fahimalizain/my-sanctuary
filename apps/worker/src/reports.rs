@@ -1,6 +1,7 @@
 //! `/api/reports/*` handlers (reports slices 2 and 5).
 //!
-//! Session-gated like `/api/categories/*`. The orchestration lives in
+//! Session-gated like `/api/categories/*` (session cookie or API key bearer).
+//! The orchestration lives in
 //! `api_core::digest` / `api_core::record` (pure, unit-tested); this file
 //! extracts the session user, wires the D1 repo, and maps the result to JSON.
 //!
@@ -64,7 +65,7 @@ pub async fn status(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return json_error(&ctx, 401, "unauthorized");
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
@@ -90,7 +91,7 @@ pub async fn record(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return json_error(&ctx, 401, "unauthorized");
     };
     let requested = req

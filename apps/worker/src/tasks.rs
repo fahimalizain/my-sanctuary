@@ -2,8 +2,9 @@
 //! (start/stop/pause/complete/discard), and the board move — all backed by
 //! Google Calendar events where the action touches Google.
 //!
-//! CRUD is session-gated via the session cookie only — like `/api/lists/*`
-//! and `/api/categories/*`. The timer actions additionally refresh the Google
+//! CRUD is session-gated via the session cookie or an API key bearer — like
+//! `/api/lists/*` and `/api/categories/*`. The timer actions additionally
+//! refresh the Google
 //! access token (like `/api/calendar/*`): a user whose token cannot be
 //! refreshed gets `401 {"error":"unauthorized"}`.
 //!
@@ -71,22 +72,26 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: TasksError) -> R
     }
 }
 
-/// Session user id + OAuth config, or a `None` 401 signal — the timer's
-/// session gate (same shape as `crate::calendar::session_and_oauth`).
-fn session_and_oauth<'a>(
-    req: &Request,
-    ctx: &'a RouteContext<Option<api_core::Config>>,
-) -> Result<Option<(String, &'a api_core::OAuthConfig)>> {
-    let Some(user) = crate::auth::session_user(req, ctx.data.as_ref()) else {
-        return Ok(None);
-    };
+/// Token-refresh gate for the Google-touching task verbs. The caller has
+/// already authenticated and keeps that user; the inner `Err` carries the
+/// already-built `401` response (missing OAuth config or an unrefreshable
+/// token).
+async fn timer_access(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user: &api_core::SessionUser,
+) -> Result<Result<api_core::GoogleAccess, Response>> {
     let Some(config) = ctx.data.as_ref() else {
-        return Ok(None);
+        return Ok(Err(unauthorized(ctx)?));
     };
     let Some(oauth) = config.oauth.as_ref() else {
-        return Ok(None);
+        return Ok(Err(unauthorized(ctx)?));
     };
-    Ok(Some((user.id, oauth)))
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    let repos = timer_d1(ctx)?;
+    let Some(access) = refresh_access(&repos.tokens, oauth, &user.id, now_unix).await else {
+        return Ok(Err(unauthorized(ctx)?));
+    };
+    Ok(Ok(access))
 }
 
 /// Refreshes the user's Google access token. `Ok(None)` when the stored token
@@ -161,7 +166,7 @@ fn users_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D
 /// read; a missing/soft-deleted user row (or a failed load) just lists with
 /// `focused: false` everywhere rather than failing the board.
 pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let users = users_d1(&ctx)?;
@@ -194,7 +199,7 @@ pub async fn classify_title(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let pairs: Vec<(String, String)> = {
@@ -237,7 +242,7 @@ pub async fn create_task(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let input: NewTaskInput = match req.json().await {
@@ -274,7 +279,7 @@ pub async fn update_task(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -304,7 +309,7 @@ pub async fn delete_task(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -324,8 +329,8 @@ pub async fn delete_task(
     let repos = timer_d1(&ctx)?;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let (http, access) = if is_focused {
-        let (_user_id, access) = match timer_access(&req, &ctx).await? {
-            Ok(gated) => gated,
+        let access = match timer_access(&ctx, &user).await? {
+            Ok(access) => access,
             Err(response) => return Ok(response),
         };
         (
@@ -394,24 +399,6 @@ fn timer_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<TimerRepos> 
     })
 }
 
-/// Shared session + token-refresh gate for the five timer actions. The inner
-/// `Err` carries the already-built `401` response (missing session, missing
-/// OAuth config, or an unrefreshable token).
-async fn timer_access(
-    req: &Request,
-    ctx: &RouteContext<Option<api_core::Config>>,
-) -> Result<Result<(String, api_core::GoogleAccess), Response>> {
-    let Some((user_id, oauth)) = session_and_oauth(req, ctx)? else {
-        return Ok(Err(unauthorized(ctx)?));
-    };
-    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let repos = timer_d1(ctx)?;
-    let Some(access) = refresh_access(&repos.tokens, oauth, &user_id, now_unix).await else {
-        return Ok(Err(unauthorized(ctx)?));
-    };
-    Ok(Ok((user_id, access)))
-}
-
 /// POST /api/tasks/:id/start → 200 `{"task":{...},"event":{...}}`.
 ///
 /// Opens a Google Calendar event now → now + 15 min — a fixed live marker,
@@ -427,8 +414,11 @@ pub async fn start_task(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let (user_id, access) = match timer_access(&req, &ctx).await? {
-        Ok(gated) => gated,
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+    let access = match timer_access(&ctx, &user).await? {
+        Ok(access) => access,
         Err(response) => return Ok(response),
     };
     let Some(id) = ctx.param("id") else {
@@ -447,7 +437,7 @@ pub async fn start_task(
         &repos.tasks,
         &repos.logs,
         &access,
-        &user_id,
+        &user.id,
         id,
         now_unix,
         &agenda_d1(&ctx)?,
@@ -467,8 +457,11 @@ macro_rules! timer_action {
             req: Request,
             ctx: RouteContext<Option<api_core::Config>>,
         ) -> Result<Response> {
-            let (user_id, access) = match timer_access(&req, &ctx).await? {
-                Ok(gated) => gated,
+            let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+                return unauthorized(&ctx);
+            };
+            let access = match timer_access(&ctx, &user).await? {
+                Ok(access) => access,
                 Err(response) => return Ok(response),
             };
             let Some(id) = ctx.param("id") else {
@@ -488,7 +481,7 @@ macro_rules! timer_action {
                 &repos.logs,
                 &users,
                 &access,
-                &user_id,
+                &user.id,
                 id,
                 now_unix,
                 &agenda_d1(&ctx)?,
@@ -551,11 +544,11 @@ fn respond_action(
 /// A move to IN_PROGRESS is just `start` and opens a NEW event even while
 /// other tasks already run (never a 409).
 ///
-/// The auth gate is **per action** (session + token refresh only when Google
+/// The auth gate is **per action** (credential + token refresh only when Google
 /// would be touched):
 /// - `needs_google`: target is IN_PROGRESS (start), or the current status is
 ///   IN_PROGRESS and the target is not (exit: stop/pause/complete/discard).
-/// - Otherwise the session cookie is enough, exactly like CRUD.
+/// - Otherwise the session cookie or API key bearer is enough, like CRUD.
 ///
 /// Body faults (unknown status, negative `sort_order`) are 400; a missing/
 /// other-user/soft-deleted task is 404 (checked before the gate, so a
@@ -564,7 +557,7 @@ pub async fn move_task(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -593,8 +586,8 @@ pub async fn move_task(
         || (task.status == api_core::TASK_STATUS_IN_PROGRESS
             && input.status != api_core::TASK_STATUS_IN_PROGRESS);
     let (http, access) = if needs_google {
-        let (_user_id, access) = match timer_access(&req, &ctx).await? {
-            Ok(gated) => gated,
+        let access = match timer_access(&ctx, &user).await? {
+            Ok(access) => access,
             Err(response) => return Ok(response),
         };
         (
@@ -666,8 +659,11 @@ pub async fn focus_task(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let (user_id, access) = match timer_access(&req, &ctx).await? {
-        Ok(gated) => gated,
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+    let access = match timer_access(&ctx, &user).await? {
+        Ok(access) => access,
         Err(response) => return Ok(response),
     };
     let Some(id) = ctx.param("id") else {
@@ -687,7 +683,7 @@ pub async fn focus_task(
         &repos.logs,
         &users_d1(&ctx)?,
         &access,
-        &user_id,
+        &user.id,
         id,
         now_unix,
         &notify,
@@ -707,8 +703,11 @@ pub async fn delete_focus(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let (user_id, access) = match timer_access(&req, &ctx).await? {
-        Ok(gated) => gated,
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+    let access = match timer_access(&ctx, &user).await? {
+        Ok(access) => access,
         Err(response) => return Ok(response),
     };
     let repos = timer_d1(&ctx)?;
@@ -724,7 +723,7 @@ pub async fn delete_focus(
         &repos.logs,
         &users_d1(&ctx)?,
         &access,
-        &user_id,
+        &user.id,
         now_unix,
         &notify,
     )
