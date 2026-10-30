@@ -1,9 +1,14 @@
 import { useState } from 'react';
-import { Loader2, Trash2 } from 'lucide-react';
+import { Loader2, Plus, Trash2 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { useApiKeysQuery, useRevokeApiKey } from '@/app/queries/api-keys';
+import {
+  useApiKeysQuery,
+  useCreateApiKey,
+  useRevokeApiKey,
+} from '@/app/queries/api-keys';
 import type { ApiKey } from '@/app/types';
+import { CreateApiKeyDialog } from './CreateApiKeyDialog';
 import { SettingsSection } from './SettingsSection';
 import { expiryLabel, isExpired, lastUsedLabel } from './api-key-format';
 
@@ -16,6 +21,8 @@ import { expiryLabel, isExpired, lastUsedLabel } from './api-key-format';
 export function ApiKeysSection() {
   const apiKeysQuery = useApiKeysQuery();
   const revoke = useRevokeApiKey();
+  const create = useCreateApiKey();
+  const [createOpen, setCreateOpen] = useState(false);
 
   const apiKeys = apiKeysQuery.data?.keys ?? [];
   const isLoading = apiKeysQuery.isLoading;
@@ -44,10 +51,16 @@ export function ApiKeysSection() {
 
   return (
     <SettingsSection title="API keys">
-      <p className="mb-3 text-sm text-muted-foreground">
-        Use a key to call the Sanctuary API from scripts, Shortcuts, or other
-        clients.
-      </p>
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+          Use a key to call the Sanctuary API from scripts, Shortcuts, or other
+          clients.
+        </p>
+        <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <Plus className="mr-1.5 h-3.5 w-3.5" />
+          New key
+        </Button>
+      </div>
 
       {/* Load error — rows stay mounted underneath when a refresh fails */}
       {loadError && (
@@ -89,7 +102,10 @@ export function ApiKeysSection() {
 
       {!isLoading && !loadError && apiKeys.length === 0 && (
         <div className="rounded-lg border border-dashed border-border bg-card/50 p-6 text-center">
-          <p className="text-sm text-muted-foreground">No API keys yet.</p>
+          <p className="text-sm text-muted-foreground">
+            No API keys yet. Create one to call the API from scripts or
+            Shortcuts.
+          </p>
         </div>
       )}
 
@@ -137,6 +153,17 @@ export function ApiKeysSection() {
           })}
         </div>
       )}
+
+      {/* `reset()` on close drops the secret-bearing mutation result; the
+          dialog keeps the secret only while it is open. */}
+      <CreateApiKeyDialog
+        open={createOpen}
+        onOpenChange={(next) => {
+          setCreateOpen(next);
+          if (!next) create.reset();
+        }}
+        onCreate={create.mutateAsync}
+      />
     </SettingsSection>
   );
 }
