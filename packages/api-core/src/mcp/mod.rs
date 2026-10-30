@@ -29,6 +29,6 @@ pub use protocol::{
 };
 pub use tools::{tool_by_name, tools, Tool};
 pub use upstream::{
-    is_safe_id, tool_outcome_from_upstream, validate_event_window, GOOGLE_ACCESS_EXPIRED,
-    MAX_EVENT_SPAN_SECS,
+    allow_subrequest, is_safe_id, tool_outcome_from_upstream, validate_event_window,
+    GOOGLE_ACCESS_EXPIRED, MAX_EVENT_SPAN_SECS,
 };

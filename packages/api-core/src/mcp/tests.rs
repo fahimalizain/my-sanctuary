@@ -929,3 +929,94 @@ fn is_safe_id_rejects_paths_spaces_and_oversized_ids() {
     }
     assert!(!is_safe_id(&"a".repeat(65)));
 }
+
+/// A real-shaped path id: a UUID passes [`is_safe_id`] and must stay allowed.
+const UUID_TASK_PATH: &str = "/api/tasks/9f1c2a7e-0b3d-4c8a-9e5f-1a2b3c4d5e6f";
+
+#[test]
+fn allow_subrequest_accepts_every_pair_in_the_table() {
+    for (method, path) in [
+        ("GET", "/auth/me"),
+        ("GET", "/api/tasks"),
+        ("POST", "/api/tasks"),
+        ("GET", "/api/tasks/classify"),
+        ("PATCH", "/api/tasks/ab12"),
+        ("PATCH", UUID_TASK_PATH),
+        ("POST", "/api/tasks/ab12/move"),
+        ("GET", "/api/agenda"),
+        ("POST", "/api/agenda/items/ab12/move"),
+        ("POST", "/api/agenda/items/ab12/reschedule"),
+        ("GET", "/api/calendar/events"),
+        ("POST", "/api/calendar/events"),
+        ("GET", "/api/calendar/calendars"),
+        ("GET", "/api/reports/status"),
+        ("GET", "/api/rules/scoreboard"),
+    ] {
+        assert!(
+            allow_subrequest(method, path),
+            "{method} {path} must be allowed"
+        );
+    }
+}
+
+#[test]
+fn allow_subrequest_refuses_unlisted_methods_and_paths() {
+    for (method, path) in [
+        // Deletes and the task timer verbs are not in the table.
+        ("DELETE", "/api/tasks/ab12"),
+        ("POST", "/api/tasks/ab12/start"),
+        ("POST", "/api/tasks/ab12/stop"),
+        ("POST", "/api/tasks/ab12/complete"),
+        ("POST", "/api/tasks/ab12/focus"),
+        // `classify` is a GET; the POST would create a task instead.
+        ("POST", "/api/tasks/classify"),
+        // Calendar repair and a single calendar have no entry.
+        ("POST", "/api/calendar/calendars/ab12/repair"),
+        ("GET", "/api/calendar/calendars/ab12"),
+        ("GET", "/api/calendar/events/ab12"),
+        // Key management stays cookie-only.
+        ("GET", "/api/keys"),
+        ("POST", "/api/keys"),
+        ("DELETE", "/api/keys/ab12"),
+        // The MCP endpoint itself is not a sub-request target.
+        ("POST", "/api/mcp"),
+        // Right path, wrong method.
+        ("GET", "/api/agenda/items/ab12/move"),
+        ("GET", "/api/tasks/ab12"),
+        ("GET", "/api/agenda/items/ab12/reschedule"),
+        // Nothing outside `/auth` and `/api` is reachable.
+        ("GET", "/"),
+        ("GET", "/api"),
+    ] {
+        assert!(
+            !allow_subrequest(method, path),
+            "{method} {path} must be refused"
+        );
+    }
+}
+
+#[test]
+fn allow_subrequest_refuses_unsafe_ids_and_trailing_slashes() {
+    for (method, path) in [
+        // `..`, embedded slashes, an empty id, and a trailing slash.
+        ("PATCH", "/api/tasks/../keys"),
+        ("PATCH", "/api/tasks/.."),
+        ("PATCH", "/api/tasks/a/b"),
+        ("PATCH", "/api/tasks/"),
+        ("POST", "/api/tasks/"),
+        ("POST", "/api/tasks//move"),
+        ("POST", "/api/agenda/items//move"),
+        ("POST", "/api/agenda/items/../reschedule"),
+        ("POST", "/api/agenda/items/a/b/move"),
+        // A query string is never part of an allowlisted path.
+        ("GET", "/api/tasks?include=all"),
+        ("PATCH", "/api/tasks/ab12?force=1"),
+    ] {
+        assert!(
+            !allow_subrequest(method, path),
+            "{method} {path} must be refused"
+        );
+    }
+    let too_long = format!("/api/tasks/{}", "a".repeat(65));
+    assert!(!allow_subrequest("PATCH", &too_long));
+}

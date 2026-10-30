@@ -83,6 +83,46 @@ pub fn is_safe_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
+/// Whether a tool may issue this sub-request through the REST router.
+///
+/// An explicit table of exact method-and-path pairs, never a prefix rule: a
+/// `POST /api/tasks` prefix would also reach `/api/tasks/:id/complete`, and a
+/// `/api/calendar/calendars` rule would reach the repair endpoint (ADR 0009
+/// §4). `:id` segments must pass [`is_safe_id`], so `..`, embedded slashes, and
+/// an empty or trailing-slash id are refused. Anything not in the table —
+/// `DELETE`, `/api/keys`, the timer verbs, focus, occurrences — is refused, and
+/// so is any path carrying a query string.
+pub fn allow_subrequest(method: &str, path: &str) -> bool {
+    match (method, path) {
+        ("GET", "/auth/me")
+        | ("GET", "/api/tasks")
+        | ("POST", "/api/tasks")
+        | ("GET", "/api/tasks/classify")
+        | ("GET", "/api/agenda")
+        | ("GET", "/api/calendar/events")
+        | ("POST", "/api/calendar/events")
+        | ("GET", "/api/calendar/calendars")
+        | ("GET", "/api/reports/status")
+        | ("GET", "/api/rules/scoreboard") => true,
+        ("PATCH", path) => id_between(path, "/api/tasks/", ""),
+        ("POST", path) => {
+            id_between(path, "/api/tasks/", "/move")
+                || id_between(path, "/api/agenda/items/", "/move")
+                || id_between(path, "/api/agenda/items/", "/reschedule")
+        }
+        _ => false,
+    }
+}
+
+/// True iff `path` is exactly `{prefix}{id}{suffix}` and `id` passes
+/// [`is_safe_id`]. With an empty `suffix` the id must reach the end of the
+/// path, so a trailing slash fails.
+fn id_between(path: &str, prefix: &str, suffix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .is_some_and(is_safe_id)
+}
+
 /// Truncates on a character boundary — never splits a UTF-8 sequence.
 fn truncate_chars(message: &str, max: usize) -> String {
     if message.chars().count() <= max {

@@ -7,6 +7,7 @@ mod cron;
 mod db;
 mod http;
 mod lists;
+mod mcp;
 mod queue;
 mod reports;
 mod routines;
@@ -75,6 +76,33 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         return user_hub::connect(req, env, config.as_ref()).await;
     }
 
+    // OAuth discovery probes must not reach the SPA, whose
+    // `single-page-application` fallback answers an unknown GET with
+    // `index.html` and 200 — a discovery document that happens to be HTML.
+    // Every method gets a JSON 404, with no CORS and no `WWW-Authenticate`
+    // (ADR 0009 §7). This runs before the router, which would answer as text.
+    if req.path().starts_with("/.well-known/oauth-") {
+        return Ok(
+            Response::from_json(&serde_json::json!({ "error": "not found" }))?.with_status(404),
+        );
+    }
+
+    router(config).run(req, env).await
+}
+
+/// The Worker's whole route table, in one chain.
+///
+/// The MCP endpoint runs its tools as in-process sub-requests through this same
+/// router (ADR 0009 §4), so the chain lives here instead of inline in `fetch`:
+/// both callers see identical routing, Google gating, defaults, and error
+/// mapping.
+///
+/// `/api/mcp` is registered for POST and OPTIONS only, adding no GET or DELETE
+/// — the router's 405 is the answer for those, and there is deliberately no
+/// session-terminating DELETE (ADR 0009 §2).
+pub(crate) fn router(
+    config: Option<api_core::Config>,
+) -> Router<'static, Option<api_core::Config>> {
     Router::with_data(config)
         .get("/health", health)
         .get("/version", version)
@@ -197,8 +225,8 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         .options("/api/occurrences/:id/complete", auth::options)
         .options("/api/occurrences/:id/skip", auth::options)
         .options("/api/occurrences/:id/reopen", auth::options)
-        .run(req, env)
-        .await
+        .post_async("/api/mcp", mcp::post)
+        .options("/api/mcp", mcp::options)
 }
 
 /// Whether `req` is a Google Calendar push notification: a POST whose path
