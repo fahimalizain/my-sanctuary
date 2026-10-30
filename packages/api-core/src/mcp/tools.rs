@@ -96,7 +96,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         read_only(
             "classify_title",
-            "Classify an event or task title against the user's categories. `title` is required; `category_id` is optional. Creates nothing.",
+            "Classify a task title against the user's categories. `title` is required; `category_id` is optional. Creates nothing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -196,16 +196,16 @@ pub fn tools() -> Vec<Tool> {
         ),
         mutating(
             "create_event",
-            "Create a calendar event. `summary`, `start`, and `end` are required; `description`, `is_all_day`, `start_time_zone`, and `calendar_id` are optional. Omitting `calendar_id` lets title classification pick the calendar. Task, routine, and occurrence links are not accepted.",
+            "Create a calendar event. `summary`, `start`, and `end` are required; `description`, `is_all_day`, `start_time_zone`, and `calendar_id` are optional. `start`/`end` are RFC 3339 instants, or civil dates when `is_all_day` is true. Omitting `calendar_id` lets title classification pick the calendar. Task, routine, and occurrence links are not accepted.",
             json!({
                 "type": "object",
                 "properties": {
                     "summary": { "type": "string" },
-                    "start": { "type": "string", "description": "RFC 3339 start instant" },
-                    "end": { "type": "string", "description": "RFC 3339 end instant" },
+                    "start": { "type": "string", "description": "RFC 3339 start instant; when `is_all_day` is true, a civil `YYYY-MM-DD` (or an RFC 3339 value whose date prefix is used)" },
+                    "end": { "type": "string", "description": "RFC 3339 end instant; when `is_all_day` is true, a civil `YYYY-MM-DD` (or an RFC 3339 value whose date prefix is used)" },
                     "description": { "type": "string" },
                     "is_all_day": { "type": "boolean" },
-                    "start_time_zone": { "type": "string", "description": "IANA zone for an all-day event" },
+                    "start_time_zone": { "type": "string", "description": "IANA zone for a timed event; ignored when `is_all_day` is true" },
                     "calendar_id": { "type": "string", "description": "Force a calendar; omit to classify the title" },
                 },
                 "required": ["summary", "start", "end"],
