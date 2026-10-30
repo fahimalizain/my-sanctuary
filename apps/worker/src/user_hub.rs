@@ -15,6 +15,8 @@ use worker::*;
 /// - Missing `Upgrade: websocket` → `426`.
 /// - Missing `USER_HUB` binding → logged `500`.
 pub async fn connect(req: Request, env: Env, config: Option<&api_core::Config>) -> Result<Response> {
+    // Cookie-only by design: a browser WebSocket upgrade cannot set an
+    // `Authorization` header, so realtime never authenticates a bearer token.
     let Some(user) = crate::auth::session_user(&req, config) else {
         return Ok(Response::from_json(&serde_json::json!({ "error": "unauthorized" }))?
             .with_status(401));

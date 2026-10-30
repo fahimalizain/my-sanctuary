@@ -2,20 +2,20 @@
 //! creation, and the Google push-notification webhook, mirroring the old Go
 //! `handlers/calendar.go`.
 //!
-//! The list/create endpoints are session-gated and refresh the Google access
-//! token when stale. GET list endpoints (`events`, `calendars`): 401 is
-//! session-only; a Google grant refresh failure serves the D1 cache (events
-//! include an `authorization_required` envelope). Write verbs
-//! (create/patch/delete) still map refresh failure to 401
-//! `{"error":"unauthorized"}`. The webhook is unauthenticated by design
+//! The list/create endpoints are gated on the session cookie or an API key
+//! bearer and refresh the Google access token when stale. GET list endpoints
+//! (`events`, `calendars`): 401 is credential-only; a Google grant refresh
+//! failure serves the D1 cache (events include an `authorization_required`
+//! envelope). Write verbs (create/patch/delete) still map refresh failure to
+//! 401 `{"error":"unauthorized"}`. The webhook is unauthenticated by design
 //! (ADR 0001 § Webhook): Google cannot send a session cookie, so verification
 //! is the `X-Goog-Channel-*` headers, and every failure is swallowed into a
 //! 200.
 //!
 //! The sync/create/webhook orchestration lives in `api_core::calendar` (pure,
-//! unit-tested); this module only extracts the session user (or the webhook
-//! headers), wires the D1 repos and `WorkerHttp`, and maps errors to HTTP
-//! responses.
+//! unit-tested); this module only extracts the authenticated user (or the
+//! webhook headers), wires the D1 repos and `WorkerHttp`, and maps errors to
+//! HTTP responses.
 //!
 //! - [`http`] — REST: list/create/patch/delete events and list calendars
 //! - [`webhook`] — Google push-notification handler (`notifications`)

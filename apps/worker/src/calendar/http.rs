@@ -24,12 +24,14 @@ fn json_error(
     Ok(response)
 }
 
-/// Session user id + OAuth config, or a 401 response when unavailable.
-fn session_and_oauth<'a>(
+/// Authenticated user + OAuth config, or a `None` 401 signal: the credential
+/// is read once by [`crate::auth::authenticate`] (cookie or API key bearer),
+/// and a missing OAuth config stays a 401 exactly as it did cookie-only.
+async fn session_and_oauth<'a>(
     req: &Request,
     ctx: &'a RouteContext<Option<api_core::Config>>,
-) -> Result<Option<(String, &'a OAuthConfig)>> {
-    let Some(user) = crate::auth::session_user(req, ctx.data.as_ref()) else {
+) -> Result<Option<(api_core::SessionUser, &'a OAuthConfig)>> {
+    let Some(user) = crate::auth::authenticate(req, ctx).await else {
         return Ok(None);
     };
     let Some(config) = ctx.data.as_ref() else {
@@ -38,7 +40,7 @@ fn session_and_oauth<'a>(
     let Some(oauth) = config.oauth.as_ref() else {
         return Ok(None);
     };
-    Ok(Some((user.id, oauth)))
+    Ok(Some((user, oauth)))
 }
 
 async fn paint_single_event(
@@ -185,18 +187,19 @@ async fn resolve_create_defaults(
 /// `GET /api/calendar/events` → 200
 /// `{"events":[...],"source":"cache"|"window"|"mixed","sync":{...}}`.
 ///
-/// Session-gated; refreshes the Google token when stale; for each
-/// never-initialized sync-enabled calendar runs a bounded window fetch
+/// Gated on the session cookie or an API key bearer; refreshes the Google
+/// token when stale; for each never-initialized sync-enabled calendar runs a
+/// bounded window fetch
 /// (awaited, never fire-and-forget) without waiting on the replica token;
 /// then serves the overlap window from the D1 cache (plus ephemeral rows on
 /// lease miss) and a sanitized replica-health `sync` envelope. Google auth
 /// failures on this path are logged in `sync_errors` — they are **not**
-/// mapped to HTTP 401 (401 stays session-only).
+/// mapped to HTTP 401 (401 stays a credential failure).
 pub async fn list_events(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
 
@@ -235,9 +238,9 @@ pub async fn list_events(
     // snapshot, and the paint taxonomy (lists, categories, patterns). Only
     // the range query has to wait — a window fetch may write through first.
     let (refresh, snapshot, taxonomy) = futures::join!(
-        api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix),
-        api_core::load_list_snapshot(&calendars, &watches, &user_id),
-        api_core::load_paint_taxonomy(&list_repo, &category_repo, &user_id),
+        api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix),
+        api_core::load_list_snapshot(&calendars, &watches, &user.id),
+        api_core::load_paint_taxonomy(&list_repo, &category_repo, &user.id),
     );
 
     let output = match refresh {
@@ -255,7 +258,7 @@ pub async fn list_events(
                 &events,
                 &watches,
                 &access,
-                &user_id,
+                &user.id,
                 &start,
                 &end,
                 now_unix,
@@ -285,7 +288,7 @@ pub async fn list_events(
             match api_core::list_events_after_refresh_failure(
                 &calendars,
                 &events,
-                &user_id,
+                &user.id,
                 &start,
                 &end,
                 now_unix,
@@ -328,12 +331,13 @@ pub async fn list_events(
 
 /// `GET /api/calendar/calendars` → 200 `{"calendars":[...]}`.
 ///
-/// Session-gated; refreshes the Google token when stale. Serves the user's
-/// imported calendars from the D1 cache — no Google calls once the store has
+/// Gated on the session cookie or an API key bearer; refreshes the Google
+/// token when stale. Serves the user's imported calendars from the D1 cache —
+/// no Google calls once the store has
 /// rows; an empty store runs the same first-contact `calendarList` import
 /// as `GET /api/calendar/events` (no event sync, no watch setup).
 ///
-/// Missing session → 401 `{"error":"unauthorized"}`.
+/// Missing/unusable credential → 401 `{"error":"unauthorized"}`.
 /// Google `refresh_if_needed` failure: revoked/missing grant → 200 cached
 /// calendars (stamp `authorization_required` on revoked); transient → 500.
 /// A `calendarList` import failure → 502 with Google's message; anything else
@@ -342,7 +346,7 @@ pub async fn list_calendars(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
 
@@ -357,7 +361,7 @@ pub async fn list_calendars(
         &crate::http::WorkerHttp,
         &tokens,
         oauth,
-        &user_id,
+        &user.id,
         now_unix,
     )
     .await
@@ -367,7 +371,7 @@ pub async fn list_calendars(
                 &crate::http::WorkerHttp,
                 &calendars,
                 &access,
-                &user_id,
+                &user.id,
                 &now_rfc3339,
             )
             .await
@@ -388,7 +392,7 @@ pub async fn list_calendars(
             }
             match api_core::list_calendars_after_refresh_failure(
                 &calendars,
-                &user_id,
+                &user.id,
                 now_unix,
                 &err,
             )
@@ -408,15 +412,16 @@ pub async fn list_calendars(
 /// `POST /api/calendar/calendars/:id/repair` → 200
 /// `{"status":"queued"|"in_progress"|"cooldown","retry_after_seconds":?}`.
 ///
-/// Session-gated D1-only write: persists a tracked reseed
-/// (`full_sync_requested` / `rebuilding`) and returns immediately. Does **not**
+/// Gated on the session cookie or an API key bearer, D1-only write: persists
+/// a tracked reseed (`full_sync_requested` / `rebuilding`) and returns
+/// immediately. Does **not**
 /// refresh the Google grant, walk the replica, or notify the user — cron is
 /// the walker and notifies on publish (issue #59).
 pub async fn repair_calendar(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, _oauth)) = session_and_oauth(&req, &ctx)? else {
+    let Some((user, _oauth)) = session_and_oauth(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
@@ -427,7 +432,7 @@ pub async fn repair_calendar(
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
-    match api_core::request_calendar_repair(&calendars, &user_id, &id, now_unix).await {
+    match api_core::request_calendar_repair(&calendars, &user.id, &id, now_unix).await {
         Ok(body) => {
             let response = Response::from_json(&body)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
@@ -460,7 +465,7 @@ pub async fn create_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
 
@@ -468,7 +473,7 @@ pub async fn create_event(
     let tokens = crate::db::D1TokenRepo::new(d1()?);
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix).await {
         Ok(access) => access,
         Err(err) => {
             console_log!("calendar: token refresh failed: {err}");
@@ -491,7 +496,7 @@ pub async fn create_event(
         &list_repo,
         &category_repo,
         &access,
-        &user_id,
+        &user.id,
         now_unix,
         &mut input,
     )
@@ -503,7 +508,7 @@ pub async fn create_event(
         &events,
         &operations,
         &access,
-        &user_id,
+        &user.id,
         &input,
         now_unix,
         &category_repo,
@@ -513,7 +518,7 @@ pub async fn create_event(
     {
         Ok(output) => {
             // create_event never returns Ok with cache_error set (issue #50).
-            let event = paint_single_event(&ctx, &user_id, output.event).await?;
+            let event = paint_single_event(&ctx, &user.id, output.event).await?;
             let response = Response::from_json(&api_core::CreateEventResponse {
                 event,
                 source: output.source,
@@ -549,7 +554,7 @@ pub async fn update_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
@@ -560,7 +565,7 @@ pub async fn update_event(
     let tokens = crate::db::D1TokenRepo::new(d1()?);
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix).await {
         Ok(access) => access,
         Err(err) => {
             console_log!("calendar: token refresh failed: {err}");
@@ -584,7 +589,7 @@ pub async fn update_event(
         &events,
         &operations,
         &access,
-        &user_id,
+        &user.id,
         &id,
         &fields,
         now_unix,
@@ -595,7 +600,7 @@ pub async fn update_event(
     {
         Ok(output) => {
             // Journaled patch never returns Ok with cache_error set (issue #50).
-            let event = paint_single_event(&ctx, &user_id, output.event).await?;
+            let event = paint_single_event(&ctx, &user.id, output.event).await?;
             let response = Response::from_json(&api_core::CreateEventResponse {
                 event,
                 source: output.source,
@@ -625,7 +630,7 @@ pub async fn delete_event(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx)? else {
+    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
@@ -636,7 +641,7 @@ pub async fn delete_event(
     let tokens = crate::db::D1TokenRepo::new(d1()?);
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user_id, now_unix).await {
+    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix).await {
         Ok(access) => access,
         Err(err) => {
             console_log!("calendar: token refresh failed: {err}");
@@ -654,7 +659,7 @@ pub async fn delete_event(
         &events,
         &operations,
         &access,
-        &user_id,
+        &user.id,
         &id,
         now_unix,
         &notify,

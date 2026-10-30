@@ -12,23 +12,9 @@ import { cn } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/lib/theme-context';
 import { ThemePreferenceControl } from './ThemePreferenceControl';
+import { SettingsSection } from './SettingsSection';
+import { ApiKeysSection } from './ApiKeysSection';
 import { useNavigate } from '@tanstack/react-router';
-
-interface SettingsSectionProps {
-  title: string;
-  children: React.ReactNode;
-}
-
-function SettingsSection({ title, children }: SettingsSectionProps) {
-  return (
-    <div className="bg-card rounded-xl shadow-sm border border-border overflow-hidden mb-6">
-      <div className="p-4 border-b border-border bg-muted/50">
-        <h2 className="font-heading font-semibold text-foreground">{title}</h2>
-      </div>
-      <div className="p-4">{children}</div>
-    </div>
-  );
-}
 
 interface SettingsItemProps {
   icon: React.ReactNode;
@@ -200,6 +186,9 @@ export function SettingsPage() {
             />
           </div>
         </SettingsSection>
+
+        {/* API keys */}
+        <ApiKeysSection />
 
         {/* Routines */}
         <SettingsSection title="Routines">

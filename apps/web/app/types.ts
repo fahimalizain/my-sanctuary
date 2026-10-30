@@ -1016,6 +1016,51 @@ export interface RecordYearRow {
   days: number;
 }
 
+// ──────────────────────────────────────────
+// API keys (settings) — shapes mirror the `api_keys` row view the worker
+// returns. The secret exists exactly once, in the create response; neither
+// it nor the stored `key_hash` is ever part of the list row.
+// ──────────────────────────────────────────
+
+// One key from GET /api/keys (cookie-session read only).
+export interface ApiKey {
+  id: string;
+  name: string;
+  // The stored prefix ("sk_AbCd1234": `sk_` plus 8 base64url chars), shown
+  // with an ellipsis — never the secret itself.
+  key_prefix: string;
+  // `YYYY-MM-DD` civil expiry date; `null` = never expires.
+  expires_on: string | null;
+  // RFC 3339 instant the server compares against; `null` = never expires.
+  expires_at: string | null;
+  // RFC 3339 instant of the last successful use; `null` = never used.
+  last_used_at: string | null;
+  created_at: string;
+}
+
+// The envelope returned by GET /api/keys
+export interface ApiKeysResponse {
+  keys: ApiKey[];
+}
+
+// Request body for POST /api/keys. `expires_on` omitted / null = no expiry.
+export interface NewApiKeyInput {
+  name: string;
+  expires_on?: string | null;
+}
+
+// The envelope returned by POST /api/keys. `secret` is the one-time
+// plaintext — never cached, never re-readable from the server.
+export interface CreateApiKeyResponse {
+  key: ApiKey;
+  secret: string;
+}
+
+// The envelope returned by DELETE /api/keys/:id
+export interface DeleteApiKeyResponse {
+  success: boolean;
+}
+
 // The envelope returned by GET /api/reports/record.
 export interface RecordReport {
   as_of: string;

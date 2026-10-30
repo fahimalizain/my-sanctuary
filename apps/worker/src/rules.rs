@@ -1,8 +1,9 @@
 //! `/api/rules/*` and `/api/pauses/*` handlers (reports slice 3).
 //!
-//! Session-gated like `/api/categories/*`. The model lives in
-//! `api_core::rules` (pure, unit-tested); this file extracts the session user,
-//! wires the D1 repos, and maps errors to HTTP responses.
+//! Gated like `/api/categories/*` (session cookie or API key bearer). The
+//! model lives in `api_core::rules` (pure, unit-tested); this file extracts
+//! the authenticated user, wires the D1 repos, and maps errors to HTTP
+//! responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid body / invalid params / unknown
 //! category, 404 unknown rule or pause, 409 a transition the rule's phase does
@@ -126,7 +127,7 @@ pub async fn scoreboard(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
@@ -141,7 +142,7 @@ pub async fn scoreboard(
 
 /// `GET /api/rules/archive` → 200 `{"rules":[RuleScore]}`.
 pub async fn archive(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
@@ -159,7 +160,7 @@ pub async fn create_rule(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(input) = json_body::<api_core::NewRuleInput>(&mut req).await else {
@@ -177,7 +178,7 @@ pub async fn update_rule(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").cloned() else {
@@ -202,7 +203,7 @@ pub async fn pause_rule(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").cloned() else {
@@ -225,7 +226,7 @@ pub async fn resume_rule(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").cloned() else {
@@ -259,7 +260,7 @@ async fn set_archived(
     ctx: RouteContext<Option<api_core::Config>>,
     archived: bool,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").cloned() else {
@@ -287,7 +288,7 @@ pub async fn reorder_rules(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(input) = json_body::<api_core::ReorderInput>(&mut req).await else {
@@ -305,7 +306,7 @@ pub async fn list_pauses(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     match api_core::list_pauses(&rules_d1(&ctx)?, &user.id).await {
@@ -319,7 +320,7 @@ pub async fn create_pause(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(input) = json_body::<api_core::NewPauseInput>(&mut req).await else {
@@ -337,7 +338,7 @@ pub async fn delete_pause(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").cloned() else {

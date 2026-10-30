@@ -1,24 +1,25 @@
 //! `/api/agenda/*` + `/api/occurrences/*` handlers (ADR 0004).
 //!
-//! Session-gated via the session cookie — like `/api/lists/*` and
-//! `/api/routines`. The Google-touching verbs gate on a refreshable token:
+//! Session-gated via the session cookie or an API key bearer — like
+//! `/api/lists/*` and `/api/routines`. The Google-touching verbs gate on a
+//! refreshable token:
 //! `/start` always, pause/complete/skip **when the occurrence is `in_progress`
 //! with stored ids** (load first, like the focused delete), and the title
-//! PATCH **when a chip exists** (`google_event_id` set). Everything else is
-//! session-only. The orchestration lives in `api_core::agenda` (pure,
-//! unit-tested); this file extracts the session user, wires the D1 repos,
-//! refreshes tokens, and maps errors to HTTP responses.
+//! PATCH **when a chip exists** (`google_event_id` set). Everything else
+//! needs only the credential. The orchestration lives in `api_core::agenda`
+//! (pure, unit-tested); this file extracts the authenticated user, wires the
+//! D1 repos, refreshes tokens, and maps errors to HTTP responses.
 //!
-//! Status map: 401 unauthorized (missing session, or a Google-touching verb
-//! without a refreshable token), 400 invalid input (invalid date, malformed
-//! body, negative rank, reschedule into the past / past today+10y / of a
-//! running or terminal task, a reschedule that sets both `date` and `backlog`
-//! or neither, a backlog drop of a running/terminal task or of an occurrence,
-//! move-to-today of a day that is not in the past, empty PATCH body, start on
-//! a non-today or terminal occurrence, no writable calendar), 404 "not found"
-//! (missing/other-user/soft-deleted task, occurrence, item, or routine —
-//! existence is never leaked), 502 Google write failure, 500 logged database
-//! errors.
+//! Status map: 401 unauthorized (missing/unusable credential, or a
+//! Google-touching verb without a refreshable token), 400 invalid input
+//! (invalid date, malformed body, negative rank, reschedule into the past /
+//! past today+10y / of a running or terminal task, a reschedule that sets both
+//! `date` and `backlog` or neither, a backlog drop of a running/terminal task
+//! or of an occurrence, move-to-today of a day that is not in the past, empty
+//! PATCH body, start on a non-today or terminal occurrence, no writable
+//! calendar), 404 "not found" (missing/other-user/soft-deleted task, occurrence,
+//! item, or routine — existence is never leaked), 502 Google write failure,
+//! 500 logged database errors.
 
 use worker::*;
 
@@ -158,16 +159,10 @@ fn tokens_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::
     Ok(crate::db::D1TokenRepo::new(db))
 }
 
-/// Session user id + OAuth config, or `None` — the Google gate's session
-/// check (missing session or missing OAuth config both mean 401).
-fn session_and_oauth<'a>(
-    req: &Request,
-    ctx: &'a RouteContext<Option<api_core::Config>>,
-) -> Option<(String, &'a OAuthConfig)> {
-    let user = crate::auth::session_user(req, ctx.data.as_ref())?;
-    let config = ctx.data.as_ref()?;
-    let oauth = config.oauth.as_ref()?;
-    Some((user.id, oauth))
+/// OAuth config for the Google gate, or `None` — the caller has already
+/// authenticated, so a missing config or a missing grant both stay 401.
+fn google_access<'a>(ctx: &'a RouteContext<Option<api_core::Config>>) -> Option<&'a OAuthConfig> {
+    ctx.data.as_ref()?.oauth.as_ref()
 }
 
 /// Refreshes the user's Google access token. `None` when the stored token
@@ -224,7 +219,7 @@ async fn focused_task_id(
 /// (the old `?date=` parameter is ignored). The response carries the
 /// server-computed `today` + `time_zone`.
 pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let (from, to) = {
@@ -278,7 +273,7 @@ pub async fn move_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -328,7 +323,7 @@ pub async fn reschedule_agenda_item(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -376,13 +371,13 @@ pub async fn reschedule_agenda_item(
 /// civil today in one call, appended to today's pile in their original
 /// order. `done`/`skipped`/`in_progress` occurrences, terminal or
 /// soft-deleted tasks, soft-deleted-routine leftovers and orphans stay where
-/// they are. Today or a future date → 400. No body, session-only — no Google
-/// write of any kind.
+/// they are. Today or a future date → 400. No body, credential-only — no
+/// Google write of any kind.
 pub async fn move_day_to_today(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(date) = ctx.param("date") else {
@@ -422,12 +417,12 @@ pub async fn move_day_to_today(
 /// (`google_event_id` set — load first, like the focused delete) does the
 /// PATCH also write Google (the chip's `summary` follows the resolved
 /// title), so only then is a refreshable token required (401 otherwise). A
-/// chip-less occurrence is session-only.
+/// chip-less occurrence needs only the credential.
 pub async fn patch_occurrence(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -452,11 +447,11 @@ pub async fn patch_occurrence(
     }
     let needs_google = occurrence.google_event_id.is_some() && occurrence.calendar_id.is_some();
     let (http, access) = if needs_google {
-        let Some((user_id, oauth)) = session_and_oauth(&req, &ctx) else {
+        let Some(oauth) = google_access(&ctx) else {
             return unauthorized(&ctx);
         };
         let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-        let Some(access) = refresh_access(&tokens_d1(&ctx)?, oauth, &user_id, now_unix).await else {
+        let Some(access) = refresh_access(&tokens_d1(&ctx)?, oauth, &user.id, now_unix).await else {
             return unauthorized(&ctx);
         };
         (
@@ -512,7 +507,10 @@ pub async fn start_occurrence(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user_id, oauth)) = session_and_oauth(&req, &ctx) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+    let Some(oauth) = google_access(&ctx) else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
@@ -520,7 +518,7 @@ pub async fn start_occurrence(
     };
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let tokens = tokens_d1(&ctx)?;
-    let Some(access) = refresh_access(&tokens, oauth, &user_id, now_unix).await else {
+    let Some(access) = refresh_access(&tokens, oauth, &user.id, now_unix).await else {
         return unauthorized(&ctx);
     };
 
@@ -539,7 +537,7 @@ pub async fn start_occurrence(
         &occurrences_d1(&ctx)?,
         &agenda_d1(&ctx)?,
         &access,
-        &user_id,
+        &user.id,
         id,
         now_unix,
         &notify,
@@ -554,7 +552,7 @@ pub async fn start_occurrence(
     }
 }
 
-/// Shared body of the pause/complete/skip handlers: session-only unless the
+/// Shared body of the pause/complete/skip handlers: credential-only unless the
 /// occurrence is `in_progress` **with** stored ids — then the running chip
 /// gets closed and a refreshable token is required (401 otherwise). The
 /// occurrence is loaded before the gate (like the focused delete / move), so
@@ -566,7 +564,7 @@ macro_rules! occurrence_exit {
             req: Request,
             ctx: RouteContext<Option<api_core::Config>>,
         ) -> Result<Response> {
-            let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+            let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
                 return unauthorized(&ctx);
             };
             let Some(id) = ctx.param("id") else {
@@ -588,12 +586,12 @@ macro_rules! occurrence_exit {
                 && occurrence.google_event_id.is_some()
                 && occurrence.calendar_id.is_some();
             let (http, access) = if needs_google {
-                let Some((user_id, oauth)) = session_and_oauth(&req, &ctx) else {
+                let Some(oauth) = google_access(&ctx) else {
                     return unauthorized(&ctx);
                 };
                 let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
                 let Some(access) =
-                    refresh_access(&tokens_d1(&ctx)?, oauth, &user_id, now_unix).await
+                    refresh_access(&tokens_d1(&ctx)?, oauth, &user.id, now_unix).await
                 else {
                     return unauthorized(&ctx);
                 };
@@ -646,13 +644,13 @@ occurrence_exit!(
 occurrence_exit!(
     complete_occurrence,
     api_core::complete_occurrence,
-    "POST /api/occurrences/:id/complete → 200 `{\"occurrence\":{...}}` — the verb matrix; from `in_progress` with stored ids the running chip's end is PATCHed closed (Google gate), otherwise session-only."
+    "POST /api/occurrences/:id/complete → 200 `{\"occurrence\":{...}}` — the verb matrix; from `in_progress` with stored ids the running chip's end is PATCHed closed (Google gate), otherwise credential-only."
 );
 
 occurrence_exit!(
     skip_occurrence,
     api_core::skip_occurrence,
-    "POST /api/occurrences/:id/skip → 200 `{\"occurrence\":{...}}` — the verb matrix; from `in_progress` with stored ids the running chip's end is PATCHed closed (Google gate), otherwise session-only."
+    "POST /api/occurrences/:id/skip → 200 `{\"occurrence\":{...}}` — the verb matrix; from `in_progress` with stored ids the running chip's end is PATCHed closed (Google gate), otherwise credential-only."
 );
 
 /// `POST /api/occurrences/:id/reopen` → 200 `{"occurrence":{...}}`.
@@ -669,7 +667,7 @@ pub async fn reopen_occurrence(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some(user) = crate::auth::session_user(&req, ctx.data.as_ref()) else {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id") else {
