@@ -17,6 +17,7 @@ pub mod categories;
 pub mod digest;
 pub mod google_color;
 pub mod lists;
+pub mod mcp;
 pub mod models;
 pub mod oauth;
 pub mod pattern_gen;

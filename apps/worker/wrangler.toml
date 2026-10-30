@@ -40,7 +40,7 @@ command = "PATH=\"$HOME/.cargo/bin:$PATH\" worker-build --release"
 [assets]
 directory = "../../dist/apps/web"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*", "/auth/*", "/health", "/version"]
+run_worker_first = ["/api/*", "/auth/*", "/health", "/version", "/.well-known/oauth-*"]
 
 [triggers]
 crons = ["*/2 * * * *", "*/15 * * * *"]
