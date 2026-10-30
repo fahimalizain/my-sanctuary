@@ -267,8 +267,11 @@ fn capped(rows: &[Value], max: usize) -> (&[Value], usize) {
 /// keeps as much as the budget allows: `evidence` first, then `strip`, then
 /// whole rules from the end. A payload that already fits is returned exactly as
 /// given, with no `truncated` key; anything shed at any stage marks the top
-/// level `truncated: true`. A value that is not `{rules: [{...}]}` has no shape
-/// to shed from and is returned unchanged (the protocol backstop still applies).
+/// level `truncated: true`. The marker goes on before the first fit check, so
+/// its own bytes (`,"truncated":true`) are counted against the budget rather
+/// than pushing an otherwise fitting payload back over it. A value that is not
+/// `{rules: [{...}]}` has no shape to shed from and is returned unchanged (the
+/// protocol backstop still applies).
 pub fn clamp_scoreboard(value: Value) -> Value {
     if fits(&value) {
         return value;
@@ -279,12 +282,14 @@ pub fn clamp_scoreboard(value: Value) -> Value {
     if !has_rule_objects(scoreboard) {
         return value;
     }
-    let mut scoreboard = value;
+    // Shedding has begun, so mark it now: every check below must measure the
+    // payload the caller will actually receive.
+    let mut scoreboard = truncated(value);
 
     for field in ["evidence", "strip"] {
         shed_rule_field(&mut scoreboard, field);
         if fits(&scoreboard) {
-            return truncated(scoreboard);
+            return scoreboard;
         }
     }
     // Still over: whole rules, tail first, until it fits or the array is empty.
@@ -294,7 +299,7 @@ pub fn clamp_scoreboard(value: Value) -> Value {
             break;
         }
     }
-    truncated(scoreboard)
+    scoreboard
 }
 
 /// A scoreboard whose `rules` is an array of objects — the only shape the

@@ -1549,6 +1549,42 @@ fn clamp_scoreboard_sheds_evidence_before_strip() {
     assert_eq!(clamped["truncated"], json!(true));
 }
 
+/// The `,"truncated":true` marker is 17 bytes and must be inside the budget
+/// before any fit check, or a payload that only just fits is pushed back over
+/// and the protocol answers `result too large` with no scoreboard at all.
+#[test]
+fn clamp_scoreboard_counts_the_truncated_marker_in_the_budget() {
+    // Land the scoreboard 10 bytes short of the budget once `evidence` is shed
+    // — less headroom than the marker itself, so applying it after the fit
+    // check would overshoot.
+    let shell = json!({ "rules": [{ "name": "a", "owed": "", "strip": [1] }] });
+    let padding = MAX_TOOL_RESULT_BYTES - 10 - compact_len(&shell);
+    let value = json!({
+        "rules": [{
+            "name": "a",
+            "owed": "p".repeat(padding),
+            "strip": [1],
+            "evidence": ["x".repeat(1024)],
+        }],
+    });
+    let mut shed = value.clone();
+    shed["rules"][0]
+        .as_object_mut()
+        .expect("rule")
+        .remove("evidence");
+    assert!(compact_len(&value) > MAX_TOOL_RESULT_BYTES);
+    assert!(MAX_TOOL_RESULT_BYTES - compact_len(&shed) < 20);
+
+    let clamped = clamp_scoreboard(value);
+    let len = compact_len(&clamped);
+    assert!(len <= MAX_TOOL_RESULT_BYTES);
+    assert_eq!(clamped["truncated"], json!(true));
+    assert!(clamped["rules"][0].get("evidence").is_none());
+    // Still tight against the budget, so the clamp did not stop at a size the
+    // marker would blow.
+    assert!(MAX_TOOL_RESULT_BYTES - len < 20);
+}
+
 #[test]
 fn clamp_scoreboard_pops_rules_when_the_fields_are_not_enough() {
     // Too wide to fit even without `strip`, so whole rules must go.
