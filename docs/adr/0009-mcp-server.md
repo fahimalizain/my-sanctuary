@@ -271,8 +271,10 @@ exactly the intended contract. Do not "fix" these hints to false later.
 `isError` with a short "result too large" message, never a truncated blob that
 is no longer valid JSON. That backstop stays, but the row caps do not make it
 unreachable: tasks 100, agenda items 80, backlog 40, events 100, calendars 50
-are row counts, not a byte cap, and long titles alone can cross 64 KiB. So each
-list tool also shrinks itself:
+are row counts, not a byte cap, and long titles alone can cross 64 KiB. Two
+list tools and the scoreboard shrink themselves to fit; `list_events` and
+`list_calendars` stay at their row caps and leave an over-budget result to that
+backstop:
 
 - `list_tasks` drops tasks from the tail until the compact JSON fits, and sets
   `truncated` / `omitted`.
