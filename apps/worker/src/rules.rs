@@ -1,9 +1,9 @@
 //! `/api/rules/*` and `/api/pauses/*` handlers (reports slice 3).
 //!
-//! Session-gated like `/api/categories/*` (session cookie or API key bearer).
-//! The model lives in
-//! `api_core::rules` (pure, unit-tested); this file extracts the session user,
-//! wires the D1 repos, and maps errors to HTTP responses.
+//! Gated like `/api/categories/*` (session cookie or API key bearer). The
+//! model lives in `api_core::rules` (pure, unit-tested); this file extracts
+//! the authenticated user, wires the D1 repos, and maps errors to HTTP
+//! responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid body / invalid params / unknown
 //! category, 404 unknown rule or pause, 409 a transition the rule's phase does

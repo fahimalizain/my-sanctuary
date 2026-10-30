@@ -9,6 +9,11 @@ import type { CreateApiKeyResponse, NewApiKeyInput } from '@/app/types';
 import { addCivilDays, civilToday } from '../routines/rrule-preview';
 import { installDom } from '../calendar/components/install-dom';
 
+// `@/lib/api/base` reads the Vite `__API_BASE_URL__` define at module load
+// and static ESM imports hoist, so the global is set before the dialog is
+// dynamic-imported in `before`.
+(globalThis as { __API_BASE_URL__?: string }).__API_BASE_URL__ = '';
+
 installDom();
 
 type CreateApiKeyDialogProps = {
@@ -207,7 +212,7 @@ test('copy: a denied clipboard falls back to focus + select', async () => {
 
   fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
 
-  await screen.findByText('Press ⌘C or long-press to copy.');
+  await screen.findByText('Press ⌘C / Ctrl+C, or long-press, to copy.');
   assert.equal(document.activeElement, secretInput);
   assert.equal(secretInput.selectionStart, 0);
   assert.equal(secretInput.selectionEnd, SECRET.length);

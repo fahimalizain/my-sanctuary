@@ -1,11 +1,10 @@
 //! `/api/lists/*` handlers: task list CRUD (the former "streams").
 //!
-//! Session-gated via the session cookie or an API key bearer — unlike the
-//! calendar handlers,
-//! `task_lists` is user-scoped by the session and does NOT require a Google
-//! token refresh. The orchestration lives in `api_core::lists` (pure,
-//! unit-tested); this file extracts the session user, wires the D1 repo, and
-//! maps errors to HTTP responses.
+//! Gated on the session cookie or an API key bearer — unlike the calendar
+//! handlers, `task_lists` is user-scoped by the authenticated user and does
+//! NOT require a Google token refresh. The orchestration lives in
+//! `api_core::lists` (pure, unit-tested); this file extracts the authenticated
+//! user, wires the D1 repo, and maps errors to HTTP responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid input, 404 not found,
 //! 409 list in use, 500 logged database errors.

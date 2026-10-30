@@ -2,11 +2,10 @@
 //! (start/stop/pause/complete/discard), and the board move — all backed by
 //! Google Calendar events where the action touches Google.
 //!
-//! CRUD is session-gated via the session cookie or an API key bearer — like
+//! CRUD is gated on the session cookie or an API key bearer — like
 //! `/api/lists/*` and `/api/categories/*`. The timer actions additionally
-//! refresh the Google
-//! access token (like `/api/calendar/*`): a user whose token cannot be
-//! refreshed gets `401 {"error":"unauthorized"}`.
+//! refresh the Google access token (like `/api/calendar/*`): a user whose
+//! token cannot be refreshed gets `401 {"error":"unauthorized"}`.
 //!
 //! The move endpoint uses a **per-action gate** (ADR 0002 § Move API): moves
 //! that would call Google — target IN_PROGRESS (start), leaving IN_PROGRESS
@@ -17,8 +16,8 @@
 //! what else is running, so they never conflict.
 //!
 //! The orchestration lives in `api_core::tasks` (pure, unit-tested); this
-//! file extracts the session user, wires the D1 repos, refreshes the OAuth
-//! token for the timer, and maps errors to HTTP responses.
+//! file extracts the authenticated user, wires the D1 repos, refreshes the
+//! OAuth token for the timer, and maps errors to HTTP responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid input (title/category rules, bad
 //! duration or priority, empty PATCH body, terminal-task stop/pause, no
@@ -303,8 +302,9 @@ pub async fn update_task(
 ///
 /// The focus pointer decides the auth gate: deleting the user's **focused**
 /// task snaps its living event, so it uses the timer's Google gate (401
-/// without a refreshable token); every other delete stays session-only. The
-/// pointer is always cleared when it points at the deleted id.
+/// without a refreshable token); every other delete needs only the credential
+/// (no Google token). The pointer is always cleared when it points at the
+/// deleted id.
 pub async fn delete_task(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,

@@ -243,8 +243,11 @@ pub fn validate_expires_on(raw: &str, today: &str) -> Result<(), ApiKeyError> {
 /// `expires_on` in `zone`, so the key stays valid through the whole chosen
 /// day. Unknown/empty zones fall back to UTC. A fall-back fold resolves to the
 /// earliest instant (same `.single().or_else(earliest)` rule as the digest's
-/// local-midnight walk); a midnight swallowed by a spring-forward gap has no
-/// instant and is reported as [`ApiKeyError::InvalidExpiry`].
+/// local-midnight walk). A midnight swallowed by a spring-forward gap (some
+/// zones start DST at 00:00, e.g. `America/Santiago` on 2026-09-06) has no
+/// instant of its own; the walk then takes the first local minute that does
+/// exist — the gap's end, i.e. the true start of the chosen day — instead of
+/// rejecting a legitimate date.
 pub fn expiry_instant_rfc3339(expires_on: &str, zone: &str) -> Result<String, ApiKeyError> {
     let day = crate::digest::parse_civil_date(expires_on).ok_or(ApiKeyError::InvalidExpiry)?;
     let next_day = day
@@ -256,11 +259,22 @@ pub fn expiry_instant_rfc3339(expires_on: &str, zone: &str) -> Result<String, Ap
 
     let tz = parse_iana_tz(zone).unwrap_or(Tz::UTC);
     let resolved = tz.from_local_datetime(&midnight);
-    let instant = resolved
-        .single()
-        .or_else(|| resolved.earliest())
-        .ok_or(ApiKeyError::InvalidExpiry)?;
-    Ok(unix_secs_to_rfc3339(instant.timestamp()))
+    if let Some(instant) = resolved.single().or_else(|| resolved.earliest()) {
+        return Ok(unix_secs_to_rfc3339(instant.timestamp()));
+    }
+
+    // Gap case: scan forward minute by minute (bounded well past the largest
+    // real gap) for the first local time that exists.
+    for minutes in 0..=240 {
+        let Some(candidate) = midnight.checked_add_signed(chrono::Duration::minutes(minutes))
+        else {
+            break;
+        };
+        if let Some(instant) = tz.from_local_datetime(&candidate).earliest() {
+            return Ok(unix_secs_to_rfc3339(instant.timestamp()));
+        }
+    }
+    Err(ApiKeyError::InvalidExpiry)
 }
 
 /// Whether an authenticated request should rewrite `last_used_at`.
@@ -917,6 +931,28 @@ mod tests {
     }
 
     #[test]
+    fn expiry_instant_lands_on_the_gap_end_when_midnight_is_skipped() {
+        // These zones start DST at local 00:00, so the day after the chosen
+        // date begins at 01:00 and the expiry is that gap-end instant: the
+        // local wall clock reads 01:00 on the day *after* `expires_on`.
+        // Santiago: 2026-09-06T01:00-03:00.
+        assert_eq!(
+            expiry_instant_rfc3339("2026-09-05", "America/Santiago").expect("instant"),
+            "2026-09-06T04:00:00Z"
+        );
+        // Cairo: 2026-04-24T01:00+03:00 — UTC is still the previous day.
+        assert_eq!(
+            expiry_instant_rfc3339("2026-04-23", "Africa/Cairo").expect("instant"),
+            "2026-04-23T22:00:00Z"
+        );
+        // Havana: 2026-03-08T01:00-04:00.
+        assert_eq!(
+            expiry_instant_rfc3339("2026-03-07", "America/Havana").expect("instant"),
+            "2026-03-08T05:00:00Z"
+        );
+    }
+
+    #[test]
     fn expiry_instant_rejects_a_bad_date() {
         assert_eq!(
             expiry_instant_rfc3339("2026-02-31", "UTC"),
@@ -1244,9 +1280,10 @@ mod tests {
             key_hash: &str,
             now_rfc3339: &str,
         ) -> Result<Option<ApiKeyOwner>, RepoError> {
-            // Unused by these services; kept honest so slice 3's tests can
-            // rely on it. The real query joins `users`; the fake synthesizes
-            // the identity from the owning user id.
+            // Unused by these services (which never authenticate a secret);
+            // implemented for trait completeness. The real query joins
+            // `users`; the fake synthesizes the identity from the owning user
+            // id.
             let row = self
                 .rows
                 .lock()

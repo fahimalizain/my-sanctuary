@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/dialog';
 import type { CreateApiKeyResponse, NewApiKeyInput } from '@/app/types';
 import { addCivilDays, civilToday } from '@/app/modules/routines/rrule-preview';
+import { API_BASE_URL } from '@/lib/api/base';
 import { cn } from '@/lib/utils';
 
 const INPUT_CLASS =
@@ -235,7 +236,7 @@ export function CreateApiKeyDialog({
               </span>
               {copyFallback && (
                 <p className="selectable mt-2 text-xs text-muted-foreground">
-                  Press ⌘C or long-press to copy.
+                  Press ⌘C / Ctrl+C, or long-press, to copy.
                 </p>
               )}
 
@@ -244,7 +245,7 @@ export function CreateApiKeyDialog({
                   Try it from a terminal
                 </p>
                 <pre className="selectable overflow-x-auto rounded-lg border border-border bg-muted/50 p-3 font-mono text-xs text-muted-foreground">
-                  {`curl -H "Authorization: Bearer sk_…" ${window.location.origin}/api/tasks`}
+                  {`curl -H "Authorization: Bearer sk_…" ${API_BASE_URL || window.location.origin}/api/tasks`}
                 </pre>
               </div>
             </div>

@@ -1026,8 +1026,8 @@ export interface RecordYearRow {
 export interface ApiKey {
   id: string;
   name: string;
-  // The stored prefix ("sk_live_ab12"), shown with an ellipsis — never the
-  // secret itself.
+  // The stored prefix ("sk_AbCd1234": `sk_` plus 8 base64url chars), shown
+  // with an ellipsis — never the secret itself.
   key_prefix: string;
   // `YYYY-MM-DD` civil expiry date; `null` = never expires.
   expires_on: string | null;

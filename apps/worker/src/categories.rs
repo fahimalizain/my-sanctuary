@@ -1,10 +1,9 @@
 //! `/api/categories/*` handlers: category CRUD for the one-level taxonomy.
 //!
-//! Session-gated via the session cookie or an API key bearer — like
-//! `/api/lists/*`. The
-//! orchestration lives in `api_core::categories` (pure, unit-tested); this
-//! file extracts the session user, wires the D1 repo, and maps errors to HTTP
-//! responses.
+//! Gated on the session cookie or an API key bearer — like `/api/lists/*`.
+//! The orchestration lives in `api_core::categories` (pure, unit-tested); this
+//! file extracts the authenticated user, wires the D1 repo, and maps errors to
+//! HTTP responses.
 //!
 //! Status map: 401 unauthorized, 400 invalid input (including bad pattern
 //! regexes), 404 not found, 409 conflict (living children, the undeletable

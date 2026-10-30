@@ -2,9 +2,10 @@
 //!
 //! Key management is **cookie-session only**. A bearer-only request gets 401
 //! by design so a leaked key cannot mint a replacement or revoke its siblings —
-//! `session_user` is the only accepted identity here. Bearer authentication on
-//! data routes lands in a later slice; nothing in this file reads the
-//! `Authorization` header.
+//! `session_user` is the only accepted identity here, and nothing in this file
+//! reads the `Authorization` header. Data routes do accept bearer tokens via
+//! `crate::auth::authenticate`; this file deliberately does not, so a leaked
+//! key cannot mint or revoke keys.
 //!
 //! The plaintext secret is returned by `POST /api/keys` exactly once and never
 //! again: only its SHA-256 hash is stored, no handler echoes or logs it, and

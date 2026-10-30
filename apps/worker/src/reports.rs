@@ -1,9 +1,9 @@
 //! `/api/reports/*` handlers (reports slices 2 and 5).
 //!
-//! Session-gated like `/api/categories/*` (session cookie or API key bearer).
-//! The orchestration lives in
-//! `api_core::digest` / `api_core::record` (pure, unit-tested); this file
-//! extracts the session user, wires the D1 repo, and maps the result to JSON.
+//! Gated like `/api/categories/*` (session cookie or API key bearer). The
+//! orchestration lives in `api_core::digest` / `api_core::record` (pure,
+//! unit-tested); this file extracts the authenticated user, wires the D1 repo,
+//! and maps the result to JSON.
 //!
 //! `GET /api/reports/status` is deliberately cheap: it reports the two job
 //! flags and the dirty-day count, and *at most* flips the backfill job to
