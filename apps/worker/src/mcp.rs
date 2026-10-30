@@ -255,10 +255,16 @@ impl RestExecutor {
             .await
     }
 
-    /// `rules_scoreboard`: the scoreboard object passed through unchanged.
+    /// `rules_scoreboard`: the scoreboard object, shrunk to fit the protocol's
+    /// result budget (evidence first, then strip, then whole rules).
     async fn rules_scoreboard(&self) -> ToolExecution {
-        self.object_through("/api/rules/scoreboard", "unexpected scoreboard response")
+        match self
+            .object_through("/api/rules/scoreboard", "unexpected scoreboard response")
             .await
+        {
+            ToolExecution::Ok(value) => ToolExecution::Ok(api_core::mcp::clamp_scoreboard(value)),
+            failed => failed,
+        }
     }
 
     /// `classify_title`: `title` is required (empty is allowed — the REST

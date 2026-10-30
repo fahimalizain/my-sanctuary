@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
+use super::project::{MAX_AGENDA_BACKLOG, MAX_AGENDA_ITEMS, MAX_TASKS};
 use super::*;
 
 /// Every v1 tool with its `readOnlyHint`, `destructiveHint`, and
@@ -1037,6 +1038,12 @@ fn keys(value: &Value) -> Vec<&str> {
     keys
 }
 
+/// Compact byte length of a tool result — the measure `protocol` applies to
+/// `content[0].text` before answering `isError: "result too large"`.
+fn compact_len(value: &Value) -> usize {
+    serde_json::to_string(value).expect("serialized").len()
+}
+
 /// One REST `TaskView`: every column plus the computed fields, including the
 /// ones a slim row must drop.
 fn rest_task(id: &str) -> Value {
@@ -1091,6 +1098,23 @@ fn task_agenda_item(index: usize) -> Value {
         "task": rest_task(&format!("t{index}")),
         "occurrence": null,
     })
+}
+
+/// A REST task whose title and display_title are `width` characters of `a`:
+/// the payload shape that pushes a full list over the byte budget.
+fn wide_task(id: &str, width: usize) -> Value {
+    let title = "a".repeat(width);
+    let mut task = rest_task(id);
+    task["title"] = json!(title);
+    task["display_title"] = json!(title);
+    task
+}
+
+/// A tapped-wide agenda row; the embedded task is the part that grows.
+fn wide_agenda_item(index: usize, width: usize) -> Value {
+    let mut item = task_agenda_item(index);
+    item["task"] = wide_task(&format!("t{index}"), width);
+    item
 }
 
 /// A `kind: "occurrence"` agenda row, rrule blob and timestamps included.
@@ -1284,6 +1308,48 @@ fn project_tasks_reports_no_truncation_for_a_short_list() {
 }
 
 #[test]
+fn project_tasks_leaves_two_short_tasks_untruncated() {
+    let projected =
+        project_tasks(&json!({ "tasks": [rest_task("t1"), rest_task("t2")] })).expect("projected");
+    assert_eq!(projected["tasks"].as_array().expect("array").len(), 2);
+    assert_eq!(projected["truncated"], json!(false));
+    assert!(projected.get("omitted").is_none());
+}
+
+/// 100 rows at the cap's expected title width must still fit the protocol's
+/// budget: the row cap is not a byte cap, so nothing may be dropped here.
+#[test]
+fn project_tasks_fits_the_result_budget_with_long_titles() {
+    let tasks: Vec<Value> = (0..MAX_TASKS)
+        .map(|index| wide_task(&format!("t{index:03}"), 200))
+        .collect();
+    let projected = project_tasks(&json!({ "tasks": tasks })).expect("projected");
+
+    assert!(compact_len(&projected) <= MAX_TOOL_RESULT_BYTES);
+    assert_eq!(
+        projected["tasks"].as_array().expect("array").len(),
+        MAX_TASKS
+    );
+    assert_eq!(projected["truncated"], json!(false));
+    assert!(projected.get("omitted").is_none());
+}
+
+#[test]
+fn project_tasks_drops_the_tail_when_the_list_is_over_budget() {
+    let tasks: Vec<Value> = (0..MAX_TASKS)
+        .map(|index| wide_task(&format!("t{index:03}"), 400))
+        .collect();
+    let projected = project_tasks(&json!({ "tasks": tasks })).expect("projected");
+
+    assert!(compact_len(&projected) <= MAX_TOOL_RESULT_BYTES);
+    let kept = projected["tasks"].as_array().expect("array");
+    assert!(kept.len() < MAX_TASKS, "the rows must be over budget");
+    assert_eq!(kept[0]["id"], json!("t000"));
+    assert_eq!(projected["truncated"], json!(true));
+    assert_eq!(projected["omitted"], json!(MAX_TASKS - kept.len()));
+}
+
+#[test]
 fn project_tasks_skips_a_non_object_row_but_still_counts_it() {
     let body = json!({ "tasks": [rest_task("t1"), 7, null, rest_task("t2")] });
     let projected = project_tasks(&body).expect("projected");
@@ -1404,6 +1470,103 @@ fn project_agenda_treats_a_missing_or_null_backlog_as_empty() {
         // A missing envelope scalar is an empty string, not an error.
         assert_eq!(projected["from"], json!(""));
     }
+}
+
+/// A full window at its own caps must still fit the protocol's byte budget —
+/// otherwise the agent gets `isError: "result too large"` and no agenda at all.
+#[test]
+fn project_agenda_fits_the_result_budget_at_its_caps() {
+    let items: Vec<Value> = (0..MAX_AGENDA_ITEMS)
+        .map(|index| wide_agenda_item(index, 80))
+        .collect();
+    let backlog: Vec<Value> = (0..MAX_AGENDA_BACKLOG)
+        .map(|index| wide_agenda_item(index, 80))
+        .collect();
+    let projected =
+        project_agenda(&json!({ "items": items, "backlog": backlog })).expect("projected");
+
+    assert!(compact_len(&projected) <= MAX_TOOL_RESULT_BYTES);
+    let items_left = projected["items"].as_array().expect("array").len();
+    let backlog_left = projected["backlog"].as_array().expect("array").len();
+    if items_left < MAX_AGENDA_ITEMS {
+        assert_eq!(projected["truncated_items"], json!(true));
+        assert!(projected["omitted_items"].as_u64().expect("count") > 0);
+    }
+    if backlog_left < MAX_AGENDA_BACKLOG {
+        assert_eq!(projected["truncated_backlog"], json!(true));
+        assert!(projected["omitted_backlog"].as_u64().expect("count") > 0);
+    }
+}
+
+/// The backlog goes first: it is the older, less urgent half of the window.
+#[test]
+fn project_agenda_drops_backlog_rows_before_items_to_fit_the_budget() {
+    let items: Vec<Value> = (0..MAX_AGENDA_ITEMS)
+        .map(|index| wide_agenda_item(index, 200))
+        .collect();
+    let backlog: Vec<Value> = (0..MAX_AGENDA_BACKLOG)
+        .map(|index| wide_agenda_item(index, 200))
+        .collect();
+    let projected =
+        project_agenda(&json!({ "items": items, "backlog": backlog })).expect("projected");
+
+    assert!(compact_len(&projected) <= MAX_TOOL_RESULT_BYTES);
+    let backlog_left = projected["backlog"].as_array().expect("array").len();
+    let dropped = MAX_AGENDA_BACKLOG - backlog_left;
+    assert!(dropped > 0, "the rows must be over budget at this width");
+    // The cap itself dropped nothing (exactly 40 rows), so `omitted` counts
+    // only what the byte budget shed.
+    assert_eq!(projected["truncated_backlog"], json!(true));
+    assert_eq!(projected["omitted_backlog"], json!(dropped));
+    // The backlog alone covered the overshoot, so the window is untouched.
+    assert_eq!(
+        projected["items"].as_array().expect("array").len(),
+        MAX_AGENDA_ITEMS
+    );
+    assert_eq!(projected["truncated_items"], json!(false));
+    assert!(projected.get("omitted_items").is_none());
+}
+
+#[test]
+fn clamp_scoreboard_leaves_a_small_scoreboard_untouched() {
+    let value = json!({ "rules": [{ "name": "a", "evidence": [1], "strip": [1] }] });
+    let clamped = clamp_scoreboard(value.clone());
+    assert_eq!(clamped, value);
+    assert_eq!(clamped["rules"][0]["evidence"], json!([1]));
+    assert!(clamped.get("truncated").is_none());
+}
+
+#[test]
+fn clamp_scoreboard_sheds_evidence_before_strip() {
+    let evidence = "x".repeat(MAX_TOOL_RESULT_BYTES + 1024);
+    let value = json!({ "rules": [{ "evidence": [evidence], "strip": [1], "name": "a" }] });
+
+    let clamped = clamp_scoreboard(value);
+    assert!(compact_len(&clamped) <= MAX_TOOL_RESULT_BYTES);
+    assert!(clamped["rules"][0].get("evidence").is_none());
+    // The strip array is enough on its own, so it stays.
+    assert_eq!(clamped["rules"][0]["strip"], json!([1]));
+    assert_eq!(clamped["truncated"], json!(true));
+}
+
+#[test]
+fn clamp_scoreboard_pops_rules_when_the_fields_are_not_enough() {
+    // Too wide to fit even without `strip`, so whole rules must go.
+    let rule = json!({ "name": "y".repeat(40_000), "strip": [1] });
+    let value = json!({ "rules": [rule.clone(), rule.clone(), rule] });
+
+    let clamped = clamp_scoreboard(value);
+    assert!(compact_len(&clamped) <= MAX_TOOL_RESULT_BYTES);
+    assert_eq!(clamped["rules"].as_array().expect("array").len(), 1);
+    assert!(clamped["rules"][0].get("strip").is_none());
+    assert_eq!(clamped["truncated"], json!(true));
+}
+
+#[test]
+fn clamp_scoreboard_leaves_a_foreign_shape_alone() {
+    let value = json!({ "rules": ["x".repeat(MAX_TOOL_RESULT_BYTES + 1)] });
+    let clamped = clamp_scoreboard(value.clone());
+    assert_eq!(clamped, value);
 }
 
 #[test]

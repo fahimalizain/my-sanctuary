@@ -115,9 +115,9 @@ pub fn tools() -> Vec<Tool> {
                 "properties": {
                     "title": { "type": "string" },
                     "description": { "type": "string" },
-                    "duration_minutes": { "type": "integer" },
-                    "priority": { "type": "string" },
-                    "difficulty": { "type": "string" },
+                    "duration_minutes": { "type": "integer", "minimum": 1 },
+                    "priority": { "type": "string", "enum": ["high", "medium", "low"] },
+                    "difficulty": { "type": "string", "enum": ["easy", "medium", "hard"] },
                 },
                 "required": ["title"],
                 "additionalProperties": false,
@@ -134,9 +134,9 @@ pub fn tools() -> Vec<Tool> {
                     "id": { "type": "string" },
                     "title": { "type": "string" },
                     "description": { "type": "string" },
-                    "duration_minutes": { "type": "integer" },
-                    "priority": { "type": "string" },
-                    "difficulty": { "type": "string" },
+                    "duration_minutes": { "type": "integer", "minimum": 1 },
+                    "priority": { "type": "string", "enum": ["high", "medium", "low"] },
+                    "difficulty": { "type": "string", "enum": ["easy", "medium", "hard"] },
                 },
                 "required": ["id"],
                 "additionalProperties": false,
@@ -179,7 +179,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         mutating(
             "reschedule_agenda_item",
-            "Reschedule an agenda item. `id` is required. Set `date` (YYYY-MM-DD) and/or `sort_order` (>= 0), or `backlog: true` to return it to the backlog; `date` is omitted when `backlog` is true.",
+            "Reschedule an agenda item. `id` is required. Set `date` (YYYY-MM-DD), optionally with `sort_order` (>= 0), or set `backlog: true` to return it to the backlog; when `backlog` is true the rank is ignored.",
             json!({
                 "type": "object",
                 "properties": {
@@ -206,7 +206,7 @@ pub fn tools() -> Vec<Tool> {
                     "description": { "type": "string" },
                     "is_all_day": { "type": "boolean" },
                     "start_time_zone": { "type": "string", "description": "IANA zone for a timed event; ignored when `is_all_day` is true" },
-                    "calendar_id": { "type": "string", "description": "Force a calendar; omit to classify the title" },
+                    "calendar_id": { "type": "string", "description": "The local `id` from `list_calendars` (not `google_calendar_id`); omit to classify the title" },
                 },
                 "required": ["summary", "start", "end"],
                 "additionalProperties": false,

@@ -30,7 +30,8 @@ mod write;
 mod tests;
 
 pub use project::{
-    agenda_bounds, project_agenda, project_calendars, project_events, project_now, project_tasks,
+    agenda_bounds, clamp_scoreboard, project_agenda, project_calendars, project_events,
+    project_now, project_tasks,
 };
 pub use protocol::{
     handle_post, McpResponse, ToolExecution, ToolExecutor, LATEST_PROTOCOL_VERSION,

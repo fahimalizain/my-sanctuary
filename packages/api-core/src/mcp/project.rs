@@ -12,6 +12,8 @@
 
 use serde_json::{json, Map, Value};
 
+use super::protocol::MAX_TOOL_RESULT_BYTES;
+
 /// Most tasks `list_tasks` returns; the rest are counted in `omitted`.
 pub const MAX_TASKS: usize = 100;
 
@@ -102,6 +104,12 @@ pub fn project_now(me: &Value, agenda: &Value) -> Result<Value, String> {
 }
 
 /// `list_tasks`: the first [`MAX_TASKS`] slim tasks.
+///
+/// The row cap alone is not a byte cap: 100 rows with long titles can still
+/// exceed [`MAX_TOOL_RESULT_BYTES`], and the protocol would then answer
+/// "result too large" with no data at all. The tail is dropped until the
+/// compact JSON fits. A projection already under the limit is returned as
+/// built — `truncated: false` and no `omitted` key.
 pub fn project_tasks(body: &Value) -> Result<Value, String> {
     let Some(tasks) = body.get("tasks").and_then(Value::as_array) else {
         return Err("unexpected tasks response".to_string());
@@ -113,13 +121,28 @@ pub fn project_tasks(body: &Value) -> Result<Value, String> {
         Value::Array(kept.iter().filter_map(slim_task).collect()),
     );
     mark_truncated(&mut result, "truncated", "omitted", omitted);
-    Ok(Value::Object(result))
+    let mut result = Value::Object(result);
+    while !fits(&result) {
+        // An empty list cannot be over budget unless the envelope itself is,
+        // and then there is nothing left to drop; the protocol's own check is
+        // the backstop for that.
+        if !pop_last(&mut result, "tasks") {
+            break;
+        }
+        bump_omitted(&mut result, "truncated", "omitted");
+    }
+    Ok(result)
 }
 
 /// `get_agenda`: the window and the backlog, each capped independently.
 ///
 /// `backlog` is absent or `null` on a history read; that is an empty backlog,
 /// not a malformed envelope.
+///
+/// As with `list_tasks`, the 80 + 40 row caps are not a byte cap: with long
+/// titles the projection can exceed [`MAX_TOOL_RESULT_BYTES`]. Backlog rows go
+/// first (they are the older, less urgent half), then window items, until the
+/// compact JSON fits.
 pub fn project_agenda(body: &Value) -> Result<Value, String> {
     const NO_ROWS: &[Value] = &[];
 
@@ -165,7 +188,19 @@ pub fn project_agenda(body: &Value) -> Result<Value, String> {
         "omitted_backlog",
         omitted_backlog,
     );
-    Ok(Value::Object(result))
+    let mut result = Value::Object(result);
+    while !fits(&result) {
+        if pop_last(&mut result, "backlog") {
+            bump_omitted(&mut result, "truncated_backlog", "omitted_backlog");
+        } else if pop_last(&mut result, "items") {
+            bump_omitted(&mut result, "truncated_items", "omitted_items");
+        } else {
+            // Both lists are empty and the fixed envelope alone is over the
+            // limit: nothing here can shrink it further.
+            break;
+        }
+    }
+    Ok(result)
 }
 
 /// `list_events`: the first [`MAX_EVENTS`] slim events.
@@ -223,6 +258,104 @@ fn capped(rows: &[Value], max: usize) -> (&[Value], usize) {
     } else {
         (rows, 0)
     }
+}
+
+/// `rules_scoreboard`: the REST scoreboard shrunk to fit the result budget.
+///
+/// Unlike the list tools there is no row cap here — a rule's `evidence` and
+/// `strip` arrays are the variable part, so the scoreboard sheds in stages and
+/// keeps as much as the budget allows: `evidence` first, then `strip`, then
+/// whole rules from the end. A payload that already fits is returned exactly as
+/// given, with no `truncated` key; anything shed at any stage marks the top
+/// level `truncated: true`. A value that is not `{rules: [{...}]}` has no shape
+/// to shed from and is returned unchanged (the protocol backstop still applies).
+pub fn clamp_scoreboard(value: Value) -> Value {
+    if fits(&value) {
+        return value;
+    }
+    let Some(scoreboard) = value.as_object() else {
+        return value;
+    };
+    if !has_rule_objects(scoreboard) {
+        return value;
+    }
+    let mut scoreboard = value;
+
+    for field in ["evidence", "strip"] {
+        shed_rule_field(&mut scoreboard, field);
+        if fits(&scoreboard) {
+            return truncated(scoreboard);
+        }
+    }
+    // Still over: whole rules, tail first, until it fits or the array is empty.
+    // A lone rule too large to fit on its own is left to the protocol backstop.
+    while !fits(&scoreboard) {
+        if !pop_last(&mut scoreboard, "rules") {
+            break;
+        }
+    }
+    truncated(scoreboard)
+}
+
+/// A scoreboard whose `rules` is an array of objects — the only shape the
+/// staged shed knows how to shrink.
+fn has_rule_objects(scoreboard: &Map<String, Value>) -> bool {
+    scoreboard
+        .get("rules")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| rules.iter().all(Value::is_object))
+}
+
+/// Removes `field` from every rule object.
+fn shed_rule_field(scoreboard: &mut Value, field: &str) {
+    let Some(rules) = scoreboard.get_mut("rules").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for rule in rules {
+        if let Some(rule) = rule.as_object_mut() {
+            rule.remove(field);
+        }
+    }
+}
+
+/// Marks a scoreboard that lost something to the budget.
+fn truncated(mut scoreboard: Value) -> Value {
+    if let Some(scoreboard) = scoreboard.as_object_mut() {
+        scoreboard.insert("truncated".to_string(), Value::Bool(true));
+    }
+    scoreboard
+}
+
+/// Whether a tool result survives the protocol's size check: the compact JSON
+/// `serde_json::to_string` produces is exactly what `content[0].text` holds
+/// (ADR 0009 §8), so measuring it here means the same bytes are counted.
+fn fits(value: &Value) -> bool {
+    serde_json::to_string(value)
+        .map(|text| text.len() <= MAX_TOOL_RESULT_BYTES)
+        .unwrap_or(false)
+}
+
+/// Pops the last row of `key`; `false` when the array is absent or empty.
+fn pop_last(result: &mut Value, key: &str) -> bool {
+    match result.get_mut(key).and_then(Value::as_array_mut) {
+        Some(rows) if !rows.is_empty() => {
+            rows.pop();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Records one row dropped by the byte budget: this side is now truncated, and
+/// its `omitted` count grows from whatever the row cap already dropped (the
+/// key is inserted when the cap dropped none).
+fn bump_omitted(result: &mut Value, truncated_key: &str, omitted_key: &str) {
+    let Some(result) = result.as_object_mut() else {
+        return;
+    };
+    let omitted = result.get(omitted_key).and_then(Value::as_u64).unwrap_or(0) + 1;
+    result.insert(omitted_key.to_string(), Value::from(omitted));
+    result.insert(truncated_key.to_string(), Value::Bool(true));
 }
 
 /// `truncated` is always present; `omitted` only when rows were dropped.
