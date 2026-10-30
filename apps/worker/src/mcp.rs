@@ -387,7 +387,7 @@ impl RestExecutor {
     }
 
     /// `reschedule_agenda_item`: `POST /api/agenda/items/:id/reschedule` with a
-    /// date or `backlog: true`, never both.
+    /// date, `backlog: true`, or `unschedule: true`; never more than one.
     async fn reschedule_agenda_item(&self, arguments: &serde_json::Value) -> ToolExecution {
         let (id, body) = match api_core::mcp::build_reschedule_agenda_item(arguments) {
             Ok(pair) => pair,

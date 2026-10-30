@@ -164,21 +164,31 @@ pub fn build_move_agenda_item(arguments: &Value) -> Result<(String, Value), Stri
 }
 
 /// The `POST /api/agenda/items/:id/reschedule` path id and body: a dated
-/// reschedule, or a backlog drop.
+/// reschedule, a backlog drop, or an unschedule.
 ///
 /// A backlog drop ignores `sort_order` (the Open column is the Board's task
 /// rank), so the body is exactly `{"backlog":true}`; sending a rank alongside
-/// would look like it placed the row. The date is shape-checked only — whether
-/// `2026-02-31` exists is the route's 400 to give, exactly like
-/// [`super::project::agenda_bounds`].
+/// would look like it placed the row. An unschedule keeps the task `PLANNED`
+/// and parks its row in the Planned warehouse, so the body is exactly
+/// `{"unschedule":true}`; a rank is ignored there too. The date is
+/// shape-checked only — whether `2026-02-31` exists is the route's 400 to
+/// give, exactly like [`super::project::agenda_bounds`].
 pub fn build_reschedule_agenda_item(arguments: &Value) -> Result<(String, Value), String> {
-    reject_unknown(arguments, &["id", "date", "sort_order", "backlog"])?;
+    reject_unknown(
+        arguments,
+        &["id", "date", "sort_order", "backlog", "unschedule"],
+    )?;
 
     let id = path_id(arguments)?;
     let backlog = match arguments.get("backlog") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(flag)) => *flag,
         Some(_) => return Err("backlog must be a boolean".to_string()),
+    };
+    let unschedule = match arguments.get("unschedule") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err("unschedule must be a boolean".to_string()),
     };
     let sort_order = match arguments.get("sort_order") {
         None | Some(Value::Null) => None,
@@ -190,15 +200,24 @@ pub fn build_reschedule_agenda_item(arguments: &Value) -> Result<(String, Value)
     };
     let date = arguments.get("date").filter(|value| !value.is_null());
 
+    if backlog && unschedule {
+        return Err("backlog and unschedule are mutually exclusive".to_string());
+    }
     if backlog {
         if date.is_some() {
             return Err("date is omitted when backlog is true".to_string());
         }
         return Ok((id, json!({ "backlog": true })));
     }
+    if unschedule {
+        if date.is_some() {
+            return Err("date is omitted when unschedule is true".to_string());
+        }
+        return Ok((id, json!({ "unschedule": true })));
+    }
 
     let Some(date) = date else {
-        return Err("date is required, or set backlog true".to_string());
+        return Err("date is required, or set backlog or unschedule true".to_string());
     };
     let date = match date.as_str() {
         Some(text) if is_date_shape(text) => text,
