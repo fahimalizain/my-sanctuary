@@ -128,11 +128,30 @@ colour, reclassify queueing, `UserHub` notification, and the existing error
 mapping all keep working. A tool that called the service layer directly would
 silently skip them.
 
-The sub-request helper is an allowlist: `GET`, `POST`, and `PATCH` to
-`/auth/me`, `/api/tasks`, `/api/agenda`, `/api/calendar/events`,
-`/api/calendar/calendars`, `/api/reports/status`, and
-`/api/rules/scoreboard`. It refuses DELETE and refuses `/api/keys`, so a bug in
-a tool cannot mint or revoke a key. Path ids interpolated into a URL must match
+The sub-request helper is an allowlist of method-and-path pairs, not of path
+prefixes:
+
+| Method    | Path                               |
+| --------- | ---------------------------------- |
+| GET       | `/auth/me`                         |
+| GET, POST | `/api/tasks`                       |
+| GET       | `/api/tasks/classify`              |
+| PATCH     | `/api/tasks/:id`                   |
+| POST      | `/api/tasks/:id/move`              |
+| GET       | `/api/agenda`                      |
+| POST      | `/api/agenda/items/:id/move`       |
+| POST      | `/api/agenda/items/:id/reschedule` |
+| GET, POST | `/api/calendar/events`             |
+| GET       | `/api/calendar/calendars`          |
+| GET       | `/api/reports/status`              |
+| GET       | `/api/rules/scoreboard`            |
+
+Anything not in that table is refused — DELETE, `/api/keys`,
+`/api/calendar/calendars/:id/repair`, the task timer verbs (`/start`, `/stop`,
+`/complete`, …), focus, and the occurrence routes. A prefix match would let a
+`POST /api/tasks` rule reach every verb hanging off a task, and a
+`/api/calendar/calendars` rule reach the repair endpoint, so the table is
+enumerated rather than derived. Path ids interpolated into a URL must match
 `^[0-9A-Za-z_-]{1,64}$`.
 
 ### 5. `/api/mcp` is bearer-only, with an origin check
