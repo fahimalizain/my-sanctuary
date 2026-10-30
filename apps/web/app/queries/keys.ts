@@ -48,4 +48,9 @@ export const queryKeys = {
     events: (timeMin: string, timeMax: string) =>
       [...queryKeys.calendar.all, 'events', timeMin, timeMax] as const,
   },
+  // Settings' API keys. Named `apiKeys` because `keys` would read as this
+  // file's own key factories.
+  apiKeys: {
+    all: ['apiKeys'] as const,
+  },
 };

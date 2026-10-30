@@ -10,6 +10,7 @@ export * from './tasks';
 export * from './agenda';
 export * from './occurrences';
 export * from './routines';
+export * from './api-keys';
 export * from './rules';
 export * from './record';
 export * from './calendar';
