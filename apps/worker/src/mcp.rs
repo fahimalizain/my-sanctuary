@@ -8,8 +8,8 @@
 //!
 //! Tool execution goes back through the REST router as an in-process
 //! sub-request (ADR 0009 §4), restricted to [`api_core::mcp::allow_subrequest`].
-//! The tool slices land later: until then [`ToolExecutor::execute`] answers
-//! "not implemented" and [`RestExecutor::call_rest`] has no caller.
+//! The eight read tools are implemented here; the six write tools still answer
+//! "not implemented" until the next slice.
 
 use api_core::mcp::{McpResponse, ToolExecution, ToolExecutor, SUPPORTED_PROTOCOL_VERSIONS};
 use worker::*;
@@ -114,21 +114,190 @@ struct RestExecutor {
 
 #[async_trait::async_trait(?Send)]
 impl ToolExecutor for RestExecutor {
-    async fn execute(&self, _name: &str, _arguments: &serde_json::Value) -> ToolExecution {
-        // The read and write slices map a tool name and its validated
-        // arguments onto `call_rest`. Until then every known tool fails as a
-        // tool result, never as a JSON-RPC error.
-        ToolExecution::Failed("not implemented".to_string())
+    async fn execute(&self, name: &str, arguments: &serde_json::Value) -> ToolExecution {
+        // Every known tool reaches one method; a bad argument is a failed tool
+        // result, never a JSON-RPC error. The six write tools land in slice 5.
+        match name {
+            "now" => self.now().await,
+            "list_tasks" => self.list_tasks().await,
+            "get_agenda" => self.get_agenda(arguments).await,
+            "list_events" => self.list_events(arguments).await,
+            "list_calendars" => self.list_calendars().await,
+            "reports_status" => self.reports_status().await,
+            "rules_scoreboard" => self.rules_scoreboard().await,
+            "classify_title" => self.classify_title(arguments).await,
+            _ => ToolExecution::Failed("not implemented".to_string()),
+        }
     }
 }
 
 impl RestExecutor {
+    /// One `GET` sub-request, mapped onto a tool outcome.
+    ///
+    /// A transport-level `Err` becomes [`ToolExecution::Failed`] with the same
+    /// message; an upstream response goes through
+    /// [`api_core::mcp::tool_outcome_from_upstream`] unchanged, so a 401 is the
+    /// Google re-auth message and a non-2xx is never projected.
+    async fn rest(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> ToolExecution {
+        match self.call_rest(method, path, query, body).await {
+            Ok((status, text)) => api_core::mcp::tool_outcome_from_upstream(status, &text),
+            Err(message) => ToolExecution::Failed(message),
+        }
+    }
+
+    /// `now`: `/auth/me` first, then `/api/agenda` with no query. A failed
+    /// first call short-circuits — there is no point spending a second
+    /// sub-request on a user the agenda call cannot identify either.
+    async fn now(&self) -> ToolExecution {
+        let me = match self.rest(Method::Get, "/auth/me", &[], None).await {
+            ToolExecution::Ok(value) => value,
+            failed => return failed,
+        };
+        let agenda = match self.rest(Method::Get, "/api/agenda", &[], None).await {
+            ToolExecution::Ok(value) => value,
+            failed => return failed,
+        };
+        projected(api_core::mcp::project_now(&me, &agenda))
+    }
+
+    /// `list_tasks`: the whole task list, slimmed and capped.
+    async fn list_tasks(&self) -> ToolExecution {
+        let body = match self.rest(Method::Get, "/api/tasks", &[], None).await {
+            ToolExecution::Ok(value) => value,
+            failed => return failed,
+        };
+        projected(api_core::mcp::project_tasks(&body))
+    }
+
+    /// `get_agenda`: `from`/`to` together or neither. A bad pair is a failed
+    /// tool result *before* any sub-request.
+    async fn get_agenda(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let bounds = match api_core::mcp::agenda_bounds(arguments) {
+            Ok(bounds) => bounds,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let body = match bounds {
+            None => self.rest(Method::Get, "/api/agenda", &[], None).await,
+            Some((from, to)) => {
+                self.rest(
+                    Method::Get,
+                    "/api/agenda",
+                    &[("from", &from), ("to", &to)],
+                    None,
+                )
+                .await
+            }
+        };
+        let body = match body {
+            ToolExecution::Ok(value) => value,
+            failed => return failed,
+        };
+        projected(api_core::mcp::project_agenda(&body))
+    }
+
+    /// `list_events`: both bounds are required strings, and the window is
+    /// validated before the sub-request so an out-of-range span never reaches
+    /// the REST route (which has no span cap of its own).
+    async fn list_events(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let (Some(time_min), Some(time_max)) = (
+            arguments.get("time_min").and_then(|value| value.as_str()),
+            arguments.get("time_max").and_then(|value| value.as_str()),
+        ) else {
+            return ToolExecution::Failed("time_min and time_max are required".to_string());
+        };
+        let (min, max) = match api_core::mcp::validate_event_window(time_min, time_max) {
+            Ok(window) => window,
+            Err(message) => return ToolExecution::Failed(message),
+        };
+        let body = match self
+            .rest(
+                Method::Get,
+                "/api/calendar/events",
+                &[("time_min", &min), ("time_max", &max)],
+                None,
+            )
+            .await
+        {
+            ToolExecution::Ok(value) => value,
+            failed => return failed,
+        };
+        projected(api_core::mcp::project_events(&body))
+    }
+
+    /// `list_calendars`: the picker rows, slimmed and capped.
+    async fn list_calendars(&self) -> ToolExecution {
+        let body = match self
+            .rest(Method::Get, "/api/calendar/calendars", &[], None)
+            .await
+        {
+            ToolExecution::Ok(value) => value,
+            failed => return failed,
+        };
+        projected(api_core::mcp::project_calendars(&body))
+    }
+
+    /// `reports_status`: the status object passed through unchanged.
+    async fn reports_status(&self) -> ToolExecution {
+        self.object_through("/api/reports/status", "unexpected status response")
+            .await
+    }
+
+    /// `rules_scoreboard`: the scoreboard object passed through unchanged.
+    async fn rules_scoreboard(&self) -> ToolExecution {
+        self.object_through("/api/rules/scoreboard", "unexpected scoreboard response")
+            .await
+    }
+
+    /// `classify_title`: `title` is required (empty is allowed — the REST
+    /// handler decides whether a blank title is a 400), `category_id` is an
+    /// optional safe id. The classification object passes through unchanged.
+    async fn classify_title(&self, arguments: &serde_json::Value) -> ToolExecution {
+        let Some(title) = arguments.get("title").and_then(|value| value.as_str()) else {
+            return ToolExecution::Failed("title is required".to_string());
+        };
+        let mut query: Vec<(&str, &str)> = vec![("title", title)];
+        match arguments.get("category_id") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(category_id)) => {
+                // A lock travels in the query string, so the same id shape the
+                // path rules use applies here.
+                if !api_core::mcp::is_safe_id(category_id) {
+                    return ToolExecution::Failed("invalid category_id".to_string());
+                }
+                query.push(("category_id", category_id));
+            }
+            Some(_) => return ToolExecution::Failed("invalid category_id".to_string()),
+        }
+        match self
+            .rest(Method::Get, "/api/tasks/classify", &query, None)
+            .await
+        {
+            ToolExecution::Ok(value) if value.is_object() => ToolExecution::Ok(value),
+            ToolExecution::Ok(_) => {
+                ToolExecution::Failed("unexpected classify response".to_string())
+            }
+            failed => failed,
+        }
+    }
+
+    /// A `GET` whose 2xx body is passed through when it is a JSON object.
+    /// `unexpected` is the failure text for anything else, including `null`.
+    async fn object_through(&self, path: &str, unexpected: &str) -> ToolExecution {
+        match self.rest(Method::Get, path, &[], None).await {
+            ToolExecution::Ok(value) if value.is_object() => ToolExecution::Ok(value),
+            ToolExecution::Ok(_) => ToolExecution::Failed(unexpected.to_string()),
+            failed => failed,
+        }
+    }
+
     /// Issues one in-process sub-request through the REST router (ADR 0009 §4)
     /// and returns its status and body text.
-    ///
-    /// Slices 4 and 5 are the callers; nothing dispatches here yet, which is
-    /// why this is allowed to be unused today.
-    #[allow(dead_code)]
     pub(crate) async fn call_rest(
         &self,
         method: Method,
@@ -209,6 +378,15 @@ impl RestExecutor {
             // tool what happened.
             Err(_) => Ok((status, String::new())),
         }
+    }
+}
+
+/// A projector's result as a tool outcome: `Err(message)` is a failed tool
+/// result with that exact text, never a JSON-RPC error.
+fn projected(result: Result<serde_json::Value, String>) -> ToolExecution {
+    match result {
+        Ok(value) => ToolExecution::Ok(value),
+        Err(message) => ToolExecution::Failed(message),
     }
 }
 

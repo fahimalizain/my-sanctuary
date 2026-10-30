@@ -1020,3 +1020,577 @@ fn allow_subrequest_refuses_unsafe_ids_and_trailing_slashes() {
     let too_long = format!("/api/tasks/{}", "a".repeat(65));
     assert!(!allow_subrequest("PATCH", &too_long));
 }
+
+// ──────────────────────────────────────────
+// Projectors
+// ──────────────────────────────────────────
+
+/// The keys of a JSON object, sorted, so a test can assert an exact shape.
+fn keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("expected a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// One REST `TaskView`: every column plus the computed fields, including the
+/// ones a slim row must drop.
+fn rest_task(id: &str) -> Value {
+    json!({
+        "id": id,
+        "user_id": "u1",
+        "title": "Ship the slice",
+        "display_title": "Ship the slice",
+        "description": "internal notes the agent never sees",
+        "duration_minutes": 45,
+        "priority": "high",
+        "difficulty": "medium",
+        "sort_order": 3,
+        "status": "OPEN",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "focused": true,
+        "category": {
+            "id": "cat1",
+            "title": "Work",
+            "slug": "work",
+            "list_id": "list1",
+            "inherited_list_id": "list1",
+            "is_untracked": false,
+            "color": "#112233",
+        },
+    })
+}
+
+/// A REST category summary, as embedded on tasks and occurrences.
+fn rest_category() -> Value {
+    json!({
+        "id": "cat1",
+        "title": "Work",
+        "slug": "work",
+        "list_id": null,
+        "inherited_list_id": null,
+        "is_untracked": false,
+        "color": "#112233",
+    })
+}
+
+/// A `kind: "task"` agenda row.
+fn task_agenda_item(index: usize) -> Value {
+    json!({
+        "id": format!("i{index}"),
+        "user_id": "u1",
+        "local_date": "2026-02-01",
+        "kind": "task",
+        "ref_id": format!("t{index}"),
+        "sort_order": index,
+        "task": rest_task(&format!("t{index}")),
+        "occurrence": null,
+    })
+}
+
+/// A `kind: "occurrence"` agenda row, rrule blob and timestamps included.
+fn occurrence_agenda_item(index: usize) -> Value {
+    json!({
+        "id": format!("i{index}"),
+        "user_id": "u1",
+        "local_date": "2026-02-01",
+        "kind": "occurrence",
+        "ref_id": format!("o{index}"),
+        "sort_order": index,
+        "task": null,
+        "occurrence": {
+            "id": format!("o{index}"),
+            "routine_id": "r1",
+            "user_id": "u1",
+            "local_date": "2026-02-01",
+            "title": null,
+            "resolved_title": "Morning walk",
+            "status": "pending",
+            "estimated_minutes": 20,
+            "rrule": "DTSTART:20260101T080000Z\nRRULE:FREQ=DAILY",
+            "routine_deleted": false,
+            "calendar_id": null,
+            "google_event_id": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "category": rest_category(),
+        },
+    })
+}
+
+/// One flat REST event: every `CalendarEvent` field plus the painted `color`.
+fn rest_event(index: usize) -> Value {
+    json!({
+        "id": format!("e{index}"),
+        "calendar_id": "cal1",
+        "google_event_id": format!("g{index}"),
+        "google_etag": "\"etag\"",
+        "google_updated_at": "2026-01-01T00:00:00Z",
+        "last_synced_at": "2026-01-01T00:00:00Z",
+        "title": "Standup",
+        "description": "daily sync",
+        "start_time": "2026-02-01T09:00:00Z",
+        "end_time": "2026-02-01T09:15:00Z",
+        "recurrence": "[]",
+        "task_id": "",
+        "ical_uid": "",
+        "sequence": 0,
+        "status": "confirmed",
+        "recurring_event_id": "",
+        "original_start": "",
+        "start_time_zone": "UTC",
+        "end_time_zone": "UTC",
+        "is_all_day": false,
+        "category_id": null,
+        "is_self_organized": true,
+        "event_type": "default",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "deleted_at": null,
+        "color": "#445566",
+    })
+}
+
+/// One `CalendarView` row plus a sync internal that must never be copied.
+fn rest_calendar(index: usize) -> Value {
+    json!({
+        "id": format!("cal{index}"),
+        "google_calendar_id": format!("g{index}@group.calendar.google.com"),
+        "summary": "Home",
+        "time_zone": "Asia/Kolkata",
+        "is_primary": index == 0,
+        "access_role": "owner",
+        "sync_enabled": true,
+        "sync_token": "private-sync-token",
+        "last_synced_at": "2026-01-01T00:00:00Z",
+        "deleted_at": null,
+    })
+}
+
+#[test]
+fn agenda_bounds_defaults_to_no_query_when_neither_bound_is_set() {
+    assert_eq!(agenda_bounds(&json!({})), Ok(None));
+    // A JSON null is "not set", exactly like an absent key.
+    assert_eq!(
+        agenda_bounds(&json!({ "from": null, "to": null })),
+        Ok(None)
+    );
+    assert_eq!(agenda_bounds(&Value::Null), Ok(None));
+}
+
+#[test]
+fn agenda_bounds_requires_from_and_to_together() {
+    for arguments in [
+        json!({ "from": "2026-01-01" }),
+        json!({ "to": "2026-01-01" }),
+        json!({ "from": "2026-01-01", "to": null }),
+        json!({ "from": null, "to": "2026-01-01" }),
+    ] {
+        assert_eq!(
+            agenda_bounds(&arguments),
+            Err("from and to must be set together".to_string()),
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
+fn agenda_bounds_checks_the_shape_of_each_bound() {
+    assert_eq!(
+        agenda_bounds(&json!({ "from": "2026-01-01", "to": "2026-01-07" })),
+        Ok(Some(("2026-01-01".to_string(), "2026-01-07".to_string())))
+    );
+    // Shape only: a month that does not exist is the REST handler's 400.
+    assert_eq!(
+        agenda_bounds(&json!({ "from": "2026-13-01", "to": "2026-13-02" })),
+        Ok(Some(("2026-13-01".to_string(), "2026-13-02".to_string())))
+    );
+    assert_eq!(
+        agenda_bounds(&json!({ "from": "2026-1-01", "to": "2026-01-07" })),
+        Err("from must be YYYY-MM-DD".to_string())
+    );
+    assert_eq!(
+        agenda_bounds(&json!({ "from": "2026-01-01", "to": "07-01-2026" })),
+        Err("to must be YYYY-MM-DD".to_string())
+    );
+    assert_eq!(
+        agenda_bounds(&json!({ "from": 20260101, "to": "2026-01-07" })),
+        Err("from must be YYYY-MM-DD".to_string())
+    );
+    // `from` is reported first when both are wrong.
+    assert_eq!(
+        agenda_bounds(&json!({ "from": false, "to": 5 })),
+        Err("from must be YYYY-MM-DD".to_string())
+    );
+    // Never trimmed.
+    assert_eq!(
+        agenda_bounds(&json!({ "from": " 2026-01-01", "to": "2026-01-07" })),
+        Err("from must be YYYY-MM-DD".to_string())
+    );
+}
+
+#[test]
+fn project_tasks_caps_at_100_and_slims_each_row() {
+    let tasks: Vec<Value> = (0..101)
+        .map(|index| rest_task(&format!("t{index:03}")))
+        .collect();
+    let projected = project_tasks(&json!({ "tasks": tasks })).expect("projected");
+
+    let rows = projected["tasks"].as_array().expect("array");
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows[0]["id"], json!("t000"));
+    assert_eq!(rows[99]["id"], json!("t099"));
+    assert_eq!(projected["truncated"], json!(true));
+    assert_eq!(projected["omitted"], json!(1));
+
+    let first = &rows[0];
+    assert!(first.get("description").is_none());
+    assert!(first.get("user_id").is_none());
+    assert!(first.get("created_at").is_none());
+    assert_eq!(first["duration_minutes"], json!(45));
+    assert_eq!(first["sort_order"], json!(3));
+    assert_eq!(first["focused"], json!(true));
+    assert_eq!(
+        keys(first),
+        vec![
+            "category",
+            "difficulty",
+            "display_title",
+            "duration_minutes",
+            "focused",
+            "id",
+            "priority",
+            "sort_order",
+            "status",
+            "title",
+        ]
+    );
+    // The category is three fields, not the REST summary.
+    assert_eq!(keys(&first["category"]), vec!["color", "id", "title"]);
+    assert_eq!(first["category"]["color"], json!("#112233"));
+}
+
+#[test]
+fn project_tasks_reports_no_truncation_for_a_short_list() {
+    let projected = project_tasks(&json!({ "tasks": [] })).expect("projected");
+    assert_eq!(projected["tasks"], json!([]));
+    assert_eq!(projected["truncated"], json!(false));
+    assert!(projected.get("omitted").is_none());
+}
+
+#[test]
+fn project_tasks_skips_a_non_object_row_but_still_counts_it() {
+    let body = json!({ "tasks": [rest_task("t1"), 7, null, rest_task("t2")] });
+    let projected = project_tasks(&body).expect("projected");
+    let rows = projected["tasks"].as_array().expect("array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["id"], json!("t2"));
+    assert_eq!(projected["truncated"], json!(false));
+}
+
+#[test]
+fn project_tasks_zeroes_fields_of_the_wrong_json_type() {
+    let body = json!({
+        "tasks": [{
+            "id": "t1",
+            "duration_minutes": 1.5,
+            "sort_order": "7",
+            "focused": "yes",
+            "priority": 3,
+            "category": "Work",
+        }]
+    });
+    let projected = project_tasks(&body).expect("projected");
+    let task = &projected["tasks"][0];
+    assert_eq!(task["duration_minutes"], json!(0));
+    assert_eq!(task["sort_order"], json!(0));
+    assert_eq!(task["focused"], json!(false));
+    assert_eq!(task["priority"], json!(""));
+    assert_eq!(task["category"], Value::Null);
+}
+
+#[test]
+fn project_agenda_caps_items_and_backlog_independently() {
+    let items: Vec<Value> = (0..81)
+        .map(|index| {
+            if index % 2 == 0 {
+                task_agenda_item(index)
+            } else {
+                occurrence_agenda_item(index)
+            }
+        })
+        .collect();
+    let backlog: Vec<Value> = (0..41).map(task_agenda_item).collect();
+    let body = json!({
+        "items": items,
+        "from": "2026-02-01",
+        "to": "2026-02-07",
+        "today": "2026-02-03",
+        "time_zone": "Asia/Kolkata",
+        "anchor_date": "2026-02-01",
+        "earliest_date": "2025-01-01",
+        "backlog": backlog,
+    });
+
+    let projected = project_agenda(&body).expect("projected");
+    assert_eq!(projected["items"].as_array().expect("array").len(), 80);
+    assert_eq!(projected["backlog"].as_array().expect("array").len(), 40);
+    assert_eq!(projected["truncated_items"], json!(true));
+    assert_eq!(projected["omitted_items"], json!(1));
+    assert_eq!(projected["truncated_backlog"], json!(true));
+    assert_eq!(projected["omitted_backlog"], json!(1));
+    assert_eq!(projected["from"], json!("2026-02-01"));
+    assert_eq!(projected["to"], json!("2026-02-07"));
+    assert_eq!(projected["today"], json!("2026-02-03"));
+    assert_eq!(projected["time_zone"], json!("Asia/Kolkata"));
+    // Window internals the browser scrolls with are not part of the tool.
+    assert!(projected.get("anchor_date").is_none());
+    assert!(projected.get("earliest_date").is_none());
+
+    let task_item = &projected["items"][0];
+    assert_eq!(
+        keys(task_item),
+        vec![
+            "id",
+            "kind",
+            "local_date",
+            "occurrence",
+            "ref_id",
+            "sort_order",
+            "task"
+        ]
+    );
+    assert!(task_item["task"].get("description").is_none());
+    assert_eq!(task_item["occurrence"], Value::Null);
+
+    let occurrence_item = &projected["items"][1];
+    let occurrence = &occurrence_item["occurrence"];
+    assert!(occurrence.get("rrule").is_none());
+    assert!(occurrence.get("user_id").is_none());
+    assert!(occurrence.get("created_at").is_none());
+    assert_eq!(
+        keys(occurrence),
+        vec![
+            "category",
+            "estimated_minutes",
+            "id",
+            "resolved_title",
+            "routine_id",
+            "status",
+        ]
+    );
+    assert_eq!(occurrence["resolved_title"], json!("Morning walk"));
+    assert_eq!(occurrence["estimated_minutes"], json!(20));
+    assert_eq!(keys(&occurrence["category"]), vec!["color", "id", "title"]);
+}
+
+#[test]
+fn project_agenda_treats_a_missing_or_null_backlog_as_empty() {
+    for body in [
+        json!({ "items": [], "today": "2026-02-03" }),
+        json!({ "items": [], "backlog": null, "today": "2026-02-03" }),
+    ] {
+        let projected = project_agenda(&body).expect("projected");
+        assert_eq!(projected["backlog"], json!([]));
+        assert_eq!(projected["truncated_backlog"], json!(false));
+        assert!(projected.get("omitted_backlog").is_none());
+        assert_eq!(projected["truncated_items"], json!(false));
+        assert!(projected.get("omitted_items").is_none());
+        // A missing envelope scalar is an empty string, not an error.
+        assert_eq!(projected["from"], json!(""));
+    }
+}
+
+#[test]
+fn project_events_drops_the_sync_envelope_and_caps_at_100() {
+    let events: Vec<Value> = (0..101).map(rest_event).collect();
+    let body = json!({
+        "events": events,
+        "source": "replica",
+        "sync": { "state": "healthy", "last_synced_at": "2026-01-01T00:00:00Z" },
+    });
+
+    let projected = project_events(&body).expect("projected");
+    assert!(projected.get("sync").is_none());
+    let rows = projected["events"].as_array().expect("array");
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rows[0]["id"], json!("e0"));
+    assert_eq!(rows[99]["id"], json!("e99"));
+    assert_eq!(projected["truncated"], json!(true));
+    assert_eq!(projected["omitted"], json!(1));
+    assert_eq!(projected["source"], json!("replica"));
+
+    let first = &rows[0];
+    assert_eq!(first["color"], json!("#445566"));
+    assert_eq!(first["start_time_zone"], json!("UTC"));
+    assert_eq!(first["is_all_day"], json!(false));
+    assert!(first.get("description").is_none());
+    assert!(first.get("google_event_id").is_none());
+    assert_eq!(
+        keys(first),
+        vec![
+            "calendar_id",
+            "category_id",
+            "color",
+            "end_time",
+            "id",
+            "is_all_day",
+            "start_time",
+            "start_time_zone",
+            "status",
+            "title",
+        ]
+    );
+}
+
+#[test]
+fn project_events_nulls_a_blank_or_missing_category_id() {
+    let body = json!({
+        "events": [
+            { "id": "e1", "category_id": "" },
+            { "id": "e2" },
+            { "id": "e3", "category_id": "cat1" },
+            { "id": "e4", "category_id": null },
+        ],
+        "source": "google",
+    });
+    let projected = project_events(&body).expect("projected");
+    let rows = projected["events"].as_array().expect("array");
+    for index in [0, 1, 3] {
+        assert_eq!(rows[index]["category_id"], Value::Null, "row {index}");
+    }
+    assert_eq!(rows[2]["category_id"], json!("cat1"));
+}
+
+#[test]
+fn project_calendars_caps_at_50_and_drops_sync_internals() {
+    let calendars: Vec<Value> = (0..51).map(rest_calendar).collect();
+    let projected = project_calendars(&json!({ "calendars": calendars })).expect("projected");
+
+    let rows = projected["calendars"].as_array().expect("array");
+    assert_eq!(rows.len(), 50);
+    assert_eq!(rows[49]["id"], json!("cal49"));
+    assert_eq!(projected["truncated"], json!(true));
+    assert_eq!(projected["omitted"], json!(1));
+
+    let first = &rows[0];
+    assert!(first.get("sync_token").is_none());
+    assert!(first.get("last_synced_at").is_none());
+    assert_eq!(first["is_primary"], json!(true));
+    assert_eq!(first["sync_enabled"], json!(true));
+    assert_eq!(
+        keys(first),
+        vec![
+            "access_role",
+            "google_calendar_id",
+            "id",
+            "is_primary",
+            "summary",
+            "sync_enabled",
+            "time_zone",
+        ]
+    );
+}
+
+#[test]
+fn project_now_requires_a_user() {
+    let agenda = json!({ "today": "2026-02-03", "time_zone": "UTC" });
+    assert_eq!(
+        project_now(&json!({ "user": null }), &agenda),
+        Err("unauthorized".to_string())
+    );
+    assert_eq!(
+        project_now(&json!({}), &agenda),
+        Err("unauthorized".to_string())
+    );
+    assert_eq!(
+        project_now(&json!({ "user": "u1" }), &agenda),
+        Err("unauthorized".to_string())
+    );
+}
+
+#[test]
+fn project_now_returns_the_user_today_and_zone_without_items() {
+    let me = json!({
+        "user": {
+            "id": "u1",
+            "email": "a@b.c",
+            "name": "A",
+            "picture": "https://example.test/p.png",
+        }
+    });
+    let agenda = json!({
+        "items": [task_agenda_item(0)],
+        "today": "2026-02-03",
+        "time_zone": "Asia/Kolkata",
+    });
+
+    let projected = project_now(&me, &agenda).expect("projected");
+    assert_eq!(projected["today"], json!("2026-02-03"));
+    assert_eq!(projected["time_zone"], json!("Asia/Kolkata"));
+    assert_eq!(projected["user"]["email"], json!("a@b.c"));
+    assert_eq!(
+        projected["user"]["picture"],
+        json!("https://example.test/p.png")
+    );
+    assert_eq!(
+        keys(&projected["user"]),
+        vec!["email", "id", "name", "picture"]
+    );
+    assert!(projected.get("items").is_none());
+    assert_eq!(keys(&projected), vec!["time_zone", "today", "user"]);
+
+    // A missing picture is an empty string, never null.
+    let sparse = project_now(&json!({ "user": { "id": "u1" } }), &agenda).expect("projected");
+    assert_eq!(sparse["user"]["picture"], json!(""));
+}
+
+#[test]
+fn project_now_rejects_an_agenda_without_today_or_zone() {
+    let me = json!({ "user": { "id": "u1" } });
+    for agenda in [
+        json!({ "today": "", "time_zone": "UTC" }),
+        json!({ "today": "2026-02-03" }),
+        json!({ "today": "2026-02-03", "time_zone": "" }),
+        json!({}),
+    ] {
+        assert_eq!(
+            project_now(&me, &agenda),
+            Err("agenda response missing today".to_string()),
+            "{agenda}"
+        );
+    }
+}
+
+#[test]
+fn every_projector_rejects_a_missing_or_non_array_list() {
+    assert_eq!(
+        project_tasks(&json!({ "tasks": {} })),
+        Err("unexpected tasks response".to_string())
+    );
+    assert_eq!(
+        project_tasks(&json!({})),
+        Err("unexpected tasks response".to_string())
+    );
+    assert_eq!(
+        project_agenda(&json!({ "items": "nope" })),
+        Err("unexpected agenda response".to_string())
+    );
+    assert_eq!(
+        project_agenda(&json!({ "items": [], "backlog": 3 })),
+        Err("unexpected agenda response".to_string())
+    );
+    assert_eq!(
+        project_events(&json!({ "events": null })),
+        Err("unexpected events response".to_string())
+    );
+    assert_eq!(
+        project_calendars(&json!({ "calendars": 1 })),
+        Err("unexpected calendars response".to_string())
+    );
+}

@@ -12,10 +12,13 @@
 //!   annotation hints.
 //! - [`upstream`] holds the pure helpers the tool slices use to turn an
 //!   upstream REST response into a tool outcome and to validate arguments.
+//! - [`project`] turns a REST envelope into the small JSON value a tool
+//!   returns, with every list capped.
 //!
 //! Everything is stateless: each POST stands alone, so `initialize` is not
 //! required before `tools/list` or `tools/call`.
 
+mod project;
 mod protocol;
 mod tools;
 mod upstream;
@@ -23,6 +26,9 @@ mod upstream;
 #[cfg(test)]
 mod tests;
 
+pub use project::{
+    agenda_bounds, project_agenda, project_calendars, project_events, project_now, project_tasks,
+};
 pub use protocol::{
     handle_post, McpResponse, ToolExecution, ToolExecutor, LATEST_PROTOCOL_VERSION,
     MAX_TOOL_RESULT_BYTES, SERVER_NAME, SUPPORTED_PROTOCOL_VERSIONS,
