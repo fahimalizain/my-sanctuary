@@ -4,11 +4,13 @@
 //! name order (the same SQL wrangler `--local` applies), and exposes rusqlite
 //! repo implementations over api-core SQL constants.
 
+mod api_keys;
 mod digest;
 mod record;
 mod repos;
 mod rules;
 
+pub use api_keys::SqliteApiKeyRepo;
 pub use digest::{
     calendar_owner, count_rows, event_span, mark_dirty_dates, mark_dirty_for_deleted_calendar,
     mark_dirty_spans, SqliteDigestRepo,

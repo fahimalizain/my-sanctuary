@@ -141,6 +141,9 @@ pub(crate) fn bind_text(args: &[String]) -> Vec<D1Type> {
     args.iter().map(|arg| D1Type::Text(arg)).collect()
 }
 
+pub mod api_keys;
+pub use api_keys::*;
+
 pub mod calendar;
 pub use calendar::*;
 
