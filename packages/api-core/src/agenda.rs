@@ -17,7 +17,7 @@
 //!   Both bounds omitted reads `anchor_date … today+6` — **no 31-day cap** —
 //!   where `anchor_date` is the oldest past date holding a pending item, else
 //!   today, plus the `backlog` array holding every row past `today+6`
-//!   (ADR 0007, amended by ADR 0009: dated rows in stream order, then the
+//!   (ADR 0007, amended by ADR 0010: dated rows in stream order, then the
 //!   `PLANNED` warehouse in Planned-column Board order, then `OPEN` in
 //!   Open-column Board order);
 //!   exactly one bound → 400; an explicit window is **history only** — an
@@ -42,7 +42,7 @@
 //!   carrying `{ "backlog": true }` — drops the task into the backlog
 //!   (ADR 0007), or — carrying `{ "unschedule": true }` — parks a dated
 //!   `PLANNED` task's row on the backlog sentinel while keeping it `PLANNED`
-//!   (ADR 0009: no task log, no Board re-rank, a named `sort_order` ignored,
+//!   (ADR 0010: no task log, no Board re-rank, a named `sort_order` ignored,
 //!   and a row already `>= today+10y` a 200 no-op). An occurrence still moves
 //!   its **agenda item only** —
 //!   `occurrence.local_date` (the rule date) and `routines.rrule` are never
@@ -375,7 +375,7 @@ pub(crate) async fn user_today(
 /// job, never a GET's.
 ///
 /// Window resolution (trim first; empty/whitespace counts as omitted):
-/// - both omitted → the **default read** (ADR 0007, amended by ADR 0009):
+/// - both omitted → the **default read** (ADR 0007, amended by ADR 0010):
 ///   `from = anchor_date`, `to = today + 6` civil days, with **no 31-day
 ///   cap** — the window runs back to the anchor even when that is more than
 ///   31 days. `backlog` carries the rows past `today+6` in three stretches:
@@ -675,7 +675,7 @@ fn resolve_window(
 }
 
 /// Splits the **backlog** rows into the response order (ADR 0007, amended by
-/// ADR 0009): three stretches.
+/// ADR 0010): three stretches.
 ///
 /// 1. The **dated** stretch — every row before the 10-year line, kept in the
 ///    range query's order (`local_date`, `sort_order`, `created_at`, the
@@ -847,7 +847,7 @@ pub async fn move_agenda_item(
 /// `POST /api/agenda/items/:id/reschedule` → `{"item":…}` (the same embed as
 /// move).
 ///
-/// Body (ADR 0007, amended by ADR 0009): `{ date, sort_order? }` relocates the
+/// Body (ADR 0007, amended by ADR 0010): `{ date, sort_order? }` relocates the
 /// slot onto that **real day** — inside `[today, today+10y)`, so the past and
 /// the backlog region are 400s — `{ backlog: true }` drops the task into the
 /// backlog, or `{ unschedule: true }` parks a `PLANNED` task's row on the
@@ -4696,7 +4696,7 @@ mod tests {
         reschedule_body(repos, user_id, id, None, None, true, false)
     }
 
-    /// `{ "unschedule": true }` — the warehouse parking path (ADR 0009), no
+    /// `{ "unschedule": true }` — the warehouse parking path (ADR 0010), no
     /// date and no rank.
     fn unschedule(
         repos: &Repos,
@@ -7167,7 +7167,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────
-    // POST /api/agenda/items/:id/reschedule — unschedule (ADR 0009)
+    // POST /api/agenda/items/:id/reschedule — unschedule (ADR 0010)
     // ──────────────────────────────────────────
 
     #[test]
@@ -9707,7 +9707,7 @@ mod tests {
             repos.tasks.push(task);
         }
         // Both PLANNED rows sit in the warehouse region and are VALID there
-        // (ADR 0009): no self-heal pulls them to today. Only the far-future
+        // (ADR 0010): no self-heal pulls them to today. Only the far-future
         // IN_PROGRESS row is misplaced, and the rowless OPEN must not steal
         // today's ranks.
         agenda_row(

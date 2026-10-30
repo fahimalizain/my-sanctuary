@@ -1,5 +1,5 @@
 // Move-to-day menu for one agenda row (ADR 0004 amendment — reschedule,
-// ADR 0007 — bounds / backlog, ADR 0009 — unschedule): the calendar icon opens
+// ADR 0007 — bounds / backlog, ADR 0010 — unschedule): the calendar icon opens
 // a compact menu with presets anchored to the SERVER's civil today, a month
 // picker, and — for tasks — Unschedule (a dated `PLANNED` row) and Backlog.
 // Every choice fires immediately; HomePage owns the optimistic move, the
@@ -92,7 +92,7 @@ export interface RescheduleControlProps {
   /** Available for task rows only; omitted for occurrences. */
   onMoveToBacklog?: (item: AgendaItemRecord) => void;
   /** Available for task rows only; omitted for occurrences. Offered on a
-   *  DATED `PLANNED` row (ADR 0009), never on one already in the warehouse. */
+   *  DATED `PLANNED` row (ADR 0010), never on one already in the warehouse. */
   onUnschedule?: (item: AgendaItemRecord) => void;
 }
 
@@ -141,7 +141,7 @@ export function RescheduleControl({
   // Anything at/after today+10y is a warehouse sentinel (today+50y, or exactly
   // the horizon). The picker's max is today+10y−1, so this is exactly the
   // "outside the date range" test. Which warehouse a sentinel means depends on
-  // the STATUS (ADR 0009): a PLANNED row lives in Planned, an OPEN row in
+  // the STATUS (ADR 0010): a PLANNED row lives in Planned, an OPEN row in
   // Backlog.
   const beyondDateRange =
     !!serverToday && !!maxDate && item.local_date > maxDate;

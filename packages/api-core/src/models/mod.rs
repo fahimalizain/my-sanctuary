@@ -662,7 +662,7 @@ pub struct MoveAgendaItemInput {
 }
 
 /// Request body for `POST /api/agenda/items/:id/reschedule` (ADR 0007,
-/// amended by ADR 0009): a dated reschedule
+/// amended by ADR 0010): a dated reschedule
 /// (`{ "date": "YYYY-MM-DD", "sort_order"?: n }`), a backlog drop
 /// (`{ "backlog": true }`), or an unschedule (`{ "unschedule": true }`). The
 /// service rejects the forms in combination.
@@ -1039,7 +1039,7 @@ mod tests {
         assert!(input.backlog);
         assert!(!input.unschedule);
 
-        // The unschedule form (ADR 0009) is the third shape: no date, no
+        // The unschedule form (ADR 0010) is the third shape: no date, no
         // rank, `backlog` stays false. The service owns the combination
         // errors.
         let input: RescheduleAgendaItemInput =

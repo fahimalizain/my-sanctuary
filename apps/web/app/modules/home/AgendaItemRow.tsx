@@ -66,7 +66,7 @@ interface AgendaItemRowProps {
    *  the optimistic paint + success notice. Never offered for occurrences. */
   onMoveToBacklog: (item: AgendaItemRecord) => void;
   /** Park a dated `PLANNED` task in the Planned warehouse (`{ unschedule: true
-   *  }`, ADR 0009) — the status, the Board rank and the logs are untouched.
+   *  }`, ADR 0010) — the status, the Board rank and the logs are untouched.
    *  Never offered for occurrences. */
   onUnschedule: (item: AgendaItemRecord) => void;
   /** Briefly ring the row after the success notice's "Show" scrolled to it. */

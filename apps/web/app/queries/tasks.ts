@@ -73,7 +73,7 @@ export function setTasksCache(
 // the row travelled. Create, unplan (`/stop`, a Board drag to Open, or a
 // reopen to `OPEN`) park the row on the **backlog date** (today+50y); reopen
 // to `PLANNED`, start, complete and discard put it on civil today. Plan
-// (`OPEN → PLANNED`) is the ADR 0009 exception: it parks the row on the
+// (`OPEN → PLANNED`) is the ADR 0010 exception: it parks the row on the
 // backlog sentinel too (unless the row already sits at/after the 10-year
 // horizon), because planning a task must never invent a civil day the user
 // did not choose. `/pause` alone leaves the row where it is, so its re-read is
