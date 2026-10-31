@@ -1285,17 +1285,20 @@ export function HomePage() {
 
   /** Task → `/complete` (parks the row under Completed right away, with a
    *  fresh `updated_at` stamp so the dump's newest-first sort jumps it to the
-   *  top) or, for a checked-off row, back to PLANNED through the Board's
-   *  `/move` (ADR 0004 amendment — uncheck is the Board reopen, no new
-   *  endpoint). Both travel onto civil today server-side — the paint mirrors
-   *  that. Unchecking never stamps: living sorts by `sort_order`. */
+   *  top) or, for a finished row — `COMPLETED` or `DISCARDED` — back to
+   *  PLANNED through the Board's `/move` (ADR 0004 amendment — uncheck is the
+   *  Board reopen, no new endpoint; ADR 0002 — a discarded task reopens the
+   *  same way, it is never completed). Both travel onto civil today
+   *  server-side — the paint mirrors that. Reopening never stamps: living
+   *  sorts by `sort_order`. */
   const handleCompleteTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
     const snapshot = readStream();
-    // Uncheck: COMPLETED → PLANNED (living again — Play/Reschedule return
-    // because the row is no longer a finished card).
-    if (task.status === 'COMPLETED') {
+    // Reopen: COMPLETED / DISCARDED → PLANNED (living again — Play/Reschedule
+    // return because the row is no longer a finished card).
+    const wasDiscarded = task.status === 'DISCARDED';
+    if (task.status === 'COMPLETED' || wasDiscarded) {
       patchStream((current) =>
         placeTaskOnToday(current, item.id, (entry) =>
           entry.task
@@ -1318,7 +1321,13 @@ export function HomePage() {
         );
       } catch (err) {
         patchStream(() => snapshot);
-        setActionError(err instanceof Error ? err.message : 'Uncheck failed');
+        setActionError(
+          err instanceof Error
+            ? err.message
+            : wasDiscarded
+              ? 'Undo discard failed'
+              : 'Uncheck failed',
+        );
       }
       return;
     }
