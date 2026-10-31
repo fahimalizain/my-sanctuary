@@ -177,7 +177,7 @@ interface AgendaRowHandlers {
   onReschedule: (item: AgendaItemRecord, date: string) => void;
   onMoveToBacklog: (item: AgendaItemRecord) => void;
   /** Park a dated `PLANNED` row in the Planned warehouse (`{ unschedule: true
-   *  }`, ADR 0009) — never a status change. Task rows only. */
+   *  }`, ADR 0010) — never a status change. Task rows only. */
   onUnschedule: (item: AgendaItemRecord) => void;
   onCompleteTask: (item: AgendaItemRecord) => void;
   onStartTask: (item: AgendaItemRecord) => void;
@@ -372,7 +372,7 @@ function AgendaDay({
   );
 }
 
-/** The Planned warehouse (ADR 0009): every `PLANNED` row parked at/after the
+/** The Planned warehouse (ADR 0010): every `PLANNED` row parked at/after the
  *  10-year horizon, in the Planned column's Board order — the server already
  *  sorted it, so it is never re-sorted here. Always visible, so an empty
  *  section still accepts a drop; a drop ON the section means "the end of the
@@ -456,7 +456,7 @@ function PlannedSection({
  *  one of them is `>= today`), then the `OPEN` rows as ONE Board-ordered list
  *  (reordering them is the Board's task `/move`, never the agenda). The section
  *  itself is the droppable that sends a row back to the backlog, so an empty
- *  section still accepts a drop. Warehoused Planned rows (ADR 0009) live in
+ *  section still accepts a drop. Warehoused Planned rows (ADR 0010) live in
  *  their own section above; dated Planned rows still render in their day
  *  groups here. */
 function BacklogSection({
@@ -614,7 +614,7 @@ export function HomePage() {
     [pages],
   );
   const byDate = useMemo(() => groupItemsByDate(items), [items]);
-  // The two warehouses (ADR 0007, ADR 0009): the DEFAULT read's `backlog`
+  // The two warehouses (ADR 0007, ADR 0010): the DEFAULT read's `backlog`
   // array (a history read always answers with an empty one), split into the
   // dated stretch (grouped by day), the Planned stretch and the OPEN stretch —
   // both warehouse stretches in their column's Board order, as served.
@@ -790,7 +790,7 @@ export function HomePage() {
       overId === BACKLOG_DROPPABLE_ID ||
       (overItem !== null && isOpenBacklogTask(overItem, serverToday));
 
-    // 1. The Planned warehouse (ADR 0009): a same-status reorder through the
+    // 1. The Planned warehouse (ADR 0010): a same-status reorder through the
     //    Board, a plan from an OPEN row, or an unschedule from a dated row.
     //    Occurrences, a running task and terminal cards are rejected on BOTH
     //    warehouse targets.
@@ -1045,7 +1045,7 @@ export function HomePage() {
     }
   };
 
-  /** Drop a row into the Planned warehouse (ADR 0009): the Board's
+  /** Drop a row into the Planned warehouse (ADR 0010): the Board's
    *  `POST /api/tasks/:id/move { status: 'PLANNED' }` with **no rank** — the
    *  plan appends the task to the Planned column server-side and parks its
    *  agenda row on the backlog sentinel, never on civil today. (The hovered
@@ -1089,7 +1089,7 @@ export function HomePage() {
     }
   };
 
-  /** Unschedule a dated `PLANNED` row (ADR 0009): `{ unschedule: true }` keeps
+  /** Unschedule a dated `PLANNED` row (ADR 0010): `{ unschedule: true }` keeps
    *  the task `PLANNED`, writes no task log and does NOT re-rank the Planned
    *  column — only the agenda row travels to the backlog sentinel, appended.
    *  Painted optimistically with `unscheduleItem`, merged with the
@@ -1127,7 +1127,7 @@ export function HomePage() {
   };
 
   /** Reorder one warehouse row onto another row's slot (ADR 0007 for OPEN,
-   *  ADR 0009 for PLANNED): the Board's own
+   *  ADR 0010 for PLANNED): the Board's own
    *  `POST /api/tasks/:id/move { status, sort_order }`, so Home and the Board
    *  never disagree on a column's order. The optimistic paint mirrors the
    *  server's `reorder_in_place` over every task embed that shares that
@@ -2257,7 +2257,7 @@ export function HomePage() {
                     ))}
 
                     {/* Under the last stream day: the two warehouses (ADR
-                        0007, ADR 0009) — Planned first, then the Backlog
+                        0007, ADR 0010) — Planned first, then the Backlog
                         (dated rows grouped by day, then the Board-ordered OPEN
                         stretch). Each is its own drop target, so an empty
                         warehouse still accepts a row. */}

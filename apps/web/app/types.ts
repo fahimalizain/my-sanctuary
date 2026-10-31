@@ -602,7 +602,7 @@ export interface AgendaItemRecord {
 // itself.
 export interface AgendaResponse {
   items: AgendaItemRecord[];
-  // Rows past the day stream — THREE stretches (ADR 0007, ADR 0009): the dated
+  // Rows past the day stream — THREE stretches (ADR 0007, ADR 0010): the dated
   // stretch `today+6 < local_date < today+10y` in the range query's order
   // (never re-sorted), then `PLANNED` tasks whose row date is `≥ today+10y` in
   // Planned-column Board order (`tasks.sort_order`, ties by task id), then
@@ -645,7 +645,7 @@ export interface MoveAgendaItemInput {
   sort_order: number;
 }
 
-// Request body for POST /api/agenda/items/:id/reschedule (ADR 0007, ADR 0009)
+// Request body for POST /api/agenda/items/:id/reschedule (ADR 0007, ADR 0010)
 // — one of three bodies: the local civil date (`YYYY-MM-DD`) the slot
 // relocates to, `{ backlog: true }` to drop it into the backlog, or
 // `{ unschedule: true }` to park a dated `PLANNED` row in the Planned

@@ -114,7 +114,7 @@
 //! A same-status cross-card drag (including IN_PROGRESS → IN_PROGRESS with a
 //! rank) is a pure reorder — In Progress is a real pile, not a singleton.
 //!
-//! Agenda (ADR 0007, amended by ADR 0009): a task owns **one** agenda row,
+//! Agenda (ADR 0007, amended by ADR 0010): a task owns **one** agenda row,
 //! and its civil day follows the task's **status**. `OPEN` rows sit on the
 //! **backlog date** — civil today + 50 years via
 //! [`crate::agenda::backlog_local_date`] — out of the day stream. Plan
@@ -854,7 +854,7 @@ fn placement_error(err: AgendaError) -> TasksError {
 /// caller that cannot be sure the transition was real may still call it. The
 /// callers decide whether a failure propagates — the lifecycle write is
 /// already committed, so they usually swallow it. Plan (`OPEN` → `PLANNED`)
-/// is **not** one of them since ADR 0009: it parks the row on the backlog
+/// is **not** one of them since ADR 0010: it parks the row on the backlog
 /// date ([`ensure_task_planned_unscheduled`]).
 pub(crate) async fn place_task_on_today(
     agenda_repo: &dyn AgendaItemRepo,
@@ -893,7 +893,7 @@ pub(crate) async fn place_task_on_backlog(
 }
 
 /// Parks the task's single agenda row on the **backlog date** when a plan
-/// lands it off the calendar (ADR 0009), and leaves an already-warehoused row
+/// lands it off the calendar (ADR 0010), and leaves an already-warehoused row
 /// alone.
 ///
 /// Plan (`OPEN` → `PLANNED`) is not a real-day transition any more: a task
@@ -2343,7 +2343,7 @@ async fn dispatch_matrix_action(
                 now_unix,
             )
             .await?;
-            // Plan is a real OPEN → PLANNED transition (ADR 0009): the task
+            // Plan is a real OPEN → PLANNED transition (ADR 0010): the task
             // does NOT land on civil today — the user never dated it. A row
             // below the 10-year horizon (or a missing one) is parked on the
             // backlog date, appended; a row already at/after the horizon is
@@ -10559,7 +10559,7 @@ mod tests {
         let users = FakeUserRepo::default();
 
         // OPEN → PLANNED (plan) is a real transition, but it does NOT invent
-        // civil today (ADR 0009): the row leaves the past date for the backlog
+        // civil today (ADR 0010): the row leaves the past date for the backlog
         // sentinel, appended (that pile was empty → rank 0).
         let response = pollster::block_on(move_task(
             None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,

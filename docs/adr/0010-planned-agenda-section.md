@@ -1,4 +1,4 @@
-# ADR 0009: A Planned warehouse section
+# ADR 0010: A Planned warehouse section
 
 Status: Accepted
 Date: 2026-10-30

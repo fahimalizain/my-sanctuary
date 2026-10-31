@@ -3,13 +3,13 @@
 Status: Accepted
 Date: 2026-10-17
 
-> Superseded in part by ADR 0009 (2026-10-30): `OPEN → PLANNED` (including
+> Superseded in part by ADR 0010 (2026-10-30): `OPEN → PLANNED` (including
 > create into Planned) parks the row on the backlog sentinel instead of civil
 > today, unless the row is already at/after the 10-year horizon. The backlog read is three stretches (dated,
 > Planned warehouse, Open warehouse). Reschedule gains
 > `{ "unschedule": true }`. A `PLANNED` row at/after the horizon is valid and
 > the self-heal does not pull it to today. See
-> `docs/adr/0009-planned-agenda-section.md`.
+> `docs/adr/0010-planned-agenda-section.md`.
 
 ## Context
 
@@ -69,8 +69,8 @@ is `max(sort_order)+1` on the destination pile.
 | Event                                                                                      | Status →                                                                                            | Row date                                                               |
 | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | create (`POST /api/tasks` always creates `OPEN`)                                           | `OPEN`                                                                                              | backlog date (today+50y), appended                                     |
-| create into Planned (the web creates `OPEN`, then `POST /api/tasks/:id/move` to `PLANNED`) | `PLANNED`                                                                                           | backlog date, appended — the `/move` is the real transition (ADR 0009) |
-| plan (`OPEN` → `PLANNED`, `/move`)                                                         | `PLANNED`                                                                                           | backlog date, appended (ADR 0009)                                      |
+| create into Planned (the web creates `OPEN`, then `POST /api/tasks/:id/move` to `PLANNED`) | `PLANNED`                                                                                           | backlog date, appended — the `/move` is the real transition (ADR 0010) |
+| plan (`OPEN` → `PLANNED`, `/move`)                                                         | `PLANNED`                                                                                           | backlog date, appended (ADR 0010)                                      |
 | unplan (`PLANNED` → `OPEN`, `/move`)                                                       | `OPEN`                                                                                              | backlog date, appended                                                 |
 | real start (`/start`, or `/move` → `IN_PROGRESS`)                                          | `IN_PROGRESS`                                                                                       | today, appended                                                        |
 | pause (`IN_PROGRESS` → `PLANNED`)                                                          | `PLANNED`                                                                                           | unchanged                                                              |

@@ -233,7 +233,7 @@ pub async fn fill_occurrence_horizon(
 ///   date; `OPEN` with no row → one is inserted there. An `OPEN` row already
 ///   at `>=` the horizon is left alone, even when its date is not exactly
 ///   today's backlog date (yesterday's backlog date is still past the line).
-/// - `PLANNED` with no row → one is inserted on the backlog date (ADR 0009: a
+/// - `PLANNED` with no row → one is inserted on the backlog date (ADR 0010: a
 ///   planned task the user never dated is warehouse work, never today). Any
 ///   existing `PLANNED` row is left alone — past, dated future, and at/after
 ///   the horizon are all valid (a `PLANNED` row past the line is no longer a
@@ -295,7 +295,7 @@ pub async fn ensure_task_items(
             // already at/after the horizon is left alone.
             (TASK_STATUS_OPEN, Some(row)) if row.local_date.as_str() >= horizon.as_str() => {}
             (TASK_STATUS_OPEN, row) => backlog_pile.push((task, row)),
-            // PLANNED is a warehouse status since ADR 0009: a rowless task is
+            // PLANNED is a warehouse status since ADR 0010: a rowless task is
             // parked on the sentinel, and ANY existing row (past, dated
             // future, or at/after the horizon) is valid and left alone.
             (TASK_STATUS_PLANNED, None) => backlog_pile.push((task, None)),
@@ -322,7 +322,7 @@ pub async fn ensure_task_items(
 
 /// Appends one destination pile after that date's current max rank, in board
 /// order (the today pile holds only `IN_PROGRESS`; the backlog pile holds
-/// `PLANNED` then `OPEN`, ADR 0009).
+/// `PLANNED` then `OPEN`, ADR 0010).
 ///
 /// A task that already holds a row travels with
 /// [`AgendaItemRepo::set_local_date`]; the rowless ones are collected and

@@ -375,6 +375,16 @@ fn the_catalog_schemas_stay_narrow() {
     );
     assert_eq!(update_task.input_schema["required"], json!(["id"]));
 
+    let reschedule = catalog
+        .iter()
+        .find(|tool| tool.name == "reschedule_agenda_item")
+        .expect("reschedule_agenda_item is in the catalog");
+    assert_eq!(
+        reschedule.input_schema["properties"]["unschedule"]["type"],
+        "boolean"
+    );
+    assert_eq!(reschedule.input_schema["required"], json!(["id"]));
+
     let create_event = catalog
         .iter()
         .find(|tool| tool.name == "create_event")
@@ -2042,11 +2052,39 @@ fn build_reschedule_agenda_item_dated_body_has_no_backlog() {
 }
 
 #[test]
-fn build_reschedule_agenda_item_requires_a_date_or_backlog() {
+fn build_reschedule_agenda_item_unschedule_drops_the_date_and_rank() {
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "unschedule": true, "sort_order": 4 })),
+        Ok(("i1".to_string(), json!({ "unschedule": true })))
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(
+            &json!({ "id": "i1", "unschedule": true, "date": "2026-02-01" })
+        ),
+        Err("date is omitted when unschedule is true".to_string())
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "unschedule": true, "backlog": true })),
+        Err("backlog and unschedule are mutually exclusive".to_string())
+    );
+    assert_eq!(
+        build_reschedule_agenda_item(&json!({ "id": "i1", "unschedule": "yes" })),
+        Err("unschedule must be a boolean".to_string())
+    );
+    // `unschedule: false` behaves exactly like an absent flag.
+    let (_, body) = build_reschedule_agenda_item(
+        &json!({ "id": "i1", "date": "2026-02-01", "unschedule": false }),
+    )
+    .expect("built");
+    assert_eq!(keys(&body), vec!["date"]);
+}
+
+#[test]
+fn build_reschedule_agenda_item_requires_a_date_backlog_or_unschedule() {
     for arguments in [json!({ "id": "i1" }), json!({ "id": "i1", "date": null })] {
         assert_eq!(
             build_reschedule_agenda_item(&arguments),
-            Err("date is required, or set backlog true".to_string()),
+            Err("date is required, or set backlog or unschedule true".to_string()),
             "{arguments}"
         );
     }

@@ -1,5 +1,5 @@
 // Pure helpers for Home's agenda stream (ADR 0004 amendment — slice 5, ADR
-// 0007 — slice 6, ADR 0009 — slice 7): the day label, the move presets /
+// 0007 — slice 6, ADR 0010 — slice 7): the day label, the move presets /
 // picker bounds, the reorder rank math, the living / Completed dump split, the
 // backlog split into its dated / Planned / Open stretches, the date-window
 // walk, and the optimistic edits over React Query's infinite `{ pages }` cache.
@@ -302,7 +302,7 @@ export function isOpenBacklogTask(
   );
 }
 
-/** True when the row is part of the **Planned** warehouse (ADR 0009): a
+/** True when the row is part of the **Planned** warehouse (ADR 0010): a
  *  `PLANNED` task whose row sits on/past the 10-year line — the mirror of
  *  `isOpenBacklogTask` one status over. Those rows are ordered by the Board's
  *  `tasks.sort_order` (the Planned column), never by the agenda's
@@ -321,7 +321,7 @@ export function isPlannedBacklogTask(
 }
 
 /** Splits the server's `backlog` array into its THREE stretches (ADR 0007,
- *  ADR 0009) WITHOUT re-sorting either warehouse: `dated` is `local_date`
+ *  ADR 0010) WITHOUT re-sorting either warehouse: `dated` is `local_date`
  *  before the 10-year line (already `local_date`, `sort_order`, `created_at`
  *  asc), `planned` is the rest that reads as a `PLANNED` task in Planned-column
  *  Board order, and `open` is the rest that reads as an `OPEN` task in
@@ -357,7 +357,7 @@ export function splitBacklogSection(
 }
 
 /** The three stretches as the optimistic edits REBUILD a `backlog` array
- *  (ADR 0009): same predicates as `splitBacklogSection`, except that a row
+ *  (ADR 0010): same predicates as `splitBacklogSection`, except that a row
  *  belonging to neither warehouse pile (a stale `IN_PROGRESS` / terminal /
  *  embedless row at the horizon — the server omits those) rides along with the
  *  dated stretch instead of being dropped, so a rebuild never loses a row. */
@@ -380,7 +380,7 @@ export function backlogStretchesForRebuild(
   };
 }
 
-/** The Planned column's Board order (ADR 0009): `tasks.sort_order` asc, ties
+/** The Planned column's Board order (ADR 0010): `tasks.sort_order` asc, ties
  *  by task id — the same order the read applies server-side. */
 function byPlannedBoardOrder(a: AgendaItemRecord, b: AgendaItemRecord): number {
   const rank = (a.task?.sort_order ?? 0) - (b.task?.sort_order ?? 0);
@@ -581,7 +581,7 @@ export function moveItemToBacklog(
   return { ...data, pages };
 }
 
-/** The optimistic mirror of `reschedule { unschedule: true }` (ADR 0009): a
+/** The optimistic mirror of `reschedule { unschedule: true }` (ADR 0010): a
  *  dated `PLANNED` row leaves its day and parks in the **Planned** warehouse
  *  without a status change, a task log or a Board re-rank — so `task` (status
  *  AND `sort_order`) is kept byte-for-byte and only `local_date` moves to
@@ -634,7 +634,7 @@ export function unscheduleItem(
 }
 
 /** The optimistic mirror of a **plan** (`POST /api/tasks/:id/move {
- *  status: 'PLANNED' }` with no rank, ADR 0009): an `OPEN` task becomes
+ *  status: 'PLANNED' }` with no rank, ADR 0010): an `OPEN` task becomes
  *  `PLANNED` with the appended Planned-column rank (`max + 1` over every other
  *  `PLANNED` embed in the loaded cache, else 0) and its one agenda row parks in
  *  the Planned warehouse instead of on civil today. A row already at/after the
@@ -753,7 +753,7 @@ export function agendaMoveTargetAt(
  *  the slot now held by `toIndex` (the math is status-keyed: the caller passes
  *  the stretch for the status it is reordering). The rank is the task's own
  *  `tasks.sort_order` (ADR 0007 — Home and the Board share one Open order;
- *  ADR 0009 — and one Planned order), never the agenda row's, and it is the
+ *  ADR 0010 — and one Planned order), never the agenda row's, and it is the
  *  HOVERED row's rank in BOTH directions: a same-status `/move` is
  *  `reorder_in_place` (packages/api-core/src/tasks.rs), which shifts the
  *  hovered row away from the slot and lands the mover on it — the `+ 1` of the
@@ -787,7 +787,7 @@ export function openTaskMoveTargetAt(
  *  `[new, old)` up by one when the mover drops above (`new < old`), `(old,
  *  new]` down by one when it drops below (`new > old`). Tasks in any other
  *  status keep their ranks. The math is status-keyed, so it serves both
- *  warehouses: `OPEN` (ADR 0007) and `PLANNED` (ADR 0009 — the same Planned
+ *  warehouses: `OPEN` (ADR 0007) and `PLANNED` (ADR 0010 — the same Planned
  *  column the Board shows). `new === old` writes nothing, and a missing mover
  *  returns the input array unchanged. */
 export function applyOpenTaskReorder(
@@ -892,7 +892,7 @@ export function canReschedule(item: AgendaItemRecord): boolean {
   return false;
 }
 
-/** Backlog as a destination (ADR 0007, ADR 0009): tasks only, living work
+/** Backlog as a destination (ADR 0007, ADR 0010): tasks only, living work
  *  only. An `OPEN` task already parked on the backlog sentinel is never
  *  offered the drop again (it is already there), but a `PLANNED` row at/past
  *  the horizon still is — that drop UNPLANS it (`{ backlog: true }` flips it
@@ -917,7 +917,7 @@ export function canMoveToBacklog(
   return !isOpenBacklogTask(item, today);
 }
 
-/** Unschedule as a destination (ADR 0009): a **dated** `PLANNED` task — its row
+/** Unschedule as a destination (ADR 0010): a **dated** `PLANNED` task — its row
  *  sits before the 10-year line, past dates included — can be parked in the
  *  Planned warehouse without touching its status, its Board rank or the logs.
  *  A row already at/after the horizon is the warehouse itself (the server

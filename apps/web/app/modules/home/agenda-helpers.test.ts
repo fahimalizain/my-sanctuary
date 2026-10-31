@@ -1,11 +1,11 @@
 // Unit tests for Home's pure stream helpers (day label, date-window walk,
 // stream bounds / grouping, month-clamped date math, pending predicate, the
-// backlog split into dated / Planned / Open stretches (ADR 0009), the history
+// backlog split into dated / Planned / Open stretches (ADR 0010), the history
 // window and its page 0 (`historyPageZero`) — the shared `['tasks']` patch, and
 // the optimistic cache edits). The reorder tests pin the exact server semantics
 // of `POST /api/agenda/items/:id/move`: peers at/after the target rank shift up
 // one and the item lands on it; `moveStreamItem` pins the same rule for the
-// cross-day `reschedule`. The backlog tests pin ADR 0007 / ADR 0009: a dated
+// cross-day `reschedule`. The backlog tests pin ADR 0007 / ADR 0010: a dated
 // backlog row reorders with the agenda, an OPEN (or PLANNED) warehouse row
 // through the Board's own same-status `reorder_in_place` (the hovered rank in
 // both directions, peers shifted), a backlog drop appends the row at today+50y,
@@ -639,7 +639,7 @@ test('isPlannedBacklogTask: only a PLANNED task on/past the 10-year line', () =>
     isPlannedBacklogTask(taskItemAt('a', 'PLANNED', BACKLOG_DATE), TODAY),
     true,
   );
-  // Exactly the horizon counts (ADR 0009: a valid parking spot).
+  // Exactly the horizon counts (ADR 0010: a valid parking spot).
   assert.equal(
     isPlannedBacklogTask(taskItemAt('b', 'PLANNED', HORIZON), TODAY),
     true,
@@ -689,7 +689,7 @@ test('splitBacklogSection: three stretches in server order, never re-sorted', ()
   const dated = taskItemAt('d', 'PLANNED', '2026-08-30', 1);
   const open = taskItemAt('a', 'OPEN', BACKLOG_DATE, 9);
   const open2 = taskItemAt('b', 'OPEN', BACKLOG_DATE, 2);
-  // A PLANNED row on the sentinel IS the Planned warehouse (ADR 0009) — no
+  // A PLANNED row on the sentinel IS the Planned warehouse (ADR 0010) — no
   // longer a misplacement window waiting for a self-heal.
   const planned = taskItemAt('m', 'PLANNED', BACKLOG_DATE, 5);
   // Neither warehouse: a running task and an occurrence at the horizon are
@@ -1043,7 +1043,7 @@ test('moveItemToBacklog: a missing id (or no data) keeps the same reference', ()
   assert.equal(moveItemToBacklog(empty, 'a', BACKLOG_DATE), empty);
 });
 
-// ── unscheduleItem / planOpenItem (ADR 0009) ────────────────────────────
+// ── unscheduleItem / planOpenItem (ADR 0010) ────────────────────────────
 
 test('unscheduleItem: a dated PLANNED row parks in the Planned stretch in Board order', () => {
   // The mover holds Planned rank 3; the existing planned peer holds 1 and an
@@ -1662,7 +1662,7 @@ test('canMoveToBacklog: a task already on the backlog date is not offered again'
 });
 
 test('canMoveToBacklog: a PLANNED warehouse row is still offered Backlog', () => {
-  // ADR 0009: the drop unplans it (`PLANNED → OPEN`, Open-column append), so
+  // ADR 0010: the drop unplans it (`PLANNED → OPEN`, Open-column append), so
   // it is a real transition even though the row stays on the sentinel.
   const planned = { ...taskItem('a', 'PLANNED'), local_date: BACKLOG_DATE };
   assert.equal(canMoveToBacklog(planned, TODAY), true);

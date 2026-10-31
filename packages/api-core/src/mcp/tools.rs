@@ -146,7 +146,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         mutating(
             "move_task",
-            "Move a task to `status`: OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED. `id` and `status` are required. Rank is the server default. Can discard or complete a task, and entering or leaving IN_PROGRESS writes Google.",
+            "Move a task to `status`: OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED. `id` and `status` are required. Rank is the server default. `PLANNED` does not schedule an undated task for today; it parks it in the Planned warehouse. Can discard or complete a task, and entering or leaving IN_PROGRESS writes Google.",
             json!({
                 "type": "object",
                 "properties": {
@@ -179,14 +179,15 @@ pub fn tools() -> Vec<Tool> {
         ),
         mutating(
             "reschedule_agenda_item",
-            "Reschedule an agenda item. `id` is required. Set `date` (YYYY-MM-DD), optionally with `sort_order` (>= 0), or set `backlog: true` to return it to the backlog; when `backlog` is true the rank is ignored.",
+            "Reschedule an agenda item. `id` is required. Set exactly one of `date` (YYYY-MM-DD, optionally with `sort_order` >= 0), `backlog: true` to return it to the Open backlog, or `unschedule: true` to park a dated PLANNED task in the Planned warehouse. `sort_order` is ignored on the two flags.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
                     "date": { "type": "string", "description": "Target date (YYYY-MM-DD)" },
                     "sort_order": { "type": "integer", "minimum": 0 },
-                    "backlog": { "type": "boolean", "description": "Return the item to the backlog" },
+                    "backlog": { "type": "boolean", "description": "Return the item to the Open backlog (unplans a PLANNED task)" },
+                    "unschedule": { "type": "boolean", "description": "Park a dated PLANNED task in the Planned warehouse; the status stays PLANNED" },
                 },
                 "required": ["id"],
                 "additionalProperties": false,

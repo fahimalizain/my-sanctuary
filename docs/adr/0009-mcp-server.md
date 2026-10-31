@@ -213,22 +213,22 @@ happens to be HTML. No `WWW-Authenticate` is sent anywhere.
 Every tool sets all three annotation hints. "Read-only" here means **no
 user-facing mutation** — see the note after the table.
 
-| Tool                     | readOnlyHint | destructiveHint | idempotentHint | Route and purpose                                                                                             |
-| ------------------------ | ------------ | --------------- | -------------- | ------------------------------------------------------------------------------------------------------------- |
-| `now`                    | true         | false           | true           | `GET /auth/me` + `GET /api/agenda`; today and time zone                                                       |
-| `list_tasks`             | true         | false           | true           | `GET /api/tasks`; cap 100                                                                                     |
-| `get_agenda`             | true         | false           | true           | `GET /api/agenda`; cap 80 items, 40 backlog rows                                                              |
-| `list_events`            | true         | false           | true           | `GET /api/calendar/events`; cap 100                                                                           |
-| `list_calendars`         | true         | false           | true           | `GET /api/calendar/calendars`; cap 50                                                                         |
-| `reports_status`         | true         | false           | true           | `GET /api/reports/status`                                                                                     |
-| `rules_scoreboard`       | true         | false           | true           | `GET /api/rules/scoreboard`                                                                                   |
-| `classify_title`         | true         | false           | true           | `GET /api/tasks/classify`                                                                                     |
-| `create_task`            | false        | false           | false          | `POST /api/tasks`                                                                                             |
-| `update_task`            | false        | false           | true           | `PATCH /api/tasks/:id`; no status field                                                                       |
-| `move_task`              | false        | true            | true           | `POST /api/tasks/:id/move`; `status` only                                                                     |
-| `move_agenda_item`       | false        | false           | true           | `POST /api/agenda/items/:id/move`; `sort_order`                                                               |
-| `reschedule_agenda_item` | false        | false           | true           | `POST /api/agenda/items/:id/reschedule`; `date` with optional `sort_order`, or `backlog: true` (rank ignored) |
-| `create_event`           | false        | false           | false          | `POST /api/calendar/events`                                                                                   |
+| Tool                     | readOnlyHint | destructiveHint | idempotentHint | Route and purpose                                                                                                                 |
+| ------------------------ | ------------ | --------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `now`                    | true         | false           | true           | `GET /auth/me` + `GET /api/agenda`; today and time zone                                                                           |
+| `list_tasks`             | true         | false           | true           | `GET /api/tasks`; cap 100                                                                                                         |
+| `get_agenda`             | true         | false           | true           | `GET /api/agenda`; cap 80 items, 40 backlog rows                                                                                  |
+| `list_events`            | true         | false           | true           | `GET /api/calendar/events`; cap 100                                                                                               |
+| `list_calendars`         | true         | false           | true           | `GET /api/calendar/calendars`; cap 50                                                                                             |
+| `reports_status`         | true         | false           | true           | `GET /api/reports/status`                                                                                                         |
+| `rules_scoreboard`       | true         | false           | true           | `GET /api/rules/scoreboard`                                                                                                       |
+| `classify_title`         | true         | false           | true           | `GET /api/tasks/classify`                                                                                                         |
+| `create_task`            | false        | false           | false          | `POST /api/tasks`                                                                                                                 |
+| `update_task`            | false        | false           | true           | `PATCH /api/tasks/:id`; no status field                                                                                           |
+| `move_task`              | false        | true            | true           | `POST /api/tasks/:id/move`; `status` only                                                                                         |
+| `move_agenda_item`       | false        | false           | true           | `POST /api/agenda/items/:id/move`; `sort_order`                                                                                   |
+| `reschedule_agenda_item` | false        | false           | true           | `POST /api/agenda/items/:id/reschedule`; `date` with optional `sort_order`, `backlog: true`, or `unschedule: true` (rank ignored) |
+| `create_event`           | false        | false           | false          | `POST /api/calendar/events`                                                                                                       |
 
 Per tool:
 
@@ -250,8 +250,13 @@ Per tool:
 - **`move_task`** sends `status` only — one of `OPEN`, `PLANNED`, `IN_PROGRESS`,
   `COMPLETED`, `DISCARDED` — and omits `sort_order` so the server applies the
   column default. Sending the same status twice with no rank is a no-op.
-  `destructiveHint` is true because the tool can discard or complete a task,
-  and entering or leaving `IN_PROGRESS` writes Google.
+  `PLANNED` does not schedule an undated task for today; it parks the row in
+  the Planned warehouse. `destructiveHint` is true because the tool can discard
+  or complete a task, and entering or leaving `IN_PROGRESS` writes Google.
+- **`reschedule_agenda_item`** takes exactly one of `date` (with optional
+  `sort_order`), `backlog: true` (unplans a `PLANNED` task to `OPEN`), or
+  `unschedule: true` (keeps `PLANNED` and parks the row in the Planned
+  warehouse). A rank is ignored on the two flags.
 - **`create_event`** requires `summary`, `start`, and `end`; it accepts
   `description`, `is_all_day`, `start_time_zone`, and `calendar_id`. When
   `calendar_id` is omitted it resolves the primary calendar's local id and
