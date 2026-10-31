@@ -3,13 +3,16 @@
 // skipped ↔ pending hidden while done, start, pause while in progress —
 // ADR 0004 `/pause` lands pending + clears chip ids — rename, reschedule
 // popover) and the
-// task variant (checkbox toggles completed ↔ planned, start, pause while
-// in progress — ADR 0002 `/pause` lands PLANNED — reschedule popover, tap →
-// TaskModal). Living rows lead with a grab handle (ADR 0004 amendment —
-// reorder is a handle): the grip is the ONLY drag activator, so a tap on
-// checkbox / title / skip / play / pause / calendar never starts a drag.
-// Parked rows (the Completed dump — ADR 0004 amendment) render the same card
-// WITHOUT the grip. Occurrence rows of a soft-deleted routine
+// task variant (checkbox completes a living row and reopens a finished one,
+// start, pause while in progress — ADR 0002 `/pause` lands PLANNED —
+// reschedule popover, tap → TaskModal). Living rows lead with a grab handle
+// (ADR 0004 amendment — reorder is a handle): the grip is the ONLY drag
+// activator, so a tap on checkbox / title / skip / play / pause / calendar
+// never starts a drag. Parked rows (the Completed dump — ADR 0004 amendment)
+// render the same card WITHOUT the grip. A parked `DISCARDED` task is
+// finished too: struck through like a done row, its check circle replaced by
+// a red X — clicking the X reopens it to PLANNED (ADR 0002), it never
+// completes it. Occurrence rows of a soft-deleted routine
 // (`routine_deleted`) are read-only history: no checkbox, skip, reschedule,
 // rename, play or grip — just the muted hint. Pure presentational — every
 // mutation lives in HomePage; HomePage owns the verb branch (reopen vs
@@ -29,6 +32,7 @@ import {
   Pause,
   Pencil,
   Play,
+  X,
 } from 'lucide-react';
 import type {
   AgendaItemRecord,
@@ -243,6 +247,32 @@ function CheckCircle({
         )}
       >
         {checked && <Check className="h-3 w-3" strokeWidth={3} />}
+      </span>
+    </button>
+  );
+}
+
+/** The abandoned twin of the check circle — a parked `DISCARDED` task's
+ *  toggle. Same geometry and hit slop as `CheckCircle` so the column still
+ *  lines up, but the mark is a red X on a faint rose disc: the row is
+ *  finished, just not done. Clicking it reopens to PLANNED (HomePage owns
+ *  that branch); it never completes the task again. */
+function DiscardCircle({
+  label,
+  onClick,
+}: {
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Undo discard — ${label}`}
+      className="flex-shrink-0 p-2.5 -m-2.5 sm:p-0 sm:m-0"
+    >
+      <span className="h-5 w-5 rounded-full border-2 border-rose-500 bg-rose-500/15 text-rose-500 flex items-center justify-center transition-colors">
+        <X className="h-3 w-3 text-rose-500" strokeWidth={3} />
       </span>
     </button>
   );
@@ -539,7 +569,11 @@ function TaskRow({
   onPause: () => void;
   onOpen: () => void;
 }) {
-  const crossed = task.status === 'COMPLETED';
+  // Both terminal statuses read as finished: the row dims and the title is
+  // struck through. Only COMPLETED wears the check; DISCARDED wears the X.
+  const completed = task.status === 'COMPLETED';
+  const discarded = task.status === 'DISCARDED';
+  const crossed = completed || discarded;
   // Start is today-only on the API (it opens the running Google event "now").
   const canStart =
     (task.status === 'OPEN' || task.status === 'PLANNED') &&
@@ -561,11 +595,15 @@ function TaskRow({
         ) : null
       }
       check={
-        <CheckCircle
-          checked={crossed}
-          label={task.display_title}
-          onClick={onComplete}
-        />
+        discarded ? (
+          <DiscardCircle label={task.display_title} onClick={onComplete} />
+        ) : (
+          <CheckCircle
+            checked={completed}
+            label={task.display_title}
+            onClick={onComplete}
+          />
+        )
       }
       title={
         <button
