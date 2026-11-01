@@ -3,6 +3,10 @@
 // strikethrough title, dimmed card — while its control offers "reopen", not
 // "complete": a red X instead of the filled check. `COMPLETED` keeps the
 // check, a living row keeps the empty circle.
+// The second half covers the row's `pending` slot: the control that owns the
+// in-flight request swaps its glyph for the same-size spinner (and refuses a
+// second click), while the rest of the row's mutating controls go disabled
+// without a second spinner.
 // DOM must exist before the component module is imported — installDom() then
 // dynamic import (see EventChip.test.ts).
 
@@ -85,23 +89,34 @@ function taskItem(
   };
 }
 
-/** Render one row (no sortable wrapper, no grip) and return its root. */
+/** Render one row and return its root. */
 function mount(
   item: AgendaItemRecord,
-  onCompleteTask: (row: AgendaItemRecord) => void = () => {},
+  {
+    onCompleteTask = () => {},
+    onPauseTask = () => {},
+    pending = null,
+    showHandle = false,
+  }: {
+    onCompleteTask?: (row: AgendaItemRecord) => void;
+    onPauseTask?: (row: AgendaItemRecord) => void;
+    pending?: 'check' | 'play' | 'calendar' | 'grip' | null;
+    showHandle?: boolean;
+  } = {},
 ): HTMLElement {
   render(
     createElement(AgendaItemRow, {
       item,
       isDragging: false,
-      showHandle: false,
+      showHandle,
+      pending,
       serverToday: TODAY,
       onReschedule: () => {},
       onMoveToBacklog: () => {},
       onUnschedule: () => {},
       onCompleteTask,
       onStartTask: () => {},
-      onPauseTask: () => {},
+      onPauseTask,
       onOpenTask: () => {},
       onCompleteOccurrence: () => {},
       onSkipOccurrence: () => {},
@@ -115,12 +130,18 @@ function mount(
   return root;
 }
 
+/** The control's glyph is the in-flight spinner (lucide's Loader2). */
+function isSpinning(el: Element): boolean {
+  const svg = el.querySelector('svg');
+  return !!svg && (svg.getAttribute('class') ?? '').includes('animate-spin');
+}
+
 // ── DISCARDED ───────────────────────────────────────────────────────────
 
 test('discarded row is crossed out and reopens through a red X', () => {
   const item = taskItem('DISCARDED', 'Buy Chicken');
   const calls: AgendaItemRecord[] = [];
-  const root = mount(item, (row) => calls.push(row));
+  const root = mount(item, { onCompleteTask: (row) => calls.push(row) });
 
   assert.ok(
     screen.getByText('Buy Chicken').className.includes('line-through'),
@@ -197,4 +218,157 @@ test('a planned row is open-looking and completes', () => {
     screen.getByRole('button', { name: 'Complete Buy Chicken' }),
     'a living row completes',
   );
+});
+
+// ── a mutation in flight (the row's `pending` slot) ─────────────────────
+
+test('a planned row spins its check and ignores a second click', () => {
+  const item = taskItem('PLANNED', 'Buy Chicken');
+  const calls: AgendaItemRecord[] = [];
+  mount(item, { pending: 'check', onCompleteTask: (row) => calls.push(row) });
+
+  const complete = screen.getByRole('button', { name: 'Complete Buy Chicken' });
+  assert.equal(
+    (complete as HTMLButtonElement).disabled,
+    true,
+    'the circle is disabled while it saves',
+  );
+  assert.equal(
+    complete.getAttribute('aria-busy'),
+    'true',
+    'the circle announces the save',
+  );
+  assert.ok(isSpinning(complete), 'the mark is the in-flight spinner');
+
+  const circle = complete.querySelector('span');
+  assert.ok(circle, 'spinny mark still sits in the 20px circle');
+  assert.equal(
+    circle.className.includes('bg-primary'),
+    false,
+    'a saving circle is neutral, never a filled check',
+  );
+
+  fireEvent.click(complete);
+  assert.equal(calls.length, 0, 'a busy row fires no second mutation');
+});
+
+test('a discarded row spins its undo-discard and drops the rose mark', () => {
+  const item = taskItem('DISCARDED', 'Buy Chicken');
+  mount(item, { pending: 'check' });
+
+  const undo = screen.getByRole('button', {
+    name: 'Undo discard — Buy Chicken',
+  });
+  assert.equal((undo as HTMLButtonElement).disabled, true);
+  assert.equal(undo.getAttribute('aria-busy'), 'true');
+  assert.ok(isSpinning(undo), 'the X is the in-flight spinner');
+
+  const circle = undo.querySelector('span');
+  assert.ok(circle, 'the spinner keeps the circle box');
+  assert.equal(
+    circle.className.includes('bg-rose-500'),
+    false,
+    'no rose disc while saving',
+  );
+  assert.equal(
+    circle.className.includes('border-rose-500'),
+    false,
+    'no rose ring while saving',
+  );
+});
+
+test('a completed row spins its undo-done and keeps the Done chip', () => {
+  const item = taskItem('COMPLETED', 'Buy Chicken');
+  mount(item, { pending: 'check' });
+
+  const undo = screen.getByRole('button', { name: 'Undo done — Buy Chicken' });
+  assert.equal((undo as HTMLButtonElement).disabled, true);
+  assert.equal(undo.getAttribute('aria-busy'), 'true');
+  assert.ok(isSpinning(undo), 'the check is the in-flight spinner');
+  assert.ok(screen.getByText('Done'), 'the row is still a done row');
+
+  const circle = undo.querySelector('span');
+  assert.ok(circle);
+  assert.equal(
+    circle.className.includes('bg-primary'),
+    false,
+    'no filled check while saving',
+  );
+});
+
+test('an in-progress row spins Pause and ignores a second click', () => {
+  const item = taskItem('IN_PROGRESS', 'Buy Chicken');
+  const calls: AgendaItemRecord[] = [];
+  mount(item, { pending: 'play', onPauseTask: (row) => calls.push(row) });
+
+  const pause = screen.getByRole('button', { name: 'Pause Buy Chicken' });
+  assert.equal((pause as HTMLButtonElement).disabled, true);
+  assert.equal(pause.getAttribute('aria-busy'), 'true');
+  assert.ok(isSpinning(pause), 'Pause becomes the spinner');
+
+  fireEvent.click(pause);
+  assert.equal(calls.length, 0, 'a busy row fires no second pause');
+});
+
+test('a planned row spins its calendar trigger while the move runs', () => {
+  const item = taskItem('PLANNED', 'Buy Chicken');
+  mount(item, { pending: 'calendar' });
+
+  const move = screen.getByRole('button', {
+    name: 'Move Buy Chicken to another day',
+  });
+  assert.equal((move as HTMLButtonElement).disabled, true);
+  assert.equal(move.getAttribute('aria-busy'), 'true');
+  assert.ok(isSpinning(move), 'the calendar icon becomes the spinner');
+});
+
+test('a busy calendar still renders on a row that cannot reschedule', () => {
+  // `IN_PROGRESS` tasks are never reschedulable, but the move that IS running
+  // still owns the slot — the trigger must exist to show its spinner.
+  const item = taskItem('IN_PROGRESS', 'Buy Chicken');
+  mount(item, { pending: 'calendar' });
+
+  const move = screen.getByRole('button', {
+    name: 'Move Buy Chicken to another day',
+  });
+  assert.equal((move as HTMLButtonElement).disabled, true);
+  assert.equal(move.getAttribute('aria-busy'), 'true');
+  assert.ok(isSpinning(move), 'the calendar icon becomes the spinner');
+});
+
+test('a dragged row spins its grip', () => {
+  const item = taskItem('PLANNED', 'Buy Chicken');
+  mount(item, { pending: 'grip', showHandle: true });
+
+  const grip = screen.getByRole('button', { name: 'Reorder Buy Chicken' });
+  assert.equal((grip as HTMLButtonElement).disabled, true);
+  assert.equal(grip.getAttribute('aria-busy'), 'true');
+  assert.ok(isSpinning(grip), 'the grip becomes the spinner');
+});
+
+test('a row saving its check quiets the other controls without spinning them', () => {
+  const item = taskItem('PLANNED', 'Buy Chicken');
+  mount(item, { pending: 'check', showHandle: true });
+
+  const others: Array<[string, HTMLElement]> = [
+    ['play', screen.getByRole('button', { name: 'Start Buy Chicken' })],
+    [
+      'calendar',
+      screen.getByRole('button', { name: 'Move Buy Chicken to another day' }),
+    ],
+    ['grip', screen.getByRole('button', { name: 'Reorder Buy Chicken' })],
+  ];
+  for (const [name, control] of others) {
+    assert.equal(
+      (control as HTMLButtonElement).disabled,
+      true,
+      `${name} cannot race the check`,
+    );
+    assert.equal(
+      control.getAttribute('aria-busy'),
+      null,
+      `${name} keeps its own glyph — no second spinner`,
+    );
+    assert.equal(isSpinning(control), false, `${name} is not the spinner slot`);
+  }
 });

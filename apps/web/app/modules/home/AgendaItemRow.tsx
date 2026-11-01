@@ -14,9 +14,11 @@
 // a red X — clicking the X reopens it to PLANNED (ADR 0002), it never
 // completes it. Occurrence rows of a soft-deleted routine
 // (`routine_deleted`) are read-only history: no checkbox, skip, reschedule,
-// rename, play or grip — just the muted hint. Pure presentational — every
-// mutation lives in HomePage; HomePage owns the verb branch (reopen vs
-// complete/skip).
+// rename, play or grip — just the muted hint. While one of the row's own
+// mutations is in flight (`pending`) that slot swaps its glyph for a spinner
+// in the same box, and the other mutating controls on the row go disabled so
+// a second click can never race it. Pure presentational — every mutation lives
+// in HomePage; HomePage owns the verb branch (reopen vs complete/skip).
 
 import { Children, type ReactNode } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
@@ -29,6 +31,7 @@ import {
   CalendarX2,
   Check,
   GripVertical,
+  Loader2,
   Pause,
   Pencil,
   Play,
@@ -60,6 +63,12 @@ interface AgendaItemRowProps {
    *  `showHandle={false}` for parked rows and for living rows a drag may not
    *  grab (done/skipped occurrences, deleted routines, orphans). */
   showHandle?: boolean;
+  /** The slot whose mutation is in flight for this row (HomePage owns the
+   *  in-flight set). That control swaps its glyph for a spinner in the same
+   *  box and goes `aria-busy`; every other mutating control on the row is
+   *  disabled so a second click cannot race it. `null` (the default) is a
+   *  quiet row. */
+  pending?: 'check' | 'play' | 'calendar' | 'grip' | null;
   /** The server's civil today — the Play gate (start is today-only on the
    *  API) and the RescheduleControl's floor. */
   serverToday: string;
@@ -221,32 +230,48 @@ function PriorityMark({ priority }: { priority: TaskPriority }) {
 /** Round check circle — the row's done toggle (tasks and occurrences both
  *  cross off through it; clicking a checked circle unchecks — HomePage
  *  decides reopen vs complete/skip). Visual stays 20px; padding is hit slop
- *  only (negative margin keeps the layout size). */
+ *  only (negative margin keeps the layout size). While this slot is saving
+ *  (`pending`) the circle turns neutral and holds a spinner, so the row never
+ *  jumps and the check/X never reads as settled. */
 function CheckCircle({
   checked,
   label,
   onClick,
+  pending = false,
+  disabled = false,
 }: {
   checked: boolean;
   label: string;
   onClick: () => void;
+  /** This slot is the one in flight — spinner instead of the mark. */
+  pending?: boolean;
+  /** Some row action is in flight (this slot or another). */
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
+      aria-busy={pending || undefined}
       aria-label={checked ? `Undo done — ${label}` : `Complete ${label}`}
       className="flex-shrink-0 p-2.5 -m-2.5 sm:p-0 sm:m-0"
     >
       <span
         className={cn(
           'h-5 w-5 rounded-full border-2 flex items-center justify-center transition-colors',
-          checked
-            ? 'bg-primary border-primary text-primary-foreground'
-            : 'border-input hover:border-primary',
+          pending
+            ? 'border-input'
+            : checked
+              ? 'bg-primary border-primary text-primary-foreground'
+              : 'border-input hover:border-primary',
         )}
       >
-        {checked && <Check className="h-3 w-3" strokeWidth={3} />}
+        {pending ? (
+          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+        ) : (
+          checked && <Check className="h-3 w-3" strokeWidth={3} />
+        )}
       </span>
     </button>
   );
@@ -256,23 +281,41 @@ function CheckCircle({
  *  toggle. Same geometry and hit slop as `CheckCircle` so the column still
  *  lines up, but the mark is a red X on a faint rose disc: the row is
  *  finished, just not done. Clicking it reopens to PLANNED (HomePage owns
- *  that branch); it never completes the task again. */
+ *  that branch); it never completes the task again. Busy swaps the X for the
+ *  same neutral spinner the check circle uses. */
 function DiscardCircle({
   label,
   onClick,
+  pending = false,
+  disabled = false,
 }: {
   label: string;
   onClick: () => void;
+  pending?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
+      aria-busy={pending || undefined}
       aria-label={`Undo discard — ${label}`}
       className="flex-shrink-0 p-2.5 -m-2.5 sm:p-0 sm:m-0"
     >
-      <span className="h-5 w-5 rounded-full border-2 border-rose-500 bg-rose-500/15 text-rose-500 flex items-center justify-center transition-colors">
-        <X className="h-3 w-3 text-rose-500" strokeWidth={3} />
+      <span
+        className={cn(
+          'h-5 w-5 rounded-full border-2 flex items-center justify-center transition-colors',
+          pending
+            ? 'border-input'
+            : 'border-rose-500 bg-rose-500/15 text-rose-500',
+        )}
+      >
+        {pending ? (
+          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+        ) : (
+          <X className="h-3 w-3 text-rose-500" strokeWidth={3} />
+        )}
       </span>
     </button>
   );
@@ -285,55 +328,93 @@ function DiscardCircle({
  *  page; the cursor flips to grabbing while the drag is live. Rows in the
  *  Completed dump and read-only history rows never render it
  *  (`showHandle={false}` in the rows below), so its props are optional here
- *  too. */
+ *  too. A busy row drops the listeners entirely — a drag must never start on
+ *  top of an in-flight mutation — and the in-flight grip shows the spinner. */
 function DragHandle({
   attributes,
   listeners,
   label,
   isDragging,
+  pending = false,
+  disabled = false,
 }: {
   attributes?: DraggableAttributes;
   listeners?: DraggableSyntheticListeners;
   label: string;
   isDragging: boolean;
+  pending?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       aria-label={`Reorder ${label}`}
       title="Reorder"
+      disabled={disabled}
+      aria-busy={pending || undefined}
       className={cn(
         'flex-shrink-0 touch-none rounded-md p-1 -ml-0.5 text-muted-foreground/50 hover:bg-muted hover:text-muted-foreground sm:ml-0 sm:p-1.5',
         isDragging ? 'cursor-grabbing' : 'cursor-grab',
       )}
-      {...attributes}
-      {...listeners}
+      {...(!disabled && attributes ? attributes : {})}
+      {...(!disabled && listeners ? listeners : {})}
     >
-      <GripVertical className="h-3.5 w-3.5 text-muted-foreground/50" />
+      {pending ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+      ) : (
+        <GripVertical className="h-3.5 w-3.5 text-muted-foreground/50" />
+      )}
     </button>
   );
 }
 
 /** Shared Play ↔ Pause swap for both row kinds. Play when `canStart`;
- *  Pause when `running`; nothing otherwise. */
+ *  Pause when `running`; nothing otherwise — except while this slot saves:
+ *  then the button stays in its box as a disabled spinner (deriving a
+ *  `Saving …` label when the optimistic status already hid the glyph). */
 function PlayPauseControl({
   label,
   canStart,
   running,
   onStart,
   onPause,
+  pending = false,
+  disabled = false,
 }: {
   label: string;
   canStart: boolean;
   running: boolean;
   onStart: () => void;
   onPause: () => void;
+  pending?: boolean;
+  disabled?: boolean;
 }) {
+  if (pending) {
+    return (
+      <button
+        type="button"
+        disabled
+        aria-busy="true"
+        aria-label={
+          running
+            ? `Pause ${label}`
+            : canStart
+              ? `Start ${label}`
+              : `Saving ${label}`
+        }
+        title={running ? 'Pause' : canStart ? 'Start' : 'Saving'}
+        className={ICON_BTN}
+      >
+        <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+      </button>
+    );
+  }
   if (running) {
     return (
       <button
         type="button"
         onClick={onPause}
+        disabled={disabled}
         aria-label={`Pause ${label}`}
         title="Pause"
         className={ICON_BTN}
@@ -347,6 +428,7 @@ function PlayPauseControl({
       <button
         type="button"
         onClick={onStart}
+        disabled={disabled}
         aria-label={`Start ${label}`}
         title="Start"
         className={ICON_BTN}
@@ -388,6 +470,7 @@ function OccurrenceRow({
   listeners,
   isDragging,
   showHandle,
+  pending,
   serverToday,
   onReschedule,
   highlighted,
@@ -404,6 +487,7 @@ function OccurrenceRow({
   listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
   showHandle: boolean;
+  pending: 'check' | 'play' | 'calendar' | 'grip' | null;
   serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
   highlighted: boolean;
@@ -418,6 +502,8 @@ function OccurrenceRow({
     occurrence.status === 'done' || occurrence.status === 'skipped';
   // A soft-deleted routine's row is history: no verbs, no grip, no rename.
   const readOnly = occurrence.routine_deleted;
+  // Any in-flight row action quiets the controls a second click could reach.
+  const busy = pending !== null;
   // Start is today-only on the API (it opens a one-shot Google log "now"), so
   // Play lives on the row whose civil day IS the server's today.
   const canStart =
@@ -429,12 +515,14 @@ function OccurrenceRow({
       highlighted={highlighted}
       domId={domId}
       handle={
-        showHandle && !readOnly ? (
+        !readOnly && (showHandle || pending === 'grip') ? (
           <DragHandle
             attributes={attributes}
             listeners={listeners}
             label={occurrence.resolved_title}
             isDragging={isDragging}
+            pending={pending === 'grip'}
+            disabled={busy}
           />
         ) : null
       }
@@ -444,6 +532,8 @@ function OccurrenceRow({
             checked={occurrence.status === 'done'}
             label={occurrence.resolved_title}
             onClick={onComplete}
+            pending={pending === 'check'}
+            disabled={busy}
           />
         )
       }
@@ -501,11 +591,14 @@ function OccurrenceRow({
                 running={occurrence.status === 'in_progress'}
                 onStart={onStart}
                 onPause={onPause}
+                pending={pending === 'play'}
+                disabled={busy}
               />
               {occurrence.status !== 'done' && (
                 <button
                   type="button"
                   onClick={onSkip}
+                  disabled={busy}
                   aria-label={
                     occurrence.status === 'skipped'
                       ? `Undo skip ${occurrence.resolved_title}`
@@ -517,12 +610,14 @@ function OccurrenceRow({
                   <CalendarX2 className="h-3.5 w-3.5" />
                 </button>
               )}
-              {canReschedule(item) && (
+              {(canReschedule(item) || pending === 'calendar') && (
                 <RescheduleControl
                   item={item}
                   label={occurrence.resolved_title}
                   serverToday={serverToday}
                   triggerClassName={ICON_BTN}
+                  busy={pending === 'calendar'}
+                  disabled={busy && pending !== 'calendar'}
                   onReschedule={onReschedule}
                 />
               )}
@@ -541,6 +636,7 @@ function TaskRow({
   listeners,
   isDragging,
   showHandle,
+  pending,
   serverToday,
   onReschedule,
   onMoveToBacklog,
@@ -558,6 +654,7 @@ function TaskRow({
   listeners?: DraggableSyntheticListeners;
   isDragging: boolean;
   showHandle: boolean;
+  pending: 'check' | 'play' | 'calendar' | 'grip' | null;
   serverToday: string;
   onReschedule: AgendaItemRowProps['onReschedule'];
   onMoveToBacklog: AgendaItemRowProps['onMoveToBacklog'];
@@ -574,6 +671,8 @@ function TaskRow({
   const completed = task.status === 'COMPLETED';
   const discarded = task.status === 'DISCARDED';
   const crossed = completed || discarded;
+  // Any in-flight row action quiets the controls a second click could reach.
+  const busy = pending !== null;
   // Start is today-only on the API (it opens the running Google event "now").
   const canStart =
     (task.status === 'OPEN' || task.status === 'PLANNED') &&
@@ -585,23 +684,32 @@ function TaskRow({
       highlighted={highlighted}
       domId={domId}
       handle={
-        showHandle ? (
+        showHandle || pending === 'grip' ? (
           <DragHandle
             attributes={attributes}
             listeners={listeners}
             label={task.display_title}
             isDragging={isDragging}
+            pending={pending === 'grip'}
+            disabled={busy}
           />
         ) : null
       }
       check={
         discarded ? (
-          <DiscardCircle label={task.display_title} onClick={onComplete} />
+          <DiscardCircle
+            label={task.display_title}
+            onClick={onComplete}
+            pending={pending === 'check'}
+            disabled={busy}
+          />
         ) : (
           <CheckCircle
             checked={completed}
             label={task.display_title}
             onClick={onComplete}
+            pending={pending === 'check'}
+            disabled={busy}
           />
         )
       }
@@ -635,13 +743,17 @@ function TaskRow({
               running={task.status === 'IN_PROGRESS'}
               onStart={onStart}
               onPause={onPause}
+              pending={pending === 'play'}
+              disabled={busy}
             />
-            {canReschedule(item) && (
+            {(canReschedule(item) || pending === 'calendar') && (
               <RescheduleControl
                 item={item}
                 label={task.display_title}
                 serverToday={serverToday}
                 triggerClassName={ICON_BTN}
+                busy={pending === 'calendar'}
+                disabled={busy && pending !== 'calendar'}
                 onReschedule={onReschedule}
                 onMoveToBacklog={() => onMoveToBacklog(item)}
                 onUnschedule={() => onUnschedule(item)}
@@ -658,6 +770,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
   const { item } = props;
   const showHandle = props.showHandle ?? true;
   const highlighted = props.highlighted ?? false;
+  const pending = props.pending ?? null;
   const domId = `agenda-item-${item.id}`;
   if (item.kind === 'occurrence' && item.occurrence) {
     return (
@@ -668,6 +781,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         listeners={props.listeners}
         isDragging={props.isDragging}
         showHandle={showHandle}
+        pending={pending}
         serverToday={props.serverToday}
         onReschedule={props.onReschedule}
         highlighted={highlighted}
@@ -689,6 +803,7 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
         listeners={props.listeners}
         isDragging={props.isDragging}
         showHandle={showHandle}
+        pending={pending}
         serverToday={props.serverToday}
         onReschedule={props.onReschedule}
         onMoveToBacklog={props.onMoveToBacklog}
@@ -734,6 +849,7 @@ export function SortableAgendaItemRow(
     >
       <AgendaItemRow
         {...props}
+        pending={props.pending ?? null}
         attributes={attributes}
         listeners={listeners}
         isDragging={isDragging}

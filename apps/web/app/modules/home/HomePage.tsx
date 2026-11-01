@@ -188,7 +188,16 @@ interface AgendaRowHandlers {
   onStartOccurrence: (item: AgendaItemRecord) => void;
   onPauseOccurrence: (item: AgendaItemRecord) => void;
   onRenameOccurrence: (item: AgendaItemRecord) => void;
+  /** The slot whose request is in flight for this row, or null — feeds
+   *  `AgendaItemRow`'s `pending` spinner/disabled contract. */
+  pendingOf: (itemId: string) => RowBusySlot | null;
 }
+
+/** The one control on a row that shows the spinner while its mutation is in
+ *  flight. Check covers the circle (complete / undo done / undo discard); play
+ *  covers Play and Pause; calendar is the row menu's move trigger; grip is a
+ *  drag-driven reorder. */
+type RowBusySlot = 'check' | 'play' | 'calendar' | 'grip';
 
 /** A successful move's transient confirmation. `itemId` lets Show scroll
  *  straight to the exact row (the day header is only a fallback). */
@@ -329,6 +338,7 @@ function AgendaDay({
                     item={entry}
                     serverToday={serverToday}
                     highlighted={highlightedItemId === entry.id}
+                    pending={handlers.pendingOf(entry.id)}
                     {...handlers}
                   />
                 ) : (
@@ -339,6 +349,7 @@ function AgendaDay({
                     showHandle={false}
                     serverToday={serverToday}
                     highlighted={highlightedItemId === entry.id}
+                    pending={handlers.pendingOf(entry.id)}
                     {...handlers}
                   />
                 ),
@@ -362,6 +373,7 @@ function AgendaDay({
                 showHandle={false}
                 serverToday={serverToday}
                 highlighted={highlightedItemId === entry.id}
+                pending={handlers.pendingOf(entry.id)}
                 {...handlers}
               />
             ))}
@@ -400,6 +412,7 @@ function PlannedSection({
         item={entry}
         serverToday={serverToday}
         highlighted={highlightedItemId === entry.id}
+        pending={handlers.pendingOf(entry.id)}
         {...handlers}
       />
     ) : (
@@ -410,6 +423,7 @@ function PlannedSection({
         showHandle={false}
         serverToday={serverToday}
         highlighted={highlightedItemId === entry.id}
+        pending={handlers.pendingOf(entry.id)}
         {...handlers}
       />
     );
@@ -485,6 +499,7 @@ function BacklogSection({
         item={entry}
         serverToday={serverToday}
         highlighted={highlightedItemId === entry.id}
+        pending={handlers.pendingOf(entry.id)}
         {...handlers}
       />
     ) : (
@@ -495,6 +510,7 @@ function BacklogSection({
         showHandle={false}
         serverToday={serverToday}
         highlighted={highlightedItemId === entry.id}
+        pending={handlers.pendingOf(entry.id)}
         {...handlers}
       />
     );
@@ -637,6 +653,13 @@ export function HomePage() {
   const [flashItemId, setFlashItemId] = useState<string | null>(null);
   // The row currently dragged — feeds the DragOverlay title chip.
   const [activeDrag, setActiveDrag] = useState<AgendaItemRecord | null>(null);
+  // Row actions in flight: the render-time map behind `AgendaItemRow`'s
+  // spinner + disabled controls …
+  const [rowBusy, setRowBusy] = useState<Record<string, RowBusySlot>>({});
+  // … and its SYNCHRONOUS twin. A second click can land before React paints
+  // the disabled button, so the lock is taken in the ref first and only then
+  // mirrored into state.
+  const rowBusyRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (!actionNotice) return;
@@ -714,6 +737,41 @@ export function HomePage() {
       patchStream((current) => updateStreamItem(current, itemId, updater));
     },
     [patchStream],
+  );
+
+  // ──────────────────────────────────────────
+  // Row action locks (spinner + one mutation per row)
+  // ──────────────────────────────────────────
+
+  /** Take the row's lock for `slot`, or return false when another action on
+   *  that row is still in flight. Called SYNCHRONOUSLY before the optimistic
+   *  paint (and before any `await`), so a double click never fires two
+   *  requests and the row can paint its spinner. */
+  const beginRowAction = useCallback(
+    (itemId: string, slot: RowBusySlot): boolean => {
+      if (rowBusyRef.current.has(itemId)) return false;
+      rowBusyRef.current.add(itemId);
+      setRowBusy((prev) => ({ ...prev, [itemId]: slot }));
+      return true;
+    },
+    [],
+  );
+
+  /** Release the row's lock — always from the handler's `finally`, so the
+   *  spinner clears on success AND failure. */
+  const endRowAction = useCallback((itemId: string) => {
+    rowBusyRef.current.delete(itemId);
+    setRowBusy((prev) => {
+      if (!(itemId in prev)) return prev;
+      const next = { ...prev };
+      delete next[itemId];
+      return next;
+    });
+  }, []);
+
+  const pendingOf = useCallback(
+    (itemId: string): RowBusySlot | null => rowBusy[itemId] ?? null,
+    [rowBusy],
   );
 
   // ──────────────────────────────────────────
@@ -828,7 +886,7 @@ export function HomePage() {
       }
       if (dragged.task.status === 'PLANNED') {
         // A dated (or past) PLANNED row: the warehouse, not a status change.
-        void handleUnschedule(dragged);
+        void handleUnschedule(dragged, 'grip');
       }
       return;
     }
@@ -856,7 +914,7 @@ export function HomePage() {
         return;
       }
       if (dragged.task.status === 'OPEN' || dragged.task.status === 'PLANNED') {
-        void handleBacklogDrop(dragged);
+        void handleBacklogDrop(dragged, 'grip');
       }
       return;
     }
@@ -877,7 +935,7 @@ export function HomePage() {
       }
       if (day < serverToday) return;
       if (dragged.task?.status === 'IN_PROGRESS') return;
-      void handleCrossDayMove(dragged, day);
+      void handleCrossDayMove(dragged, day, 'grip');
       return;
     }
 
@@ -901,6 +959,7 @@ export function HomePage() {
     void handleCrossDayMove(
       dragged,
       overItem.local_date,
+      'grip',
       crossDayRank(overItem.local_date, overId),
     );
   };
@@ -917,23 +976,28 @@ export function HomePage() {
     // Rank gaps make `applyAgendaMove` a no-op when the row already holds the
     // target rank — nothing to POST either.
     if (moved === dayItems) return;
-    patchStream((current) =>
-      moved.reduce(
-        (acc, entry) => updateStreamItem(acc, entry.id, () => entry),
-        current,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, 'grip')) return;
     try {
-      const data = await moveAgendaItemMutation.mutateAsync({
-        id: item.id,
-        input: { sort_order: target },
-      });
-      // Merge the authoritative row (fresh embeds); ranks already match.
-      mergeRow(data.item.id, () => data.item);
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      patchStream((current) =>
+        moved.reduce(
+          (acc, entry) => updateStreamItem(acc, entry.id, () => entry),
+          current,
+        ),
+      );
+      setActionError(null);
+      try {
+        const data = await moveAgendaItemMutation.mutateAsync({
+          id: item.id,
+          input: { sort_order: target },
+        });
+        // Merge the authoritative row (fresh embeds); ranks already match.
+        mergeRow(data.item.id, () => data.item);
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Move failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -968,6 +1032,7 @@ export function HomePage() {
   const handleCrossDayMove = async (
     item: AgendaItemRecord,
     targetDate: string,
+    slot: 'calendar' | 'grip',
     sortOrder?: number,
   ) => {
     if (!targetDate || targetDate === item.local_date) return;
@@ -977,35 +1042,40 @@ export function HomePage() {
     // first).
     if (item.occurrence?.status === 'in_progress') return;
     if (item.task?.status === 'IN_PROGRESS') return;
-    const snapshot = readStream();
-    const input: RescheduleAgendaItemInput =
-      sortOrder === undefined
-        ? { date: targetDate }
-        : { date: targetDate, sort_order: sortOrder };
-    patchStream((current) =>
-      moveStreamItem(
-        current,
-        item.id,
-        targetDate,
-        sortOrder ?? appendRankOnStream(current, targetDate),
-        true,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, slot)) return;
     try {
-      const data = await rescheduleAgendaItemMutation.mutateAsync({
-        id: item.id,
-        input,
-      });
-      mergeRow(data.item.id, () => data.item);
-      // Patch the shared tasks cache so Board/Lists see the flipped status
-      // and the new Planned rank.
-      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
-      showMoveNotice(data.item);
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionNotice(null);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      const snapshot = readStream();
+      const input: RescheduleAgendaItemInput =
+        sortOrder === undefined
+          ? { date: targetDate }
+          : { date: targetDate, sort_order: sortOrder };
+      patchStream((current) =>
+        moveStreamItem(
+          current,
+          item.id,
+          targetDate,
+          sortOrder ?? appendRankOnStream(current, targetDate),
+          true,
+        ),
+      );
+      setActionError(null);
+      try {
+        const data = await rescheduleAgendaItemMutation.mutateAsync({
+          id: item.id,
+          input,
+        });
+        mergeRow(data.item.id, () => data.item);
+        // Patch the shared tasks cache so Board/Lists see the flipped status
+        // and the new Planned rank.
+        setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+        showMoveNotice(data.item);
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionNotice(null);
+        setActionError(err instanceof Error ? err.message : 'Move failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1016,32 +1086,40 @@ export function HomePage() {
    *  row (the server's real backlog date and status). A failure restores the
    *  snapshot and banners. The mutation invalidates the stream on settle —
    *  never awaited, so the rollback cannot race it. */
-  const handleBacklogDrop = async (item: AgendaItemRecord) => {
+  const handleBacklogDrop = async (
+    item: AgendaItemRecord,
+    slot: 'calendar' | 'grip',
+  ) => {
     const task = item.task;
     if (!task || !serverToday) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      moveItemToBacklog(current, item.id, addMonthsClamp(serverToday, 600)),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, slot)) return;
     try {
-      const data = await rescheduleAgendaItemMutation.mutateAsync({
-        id: item.id,
-        input: { backlog: true },
-      });
-      mergeRow(data.item.id, () => data.item);
-      // Patch the shared tasks cache so Board/Lists see the flipped status
-      // and the appended Open rank.
-      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
-      setActionNotice({
-        message: 'Moved to Backlog',
-        itemId: data.item.id,
-        section: 'backlog',
-      });
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionNotice(null);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      const snapshot = readStream();
+      patchStream((current) =>
+        moveItemToBacklog(current, item.id, addMonthsClamp(serverToday, 600)),
+      );
+      setActionError(null);
+      try {
+        const data = await rescheduleAgendaItemMutation.mutateAsync({
+          id: item.id,
+          input: { backlog: true },
+        });
+        mergeRow(data.item.id, () => data.item);
+        // Patch the shared tasks cache so Board/Lists see the flipped status
+        // and the appended Open rank.
+        setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+        setActionNotice({
+          message: 'Moved to Backlog',
+          itemId: data.item.id,
+          section: 'backlog',
+        });
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionNotice(null);
+        setActionError(err instanceof Error ? err.message : 'Move failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1058,34 +1136,39 @@ export function HomePage() {
   const handlePlanDrop = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task || task.status !== 'OPEN' || !serverToday) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      planOpenItem(
-        current,
-        item.id,
-        addMonthsClamp(serverToday, 600),
-        serverToday,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, 'grip')) return;
     try {
-      const data = await moveTaskMutation.mutateAsync({
-        id: task.id,
-        input: { status: 'PLANNED' } satisfies MoveTaskInput,
-      });
-      mergeRow(item.id, (entry) =>
-        entry.task ? { ...entry, task: data.task } : entry,
+      const snapshot = readStream();
+      patchStream((current) =>
+        planOpenItem(
+          current,
+          item.id,
+          addMonthsClamp(serverToday, 600),
+          serverToday,
+        ),
       );
-      setTasksCache((prev) => replaceCachedTask(prev, data.task));
-      setActionNotice({
-        message: 'Moved to Planned',
-        itemId: item.id,
-        section: 'planned',
-      });
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionNotice(null);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      setActionError(null);
+      try {
+        const data = await moveTaskMutation.mutateAsync({
+          id: task.id,
+          input: { status: 'PLANNED' } satisfies MoveTaskInput,
+        });
+        mergeRow(item.id, (entry) =>
+          entry.task ? { ...entry, task: data.task } : entry,
+        );
+        setTasksCache((prev) => replaceCachedTask(prev, data.task));
+        setActionNotice({
+          message: 'Moved to Planned',
+          itemId: item.id,
+          section: 'planned',
+        });
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionNotice(null);
+        setActionError(err instanceof Error ? err.message : 'Move failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1095,34 +1178,42 @@ export function HomePage() {
    *  Painted optimistically with `unscheduleItem`, merged with the
    *  authoritative row on success; a failure restores the snapshot and
    *  banners. Occurrences, `OPEN` rows and terminal cards never get here. */
-  const handleUnschedule = async (item: AgendaItemRecord) => {
+  const handleUnschedule = async (
+    item: AgendaItemRecord,
+    slot: 'calendar' | 'grip',
+  ) => {
     if (!canUnschedule(item, serverToday)) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      unscheduleItem(
-        current,
-        item.id,
-        addMonthsClamp(serverToday, 600),
-        serverToday,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, slot)) return;
     try {
-      const data = await rescheduleAgendaItemMutation.mutateAsync({
-        id: item.id,
-        input: { unschedule: true },
-      });
-      mergeRow(data.item.id, () => data.item);
-      setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
-      setActionNotice({
-        message: 'Moved to Planned',
-        itemId: data.item.id,
-        section: 'planned',
-      });
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionNotice(null);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      const snapshot = readStream();
+      patchStream((current) =>
+        unscheduleItem(
+          current,
+          item.id,
+          addMonthsClamp(serverToday, 600),
+          serverToday,
+        ),
+      );
+      setActionError(null);
+      try {
+        const data = await rescheduleAgendaItemMutation.mutateAsync({
+          id: item.id,
+          input: { unschedule: true },
+        });
+        mergeRow(data.item.id, () => data.item);
+        setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+        setActionNotice({
+          message: 'Moved to Planned',
+          itemId: data.item.id,
+          section: 'planned',
+        });
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionNotice(null);
+        setActionError(err instanceof Error ? err.message : 'Move failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1148,94 +1239,99 @@ export function HomePage() {
     const task = item.task;
     const fromIndex = rows.findIndex((entry) => entry.id === item.id);
     if (!task || fromIndex < 0 || toIndex < 0) return;
-    // The new order — dnd-kit's own array move, so the row lands where the
-    // user dropped it.
-    const reordered = arrayMove(rows, fromIndex, toIndex);
-    const order = new Map(reordered.map((entry, index) => [entry.id, index]));
-    const snapshot = readStream();
-    // The task embeds sharing this column's rank space. OPEN reorders only
-    // touch the stretch; a PLANNED reorder is the whole Planned column, so the
-    // dated PLANNED rows (they live in `items` / the dated backlog) shift too.
-    const peerTasks =
-      status === 'PLANNED'
-        ? streamItemsOf(snapshot).flatMap((entry) =>
-            entry.task && entry.task.status === 'PLANNED' ? [entry.task] : [],
-          )
-        : rows.flatMap((entry) => (entry.task ? [entry.task] : []));
-    const shiftedRanks = new Map(
-      applyOpenTaskReorder(peerTasks, task.id, target).map((entry) => [
-        entry.id,
-        entry.sort_order,
-      ]),
-    );
-    /** `entry` with its shifted Board rank, or the same reference when its
-     *  task is not part of this column (or kept its rank). */
-    const withRank = (entry: AgendaItemRecord): AgendaItemRecord => {
-      const rank = entry.task ? shiftedRanks.get(entry.task.id) : null;
-      if (!entry.task || rank == null || rank === entry.task.sort_order) {
-        return entry;
-      }
-      return { ...entry, task: { ...entry.task, sort_order: rank } };
-    };
-    const inDroppedOrder = (entries: AgendaItemRecord[]) =>
-      entries
-        .slice()
-        .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
-        .map(withRank);
-    patchStream((current) => {
-      if (!current) return current;
-      return {
-        ...current,
-        pages: current.pages.map((page) => {
-          const items = page.items.map(withRank);
-          const backlog = page.backlog ?? [];
-          if (!backlog.some((entry) => entry.id === item.id)) {
-            // Only a PLANNED reorder changes rows off the mover's page (the
-            // dated PLANNED ranks); keep the reference when nothing moved.
-            return items.some((entry, index) => entry !== page.items[index])
-              ? { ...page, items }
-              : page;
-          }
-          // Dated rows keep their places ahead of both warehouses; only the
-          // reordered stretch takes the new order. The rebuild preserves rows
-          // that belong to neither warehouse pile (a stale optimistic
-          // `IN_PROGRESS` at the horizon) instead of dropping them.
-          const split = backlogStretchesForRebuild(backlog, serverToday);
-          return {
-            ...page,
-            items,
-            backlog: [
-              ...split.dated.map(withRank),
-              ...(status === 'PLANNED'
-                ? inDroppedOrder(split.planned)
-                : split.planned.map(withRank)),
-              ...(status === 'OPEN'
-                ? inDroppedOrder(split.open)
-                : split.open.map(withRank)),
-            ],
-          };
-        }),
-      };
-    });
-    setActionError(null);
+    if (!beginRowAction(item.id, 'grip')) return;
     try {
-      const data = await moveTaskMutation.mutateAsync({
-        id: task.id,
-        input: { status, sort_order: target } satisfies MoveTaskInput,
+      // The new order — dnd-kit's own array move, so the row lands where the
+      // user dropped it.
+      const reordered = arrayMove(rows, fromIndex, toIndex);
+      const order = new Map(reordered.map((entry, index) => [entry.id, index]));
+      const snapshot = readStream();
+      // The task embeds sharing this column's rank space. OPEN reorders only
+      // touch the stretch; a PLANNED reorder is the whole Planned column, so the
+      // dated PLANNED rows (they live in `items` / the dated backlog) shift too.
+      const peerTasks =
+        status === 'PLANNED'
+          ? streamItemsOf(snapshot).flatMap((entry) =>
+              entry.task && entry.task.status === 'PLANNED' ? [entry.task] : [],
+            )
+          : rows.flatMap((entry) => (entry.task ? [entry.task] : []));
+      const shiftedRanks = new Map(
+        applyOpenTaskReorder(peerTasks, task.id, target).map((entry) => [
+          entry.id,
+          entry.sort_order,
+        ]),
+      );
+      /** `entry` with its shifted Board rank, or the same reference when its
+       *  task is not part of this column (or kept its rank). */
+      const withRank = (entry: AgendaItemRecord): AgendaItemRecord => {
+        const rank = entry.task ? shiftedRanks.get(entry.task.id) : null;
+        if (!entry.task || rank == null || rank === entry.task.sort_order) {
+          return entry;
+        }
+        return { ...entry, task: { ...entry.task, sort_order: rank } };
+      };
+      const inDroppedOrder = (entries: AgendaItemRecord[]) =>
+        entries
+          .slice()
+          .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+          .map(withRank);
+      patchStream((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          pages: current.pages.map((page) => {
+            const items = page.items.map(withRank);
+            const backlog = page.backlog ?? [];
+            if (!backlog.some((entry) => entry.id === item.id)) {
+              // Only a PLANNED reorder changes rows off the mover's page (the
+              // dated PLANNED ranks); keep the reference when nothing moved.
+              return items.some((entry, index) => entry !== page.items[index])
+                ? { ...page, items }
+                : page;
+            }
+            // Dated rows keep their places ahead of both warehouses; only the
+            // reordered stretch takes the new order. The rebuild preserves rows
+            // that belong to neither warehouse pile (a stale optimistic
+            // `IN_PROGRESS` at the horizon) instead of dropping them.
+            const split = backlogStretchesForRebuild(backlog, serverToday);
+            return {
+              ...page,
+              items,
+              backlog: [
+                ...split.dated.map(withRank),
+                ...(status === 'PLANNED'
+                  ? inDroppedOrder(split.planned)
+                  : split.planned.map(withRank)),
+                ...(status === 'OPEN'
+                  ? inDroppedOrder(split.open)
+                  : split.open.map(withRank)),
+              ],
+            };
+          }),
+        };
       });
-      mergeRow(item.id, (entry) =>
-        entry.task ? { ...entry, task: data.task } : entry,
-      );
-      // Patch the shared tasks cache: the same peer shift, then the mover's
-      // authoritative row, so Board/Lists never read a stale column order.
-      setTasksCache((prev) =>
-        applyOpenTaskReorder(prev, data.task.id, data.task.sort_order).map(
-          (entry) => (entry.id === data.task.id ? data.task : entry),
-        ),
-      );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Move failed');
+      setActionError(null);
+      try {
+        const data = await moveTaskMutation.mutateAsync({
+          id: task.id,
+          input: { status, sort_order: target } satisfies MoveTaskInput,
+        });
+        mergeRow(item.id, (entry) =>
+          entry.task ? { ...entry, task: data.task } : entry,
+        );
+        // Patch the shared tasks cache: the same peer shift, then the mover's
+        // authoritative row, so Board/Lists never read a stale column order.
+        setTasksCache((prev) =>
+          applyOpenTaskReorder(prev, data.task.id, data.task.sort_order).map(
+            (entry) => (entry.id === data.task.id ? data.task : entry),
+          ),
+        );
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Move failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1294,23 +1390,67 @@ export function HomePage() {
   const handleCompleteTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
-    const snapshot = readStream();
-    // Reopen: COMPLETED / DISCARDED → PLANNED (living again — Play/Reschedule
-    // return because the row is no longer a finished card).
-    const wasDiscarded = task.status === 'DISCARDED';
-    if (task.status === 'COMPLETED' || wasDiscarded) {
+    if (!beginRowAction(item.id, 'check')) return;
+    try {
+      const snapshot = readStream();
+      // Reopen: COMPLETED / DISCARDED → PLANNED (living again — Play/Reschedule
+      // return because the row is no longer a finished card).
+      const wasDiscarded = task.status === 'DISCARDED';
+      if (task.status === 'COMPLETED' || wasDiscarded) {
+        patchStream((current) =>
+          placeTaskOnToday(current, item.id, (entry) =>
+            entry.task
+              ? { ...entry, task: { ...entry.task, status: 'PLANNED' } }
+              : entry,
+          ),
+        );
+        setActionError(null);
+        try {
+          const data = await moveTaskMutation.mutateAsync({
+            id: task.id,
+            input: { status: 'PLANNED' } satisfies MoveTaskInput,
+          });
+          mergeRow(item.id, (entry) =>
+            entry.task ? { ...entry, task: data.task } : entry,
+          );
+          // Patch the shared tasks cache so Board/Lists see the fresh row.
+          setTasksCache((prev) =>
+            prev.map((entry) =>
+              entry.id === data.task.id ? data.task : entry,
+            ),
+          );
+        } catch (err) {
+          patchStream(() => snapshot);
+          setActionError(
+            err instanceof Error
+              ? err.message
+              : wasDiscarded
+                ? 'Undo discard failed'
+                : 'Uncheck failed',
+          );
+        }
+        return;
+      }
       patchStream((current) =>
         placeTaskOnToday(current, item.id, (entry) =>
           entry.task
-            ? { ...entry, task: { ...entry.task, status: 'PLANNED' } }
+            ? {
+                ...entry,
+                task: {
+                  ...entry.task,
+                  status: 'COMPLETED',
+                  // Fresh stamp → the Completed dump sorts this row first.
+                  updated_at: new Date().toISOString(),
+                },
+              }
             : entry,
         ),
       );
       setActionError(null);
       try {
-        const data = await moveTaskMutation.mutateAsync({
+        const data = await runTaskActionMutation.mutateAsync({
           id: task.id,
-          input: { status: 'PLANNED' } satisfies MoveTaskInput,
+          action: 'complete',
         });
         mergeRow(item.id, (entry) =>
           entry.task ? { ...entry, task: data.task } : entry,
@@ -1321,47 +1461,10 @@ export function HomePage() {
         );
       } catch (err) {
         patchStream(() => snapshot);
-        setActionError(
-          err instanceof Error
-            ? err.message
-            : wasDiscarded
-              ? 'Undo discard failed'
-              : 'Uncheck failed',
-        );
+        setActionError(err instanceof Error ? err.message : 'Complete failed');
       }
-      return;
-    }
-    patchStream((current) =>
-      placeTaskOnToday(current, item.id, (entry) =>
-        entry.task
-          ? {
-              ...entry,
-              task: {
-                ...entry.task,
-                status: 'COMPLETED',
-                // Fresh stamp → the Completed dump sorts this row first.
-                updated_at: new Date().toISOString(),
-              },
-            }
-          : entry,
-      ),
-    );
-    setActionError(null);
-    try {
-      const data = await runTaskActionMutation.mutateAsync({
-        id: task.id,
-        action: 'complete',
-      });
-      mergeRow(item.id, (entry) =>
-        entry.task ? { ...entry, task: data.task } : entry,
-      );
-      // Patch the shared tasks cache so Board/Lists see the fresh row.
-      setTasksCache((prev) =>
-        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
-      );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Complete failed');
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1371,30 +1474,35 @@ export function HomePage() {
   const handleStartTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      placeTaskOnToday(current, item.id, (entry) =>
-        entry.task
-          ? { ...entry, task: { ...entry.task, status: 'IN_PROGRESS' } }
-          : entry,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, 'play')) return;
     try {
-      const data = await runTaskActionMutation.mutateAsync({
-        id: task.id,
-        action: 'start',
-      });
-      mergeRow(item.id, (entry) =>
-        entry.task ? { ...entry, task: data.task } : entry,
+      const snapshot = readStream();
+      patchStream((current) =>
+        placeTaskOnToday(current, item.id, (entry) =>
+          entry.task
+            ? { ...entry, task: { ...entry.task, status: 'IN_PROGRESS' } }
+            : entry,
+        ),
       );
-      // Patch the shared tasks cache so Board/Lists see the fresh row.
-      setTasksCache((prev) =>
-        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
-      );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Start failed');
+      setActionError(null);
+      try {
+        const data = await runTaskActionMutation.mutateAsync({
+          id: task.id,
+          action: 'start',
+        });
+        mergeRow(item.id, (entry) =>
+          entry.task ? { ...entry, task: data.task } : entry,
+        );
+        // Patch the shared tasks cache so Board/Lists see the fresh row.
+        setTasksCache((prev) =>
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+        );
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Start failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1404,20 +1512,25 @@ export function HomePage() {
   const handlePauseTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
-    setActionError(null);
+    if (!beginRowAction(item.id, 'play')) return;
     try {
-      const data = await runTaskActionMutation.mutateAsync({
-        id: task.id,
-        action: 'pause',
-      });
-      mergeRow(item.id, (entry) =>
-        entry.task ? { ...entry, task: data.task } : entry,
-      );
-      setTasksCache((prev) =>
-        prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
-      );
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Pause failed');
+      setActionError(null);
+      try {
+        const data = await runTaskActionMutation.mutateAsync({
+          id: task.id,
+          action: 'pause',
+        });
+        mergeRow(item.id, (entry) =>
+          entry.task ? { ...entry, task: data.task } : entry,
+        );
+        setTasksCache((prev) =>
+          prev.map((entry) => (entry.id === data.task.id ? data.task : entry)),
+        );
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : 'Pause failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1445,36 +1558,46 @@ export function HomePage() {
   ) => {
     const occurrence = item.occurrence;
     if (!occurrence) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      updateStreamItem(current, item.id, (entry) =>
-        entry.occurrence
-          ? {
-              ...entry,
-              occurrence: {
-                ...entry.occurrence,
-                status,
-                updated_at:
-                  verb === 'complete'
-                    ? new Date().toISOString()
-                    : entry.occurrence.updated_at,
-              },
-            }
-          : entry,
-      ),
-    );
-    setActionError(null);
+    // Only a complete takes the row lock: undoing a skip is the reopen
+    // path and must never spin the circle.
+    const locksRow = verb === 'complete';
+    if (locksRow && !beginRowAction(item.id, 'check')) return;
     try {
-      const data =
-        verb === 'complete'
-          ? await completeOccurrenceMutation.mutateAsync({ id: occurrence.id })
-          : await skipOccurrenceMutation.mutateAsync({ id: occurrence.id });
-      mergeRow(item.id, (entry) =>
-        entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+      const snapshot = readStream();
+      patchStream((current) =>
+        updateStreamItem(current, item.id, (entry) =>
+          entry.occurrence
+            ? {
+                ...entry,
+                occurrence: {
+                  ...entry.occurrence,
+                  status,
+                  updated_at:
+                    verb === 'complete'
+                      ? new Date().toISOString()
+                      : entry.occurrence.updated_at,
+                },
+              }
+            : entry,
+        ),
       );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Update failed');
+      setActionError(null);
+      try {
+        const data =
+          verb === 'complete'
+            ? await completeOccurrenceMutation.mutateAsync({
+                id: occurrence.id,
+              })
+            : await skipOccurrenceMutation.mutateAsync({ id: occurrence.id });
+        mergeRow(item.id, (entry) =>
+          entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+        );
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Update failed');
+      }
+    } finally {
+      if (locksRow) endRowAction(item.id);
     }
   };
 
@@ -1484,36 +1607,46 @@ export function HomePage() {
    *  optimistic shape as setOccurrenceStatus: paint pending immediately,
    *  merge the authoritative occurrence on success, snapshot-rollback +
    *  banner on failure. */
-  const handleReopenOccurrence = async (item: AgendaItemRecord) => {
+  const handleReopenOccurrence = async (
+    item: AgendaItemRecord,
+    slot: 'check' | null,
+  ) => {
     const occurrence = item.occurrence;
     if (!occurrence) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      updateStreamItem(current, item.id, (entry) =>
-        entry.occurrence
-          ? {
-              ...entry,
-              occurrence: {
-                ...entry.occurrence,
-                status: 'pending',
-                calendar_id: null,
-                google_event_id: null,
-              },
-            }
-          : entry,
-      ),
-    );
-    setActionError(null);
+    // Undoing a skip never locks the row (no spinner); unchecking a
+    // done occurrence is the circle's save and does.
+    if (slot && !beginRowAction(item.id, slot)) return;
     try {
-      const data = await reopenOccurrenceMutation.mutateAsync({
-        id: occurrence.id,
-      });
-      mergeRow(item.id, (entry) =>
-        entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+      const snapshot = readStream();
+      patchStream((current) =>
+        updateStreamItem(current, item.id, (entry) =>
+          entry.occurrence
+            ? {
+                ...entry,
+                occurrence: {
+                  ...entry.occurrence,
+                  status: 'pending',
+                  calendar_id: null,
+                  google_event_id: null,
+                },
+              }
+            : entry,
+        ),
       );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Update failed');
+      setActionError(null);
+      try {
+        const data = await reopenOccurrenceMutation.mutateAsync({
+          id: occurrence.id,
+        });
+        mergeRow(item.id, (entry) =>
+          entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+        );
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Update failed');
+      }
+    } finally {
+      if (slot) endRowAction(item.id);
     }
   };
 
@@ -1524,28 +1657,33 @@ export function HomePage() {
   const handleStartOccurrence = async (item: AgendaItemRecord) => {
     const occurrence = item.occurrence;
     if (!occurrence) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      updateStreamItem(current, item.id, (entry) =>
-        entry.occurrence
-          ? {
-              ...entry,
-              occurrence: { ...entry.occurrence, status: 'in_progress' },
-            }
-          : entry,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, 'play')) return;
     try {
-      const data = await startOccurrenceMutation.mutateAsync({
-        id: occurrence.id,
-      });
-      mergeRow(item.id, (entry) =>
-        entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+      const snapshot = readStream();
+      patchStream((current) =>
+        updateStreamItem(current, item.id, (entry) =>
+          entry.occurrence
+            ? {
+                ...entry,
+                occurrence: { ...entry.occurrence, status: 'in_progress' },
+              }
+            : entry,
+        ),
       );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Start failed');
+      setActionError(null);
+      try {
+        const data = await startOccurrenceMutation.mutateAsync({
+          id: occurrence.id,
+        });
+        mergeRow(item.id, (entry) =>
+          entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+        );
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Start failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -1555,33 +1693,38 @@ export function HomePage() {
   const handlePauseOccurrence = async (item: AgendaItemRecord) => {
     const occurrence = item.occurrence;
     if (!occurrence) return;
-    const snapshot = readStream();
-    patchStream((current) =>
-      updateStreamItem(current, item.id, (entry) =>
-        entry.occurrence
-          ? {
-              ...entry,
-              occurrence: {
-                ...entry.occurrence,
-                status: 'pending',
-                calendar_id: null,
-                google_event_id: null,
-              },
-            }
-          : entry,
-      ),
-    );
-    setActionError(null);
+    if (!beginRowAction(item.id, 'play')) return;
     try {
-      const data = await pauseOccurrenceMutation.mutateAsync({
-        id: occurrence.id,
-      });
-      mergeRow(item.id, (entry) =>
-        entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+      const snapshot = readStream();
+      patchStream((current) =>
+        updateStreamItem(current, item.id, (entry) =>
+          entry.occurrence
+            ? {
+                ...entry,
+                occurrence: {
+                  ...entry.occurrence,
+                  status: 'pending',
+                  calendar_id: null,
+                  google_event_id: null,
+                },
+              }
+            : entry,
+        ),
       );
-    } catch (err) {
-      patchStream(() => snapshot);
-      setActionError(err instanceof Error ? err.message : 'Pause failed');
+      setActionError(null);
+      try {
+        const data = await pauseOccurrenceMutation.mutateAsync({
+          id: occurrence.id,
+        });
+        mergeRow(item.id, (entry) =>
+          entry.occurrence ? { ...entry, occurrence: data.occurrence } : entry,
+        );
+      } catch (err) {
+        patchStream(() => snapshot);
+        setActionError(err instanceof Error ? err.message : 'Pause failed');
+      }
+    } finally {
+      endRowAction(item.id);
     }
   };
 
@@ -2070,24 +2213,28 @@ export function HomePage() {
   );
 
   const handlers: AgendaRowHandlers = {
-    onReschedule: (entry, date) => void handleCrossDayMove(entry, date),
-    onMoveToBacklog: (entry) => void handleBacklogDrop(entry),
-    onUnschedule: (entry) => void handleUnschedule(entry),
+    onReschedule: (entry, date) =>
+      void handleCrossDayMove(entry, date, 'calendar'),
+    onMoveToBacklog: (entry) => void handleBacklogDrop(entry, 'calendar'),
+    onUnschedule: (entry) => void handleUnschedule(entry, 'calendar'),
     onCompleteTask: (entry) => void handleCompleteTask(entry),
     onStartTask: (entry) => void handleStartTask(entry),
     onPauseTask: (entry) => void handlePauseTask(entry),
     onOpenTask: (task) => setTaskModal(task),
+    // Unchecking a done occurrence is the circle's own save (it spins);
+    // undoing a skip is not — it never takes the row lock.
     onCompleteOccurrence: (entry) =>
       entry.occurrence?.status === 'done'
-        ? void handleReopenOccurrence(entry)
+        ? void handleReopenOccurrence(entry, 'check')
         : void setOccurrenceStatus(entry, 'done', 'complete'),
     onSkipOccurrence: (entry) =>
       entry.occurrence?.status === 'skipped'
-        ? void handleReopenOccurrence(entry)
+        ? void handleReopenOccurrence(entry, null)
         : void setOccurrenceStatus(entry, 'skipped', 'skip'),
     onStartOccurrence: (entry) => void handleStartOccurrence(entry),
     onPauseOccurrence: (entry) => void handlePauseOccurrence(entry),
     onRenameOccurrence: (entry) => openRename(entry),
+    pendingOf,
   };
 
   return (

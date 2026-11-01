@@ -3,7 +3,9 @@
 // a compact menu with presets anchored to the SERVER's civil today, a month
 // picker, and — for tasks — Unschedule (a dated `PLANNED` row) and Backlog.
 // Every choice fires immediately; HomePage owns the optimistic move, the
-// failure banner and the success notice. Presentational only.
+// failure banner and the success notice. Presentational only. A `busy` control
+// is the row's in-flight move: the trigger holds a spinner and the popover
+// cannot open (`disabled` quiets the trigger while ANOTHER slot saves).
 //
 // The presets deliberately shift from `serverToday`, never from the row's own
 // date. "Tomorrow" on a row three days out must move it to TOMORROW, not one
@@ -19,6 +21,7 @@ import {
   CalendarOff,
   ChevronLeft,
   ChevronRight,
+  Loader2,
 } from 'lucide-react';
 import {
   Popover,
@@ -88,6 +91,12 @@ export interface RescheduleControlProps {
   serverToday: string;
   /** Shared row action styling (the 24px icon button). */
   triggerClassName: string;
+  /** This row's calendar move is the request in flight: the trigger swaps to
+   *  a spinner, cannot open, and the popover is forced closed. */
+  busy?: boolean;
+  /** Another control on the row is in flight: the trigger keeps its calendar
+   *  glyph but cannot open. */
+  disabled?: boolean;
   onReschedule: (item: AgendaItemRecord, date: string) => void;
   /** Available for task rows only; omitted for occurrences. */
   onMoveToBacklog?: (item: AgendaItemRecord) => void;
@@ -101,6 +110,8 @@ export function RescheduleControl({
   label,
   serverToday,
   triggerClassName,
+  busy = false,
+  disabled = false,
   onReschedule,
   onMoveToBacklog,
   onUnschedule,
@@ -187,8 +198,11 @@ export function RescheduleControl({
 
   return (
     <Popover
-      open={open}
+      open={busy ? false : open}
       onOpenChange={(next) => {
+        // A busy trigger never becomes an open popover — the row's request
+        // owns the surface until it settles.
+        if (busy) return;
         setOpen(next);
         if (!next) {
           setView('menu');
@@ -199,9 +213,15 @@ export function RescheduleControl({
       <PopoverTrigger
         aria-label={`Move ${label} to another day`}
         title={`Move ${label} to another day`}
+        disabled={busy || disabled}
+        aria-busy={busy || undefined}
         className={triggerClassName}
       >
-        <Calendar className="h-3.5 w-3.5" />
+        {busy ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+        ) : (
+          <Calendar className="h-3.5 w-3.5" />
+        )}
       </PopoverTrigger>
       <PopoverContent
         align="end"
