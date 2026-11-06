@@ -210,13 +210,22 @@ export interface TouchHandleGeometry {
  *   slides outside the right edge, and it never reaches left of move's box.
  *   Hidden (null) below DELETE_HANDLE_MIN_CHIP_W / _H so it can't crowd the
  *   move/resize knobs; those always stay.
+ *
+ * `leftRoom` is the unclipped px left of the chip (its offset inside a column
+ * whose left edge is the viewport's). Infinite, the default, lets move straddle
+ * the chip edge. Finite, move is pulled inside that wall — box and knob stay at
+ * or right of `-leftRoom` — and on short chips, where it would then meet them,
+ * start/end give up their left part (their knobs stay at the midline).
  */
 export function touchHandleGeometry(
   chipWidth: number,
   chipHeight: number,
+  leftRoom = Infinity,
 ): TouchHandleGeometry {
   const w = Number.isFinite(chipWidth) ? Math.max(0, chipWidth) : 0;
   const h = Number.isFinite(chipHeight) ? Math.max(0, chipHeight) : 0;
+  // Unclipped space left of the chip; non-finite or negative means no wall.
+  const room = Number.isFinite(leftRoom) ? Math.max(0, leftRoom) : Infinity;
   const hit = TOUCH_HANDLE_HIT_PX;
   const half = hit / 2;
   const knob = TOUCH_HANDLE_KNOB_PX;
@@ -224,21 +233,51 @@ export function touchHandleGeometry(
   const shift = Math.min(half - into, knob / 2 - 4);
 
   const midX = w / 2;
-  const start = { x: midX - half, y: into - hit, w: hit, h: hit };
-  const end = { x: midX - half, y: h - into, w: hit, h: hit };
-
   // On tall chips the move box's vertical range clears start/end already.
   const mayMeet = h < hit * 2;
-  const moveRight = mayMeet ? Math.min(18, start.x) : 18;
-  const move = { x: moveRight - hit, y: h / 2 - half, w: hit, h: hit };
+  const baseRight = mayMeet ? Math.min(18, midX - half) : 18;
+  // The wall is left of where the move box would put its left edge.
+  const walled = baseRight - hit < -room;
+
+  // Only a walled box that could meet start/end needs their left part; they
+  // keep their knob at the midline, so never yield past it.
+  const startLeft =
+    walled && mayMeet
+      ? Math.min(Math.max(midX - half, knob - room), midX)
+      : midX - half;
+  const startW = midX + half - startLeft;
+  const start = { x: startLeft, y: into - hit, w: startW, h: hit };
+  const end = { x: startLeft, y: h - into, w: startW, h: hit };
+
+  const moveLeft = walled ? -room : baseRight - hit;
+  const moveRight = walled
+    ? Math.min(-room + hit, mayMeet ? startLeft : Infinity)
+    : baseRight;
+  const move = {
+    x: moveLeft,
+    y: h / 2 - half,
+    w: Math.max(0, moveRight - moveLeft),
+    h: hit,
+  };
 
   // Mirror of `move`: clear of start/end when they could meet, else of move.
-  const removeLeft = Math.max(w - 18, mayMeet ? start.x + hit : move.x + hit);
+  const removeLeft = Math.max(
+    w - 18,
+    mayMeet ? start.x + start.w : move.x + move.w,
+  );
   const hasRemove =
     w >= DELETE_HANDLE_MIN_CHIP_W && h >= DELETE_HANDLE_MIN_CHIP_H;
   const remove = hasRemove
     ? { x: removeLeft, y: h / 2 - half, w: hit, h: hit }
     : null;
+
+  // Keep the knob at the chip edge even when its hit box slid out, then pull it
+  // fully into the room; the box's right edge wins on impossible narrow chips.
+  const baseKnobX = Math.max(baseRight - half, -(knob / 2 - 4));
+  const moveKnobX = Math.min(
+    Math.max(baseKnobX, -room + knob / 2),
+    move.x + move.w,
+  );
 
   return {
     start,
@@ -248,8 +287,7 @@ export function touchHandleGeometry(
     knobs: {
       start: [midX, -shift],
       end: [midX, h + shift],
-      // Keep the knob straddling the left edge even when the hit box slid out.
-      move: [Math.max(moveRight - half, -(knob / 2 - 4)), h / 2],
+      move: [moveKnobX, h / 2],
       remove: remove
         ? [Math.min(removeLeft + half, w + (knob / 2 - 4)), h / 2]
         : null,

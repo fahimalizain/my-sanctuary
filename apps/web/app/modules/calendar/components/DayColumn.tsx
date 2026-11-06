@@ -36,6 +36,8 @@ export interface DayColumnProps {
   onRequestDelete?: () => void;
   /** Local-only chips whose create failed (dashed outline), by event id. */
   unsavedEventIds?: ReadonlySet<string>;
+  /** Column holds the strip's first visible day: the gutter clips its left. */
+  firstVisible: boolean;
 }
 
 /**
@@ -61,6 +63,7 @@ export const DayColumn = memo(function DayColumn({
   onSelectChip,
   onRequestDelete,
   unsavedEventIds,
+  firstVisible,
 }: DayColumnProps) {
   return (
     <div
@@ -90,6 +93,9 @@ export const DayColumn = memo(function DayColumn({
           dragging={draggingEventId === p.event.id}
           past={isEventPast(Date.parse(p.event.end_time), nowMs)}
           unsaved={unsavedEventIds?.has(p.event.id) ?? false}
+          leftRoom={
+            firstVisible ? p.leftPixels + p.leftPercent * colW : undefined
+          }
         />
       ))}
 

@@ -24,6 +24,8 @@ export interface CalendarWeekGridProps {
   gutterW: number;
   trackWidth: number;
   days: Date[];
+  /** First day fully in view; its column's left edge is the strip's clip. */
+  visibleStart: Date;
   today: Date;
   /** Current time for the now-line (only needed on today's column). */
   now: Date;
@@ -83,6 +85,7 @@ export function CalendarWeekGrid({
   gutterW,
   trackWidth,
   days,
+  visibleStart,
   today,
   now,
   hourH,
@@ -260,6 +263,7 @@ export function CalendarWeekGrid({
                 {/* Day columns — memoized; drag preview is a sibling overlay */}
                 {days.map((day) => {
                   const isTodayCol = isSameDay(day, today);
+                  const firstVisible = isSameDay(day, visibleStart);
                   const dayKey = day.toDateString();
                   const dayEvents = eventsByDay.get(dayKey) ?? EMPTY_DAY_EVENTS;
 
@@ -284,6 +288,7 @@ export function CalendarWeekGrid({
                       onSelectChip={onSelectChip}
                       onRequestDelete={onRequestDelete}
                       unsavedEventIds={unsavedEventIds}
+                      firstVisible={firstVisible}
                     />
                   );
                 })}

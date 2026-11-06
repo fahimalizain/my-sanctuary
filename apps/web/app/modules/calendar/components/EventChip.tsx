@@ -33,9 +33,12 @@ const knobClassName =
 
 function TouchHandles({
   height,
+  leftRoom,
   onRequestDelete,
 }: {
   height: number;
+  /** Unclipped px left of the chip; undefined = room to straddle the edge. */
+  leftRoom?: number;
   /** Omitted for read-only events: no delete handle. */
   onRequestDelete?: () => void;
 }) {
@@ -51,7 +54,7 @@ function TouchHandles({
     return () => ro.disconnect();
   }, []);
 
-  const g = touchHandleGeometry(width, height);
+  const g = touchHandleGeometry(width, height, leftRoom);
   const knob = TOUCH_HANDLE_KNOB_PX;
   const handle = (
     r: HandleRect,
@@ -171,6 +174,11 @@ interface EventChipProps {
   past?: boolean;
   /** Local-only event whose create failed: dashed outline, retryable. */
   unsaved?: boolean;
+  /**
+   * Unclipped px left of the chip; only set on the first visible column, where
+   * the gutter clips a move handle that straddles the chip's left edge.
+   */
+  leftRoom?: number;
 }
 
 export const EventChip = memo(function EventChip({
@@ -182,6 +190,7 @@ export const EventChip = memo(function EventChip({
   dragging = false,
   past = false,
   unsaved = false,
+  leftRoom,
 }: EventChipProps) {
   const {
     event,
@@ -340,7 +349,11 @@ export const EventChip = memo(function EventChip({
         </div>
       </div>
       {selected && (
-        <TouchHandles height={height} onRequestDelete={onRequestDelete} />
+        <TouchHandles
+          height={height}
+          leftRoom={leftRoom}
+          onRequestDelete={onRequestDelete}
+        />
       )}
     </div>
   );

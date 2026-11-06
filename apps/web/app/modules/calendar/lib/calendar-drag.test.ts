@@ -1325,6 +1325,69 @@ test('touchHandleGeometry: no hit-box overlap, knobs belong to the chip', () => 
   }
 });
 
+test('touchHandleGeometry: a left wall keeps the move handle inside the column', () => {
+  const half = TOUCH_HANDLE_KNOB_PX / 2;
+  const inside = (r: HandleRect, [x, y]: [number, number]) =>
+    x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  for (const leftRoom of [0, 4]) {
+    for (const w of [45, 60, 110, 200]) {
+      for (const h of [15, 30, 45, 90]) {
+        const g = touchHandleGeometry(w, h, leftRoom);
+        const label = `w=${w} h=${h} room=${leftRoom}`;
+        // The first visible column clips everything left of its x=0.
+        assert.ok(g.move.x >= -leftRoom, `move box past the wall ${label}`);
+        assert.ok(
+          g.knobs.move[0] - half >= -leftRoom,
+          `move knob clipped by the wall ${label}`,
+        );
+        // ...but the knob still reads as the chip's left-edge handle.
+        const knob = {
+          x: g.knobs.move[0] - half,
+          y: g.knobs.move[1] - half,
+          w: half * 2,
+          h: half * 2,
+        };
+        assert.ok(
+          intersects(knob, { x: 0, y: 0, w, h }),
+          `move knob touches chip ${label}`,
+        );
+
+        const boxes: HandleRect[] = [g.start, g.end, g.move];
+        if (g.remove) boxes.push(g.remove);
+        for (let i = 0; i < boxes.length; i++) {
+          for (let j = i + 1; j < boxes.length; j++) {
+            assert.ok(!intersects(boxes[i], boxes[j]), `overlap ${label}`);
+          }
+        }
+
+        assert.ok(inside(g.start, g.knobs.start), `start knob in box ${label}`);
+        assert.ok(inside(g.end, g.knobs.end), `end knob in box ${label}`);
+        assert.ok(inside(g.move, g.knobs.move), `move knob in box ${label}`);
+        if (g.remove && g.knobs.remove) {
+          assert.ok(
+            inside(g.remove, g.knobs.remove),
+            `remove knob in box ${label}`,
+          );
+        }
+        // Yielding the left part never moves the resize knobs off the middle.
+        assert.equal(g.knobs.start[0], w / 2);
+        assert.equal(g.knobs.end[0], w / 2);
+      }
+    }
+  }
+});
+
+test('touchHandleGeometry: no left room is the default geometry', () => {
+  for (const w of [45, 60, 110, 200]) {
+    for (const h of [15, 30, 45, 90]) {
+      assert.deepEqual(
+        touchHandleGeometry(w, h, Infinity),
+        touchHandleGeometry(w, h),
+      );
+    }
+  }
+});
+
 test('touchHandleGeometry: tall wide chips straddle the edge symmetrically', () => {
   const g = touchHandleGeometry(200, 200);
   assert.equal(g.start.y + g.start.h, TOUCH_HANDLE_HIT_PX / 2);
