@@ -213,6 +213,7 @@ export function CalendarPage() {
           gutterW={strip.gutterW}
           trackWidth={strip.trackWidth}
           days={strip.days}
+          visibleStart={strip.visibleStart}
           today={strip.today}
           now={session.now}
           hourH={session.hourH}

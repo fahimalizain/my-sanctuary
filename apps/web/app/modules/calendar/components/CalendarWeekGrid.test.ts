@@ -68,6 +68,7 @@ function mountGrid(): {
       gutterW: GUTTER_W,
       trackWidth: DAY_COUNT * COL_W,
       days,
+      visibleStart: days[0],
       today: days[7],
       now: new Date(2026, 9, 19, 12),
       hourH: 48,
