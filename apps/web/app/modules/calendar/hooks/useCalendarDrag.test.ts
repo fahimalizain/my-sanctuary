@@ -13,6 +13,11 @@ import assert from 'node:assert/strict';
 import { createElement, type PointerEvent as ReactPointerEvent } from 'react';
 import type { CalendarEvent } from '@/app/types';
 import type { DragZone, TimedRange } from '../lib/calendar-drag';
+import {
+  addDays,
+  civilDateFromAllDayIso,
+  startOfDay,
+} from '../lib/week-layout';
 import { installDom } from '../components/install-dom';
 
 installDom();
@@ -701,4 +706,75 @@ test('an all-day chip grab counts days from the civil date, not the UTC instant'
     new Date(2026, 10, 10).getTime(),
   );
   assert.equal(moves[0].range.end.getTime(), new Date(2026, 10, 11).getTime());
+});
+
+test('a timed band chip seeds from its instant, not the ISO date prefix', async () => {
+  // The replica convention belongs to all-day rows only: a timed event that
+  // merely renders in the band is grabbed where it really is. `18:30Z` is the
+  // next local civil day east of UTC+5:30, so reading the date prefix would
+  // seed the grab a day early there (a no-op in UTC, where both agree).
+  const iso = '2026-11-09T18:30:00Z';
+  const localDay = startOfDay(new Date(iso));
+  const prefixDay = civilDateFromAllDayIso(iso);
+  assert.ok(prefixDay, 'the date prefix parses');
+
+  // Column 0 is the instant's own local day, whatever the prefix says.
+  const band = mountAllDayRow([localDay, addDays(localDay, 1)]);
+  const moves: { id: string; range: TimedRange; zone: DragZone }[] = [];
+  try {
+    const drag = await mountDrag(undefined, (id, range, zone) => {
+      moves.push({ id, range, zone });
+    });
+    const event: CalendarEvent = {
+      ...timedEvent(),
+      id: 'timed-1',
+      start_time: iso,
+      end_time: '2026-11-09T19:30:00Z',
+    };
+
+    await act(async () => {
+      drag.onAllDayChipPointerDown(
+        pointerDown(band.chip, 10, 10),
+        event,
+        band.chip,
+      );
+    });
+    const move = (type: 'pointermove' | 'pointerup') => {
+      window.dispatchEvent(
+        new window.PointerEvent(type, {
+          pointerId: 1,
+          pointerType: 'mouse',
+          clientX: 110,
+          clientY: 10,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    };
+    await act(async () => {
+      move('pointermove');
+    });
+    await act(async () => {
+      move('pointerup');
+    });
+  } finally {
+    band.remove();
+  }
+
+  assert.equal(moves.length, 1, 'the drop commits once');
+  assert.equal(moves[0].id, 'timed-1');
+  assert.equal(moves[0].zone, 'allday', 'the drop zone rides along');
+  // Grab offset 0 on the instant's own local day: one column of travel moves
+  // exactly one civil day, and `movedAllDayRange` keeps a whole-day exclusive
+  // duration (a sub-day timed span rounds up to 1).
+  assert.equal(moves[0].range.start.getTime(), addDays(localDay, 1).getTime());
+  assert.equal(moves[0].range.end.getTime(), addDays(localDay, 2).getTime());
+  if (localDay.getTime() !== prefixDay.getTime()) {
+    // Discriminating case: the instant, not the date prefix. Seeding from the
+    // prefix would grab the wrong day and land one day short of this.
+    assert.notEqual(
+      moves[0].range.start.getTime(),
+      addDays(prefixDay, 1).getTime(),
+    );
+  }
 });

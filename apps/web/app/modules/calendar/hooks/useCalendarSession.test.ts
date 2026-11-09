@@ -658,6 +658,11 @@ function mountAllDayDragDom(
   bandDays: Date[],
   gridDay: Date,
   hourH: number,
+  /**
+   * Put the chip in the timed column instead of the first band cell: a timed
+   * grab (`onChipPointerDown`) that can still be dropped on the band.
+   */
+  timedChip?: { startMin: number; endMin: number },
 ): AllDayDragDom {
   const row = document.createElement('div');
   row.setAttribute('data-allday-row', '');
@@ -683,11 +688,6 @@ function mountAllDayDragDom(
     return cell;
   });
 
-  const chipEl = document.createElement('div');
-  chipEl.className = 'event-chip';
-  chipEl.dataset.eventId = chipId;
-  cells[0].append(chipEl);
-
   const col = document.createElement('div');
   col.setAttribute('data-day-col', gridDay.toISOString());
   col.getBoundingClientRect = () =>
@@ -704,6 +704,32 @@ function mountAllDayDragDom(
         return {};
       },
     }) as DOMRect;
+
+  const chipEl = document.createElement('div');
+  chipEl.className = 'event-chip';
+  chipEl.dataset.eventId = chipId;
+  if (timedChip) {
+    chipEl.dataset.startMin = String(timedChip.startMin);
+    chipEl.dataset.endMin = String(timedChip.endMin);
+    const rect = chipRect(timedChip.startMin, timedChip.endMin, hourH);
+    chipEl.getBoundingClientRect = () =>
+      ({
+        top: BAND_H + rect.top,
+        left: rect.left,
+        right: rect.right,
+        bottom: BAND_H + rect.bottom,
+        width: rect.width,
+        height: rect.height,
+        x: rect.x,
+        y: BAND_H + rect.y,
+        toJSON() {
+          return {};
+        },
+      }) as DOMRect;
+    col.append(chipEl);
+  } else {
+    cells[0].append(chipEl);
+  }
 
   document.body.append(row, col);
 
@@ -1361,6 +1387,44 @@ test('dragging an all-day chip onto the timed grid converts it to instants', asy
     is_all_day: false,
     start: new Date(2026, 9, 19, 9, 0, 0, 0).toISOString(),
     end: new Date(2026, 9, 19, 9, 30, 0, 0).toISOString(),
+  });
+});
+
+test('dragging a timed chip onto the all-day band converts it to civil dates', async () => {
+  // A timed grab (origin zone timed) that ends on the band: the gesture
+  // converts the row, so the body is the all-day shape of the drop day.
+  const timed = seededEvent('e1', { title: 'Dentist' });
+  seededEvents = [timed];
+  const session = await mountSession();
+  const hourH = session.current!.hourH;
+  const dropDay = new Date(2026, 9, 19);
+  const nextLocalDay = new Date(2026, 9, 20);
+  // The chip sits in the event's own timed column; the drop column is the
+  // second band cell.
+  const dom = mountAllDayDragDom('e1', [DAY, dropDay], DAY, hourH, {
+    startMin: 9 * 60,
+    endMin: 10 * 60,
+  });
+  try {
+    await act(async () => {
+      // Mid-chip: the 6px edge zones stay resizes, the body is a move.
+      chipPointerDown(session.current!, timed, dom.chipEl, dom.gridY(9.5 * 60));
+    });
+    // Up onto the band: `toAllDayRange` collapses the timed span to the drop
+    // column's civil day, midnight to next midnight.
+    await movePointer(10, COL_W + 10);
+    await dropPointer(10, COL_W + 10);
+    await settle();
+  } finally {
+    dom.remove();
+  }
+
+  const patches = patchRequests();
+  assert.equal(patches.length, 1);
+  assert.deepEqual(patches[0].body, {
+    is_all_day: true,
+    start: civilYmdToUtcMidnightIso(toDateInputValue(dropDay)),
+    end: civilYmdToUtcMidnightIso(toDateInputValue(nextLocalDay)),
   });
 });
 
