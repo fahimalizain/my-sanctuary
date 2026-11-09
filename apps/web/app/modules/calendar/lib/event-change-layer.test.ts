@@ -180,6 +180,95 @@ test('prepareSend: a zone clear still carries the times', () => {
   });
 });
 
+test('prepareSend: a move on an all-day row keeps the flag with both edges', () => {
+  const base = makeEvent({
+    start_time: '2026-09-13T00:00:00.000Z',
+    end_time: '2026-09-14T00:00:00.000Z',
+    is_all_day: true,
+  });
+  const layer = new EventChangeLayer(serverLookup(base));
+  layer.edit('e1', {
+    is_all_day: true,
+    start: '2026-09-20T00:00:00Z',
+    end: '2026-09-21T00:00:00Z',
+  });
+
+  // The server row already holds `is_all_day: true`: the no-op skip must not
+  // take the flag away, or the API would encode the move as instants.
+  const prepared = layer.prepareSend(
+    'e1',
+    {
+      is_all_day: true,
+      start: '2026-09-20T00:00:00Z',
+      end: '2026-09-21T00:00:00Z',
+    },
+    base,
+  );
+  assert.deepEqual(prepared.patch, {
+    is_all_day: true,
+    start: '2026-09-20T00:00:00Z',
+    end: '2026-09-21T00:00:00Z',
+  });
+  assert.deepEqual(
+    prepared.skipped,
+    {},
+    'the flag is never reported as skipped',
+  );
+});
+
+test('prepareSend: an edge-only move on an all-day row still carries the flag', () => {
+  const base = makeEvent({
+    start_time: '2026-09-13T00:00:00.000Z',
+    end_time: '2026-09-14T00:00:00.000Z',
+    is_all_day: true,
+  });
+  const layer = new EventChangeLayer(serverLookup(base));
+
+  const prepared = layer.prepareSend(
+    'e1',
+    { start: '2026-09-20T00:00:00Z' },
+    base,
+  );
+  // The flag is the encoding discriminator, so it brings the other edge along
+  // (the API reads the three together).
+  assert.deepEqual(prepared.patch, {
+    is_all_day: true,
+    start: '2026-09-20T00:00:00Z',
+    end: base.end_time,
+  });
+  assert.deepEqual(prepared.skipped, {});
+});
+
+test('prepareSend: a timed move does not gain the all-day flag', () => {
+  const base = makeEvent();
+  const layer = new EventChangeLayer(serverLookup(base));
+  const patch = {
+    start: '2026-09-13T07:00:00.000Z',
+    end: '2026-09-13T08:00:00.000Z',
+  };
+
+  const prepared = layer.prepareSend('e1', patch, base);
+  assert.equal(prepared.patch.is_all_day, undefined);
+  assert.deepEqual(prepared.patch, patch);
+});
+
+test('prepareSend: an explicit timed conversion is not forced back to all-day', () => {
+  const base = makeEvent({
+    start_time: '2026-09-13T00:00:00.000Z',
+    end_time: '2026-09-14T00:00:00.000Z',
+    is_all_day: true,
+  });
+  const layer = new EventChangeLayer(serverLookup(base));
+  const patch = {
+    is_all_day: false,
+    start: '2026-09-13T09:00:00.000Z',
+    end: '2026-09-13T10:00:00.000Z',
+  };
+
+  const prepared = layer.prepareSend('e1', patch, base);
+  assert.deepEqual(prepared.patch, patch);
+});
+
 test('unsentPatch: an acknowledged value is not sent again', () => {
   const layer = new EventChangeLayer(serverLookup(makeEvent()));
   layer.edit('e1', { summary: 'New' });

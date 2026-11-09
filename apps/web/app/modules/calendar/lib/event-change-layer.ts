@@ -223,6 +223,18 @@ function needsTimeEdges(patch: EventPatch): boolean {
 }
 
 /**
+ * True when sending `patch` leaves the row all-day. The flag may be absent —
+ * a move only carries the edges — so the known server row decides.
+ */
+function staysAllDay(
+  patch: EventPatch,
+  serverRow: CalendarEvent | undefined,
+): boolean {
+  if (patch.is_all_day === false) return false;
+  return patch.is_all_day === true || serverRow?.is_all_day === true;
+}
+
+/**
  * An all-day or zone write is read together with its two edges by the API, so
  * a squashed patch that carries the flag / zone must carry start and end too.
  * The values come from the local intent, then the known server row.
@@ -476,6 +488,19 @@ export class EventChangeLayer {
         assignPatchField(skipped, field, prepared[field]);
         delete prepared[field];
       }
+    }
+
+    // A moved all-day row carries the flag even though the server row already
+    // holds it: `is_all_day` is the discriminator the API reads together with
+    // the edges, so a start/end-only body would encode the move as instants
+    // (Google rejects a `dateTime` patch of a date-only event).
+    if (
+      prepared.is_all_day === undefined &&
+      (prepared.start !== undefined || prepared.end !== undefined) &&
+      staysAllDay(patch, serverRow)
+    ) {
+      prepared.is_all_day = true;
+      delete skipped.is_all_day;
     }
 
     if (needsTimeEdges(prepared)) {
