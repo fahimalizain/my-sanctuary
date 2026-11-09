@@ -27,6 +27,7 @@ import {
   allDayPreviewIndices,
   timedPreviewSegments,
   type DragPreviewInfo,
+  type DragZone,
   type TimedRange,
 } from '../lib/calendar-drag';
 import {
@@ -70,12 +71,14 @@ import { useCalendarDrag } from './useCalendarDrag';
 import { useCalendarZoom } from './useCalendarZoom';
 import {
   COL_HEADER_H,
+  civilYmdToUtcMidnightIso,
   colorForCalendar,
   defaultWritableCalendar,
   hourGridBackground,
   hourHeight as computeHourHeight,
   isMultiDay,
   isSameDay,
+  toDateInputValue,
   type StripLockReason,
 } from '../lib/week-layout';
 
@@ -1372,7 +1375,7 @@ export function useCalendarSession({
   const totalHoursH = hourH * 24;
 
   const handleMoveOrResize = useCallback(
-    (eventId: string, range: TimedRange) => {
+    (eventId: string, range: TimedRange, zone: DragZone = 'timed') => {
       // A drag session holds the id it started under; the alias maps a temp
       // id whose create returned mid-gesture onto the server row, so the drop
       // commits instead of finding nothing.
@@ -1383,12 +1386,31 @@ export function useCalendarSession({
       if (!current) return;
 
       clearWriteError();
-      // Field-level intent only: paint the two edges over the live row (or
-      // update a temp row in place) and PATCH them for a server id.
-      queue.edit(id, {
-        start: range.start.toISOString(),
-        end: range.end.toISOString(),
-      });
+      if (zone === 'allday') {
+        // All-day carries civil dates, and the API reads `is_all_day` together
+        // with both edges: the replica's `YYYY-MM-DDT00:00:00Z` shape of the
+        // drop day, not the local midnight instants of the drag range.
+        queue.edit(id, {
+          is_all_day: true,
+          start: civilYmdToUtcMidnightIso(toDateInputValue(range.start)),
+          end: civilYmdToUtcMidnightIso(toDateInputValue(range.end)),
+        });
+      } else if (current.is_all_day === true) {
+        // Dropped back on the timed grid: the gesture converts the row, the
+        // same write the inspector toggle makes.
+        queue.edit(id, {
+          is_all_day: false,
+          start: range.start.toISOString(),
+          end: range.end.toISOString(),
+        });
+      } else {
+        // Field-level intent only: paint the two edges over the live row (or
+        // update a temp row in place) and PATCH them for a server id.
+        queue.edit(id, {
+          start: range.start.toISOString(),
+          end: range.end.toISOString(),
+        });
+      }
 
       // Still a temp id: no server row yet — a create in flight flushes these
       // times on success; an unsaved create re-POSTs now, so a drag is not

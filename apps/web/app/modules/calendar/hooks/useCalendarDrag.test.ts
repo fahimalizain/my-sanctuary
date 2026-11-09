@@ -12,6 +12,7 @@ import { after, afterEach, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement, type PointerEvent as ReactPointerEvent } from 'react';
 import type { CalendarEvent } from '@/app/types';
+import type { DragZone, TimedRange } from '../lib/calendar-drag';
 import { installDom } from '../components/install-dom';
 
 installDom();
@@ -42,6 +43,7 @@ after(() => {
 function Harness(props: {
   api: { current: CalendarDragApi | null };
   scrollStripBy?: (dx: number) => void;
+  onMove?: (eventId: string, range: TimedRange, zone: DragZone) => void;
 }) {
   const drag = useCalendarDrag({
     hourH: 48,
@@ -50,7 +52,7 @@ function Harness(props: {
     scrollStripBy: props.scrollStripBy ?? (() => {}),
     onClickCreate: () => {},
     onDragCreate: () => {},
-    onMove: () => {},
+    onMove: props.onMove ?? (() => {}),
     onResize: () => {},
     onAllDayCreate: () => {},
     onChipTap: () => {},
@@ -61,10 +63,11 @@ function Harness(props: {
 
 async function mountDrag(
   scrollStripBy?: (dx: number) => void,
+  onMove?: (eventId: string, range: TimedRange, zone: DragZone) => void,
 ): Promise<CalendarDragApi> {
   const api: { current: CalendarDragApi | null } = { current: null };
   await act(async () => {
-    render(createElement(Harness, { api, scrollStripBy }));
+    render(createElement(Harness, { api, scrollStripBy, onMove }));
   });
   assert.ok(api.current);
   return api.current;
@@ -604,4 +607,98 @@ test('a hidden document releases the freeze', async () => {
     grid.remove();
     frames.restore();
   }
+});
+
+/**
+ * The all-day band: one cell per civil day, laid out left to right, with a chip
+ * inside the first. `elementFromPoint` resolves by X — jsdom has no hit-testing.
+ */
+function mountAllDayRow(days: Date[]): {
+  chip: HTMLDivElement;
+  remove: () => void;
+} {
+  const row = document.createElement('div');
+  row.setAttribute('data-allday-row', '');
+  const cells = days.map((day, index) => {
+    const cell = document.createElement('div');
+    cell.setAttribute('data-allday-day', day.toISOString());
+    stubRect(cell, { top: 0, left: index * 100, width: 100, height: 20 });
+    row.append(cell);
+    return cell;
+  });
+  const chip = document.createElement('div');
+  cells[0].append(chip);
+  document.body.append(row);
+
+  const prevHit = document.elementFromPoint;
+  const hadHitTest = typeof prevHit === 'function';
+  document.elementFromPoint = (x: number) =>
+    cells[Math.min(Math.max(Math.floor(x / 100), 0), cells.length - 1)] ?? null;
+
+  return {
+    chip,
+    remove: () => {
+      row.remove();
+      if (hadHitTest) document.elementFromPoint = prevHit;
+      else Reflect.deleteProperty(document, 'elementFromPoint');
+    },
+  };
+}
+
+test('an all-day chip grab counts days from the civil date, not the UTC instant', async () => {
+  // Production shape: the replica is UTC midnight of the civil date. West of
+  // UTC `new Date(iso)` is the previous evening, so seeding the grab offset
+  // from the instant would make it 1 and pin the chip to its own day.
+  const band = mountAllDayRow([new Date(2026, 10, 9), new Date(2026, 10, 10)]);
+  const moves: { id: string; range: TimedRange; zone: DragZone }[] = [];
+  try {
+    const drag = await mountDrag(undefined, (id, range, zone) => {
+      moves.push({ id, range, zone });
+    });
+    const event: CalendarEvent = {
+      ...timedEvent(),
+      id: 'allday-1',
+      start_time: '2026-11-09T00:00:00Z',
+      end_time: '2026-11-10T00:00:00Z',
+      is_all_day: true,
+    };
+
+    await act(async () => {
+      drag.onAllDayChipPointerDown(
+        pointerDown(band.chip, 10, 10),
+        event,
+        band.chip,
+      );
+    });
+    const move = (type: 'pointermove' | 'pointerup') => {
+      window.dispatchEvent(
+        new window.PointerEvent(type, {
+          pointerId: 1,
+          pointerType: 'mouse',
+          clientX: 110,
+          clientY: 10,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    };
+    await act(async () => {
+      move('pointermove');
+    });
+    await act(async () => {
+      move('pointerup');
+    });
+  } finally {
+    band.remove();
+  }
+
+  assert.equal(moves.length, 1, 'the drop commits once');
+  assert.equal(moves[0].id, 'allday-1');
+  assert.equal(moves[0].zone, 'allday', 'the drop zone rides along');
+  // Grab offset 0: one column of travel moves the chip exactly one civil day.
+  assert.equal(
+    moves[0].range.start.getTime(),
+    new Date(2026, 10, 10).getTime(),
+  );
+  assert.equal(moves[0].range.end.getTime(), new Date(2026, 10, 11).getTime());
 });

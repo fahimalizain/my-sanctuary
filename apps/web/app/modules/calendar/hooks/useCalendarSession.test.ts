@@ -26,6 +26,7 @@ import type {
   PatchCalendarEventInput,
 } from '@/app/types';
 import type { CalendarClipboardItem } from '../lib/calendar-clipboard';
+import { civilYmdToUtcMidnightIso, toDateInputValue } from '../lib/week-layout';
 import { installDom } from '../components/install-dom';
 
 installDom();
@@ -602,13 +603,13 @@ function chipPointerDown(
   session.onChipPointerDown(e, event, chipEl);
 }
 
-async function movePointer(clientY: number): Promise<void> {
+async function movePointer(clientY: number, clientX = 10): Promise<void> {
   await act(async () => {
     window.dispatchEvent(
       new window.PointerEvent('pointermove', {
         pointerId: 1,
         pointerType: 'mouse',
-        clientX: 10,
+        clientX,
         clientY,
         bubbles: true,
         cancelable: true,
@@ -617,13 +618,13 @@ async function movePointer(clientY: number): Promise<void> {
   });
 }
 
-async function dropPointer(clientY: number): Promise<void> {
+async function dropPointer(clientY: number, clientX = 10): Promise<void> {
   await act(async () => {
     window.dispatchEvent(
       new window.PointerEvent('pointerup', {
         pointerId: 1,
         pointerType: 'mouse',
-        clientX: 10,
+        clientX,
         clientY,
         bubbles: true,
       }),
@@ -634,6 +635,121 @@ async function dropPointer(clientY: number): Promise<void> {
 /** Client Y for a minute-of-day on the stubbed column. */
 function yForMinutes(minutes: number, hourH: number): number {
   return (minutes / 60) * hourH;
+}
+
+// ── All-day band drag helper ─────────────────────────────────────────────
+//
+// The band is a strip on top of the timed grid: `hitTestAllDay` wins on a cell
+// there, `hitTestTimed` wins below it. jsdom has neither layout nor hit-testing,
+// so both are stubbed, and `elementFromPoint` resolves by Y (band or grid) and
+// then X (which civil day).
+
+const BAND_H = 20;
+
+interface AllDayDragDom {
+  chipEl: HTMLElement;
+  /** Client Y for a minute-of-day inside the timed grid under the band. */
+  gridY: (minutes: number) => number;
+  remove: () => void;
+}
+
+function mountAllDayDragDom(
+  chipId: string,
+  bandDays: Date[],
+  gridDay: Date,
+  hourH: number,
+): AllDayDragDom {
+  const row = document.createElement('div');
+  row.setAttribute('data-allday-row', '');
+
+  const cells = bandDays.map((day, index) => {
+    const cell = document.createElement('div');
+    cell.setAttribute('data-allday-day', day.toISOString());
+    cell.getBoundingClientRect = () =>
+      ({
+        top: 0,
+        left: index * COL_W,
+        right: (index + 1) * COL_W,
+        bottom: BAND_H,
+        width: COL_W,
+        height: BAND_H,
+        x: index * COL_W,
+        y: 0,
+        toJSON() {
+          return {};
+        },
+      }) as DOMRect;
+    row.append(cell);
+    return cell;
+  });
+
+  const chipEl = document.createElement('div');
+  chipEl.className = 'event-chip';
+  chipEl.dataset.eventId = chipId;
+  cells[0].append(chipEl);
+
+  const col = document.createElement('div');
+  col.setAttribute('data-day-col', gridDay.toISOString());
+  col.getBoundingClientRect = () =>
+    ({
+      top: BAND_H,
+      left: 0,
+      right: COL_W,
+      bottom: BAND_H + hourH * 24,
+      width: COL_W,
+      height: hourH * 24,
+      x: 0,
+      y: BAND_H,
+      toJSON() {
+        return {};
+      },
+    }) as DOMRect;
+
+  document.body.append(row, col);
+
+  const prevHit = document.elementFromPoint;
+  document.elementFromPoint = (x: number, y: number) => {
+    if (y >= BAND_H) return col;
+    const index = Math.min(
+      Math.max(Math.floor(x / COL_W), 0),
+      cells.length - 1,
+    );
+    return cells[index] ?? null;
+  };
+
+  return {
+    chipEl,
+    gridY: (minutes: number) => BAND_H + yForMinutes(minutes, hourH),
+    remove: () => {
+      row.remove();
+      col.remove();
+      if (typeof prevHit === 'function') document.elementFromPoint = prevHit;
+      else Reflect.deleteProperty(document, 'elementFromPoint');
+    },
+  };
+}
+
+function allDayChipPointerDown(
+  session: Session,
+  eventId: string,
+  chipEl: HTMLElement,
+  clientX: number,
+): void {
+  const e = {
+    button: 0,
+    clientX,
+    clientY: 10,
+    pointerId: 1,
+    pointerType: 'mouse',
+    metaKey: false,
+    ctrlKey: false,
+    timeStamp: 0,
+    target: chipEl,
+    currentTarget: chipEl,
+    preventDefault() {},
+    stopPropagation() {},
+  } as unknown as ReactPointerEvent<HTMLElement>;
+  session.onAllDayChipPointerDown(e, eventId, chipEl);
 }
 
 /** The painted event for `id`, wherever the packing put it. */
@@ -1167,6 +1283,85 @@ test('a stale temp id from a drag still patches the server row', async () => {
     paintedEvent(session.current!, 'srv-1')?.start_time,
     moved.start.toISOString(),
   );
+});
+
+// ── All-day drags: civil dates, never the local midnight instants ────────
+
+/** The production repro: an all-day row stored as a UTC-midnight replica. */
+function allDayEvent(overrides: Partial<CalendarEvent> = {}): CalendarEvent {
+  return seededEvent('e1', {
+    title: 'Boring Habits',
+    start_time: '2026-10-18T00:00:00.000Z',
+    end_time: '2026-10-19T00:00:00.000Z',
+    is_all_day: true,
+    ...overrides,
+  });
+}
+
+test('dragging an all-day chip patches the civil dates of the drop day', async () => {
+  seededEvents = [allDayEvent()];
+  const session = await mountSession();
+  const nextDay = new Date(2026, 9, 19);
+  const dom = mountAllDayDragDom(
+    'e1',
+    [DAY, nextDay],
+    nextDay,
+    session.current!.hourH,
+  );
+  try {
+    await act(async () => {
+      allDayChipPointerDown(session.current!, 'e1', dom.chipEl, 10);
+    });
+    // One band column to the right: the drop lands on the next civil day.
+    await movePointer(10, COL_W + 10);
+    await dropPointer(10, COL_W + 10);
+    await settle();
+  } finally {
+    dom.remove();
+  }
+
+  const patches = patchRequests();
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].path, '/api/calendar/events/e1');
+  // Replica shape: UTC midnight of the LOCAL civil day. The local midnight
+  // instant (`new Date(2026, 9, 19).toISOString()`) is a dateTime, which Google
+  // rejects for a date-only event.
+  assert.deepEqual(patches[0].body, {
+    is_all_day: true,
+    start: civilYmdToUtcMidnightIso(toDateInputValue(nextDay)),
+    end: civilYmdToUtcMidnightIso(toDateInputValue(new Date(2026, 9, 20))),
+  });
+});
+
+test('dragging an all-day chip onto the timed grid converts it to instants', async () => {
+  seededEvents = [allDayEvent()];
+  const session = await mountSession();
+  const dropDay = new Date(2026, 9, 19);
+  const dom = mountAllDayDragDom(
+    'e1',
+    [DAY, dropDay],
+    dropDay,
+    session.current!.hourH,
+  );
+  try {
+    await act(async () => {
+      allDayChipPointerDown(session.current!, 'e1', dom.chipEl, 10);
+    });
+    // Down into the grid: a 30-minute default range at 09:00.
+    await movePointer(dom.gridY(9 * 60));
+    await dropPointer(dom.gridY(9 * 60));
+    await settle();
+  } finally {
+    dom.remove();
+  }
+
+  const patches = patchRequests();
+  assert.equal(patches.length, 1);
+  assert.deepEqual(patches[0].body, {
+    is_all_day: false,
+    start: new Date(2026, 9, 19, 9, 0, 0, 0).toISOString(),
+    end: new Date(2026, 9, 19, 9, 30, 0, 0).toISOString(),
+  });
 });
 
 test('a paste renamed before create returns is flushed, not lost', async () => {

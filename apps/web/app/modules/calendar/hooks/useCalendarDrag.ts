@@ -45,6 +45,7 @@ import {
 import { tick } from '../lib/haptics';
 import {
   SNAP_MINUTES,
+  civilDateFromAllDayIso,
   dateOnDay,
   minutesFromY,
   minutesSinceMidnight,
@@ -67,7 +68,8 @@ export interface UseCalendarDragOptions {
   scrollStripBy: (dx: number) => void;
   onClickCreate: (slot: DragSlot) => void;
   onDragCreate: (range: TimedRange) => void;
-  onMove: (eventId: string, range: TimedRange) => void;
+  /** `zone` is where the chip was dropped: the row may change kind. */
+  onMove: (eventId: string, range: TimedRange, zone: DragZone) => void;
   onResize: (eventId: string, range: TimedRange) => void;
   onAllDayCreate: (range: TimedRange) => void;
   /** All-day tap without drag; defaults to `onAllDayCreate`. */
@@ -292,6 +294,19 @@ function parseDayAttr(value: string | null | undefined): Date | null {
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return null;
   return startOfDay(d);
+}
+
+/**
+ * The instant a chip's gesture starts from. An all-day replica is
+ * `YYYY-MM-DDT00:00:00Z` (UTC midnight of the civil date), so its local civil
+ * midnight comes from the date prefix — `new Date(iso)` is the previous
+ * evening west of UTC, which would shift the grab offset and duration by a
+ * day. Timed rows keep their instant.
+ */
+function dragOriginalInstant(event: CalendarEvent, iso: string): Date {
+  return event.is_all_day === true
+    ? (civilDateFromAllDayIso(iso) ?? new Date(iso))
+    : new Date(iso);
 }
 
 function rawMinutesAtColumn(
@@ -1352,7 +1367,9 @@ export function useCalendarDrag(
           if (s.eventId) chipTap(s.eventId);
         } else if (preview && s.eventId) {
           suppressClickRef.current = true;
-          moveCb(s.eventId, preview);
+          // The drop zone decides the row kind: all-day carries civil dates,
+          // the timed grid carries instants.
+          moveCb(s.eventId, preview, s.currentZone);
         }
       } else if (s.kind === 'resize-start' || s.kind === 'resize-end') {
         if (!dragged) {
@@ -1687,8 +1704,8 @@ export function useCalendarDrag(
       if (e.button !== 0) return;
       e.stopPropagation();
 
-      const originalStart = new Date(event.start_time);
-      const originalEnd = new Date(event.end_time);
+      const originalStart = dragOriginalInstant(event, event.start_time);
+      const originalEnd = dragOriginalInstant(event, event.end_time);
       const hit = hitTestAllDay(e.clientX, e.clientY);
       const day = hit?.day ?? startOfDay(originalStart);
       const originSlot: DragSlot = { day, minutes: 0 };
