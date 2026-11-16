@@ -359,7 +359,14 @@ fn the_catalog_schemas_stay_narrow() {
     );
     assert_eq!(
         properties["status"]["enum"],
-        json!(["OPEN", "PLANNED", "IN_PROGRESS", "COMPLETED", "DISCARDED"])
+        json!([
+            "OPEN",
+            "PLANNED",
+            "IN_PROGRESS",
+            "WAITING",
+            "COMPLETED",
+            "DISCARDED"
+        ])
     );
     assert_eq!(move_task.input_schema["required"], json!(["id", "status"]));
 
@@ -1962,26 +1969,51 @@ fn build_move_task_rejects_sort_order_before_the_unknown_scan() {
 }
 
 #[test]
-fn build_move_task_accepts_exactly_the_five_statuses() {
-    for status in ["OPEN", "PLANNED", "IN_PROGRESS", "COMPLETED", "DISCARDED"] {
+fn build_move_task_accepts_exactly_the_six_statuses() {
+    for status in [
+        "OPEN",
+        "PLANNED",
+        "IN_PROGRESS",
+        "WAITING",
+        "COMPLETED",
+        "DISCARDED",
+    ] {
         let (_, body) = build_move_task(&json!({ "id": "t1", "status": status })).expect("built");
         assert_eq!(body, json!({ "status": status }));
     }
-    for status in ["open", "DONE", "", "PLANNED "] {
+    for status in ["open", "DONE", "WAITNG", "", "PLANNED "] {
         assert_eq!(
             build_move_task(&json!({ "id": "t1", "status": status })),
-            Err("status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string()),
+            Err(
+                "status must be OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED"
+                    .to_string()
+            ),
             "{status}"
         );
     }
     assert_eq!(
         build_move_task(&json!({ "id": "t1" })),
-        Err("status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string())
+        Err(
+            "status must be OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED"
+                .to_string()
+        )
     );
     assert_eq!(
         build_move_task(&json!({ "id": "t1", "status": null })),
-        Err("status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string())
+        Err(
+            "status must be OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED"
+                .to_string()
+        )
     );
+}
+
+#[test]
+fn build_move_task_accepts_waiting() {
+    // The hand-off status (ADR 0011) is a status like any other to `move_task`:
+    // the location may change, the body never does.
+    let (id, body) = build_move_task(&json!({ "id": "t1", "status": "WAITING" })).expect("built");
+    assert_eq!(id, "t1");
+    assert_eq!(body, json!({ "status": "WAITING" }));
 }
 
 #[test]

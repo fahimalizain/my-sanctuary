@@ -22,7 +22,14 @@ use super::upstream::is_safe_id;
 const STATUS_MOVES_THROUGH: &str = "status changes go through move_task";
 
 /// The only statuses `move_task` accepts, exactly as the service spells them.
-const TASK_STATUSES: [&str; 5] = ["OPEN", "PLANNED", "IN_PROGRESS", "COMPLETED", "DISCARDED"];
+const TASK_STATUSES: [&str; 6] = [
+    "OPEN",
+    "PLANNED",
+    "IN_PROGRESS",
+    "WAITING",
+    "COMPLETED",
+    "DISCARDED",
+];
 
 /// Task fields a create may set beyond `title`.
 const CREATE_TASK_KEYS: [&str; 5] = [
@@ -136,7 +143,8 @@ pub fn build_move_task(arguments: &Value) -> Result<(String, Value), String> {
         .filter(|status| TASK_STATUSES.contains(status));
     let Some(status) = status else {
         return Err(
-            "status must be OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED".to_string(),
+            "status must be OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED"
+                .to_string(),
         );
     };
     Ok((id, json!({ "status": status })))

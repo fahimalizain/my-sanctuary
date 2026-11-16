@@ -80,10 +80,11 @@
 //! - `complete_task`/`discard_task` PATCH the latest started event only while
 //!   the task is still `IN_PROGRESS` (the `stopped` log then precedes the
 //!   terminal log), then set the terminal status. Any other pre-status —
-//!   `OPEN`, `PLANNED`, or terminal → terminal — is status + terminal log
-//!   only: no Google write, no `stopped` log, and no focus clear. **Status is
-//!   the lock**: a living timer exists only while the task is IN_PROGRESS, so
-//!   a leftover event window in the cache never triggers a write.
+//!   `OPEN`, `PLANNED`, `WAITING`, or terminal → terminal — is status +
+//!   terminal log only: no Google write, no `stopped` log, and no focus
+//!   clear. **Status is the lock**: a living timer exists only while the task
+//!   is IN_PROGRESS, so a leftover event window in the cache never triggers a
+//!   write.
 //!   `complete_or_discard` is the one implementation — `/complete`,
 //!   `/discard`, and `/move` into a terminal status all run it. Repeating the
 //!   same terminal action is an idempotent 200 no-op.
@@ -93,7 +94,7 @@
 //!   Missing/other-user/soft-deleted tasks are 404.
 //! - Every transition appends to `task_logs` (an audit trail, not a
 //!   timesheet): `started|stopped|paused|completed|discarded` plus the move
-//!   verbs `planned|unplanned|reopened`.
+//!   verbs `planned|unplanned|reopened|handed_off`.
 //! - The `*/2` elongate cron ([`run_elongate_cron`]) grows every living
 //!   IN_PROGRESS task's event end to `max(current, ceil-5min(now + 5min)` in
 //!   the event calendar's TZ) so the live calendar block never looks
@@ -182,6 +183,10 @@ pub const TASK_STATUS_DISCARDED: &str = "DISCARDED";
 /// A paused task sitting in the Planned pile — `pause` lands here since the
 /// board slice, not back in Backlog.
 pub const TASK_STATUS_PLANNED: &str = "PLANNED";
+/// A living task handed to someone else (an agent, ADR 0011). It holds no
+/// calendar time: a hand-off from IN_PROGRESS closes the running event, focus
+/// stays IN_PROGRESS-only, and the agenda row still sits on a real day.
+pub const TASK_STATUS_WAITING: &str = "WAITING";
 
 /// `task_logs.type` values (the audit trail is append-only).
 pub const TASK_LOG_STARTED: &str = "started";
@@ -194,6 +199,10 @@ pub const TASK_LOG_DISCARDED: &str = "discarded";
 pub const TASK_LOG_PLANNED: &str = "planned";
 pub const TASK_LOG_UNPLANNED: &str = "unplanned";
 pub const TASK_LOG_REOPENED: &str = "reopened";
+/// Written on every real transition into [`TASK_STATUS_WAITING`] (ADR 0011).
+/// When the hand-off started from IN_PROGRESS the row carries the closed
+/// event's calendar/google ids; otherwise both are empty.
+pub const TASK_LOG_HANDED_OFF: &str = "handed_off";
 /// Task-focus (slice 3): opening a flagged focus segment logs `focused`;
 /// closing/clearing focus logs `unfocused` (with the **continuation** event's
 /// ids on a focus switch/clear, or the snapped event's ids on an exit).
@@ -208,16 +217,20 @@ fn append_rank(max: Option<i64>) -> i64 {
 
 /// The column default for a no-drop `/move` (ADR 0002 § Move API): OPEN and
 /// PLANNED append at `max + 1` — except a pause (`PLANNED` from
-/// IN_PROGRESS), which prepends 0; every other target prepends 0. `max` is
-/// the highest living rank of the mover-excluded target pile; callers only
-/// query it when this default appends (OPEN, or PLANNED not from
-/// IN_PROGRESS). The target status is already validated by the caller.
+/// IN_PROGRESS), which prepends 0; every other target (IN_PROGRESS, WAITING,
+/// COMPLETED, DISCARDED) prepends 0. `max` is the highest living rank of the
+/// mover-excluded target pile; callers only query it when this default
+/// appends (OPEN, or PLANNED not from IN_PROGRESS). The target status is
+/// already validated by the caller.
 fn default_move_rank(from: &str, to: &str, max: Option<i64>) -> i64 {
     match to {
         TASK_STATUS_OPEN => append_rank(max),
         TASK_STATUS_PLANNED if from == TASK_STATUS_IN_PROGRESS => 0,
         TASK_STATUS_PLANNED => append_rank(max),
-        TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED | TASK_STATUS_IN_PROGRESS => 0,
+        TASK_STATUS_COMPLETED
+        | TASK_STATUS_DISCARDED
+        | TASK_STATUS_IN_PROGRESS
+        | TASK_STATUS_WAITING => 0,
         _ => 0, // status already validated
     }
 }
@@ -1654,8 +1667,10 @@ pub async fn discard_task(
 
 /// Shared stop/pause machinery (see [`stop_task`]).
 ///
-/// `target_status` is the landing status: OPEN for stop, PLANNED for pause
-/// (mirrors `complete_or_discard`, where the caller picks the terminal state).
+/// `target_status` is the landing status: OPEN for stop, PLANNED for pause,
+/// WAITING for the board's hand-off (ADR 0011 — the same Google exit as
+/// pause, with a `handed_off` log and the row on today). Mirrors
+/// `complete_or_discard`, where the caller picks the terminal state.
 ///
 /// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
 /// from the raw endpoints — on a real transition stop appends OPEN
@@ -1664,12 +1679,13 @@ pub async fn discard_task(
 /// (and the log behavior is unchanged). `false` from [`dispatch_matrix_action`]
 /// — `/move` places exactly once afterwards.
 ///
-/// Agenda (ADR 0007): the board rank and the agenda row are independent. A
-/// real stop into `OPEN` moves the one agenda row to the backlog date
+/// Agenda (ADR 0007/0011): the board rank and the agenda row are independent.
+/// A real stop into `OPEN` moves the one agenda row to the backlog date
 /// (today+50y), appended — for `/stop` (`place: true`) and for a Board drag
-/// In Progress → Open (`place: false`) alike. Pause (landing `PLANNED`) never
-/// places, and an already-OPEN stop never moves the row. Placement is
-/// best-effort and runs after the board rank.
+/// In Progress → Open (`place: false`) alike. A real hand-off into `WAITING`
+/// is the opposite rule: the row lands on civil today, appended. Pause
+/// (landing `PLANNED`) never places, and an already-OPEN stop never moves the
+/// row. Placement is best-effort and runs after the board rank.
 async fn stop_or_pause(
     http: &dyn HttpClient,
     calendars: &dyn CalendarRepo,
@@ -1746,8 +1762,11 @@ async fn stop_or_pause(
 
     // A real stop lands OPEN and therefore sends the agenda row to the
     // backlog: capture that BEFORE the status write (already-OPEN still
-    // rewrites the status and logs, but must not move the row).
+    // rewrites the status and logs, but must not move the row). A real
+    // hand-off into WAITING is the opposite rule (ADR 0011 rule 2): the row
+    // moves to civil today.
     let opens_backlog = target_status == TASK_STATUS_OPEN && task.status != target_status;
+    let enters_waiting = target_status == TASK_STATUS_WAITING && task.status != target_status;
 
     let Some(updated) = task_repo
         .set_status(task_id, target_status, &now_rfc3339)
@@ -1771,8 +1790,10 @@ async fn stop_or_pause(
     // Verb landing on a real transition only: stop appends OPEN
     // (mover-excluded max + 1 — the row already sits in OPEN holding its
     // leftover IN_PROGRESS rank, which must not inflate its own target),
-    // pause prepends PLANNED. Already in the landing status → the row as
-    // set, no re-rank.
+    // pause prepends PLANNED, and a hand-off into WAITING prepends its pile
+    // too (no raw endpoint lands WAITING today, and the board's default for
+    // it is already 0). Already in the landing status → the row as set, no
+    // re-rank.
     let placed = if place && task.status != target_status {
         let rank = if target_status == TASK_STATUS_OPEN {
             let max = task_repo
@@ -1780,18 +1801,20 @@ async fn stop_or_pause(
                 .await?;
             append_rank(max)
         } else {
-            0 // pause prepends Planned
+            // Pause (PLANNED) and hand-off (WAITING) both prepend.
+            0
         };
         place_at(task_repo, user_id, task_id, target_status, rank).await?
     } else {
         updated
     };
 
-    // Agenda (ADR 0007), after the board rank: a real stop into OPEN sends
-    // the one row to the backlog date, appended — both `/stop` and a Board
-    // drag In Progress → Open (`place: false`). Pause (landing PLANNED) and an
-    // already-OPEN stop never place. Best-effort: the status, the log, and the
-    // board rank are already committed.
+    // Agenda (ADR 0007/0011), after the board rank: a real stop into OPEN
+    // sends the one row to the backlog date, appended — both `/stop` and a
+    // Board drag In Progress → Open (`place: false`). A real hand-off into
+    // WAITING is the opposite: the row lands on civil today, appended. Pause
+    // (landing PLANNED) and an already-OPEN stop never place. Best-effort:
+    // the status, the log, and the board rank are already committed.
     if opens_backlog {
         if let Err(_) =
             place_task_on_backlog(agenda_repo, calendars, user_id, task_id, now_unix).await
@@ -1799,6 +1822,13 @@ async fn stop_or_pause(
             // A stale row is the least-bad outcome: a 500 would report a
             // write that already landed. The cron backfills a MISSING OR
             // MISPLACED row; it does not repair a half-written Google log.
+        }
+    } else if enters_waiting {
+        if let Err(_) =
+            place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+        {
+            // Same policy as the stop leg: the hand-off stands, the cron
+            // completes a placement that failed.
         }
     }
 
@@ -1816,12 +1846,12 @@ async fn stop_or_pause(
 /// **Status is the lock.** The auto-stop — PATCH the event the task's latest
 /// `started` log names to snapped now, then the focus exit, then a `stopped`
 /// log — runs only while `task.status == IN_PROGRESS`, the one state that
-/// owns a living timer. Every other pre-status (OPEN/PLANNED, and terminal →
-/// terminal) writes the terminal status + log only: no Google write, no
-/// `stopped` log, and no focus clear (focus is IN_PROGRESS-only, and `/move`'s
-/// idle path never cleared the pointer either). `http`/`access` are `Option`
-/// for that reason: [`require_google`] fires on the IN_PROGRESS branch alone,
-/// so an idle `/move` can pass `None`/`None`.
+/// owns a living timer. Every other pre-status (OPEN/PLANNED/WAITING, and
+/// terminal → terminal) writes the terminal status + log only: no Google
+/// write, no `stopped` log, and no focus clear (focus is IN_PROGRESS-only, and
+/// `/move`'s idle path never cleared the pointer either). `http`/`access` are
+/// `Option` for that reason: [`require_google`] fires on the IN_PROGRESS
+/// branch alone, so an idle `/move` can pass `None`/`None`.
 ///
 /// `place` gates the verb landing (ADR 0002 § Timer verb landings): `true`
 /// from the raw endpoints — on a real transition the task prepends its
@@ -1834,10 +1864,10 @@ async fn stop_or_pause(
 /// moves onto civil today (both the raw `/complete` `/discard` path and a
 /// `/move` into a terminal status). Placement runs **last**, after the
 /// terminal log and the board rank, and only when the status loaded at the
-/// start was `OPEN`/`PLANNED`/`IN_PROGRESS`: a `COMPLETED` ⇄ `DISCARDED` move
-/// is a real status change but must not pull an old history row onto today.
-/// A placement failure is swallowed — the status, the log, and the rank are
-/// already committed.
+/// start was `OPEN`/`PLANNED`/`IN_PROGRESS`/`WAITING`: a `COMPLETED` ⇄
+/// `DISCARDED` move is a real status change but must not pull an old history
+/// row onto today. A placement failure is swallowed — the status, the log,
+/// and the rank are already committed.
 async fn complete_or_discard(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -1976,7 +2006,7 @@ async fn complete_or_discard(
     // MISSING OR MISPLACED row; it never repairs a half-written Google log.
     if matches!(
         task.status.as_str(),
-        TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS
+        TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS | TASK_STATUS_WAITING
     ) {
         if let Err(_) =
             place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
@@ -2245,6 +2275,7 @@ fn is_valid_task_status(status: &str) -> bool {
         TASK_STATUS_OPEN
             | TASK_STATUS_PLANNED
             | TASK_STATUS_IN_PROGRESS
+            | TASK_STATUS_WAITING
             | TASK_STATUS_COMPLETED
             | TASK_STATUS_DISCARDED
     )
@@ -2252,8 +2283,10 @@ fn is_valid_task_status(status: &str) -> bool {
 
 /// The move endpoint's Google gate (mirrors the worker's `needs_google`):
 /// start and any exit from IN_PROGRESS PATCH/create Google events and require
-/// a refreshable token. The session-only transitions (plan/unplan/reopen/
-/// reorder/idle complete/discard) must be able to run with both `None`.
+/// a refreshable token — a hand-off (`IN_PROGRESS` → `WAITING`) is an exit and
+/// needs it too. The session-only transitions (plan/unplan/reopen, a hand-off
+/// from any non-running status, reorder, idle complete/discard) must be able
+/// to run with both `None`.
 fn require_google<'a>(
     http: Option<&'a dyn HttpClient>,
     access: Option<&'a GoogleAccess>,
@@ -2277,6 +2310,16 @@ fn require_google<'a>(
 /// pure local transitions + audit logs; complete/discard go through
 /// [`complete_or_discard`] as well, which PATCHes only while the task is
 /// still IN_PROGRESS — an idle move therefore passes `None`/`None`.
+///
+/// WAITING (ADR 0011) is a living status that holds no calendar time. The one
+/// Google leg into it is `IN_PROGRESS` → `WAITING`, an exit through
+/// [`stop_or_pause`] (one `handed_off` log carrying the closed event's ids,
+/// focus cleared). A hand-off from any other status is a local flip +
+/// `handed_off` log — including from a terminal status, which is one log, not
+/// `reopened` + `handed_off`. Moves **out** of WAITING reuse the existing
+/// arms (`start_task` for IN_PROGRESS, [`complete_or_discard`] for a terminal
+/// status) except the two shelve legs, `WAITING` → `OPEN`/`PLANNED`, which
+/// flip locally and send the row to the backlog date.
 ///
 /// `http`/`access` are only consumed by the Google-touching arms; the
 /// session-only arms work with both `None` (see [`require_google`]).
@@ -2331,6 +2374,21 @@ async fn dispatch_matrix_action(
             stop_or_pause(
                 http, calendars, events, operations, category_repo, task_repo, logs, users, access,
                 user_id, task_id, now_unix, TASK_LOG_PAUSED, TASK_STATUS_PLANNED, false,
+                agenda_repo, notify,
+            )
+            .await
+            .map(|response| response.event)
+        }
+        // Hand-off (ADR 0011): the same Google exit as pause — the running
+        // event closes through `stop_running_event`, the `handed_off` log
+        // carries the closed event's ids, focus is cleared (the helper logs
+        // `unfocused` and drops the pointer), and the row lands on civil
+        // today. Never `paused`/`stopped`: WAITING owns no calendar time.
+        (TASK_STATUS_IN_PROGRESS, TASK_STATUS_WAITING) => {
+            let (http, access) = require_google(http, access)?;
+            stop_or_pause(
+                http, calendars, events, operations, category_repo, task_repo, logs, users, access,
+                user_id, task_id, now_unix, TASK_LOG_HANDED_OFF, TASK_STATUS_WAITING, false,
                 agenda_repo, notify,
             )
             .await
@@ -2400,6 +2458,65 @@ async fn dispatch_matrix_action(
             }
             Ok(None)
         }
+        // Hand-off from any non-running status (ADR 0011): a local status flip
+        // plus one `handed_off` log — from a terminal status too, never
+        // `reopened` + `handed_off`. No Google call (WAITING holds no
+        // calendar time) and no focus work (focus is IN_PROGRESS-only, so
+        // these pre-statuses cannot be focused).
+        (
+            TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED,
+            TASK_STATUS_WAITING,
+        ) => {
+            local_transition(
+                task_repo, logs, user_id, task_id, TASK_STATUS_WAITING, TASK_LOG_HANDED_OFF,
+                now_unix,
+            )
+            .await?;
+            // Rule 2: a transition into WAITING moves the one row to civil
+            // today, appended. Best-effort — the status and the `handed_off`
+            // log are already committed.
+            if let Err(_) =
+                place_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+            {
+                // The transition stands; the cron completes a placement that
+                // failed.
+            }
+            Ok(None)
+        }
+        // Shelving (ADR 0011 rule 3): every move out of WAITING reaches the
+        // backlog date, appended. The log is named for the destination
+        // (`unplanned` / `planned`), never `stopped`/`paused` — WAITING has no
+        // event to close.
+        (TASK_STATUS_WAITING, TASK_STATUS_OPEN) => {
+            local_transition(
+                task_repo, logs, user_id, task_id, TASK_STATUS_OPEN, TASK_LOG_UNPLANNED, now_unix,
+            )
+            .await?;
+            if let Err(_) =
+                place_task_on_backlog(agenda_repo, calendars, user_id, task_id, now_unix).await
+            {
+                // Best-effort: the status and the `unplanned` log are already
+                // committed; the cron heals the row on its next tick.
+            }
+            Ok(None)
+        }
+        (TASK_STATUS_WAITING, TASK_STATUS_PLANNED) => {
+            local_transition(
+                task_repo, logs, user_id, task_id, TASK_STATUS_PLANNED, TASK_LOG_PLANNED,
+                now_unix,
+            )
+            .await?;
+            // The backlog date, appended — `place_task_on_backlog`, NOT
+            // `ensure_task_planned_unscheduled` (that is plan's ADR 0010
+            // park-it-where-it-is; a shelved WAITING row is dated work and
+            // rule 3 always retargets the sentinel) and not today.
+            if let Err(_) =
+                place_task_on_backlog(agenda_repo, calendars, user_id, task_id, now_unix).await
+            {
+                // Same policy as the OPEN leg.
+            }
+            Ok(None)
+        }
         // complete / discard from any non-target status: `complete_or_discard`
         // PATCHes only while the task is IN_PROGRESS (see its doc); idle and
         // terminal → terminal legs are status + terminal log only.
@@ -2425,7 +2542,7 @@ async fn dispatch_matrix_action(
         // are handled by the caller — this defensive fallback is unreachable
         // by construction.
         (from, to) if from == to => Ok(None),
-        // Every other cell of the 5×5 matrix is dispatched above; this is
+        // Every other cell of the 6×6 matrix is dispatched above; this is
         // unreachable by construction.
         (from, to) => Err(TasksError::Invalid(format!(
             "unexpected move transition: {from} → {to}"
@@ -2522,43 +2639,48 @@ async fn reorder_in_place(
 ///
 /// Dispatches the transition matrix for `task.status → input.status`
 /// (reusing `start_task` and the INNER unplaced stop/pause/complete/discard
-/// helpers for the Google-touching legs, with plan/unplan/reopen as local
-/// flips), then places the task at `input.sort_order` in the target status —
-/// exactly once, which is why the dispatched exits never place themselves.
-/// Same-status moves are pure reorders — including IN_PROGRESS → IN_PROGRESS
-/// with a sent rank: In Progress is a real pile, not a singleton.
+/// helpers for the Google-touching legs, with plan/unplan/reopen/hand-off as
+/// local flips), then places the task at `input.sort_order` in the target
+/// status — exactly once, which is why the dispatched exits never place
+/// themselves. Same-status moves are pure reorders — including IN_PROGRESS →
+/// IN_PROGRESS with a sent rank: In Progress is a real pile, not a singleton,
+/// and WAITING → WAITING with a rank is the same reorder (ADR 0011 § Board).
 ///
 /// Omitted `sort_order` (null or absent) means "no drop position": the server
 /// applies the column default from [`default_move_rank`] — OPEN and PLANNED
 /// append (`max + 1` over the mover-excluded pile, so the mover's leftover
 /// rank never inflates its own target), except a pause (PLANNED from
-/// IN_PROGRESS) which prepends 0; COMPLETED/DISCARDED/IN_PROGRESS prepend 0.
-/// A same-status move with omitted `sort_order` is a no-op (the row is
-/// returned unchanged, never sent to the tail).
+/// IN_PROGRESS) which prepends 0; WAITING/COMPLETED/DISCARDED/IN_PROGRESS
+/// prepend 0. A same-status move with omitted `sort_order` is a no-op (the
+/// row is returned unchanged, never sent to the tail).
 ///
 /// `/move` to IN_PROGRESS is just `start` ([`dispatch_matrix_action`] →
 /// [`start_task`]) — a NEW event opens regardless of what else is running,
 /// so moving the second task into In Progress while others already run never
-/// conflicts.
+/// conflicts. That arm also covers `WAITING` → `IN_PROGRESS` (taking a task
+/// back from a hand-off): it is a start, so it opens a new event and needs
+/// Google access even though the task was not IN_PROGRESS.
 ///
 /// `http`/`access` are `Option` because status-only moves (plan/unplan/
-/// reopen/reorder and complete/discard of an idle task) never touch Google;
-/// the worker passes both only when its `needs_google` gate fires (target
-/// IN_PROGRESS, or leaving IN_PROGRESS). An idle complete/discard still runs
-/// through [`complete_or_discard`], which demands Google access only on its
-/// IN_PROGRESS branch.
+/// reopen/hand-off from a non-running status/reorder and complete/discard of
+/// an idle task) never touch Google; the worker passes both only when its
+/// `needs_google` gate fires (target IN_PROGRESS, or leaving IN_PROGRESS —
+/// which includes IN_PROGRESS → WAITING). An idle complete/discard or
+/// non-running hand-off still runs without them.
 ///
 /// Validation: unknown `status` → 400; negative `sort_order` → 400 (`None`
 /// is not negative); missing/other-user/soft-deleted task → 404.
 ///
-/// Agenda (ADR 0007): real lifecycle transitions move the task's single
+/// Agenda (ADR 0007/0011): real lifecycle transitions move the task's single
 /// agenda row according to the **landing status**. A real start, plan
 /// (`OPEN` → `PLANNED`), reopen → `PLANNED`, and a move into a terminal
 /// status from a living one (via [`complete_or_discard`]) put that row on
-/// civil today; unplan (`PLANNED` → `OPEN`), a stop (`IN_PROGRESS` → `OPEN`),
-/// and reopen → `OPEN` put it on the backlog date (today+50y). Pause, reorder,
-/// the terminal → IN_PROGRESS start arm, and terminal → terminal moves never
-/// place.
+/// civil today; a hand-off into `WAITING` lands it on today too (from any
+/// status, terminal included). Unplan (`PLANNED` → `OPEN`), a stop
+/// (`IN_PROGRESS` → `OPEN`), reopen → `OPEN`, and a shelve out of `WAITING`
+/// (`WAITING` → `OPEN`/`PLANNED`) put it on the backlog date (today+50y).
+/// Pause, reorder, the terminal → IN_PROGRESS start arm, and terminal →
+/// terminal moves never place.
 pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -9270,6 +9392,47 @@ mod tests {
         ))
     }
 
+    /// Calls `move_task` for `u-1` on the agenda clock (`AGENDA_NOW_UNIX`):
+    /// the hand-off tests assert civil dates, so their moves must run on that
+    /// fixed today.
+    fn agenda_move_to(
+        http: &FakeHttp,
+        calendars: &FakeCalendarRepo,
+        events: &FakeEventRepo,
+        lists: &FakeTaskListRepo,
+        categories: &FakeTaskCategoryRepo,
+        tasks: &FakeTaskRepo,
+        logs: &FakeTaskLogRepo,
+        users: &FakeUserRepo,
+        agenda: &FakeAgendaItemRepo,
+        access: Option<&GoogleAccess>,
+        task_id: &str,
+        status: &str,
+        sort_order: Option<i64>,
+    ) -> Result<MoveTaskResponse, TasksError> {
+        pollster::block_on(move_task(
+            Some(http),
+            calendars,
+            events,
+            &ops(),
+            lists,
+            categories,
+            tasks,
+            logs,
+            users,
+            access,
+            "u-1",
+            task_id,
+            AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: status.to_string(),
+                sort_order,
+            },
+            agenda,
+            noop_notify(),
+        ))
+    }
+
     /// Starts `task_id` against the default Google stack (writable primary
     /// calendar, one `/events` route) and returns the fresh fakes — the
     /// running-task setup behind the exit tests.
@@ -9544,6 +9707,556 @@ mod tests {
         assert!(response.event.is_some(), "stop leg returns the patched event");
         let inserted = logs.inserted.lock().unwrap().clone();
         assert_eq!(inserted.last().unwrap().r#type, TASK_LOG_STOPPED, "{inserted:?}");
+    }
+
+    // ──────────────────────────────────────────
+    // Hand-off (ADR 0011): any status → WAITING and back
+    // ──────────────────────────────────────────
+
+    #[test]
+    fn move_in_progress_to_waiting_is_a_hand_off() {
+        // The hand-off closes the running event through the pause path, writes
+        // exactly one `handed_off` carrying the closed event's ids, clears
+        // focus (`unfocused` + pointer), and lands the row on civil today.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // A peer row on today's pile proves the append rank.
+        let peer_row = agenda
+            .rows("u-1")
+            .into_iter()
+            .find(|row| row.ref_id == peer.id)
+            .unwrap();
+        agenda.move_row(&peer_row.id, AGENDA_TODAY, 0);
+        let (_start_http, calendars, events, logs) =
+            start_running(&lists, &categories, &tasks, &agenda, &task.id);
+        drop(_start_http);
+        let users = FakeUserRepo::focused(&task.id);
+
+        // 2026-08-23T10:00:00Z is the agenda clock, already on the minute.
+        let http = FakeHttp::new(vec![(
+            "/events/g-1",
+            200,
+            &patched_event_json(&task.id, NOW_SNAPPED, "2026-08-23T10:00:00Z"),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &ops(),
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            &users,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_WAITING.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_WAITING);
+        let event = response.event.expect("the hand-off returns the closed event");
+        assert_eq!(event.end_time, "2026-08-23T10:00:00Z", "the exit snaps the end");
+        assert_eq!(http.patches.lock().unwrap().len(), 1, "the running event closes");
+        assert_eq!(users.pointer(), None, "a hand-off clears focus");
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["started", "unfocused", "handed_off"], "{inserted:?}");
+        let handed_off = inserted.last().unwrap();
+        assert_eq!(
+            handed_off.calendar_id.as_deref(),
+            Some("cal-primary@example.com"),
+            "the log carries the closed event's calendar"
+        );
+        assert_eq!(handed_off.google_event_id.as_deref(), Some("g-1"));
+
+        let rows = agenda.rows("u-1");
+        let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(row.local_date, AGENDA_TODAY, "rule 2: the row lands on today");
+        assert_eq!(row.sort_order, 1, "appended after today's peer");
+    }
+
+    #[test]
+    fn move_open_to_waiting_is_a_local_hand_off() {
+        // Hand-off from a non-running status touches no Google at all: the
+        // unscripted FakeHttp panics on any call.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let peer_row = agenda
+            .rows("u-1")
+            .into_iter()
+            .find(|row| row.ref_id == peer.id)
+            .unwrap();
+        agenda.move_row(&peer_row.id, AGENDA_TODAY, 0);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let response = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_WAITING);
+        assert!(response.event.is_none(), "WAITING holds no calendar time");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 1, "exactly one hand-off log: {inserted:?}");
+        assert_eq!(inserted[0].r#type, TASK_LOG_HANDED_OFF);
+        assert!(
+            inserted[0].calendar_id.is_none() && inserted[0].google_event_id.is_none(),
+            "a hand-off with no running event carries no ids"
+        );
+        assert!(http.posts.lock().unwrap().is_empty(), "hand-off touches no Google");
+        assert!(http.patches.lock().unwrap().is_empty(), "hand-off touches no Google");
+
+        let rows = agenda.rows("u-1");
+        let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(row.local_date, AGENDA_TODAY, "rule 2: the row lands on today");
+        assert_eq!(row.sort_order, 1, "appended after today's peer");
+    }
+
+    #[test]
+    fn move_planned_to_waiting_leaves_an_already_today_row_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let planned = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_PLANNED, None,
+        )
+        .unwrap();
+        assert_eq!(planned.task.status, TASK_STATUS_PLANNED);
+        // Park the row on today by hand: the hand-off must not re-rank it.
+        let row = agenda
+            .rows("u-1")
+            .into_iter()
+            .find(|row| row.ref_id == task.id)
+            .unwrap();
+        agenda.move_row(&row.id, AGENDA_TODAY, 3);
+
+        let response = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, None,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_WAITING);
+        assert!(response.event.is_none());
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["planned", "handed_off"], "{inserted:?}");
+        assert!(http.patches.lock().unwrap().is_empty());
+
+        let rows = agenda.rows("u-1");
+        let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(row.local_date, AGENDA_TODAY);
+        assert_eq!(row.sort_order, 3, "an already-on-today row keeps its rank");
+    }
+
+    #[test]
+    fn move_terminal_to_waiting_writes_only_handed_off() {
+        // Terminal → WAITING is ONE move and one log — never `reopened` then
+        // `handed_off` — and it still pulls the row onto today.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let done = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let dropped = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&done.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_status(&dropped.id, TASK_STATUS_DISCARDED, NOW)).unwrap();
+        // Both rows start off today so the hand-off's placement is real.
+        let rows = agenda.rows("u-1");
+        for (id, date, rank) in [(&done.id, AGENDA_PAST, 2), (&dropped.id, AGENDA_FUTURE, 3)] {
+            let row = rows.iter().find(|row| &row.ref_id == id).unwrap();
+            agenda.move_row(&row.id, date, rank);
+        }
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        for id in [&done.id, &dropped.id] {
+            let response = agenda_move_to(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda,
+                None, id, TASK_STATUS_WAITING, Some(0),
+            )
+            .unwrap();
+            assert_eq!(response.task.status, TASK_STATUS_WAITING);
+            assert!(response.event.is_none());
+        }
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 2, "one log per hand-off: {inserted:?}");
+        assert!(
+            inserted.iter().all(|log| log.r#type == TASK_LOG_HANDED_OFF),
+            "{inserted:?}"
+        );
+        assert!(http.patches.lock().unwrap().is_empty(), "terminal hand-off touches no Google");
+
+        let rows = agenda.rows("u-1");
+        for id in [&done.id, &dropped.id] {
+            let row = rows.iter().find(|row| &row.ref_id == id).unwrap();
+            assert_eq!(row.local_date, AGENDA_TODAY, "rule 2: the row lands on today");
+        }
+    }
+
+    #[test]
+    fn move_waiting_to_open_shelves_to_the_backlog_date() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let handed = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+        assert_eq!(handed.task.status, TASK_STATUS_WAITING);
+
+        // No drop position: OPEN appends over the mover-excluded backlog pile.
+        let shelved = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_OPEN, None,
+        )
+        .unwrap();
+        assert_eq!(shelved.task.status, TASK_STATUS_OPEN);
+        assert_eq!(shelved.task.sort_order, 2, "OPEN appends behind the backlog peer");
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["handed_off", "unplanned"], "{inserted:?}");
+        assert!(http.patches.lock().unwrap().is_empty(), "shelving touches no Google");
+
+        let rows = agenda.rows("u-1");
+        let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(row.local_date, AGENDA_BACKLOG, "rule 3: the backlog date");
+        assert_eq!(row.sort_order, 2, "appended on the backlog date");
+        let peer_row = rows.iter().find(|row| row.ref_id == peer.id).unwrap();
+        assert_eq!(peer_row.local_date, AGENDA_BACKLOG, "the peer never moves");
+    }
+
+    #[test]
+    fn move_waiting_to_planned_shelves_to_the_backlog_date() {
+        // Rule 3, not ADR 0010's plan parking and not ADR 0007's reopen →
+        // PLANNED: the row goes to the backlog date, never to today.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+        let shelved = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_PLANNED, None,
+        )
+        .unwrap();
+        assert_eq!(shelved.task.status, TASK_STATUS_PLANNED);
+        assert_eq!(
+            shelved.task.sort_order, 0,
+            "PLANNED from WAITING appends (an empty Planned pile takes 0)"
+        );
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["handed_off", "planned"], "{inserted:?}");
+
+        let rows = agenda.rows("u-1");
+        let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(row.local_date, AGENDA_BACKLOG, "rule 3: the backlog date");
+        assert_eq!(row.sort_order, 2, "appended on the backlog date");
+        let peer_row = rows.iter().find(|row| row.ref_id == peer.id).unwrap();
+        assert_eq!(peer_row.local_date, AGENDA_BACKLOG);
+    }
+
+    #[test]
+    fn move_waiting_to_terminal_writes_no_stopped_log() {
+        // WAITING owns no event: neither terminal verb PATCHes, logs `stopped`,
+        // or touches focus — but both still place the row on today.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let done = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let dropped = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        for id in [&done.id, &dropped.id] {
+            agenda_move_to(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda,
+                None, id, TASK_STATUS_WAITING, Some(0),
+            )
+            .unwrap();
+        }
+        // Park both rows off today so the terminal placement is real.
+        let rows = agenda.rows("u-1");
+        for (id, date, rank) in [(&done.id, AGENDA_PAST, 5), (&dropped.id, AGENDA_FUTURE, 6)] {
+            let row = rows.iter().find(|row| &row.ref_id == id).unwrap();
+            agenda.move_row(&row.id, date, rank);
+        }
+
+        let completed = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &done.id, TASK_STATUS_COMPLETED, Some(0),
+        )
+        .unwrap();
+        assert_eq!(completed.task.status, TASK_STATUS_COMPLETED);
+        assert!(completed.event.is_none(), "no event to close");
+        let discarded = agenda_move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &dropped.id, TASK_STATUS_DISCARDED, Some(0),
+        )
+        .unwrap();
+        assert_eq!(discarded.task.status, TASK_STATUS_DISCARDED);
+        assert!(discarded.event.is_none(), "no event to close");
+
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["handed_off", "handed_off", "completed", "discarded"],
+            "{inserted:?}"
+        );
+        assert!(!types.contains(&TASK_LOG_STOPPED), "WAITING has no run to stop");
+        assert!(http.patches.lock().unwrap().is_empty());
+
+        let rows = agenda.rows("u-1");
+        for id in [&done.id, &dropped.id] {
+            let row = rows.iter().find(|row| &row.ref_id == id).unwrap();
+            assert_eq!(row.local_date, AGENDA_TODAY, "rule 2: the row lands on today");
+        }
+    }
+
+    #[test]
+    fn move_waiting_to_in_progress_takes_the_task_back() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+        // Park the row off today so the start's placement is real.
+        let row = agenda
+            .rows("u-1")
+            .into_iter()
+            .find(|row| row.ref_id == task.id)
+            .unwrap();
+        agenda.move_row(&row.id, AGENDA_PAST, 4);
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(
+                &task.id,
+                "2026-08-23T10:00:00Z",
+                "2026-08-23T10:15:00Z",
+            ),
+        )]);
+        let response = pollster::block_on(move_task(
+            Some(&http),
+            &calendars,
+            &events,
+            &ops(),
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            &users,
+            Some(&access()),
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_IN_PROGRESS.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        assert_eq!(response.task.status, TASK_STATUS_IN_PROGRESS);
+        let event = response.event.expect("taking a task back opens an event");
+        assert_eq!(event.start_time, "2026-08-23T10:00:00Z");
+        assert_eq!(event.end_time, "2026-08-23T10:15:00Z");
+        assert_eq!(http.posts.lock().unwrap().len(), 1, "one insert");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        let types: Vec<&str> = inserted.iter().map(|log| log.r#type.as_str()).collect();
+        assert_eq!(types, vec!["handed_off", "started"], "{inserted:?}");
+
+        let rows = agenda.rows("u-1");
+        let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
+        assert_eq!(row.local_date, AGENDA_TODAY, "the start lands the row on today");
+    }
+
+    #[test]
+    fn move_waiting_to_waiting_reorders_and_never_logs() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let a = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let b = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let c = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Three omitted-rank hand-offs prepend in order: c=0, b=1, a=2.
+        for id in [&a.id, &b.id, &c.id] {
+            move_to(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda,
+                None, id, TASK_STATUS_WAITING, None,
+            )
+            .unwrap();
+        }
+        let rank = |id: &str| {
+            tasks
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .sort_order
+        };
+        assert_eq!((rank(&c.id), rank(&b.id), rank(&a.id)), (0, 1, 2));
+        let before = logs.inserted.lock().unwrap().len();
+
+        // Same-status drag with a rank: a pure reorder, no log.
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &a.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_WAITING);
+        assert_eq!(response.task.sort_order, 0);
+        assert!(response.event.is_none());
+        assert_eq!(
+            (rank(&c.id), rank(&b.id), rank(&a.id)),
+            (1, 2, 0),
+            "peers shift up one"
+        );
+        assert_eq!(logs.inserted.lock().unwrap().len(), before, "a reorder never logs");
+
+        // Same-status drag with no rank: unchanged, never sent to the tail.
+        let noop = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &b.id, TASK_STATUS_WAITING, None,
+        )
+        .unwrap();
+        assert_eq!(noop.task.sort_order, 2, "omitted rank is a no-op");
+        assert_eq!(logs.inserted.lock().unwrap().len(), before);
+        assert!(http.patches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_omit_sort_order_prepends_waiting() {
+        // A hand-off with no drop position prepends the Waiting pile, like
+        // In Progress / Done / Discarded.
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        let parked = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &peer.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+        assert_eq!(parked.task.sort_order, 0);
+
+        let response = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, None,
+        )
+        .unwrap();
+        assert_eq!(response.task.status, TASK_STATUS_WAITING);
+        assert_eq!(response.task.sort_order, 0, "hand-off prepends the Waiting pile");
+        let stored = tasks.stored.lock().unwrap();
+        assert_eq!(
+            stored.iter().find(|row| row.id == peer.id).unwrap().sort_order,
+            1,
+            "the old WAITING peer shifts down one"
+        );
+    }
+
+    #[test]
+    fn move_rejects_an_unknown_status_and_accepts_waiting() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        for status in ["waiting", "WAITING ", "HANDED_OFF"] {
+            let input = MoveTaskInput {
+                status: status.to_string(),
+                sort_order: Some(0),
+            };
+            let err = pollster::block_on(move_task(
+                Some(&http), &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+                &users, None, "u-1", &task.id, AGENDA_NOW_UNIX, &input, &agenda,
+                noop_notify(),
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(&err, TasksError::Invalid(message) if message == "unknown task status"),
+                "{status}: {err:?}"
+            );
+        }
+
+        // ...and WAITING itself is a valid target (ADR 0011).
+        let accepted = move_to(
+            &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda, None,
+            &task.id, TASK_STATUS_WAITING, Some(0),
+        )
+        .unwrap();
+        assert_eq!(accepted.task.status, TASK_STATUS_WAITING);
     }
 
     #[test]

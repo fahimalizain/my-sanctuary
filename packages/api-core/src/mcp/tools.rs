@@ -146,14 +146,14 @@ pub fn tools() -> Vec<Tool> {
         ),
         mutating(
             "move_task",
-            "Move a task to `status`: OPEN, PLANNED, IN_PROGRESS, COMPLETED, or DISCARDED. `id` and `status` are required. Rank is the server default. `PLANNED` does not schedule an undated task for today; it parks it in the Planned warehouse. Can discard or complete a task, and entering or leaving IN_PROGRESS writes Google.",
+            "Move a task to `status`: OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED. `id` and `status` are required. Rank is the server default. `PLANNED` does not schedule an undated task for today; it parks it in the Planned warehouse. Can discard or complete a task, and entering or leaving IN_PROGRESS writes Google. `WAITING` holds no calendar time; leaving `IN_PROGRESS` for `WAITING` closes the Google event.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
                     "status": {
                         "type": "string",
-                        "enum": ["OPEN", "PLANNED", "IN_PROGRESS", "COMPLETED", "DISCARDED"],
+                        "enum": ["OPEN", "PLANNED", "IN_PROGRESS", "WAITING", "COMPLETED", "DISCARDED"],
                     },
                 },
                 "required": ["id", "status"],
