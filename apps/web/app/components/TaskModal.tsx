@@ -75,12 +75,14 @@ const difficultyConfig: Record<TaskDifficulty, { label: string }> = {
   hard: { label: 'Hard' },
 };
 
-// The five board columns (ADR 0002 § Status model) — friendly labels, never
-// the raw OPEN/COMPLETED values, in the user-facing pills.
+// The board columns (ADR 0002 § Status model, ADR 0011 adds Waiting) —
+// friendly labels, never the raw OPEN/COMPLETED values, in the user-facing
+// pills.
 const statusConfig: Record<TaskStatus, { label: string }> = {
   OPEN: { label: 'Backlog' },
   PLANNED: { label: 'Planned' },
   IN_PROGRESS: { label: 'In Progress' },
+  WAITING: { label: 'Waiting' },
   COMPLETED: { label: 'Done' },
   DISCARDED: { label: 'Discarded' },
 };
@@ -608,8 +610,8 @@ export function TaskModal({
               </div>
             </div>
 
-            {/* Duration — own row; five status pills will not fit beside it on
-              a phone */}
+            {/* Duration — own row; the status pills (six since ADR 0011)
+              will not fit beside it on a phone */}
             <div className="space-y-2 mb-5">
               <label className="text-sm font-medium text-foreground flex items-center gap-2">
                 <Clock className="h-4 w-4 text-muted-foreground" />
@@ -634,10 +636,11 @@ export function TaskModal({
               with no drop position: `sort_order` is omitted and the server
               applies the column default); without it, keep the old read-only
               box so hypothetical callers stay intact. Create mode: when
-              `createStatus` is set (board column +), the same five pills
-              render locked to that destination — changing column means
-              Cancel and tapping another +. Omitted (Lists page) means no
-              Status section at all. */}
+              `createStatus` is set (board column +), the same pills render
+              locked to that destination — changing column means Cancel and
+              tapping another +. They wrap onto a second line rather than
+              shrinking. Omitted (Lists page) means no Status section at
+              all. */}
             {isEditing ? (
               onMove ? (
                 <div className="space-y-2 mb-6">

@@ -764,6 +764,11 @@ function TaskChip({
           running
         </span>
       )}
+      {task.status === 'WAITING' && (
+        <span className="flex-shrink-0 rounded-full bg-amber-400/30 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-100">
+          waiting
+        </span>
+      )}
       {task.status === 'COMPLETED' && (
         <span className="flex-shrink-0 rounded-full bg-sky-400/30 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-sky-100">
           done

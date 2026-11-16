@@ -54,16 +54,20 @@
 //!   same routine on one day are legal); no occurrence can be dropped into
 //!   the backlog. A task reschedule is a **status transition**: `OPEN` →
 //!   `PLANNED` with a `planned` task log plus the Planned-column append,
-//!   `PLANNED` stays `PLANNED` (no log, no re-rank), `IN_PROGRESS` → 400
-//!   `cannot reschedule an in_progress task` (pause first),
-//!   `COMPLETED`/`DISCARDED` → 400 `cannot reschedule a terminal task`. A
-//!   backlog drop returns a `PLANNED` task to `OPEN` with an `unplanned` log
-//!   plus the Open-column append, leaves an already-`OPEN` task alone (no
-//!   log), and refuses a running (`cannot move an in_progress task to the
-//!   backlog`) or terminal (`cannot move a terminal task to the backlog`)
-//!   task. An unschedule keeps `PLANNED`, writes no log, leaves the Board
-//!   rank alone, and refuses `OPEN` (`cannot unschedule an open task`),
-//!   `IN_PROGRESS` (`cannot unschedule an in_progress task`), terminal
+//!   `PLANNED` stays `PLANNED` (no log, no re-rank), `WAITING` stays
+//!   `WAITING` (no log, no re-rank; only the row moves, ADR 0011),
+//!   `IN_PROGRESS` → 400 `cannot reschedule an in_progress task` (pause
+//!   first), `COMPLETED`/`DISCARDED` → 400 `cannot reschedule a terminal
+//!   task`. A backlog drop returns a `PLANNED` task to `OPEN` with an
+//!   `unplanned` log plus the Open-column append, leaves an already-`OPEN`
+//!   task alone (no log), and refuses a running (`cannot move an in_progress
+//!   task to the backlog`), waiting (`cannot move a waiting task to the
+//!   backlog` — shelving a `WAITING` task is a status change, ADR 0011) or
+//!   terminal (`cannot move a terminal task to the backlog`) task. An
+//!   unschedule keeps `PLANNED`, writes no log, leaves the Board rank alone,
+//!   and refuses `OPEN` (`cannot unschedule an open task`), `IN_PROGRESS`
+//!   (`cannot unschedule an in_progress task`), `WAITING` (`cannot unschedule
+//!   a waiting task; move it to Open or Planned instead`), terminal
 //!   (`cannot unschedule a terminal task`) tasks and any occurrence
 //!   (`cannot unschedule an occurrence`). Same date / already on the backlog
 //!   date → 200 no-op (same-day placement is `/move`). One row per task
@@ -71,11 +75,12 @@
 //!   path. Session-only, never a Google write.
 //! - `POST /api/agenda/days/:date/move-to-today` sweeps a **past** day's
 //!   still-pending items onto civil today in one call: living
-//!   `OPEN | PLANNED | IN_PROGRESS` tasks and `pending` occurrences of living
-//!   routines, appended to today's pile in their original order. `done`/
-//!   `skipped`/`in_progress` occurrences, terminal or soft-deleted tasks,
-//!   soft-deleted-routine leftovers, orphans and unknown kinds stay put. A
-//!   call on today or a future date is a 400. Session-only, no Google write.
+//!   `OPEN | PLANNED | IN_PROGRESS | WAITING` tasks and `pending` occurrences
+//!   of living routines, appended to today's pile in their original order.
+//!   `done`/`skipped`/`in_progress` occurrences, terminal or soft-deleted
+//!   tasks, soft-deleted-routine leftovers, orphans and unknown kinds stay
+//!   put. A call on today or a future date is a 400. Session-only, no Google
+//!   write.
 //! - `PATCH /api/occurrences/:id { title }` writes the override; `""`/
 //!   whitespace clears it back to inheritance (NULL). When `google_event_id`
 //!   is set and the **resolved** title actually changed, the Google event's
@@ -146,7 +151,7 @@ use crate::repo::{
 use crate::tasks::{
     open_task_for_backlog, plan_task_for_reschedule, ElongateReport, TaskCategorySummary, TaskView,
     TasksError, START_EVENT_MINUTES, TASK_STATUS_COMPLETED, TASK_STATUS_DISCARDED,
-    TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED,
+    TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED, TASK_STATUS_WAITING,
 };
 use crate::time::{
     ceil_5min_unix_in_zone, civil_date_in_zone, nearest_minute_unix, rfc3339_to_unix_secs,
@@ -396,7 +401,7 @@ pub(crate) async fn user_today(
 /// - a non-empty value that is not `YYYY-MM-DD` → 400.
 ///
 /// `anchor_date` is the oldest **past** date that still holds a pending item
-/// (a living `OPEN | PLANNED | IN_PROGRESS` task, or a `pending |
+/// (a living `OPEN | PLANNED | IN_PROGRESS | WAITING` task, or a `pending |
 /// in_progress` occurrence of a living routine), else today. It is computed
 /// by one repo query, never by loading history. `earliest_date` is
 /// `MIN(local_date)` over every agenda row of the user (orphans and future
@@ -881,13 +886,14 @@ pub async fn move_agenda_item(
 /// **Task** (kind `task`): a **status transition** plus the row move
 /// ([`plan_task_for_reschedule`]) — `OPEN` → `PLANNED` with a `planned` task
 /// log and the Planned-column append, `PLANNED` stays `PLANNED` with no log,
+/// `WAITING` stays `WAITING` with no log and no Board re-rank (ADR 0011),
 /// `IN_PROGRESS` → 400 `cannot reschedule an in_progress task` (pause first),
 /// `COMPLETED`/`DISCARDED` → 400 `cannot reschedule a terminal task`. One row
 /// per task (0018) means the source row itself moves: there is no target row
 /// to merge into. A backlog drop goes through [`open_task_for_backlog`]
 /// instead: `PLANNED` → `OPEN` with an `unplanned` log and the Open-column
-/// append, an already-`OPEN` task writes nothing, a running/terminal task is
-/// a 400. `sort_order` is **ignored** on this path (Open-column order is the
+/// append, an already-`OPEN` task writes nothing, a running/waiting/terminal
+/// task is a 400 (a `WAITING` task reaches the backlog only by a status move). `sort_order` is **ignored** on this path (Open-column order is the
 /// Board's `tasks.sort_order`).
 ///
 /// **Unschedule** (tasks only): `PLANNED` keeps its status and moves its row
@@ -896,7 +902,9 @@ pub async fn move_agenda_item(
 /// row already at/after the 10-year horizon → 200 no-op, byte-for-byte (no
 /// placement at all, so not even `updated_at` changes). `OPEN` → 400
 /// `cannot unschedule an open task`, `IN_PROGRESS` → 400 `cannot unschedule
-/// an in_progress task`, terminal → 400 `cannot unschedule a terminal task`.
+/// an in_progress task`, `WAITING` → 400 `cannot unschedule a waiting task;
+/// move it to Open or Planned instead`, terminal → 400 `cannot unschedule a
+/// terminal task`.
 /// Missing/other-user/soft-deleted task → 404 **before** any row write.
 ///
 /// **Placement**: on a different day, `sort_order` omitted → appended at
@@ -1001,6 +1009,12 @@ pub async fn reschedule_agenda_item(
             TASK_STATUS_IN_PROGRESS => {
                 return Err(AgendaError::Invalid(
                     "cannot unschedule an in_progress task".to_string(),
+                ))
+            }
+            TASK_STATUS_WAITING => {
+                return Err(AgendaError::Invalid(
+                    "cannot unschedule a waiting task; move it to Open or Planned instead"
+                        .to_string(),
                 ))
             }
             TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED => {
@@ -1274,8 +1288,10 @@ async fn reschedule_occurrence(
 /// write, no RRULE anywhere.
 ///
 /// Movable rows:
-/// - kind `task` whose living task is `OPEN | PLANNED | IN_PROGRESS` (an
-///   `in_progress` **task** moves);
+/// - kind `task` whose living task is `OPEN | PLANNED | IN_PROGRESS | WAITING`
+///   (an `in_progress` or `waiting` **task** moves — this endpoint IS the
+///   user's explicit bulk reschedule, which ADR 0011 allows for `WAITING`;
+///   no cron, read-time rule or rollover ever moves a waiting row);
 /// - kind `occurrence` whose status is `pending` and whose routine is living
 ///   (the same gate as a reschedule — `occurrence.local_date` is never
 ///   rewritten: it stays the rule date).
@@ -1370,7 +1386,10 @@ pub async fn move_day_to_today(
                 let Some(task) = tasks.get(item.ref_id.as_str()) else {
                     continue; // orphan / soft-deleted task — stays put
                 };
-                if matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS") {
+                if matches!(
+                    task.status.as_str(),
+                    "OPEN" | "PLANNED" | "IN_PROGRESS" | "WAITING"
+                ) {
                     movable.push(item);
                 }
             }
@@ -3336,8 +3355,8 @@ mod tests {
         ) -> Result<Option<String>, RepoError> {
             self.calls.lock().unwrap().oldest_pending_local_date_before += 1;
             // The fake mirror of AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL:
-            // a task row must exist, live, and be OPEN|PLANNED|IN_PROGRESS; a
-            // occurrence must be pending|in_progress under a living routine.
+            // a task row must exist, live, and be OPEN|PLANNED|IN_PROGRESS|WAITING;
+            // a occurrence must be pending|in_progress under a living routine.
             let tasks = self.tasks.lock().unwrap();
             let occurrences = self.occurrences.lock().unwrap();
             let routines = self.routines.lock().unwrap();
@@ -3346,7 +3365,10 @@ mod tests {
                     task.id == item.ref_id
                         && task.user_id == item.user_id
                         && task.deleted_at.is_none()
-                        && matches!(task.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS")
+                        && matches!(
+                            task.status.as_str(),
+                            "OPEN" | "PLANNED" | "IN_PROGRESS" | "WAITING"
+                        )
                 }),
                 AGENDA_KIND_OCCURRENCE => occurrences
                     .iter()
@@ -3647,7 +3669,10 @@ mod tests {
                 .iter()
                 .filter(|row| {
                     row.deleted_at.is_none()
-                        && matches!(row.status.as_str(), "OPEN" | "PLANNED" | "IN_PROGRESS")
+                        && matches!(
+                            row.status.as_str(),
+                            "OPEN" | "PLANNED" | "IN_PROGRESS" | "WAITING"
+                        )
                 })
                 .map(|row| row.user_id.clone())
                 .collect();
@@ -5602,6 +5627,43 @@ mod tests {
     }
 
     #[test]
+    fn get_agenda_anchor_counts_a_past_waiting_task_row() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-wait", "u-1", "Wait | Work", "WAITING"));
+        repos
+            .tasks
+            .push(task_row("t-open", "u-1", "Open | Work", "OPEN"));
+        // The WAITING row is the oldest past pending one: a waiting task on a
+        // past date still pends (ADR 0011), so the stream must reach back to
+        // it even though the other living row is more recent.
+        agenda_row(
+            &repos,
+            "ai-wait",
+            "u-1",
+            "2026-08-18",
+            AGENDA_KIND_TASK,
+            "t-wait",
+            0,
+        );
+        agenda_row(
+            &repos,
+            "ai-open",
+            "u-1",
+            "2026-08-21",
+            AGENDA_KIND_TASK,
+            "t-open",
+            0,
+        );
+
+        let response = get_default(&repos, "u-1").unwrap();
+        assert_eq!(response.anchor_date, "2026-08-18");
+        assert_eq!(response.from, "2026-08-18");
+        assert_eq!(response.earliest_date, "2026-08-18");
+    }
+
+    #[test]
     fn get_agenda_anchor_falls_back_to_today_without_past_pending() {
         let repos = repos();
         repos.routines.stored.lock().unwrap().push(FakeRoutineRepo::row("rt-1", "u-1", "Fajr", 0, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY"));
@@ -6362,6 +6424,68 @@ mod tests {
         assert!(
             repos.logs.inserted.lock().unwrap().is_empty(),
             "an already-planned task writes no log"
+        );
+    }
+
+    #[test]
+    fn reschedule_of_a_waiting_task_moves_the_row_without_a_log() {
+        let repos = repos();
+        repos
+            .tasks
+            .push(task_row("t-1", "u-1", "Wait | Work", "WAITING"));
+        // A peer at a different board rank would reveal an accidental Waiting
+        // re-rank (the card is already in the destination column).
+        repos
+            .tasks
+            .push(task_row("t-peer", "u-1", "Peer | Work", "WAITING"));
+        pollster::block_on(repos.tasks.set_sort_order("t-peer", 4)).unwrap();
+        agenda_row(
+            &repos,
+            "ai-1",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-1",
+            0,
+        );
+
+        // The same [today, today+10y) window as every other reschedule.
+        for (date, message) in [
+            ("2026-08-22", "cannot reschedule into the past"),
+            ("2036-08-23", "cannot reschedule more than 10 years ahead"),
+        ] {
+            let err = reschedule(&repos, "u-1", "ai-1", date).unwrap_err();
+            assert!(
+                matches!(err, AgendaError::Invalid(ref m) if m == message),
+                "{err:?} for {date}"
+            );
+        }
+
+        let response = reschedule(&repos, "u-1", "ai-1", "2026-08-24").unwrap();
+        assert_eq!(response.item.id, "ai-1", "the row is the same");
+        assert_eq!(response.item.local_date, "2026-08-24");
+        assert_eq!(
+            response.item.task.as_ref().unwrap().status,
+            "WAITING",
+            "a reschedule never leaves WAITING (ADR 0011)"
+        );
+
+        let stored = pollster::block_on(repos.tasks.get_by_id("t-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "WAITING", "WAITING stays WAITING");
+        assert_eq!(stored.sort_order, 0, "the board column is never re-ranked");
+        let peer = pollster::block_on(repos.tasks.get_by_id("t-peer"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.sort_order, 4, "and no peer is shifted");
+        assert!(
+            repos.logs.inserted.lock().unwrap().is_empty(),
+            "a waiting-task reschedule writes no log"
+        );
+        assert!(
+            get(&repos, "u-1", "2026-08-23").unwrap().items.is_empty(),
+            "the row left today"
         );
     }
 
@@ -7132,6 +7256,50 @@ mod tests {
     }
 
     #[test]
+    fn backlog_drop_refuses_a_waiting_task() {
+        let repos = repos();
+        let mut waiting = task_row("t-wait", "u-1", "Wait | Work", "WAITING");
+        waiting.sort_order = 2;
+        repos.tasks.push(waiting);
+        agenda_row(
+            &repos,
+            "ai-wait",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "t-wait",
+            3,
+        );
+
+        // ADR 0011: reaching the backlog requires a status change, and this
+        // endpoint only moves the row. Shelving goes through the Board.
+        let err = backlog_drop(&repos, "u-1", "ai-wait").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgendaError::Invalid(ref m)
+                    if m == "cannot move a waiting task to the backlog; move it to Open or Planned instead"
+            ),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(repos.agenda.get_by_id("ai-wait"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.local_date, "2026-08-23", "the slot stays put");
+        assert_eq!(stored.sort_order, 3, "rank untouched");
+        assert_eq!(
+            stored.updated_at, "2026-08-23T00:00:00Z",
+            "nothing was written"
+        );
+        let task = pollster::block_on(repos.tasks.get_by_id("t-wait"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "WAITING", "no status write");
+        assert_eq!(task.sort_order, 2, "no board re-rank");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
     fn backlog_drop_refuses_a_terminal_task() {
         let repos = repos();
         for (id, status) in [("t-done", "COMPLETED"), ("t-disc", "DISCARDED")] {
@@ -7381,6 +7549,10 @@ mod tests {
         for (status, message) in [
             ("OPEN", "cannot unschedule an open task"),
             ("IN_PROGRESS", "cannot unschedule an in_progress task"),
+            (
+                "WAITING",
+                "cannot unschedule a waiting task; move it to Open or Planned instead",
+            ),
             ("COMPLETED", "cannot unschedule a terminal task"),
             ("DISCARDED", "cannot unschedule a terminal task"),
         ] {
@@ -7830,6 +8002,45 @@ mod tests {
         // Nothing was created or destroyed: 1 row on today + 11 on yesterday.
         assert_eq!(repos.agenda.stored.lock().unwrap().len(), 12);
         assert_eq!(repos.occurrences.stored.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn move_day_to_today_moves_a_past_waiting_task_row() {
+        let repos = repos();
+        let mut waiting = task_row("t-wait", "u-1", "Wait | Work", "WAITING");
+        waiting.sort_order = 3;
+        repos.tasks.push(waiting);
+        agenda_row(
+            &repos,
+            "ai-wait",
+            "u-1",
+            "2026-08-22",
+            AGENDA_KIND_TASK,
+            "t-wait",
+            0,
+        );
+
+        // The explicit "move this missed day to today" action is a bulk
+        // reschedule, which ADR 0011 allows for WAITING rows.
+        let response = move_day(&repos, "u-1", "2026-08-22").unwrap();
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].id, "ai-wait");
+        assert_eq!(response.items[0].local_date, "2026-08-23");
+        assert_eq!(
+            response.items[0].task.as_ref().unwrap().status,
+            "WAITING",
+            "the sweep moves the row, never the status"
+        );
+        assert!(
+            get(&repos, "u-1", "2026-08-22").unwrap().items.is_empty(),
+            "the row left the past day"
+        );
+        let stored = pollster::block_on(repos.tasks.get_by_id("t-wait"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "WAITING", "no status write");
+        assert_eq!(stored.sort_order, 3, "no board re-rank");
+        assert!(repos.logs.inserted.lock().unwrap().is_empty(), "no log");
     }
 
     #[test]
@@ -9930,6 +10141,150 @@ mod tests {
                 ("task-run".to_string(), 6, "2026-08-23".to_string()),
             ],
             "the existing rank stands and the arrival lands after it"
+        );
+    }
+
+    #[test]
+    fn ensure_task_items_places_and_heals_waiting_on_today() {
+        let repos = repos();
+        // A PLANNED row already on today is valid and keeps its rank (ADR
+        // 0010): the WAITING arrivals append after it.
+        let mut planned = task_row("task-plan", "u-1", "Plan | Work", "PLANNED");
+        planned.sort_order = 0;
+        // Rowless WAITING lands on today (ADR 0011 self-heal).
+        let mut rowless = task_row("task-wait", "u-1", "Wait | Work", "WAITING");
+        rowless.sort_order = 4;
+        // A WAITING row parked on the backlog sentinel is a failed hand-off
+        // placement: the fill completes it onto today.
+        let mut sentinel = task_row("task-heal", "u-1", "Heal | Work", "WAITING");
+        sentinel.sort_order = 1;
+        for task in [planned, rowless, sentinel] {
+            repos.tasks.push(task);
+        }
+        agenda_row(
+            &repos,
+            "ai-plan",
+            "u-1",
+            "2026-08-23",
+            AGENDA_KIND_TASK,
+            "task-plan",
+            2,
+        );
+        agenda_row(
+            &repos,
+            "ai-heal",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "task-heal",
+            7,
+        );
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-plan".to_string(), 2, "2026-08-23".to_string()),
+                ("task-heal".to_string(), 3, "2026-08-23".to_string()),
+                ("task-wait".to_string(), 4, "2026-08-23".to_string()),
+            ],
+            "rowless WAITING lands and the sentinel row is healed, appended in board order"
+        );
+        let healed =
+            pollster::block_on(repos.agenda.get_by_ref("u-1", AGENDA_KIND_TASK, "task-heal"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(healed.id, "ai-heal", "the existing row travelled");
+        assert_eq!(healed.local_date, "2026-08-23");
+    }
+
+    #[test]
+    fn ensure_task_items_leaves_dated_waiting_rows_alone() {
+        let repos = repos();
+        let mut past = task_row("task-past", "u-1", "Past | Work", "WAITING");
+        past.sort_order = 2;
+        let mut future = task_row("task-future", "u-1", "Future | Work", "WAITING");
+        future.sort_order = 5;
+        for task in [past, future] {
+            repos.tasks.push(task);
+        }
+        // A past WAITING row is anchor material and a dated future row in
+        // [today, horizon) is a real day: neither is ever moved (ADR 0011
+        // rule 1 — only a real transition moves a waiting row).
+        agenda_row(
+            &repos,
+            "ai-past",
+            "u-1",
+            "2026-08-20",
+            AGENDA_KIND_TASK,
+            "task-past",
+            2,
+        );
+        agenda_row(
+            &repos,
+            "ai-future",
+            "u-1",
+            "2026-08-31",
+            AGENDA_KIND_TASK,
+            "task-future",
+            5,
+        );
+
+        repos.agenda.reset_calls();
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-past".to_string(), 2, "2026-08-20".to_string()),
+                ("task-future".to_string(), 5, "2026-08-31".to_string()),
+            ],
+            "a WAITING row on a real date is never touched"
+        );
+        assert_eq!(repos.agenda.call_counts().insert_many, 0);
+    }
+
+    #[test]
+    fn ensure_task_items_appends_rowless_in_progress_before_waiting() {
+        let repos = repos();
+        // The WAITING card sorts first by `sort_order`, but the today pile is
+        // board-ordered by status (IN_PROGRESS, then WAITING).
+        let mut waiting = task_row("task-wait", "u-1", "Wait | Work", "WAITING");
+        waiting.sort_order = 0;
+        let mut running = task_row("task-run", "u-1", "Run | Work", "IN_PROGRESS");
+        running.sort_order = 9;
+        for task in [waiting, running] {
+            repos.tasks.push(task);
+        }
+
+        ensure_tasks(&repos, "u-1").unwrap();
+
+        assert_eq!(
+            membership_triples(&repos, "u-1"),
+            vec![
+                ("task-run".to_string(), 0, "2026-08-23".to_string()),
+                ("task-wait".to_string(), 1, "2026-08-23".to_string()),
+            ],
+            "IN_PROGRESS outranks WAITING on today's pile regardless of sort_order"
+        );
+    }
+
+    #[test]
+    fn agenda_fill_cron_visits_a_user_whose_only_living_task_is_waiting() {
+        let repos = repos();
+        let mut waiting = task_row("task-wait", "u-wait", "Wait | Work", "WAITING");
+        waiting.sort_order = 0;
+        repos.tasks.push(waiting);
+
+        let report = fill_cron(&repos);
+
+        assert_eq!(report.users, 1, "a WAITING-only owner is a fill candidate");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            membership_triples(&repos, "u-wait"),
+            vec![("task-wait".to_string(), 0, "2026-08-23".to_string())],
+            "the rowless WAITING task landed on today"
         );
     }
 

@@ -52,6 +52,7 @@ import {
   reschedulePickerMonth,
   reschedulePresets,
   splitBacklogSection,
+  splitWaitingRows,
   streamBounds,
   streamItemsOf,
   unscheduleItem,
@@ -562,6 +563,8 @@ test('isAgendaItemPending: living tasks count, terminal tasks do not', () => {
   assert.equal(isAgendaItemPending(taskItem('a', 'OPEN')), true);
   assert.equal(isAgendaItemPending(taskItem('b', 'PLANNED')), true);
   assert.equal(isAgendaItemPending(taskItem('c', 'IN_PROGRESS')), true);
+  // ADR 0011: WAITING is living work, not a finish.
+  assert.equal(isAgendaItemPending(taskItem('f', 'WAITING')), true);
   assert.equal(isAgendaItemPending(taskItem('d', 'COMPLETED')), false);
   assert.equal(isAgendaItemPending(taskItem('e', 'DISCARDED')), false);
 });
@@ -1621,6 +1624,9 @@ test('canReschedule: occurrences move only while pending or skipped', () => {
 test('canReschedule: tasks move while living; a running task or a finished card stays put', () => {
   assert.equal(canReschedule(taskItem('a', 'OPEN')), true);
   assert.equal(canReschedule(taskItem('b', 'PLANNED')), true);
+  // ADR 0011: a waiting row CAN change day and keeps waiting — unlike a
+  // running one.
+  assert.equal(canReschedule(taskItem('f', 'WAITING')), true);
   // The API 400s `cannot reschedule an in_progress task` — pause first, so
   // the control hides instead of inviting a failure banner.
   assert.equal(canReschedule(taskItem('c', 'IN_PROGRESS')), false);
@@ -1646,6 +1652,9 @@ test('canMoveToBacklog: living tasks only, occurrences never', () => {
   assert.equal(canMoveToBacklog(taskItem('a', 'OPEN'), TODAY), true);
   assert.equal(canMoveToBacklog(taskItem('b', 'PLANNED'), TODAY), true);
   assert.equal(canMoveToBacklog(taskItem('c', 'IN_PROGRESS'), TODAY), false);
+  // ADR 0011: the API 400s a WAITING row — reach the backlog by moving it to
+  // Open or Planned first.
+  assert.equal(canMoveToBacklog(taskItem('g', 'WAITING'), TODAY), false);
   assert.equal(canMoveToBacklog(taskItem('d', 'COMPLETED'), TODAY), false);
   assert.equal(canMoveToBacklog(taskItem('e', 'DISCARDED'), TODAY), false);
   assert.equal(canMoveToBacklog(occurrenceItem('f', 'pending'), TODAY), false);
@@ -1707,6 +1716,8 @@ test('canUnschedule: only a PLANNED task — everything else is rejected', () =>
   const openNear = { ...taskItem('b', 'OPEN'), local_date: '2026-08-25' };
   assert.equal(canUnschedule(openNear, TODAY), false);
   assert.equal(canUnschedule(taskItem('c', 'IN_PROGRESS'), TODAY), false);
+  // ADR 0011: a waiting row is refused too (move it to Open or Planned).
+  assert.equal(canUnschedule(taskItem('i', 'WAITING'), TODAY), false);
   assert.equal(canUnschedule(taskItem('d', 'COMPLETED'), TODAY), false);
   assert.equal(canUnschedule(taskItem('e', 'DISCARDED'), TODAY), false);
   assert.equal(canUnschedule(occurrenceItem('f', 'pending'), TODAY), false);
@@ -1836,4 +1847,51 @@ test('partitionAgendaItems: empty input yields two empty piles', () => {
   const { living, completed } = partitionAgendaItems([]);
   assert.deepEqual(living, []);
   assert.deepEqual(completed, []);
+});
+
+// ── splitWaitingRows (ADR 0011 § Agenda) ────────────────────────────────
+
+test("splitWaitingRows: a day's WAITING rows leave the main pile", () => {
+  const waitingA = { ...taskItem('a', 'WAITING'), sort_order: 1 };
+  const waitingB = { ...taskItem('b', 'WAITING'), sort_order: 3 };
+  const open = { ...taskItem('c', 'OPEN'), sort_order: 0 };
+  const running = { ...taskItem('d', 'IN_PROGRESS'), sort_order: 2 };
+  const pile = [open, waitingA, running, waitingB];
+  const { waiting, rest } = splitWaitingRows(pile);
+  assert.deepEqual(
+    waiting.map((entry) => entry.id),
+    ['a', 'b'],
+  );
+  // Input order is kept in both piles — the caller has already sorted them.
+  assert.deepEqual(
+    rest.map((entry) => entry.id),
+    ['c', 'd'],
+  );
+});
+
+test('splitWaitingRows: occurrences and terminal rows never wait', () => {
+  const pile = [
+    occurrenceItem('o1', 'pending'),
+    occurrenceItem('o2', 'in_progress'),
+    taskItem('t1', 'COMPLETED'),
+    taskItem('t2', 'DISCARDED'),
+    taskItem('t3', 'PLANNED'),
+    item('orphan', 0),
+  ];
+  const { waiting, rest } = splitWaitingRows(pile);
+  assert.deepEqual(waiting, []);
+  assert.deepEqual(
+    rest.map((entry) => entry.id),
+    ['o1', 'o2', 't1', 't2', 't3', 'orphan'],
+  );
+});
+
+test('splitWaitingRows: empty input yields two empty piles; no mutation', () => {
+  const { waiting, rest } = splitWaitingRows([]);
+  assert.deepEqual(waiting, []);
+  assert.deepEqual(rest, []);
+  const pile = [taskItem('a', 'WAITING'), taskItem('b', 'OPEN')];
+  const before = [...pile];
+  splitWaitingRows(pile);
+  before.forEach((entry, i) => assert.equal(pile[i], entry));
 });

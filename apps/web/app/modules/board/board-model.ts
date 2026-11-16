@@ -24,17 +24,20 @@ export interface BoardColumn {
   accent: string;
 }
 
-// Column order and the status each one renders (ADR 0002 § Status model).
+// Column order and the status each one renders (ADR 0002 § Status model,
+// ADR 0011 § Board adds Waiting between In Progress and Done).
 export const COLUMNS: BoardColumn[] = [
   { title: 'Backlog', status: 'OPEN', accent: 'bg-muted-foreground/20' },
   { title: 'Planned', status: 'PLANNED', accent: 'bg-sky-500' },
   { title: 'In Progress', status: 'IN_PROGRESS', accent: 'bg-emerald-500' },
+  { title: 'Waiting', status: 'WAITING', accent: 'bg-amber-500' },
   { title: 'Done', status: 'COMPLETED', accent: 'bg-sky-400' },
   { title: 'Discarded', status: 'DISCARDED', accent: 'bg-rose-400' },
 ];
 
 // Done / Discarded render at most this many filtered matches (ADR 0002
-// § Done/Discarded cap). Backlog / Planned / In Progress show all matches.
+// § Done/Discarded cap). Backlog / Planned / In Progress / Waiting show all
+// matches.
 export const TERMINAL_COLUMN_CAP = 20;
 
 // Column droppables are registered under `column:<status>` so they can never
@@ -167,7 +170,7 @@ export function applyOptimisticMove(
  *  - `OPEN` → `max + 1` (or 0 on an empty pile)
  *  - `PLANNED` from `IN_PROGRESS` (pause) → 0 (prepend)
  *  - `PLANNED` otherwise → `max + 1` (or 0)
- *  - `COMPLETED` / `DISCARDED` / `IN_PROGRESS` → 0 (prepend) */
+ *  - `COMPLETED` / `DISCARDED` / `IN_PROGRESS` / `WAITING` → 0 (prepend) */
 export function defaultMoveRank(
   from: TaskStatus,
   to: TaskStatus,
@@ -190,6 +193,7 @@ export function defaultMoveRank(
     case 'COMPLETED':
     case 'DISCARDED':
     case 'IN_PROGRESS':
+    case 'WAITING':
       return 0;
   }
 }

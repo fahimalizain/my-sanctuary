@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { TaskRecord, TaskStatus } from '../../types';
 import {
+  COLUMNS,
   applyOptimisticMove,
   defaultMoveRank,
   destIndexInRemaining,
@@ -43,6 +44,26 @@ function task(
     ...rest,
   };
 }
+
+// ── COLUMNS (ADR 0011 adds Waiting) ──────────────────────────────────────
+
+test('COLUMNS: Waiting sits between In Progress and Done', () => {
+  assert.deepEqual(
+    COLUMNS.map((column) => column.status),
+    ['OPEN', 'PLANNED', 'IN_PROGRESS', 'WAITING', 'COMPLETED', 'DISCARDED'],
+  );
+  assert.equal(
+    COLUMNS.find((column) => column.status === 'WAITING')?.title,
+    'Waiting',
+  );
+});
+
+test('COLUMNS: every column accent is distinct', () => {
+  assert.equal(
+    new Set(COLUMNS.map((column) => column.accent)).size,
+    COLUMNS.length,
+  );
+});
 
 // ── defaultMoveRank (mirrors the Rust default_move_rank) ─────────────────
 
@@ -90,6 +111,27 @@ test('defaultMoveRank: COMPLETED / DISCARDED / IN_PROGRESS prepend 0', () => {
   assert.equal(defaultMoveRank('OPEN', 'COMPLETED', tasks, 'ghost'), 0);
   assert.equal(defaultMoveRank('OPEN', 'DISCARDED', tasks, 'ghost'), 0);
   assert.equal(defaultMoveRank('OPEN', 'IN_PROGRESS', tasks, 'ghost'), 0);
+});
+
+test('defaultMoveRank: every source status prepends 0 into WAITING', () => {
+  // Waiting is a prepend column (ADR 0011 § Board) whatever the source, and
+  // the pile's own ranks never inflate it.
+  const tasks = [
+    task({ status: 'WAITING', sort_order: 0 }),
+    task({ status: 'WAITING', sort_order: 4 }),
+    task({ status: 'OPEN', sort_order: 9 }),
+  ];
+  const sources: TaskStatus[] = [
+    'OPEN',
+    'PLANNED',
+    'IN_PROGRESS',
+    'COMPLETED',
+    'DISCARDED',
+    'WAITING',
+  ];
+  for (const from of sources) {
+    assert.equal(defaultMoveRank(from, 'WAITING', tasks, 'ghost'), 0, from);
+  }
 });
 
 test('defaultMoveRank: excludeId keeps the mover out of its own append target', () => {
@@ -309,4 +351,24 @@ test('applyOptimisticMove: unknown id returns the array unchanged', () => {
     task({ id: 'B', status: 'OPEN', sort_order: 1 }),
   ];
   assert.equal(applyOptimisticMove(tasks, 'ghost', 'OPEN', 0), tasks);
+});
+
+test('applyOptimisticMove: same-status WAITING drop with a rank is a reorder', () => {
+  // Waiting is a real pile (ADR 0011 § Board): C(2) → rank 0 paints C,A,B and
+  // the peers it jumped shift down one, exactly like In Progress.
+  const tasks = [
+    task({ id: 'A', status: 'WAITING', sort_order: 0 }),
+    task({ id: 'B', status: 'WAITING', sort_order: 1 }),
+    task({ id: 'C', status: 'WAITING', sort_order: 2 }),
+  ];
+  const result = applyOptimisticMove(tasks, 'C', 'WAITING', 0);
+  assert.deepEqual(displayIds(result, 'WAITING'), ['C', 'A', 'B']);
+  assert.deepEqual(
+    result.map((t) => [t.id, t.sort_order]),
+    [
+      ['A', 1],
+      ['B', 2],
+      ['C', 0],
+    ],
+  );
 });

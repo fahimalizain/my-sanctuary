@@ -126,6 +126,7 @@ import {
   planOpenItem,
   replaceCachedTask,
   splitBacklogSection,
+  splitWaitingRows,
   streamItemsOf,
   unscheduleItem,
   updateStreamItem,
@@ -216,7 +217,10 @@ interface ActionNotice {
  *  IN_PROGRESS) and waiting/running occurrences of a LIVING routine. A
  *  skipped occurrence is a decline (no grip), terminal tasks and
  *  `routine_deleted` history are not draggable at all, and orphans have
- *  nothing to drag. */
+ *  nothing to drag. A `WAITING` task is not a drag source (ADR 0011): it
+ *  renders in its own section above the day's pile, so its view index and the
+ *  day pile's rank space no longer line up — its day changes go through the
+ *  row's reschedule control instead. */
 function isAgendaRowDraggable(item: AgendaItemRecord): boolean {
   const occurrence = item.occurrence;
   if (item.kind === 'occurrence' && occurrence) {
@@ -225,6 +229,7 @@ function isAgendaRowDraggable(item: AgendaItemRecord): boolean {
       occurrence.status === 'pending' || occurrence.status === 'in_progress'
     );
   }
+  if (item.task?.status === 'WAITING') return false;
   return isAgendaItemPending(item);
 }
 
@@ -237,9 +242,10 @@ function canMoveToToday(item: AgendaItemRecord): boolean {
 }
 
 /** One day of the stream: sticky header (with the past-day catch-up), the
- *  living pile as its own droppable + sortable list (past days are not drop
- *  targets), then the Completed dump — never draggable, never a drop
- *  target. */
+ *  Waiting section (ADR 0011 — the day's living `WAITING` rows, between the
+ *  header and the main pile), the living pile as its own droppable + sortable
+ *  list (past days are not drop targets), then the Completed dump — never
+ *  draggable, never a drop target. */
 function AgendaDay({
   day,
   serverToday,
@@ -258,12 +264,16 @@ function AgendaDay({
   highlightedItemId: string | null;
 }) {
   const { living, completed } = partitionAgendaItems(items);
+  // ADR 0011: the day's WAITING rows get their own section between the header
+  // and the main pile — `rest` is what the main list renders, so a waiting row
+  // is never painted twice and never enters the day's sortable set.
+  const { waiting, rest } = splitWaitingRows(living);
   const pendingCount = items.filter(isAgendaItemPending).length;
   // The count above includes a running occurrence, but the sweep leaves it
   // behind — the button may only appear when something would actually move.
   const canMoveDay = items.some(canMoveToToday);
   const isPast = !!serverToday && day < serverToday;
-  const draggable = living.filter(isAgendaRowDraggable);
+  const draggable = rest.filter(isAgendaRowDraggable);
   const { setNodeRef, isOver } = useDroppable({
     id: dayElementId(day),
     data: { day },
@@ -313,6 +323,28 @@ function AgendaDay({
         )}
       </header>
 
+      {waiting.length > 0 && (
+        <section className="space-y-2 px-1 pb-2" aria-label="Waiting">
+          <h3 className="px-1 text-xs font-medium tracking-wide text-muted-foreground">
+            Waiting
+          </h3>
+          <div className="space-y-2">
+            {waiting.map((entry) => (
+              <AgendaItemRow
+                key={entry.id}
+                item={entry}
+                isDragging={false}
+                showHandle={false}
+                serverToday={serverToday}
+                highlighted={highlightedItemId === entry.id}
+                pending={handlers.pendingOf(entry.id)}
+                {...handlers}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
       <SortableContext
         items={draggable.map((entry) => entry.id)}
         strategy={verticalListSortingStrategy}
@@ -325,13 +357,13 @@ function AgendaDay({
               : 'min-h-10 px-1 py-2 transition-colors'
           }
         >
-          {living.length === 0 ? (
+          {rest.length === 0 ? (
             <p className="px-1 py-1.5 text-sm italic text-muted-foreground/70">
               Nothing planned
             </p>
           ) : (
             <div className="space-y-2">
-              {living.map((entry) =>
+              {rest.map((entry) =>
                 isAgendaRowDraggable(entry) ? (
                   <SortableAgendaItemRow
                     key={entry.id}
@@ -802,8 +834,9 @@ export function HomePage() {
    *  Board reorder; the Backlog (its section or an OPEN row) → a backlog drop
    *  or the Open column's Board reorder. Past days are never drop targets (the
    *  API 400s), an `in_progress` occurrence may only reorder inside its own
-   *  day, and an `IN_PROGRESS` / terminal task or an occurrence never enters
-   *  either warehouse. */
+   *  day, and an `IN_PROGRESS` / `WAITING` / terminal task or an occurrence
+   *  never enters either warehouse (a waiting task reaches it by moving to
+   *  Open or Planned — ADR 0011). */
   const handleDragEnd = (event: DragEndEvent) => {
     setActiveDrag(null);
     const { active, over } = event;
@@ -856,6 +889,7 @@ export function HomePage() {
       if (dragged.kind !== 'task' || !dragged.task) return;
       if (
         dragged.task.status === 'IN_PROGRESS' ||
+        dragged.task.status === 'WAITING' ||
         dragged.task.status === 'COMPLETED' ||
         dragged.task.status === 'DISCARDED'
       ) {
@@ -898,6 +932,7 @@ export function HomePage() {
       if (dragged.kind !== 'task' || !dragged.task) return;
       if (
         dragged.task.status === 'IN_PROGRESS' ||
+        dragged.task.status === 'WAITING' ||
         dragged.task.status === 'COMPLETED' ||
         dragged.task.status === 'DISCARDED'
       ) {
@@ -1039,7 +1074,8 @@ export function HomePage() {
     if (!serverToday || targetDate < serverToday) return;
     // `in_progress` occurrences are reorder-only until they are paused; an
     // `IN_PROGRESS` task cannot change day at all (the API 400s — pause
-    // first).
+    // first). A `WAITING` task CAN: the API keeps it waiting and only the row
+    // travels (ADR 0011).
     if (item.occurrence?.status === 'in_progress') return;
     if (item.task?.status === 'IN_PROGRESS') return;
     if (!beginRowAction(item.id, slot)) return;

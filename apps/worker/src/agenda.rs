@@ -317,13 +317,14 @@ pub async fn move_agenda_item(
 /// Relocates the slot to that day — the occurrence moves its agenda item only
 /// (no exdate anywhere; `pending | skipped` only, never into the backlog and
 /// never unscheduled), a task reschedule plans it (`OPEN` → `PLANNED` + a
-/// `planned` task_logs row + the Planned column; `PLANNED` stays put;
-/// running/terminal → 400), a backlog drop returns it to `OPEN` on the backlog
-/// date (`unplanned` row + the Open column; an already-`OPEN` task writes
-/// nothing), and an unschedule keeps it `PLANNED` with **no** `task_logs` row
-/// and **no** Board re-rank, moving the row to the sentinel unless it is
-/// already `>= today+10y` (200 no-op). `OPEN` / `IN_PROGRESS` / terminal tasks
-/// and occurrences cannot be unscheduled (400). Same date is a 200 no-op.
+/// `planned` task_logs row + the Planned column; `PLANNED` and `WAITING` stay
+/// put (ADR 0011); running/terminal → 400), a backlog drop returns it to
+/// `OPEN` on the backlog date (`unplanned` row + the Open column; an
+/// already-`OPEN` task writes nothing; `WAITING` → 400), and an unschedule
+/// keeps it `PLANNED` with **no** `task_logs` row and **no** Board re-rank,
+/// moving the row to the sentinel unless it is already `>= today+10y` (200
+/// no-op). `OPEN` / `IN_PROGRESS` / `WAITING` / terminal tasks and
+/// occurrences cannot be unscheduled (400). Same date is a 200 no-op.
 /// Session-only: no Google write of any kind.
 pub async fn reschedule_agenda_item(
     mut req: Request,
@@ -374,7 +375,7 @@ pub async fn reschedule_agenda_item(
 /// `POST /api/agenda/days/:date/move-to-today` → 200 `{"items":[...]}`.
 ///
 /// Moves a **past** day's still-pending items (living `OPEN | PLANNED |
-/// IN_PROGRESS` tasks and `pending` occurrences of living routines) onto
+/// IN_PROGRESS | WAITING` tasks and `pending` occurrences of living routines) onto
 /// civil today in one call, appended to today's pile in their original
 /// order. `done`/`skipped`/`in_progress` occurrences, terminal or
 /// soft-deleted tasks, soft-deleted-routine leftovers and orphans stay where

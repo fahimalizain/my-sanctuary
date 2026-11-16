@@ -7,7 +7,7 @@ import type { TaskStatus } from '@/app/types';
  *  currently in view (IntersectionObserver in BoardPage), so the highlight
  *  follows both taps and manual swipes.
  *
- *  The five full titles must stay on ONE line at 390px: the nav itself pans
+ *  The column titles must stay on ONE line each at 390px: the nav itself pans
  *  horizontally (`overflow-x-auto`) and every control is `shrink-0
  *  whitespace-nowrap`, so titles never wrap or truncate. From md up the row
  *  is hidden — the columns are all visible and it would waste height.

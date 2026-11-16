@@ -14,7 +14,7 @@ import type { BoardColumnItems } from './board-dnd';
 import type { TaskStatus } from '../../types';
 import { TERMINAL_COLUMN_CAP } from './board-model';
 
-/** Full 5-key board — tests pass only the columns they care about. */
+/** Full 6-key board — tests pass only the columns they care about. */
 function board(
   entries: Partial<Record<TaskStatus, string[]>>,
 ): BoardColumnItems {
@@ -22,6 +22,7 @@ function board(
     OPEN: [],
     PLANNED: [],
     IN_PROGRESS: [],
+    WAITING: [],
     COMPLETED: [],
     DISCARDED: [],
     ...entries,

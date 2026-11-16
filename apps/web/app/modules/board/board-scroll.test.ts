@@ -3,7 +3,14 @@ import assert from 'node:assert/strict';
 import { pickVisibleColumn, scrollEdges } from './board-scroll';
 
 // The board's real column order (board-model COLUMNS).
-const order = ['OPEN', 'PLANNED', 'IN_PROGRESS', 'COMPLETED', 'DISCARDED'];
+const order = [
+  'OPEN',
+  'PLANNED',
+  'IN_PROGRESS',
+  'WAITING',
+  'COMPLETED',
+  'DISCARDED',
+];
 
 // ── pickVisibleColumn ───────────────────────────────────────────────────
 
@@ -14,6 +21,7 @@ test('pickVisibleColumn: all zeros → null', () => {
         OPEN: 0,
         PLANNED: 0,
         IN_PROGRESS: 0,
+        WAITING: 0,
         COMPLETED: 0,
         DISCARDED: 0,
       },
