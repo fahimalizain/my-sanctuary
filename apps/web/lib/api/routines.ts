@@ -1,6 +1,7 @@
 import { fetchJson } from './client';
 import type {
   NewRoutineInput,
+  ReorderRoutinesResponse,
   RoutineResponse,
   RoutinesResponse,
   UpdateRoutineInput,
@@ -31,4 +32,14 @@ export function updateRoutine(
 
 export function deleteRoutine(id: string): Promise<void> {
   return fetchJson<void>(`/api/routines/${id}`, { method: 'DELETE' });
+}
+
+/** The body must list every living routine id exactly once (400 otherwise). */
+export function reorderRoutines(
+  ids: string[],
+): Promise<ReorderRoutinesResponse> {
+  return fetchJson<ReorderRoutinesResponse>('/api/routines/reorder', {
+    method: 'POST',
+    body: { ids },
+  });
 }

@@ -516,6 +516,11 @@ export interface RoutineResponse {
   routine: RoutineRecord;
 }
 
+// The envelope returned by POST /api/routines/reorder.
+export interface ReorderRoutinesResponse {
+  success: boolean;
+}
+
 // Request body for POST /api/routines. `estimated_minutes` defaults to 15
 // server-side (min 1). The title must uniquely match a non-untracked category
 // (the server decides and explains 400s); `rrule` is the two-line recurrence

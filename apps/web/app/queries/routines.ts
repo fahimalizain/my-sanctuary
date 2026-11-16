@@ -3,9 +3,11 @@ import {
   createRoutine,
   deleteRoutine,
   listRoutines,
+  reorderRoutines,
   updateRoutine,
 } from '@/lib/api';
-import type { UpdateRoutineInput } from '@/app/types';
+import type { RoutinesResponse, UpdateRoutineInput } from '@/app/types';
+import { routinesInIdOrder } from '@/app/modules/routines/reorder';
 import { queryKeys } from './keys';
 import { queryClient } from '@/lib/queryClient';
 
@@ -16,6 +18,10 @@ import { queryClient } from '@/lib/queryClient';
 // retitling or deleting a routine changes the auto-seeded occurrences, and a
 // delete turns their history read-only — the optimistic agenda paint cannot
 // know any of that, so the stream re-reads.
+//
+// The one exception is reorder: it moves standing `sort_order` only, and the
+// materialized agenda rows keep the order they were seeded with (ADR 0004), so
+// that hook invalidates `['routines']` alone.
 
 export function routinesQueryOptions() {
   return queryOptions({
@@ -58,6 +64,35 @@ export function useDeleteRoutine() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.routines.all });
       void queryClient.invalidateQueries({ queryKey: queryKeys.agenda.all });
+    },
+  });
+}
+
+// Standing-order reorder: `['routines']` only. Unlike create/update/delete, it
+// does NOT invalidate `['agenda']` — already materialized Home rows keep their
+// seeded order (ADR 0004), so a stream re-read would change nothing.
+export function useReorderRoutines() {
+  return useMutation({
+    mutationFn: (ids: string[]) => reorderRoutines(ids),
+    onMutate: async (ids) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.routines.all });
+      const previous = queryClient.getQueryData<RoutinesResponse>(
+        queryKeys.routines.all,
+      );
+      if (previous) {
+        queryClient.setQueryData<RoutinesResponse>(queryKeys.routines.all, {
+          routines: routinesInIdOrder(previous.routines, ids),
+        });
+      }
+      return { previous };
+    },
+    onError: (_err, _ids, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(queryKeys.routines.all, context.previous);
+      }
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.routines.all });
     },
   });
 }
