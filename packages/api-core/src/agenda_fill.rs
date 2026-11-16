@@ -40,7 +40,9 @@ use crate::models::{
 };
 use crate::repo::{AgendaItemRepo, CalendarRepo, OccurrenceRepo, RoutineRepo, TaskRepo};
 use crate::routines::occurrence_dates;
-use crate::tasks::{TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED};
+use crate::tasks::{
+    TASK_STATUS_IN_PROGRESS, TASK_STATUS_OPEN, TASK_STATUS_PLANNED, TASK_STATUS_WAITING,
+};
 
 /// How many inclusive civil days the fill materializes: today … today+6.
 pub const OCCURRENCE_HORIZON_DAYS: i64 = 7;
@@ -223,7 +225,8 @@ pub async fn fill_occurrence_horizon(
 /// rows leave the day stream on the first tick; no SQL migration).
 ///
 /// - Living tasks only (`list_by_user_id` hides soft-deleted rows) and only
-///   `OPEN | PLANNED | IN_PROGRESS`: `COMPLETED`/`DISCARDED` get nothing.
+///   `OPEN | PLANNED | IN_PROGRESS | WAITING`: `COMPLETED`/`DISCARDED` get
+///   nothing.
 /// - `list_by_refs(user, "task", ids)` on **any** date maps each task to the
 ///   row it already holds, if any (never a second row — one row per task is
 ///   the 0018 invariant). The backlog date is civil today + 50 years
@@ -243,13 +246,18 @@ pub async fn fill_occurrence_horizon(
 ///   `[today, horizon)` and a past row are never touched (a past
 ///   `IN_PROGRESS` row can still pin the anchor). Nothing is rewritten just
 ///   to normalize it onto exactly today's backlog date.
+/// - `WAITING` behaves exactly like `IN_PROGRESS` (ADR 0011): a rowless task
+///   or a row parked at/after the horizon lands on today — this only completes
+///   a failed hand-off placement; a row on a real date is never touched, and
+///   no calendar event is created.
 /// - The arrivals are appended in **board order** per destination: the today
-///   pile holds only `IN_PROGRESS`, the backlog pile `PLANNED` first and then
-///   `OPEN`, each by `tasks.sort_order` with ties broken by task id
-///   ascending. Ranks start at `max_sort_order(destination) + 1` (0 when that
-///   pile is empty) and increase by one in that order. Rows already correctly
-///   on the destination keep their ranks — moving and inserting share one
-///   counter, so a healed row and a rowless task land as one board.
+///   pile holds `IN_PROGRESS` first and then `WAITING`, the backlog pile
+///   `PLANNED` first and then `OPEN`, each by `tasks.sort_order` with ties
+///   broken by task id ascending. Ranks start at
+///   `max_sort_order(destination) + 1` (0 when that pile is empty) and
+///   increase by one in that order. Rows already correctly on the destination
+///   keep their ranks — moving and inserting share one counter, so a healed
+///   row and a rowless task land as one board.
 ///
 /// Idempotent: a second pass with nothing missing or misplaced writes nothing
 /// (no `insert_many`, no `set_local_date`).
@@ -300,17 +308,22 @@ pub async fn ensure_task_items(
             // future, or at/after the horizon) is valid and left alone.
             (TASK_STATUS_PLANNED, None) => backlog_pile.push((task, None)),
             (TASK_STATUS_PLANNED, Some(_)) => {}
-            // IN_PROGRESS is a real-day status: a rowless task lands on
-            // today, and a row parked at/after the horizon is healed there.
-            (TASK_STATUS_IN_PROGRESS, None) => today_pile.push((task, None)),
-            (TASK_STATUS_IN_PROGRESS, Some(row))
+            // IN_PROGRESS and WAITING are real-day statuses: a rowless task
+            // lands on today, and a row parked at/after the horizon is healed
+            // there. A WAITING row on a real date is never moved (ADR 0011:
+            // only a real transition moves it; this heal just completes a
+            // failed hand-off placement).
+            (TASK_STATUS_IN_PROGRESS | TASK_STATUS_WAITING, None) => {
+                today_pile.push((task, None))
+            }
+            (TASK_STATUS_IN_PROGRESS | TASK_STATUS_WAITING, Some(row))
                 if row.local_date.as_str() >= horizon.as_str() =>
             {
                 today_pile.push((task, Some(row)));
             }
-            // Already correct: an IN_PROGRESS row still inside the horizon
-            // (terminal statuses never reach here — `status_rank` dropped them
-            // above).
+            // Already correct: an IN_PROGRESS/WAITING row still inside the
+            // horizon (terminal statuses never reach here — `status_rank`
+            // dropped them above).
             _ => {}
         }
     }
@@ -321,8 +334,8 @@ pub async fn ensure_task_items(
 }
 
 /// Appends one destination pile after that date's current max rank, in board
-/// order (the today pile holds only `IN_PROGRESS`; the backlog pile holds
-/// `PLANNED` then `OPEN`, ADR 0010).
+/// order (the today pile holds `IN_PROGRESS` then `WAITING`; the backlog pile
+/// holds `PLANNED` then `OPEN`, ADR 0010).
 ///
 /// A task that already holds a row travels with
 /// [`AgendaItemRepo::set_local_date`]; the rowless ones are collected and
@@ -375,13 +388,14 @@ async fn append_task_pile(
 }
 
 /// Board order rank of a still-actionable task status: `IN_PROGRESS`, then
-/// `PLANNED`, then `OPEN`. `None` for terminal statuses — they are never
-/// placed.
+/// `WAITING`, then `PLANNED`, then `OPEN`. `None` for terminal statuses — they
+/// are never placed.
 fn status_rank(status: &str) -> Option<u8> {
     match status {
         TASK_STATUS_IN_PROGRESS => Some(0),
-        TASK_STATUS_PLANNED => Some(1),
-        TASK_STATUS_OPEN => Some(2),
+        TASK_STATUS_WAITING => Some(1),
+        TASK_STATUS_PLANNED => Some(2),
+        TASK_STATUS_OPEN => Some(3),
         _ => None,
     }
 }
@@ -403,7 +417,7 @@ pub struct AgendaFillReport {
 /// The agenda fill cron (the `*/15 * * * *` tick): for each affected user,
 /// materialize the occurrence horizon and place or repair every living task's
 /// single agenda row (`OPEN` and `PLANNED` on the backlog date, `IN_PROGRESS`
-/// on today — [`ensure_task_items`], ADR 0007 / 0009).
+/// and `WAITING` on today — [`ensure_task_items`], ADR 0007 / 0009 / 0011).
 ///
 /// The work list is the sorted, deduped union of
 /// [`RoutineRepo::list_user_ids_with_living_routines`] and

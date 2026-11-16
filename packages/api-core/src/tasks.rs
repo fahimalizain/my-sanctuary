@@ -952,6 +952,7 @@ pub(crate) async fn ensure_task_planned_unscheduled(
 /// | --- | --- |
 /// | `OPEN` | [`local_transition`] to `PLANNED` with a `planned` log, then the Planned-column append (mover-excluded `max + 1` — no client rank) |
 /// | `PLANNED` | `Ok(())`: already planned, no log and no board re-rank |
+/// | `WAITING` | `Ok(())`: stays `WAITING` (ADR 0011 — the row moves, the status does not), no log and no board re-rank |
 /// | `IN_PROGRESS` | 400 `cannot reschedule an in_progress task` (pause first). No write. |
 /// | `COMPLETED` / `DISCARDED` | 400 `cannot reschedule a terminal task`. No write. |
 ///
@@ -972,7 +973,7 @@ pub(crate) async fn plan_task_for_reschedule(
         return Err(TasksError::NotFound);
     }
     match task.status.as_str() {
-        TASK_STATUS_PLANNED => Ok(()),
+        TASK_STATUS_PLANNED | TASK_STATUS_WAITING => Ok(()),
         TASK_STATUS_OPEN => {
             local_transition(
                 task_repo,
@@ -1016,6 +1017,7 @@ pub(crate) async fn plan_task_for_reschedule(
 /// | --- | --- |
 /// | `PLANNED` | [`local_transition`] to `OPEN` with an `unplanned` log, then the Open-column append (mover-excluded `max + 1`) |
 /// | `OPEN` | `Ok(())`: already Backlog, no log and no board re-rank |
+/// | `WAITING` | 400 `cannot move a waiting task to the backlog` (ADR 0011: reaching the backlog requires a status change — shelve it on the Board). No write. |
 /// | `IN_PROGRESS` | 400 `cannot move an in_progress task to the backlog`. No write. |
 /// | `COMPLETED` / `DISCARDED` | 400 `cannot move a terminal task to the backlog`. No write. |
 ///
@@ -1058,6 +1060,10 @@ pub(crate) async fn open_task_for_backlog(
         }
         TASK_STATUS_IN_PROGRESS => Err(TasksError::Invalid(
             "cannot move an in_progress task to the backlog".to_string(),
+        )),
+        TASK_STATUS_WAITING => Err(TasksError::Invalid(
+            "cannot move a waiting task to the backlog; move it to Open or Planned instead"
+                .to_string(),
         )),
         TASK_STATUS_COMPLETED | TASK_STATUS_DISCARDED => Err(TasksError::Invalid(
             "cannot move a terminal task to the backlog".to_string(),
@@ -3521,7 +3527,10 @@ mod tests {
                     row.deleted_at.is_none()
                         && matches!(
                             row.status.as_str(),
-                            TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS
+                            TASK_STATUS_OPEN
+                                | TASK_STATUS_PLANNED
+                                | TASK_STATUS_IN_PROGRESS
+                                | TASK_STATUS_WAITING
                         )
                 })
                 .map(|row| row.user_id.clone())
@@ -11795,6 +11804,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_task_for_reschedule_leaves_a_waiting_task_alone() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_WAITING, AGENDA_TODAY)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 4)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        pollster::block_on(plan_task_for_reschedule(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap();
+
+        let stored = pollster::block_on(tasks.get_by_id(&task.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, TASK_STATUS_WAITING,
+            "ADR 0011: a waiting-task reschedule moves the row, not the status"
+        );
+        assert_eq!(stored.sort_order, 4, "no board re-rank");
+        assert!(logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
     fn plan_task_for_reschedule_rejects_a_running_or_terminal_task() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
         let logs = FakeTaskLogRepo::default();
@@ -11894,6 +11931,41 @@ mod tests {
         );
         assert_eq!(stored.sort_order, 4, "no board re-rank");
         assert!(logs.inserted.lock().unwrap().is_empty(), "no log");
+    }
+
+    #[test]
+    fn open_task_for_backlog_rejects_a_waiting_task() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_WAITING, AGENDA_TODAY)).unwrap();
+        pollster::block_on(tasks.set_sort_order(&task.id, 7)).unwrap();
+        let logs = FakeTaskLogRepo::default();
+
+        let err = pollster::block_on(open_task_for_backlog(
+            &tasks,
+            &logs,
+            "u-1",
+            &task.id,
+            AGENDA_NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TasksError::Invalid(ref m)
+                    if m == "cannot move a waiting task to the backlog; move it to Open or Planned instead"
+            ),
+            "{err:?}"
+        );
+        let stored = pollster::block_on(tasks.get_by_id(&task.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, TASK_STATUS_WAITING, "status unchanged");
+        assert_eq!(stored.sort_order, 7, "no board write");
+        assert!(
+            logs.inserted.lock().unwrap().is_empty(),
+            "nothing was logged"
+        );
     }
 
     #[test]

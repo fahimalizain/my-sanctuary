@@ -181,10 +181,10 @@ pub trait TaskRepo: Send + Sync {
     /// stale/expired event cache neither adds nor drops work here).
     async fn list_in_progress(&self) -> Result<Vec<Task>, RepoError>;
     /// Distinct `user_id`s holding at least one living, still-actionable task
-    /// (`OPEN | PLANNED | IN_PROGRESS`) — the agenda fill cron's user list:
-    /// `COMPLETED`/`DISCARDED` rows never need an agenda row, so a user whose
-    /// board is done is not a fill candidate. Unordered; the caller sorts and
-    /// dedups (a user may appear once per matching row).
+    /// (`OPEN | PLANNED | IN_PROGRESS | WAITING`) — the agenda fill cron's user
+    /// list: `COMPLETED`/`DISCARDED` rows never need an agenda row, so a user
+    /// whose board is done is not a fill candidate. Unordered; the caller sorts
+    /// and dedups (a user may appear once per matching row).
     async fn list_user_ids_with_open_tasks(&self) -> Result<Vec<String>, RepoError>;
     /// Returns the task with local `id`, or `None` when absent or soft-deleted.
     /// NOT user-scoped; callers must verify `row.user_id` (the service does).
@@ -414,10 +414,10 @@ pub trait AgendaItemRepo: Send + Sync {
     /// `MIN(local_date)` strictly before `before` that still holds a
     /// **pending** item — the stream anchor, in one query (never a history
     /// load). Pending means: kind `task` with a living
-    /// `OPEN | PLANNED | IN_PROGRESS` task row, or kind `occurrence` with a
-    /// `pending | in_progress` occurrence whose routine is living. Orphan
-    /// rows and terminal states never count. `None` when nothing pends in the
-    /// past.
+    /// `OPEN | PLANNED | IN_PROGRESS | WAITING` task row, or kind `occurrence`
+    /// with a `pending | in_progress` occurrence whose routine is living.
+    /// Orphan rows and terminal states never count. `None` when nothing pends
+    /// in the past.
     async fn oldest_pending_local_date_before(
         &self,
         user_id: &str,
@@ -747,7 +747,7 @@ pub const TASK_LIST_IN_PROGRESS_SQL: &str =
 /// `DISCARDED`) are excluded — they are never backfilled.
 pub const TASK_LIST_USER_IDS_WITH_OPEN_SQL: &str = "
     SELECT DISTINCT user_id FROM tasks
-    WHERE deleted_at IS NULL AND status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')
+    WHERE deleted_at IS NULL AND status IN ('OPEN', 'PLANNED', 'IN_PROGRESS', 'WAITING')
 ";
 
 pub const TASK_GET_BY_ID_SQL: &str =
@@ -1119,7 +1119,7 @@ pub const AGENDA_ITEM_OLDEST_PENDING_LOCAL_DATE_BEFORE_SQL: &str = "
           WHERE t.id = a.ref_id
             AND t.user_id = a.user_id
             AND t.deleted_at IS NULL
-            AND t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')
+            AND t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS', 'WAITING')
         ))
         OR (a.kind = 'occurrence' AND EXISTS (
           SELECT 1 FROM routine_occurrences o
@@ -1890,7 +1890,7 @@ mod tests {
         assert!(sql.contains("SELECT DISTINCT user_id FROM tasks"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
         assert!(
-            sql.contains("status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')"),
+            sql.contains("status IN ('OPEN', 'PLANNED', 'IN_PROGRESS', 'WAITING')"),
             "terminal rows never need a backfill: {sql}"
         );
         assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
@@ -2010,7 +2010,7 @@ mod tests {
         assert!(anchor.contains("a.local_date < ?"), "strictly past: {anchor}");
         assert!(anchor.contains("a.kind = 'task'"), "{anchor}");
         assert!(
-            anchor.contains("t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS')"),
+            anchor.contains("t.status IN ('OPEN', 'PLANNED', 'IN_PROGRESS', 'WAITING')"),
             "{anchor}"
         );
         assert!(anchor.contains("t.deleted_at IS NULL"), "{anchor}");
