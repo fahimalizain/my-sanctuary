@@ -440,14 +440,14 @@ function PlayPauseControl({
   return null;
 }
 
-/** Status chip: done/skipped/in_progress for occurrences, done/in_progress
- *  for tasks — the same friendly labels the board uses. */
+/** Status chip: done/skipped/in_progress for occurrences, done/in_progress/
+ *  waiting for tasks (ADR 0011) — the same friendly labels the board uses. */
 function StatusChip({
   label,
   tone,
 }: {
   label: string;
-  tone: 'done' | 'skipped' | 'running';
+  tone: 'done' | 'skipped' | 'running' | 'waiting';
 }) {
   return (
     <span
@@ -456,6 +456,7 @@ function StatusChip({
         tone === 'done' && 'bg-emerald-100 text-emerald-700',
         tone === 'skipped' && 'bg-muted text-muted-foreground',
         tone === 'running' && 'bg-sky-100 text-sky-700',
+        tone === 'waiting' && 'bg-amber-100 text-amber-700',
       )}
     >
       {label}
@@ -735,6 +736,9 @@ function TaskRow({
           )}
           {task.status === 'IN_PROGRESS' && (
             <StatusChip label="In progress" tone="running" />
+          )}
+          {task.status === 'WAITING' && (
+            <StatusChip label="Waiting" tone="waiting" />
           )}
           <AgendaRowActions>
             <PlayPauseControl

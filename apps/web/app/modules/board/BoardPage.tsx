@@ -498,6 +498,7 @@ export function BoardPage() {
       OPEN: [] as string[],
       PLANNED: [] as string[],
       IN_PROGRESS: [] as string[],
+      WAITING: [] as string[],
       COMPLETED: [] as string[],
       DISCARDED: [] as string[],
     };
@@ -708,9 +709,9 @@ export function BoardPage() {
   /** TaskModal's immediate status change (ADR 0002 § UI): a drop with no
    *  drop position — `sort_order` is OMITTED and the server applies the
    *  column default (`defaultMoveRank` mirrors it for the optimistic frame:
-   *  OPEN appends, pause prepends Planned, complete/discard prepend). A
-   *  status pill to IN_PROGRESS is a plain `/move` — it starts the card even
-   *  while other tasks run. Optimistic, then ONE `/move`;
+   *  OPEN appends, pause prepends Planned, complete/discard/hand-off
+   *  prepend). A status pill to IN_PROGRESS is a plain `/move` — it starts the
+   *  card even while other tasks run. Optimistic, then ONE `/move`;
    *  `sendMoveRequest` already owns the revert and the banner. Returns the
    *  error message for the form (null on success). The modal stays open;
    *  `task` in props updates via this merge. */
@@ -997,7 +998,7 @@ export function BoardPage() {
               Board
             </h1>
             <p className="hidden text-muted-foreground md:block">
-              Backlog, Planned, In Progress, Done, Discarded
+              Backlog, Planned, In Progress, Waiting, Done, Discarded
             </p>
           </div>
           {/* Mobile shortcuts first, desktop pair after; `hidden md:inline-flex`
@@ -1155,9 +1156,9 @@ export function BoardPage() {
       )}
 
       {boardShown && (
-        /* Five status columns (ADR 0002 § UI). The page is a fixed 100dvh
-                column, so this scroller takes exactly the height the header
-                and filters leave over and pans horizontally only
+        /* Six status columns (ADR 0002 § UI, ADR 0011). The page is a fixed
+                100dvh column, so this scroller takes exactly the height the
+                header and filters leave over and pans horizontally only
                 (`overflow-y-hidden`) — the vertical scroll lives in each
                 column body. Columns are `85vw` below md and a fixed 260px
                 from md up; below md the row snap-scrolls so the next column

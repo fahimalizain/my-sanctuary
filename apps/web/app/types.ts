@@ -375,11 +375,14 @@ export type ClassifyResponse =
 // A task as returned by the API: the `tasks` row shape (snake_case) plus the
 // computed `category`. `status` is driven by the timer endpoints: start →
 // "IN_PROGRESS", stop → "OPEN", pause → "PLANNED" (since ADR 0002),
-// complete/discard → their terminal states.
+// complete/discard → their terminal states. A hand-off (ADR 0011) is the
+// `move` endpoint's "WAITING" — a living status with no calendar time of its
+// own, reachable from (and leaving for) any status.
 export type TaskStatus =
   | 'OPEN'
   | 'PLANNED'
   | 'IN_PROGRESS'
+  | 'WAITING'
   | 'COMPLETED'
   | 'DISCARDED';
 
@@ -451,8 +454,10 @@ export interface UpdateTaskInput {
 // Request body for POST /api/tasks/:id/move — the board drop. The server
 // dispatches the ADR 0002 transition matrix (start/stop/pause/complete/
 // discard/plan/unplan/reopen), then places the task at `sort_order` in the
-// target status. Same-status moves are reorders (including IN_PROGRESS →
-// IN_PROGRESS with a rank — In Progress is a real pile). `sort_order` is
+// target status. ADR 0011 adds the free edges: any status reaches WAITING and
+// WAITING leaves for any status (one `handed_off` log, no calendar event).
+// Same-status moves are reorders (including IN_PROGRESS → IN_PROGRESS and
+// WAITING → WAITING with a rank — both are real piles). `sort_order` is
 // optional: drops send an absolute rank; no-drop callers (modal status pills,
 // column+ create-then-move) omit it and the server applies the column
 // default.
@@ -606,8 +611,9 @@ export interface AgendaResponse {
   // stretch `today+6 < local_date < today+10y` in the range query's order
   // (never re-sorted), then `PLANNED` tasks whose row date is `≥ today+10y` in
   // Planned-column Board order (`tasks.sort_order`, ties by task id), then
-  // `OPEN` tasks at/after that line in Open-column Board order. `IN_PROGRESS`
-  // tasks and occurrences at the horizon are absent. Empty on a history read.
+  // `OPEN` tasks at/after that line in Open-column Board order. `IN_PROGRESS` /
+  // `WAITING` tasks (ADR 0011 self-heals a waiting row onto a real date) and
+  // occurrences at the horizon are absent. Empty on a history read.
   backlog: AgendaItemRecord[];
   // `YYYY-MM-DD` — the resolved inclusive window start (never the raw query).
   from: string;
@@ -654,14 +660,16 @@ export interface MoveAgendaItemInput {
 // target date's peers at/after it up one, an omitted one appends at `max + 1`.
 // Occurrences move only while `pending | skipped` (skipped → pending;
 // in_progress/done → 400); a task reschedule is a status transition — `OPEN`
-// becomes `PLANNED`, an `IN_PROGRESS` task 400s (pause first). Same date → 200
-// no-op; a past date 400s. A backlog drop never carries `date`: occurrences
-// and `IN_PROGRESS` tasks 400, a `PLANNED` task becomes `OPEN`, an already-
+// becomes `PLANNED`, an `IN_PROGRESS` task 400s (pause first), a `WAITING`
+// task keeps waiting and only its row travels (ADR 0011). Same date → 200
+// no-op; a past date 400s. A backlog drop never carries `date`: occurrences,
+// `IN_PROGRESS` and `WAITING` tasks 400 (a waiting task reaches the backlog by
+// moving to Open or Planned), a `PLANNED` task becomes `OPEN`, an already-
 // `OPEN` row on the backlog date is a no-op. `unschedule` never carries a
 // date either: it keeps the task `PLANNED`, writes no log and does not re-rank
 // the Planned column, and moves only the row to the backlog sentinel — a row
 // already at/after the 10-year horizon is a 200 no-op. `OPEN`, `IN_PROGRESS`,
-// terminal tasks and occurrences 400.
+// `WAITING`, terminal tasks and occurrences 400.
 export interface RescheduleAgendaItemInput {
   date?: string;
   sort_order?: number;

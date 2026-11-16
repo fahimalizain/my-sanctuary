@@ -283,9 +283,15 @@ export function groupItemsByDate(
   return byDate;
 }
 
-/** The living task statuses (ADR 0004 § Agenda rules): terminal tasks
- *  (COMPLETED | DISCARDED) are finished. */
-const AGENDA_LIVING_STATUSES: TaskStatus[] = ['OPEN', 'PLANNED', 'IN_PROGRESS'];
+/** The living task statuses (ADR 0004 § Agenda rules, ADR 0011): terminal
+ *  tasks (COMPLETED | DISCARDED) are finished; `WAITING` is living work the
+ *  date is holding while an agent runs. */
+const AGENDA_LIVING_STATUSES: TaskStatus[] = [
+  'OPEN',
+  'PLANNED',
+  'IN_PROGRESS',
+  'WAITING',
+];
 
 /** True when the row is part of the Backlog's OPEN stretch (ADR 0007): an
  *  `OPEN` task whose row sits on/past the 10-year line. Those rows are ordered
@@ -867,11 +873,13 @@ export function applyAgendaMove(
     .sort((a, b) => a.sort_order - b.sort_order);
 }
 
-/** Reschedule visibility (ADR 0004 amendment, ADR 0007): occurrences move
- *  only while `pending | skipped` (in_progress/done → API 400), tasks while
- *  living EXCEPT a running one — an `IN_PROGRESS` task cannot change day (the
- *  API 400s `cannot reschedule an in_progress task`; pause first), so the
- *  control hides. COMPLETED/DISCARDED slots are hidden so Home never invites
+/** Reschedule visibility (ADR 0004 amendment, ADR 0007, ADR 0011):
+ *  occurrences move only while `pending | skipped` (in_progress/done → API
+ *  400), tasks while living EXCEPT a running one — an `IN_PROGRESS` task
+ *  cannot change day (the API 400s `cannot reschedule an in_progress task`;
+ *  pause first), so the control hides. A `WAITING` row CAN change day and
+ *  stays waiting (ADR 0011 § Reschedule — the API allows it, unlike
+ *  `IN_PROGRESS`). COMPLETED/DISCARDED slots are hidden so Home never invites
  *  moving a finished card (the API would allow it). A `routine_deleted` row is
  *  read-only history: never reschedulable. */
 export function canReschedule(item: AgendaItemRecord): boolean {
@@ -892,15 +900,17 @@ export function canReschedule(item: AgendaItemRecord): boolean {
   return false;
 }
 
-/** Backlog as a destination (ADR 0007, ADR 0010): tasks only, living work
- *  only. An `OPEN` task already parked on the backlog sentinel is never
- *  offered the drop again (it is already there), but a `PLANNED` row at/past
- *  the horizon still is — that drop UNPLANS it (`{ backlog: true }` flips it
- *  to `OPEN` and appends the Open column), so it is a real transition even
- *  though the row barely moves. An `OPEN` task on a near date can still be
- *  dropped (the row moves; no status change), while a `PLANNED` row is the
- *  real transition. Occurrences have no backlog, and terminal cards are never
- *  invited back into it. */
+/** Backlog as a destination (ADR 0007, ADR 0010, ADR 0011): tasks only, and
+ *  only the ones the drop can actually move. An `OPEN` task already parked on
+ *  the backlog sentinel is never offered the drop again (it is already there),
+ *  but a `PLANNED` row at/past the horizon still is — that drop UNPLANS it
+ *  (`{ backlog: true }` flips it to `OPEN` and appends the Open column), so it
+ *  is a real transition even though the row barely moves. An `OPEN` task on a
+ *  near date can still be dropped (the row moves; no status change), while a
+ *  `PLANNED` row is the real transition. A `WAITING` task is refused: the API
+ *  400s the backlog drop for it — reaching the warehouse means moving it to
+ *  Open or Planned first (ADR 0011 § Reschedule and unschedule). Occurrences
+ *  have no backlog, and terminal cards are never invited back into it. */
 export function canMoveToBacklog(
   item: AgendaItemRecord,
   today: string,
@@ -909,6 +919,7 @@ export function canMoveToBacklog(
   if (item.kind !== 'task' || !item.task) return false;
   if (
     item.task.status === 'IN_PROGRESS' ||
+    item.task.status === 'WAITING' ||
     item.task.status === 'COMPLETED' ||
     item.task.status === 'DISCARDED'
   ) {
@@ -922,8 +933,10 @@ export function canMoveToBacklog(
  *  Planned warehouse without touching its status, its Board rank or the logs.
  *  A row already at/after the horizon is the warehouse itself (the server
  *  answers 200 as a no-op), and everything the API 400s stays hidden: an
- *  `OPEN` row (use Backlog / plan instead), a running task, a terminal card,
- *  an occurrence, an orphan. A malformed/absent `today` offers nothing. */
+ *  `OPEN` row (use Backlog / plan instead), a `WAITING` task (move it to Open
+ *  or Planned first — ADR 0011 § Reschedule and unschedule), a running task, a
+ *  terminal card, an occurrence, an orphan. A malformed/absent `today` offers
+ *  nothing. */
 export function canUnschedule(item: AgendaItemRecord, today: string): boolean {
   if (!today || !isCivilDateValid(today)) return false;
   if (item.kind !== 'task' || !item.task) return false;
@@ -972,6 +985,28 @@ export function partitionAgendaItems(items: AgendaItemRecord[]): {
     return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
   });
   return { living, completed };
+}
+
+/** Splits one date's pile into the `WAITING` rows its **Waiting section**
+ *  renders and everything else (ADR 0011 § Agenda): the section owns that
+ *  day's living waiting tasks, the main list owns the rest, so a waiting row
+ *  is never painted twice. Occurrences never wait. Both piles keep the input
+ *  order (the caller has already partitioned / sorted); does not mutate the
+ *  input. */
+export function splitWaitingRows(items: AgendaItemRecord[]): {
+  waiting: AgendaItemRecord[];
+  rest: AgendaItemRecord[];
+} {
+  const waiting: AgendaItemRecord[] = [];
+  const rest: AgendaItemRecord[] = [];
+  for (const entry of items) {
+    if (entry.kind === 'task' && entry.task?.status === 'WAITING') {
+      waiting.push(entry);
+    } else {
+      rest.push(entry);
+    }
+  }
+  return { waiting, rest };
 }
 
 /** The append rank on `date`'s pile — the server's `max + 1`, else 0. Used by
