@@ -886,13 +886,14 @@ pub async fn move_agenda_item(
 /// **Task** (kind `task`): a **status transition** plus the row move
 /// ([`plan_task_for_reschedule`]) — `OPEN` → `PLANNED` with a `planned` task
 /// log and the Planned-column append, `PLANNED` stays `PLANNED` with no log,
+/// `WAITING` stays `WAITING` with no log and no Board re-rank (ADR 0011),
 /// `IN_PROGRESS` → 400 `cannot reschedule an in_progress task` (pause first),
 /// `COMPLETED`/`DISCARDED` → 400 `cannot reschedule a terminal task`. One row
 /// per task (0018) means the source row itself moves: there is no target row
 /// to merge into. A backlog drop goes through [`open_task_for_backlog`]
 /// instead: `PLANNED` → `OPEN` with an `unplanned` log and the Open-column
-/// append, an already-`OPEN` task writes nothing, a running/terminal task is
-/// a 400. `sort_order` is **ignored** on this path (Open-column order is the
+/// append, an already-`OPEN` task writes nothing, a running/waiting/terminal
+/// task is a 400 (a `WAITING` task reaches the backlog only by a status move). `sort_order` is **ignored** on this path (Open-column order is the
 /// Board's `tasks.sort_order`).
 ///
 /// **Unschedule** (tasks only): `PLANNED` keeps its status and moves its row
@@ -901,7 +902,9 @@ pub async fn move_agenda_item(
 /// row already at/after the 10-year horizon → 200 no-op, byte-for-byte (no
 /// placement at all, so not even `updated_at` changes). `OPEN` → 400
 /// `cannot unschedule an open task`, `IN_PROGRESS` → 400 `cannot unschedule
-/// an in_progress task`, terminal → 400 `cannot unschedule a terminal task`.
+/// an in_progress task`, `WAITING` → 400 `cannot unschedule a waiting task;
+/// move it to Open or Planned instead`, terminal → 400 `cannot unschedule a
+/// terminal task`.
 /// Missing/other-user/soft-deleted task → 404 **before** any row write.
 ///
 /// **Placement**: on a different day, `sort_order` omitted → appended at

@@ -315,7 +315,7 @@ pub struct TaskActionResponse {
 /// absolute `sort_order` to assign in the target `status`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct MoveTaskInput {
-    /// One of `OPEN|PLANNED|IN_PROGRESS|COMPLETED|DISCARDED` (the service
+    /// One of `OPEN|PLANNED|IN_PROGRESS|WAITING|COMPLETED|DISCARDED` (the service
     /// validates; unknown values are 400).
     pub status: String,
     /// Absolute rank in the target status. Omitted / null = no drop
