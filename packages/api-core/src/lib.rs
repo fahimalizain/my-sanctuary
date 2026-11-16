@@ -137,9 +137,10 @@ pub use record::{
     UNCLASSIFIED_TITLES_CAP, YEARS_CAP,
 };
 pub use routines::{
-    create_routine, delete_routine, list_routines, occurrence_dates, update_routine,
-    validate_recurrence, DeleteRoutineResponse, RoutineResponse, RoutinesError, RoutinesResponse,
-    RoutineView, DEFAULT_ESTIMATED_MINUTES, MIN_ESTIMATED_MINUTES,
+    create_routine, delete_routine, list_routines, occurrence_dates, reorder_routines,
+    update_routine, validate_recurrence, DeleteRoutineResponse, ReorderRoutinesInput,
+    RoutineResponse, RoutinesError, RoutinesResponse, RoutineView, DEFAULT_ESTIMATED_MINUTES,
+    MIN_ESTIMATED_MINUTES,
 };
 pub use rules::{
     archive_rules, create_global_pause, create_rule, delete_pause, digest_load_floor,
@@ -197,7 +198,7 @@ pub use repo::{
     ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
     ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL,
     ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
-    ROUTINE_UPDATE_SQL,
+    ROUTINE_SET_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL,
     TASK_CATEGORY_DELETE_SQL, TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL,
     TASK_CATEGORY_INSERT_SQL, TASK_CATEGORY_LIST_BY_USER_ID_SQL,

@@ -41,8 +41,10 @@
 //!   tick fills today if the new rule covers it. Today and every earlier date
 //!   are never deleted or edited; existing rows are never rewritten. A
 //!   title/estimate/sort-only update does no occurrence/agenda work at all.
+//! - Reorder rewrites each living routine's standing `sort_order` only —
+//!   occurrences and agenda rows are never touched (ADR 0004).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{NaiveDate, NaiveDateTime, TimeZone};
 use thiserror::Error;
@@ -110,6 +112,15 @@ pub struct RoutineResponse {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeleteRoutineResponse {
     pub success: bool,
+}
+
+/// `POST /api/routines/reorder`. The body must list every living routine of
+/// the user exactly once. `sort_order` becomes the vec index. Does not read
+/// or write occurrences or agenda rows — already-materialized Home days keep
+/// their order (ADR 0004).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReorderRoutinesInput {
+    pub ids: Vec<String>,
 }
 
 /// HTTP shape of a routine: every `routines` column (minus `deleted_at`),
@@ -587,6 +598,49 @@ pub async fn delete_routine(
     Ok(DeleteRoutineResponse { success: true })
 }
 
+/// `POST /api/routines/reorder`. Rewrites the standing order only: the i-th
+/// submitted id gets `sort_order = i`.
+///
+/// The body must list **every living routine of the user exactly once** — a
+/// duplicate, a foreign/soft-deleted id, or a missing living routine is a 400
+/// and writes nothing. `list_by_user_id` already filters `deleted_at IS NULL`,
+/// so a soft-deleted routine is neither required nor accepted.
+///
+/// Occurrences and agenda rows are never read or written: `GET /api/routines`
+/// returns the new order, and only the **next** occurrence fill seeds new
+/// agenda rows in it. Already-materialized Home days keep their order —
+/// reordering never reshuffles a list the user already reordered (ADR 0004).
+pub async fn reorder_routines(
+    repo: &dyn RoutineRepo,
+    user_id: &str,
+    input: &ReorderRoutinesInput,
+    now_rfc3339: &str,
+) -> Result<(), RoutinesError> {
+    let routine_rows = repo.list_by_user_id(user_id).await?;
+    let living: BTreeSet<&str> = routine_rows.iter().map(|row| row.id.as_str()).collect();
+    let listed: BTreeSet<&str> = input.ids.iter().map(String::as_str).collect();
+    if listed.len() != input.ids.len() {
+        return Err(RoutinesError::Invalid("ids must not repeat".to_string()));
+    }
+    // A foreign id and a soft-deleted id read the same: ownership is never
+    // leaked. Neither is required, so this runs before the missing check.
+    if let Some(unknown) = listed.iter().find(|id| !living.contains(*id)) {
+        return Err(RoutinesError::Invalid(format!("unknown routine {unknown:?}")));
+    }
+    // An empty body is valid only for a user with zero living routines: with
+    // any living routine it lands here as a missing id.
+    if let Some(missing) = living.iter().find(|id| !listed.contains(*id)) {
+        return Err(RoutinesError::Invalid(format!(
+            "ids must list every living routine of this user exactly once (missing {missing:?})"
+        )));
+    }
+    for (index, id) in input.ids.iter().enumerate() {
+        repo.set_sort_order(user_id, id, index as i64, now_rfc3339)
+            .await?;
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────
 // Horizon reconcile (rule changes + deletes)
 // ──────────────────────────────────────────
@@ -1023,6 +1077,30 @@ mod tests {
                 .filter(|row| row.user_id == user_id && row.deleted_at.is_none())
                 .map(|row| row.sort_order)
                 .max())
+        }
+
+        async fn set_sort_order(
+            &self,
+            user_id: &str,
+            id: &str,
+            sort_order: i64,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            // Mirrors ROUTINE_SET_SORT_ORDER_SQL: living rows of this user
+            // only; a miss is a 0-row UPDATE, never an error.
+            if let Some(row) = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|row| {
+                    row.user_id == user_id && row.id == id && row.deleted_at.is_none()
+                })
+            {
+                row.sort_order = sort_order;
+                row.updated_at = now_rfc3339.to_string();
+            }
+            Ok(())
         }
 
         async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {
@@ -2714,6 +2792,283 @@ mod tests {
         ));
         // The routine survived both attempts.
         assert!(repos.routines.stored.lock().unwrap()[0].deleted_at.is_none());
+    }
+
+    // ──────────────────────────────────────────
+    // Reorder
+    // ──────────────────────────────────────────
+
+    /// The reorder timestamp, distinct from the fake's seeded `updated_at` so
+    /// the stamp is observable.
+    const REORDERED_AT: &str = "2026-08-23T04:05:06Z";
+
+    /// Two living routines of `u-1` at non-sequential ranks.
+    fn seed_living(repo: &FakeRoutineRepo) {
+        repo.stored.lock().unwrap().extend([
+            FakeRoutineRepo::row(
+                "rt-1",
+                "u-1",
+                "First",
+                10,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            ),
+            FakeRoutineRepo::row(
+                "rt-2",
+                "u-1",
+                "Second",
+                20,
+                "DTSTART:20260102T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+            ),
+        ]);
+    }
+
+    /// `(id, sort_order, updated_at)` of every stored row — the failure-path
+    /// witness: a 400 writes no rank and stamps nothing.
+    fn ranks(repo: &FakeRoutineRepo) -> Vec<(String, i64, String)> {
+        repo.stored
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| (row.id.clone(), row.sort_order, row.updated_at.clone()))
+            .collect()
+    }
+
+    /// The failure expectation: a 400 `Invalid` carrying `fragment`.
+    fn reorder_error(result: Result<(), RoutinesError>, fragment: &str) {
+        match result {
+            Err(RoutinesError::Invalid(message)) => {
+                assert!(message.contains(fragment), "{message:?} lacks {fragment:?}");
+            }
+            other => panic!("expected RoutinesError::Invalid, got {other:?}"),
+        }
+    }
+
+    fn reorder_ids(repo: &FakeRoutineRepo, ids: &[&str]) -> Result<(), RoutinesError> {
+        pollster::block_on(reorder_routines(
+            repo,
+            "u-1",
+            &ReorderRoutinesInput {
+                ids: ids.iter().map(|id| id.to_string()).collect(),
+            },
+            REORDERED_AT,
+        ))
+    }
+
+    #[test]
+    fn reorder_routines_rewrites_ranks_in_submitted_order() {
+        let repo = FakeRoutineRepo::new();
+        repo.stored.lock().unwrap().extend([
+            FakeRoutineRepo::row(
+                "rt-1",
+                "u-1",
+                "First",
+                10,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            ),
+            FakeRoutineRepo::row(
+                "rt-2",
+                "u-1",
+                "Second",
+                20,
+                "DTSTART:20260102T053000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
+            ),
+            FakeRoutineRepo::row(
+                "rt-3",
+                "u-1",
+                "Third",
+                30,
+                "DTSTART:20260103T053000\nRRULE:FREQ=WEEKLY;BYDAY=TU",
+            ),
+            FakeRoutineRepo::row(
+                "rt-x",
+                "u-2",
+                "Other user",
+                7,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            ),
+        ]);
+        let before = repo.stored.lock().unwrap().clone();
+
+        reorder_ids(&repo, &["rt-3", "rt-2", "rt-1"]).unwrap();
+
+        let after = repo.stored.lock().unwrap().clone();
+        assert_eq!(after.len(), before.len(), "reorder never invents rows");
+        // Rank becomes the submitted index, 0-based.
+        let rank_of = |id: &str| {
+            after
+                .iter()
+                .find(|row| row.id == id)
+                .expect("seeded row")
+                .sort_order
+        };
+        assert_eq!(rank_of("rt-3"), 0);
+        assert_eq!(rank_of("rt-2"), 1);
+        assert_eq!(rank_of("rt-1"), 2);
+        // `updated_at` is the passed instant; nothing else moves.
+        for id in ["rt-1", "rt-2", "rt-3"] {
+            let old = before.iter().find(|row| row.id == id).expect("seeded row");
+            let new = after.iter().find(|row| row.id == id).expect("seeded row");
+            assert_eq!(new.updated_at, REORDERED_AT);
+            assert_eq!(new.title, old.title);
+            assert_eq!(new.rrule, old.rrule);
+            assert_eq!(new.estimated_minutes, old.estimated_minutes);
+            assert_eq!(new.created_at, old.created_at);
+            assert_eq!(new.deleted_at, old.deleted_at);
+        }
+        // Another user's routine is neither required nor rewritten.
+        let other = after.iter().find(|row| row.id == "rt-x").unwrap();
+        assert_eq!(other.sort_order, 7);
+        assert_eq!(other.updated_at, "2026-08-18T00:00:00Z");
+        // The standing read (and so the fill's seed order) follows the new
+        // ranks.
+        let listed = pollster::block_on(repo.list_by_user_id("u-1")).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["rt-3", "rt-2", "rt-1"]);
+    }
+
+    #[test]
+    fn reorder_routines_rejects_duplicate_ids() {
+        let repo = FakeRoutineRepo::new();
+        seed_living(&repo);
+        let before = ranks(&repo);
+        reorder_error(
+            reorder_ids(&repo, &["rt-2", "rt-1", "rt-2"]),
+            "ids must not repeat",
+        );
+        assert_eq!(ranks(&repo), before, "a rejected reorder writes no rank");
+    }
+
+    #[test]
+    fn reorder_routines_rejects_missing_living_routine() {
+        let repo = FakeRoutineRepo::new();
+        seed_living(&repo);
+        let before = ranks(&repo);
+        reorder_error(
+            reorder_ids(&repo, &["rt-2"]),
+            "ids must list every living routine of this user exactly once",
+        );
+        assert_eq!(ranks(&repo), before, "a rejected reorder writes no rank");
+    }
+
+    #[test]
+    fn reorder_routines_rejects_foreign_id() {
+        let repo = FakeRoutineRepo::new();
+        seed_living(&repo);
+        repo.stored.lock().unwrap().push(FakeRoutineRepo::row(
+            "rt-x",
+            "u-2",
+            "Other user",
+            3,
+            "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+        ));
+        let before = ranks(&repo);
+        // `unknown routine` — ownership is never leaked either way.
+        reorder_error(
+            reorder_ids(&repo, &["rt-2", "rt-1", "rt-x"]),
+            "unknown routine",
+        );
+        assert_eq!(ranks(&repo), before, "both users' ranks stay put");
+    }
+
+    #[test]
+    fn reorder_routines_rejects_soft_deleted_id() {
+        let repo = FakeRoutineRepo::new();
+        seed_living(&repo);
+        repo.stored.lock().unwrap().push(Routine {
+            deleted_at: Some("2026-08-20T00:00:00Z".to_string()),
+            ..FakeRoutineRepo::row(
+                "rt-dead",
+                "u-1",
+                "Deleted",
+                5,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            )
+        });
+        let before = ranks(&repo);
+        // Not living, so it is not in the living set: `unknown routine`.
+        reorder_error(
+            reorder_ids(&repo, &["rt-1", "rt-2", "rt-dead"]),
+            "unknown routine",
+        );
+        assert_eq!(ranks(&repo), before, "a rejected reorder writes no rank");
+        assert_eq!(
+            repo.stored
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == "rt-dead")
+                .unwrap()
+                .sort_order,
+            5,
+            "the deleted row keeps its old rank"
+        );
+    }
+
+    #[test]
+    fn reorder_routines_skips_soft_deleted_siblings() {
+        let repo = FakeRoutineRepo::new();
+        seed_living(&repo);
+        repo.stored.lock().unwrap().push(Routine {
+            deleted_at: Some("2026-08-20T00:00:00Z".to_string()),
+            ..FakeRoutineRepo::row(
+                "rt-dead",
+                "u-1",
+                "Deleted",
+                5,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            )
+        });
+
+        // The deleted row is neither required nor accepted: the living set
+        // alone is reorderable.
+        reorder_ids(&repo, &["rt-2", "rt-1"]).unwrap();
+
+        let rows = repo.stored.lock().unwrap().clone();
+        assert_eq!(
+            rows.iter().find(|row| row.id == "rt-1").unwrap().sort_order,
+            1
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.id == "rt-2").unwrap().sort_order,
+            0
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.id == "rt-dead").unwrap().sort_order,
+            5,
+            "the deleted row keeps its old rank"
+        );
+    }
+
+    #[test]
+    fn reorder_routines_accepts_empty_ids_without_living_routines() {
+        let repo = FakeRoutineRepo::new();
+        // Only a soft-deleted row: the living set is empty, so `[]` is the
+        // complete list.
+        repo.stored.lock().unwrap().push(Routine {
+            deleted_at: Some("2026-08-20T00:00:00Z".to_string()),
+            ..FakeRoutineRepo::row(
+                "rt-dead",
+                "u-1",
+                "Deleted",
+                5,
+                "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+            )
+        });
+        let before = ranks(&repo);
+        reorder_ids(&repo, &[]).unwrap();
+        assert_eq!(ranks(&repo), before, "a deleted row is never rewritten");
+    }
+
+    #[test]
+    fn reorder_routines_rejects_empty_ids_with_living_routine() {
+        let repo = FakeRoutineRepo::new();
+        seed_living(&repo);
+        let before = ranks(&repo);
+        reorder_error(
+            reorder_ids(&repo, &[]),
+            "ids must list every living routine of this user exactly once",
+        );
+        assert_eq!(ranks(&repo), before, "a rejected reorder writes no rank");
     }
 
     // ──────────────────────────────────────────
