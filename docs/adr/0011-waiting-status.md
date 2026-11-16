@@ -43,7 +43,7 @@ This ADR keeps two things apart:
   `PLANNED` and `IN_PROGRESS`.
 - **No transition restrictions.** Any status can move to `WAITING`, and
   `WAITING` can move to any status, including `COMPLETED`/`DISCARDED →
-  WAITING`. A terminal → `WAITING` move writes a single `handed_off` log, not
+WAITING`. A terminal → `WAITING` move writes a single `handed_off` log, not
   `reopened` followed by `handed_off`.
 - `WAITING` holds **no calendar time**. `IN_PROGRESS → WAITING` closes the
   running Google event through the same Google-gated path as pause.
@@ -70,13 +70,13 @@ predate it and are deliberately left as they are: pause (`IN_PROGRESS →
 PLANNED`) leaves the row unchanged, and reopen → `PLANNED` lands on today
 (ADR 0007).
 
-| Event                                       | Status →             | Row date               | Log                       |
-| ------------------------------------------- | -------------------- | ---------------------- | ------------------------- |
-| hand off (any status → `WAITING`)           | `WAITING`            | today, appended        | `handed_off`              |
-| take back (`WAITING` → `IN_PROGRESS`)       | `IN_PROGRESS`        | today, appended        | `started` (opens event)   |
-| complete / discard from `WAITING`           | terminal             | today, appended        | `completed` / `discarded` |
-| shelve (`WAITING` → `OPEN` / `PLANNED`)     | `OPEN` / `PLANNED`   | backlog date, appended | `unplanned` / `planned`   |
-| `WAITING` → `WAITING` (same-status drag)    | unchanged            | unchanged (reorder)    | none                      |
+| Event                                    | Status →           | Row date               | Log                       |
+| ---------------------------------------- | ------------------ | ---------------------- | ------------------------- |
+| hand off (any status → `WAITING`)        | `WAITING`          | today, appended        | `handed_off`              |
+| take back (`WAITING` → `IN_PROGRESS`)    | `IN_PROGRESS`      | today, appended        | `started` (opens event)   |
+| complete / discard from `WAITING`        | terminal           | today, appended        | `completed` / `discarded` |
+| shelve (`WAITING` → `OPEN` / `PLANNED`)  | `OPEN` / `PLANNED` | backlog date, appended | `unplanned` / `planned`   |
+| `WAITING` → `WAITING` (same-status drag) | unchanged          | unchanged (reorder)    | none                      |
 
 Shelving reuses the log named for the destination: `WAITING → PLANNED` writes
 `planned`, `WAITING → OPEN` writes `unplanned`. No new log type. `stopped` and

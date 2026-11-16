@@ -1851,7 +1851,7 @@ test('partitionAgendaItems: empty input yields two empty piles', () => {
 
 // ── splitWaitingRows (ADR 0011 § Agenda) ────────────────────────────────
 
-test('splitWaitingRows: a day\'s WAITING rows leave the main pile', () => {
+test("splitWaitingRows: a day's WAITING rows leave the main pile", () => {
   const waitingA = { ...taskItem('a', 'WAITING'), sort_order: 1 };
   const waitingB = { ...taskItem('b', 'WAITING'), sort_order: 3 };
   const open = { ...taskItem('c', 'OPEN'), sort_order: 0 };
