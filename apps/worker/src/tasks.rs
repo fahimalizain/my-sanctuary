@@ -4,8 +4,10 @@
 //!
 //! CRUD is gated on the session cookie or an API key bearer — like
 //! `/api/lists/*` and `/api/categories/*`. The timer actions additionally
-//! refresh the Google access token (like `/api/calendar/*`): a user whose
-//! token cannot be refreshed gets `401 {"error":"unauthorized"}`.
+//! resolve a calendar backend through [`crate::calendar_access`]: a Google
+//! user whose token cannot be refreshed gets `401 {"error":"unauthorized"}`,
+//! and a standalone user writes to the local stand-in (same 401 when the
+//! standalone gate is closed).
 //!
 //! The move endpoint uses a **per-action gate** (ADR 0002 § Move API): moves
 //! that would call Google — target IN_PROGRESS (start), leaving IN_PROGRESS
@@ -71,44 +73,29 @@ fn map_error(ctx: &RouteContext<Option<api_core::Config>>, err: TasksError) -> R
     }
 }
 
-/// Token-refresh gate for the Google-touching task verbs. The caller has
+/// Calendar-access gate for the Google-touching task verbs. The caller has
 /// already authenticated and keeps that user; the inner `Err` carries the
-/// already-built `401` response (missing OAuth config or an unrefreshable
-/// token).
-async fn timer_access(
+/// already-built `401` response.
+///
+/// Google users get a refreshed token; standalone users get
+/// [`api_core::StandaloneCalendarHttp`] for their local calendar (the
+/// `ALLOW_STANDALONE_AUTH`/request-host gate still applies). Either way an
+/// unavailable backend — an unrefreshable grant, a closed standalone gate, or
+/// no config — is the same 401 the old token gate produced.
+async fn task_access(
+    req: &Request,
     ctx: &RouteContext<Option<api_core::Config>>,
     user: &api_core::SessionUser,
-) -> Result<Result<api_core::GoogleAccess, Response>> {
-    let Some(config) = ctx.data.as_ref() else {
-        return Ok(Err(unauthorized(ctx)?));
-    };
-    let Some(oauth) = config.oauth.as_ref() else {
-        return Ok(Err(unauthorized(ctx)?));
-    };
+) -> Result<Result<crate::calendar_access::CalendarSession, Response>> {
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let repos = timer_d1(ctx)?;
-    let Some(access) = refresh_access(&repos.tokens, oauth, &user.id, now_unix).await else {
-        return Ok(Err(unauthorized(ctx)?));
-    };
-    Ok(Ok(access))
-}
-
-/// Refreshes the user's Google access token. `Ok(None)` when the stored token
-/// cannot be refreshed (missing/expired refresh token, Google 400) — callers
-/// respond `401 {"error":"unauthorized"}` exactly like `/api/calendar/*`.
-async fn refresh_access(
-    tokens: &crate::db::D1TokenRepo,
-    oauth: &api_core::OAuthConfig,
-    user_id: &str,
-    now_unix: i64,
-) -> Option<api_core::GoogleAccess> {
-    match api_core::refresh_if_needed(&crate::http::WorkerHttp, tokens, oauth, user_id, now_unix)
-        .await
-    {
-        Ok(access) => Some(access),
-        Err(err) => {
+    match crate::calendar_access::calendar_access(ctx, req, user, now_unix).await {
+        Ok(session) => Ok(Ok(session)),
+        Err(crate::calendar_access::CalendarAccessError::Unauthorized) => {
+            Ok(Err(unauthorized(ctx)?))
+        }
+        Err(crate::calendar_access::CalendarAccessError::GoogleRefresh(err)) => {
             console_log!("tasks: token refresh failed: {err}");
-            None
+            Ok(Err(unauthorized(ctx)?))
         }
     }
 }
@@ -164,7 +151,10 @@ fn users_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D
 /// The focused flag is painted from the user's `focused_task_id` pointer — a
 /// read; a missing/soft-deleted user row (or a failed load) just lists with
 /// `focused: false` everywhere rather than failing the board.
-pub async fn list_tasks(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
+pub async fn list_tasks(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
     let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
@@ -328,18 +318,18 @@ pub async fn delete_task(
     let is_focused = focused_task_id.as_deref() == Some(id);
     let repos = timer_d1(&ctx)?;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
-    let (http, access) = if is_focused {
-        let access = match timer_access(&ctx, &user).await? {
-            Ok(access) => access,
+    let session = if is_focused {
+        match task_access(&req, &ctx, &user).await? {
+            Ok(session) => Some(session),
             Err(response) => return Ok(response),
-        };
-        (
-            Some(&crate::http::WorkerHttp as &dyn api_core::HttpClient),
-            Some(access),
-        )
+        }
     } else {
-        (None, None)
+        None
     };
+    let http = session
+        .as_ref()
+        .map(|session| session.http.as_ref() as &dyn api_core::HttpClient);
+    let access = session.as_ref().map(|session| &session.access);
 
     match api_core::delete_task(
         http,
@@ -349,7 +339,7 @@ pub async fn delete_task(
         &repos.categories,
         &repos.logs,
         &users,
-        access.as_ref(),
+        access,
         &d1(&ctx)?,
         &user.id,
         id,
@@ -382,11 +372,13 @@ struct TimerRepos {
     events: crate::db::D1CalendarEventRepo,
     operations: crate::db::D1CalendarEventOperationRepo,
     logs: crate::db::D1TaskLogRepo,
-    tokens: crate::db::D1TokenRepo,
 }
 
 fn timer_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<TimerRepos> {
-    let db = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let db = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
     Ok(TimerRepos {
         tasks: crate::db::D1TaskRepo::new(db()?),
         categories: crate::db::D1TaskCategoryRepo::new(db()?),
@@ -395,7 +387,6 @@ fn timer_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<TimerRepos> 
         events: crate::db::D1CalendarEventRepo::new(db()?),
         operations: crate::db::D1CalendarEventOperationRepo::new(db()?),
         logs: crate::db::D1TaskLogRepo::new(db()?),
-        tokens: crate::db::D1TokenRepo::new(db()?),
     })
 }
 
@@ -417,8 +408,8 @@ pub async fn start_task(
     let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
-    let access = match timer_access(&ctx, &user).await? {
-        Ok(access) => access,
+    let session = match task_access(&req, &ctx, &user).await? {
+        Ok(session) => session,
         Err(response) => return Ok(response),
     };
     let Some(id) = ctx.param("id") else {
@@ -428,7 +419,7 @@ pub async fn start_task(
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::start_task(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &repos.calendars,
         &repos.events,
         &repos.operations,
@@ -436,7 +427,7 @@ pub async fn start_task(
         &repos.categories,
         &repos.tasks,
         &repos.logs,
-        &access,
+        &session.access,
         &user.id,
         id,
         now_unix,
@@ -460,8 +451,8 @@ macro_rules! timer_action {
             let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
                 return unauthorized(&ctx);
             };
-            let access = match timer_access(&ctx, &user).await? {
-                Ok(access) => access,
+            let session = match task_access(&req, &ctx, &user).await? {
+                Ok(session) => session,
                 Err(response) => return Ok(response),
             };
             let Some(id) = ctx.param("id") else {
@@ -472,7 +463,7 @@ macro_rules! timer_action {
             let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
             let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
             let result = $path(
-                &crate::http::WorkerHttp,
+                session.http.as_ref(),
                 &repos.calendars,
                 &repos.events,
                 &repos.operations,
@@ -480,7 +471,7 @@ macro_rules! timer_action {
                 &repos.tasks,
                 &repos.logs,
                 &users,
-                &access,
+                &session.access,
                 &user.id,
                 id,
                 now_unix,
@@ -585,18 +576,18 @@ pub async fn move_task(
     let needs_google = input.status == api_core::TASK_STATUS_IN_PROGRESS
         || (task.status == api_core::TASK_STATUS_IN_PROGRESS
             && input.status != api_core::TASK_STATUS_IN_PROGRESS);
-    let (http, access) = if needs_google {
-        let access = match timer_access(&ctx, &user).await? {
-            Ok(access) => access,
+    let session = if needs_google {
+        match task_access(&req, &ctx, &user).await? {
+            Ok(session) => Some(session),
             Err(response) => return Ok(response),
-        };
-        (
-            Some(&crate::http::WorkerHttp as &dyn api_core::HttpClient),
-            Some(access),
-        )
+        }
     } else {
-        (None, None)
+        None
     };
+    let http = session
+        .as_ref()
+        .map(|session| session.http.as_ref() as &dyn api_core::HttpClient);
+    let access = session.as_ref().map(|session| &session.access);
 
     let result = api_core::move_task(
         http,
@@ -608,7 +599,7 @@ pub async fn move_task(
         &repos.tasks,
         &repos.logs,
         &users_d1(&ctx)?,
-        access.as_ref(),
+        access,
         &user.id,
         id,
         now_unix,
@@ -662,8 +653,8 @@ pub async fn focus_task(
     let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
-    let access = match timer_access(&ctx, &user).await? {
-        Ok(access) => access,
+    let session = match task_access(&req, &ctx, &user).await? {
+        Ok(session) => session,
         Err(response) => return Ok(response),
     };
     let Some(id) = ctx.param("id") else {
@@ -673,7 +664,7 @@ pub async fn focus_task(
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::focus_task(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &repos.calendars,
         &repos.events,
         &repos.operations,
@@ -682,7 +673,7 @@ pub async fn focus_task(
         &repos.tasks,
         &repos.logs,
         &users_d1(&ctx)?,
-        &access,
+        &session.access,
         &user.id,
         id,
         now_unix,
@@ -706,15 +697,15 @@ pub async fn delete_focus(
     let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
-    let access = match timer_access(&ctx, &user).await? {
-        Ok(access) => access,
+    let session = match task_access(&req, &ctx, &user).await? {
+        Ok(session) => session,
         Err(response) => return Ok(response),
     };
     let repos = timer_d1(&ctx)?;
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::delete_focus(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &repos.calendars,
         &repos.events,
         &repos.operations,
@@ -722,7 +713,7 @@ pub async fn delete_focus(
         &repos.tasks,
         &repos.logs,
         &users_d1(&ctx)?,
-        &access,
+        &session.access,
         &user.id,
         now_unix,
         &notify,
@@ -730,4 +721,3 @@ pub async fn delete_focus(
     .await;
     respond_focus(&ctx, result)
 }
-

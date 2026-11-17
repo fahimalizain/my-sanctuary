@@ -1,7 +1,8 @@
-mod auth;
 mod agenda;
 mod api_keys;
+mod auth;
 mod calendar;
+mod calendar_access;
 mod categories;
 mod cron;
 mod db;
@@ -45,13 +46,28 @@ fn load_config(env: &Env) -> Option<api_core::Config> {
         .ok()
         .map(|var| var.to_string());
     // A public URL, not a secret: Google needs it in every events.watch body.
-    let watch_callback_url = env.var("WATCH_CALLBACK_URL").ok().map(|var| var.to_string());
+    let watch_callback_url = env
+        .var("WATCH_CALLBACK_URL")
+        .ok()
+        .map(|var| var.to_string());
+    // Standalone mode (ADR 0012): the flag is a plain var, the zone a display
+    // default. Both are re-validated inside `Config`.
+    let allow_standalone_auth = env
+        .var("ALLOW_STANDALONE_AUTH")
+        .ok()
+        .map(|var| var.to_string());
+    let standalone_time_zone = env
+        .var("STANDALONE_TIME_ZONE")
+        .ok()
+        .map(|var| var.to_string());
     api_core::Config::from_env(|key| match key {
         "SESSION_SECRET" => Some(session_secret.clone()),
         "FRONTEND_URL" => frontend_url.clone().filter(|value| !value.is_empty()),
         "SECURE_COOKIE" => secure_cookie.clone(),
         "GOOGLE_CREDENTIALS_JSON" => google_json.clone(),
         "WATCH_CALLBACK_URL" => watch_callback_url.clone().filter(|value| !value.is_empty()),
+        "ALLOW_STANDALONE_AUTH" => allow_standalone_auth.clone(),
+        "STANDALONE_TIME_ZONE" => standalone_time_zone.clone(),
         _ => None,
     })
     .ok()
@@ -108,12 +124,18 @@ pub(crate) fn router(
         .get("/version", version)
         .get_async("/auth/me", auth::me)
         .post("/auth/logout", auth::logout)
+        .get("/auth/providers", auth::providers)
         .get("/auth/google", auth::google)
         .get_async("/auth/google/callback", auth::google_callback)
+        .post_async("/auth/standalone/register", auth::standalone_register)
+        .post_async("/auth/standalone/login", auth::standalone_login)
         .options("/auth/me", auth::options)
         .options("/auth/logout", auth::options)
+        .options("/auth/providers", auth::options)
         .options("/auth/google", auth::options)
         .options("/auth/google/callback", auth::options)
+        .options("/auth/standalone/register", auth::options)
+        .options("/auth/standalone/login", auth::options)
         .get_async("/api/calendar/events", calendar::list_events)
         .post_async("/api/calendar/events", calendar::create_event)
         .patch_async("/api/calendar/events/:id", calendar::update_event)
@@ -209,8 +231,14 @@ pub(crate) fn router(
         .options("/api/pauses/:id", auth::options)
         .get_async("/api/agenda", agenda::get_agenda)
         .post_async("/api/agenda/items/:id/move", agenda::move_agenda_item)
-        .post_async("/api/agenda/items/:id/reschedule", agenda::reschedule_agenda_item)
-        .post_async("/api/agenda/days/:date/move-to-today", agenda::move_day_to_today)
+        .post_async(
+            "/api/agenda/items/:id/reschedule",
+            agenda::reschedule_agenda_item,
+        )
+        .post_async(
+            "/api/agenda/days/:date/move-to-today",
+            agenda::move_day_to_today,
+        )
         .options("/api/agenda", auth::options)
         .options("/api/agenda/items/:id/move", auth::options)
         .options("/api/agenda/items/:id/reschedule", auth::options)

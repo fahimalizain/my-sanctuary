@@ -13,7 +13,7 @@
 //! `CalendarSync` variant comes first, so `{"calendar_id":"…"}` still
 //! deserializes exactly as it always did.
 
-use api_core::repo::CalendarRepo;
+use api_core::repo::{CalendarRepo, UserRepo};
 use worker::*;
 
 /// One digest tick for one user, logging the report. Never throws: a digest
@@ -182,6 +182,42 @@ pub async fn queue(
                 continue;
             }
         };
+
+        // Defense in depth (ADR 0012): a standalone user's local calendar is
+        // `sync_enabled = 1` so reads work, but it must never enter a Google
+        // walk. Skip (ack) rather than refresh a token that cannot exist.
+        // An unknown/lookup-failed owner also acks: nothing to sync.
+        let users = match env.d1("DB") {
+            Ok(db) => crate::db::D1UserRepo::new(db),
+            Err(err) => {
+                console_log!("queue: DB binding missing for owner lookup: {err} — acking");
+                message.ack();
+                continue;
+            }
+        };
+        match users.get_by_id(&cal.user_id).await {
+            Ok(Some(user))
+                if user.integration_type == api_core::models::IntegrationType::Standalone =>
+            {
+                console_log!(
+                    "queue: calendar {} belongs to a standalone user — acking",
+                    cal.id
+                );
+                message.ack();
+                continue;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                console_log!("queue: calendar {calendar_id} owner missing — acking");
+                message.ack();
+                continue;
+            }
+            Err(err) => {
+                console_log!("queue: calendar {calendar_id} owner lookup failed: {err} — acking");
+                message.ack();
+                continue;
+            }
+        }
 
         let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
         let access = match api_core::refresh_if_needed(

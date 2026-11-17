@@ -26,7 +26,15 @@ const MAX_UPSTREAM_BODY_BYTES: usize = 1024 * 1024;
 /// Dummy origin for in-process sub-requests. A web_sys `Request` needs an
 /// absolute URL; the router only matches on `Request::path()` and the handlers
 /// read the query string from `url()`.
-const SUBREQUEST_ORIGIN: &str = "https://sanctuary.internal";
+///
+/// It is a **loopback** host on purpose (ADR 0012): the standalone calendar
+/// gate ([`api_core::Config::standalone_enabled_for`]) also checks the request
+/// host, and a sub-request is built here rather than by the caller. The outer
+/// `POST /api/mcp` already authenticated the bearer, and the deployment-level
+/// half of the gate (`ALLOW_STANDALONE_AUTH`, `SECURE_COOKIE`, non-public
+/// `FRONTEND_URL`) still applies, so this only lets a standalone key reach the
+/// tools it could also reach over REST on a local deployment.
+const SUBREQUEST_ORIGIN: &str = "http://localhost";
 
 /// `POST /api/mcp`: gates, then one stateless JSON-RPC exchange.
 pub(crate) async fn post(

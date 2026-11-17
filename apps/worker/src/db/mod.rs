@@ -148,6 +148,9 @@ pub use api_keys::*;
 pub mod calendar;
 pub use calendar::*;
 
+pub mod credentials;
+pub use credentials::*;
+
 pub mod digest;
 pub use digest::*;
 
