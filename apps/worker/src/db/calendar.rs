@@ -2,7 +2,7 @@
 
 use api_core::models::{
     CalendarEvent, CalendarEventOperation, GoogleCalendar, NewCalendar, NewCalendarEvent,
-    NewCalendarEventOperation, NewWatchChannel, WatchChannel,
+    NewCalendarEventOperation, NewWatchChannel, StandaloneCalendarSeed, WatchChannel,
 };
 use api_core::digest::repo::{EventSpan, EventSpanKeyRow, EventSpanRow};
 use api_core::repo::{
@@ -13,6 +13,7 @@ use api_core::repo::{
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
     CALENDAR_DELETE_SQL, CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL,
     CALENDAR_GET_BY_ID_SQL, CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL,
+    CALENDAR_INSERT_STANDALONE_SQL,
     CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL,
     CALENDAR_LIST_SYNC_ENABLED_SQL, CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL,
     CALENDAR_RECORD_SYNC_ATTEMPT_SQL, CALENDAR_RECORD_SYNC_CONTENTION_SQL,
@@ -210,6 +211,31 @@ impl CalendarRepo for D1CalendarRepo {
 
     async fn upsert(&self, calendar: NewCalendar) -> Result<(), RepoError> {
         self.upsert_batch(vec![calendar]).await
+    }
+
+    async fn insert_standalone(&self, seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
+        // Bind params only — every literal (`sync_enabled = 1`,
+        // `sync_status = 'disabled'`, the empty-string health columns) lives in
+        // the statement. `DO NOTHING` makes register/login/self-heal
+        // idempotent and never overwrites a stored time zone or label cache.
+        let stmt = self
+            .db
+            .prepare(CALENDAR_INSERT_STANDALONE_SQL)
+            .bind_refs(&[
+                D1Type::Text(&seed.id),
+                D1Type::Text(&seed.user_id),
+                D1Type::Text(&seed.google_calendar_id),
+                D1Type::Text(&seed.summary),
+                D1Type::Text(&seed.time_zone),
+                D1Type::Text(&seed.now_rfc3339),
+                D1Type::Text(&seed.now_rfc3339),
+                D1Type::Text(&seed.event_labels),
+                D1Type::Text(&seed.now_rfc3339),
+                D1Type::Text(&seed.now_rfc3339),
+                D1Type::Text(&seed.now_rfc3339),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 
     async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError> {

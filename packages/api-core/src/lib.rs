@@ -20,6 +20,7 @@ pub mod lists;
 pub mod mcp;
 pub mod models;
 pub mod oauth;
+pub mod password;
 pub mod pattern_gen;
 pub mod realtime;
 pub mod record;
@@ -124,6 +125,11 @@ pub use oauth::{
 pub use pattern_gen::{
     emit_affixes, extract_hole, fill_regex, split_hole, ExtractError, FillError, HoleSplit,
 };
+pub use password::{
+    hash_password, hash_password_with_iterations, verify_password, PasswordError,
+    MAX_PASSWORD_ITERATIONS, MIN_PASSWORD_ITERATIONS, PASSWORD_ALGORITHM, PASSWORD_ITERATIONS,
+    PASSWORD_KEY_LEN, PASSWORD_SALT_LEN,
+};
 pub use realtime::{RealtimeKind, RealtimeMessage, RealtimeNotify};
 pub use record::{
     assemble_record, record_report, EstimatedNight, HeatmapRow, RankingRow, RecordCategoryRow,
@@ -160,7 +166,7 @@ pub use repo::{
     build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
     build_agenda_item_list_by_refs_sql, build_routine_list_by_ids_sql,
     AgendaItemRepo,
-    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, OccurrenceRepo, RepoError,
+    CalendarEventOperationRepo, CalendarEventRepo, CalendarRepo, LocalCredentialRepo, OccurrenceRepo, RepoError,
     RoutineRepo, TaskCategoryRepo,
     TaskListRepo, TaskLogRepo, TaskRepo, TokenRepo, UserRepo, WatchChannelRepo,
     AGENDA_ITEM_DELETE_BY_REF_SQL, AGENDA_ITEM_DELETE_BY_REFS_CHUNK_SIZE,
@@ -175,6 +181,7 @@ pub use repo::{
     AGENDA_ITEM_SHIFT_SORT_ORDER_SQL,
     CALENDAR_BUMP_DIRTY_REQUESTED_SQL, CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL,
     CALENDAR_GET_BY_ID_UNFILTERED_SQL,
+    CALENDAR_INSERT_STANDALONE_SQL,
     CALENDAR_LIST_STATE_GET_SQL,
     CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL,
@@ -211,6 +218,9 @@ pub use repo::{
     TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL, TASK_SHIFT_SORT_ORDER_RANGE_SQL,
     TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL, TASK_LIST_IN_PROGRESS_SQL,
     TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL,
+    LOCAL_CREDENTIAL_GET_BY_USERNAME_SQL, LOCAL_CREDENTIAL_INSERT_SQL,
+    LOCAL_CREDENTIAL_UPDATE_PASSWORD_SQL, USER_INSERT_STANDALONE_SQL,
+    standalone_event_labels_json,
     WATCH_CHANNEL_LIST_ALL_SQL, WATCH_CHANNEL_LIST_BY_USER_ID_SQL,
 };
 pub use tasks::{

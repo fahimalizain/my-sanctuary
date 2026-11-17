@@ -224,6 +224,8 @@ pub async fn exchange_and_login(
         email: saved.email,
         name: saved.name,
         picture: saved.picture.unwrap_or_default(),
+        // The OAuth callback is Google-only (ADR 0012).
+        integration_type: crate::models::IntegrationType::Google,
     })
 }
 
@@ -232,7 +234,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::models::{User, GoogleOAuthToken};
+    use crate::models::{GoogleOAuthToken, IntegrationType, User};
 
     fn oauth() -> OAuthConfig {
         OAuthConfig {
@@ -394,6 +396,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             deleted_at: None,
             focused_task_id: None,
+            integration_type: IntegrationType::Google,
         }
     }
 
@@ -462,6 +465,7 @@ mod tests {
         assert_eq!(session.email, "ada@example.com");
         assert_eq!(session.name, "Ada Lovelace");
         assert_eq!(session.picture, "https://example.com/ada.png");
+        assert_eq!(session.integration_type, IntegrationType::Google);
 
         // Token exchange hit the right URL with the right form.
         let (token_url, form) = http.posts.lock().unwrap().first().unwrap().clone();

@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::models::IntegrationType;
 use crate::repo::RepoError;
 use crate::session::SessionUser;
 use crate::time::{parse_iana_tz, rfc3339_to_unix_secs, unix_secs_to_rfc3339};
@@ -347,8 +348,9 @@ pub struct ApiKeyOwner {
 /// Row projection of [`API_KEY_AUTHENTICATE_SQL`].
 ///
 /// Every column is aliased in the query (`key_id`, `key_last_used_at`,
-/// `user_id`, `user_email`, `user_name`, `user_picture`) because both joined
-/// tables carry `id`/`created_at`/`updated_at`/`deleted_at`.
+/// `user_id`, `user_email`, `user_name`, `user_picture`,
+/// `user_integration_type`) because both joined tables carry
+/// `id`/`created_at`/`updated_at`/`deleted_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ApiKeyOwnerRow {
     /// `api_keys.id AS key_id`.
@@ -363,6 +365,10 @@ pub struct ApiKeyOwnerRow {
     pub user_name: String,
     /// `COALESCE(users.picture, '') AS user_picture` — never NULL.
     pub user_picture: String,
+    /// `users.integration_type AS user_integration_type` (ADR 0012).
+    /// Defaulted so a projection that predates migration 0024 reads as Google.
+    #[serde(default)]
+    pub user_integration_type: IntegrationType,
 }
 
 impl From<ApiKeyOwnerRow> for ApiKeyOwner {
@@ -375,6 +381,7 @@ impl From<ApiKeyOwnerRow> for ApiKeyOwner {
                 email: row.user_email,
                 name: row.user_name,
                 picture: row.user_picture,
+                integration_type: row.user_integration_type,
             },
         }
     }
@@ -588,7 +595,8 @@ pub const API_KEY_SOFT_DELETE_SQL: &str = "
 pub const API_KEY_AUTHENTICATE_SQL: &str = "
     SELECT k.id AS key_id, k.last_used_at AS key_last_used_at,
            u.id AS user_id, u.email AS user_email, u.name AS user_name,
-           COALESCE(u.picture, '') AS user_picture
+           COALESCE(u.picture, '') AS user_picture,
+           u.integration_type AS user_integration_type
     FROM api_keys k
     JOIN users u ON u.id = k.user_id
     WHERE k.key_hash = ?
@@ -1063,6 +1071,7 @@ mod tests {
             user_email: "user@example.com".to_string(),
             user_name: "Test User".to_string(),
             user_picture: String::new(),
+            user_integration_type: IntegrationType::Google,
         });
         assert_eq!(owner.key_id, "k-1");
         assert_eq!(owner.last_used_at.as_deref(), Some("2026-10-01T09:00:00Z"));
@@ -1073,7 +1082,26 @@ mod tests {
                 email: "user@example.com".to_string(),
                 name: "Test User".to_string(),
                 picture: String::new(),
+                integration_type: IntegrationType::Google,
             }
+        );
+    }
+
+    #[test]
+    fn owner_row_maps_a_standalone_integration_type() {
+        let owner = ApiKeyOwner::from(ApiKeyOwnerRow {
+            key_id: "k-2".to_string(),
+            key_last_used_at: None,
+            user_id: "u-local".to_string(),
+            user_email: "ada@standalone.invalid".to_string(),
+            user_name: "Ada".to_string(),
+            user_picture: String::new(),
+            user_integration_type: IntegrationType::Standalone,
+        });
+        assert_eq!(
+            owner.user.integration_type,
+            IntegrationType::Standalone,
+            "an API key authenticates as the owner's integration type"
         );
     }
 
@@ -1133,10 +1161,15 @@ mod tests {
             "AS user_email",
             "AS user_name",
             "AS user_picture",
+            "AS user_integration_type",
         ] {
             assert!(sql.contains(alias), "{alias}");
         }
         assert!(sql.contains("COALESCE(u.picture, '')"), "{sql}");
+        assert!(
+            sql.contains("u.integration_type AS user_integration_type"),
+            "{sql}"
+        );
         assert!(sql.contains("JOIN users u ON u.id = k.user_id"), "{sql}");
         assert!(sql.contains("k.deleted_at IS NULL"), "{sql}");
         assert!(sql.contains("u.deleted_at IS NULL"), "{sql}");
@@ -1306,6 +1339,7 @@ mod tests {
                     email: format!("{}@example.com", row.user_id),
                     name: "Test User".to_string(),
                     picture: String::new(),
+                    integration_type: IntegrationType::Google,
                 },
             }))
         }

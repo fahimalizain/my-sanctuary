@@ -135,6 +135,29 @@ pub struct NewCalendar {
     pub last_synced_at: Option<String>,
 }
 
+/// Insert input for [`crate::repo::CalendarRepo::insert_standalone`] (ADR 0012).
+///
+/// A standalone user owns exactly one local calendar. The caller supplies the
+/// id, the synthetic `google_calendar_id` (`standalone:<user_id>`), the summary
+/// and IANA zone, the cached `event_labels` JSON, and the `now` timestamp used
+/// for every stamp; the SQL hardcodes the health columns
+/// (`is_primary = 1`, `access_role = 'owner'`, `sync_enabled = 1`,
+/// `sync_status = 'disabled'`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneCalendarSeed {
+    pub id: String,
+    pub user_id: String,
+    pub google_calendar_id: String,
+    pub summary: String,
+    pub time_zone: String,
+    /// Cached `labelProperties.eventLabels` JSON (see
+    /// [`crate::repo::standalone_event_labels_json`]).
+    pub event_labels: String,
+    /// RFC 3339 instant stamped into `last_synced_at`/`last_success_at`/
+    /// `event_labels_updated_at`/`created_at`/`updated_at`.
+    pub now_rfc3339: String,
+}
+
 /// A cached Google Calendar event, as stored in `calendar_events`.
 ///
 /// Doubles as the D1 row projection AND the API response payload: serde field
@@ -535,7 +558,6 @@ pub struct NewEventInput {
     #[serde(default)]
     pub start_time_zone: Option<String>,
 }
-
 
 #[cfg(test)]
 mod tests {

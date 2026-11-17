@@ -12,10 +12,10 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    AgendaItem, GoogleOAuthToken, NewAgendaItem, NewRoutine, NewRoutineOccurrence, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Routine,
-    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine,
-    UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
+    AgendaItem, GoogleOAuthToken, NewAgendaItem, NewRoutine, NewRoutineOccurrence,
+    NewStandaloneUser, NewTask, NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog,
+    NewToken, NewUser, Routine, RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern,
+    TaskList, TaskLog, UpdateRoutine, UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
 };
 use api_core::repo::{
     build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
@@ -54,7 +54,8 @@ use api_core::repo::{
     TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL,
     TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, TASK_SET_STATUS_SQL,
     TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL,
-    USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL,
+    USER_GET_BY_ID_SQL, USER_INSERT_STANDALONE_SQL, USER_UPDATE_BY_ID_SQL,
+    USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, D1Result, D1Type};
@@ -256,8 +257,37 @@ impl UserRepo for D1UserRepo {
                     // The focus pointer is never part of a login upsert: keep
                     // whatever the stored row held (login must not wipe it).
                     focused_task_id: existing.focused_task_id,
+                    // A Google login is always a Google user; the stored row is
+                    // Google too (the read is keyed on `google_id`).
+                    integration_type: existing.integration_type,
                 })
             }
+        }
+    }
+
+    async fn create_standalone(&self, user: NewStandaloneUser) -> Result<User, RepoError> {
+        // One plain INSERT: no upsert, no RETURNING fallback. The synthetic
+        // `google_id`/email are minted by the caller (ADR 0012); a duplicate
+        // username is prevented by the `local_credentials` UNIQUE constraint.
+        let stmt = self
+            .db
+            .prepare(USER_INSERT_STANDALONE_SQL)
+            .bind_refs(&[
+                D1Type::Text(&user.id),
+                D1Type::Text(&user.google_id),
+                D1Type::Text(&user.email),
+                D1Type::Text(&user.name),
+                D1Type::Text(&user.created_at),
+                D1Type::Text(&user.updated_at),
+            ])
+            .map_err(backend)?;
+
+        match stmt.first::<User>(None).await {
+            Ok(Some(row)) => Ok(row),
+            Ok(None) => Err(RepoError::Backend(
+                "standalone user insert returned no rows".to_string(),
+            )),
+            Err(err) => Err(backend(err)),
         }
     }
 

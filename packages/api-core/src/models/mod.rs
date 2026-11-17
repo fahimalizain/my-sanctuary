@@ -121,6 +121,34 @@ fn normalize_optional_string(value: &str) -> Option<String> {
 pub mod calendar;
 pub use calendar::*;
 
+/// Which identity/calendar provider a user belongs to (ADR 0012).
+///
+/// Stored lowercase in `users.integration_type`. `Google` is the default so a
+/// pre-migration row (or JSON without the field) is always a Google user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntegrationType {
+    #[default]
+    Google,
+    Standalone,
+}
+
+impl IntegrationType {
+    /// The stored/REST form (`"google"` / `"standalone"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IntegrationType::Google => "google",
+            IntegrationType::Standalone => "standalone",
+        }
+    }
+}
+
+impl fmt::Display for IntegrationType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A user identity as stored in the `users` table.
 ///
 /// Identity only — Google OAuth tokens live in [`GoogleOAuthToken`].
@@ -141,6 +169,10 @@ pub struct User {
     /// such field) still deserializes as `None`.
     #[serde(default)]
     pub focused_task_id: Option<String>,
+    /// `google` (the default) or `standalone` (ADR 0012). `#[serde(default)]`
+    /// so rows/JSON predating migration 0024 read as Google users.
+    #[serde(default)]
+    pub integration_type: IntegrationType,
 }
 
 /// Insert/update input for [`crate::repo::UserRepo::upsert_by_google_id`].
@@ -152,6 +184,66 @@ pub struct NewUser {
     pub email: String,
     pub name: String,
     pub picture: Option<String>,
+}
+
+/// Insert input for [`crate::repo::UserRepo::create_standalone`] (ADR 0012).
+///
+/// Unlike a Google login this is a plain INSERT (one account per username, no
+/// upsert). The caller mints the id, the synthetic `google_id`
+/// (`standalone:<uuid>`), the `.invalid` email, and both timestamps; the row is
+/// always written with `integration_type = 'standalone'` and no picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewStandaloneUser {
+    pub id: String,
+    pub google_id: String,
+    pub email: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One `local_credentials` row — a standalone user's username/password login.
+///
+/// `password_hash` is the PBKDF2 string from [`crate::password`]; the plaintext
+/// password never reaches the database. Doubles as the D1 row projection
+/// (field names match the schema).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LocalCredential {
+    pub user_id: String,
+    /// Stored trimmed and lowercased; UNIQUE across the deployment.
+    pub username: String,
+    pub password_hash: String,
+    /// RFC 3339 instant.
+    pub created_at: String,
+    /// RFC 3339 instant.
+    pub updated_at: String,
+}
+
+/// Insert input for [`crate::repo::LocalCredentialRepo::insert`].
+///
+/// The caller mints both timestamps (the Worker uses `worker::Date`) and hashes
+/// the password before this reaches the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLocalCredential {
+    pub user_id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl NewLocalCredential {
+    /// The row [`crate::repo::LocalCredentialRepo::insert`] returns, built from
+    /// the same values (no `RETURNING`).
+    pub fn into_row(self) -> LocalCredential {
+        LocalCredential {
+            user_id: self.user_id,
+            username: self.username,
+            password_hash: self.password_hash,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 /// A Google OAuth token as stored in the `google_oauth_tokens` table.
@@ -695,10 +787,78 @@ pub struct RescheduleAgendaItemInput {
     pub unschedule: bool,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integration_type_serializes_lowercase_and_defaults_to_google() {
+        assert_eq!(
+            serde_json::to_string(&IntegrationType::Google).unwrap(),
+            r#""google""#
+        );
+        assert_eq!(
+            serde_json::to_string(&IntegrationType::Standalone).unwrap(),
+            r#""standalone""#
+        );
+        assert_eq!(
+            serde_json::from_str::<IntegrationType>(r#""standalone""#).unwrap(),
+            IntegrationType::Standalone
+        );
+        assert_eq!(IntegrationType::default(), IntegrationType::Google);
+        assert_eq!(IntegrationType::Google.as_str(), "google");
+        assert_eq!(IntegrationType::Standalone.as_str(), "standalone");
+        assert_eq!(IntegrationType::Standalone.to_string(), "standalone");
+    }
+
+    #[test]
+    fn user_integration_type_defaults_to_google_when_column_is_missing() {
+        // A row (or JSON payload) predating migration 0024 has no
+        // `integration_type`; it must read as a Google user, never standalone.
+        let user: User = serde_json::from_str(
+            r##"{
+                "id": "u-1", "google_id": "google-1", "email": "u@example.com",
+                "name": "U1", "picture": null,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "deleted_at": null
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(user.integration_type, IntegrationType::Google);
+        assert_eq!(user.focused_task_id, None);
+    }
+
+    #[test]
+    fn user_reads_standalone_integration_type_from_d1_row() {
+        let user: User = serde_json::from_str(
+            r##"{
+                "id": "u-2", "google_id": "standalone:abc", "email": "ada@standalone.invalid",
+                "name": "Ada", "picture": null,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "deleted_at": null,
+                "focused_task_id": null, "integration_type": "standalone"
+            }"##,
+        )
+        .unwrap();
+        assert_eq!(user.integration_type, IntegrationType::Standalone);
+    }
+
+    #[test]
+    fn new_local_credential_builds_its_row_without_returning() {
+        let credential = NewLocalCredential {
+            user_id: "u-2".to_string(),
+            username: "ada".to_string(),
+            password_hash: "pbkdf2-sha256$1$c2FsdA==$aGFzaA==".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let row = credential.clone().into_row();
+        assert_eq!(row.user_id, credential.user_id);
+        assert_eq!(row.username, "ada");
+        assert_eq!(row.password_hash, credential.password_hash);
+        assert_eq!(row.created_at, credential.created_at);
+        assert_eq!(row.updated_at, credential.updated_at);
+    }
 
     #[test]
     fn d1_integer_bools_deserialize_to_bool() {

@@ -42,7 +42,16 @@ pub struct Config {
     /// raw — the public-HTTPS check happens at use time (see
     /// [`crate::calendar::is_public_https_callback`]).
     pub watch_callback_url: Option<String>,
+    /// Whether standalone username/password auth is allowed at all
+    /// (`ALLOW_STANDALONE_AUTH == "true"`, ADR 0012). Default off.
+    pub allow_standalone_auth: bool,
+    /// IANA zone used when a standalone registration omits one
+    /// (`STANDALONE_TIME_ZONE`); `UTC` when missing/empty.
+    pub standalone_default_time_zone: String,
 }
+
+/// Time zone used for standalone registrations that do not supply one.
+pub const DEFAULT_STANDALONE_TIME_ZONE: &str = "UTC";
 
 /// Errors produced while loading [`Config`] from the environment.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -144,6 +153,9 @@ impl Config {
     ///   leaves `oauth: None`.
     /// - `WATCH_CALLBACK_URL` is optional and stored raw (no validation —
     ///   missing or empty yields `watch_callback_url: None`).
+    /// - `ALLOW_STANDALONE_AUTH` enables standalone auth only when its value
+    ///   is exactly `"true"` (ADR 0012); default off.
+    /// - `STANDALONE_TIME_ZONE` defaults to `UTC` when missing or empty.
     pub fn from_env(getenv: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let session_secret = getenv("SESSION_SECRET").ok_or(ConfigError::MissingSecret)?;
         if session_secret.len() < MIN_SESSION_SECRET_LEN {
@@ -160,13 +172,96 @@ impl Config {
             _ => None,
         };
         let watch_callback_url = getenv("WATCH_CALLBACK_URL").filter(|value| !value.is_empty());
+        let allow_standalone_auth = getenv("ALLOW_STANDALONE_AUTH").as_deref() == Some("true");
+        let standalone_default_time_zone = getenv("STANDALONE_TIME_ZONE")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_STANDALONE_TIME_ZONE.to_string());
         Ok(Self {
             session_secret,
             frontend_url,
             secure_cookie,
             oauth,
             watch_callback_url,
+            allow_standalone_auth,
+            standalone_default_time_zone,
         })
+    }
+
+    /// Whether standalone username/password auth may serve this request
+    /// (ADR 0012).
+    ///
+    /// All of the following must hold, otherwise `false` (fail closed):
+    /// - [`Config::allow_standalone_auth`] (`ALLOW_STANDALONE_AUTH=true`);
+    /// - [`Config::secure_cookie`] is `false` (production sessions are secure);
+    /// - the configured `frontend_url` host is non-public;
+    /// - `request_host` is present, parseable, and non-public.
+    ///
+    /// Non-public = `localhost`, `*.localhost`, `*.local`, `*.lan`, loopback
+    /// (127/8, `::1`), RFC 1918 (10/8, 172.16/12, 192.168/16), or link-local
+    /// (169.254/16, `fe80::/10`). Ports and IPv6 brackets are stripped. There
+    /// is deliberately no allowlist: a public hostname is always rejected.
+    pub fn standalone_enabled_for(&self, request_host: Option<&str>) -> bool {
+        if !self.allow_standalone_auth || self.secure_cookie {
+            return false;
+        }
+        let Some(frontend_host) = hostname_from_url(&self.frontend_url) else {
+            return false;
+        };
+        if !is_non_public_host(&frontend_host) {
+            return false;
+        }
+        match request_host {
+            Some(raw) => is_non_public_host(raw),
+            None => false,
+        }
+    }
+}
+
+/// Strips a port and IPv6 brackets, lowercases, and drops a trailing dot.
+/// Returns `None` for an empty/invalid host. Bare IPv6 (`::1`, `fe80::1`) is
+/// accepted without brackets.
+fn normalize_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        // Bracketed IPv6, optionally followed by `:port`.
+        let (inner, _) = rest.split_once(']')?;
+        inner
+    } else if trimmed.matches(':').count() == 1 {
+        // `host:port` (a single colon cannot be IPv6).
+        trimmed.split_once(':').map_or(trimmed, |(host, _)| host)
+    } else {
+        // No colon (hostname/IPv4) or a bare IPv6 literal.
+        trimmed
+    };
+    let host = host.trim().trim_end_matches('.');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Whether `raw_host` (possibly `host:port` / `[v6]:port`) is a non-public
+/// development host. Unparseable input fails closed (`false`).
+fn is_non_public_host(raw_host: &str) -> bool {
+    let Some(host) = normalize_host(raw_host) else {
+        return false;
+    };
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+    {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        Err(_) => false,
     }
 }
 
@@ -411,5 +506,155 @@ mod tests {
         let json = r#"{"web": {"client_id": "c", "client_secret": "s"}}"#;
         let config = OAuthConfig::from_credentials_json(json, DEFAULT_FRONTEND_URL).unwrap();
         assert_eq!(config.redirect_url, "http://localhost:5173/auth/google/callback");
+    }
+
+    // ── standalone gate (ADR 0012) ──────────────────────────────────────
+
+    /// The smallest config that can enable standalone auth. `entries` come
+    /// first and therefore win (the lookup helper returns the first match).
+    fn standalone_config(entries: &[(&str, &str)]) -> Config {
+        let mut all: Vec<(&str, &str)> = entries.to_vec();
+        all.extend_from_slice(&[
+            ("SESSION_SECRET", SECRET),
+            ("ALLOW_STANDALONE_AUTH", "true"),
+            ("SECURE_COOKIE", "false"),
+            ("FRONTEND_URL", "http://localhost:5173"),
+        ]);
+        Config::from_env(lookup(&all)).unwrap()
+    }
+
+    #[test]
+    fn standalone_is_off_by_default() {
+        let config = Config::from_env(lookup(&[("SESSION_SECRET", SECRET)])).unwrap();
+        assert!(!config.allow_standalone_auth);
+        assert!(!config.standalone_enabled_for(Some("localhost")));
+        assert!(!config.standalone_enabled_for(Some("127.0.0.1")));
+    }
+
+    #[test]
+    fn standalone_flag_requires_the_exact_true_value() {
+        for value in ["false", "TRUE", "True", "1", "yes", ""] {
+            let config = standalone_config(&[("ALLOW_STANDALONE_AUTH", value)]);
+            assert!(
+                !config.allow_standalone_auth,
+                "ALLOW_STANDALONE_AUTH={value:?} must be off"
+            );
+            assert!(!config.standalone_enabled_for(Some("localhost")));
+        }
+        assert!(standalone_config(&[]).standalone_enabled_for(Some("localhost")));
+    }
+
+    #[test]
+    fn standalone_is_disabled_by_secure_cookie() {
+        let config = standalone_config(&[("SECURE_COOKIE", "true")]);
+        assert!(!config.standalone_enabled_for(Some("localhost")));
+    }
+
+    #[test]
+    fn standalone_is_disabled_by_a_public_frontend_url() {
+        let config = standalone_config(&[("FRONTEND_URL", "https://sanctuary.example.com")]);
+        assert!(!config.standalone_enabled_for(Some("localhost")));
+        // Even against a local request host: the configured origin is public.
+        assert!(!config.standalone_enabled_for(Some("127.0.0.1")));
+    }
+
+    #[test]
+    fn standalone_is_disabled_by_an_unparseable_frontend_url() {
+        let config = standalone_config(&[("FRONTEND_URL", "not a url")]);
+        assert!(!config.standalone_enabled_for(Some("localhost")));
+    }
+
+    #[test]
+    fn standalone_is_disabled_by_a_public_request_host() {
+        let config = standalone_config(&[]);
+        for host in [
+            "sanctuary.example.com",
+            "my-sanctuary.fahimalizain.com",
+            "8.8.8.8",
+            "172.32.0.1",
+            "192.169.0.1",
+            "example.local.evil.com",
+        ] {
+            assert!(
+                !config.standalone_enabled_for(Some(host)),
+                "public host {host:?} must not enable standalone"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_is_disabled_when_the_request_host_is_missing_or_garbage() {
+        let config = standalone_config(&[]);
+        assert!(!config.standalone_enabled_for(None));
+        assert!(!config.standalone_enabled_for(Some("")));
+        assert!(!config.standalone_enabled_for(Some("   ")));
+        assert!(!config.standalone_enabled_for(Some("[::1")));
+        assert!(!config.standalone_enabled_for(Some("[not-ipv6]")));
+    }
+
+    #[test]
+    fn standalone_missing_frontend_url_cannot_enable_against_a_public_host() {
+        // FRONTEND_URL defaults to localhost, so the frontend half passes…
+        let config = Config::from_env(lookup(&[
+            ("SESSION_SECRET", SECRET),
+            ("ALLOW_STANDALONE_AUTH", "true"),
+        ]))
+        .unwrap();
+        assert_eq!(config.frontend_url, DEFAULT_FRONTEND_URL);
+        // …but the request host is still required to be non-public.
+        assert!(!config.standalone_enabled_for(Some("sanctuary.example.com")));
+        assert!(config.standalone_enabled_for(Some("localhost")));
+    }
+
+    #[test]
+    fn standalone_enables_for_loopback_and_private_hosts() {
+        let config = standalone_config(&[]);
+        for host in [
+            "localhost",
+            "localhost:8787",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.1:8787",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+            "[::1]:8787",
+            "10.0.0.5",
+            "10.255.255.254:5173",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.20",
+            "192.168.1.20:5173",
+            "169.254.10.10",
+            "fe80::1",
+            "[fe80::1]:8787",
+            "dev.localhost",
+            "sanctuary.local",
+            "sanctuary.lan",
+            "sanctuary.local.",
+        ] {
+            assert!(
+                config.standalone_enabled_for(Some(host)),
+                "non-public host {host:?} must enable standalone"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_time_zone_defaults_to_utc() {
+        let config = Config::from_env(lookup(&[("SESSION_SECRET", SECRET)])).unwrap();
+        assert_eq!(config.standalone_default_time_zone, "UTC");
+        let config = Config::from_env(lookup(&[
+            ("SESSION_SECRET", SECRET),
+            ("STANDALONE_TIME_ZONE", ""),
+        ]))
+        .unwrap();
+        assert_eq!(config.standalone_default_time_zone, "UTC");
+        let config = Config::from_env(lookup(&[
+            ("SESSION_SECRET", SECRET),
+            ("STANDALONE_TIME_ZONE", "Asia/Kolkata"),
+        ]))
+        .unwrap();
+        assert_eq!(config.standalone_default_time_zone, "Asia/Kolkata");
     }
 }
