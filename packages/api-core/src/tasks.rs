@@ -3440,7 +3440,7 @@ fn taxonomy_from(categories: Vec<TaskCategory>, patterns: Vec<TaskCategoryPatter
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::models::{
@@ -5599,6 +5599,20 @@ mod tests {
         }
     }
 
+    /// A single local calendar shaped like `ensure_standalone_calendar`'s seed
+    /// (ADR 0012): `sync_enabled = 1` (range/running SQL require it),
+    /// `sync_status = 'disabled'` (never synced, never repaired).
+    fn standalone_calendar() -> GoogleCalendar {
+        GoogleCalendar {
+            id: "standalone-cal-u-1".to_string(),
+            google_calendar_id: "standalone:u-1".to_string(),
+            summary: "Personal".to_string(),
+            sync_status: "disabled".to_string(),
+            initial_sync_complete: true,
+            ..calendar("standalone:u-1", true)
+        }
+    }
+
     struct FakeCalendarRepo {
         stored: Mutex<Vec<GoogleCalendar>>,
     }
@@ -6444,6 +6458,124 @@ mod tests {
         assert_eq!(inserted[0].at, NOW);
         assert_eq!(inserted[0].calendar_id.as_deref(), Some("cal-primary@example.com"));
         assert_eq!(inserted[0].google_event_id.as_deref(), Some("g-1"));
+    }
+
+    /// The whole timer flow over the standalone stand-in: the only
+    /// `HttpClient` the service sees is `StandaloneCalendarHttp`, so any
+    /// Google call would fail the test instead of silently succeeding.
+    #[test]
+    fn standalone_stand_in_covers_task_start_and_stop() {
+        let (lists, categories, tasks, agenda, _) = seeded();
+        // `work_task` only needs a repo to read the primary zone; the timer
+        // calls below use the standalone repos.
+        let seed_calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let task = work_task(&lists, &categories, &tasks, &agenda, &seed_calendars);
+
+        // The stand-in and the service share the SAME repos (Arc), so the
+        // journal's cache upsert is visible to the stand-in's reads.
+        let calendars = Arc::new(FakeCalendarRepo::with(vec![standalone_calendar()]));
+        let events = Arc::new(FakeEventRepo::new());
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo {
+            focused_task_id: Mutex::new(None),
+        };
+        let http = crate::calendar::StandaloneCalendarHttp::new(
+            calendars.clone(),
+            events.clone(),
+            "u-1".to_string(),
+            NOW_UNIX,
+        );
+        let access = access();
+
+        let started = pollster::block_on(start_task(
+            &http,
+            calendars.as_ref(),
+            events.as_ref(),
+            &ops(),
+            &lists,
+            &categories,
+            &tasks,
+            &logs,
+            &access,
+            "u-1",
+            &task.id,
+            NOW_UNIX,
+            &agenda,
+            noop_notify(),
+        ))
+        .expect("standalone start");
+
+        assert_eq!(started.task.status, TASK_STATUS_IN_PROGRESS);
+        let event = started.event.expect("start returns the event");
+        assert_eq!(event.task_id, task.id);
+        assert_eq!(event.start_time, NOW_SNAPPED);
+        assert_eq!(event.end_time, NOW_END, "start's fixed 15-minute marker");
+        assert!(
+            !event.google_event_id.is_empty(),
+            "the stand-in echoed the journal's insert id"
+        );
+
+        // The running list is the cache query: exactly the one live chip.
+        let running =
+            pollster::block_on(events.list_running_by_user_id("u-1", NOW)).expect("running list");
+        assert_eq!(running.len(), 1, "one running chip through the stand-in");
+        assert_eq!(running[0].task_id, task.id);
+        assert_eq!(running[0].calendar_id, "standalone-cal-u-1");
+
+        // The cached row was written by the journal's upsert of the
+        // stand-in's echoed insert (the stand-in itself never writes).
+        let stored = events.stored.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1);
+        let raw: serde_json::Value = serde_json::from_str(&stored[0].raw_json).expect("raw JSON");
+        assert_eq!(
+            raw["extendedProperties"]["shared"]["sanctuary_task_id"],
+            task.id
+        );
+        assert_eq!(raw["etag"], stored[0].google_etag);
+
+        // Stop patches the end through the same stand-in (no Google client),
+        // snapping to the minute grid like every timer write.
+        let stop_unix = NOW_UNIX + 120;
+        let expected_end = unix_secs_to_rfc3339(nearest_minute_unix(stop_unix));
+        let stopped = pollster::block_on(stop_task(
+            &http,
+            calendars.as_ref(),
+            events.as_ref(),
+            &ops(),
+            &categories,
+            &tasks,
+            &logs,
+            &users,
+            &access,
+            "u-1",
+            &task.id,
+            stop_unix,
+            &agenda,
+            noop_notify(),
+        ))
+        .expect("standalone stop");
+
+        assert_eq!(stopped.task.status, TASK_STATUS_OPEN);
+        let stored = events.stored.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1, "the patch updates the row in place");
+        assert_eq!(stored[0].end_time, expected_end, "end == snapped stop now");
+        assert!(
+            stored[0].sequence > 0,
+            "the stand-in bumped the sequence on patch"
+        );
+        let raw: serde_json::Value = serde_json::from_str(&stored[0].raw_json).expect("raw JSON");
+        assert_eq!(raw["end"]["dateTime"], expected_end);
+        assert_eq!(
+            raw["extendedProperties"]["shared"]["sanctuary_task_id"], task.id,
+            "a patch keeps the task carrier"
+        );
+
+        assert!(
+            pollster::block_on(events.list_running_by_user_id("u-1", &expected_end))
+                .expect("running list after stop")
+                .is_empty(),
+            "a stopped chip is no longer running"
+        );
     }
 
     #[test]
