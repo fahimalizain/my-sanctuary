@@ -27,6 +27,7 @@ pub mod record;
 pub mod repo;
 pub mod routines;
 pub mod rules;
+pub mod standalone;
 pub mod tasks;
 pub mod time;
 pub mod token;
@@ -72,7 +73,8 @@ pub use calendar::{
     CreateEventResponse, CronReport, DeleteEventResponse, OperatorWarningLevel,
     OperatorWarningRecord, OperatorWarningThresholds, QueueSyncAction, QueueSyncReport,
     ReplicaApplyReport, ReplicaWalkDiagnostic, ReplicaWalkMeta, ReplicaWalkPhase,
-    ReplicaWalkTrigger, SyncCalendarOutcome, SyncCalendarResult, WebhookDecision,
+    ReplicaWalkTrigger, SyncCalendarOutcome, SyncCalendarResult, StandaloneCalendarHttp,
+    WebhookDecision,
     WebhookPersistResult, CALENDAR_REPAIR_COOLDOWN_SECS, CRON_MAX_REPLICA_CALENDARS,
     CRON_SYNC_STALE_SECS, GOOGLE_CALENDAR_LIST_URL, GOOGLE_CHANNELS_STOP_URL, GOOGLE_EVENTS_BASE_URL,
     SYNC_STALE_THRESHOLD_SECS, WATCH_DEFAULT_TTL_SECS, WATCH_RENEW_HORIZON_SECS,
@@ -158,6 +160,12 @@ pub use rules::{
     RuleParams, RulePhase, RuleRepo, RuleRow, RuleScore, RuleSpec, RuleStatus, RulesError,
     Scoreboard, SeedOutcome, UpdateRuleInput, HISTORY_BUILDING, MAX_TARGET_HOURS,
     MAX_TARGET_MINUTES, SEED_HISTORY_DAYS,
+};
+pub use standalone::{
+    ensure_standalone_calendar, login, normalize_username, register, standalone_calendar_local_id,
+    standalone_google_calendar_id, LoginInput, RegisterInput, StandaloneAuthConfig,
+    StandaloneAuthError, FALLBACK_TIME_ZONE, MAX_NAME_LEN, MAX_PASSWORD_LEN, MAX_USERNAME_LEN,
+    MIN_PASSWORD_LEN, MIN_USERNAME_LEN, STANDALONE_CALENDAR_SUMMARY,
 };
 pub use repo::{
     build_event_upsert_if_owner_sql, build_event_upsert_sql, build_occurrence_delete_by_ids_sql,

@@ -69,6 +69,7 @@ pub mod diagnostics;
 pub mod replica;
 pub mod repair;
 pub mod repair_action;
+pub mod standalone;
 pub mod sync;
 pub mod window;
 pub(crate) mod google;
@@ -89,6 +90,11 @@ mod tests;
 /// In-memory operation journal for unit tests (tasks/agenda call sites).
 #[cfg(test)]
 pub(crate) use tests::support::FakeOperationRepo;
+
+/// In-memory calendar/event repos reused by other api-core modules' unit
+/// tests (standalone auth/seed and the standalone calendar stand-in).
+#[cfg(test)]
+pub(crate) use tests::support::{FakeCalendarRepo, FakeEventRepo};
 
 use thiserror::Error;
 
@@ -255,3 +261,4 @@ pub use repair_action::{
     request_calendar_repair, CalendarRepairResponse, CalendarRepairStatus,
     CALENDAR_REPAIR_COOLDOWN_SECS,
 };
+pub use standalone::StandaloneCalendarHttp;
