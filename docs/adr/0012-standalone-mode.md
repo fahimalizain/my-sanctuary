@@ -6,7 +6,7 @@ Date: 2026-11-17
 > Adds a per-user `integration_type` and a local username/password identity so
 > the app can be developed and used with no Google OAuth credentials and no
 > calls to Google. Production is fail-closed: standalone auth is off unless it
-> is explicitly enabled *and* the request arrives on a non-public host.
+> is explicitly enabled _and_ the request arrives on a non-public host.
 
 ## Context
 
@@ -84,7 +84,7 @@ check, evaluated on every standalone auth endpoint and in calendar access:
 
 1. `ALLOW_STANDALONE_AUTH == "true"` (exact match; default off).
 2. `SECURE_COOKIE != "true"` (production sessions are always secure).
-3. The configured `FRONTEND_URL` host is non-public *and* the incoming
+3. The configured `FRONTEND_URL` host is non-public _and_ the incoming
    request host is non-public. `None` (missing/unparseable) fails closed.
 
 Non-public means `localhost`, `*.localhost`, `*.local`, `*.lan`, loopback
@@ -173,7 +173,7 @@ Because the stand-in rebuilds responses from the cached row's `raw_json`:
 - `wrangler dev --remote` points at the **production** D1. Never use it for
   standalone development; use local D1 or a dedicated preview database.
 - **Migrations before deploy.** `0024` must be applied to the target D1
-  (`wrangler d1 migrations apply <db> --remote`) *before* deploying code that
+  (`wrangler d1 migrations apply <db> --remote`) _before_ deploying code that
   reads `integration_type`. An un-migrated database breaks API-key auth
   (`API_KEY_AUTHENTICATE_SQL` selects the column) and errors every cron tick.
 - `wrangler dev` needs `--test-scheduled` to fire cron locally, so nothing
