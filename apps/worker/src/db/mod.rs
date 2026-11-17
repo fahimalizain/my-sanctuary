@@ -12,10 +12,11 @@
 //! (`Text`/`Null`); nullable columns bind `D1Type::Null`.
 
 use api_core::models::{
-    AgendaItem, GoogleOAuthToken, NewAgendaItem, NewRoutine, NewRoutineOccurrence, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Routine,
-    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine,
-    UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
+    AgendaItem, GoogleOAuthToken, IntegrationType, NewAgendaItem, NewLocalCredential, NewRoutine,
+    NewRoutineOccurrence, NewStandaloneUser, NewTask, NewTaskCategory, NewTaskCategoryPattern,
+    NewTaskList, NewTaskLog, NewToken, NewUser, Routine, RoutineOccurrence, Task, TaskCategory,
+    TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine, UpdateTask, UpdateTaskCategory,
+    UpdateTaskList, User,
 };
 use api_core::repo::{
     build_agenda_item_delete_by_refs_sql, build_agenda_item_insert_sql,
@@ -53,8 +54,9 @@ use api_core::repo::{
     TASK_LIST_UPDATE_SQL, TASK_MAX_SORT_ORDER_SQL, TASK_SET_SORT_ORDER_SQL,
     TASK_SHIFT_SORT_ORDER_RANGE_SQL, TASK_SHIFT_SORT_ORDER_SQL, TASK_UPDATE_SQL,
     TASK_LOG_INSERT_SQL, TASK_LOG_LATEST_STARTED_BY_TASK_ID_SQL, TASK_SET_STATUS_SQL,
-    TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL, USER_GET_BY_GOOGLE_ID_SQL,
-    USER_GET_BY_ID_SQL, USER_UPDATE_BY_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL,
+    LOCAL_CREDENTIAL_INSERT_SQL, TOKEN_DELETE_SQL, TOKEN_GET_BY_USER_ID_SQL, TOKEN_UPSERT_SQL,
+    USER_GET_BY_GOOGLE_ID_SQL, USER_GET_BY_ID_SQL, USER_INSERT_STANDALONE_SQL,
+    USER_UPDATE_BY_ID_SQL, USER_SET_FOCUSED_TASK_ID_SQL, USER_UPSERT_SQL,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, D1Result, D1Type};
@@ -67,6 +69,21 @@ pub(crate) fn now_rfc3339() -> String {
 
 pub(crate) fn backend(err: worker::Error) -> RepoError {
     RepoError::Backend(err.to_string())
+}
+
+/// Maps a D1 failure to [`RepoError::Conflict`] when a UNIQUE index rejected
+/// the row (a duplicate username, or the synthetic standalone id/email), and
+/// to [`RepoError::Backend`] otherwise.
+///
+/// `D1PreparedStatement::run`/`D1Database::batch` either throw (the JS promise
+/// rejects) or resolve with `success: false`; both carry the SQLite message, so
+/// both paths go through this matcher.
+pub(crate) fn unique_constraint_error(message: String) -> RepoError {
+    if message.contains("UNIQUE constraint failed") {
+        RepoError::Conflict
+    } else {
+        RepoError::Backend(message)
+    }
 }
 
 /// Runs a statement, surfacing D1's `success`/`error` metadata.
@@ -146,6 +163,9 @@ pub use api_keys::*;
 
 pub mod calendar;
 pub use calendar::*;
+
+pub mod credentials;
+pub use credentials::*;
 
 pub mod digest;
 pub use digest::*;
@@ -256,9 +276,106 @@ impl UserRepo for D1UserRepo {
                     // The focus pointer is never part of a login upsert: keep
                     // whatever the stored row held (login must not wipe it).
                     focused_task_id: existing.focused_task_id,
+                    // A Google login is always a Google user; the stored row is
+                    // Google too (the read is keyed on `google_id`).
+                    integration_type: existing.integration_type,
                 })
             }
         }
+    }
+
+    async fn create_standalone(&self, user: NewStandaloneUser) -> Result<User, RepoError> {
+        // One plain INSERT: no upsert, no RETURNING fallback. The synthetic
+        // `google_id`/email are minted by the caller (ADR 0012). Kept for
+        // compatibility — `register` uses `create_standalone_account`, which
+        // writes this row and its credential in one batch.
+        let stmt = self
+            .db
+            .prepare(USER_INSERT_STANDALONE_SQL)
+            .bind_refs(&[
+                D1Type::Text(&user.id),
+                D1Type::Text(&user.google_id),
+                D1Type::Text(&user.email),
+                D1Type::Text(&user.name),
+                D1Type::Text(&user.created_at),
+                D1Type::Text(&user.updated_at),
+            ])
+            .map_err(backend)?;
+
+        match stmt.first::<User>(None).await {
+            Ok(Some(row)) => Ok(row),
+            Ok(None) => Err(RepoError::Backend(
+                "standalone user insert returned no rows".to_string(),
+            )),
+            Err(err) => Err(unique_constraint_error(err.to_string())),
+        }
+    }
+
+    async fn create_standalone_account(
+        &self,
+        user: NewStandaloneUser,
+        credential: NewLocalCredential,
+    ) -> Result<User, RepoError> {
+        // One `batch` is one D1 transaction: the user and its credential land
+        // together or not at all. Two independent `run()` calls would leave an
+        // orphan `users` row on failure — no login handle, and its UNIQUE email
+        // would block every retry (ADR 0012).
+        let user_stmt = self
+            .db
+            .prepare(USER_INSERT_STANDALONE_SQL)
+            .bind_refs(&[
+                D1Type::Text(&user.id),
+                D1Type::Text(&user.google_id),
+                D1Type::Text(&user.email),
+                D1Type::Text(&user.name),
+                D1Type::Text(&user.created_at),
+                D1Type::Text(&user.updated_at),
+            ])
+            .map_err(backend)?;
+        let credential_stmt = self
+            .db
+            .prepare(LOCAL_CREDENTIAL_INSERT_SQL)
+            .bind_refs(&[
+                D1Type::Text(&credential.user_id),
+                D1Type::Text(&credential.username),
+                D1Type::Text(&credential.password_hash),
+                D1Type::Text(&credential.created_at),
+                D1Type::Text(&credential.updated_at),
+            ])
+            .map_err(backend)?;
+
+        let results = self
+            .db
+            .batch(vec![user_stmt, credential_stmt])
+            .await
+            .map_err(|err| unique_constraint_error(err.to_string()))?;
+        // D1 can also resolve with `success: false` instead of throwing; the
+        // whole batch is rolled back either way.
+        for result in &results {
+            if !result.success() {
+                return Err(unique_constraint_error(
+                    result
+                        .error()
+                        .unwrap_or_else(|| "standalone account insert failed".to_string()),
+                ));
+            }
+        }
+
+        // The INSERT writes exactly the bound values (no upsert, no defaults
+        // beyond `picture`/`focused_task_id` NULL and the `'standalone'`
+        // literal), so no read-back is needed.
+        Ok(User {
+            id: user.id,
+            google_id: user.google_id,
+            email: user.email,
+            name: user.name,
+            picture: None,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            deleted_at: None,
+            focused_task_id: None,
+            integration_type: IntegrationType::Standalone,
+        })
     }
 
     async fn set_focused_task_id(

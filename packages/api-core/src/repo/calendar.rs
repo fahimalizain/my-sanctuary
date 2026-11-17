@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 
 use super::RepoError;
+use crate::google_color::GOOGLE_EVENT_LABEL_COLORS;
 use crate::models::{
     CalendarEvent, CalendarEventOperation, GoogleCalendar, NewCalendar, NewCalendarEvent,
-    NewCalendarEventOperation, NewWatchChannel, WatchChannel,
+    NewCalendarEventOperation, NewWatchChannel, StandaloneCalendarSeed, WatchChannel,
 };
 
 /// Google Calendar persistence (`google_calendars` rows).
@@ -32,6 +33,23 @@ pub trait CalendarRepo: Send + Sync {
     ) -> Result<Option<GoogleCalendar>, RepoError>;
     async fn upsert(&self, calendar: NewCalendar) -> Result<(), RepoError>;
     async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError>;
+    /// Idempotently seeds a standalone user's local calendar (ADR 0012).
+    ///
+    /// `INSERT … ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET
+    /// deleted_at = NULL`: calling it on register, on login, and from the
+    /// standalone list self-heal is safe, an existing row is never overwritten
+    /// (the user's time zone and labels survive), and a soft-deleted local
+    /// calendar is resurrected. The row is written with `sync_enabled = 1` (the
+    /// event-range/running SQL require it) and `sync_status = 'disabled'` (so
+    /// no sync, repair, or watch path treats it as a real calendar).
+    ///
+    /// Loud by default so existing test fakes keep compiling; every production
+    /// repo implements it.
+    async fn insert_standalone(&self, _seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
+        Err(RepoError::Backend(
+            "insert_standalone not implemented".to_string(),
+        ))
+    }
     /// Stores the incremental sync cursor and the sync timestamp.
     ///
     /// Compat path kept for existing call sites. Prefer
@@ -467,9 +485,19 @@ pub const CALENDAR_LIST_BY_USER_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE user_id = ? AND deleted_at IS NULL ORDER BY is_primary DESC, summary ASC";
 
 /// The fallback cron's work list: every sync-enabled calendar that is not
-/// soft-deleted, ordered by user, then primary first, then summary.
-pub const CALENDAR_LIST_SYNC_ENABLED_SQL: &str =
-    "SELECT * FROM google_calendars WHERE sync_enabled = 1 AND deleted_at IS NULL ORDER BY user_id ASC, is_primary DESC, summary ASC";
+/// soft-deleted and belongs to a **Google** user (ADR 0012), ordered by user,
+/// then primary first, then summary.
+///
+/// Standalone calendars are `sync_enabled = 1` so events appear in the range
+/// queries; without the integration filter the fallback cron's "no Google
+/// users" branch and operator warnings would pick them up. A subquery (not a
+/// join) keeps the `SELECT *` row shape unchanged.
+pub const CALENDAR_LIST_SYNC_ENABLED_SQL: &str = "
+    SELECT * FROM google_calendars
+    WHERE sync_enabled = 1 AND deleted_at IS NULL
+      AND user_id IN (SELECT id FROM users WHERE integration_type = 'google')
+    ORDER BY user_id ASC, is_primary DESC, summary ASC
+";
 
 pub const CALENDAR_GET_BY_ID_SQL: &str =
     "SELECT * FROM google_calendars WHERE id = ? AND deleted_at IS NULL";
@@ -509,6 +537,60 @@ pub const CALENDAR_UPSERT_SQL: &str = "
         deleted_at = NULL
 ";
 
+/// Idempotent seed for a standalone user's one local calendar (ADR 0012).
+///
+/// Binds: id, user_id, google_calendar_id, summary, time_zone, then `now`
+/// five times (`last_synced_at`, `last_success_at`,
+/// `event_labels_updated_at`, `created_at`, `updated_at`) with `event_labels`
+/// between the second and third — 11 binds total. Every column that is NOT
+/// NULL without a default is written explicitly, and the health columns are
+/// hardcoded so the row can never enter a sync path: `sync_enabled = 1` (the
+/// event-range/running SQL require it) and `sync_status = 'disabled'` (no
+/// sync, no stale banner, no repair). On conflict only `deleted_at` is
+/// cleared: a soft-deleted local calendar is resurrected, while the stored
+/// time zone, labels, and health columns are never overwritten.
+pub const CALENDAR_INSERT_STANDALONE_SQL: &str = "
+    INSERT INTO google_calendars (
+        id, user_id, google_calendar_id, summary, time_zone,
+        is_primary, access_role, sync_enabled, sync_token, sync_status,
+        sync_query_fingerprint, initial_sync_complete, last_synced_at,
+        last_success_at, last_error_code, failure_streak,
+        dirty_requested_generation, dirty_applied_generation,
+        full_sync_requested, lease_owner, cache_revision, projection,
+        event_labels, event_labels_updated_at, watch_coverage, event_coverage,
+        created_at, updated_at
+    ) VALUES (
+        ?, ?, ?, ?, ?,
+        1, 'owner', 1, '', 'disabled',
+        '', 1, ?,
+        ?, '', 0,
+        0, 0,
+        0, '', 0, 'timed_masters_and_exceptions',
+        ?, ?, 'covered', 'complete',
+        ?, ?
+    )
+    ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET deleted_at = NULL
+";
+
+/// The `labelProperties.eventLabels` JSON a standalone calendar is seeded with:
+/// the 24 [`GOOGLE_EVENT_LABEL_COLORS`] under Google's ids `"1"`..`"24"`, in
+/// the exact `[{"id","backgroundColor"}]` shape
+/// [`crate::calendar::ensure_calendar_event_labels`] caches (so the create
+/// path can resolve a snapped hex without a `calendars.get`).
+pub fn standalone_event_labels_json() -> String {
+    let labels: Vec<serde_json::Value> = GOOGLE_EVENT_LABEL_COLORS
+        .iter()
+        .enumerate()
+        .map(|(index, hex)| {
+            serde_json::json!({
+                "id": (index + 1).to_string(),
+                "backgroundColor": hex,
+            })
+        })
+        .collect();
+    serde_json::to_string(&labels).expect("a static palette always serializes")
+}
+
 /// Per-user calendarList.list cursor. Binds: user_id.
 pub const CALENDAR_LIST_STATE_GET_SQL: &str =
     "SELECT sync_token FROM google_calendar_list_state WHERE user_id = ?";
@@ -524,8 +606,16 @@ pub const CALENDAR_LIST_STATE_UPSERT_SQL: &str = "
 ";
 
 /// Distinct owners of living calendars (including sync-disabled). Ordered.
-pub const CALENDAR_LIST_USER_IDS_SQL: &str =
-    "SELECT DISTINCT user_id FROM google_calendars WHERE deleted_at IS NULL ORDER BY user_id ASC";
+///
+/// Google users only (ADR 0012): a standalone calendar is local and must never
+/// enter the calendarList import, fallback sync, or watch paths. A subquery
+/// (not a join) keeps the `SELECT *` row shape unchanged.
+pub const CALENDAR_LIST_USER_IDS_SQL: &str = "
+    SELECT DISTINCT user_id FROM google_calendars
+    WHERE deleted_at IS NULL
+      AND user_id IN (SELECT id FROM users WHERE integration_type = 'google')
+    ORDER BY user_id ASC
+";
 
 pub const CALENDAR_UPDATE_SYNC_STATE_SQL: &str =
     "UPDATE google_calendars SET sync_token = ?, last_synced_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL";
@@ -1705,16 +1795,24 @@ mod tests {
 
     #[test]
     fn calendar_list_sync_enabled_filters_and_orders() {
-        // The fallback cron's work list: only sync-enabled, non-deleted rows,
-        // ordered by user then primary first then summary.
+        // The fallback cron's work list: only sync-enabled, non-deleted rows
+        // of Google users, ordered by user then primary first then summary.
+        // Standalone calendars are `sync_enabled = 1` on purpose (events must
+        // appear in the range queries) but must never enter this work list.
         let sql = CALENDAR_LIST_SYNC_ENABLED_SQL;
         assert!(sql.contains("sync_enabled = 1"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
+        assert!(
+            sql.contains("user_id IN (SELECT id FROM users WHERE integration_type = 'google')"),
+            "only Google users: {sql}"
+        );
+        assert!(!sql.contains("user_id = ?"), "never one bound user: {sql}");
         let order_start = sql.find("ORDER BY").expect("has ORDER BY");
         assert_eq!(
-            &sql[order_start..],
+            sql[order_start..].trim(),
             "ORDER BY user_id ASC, is_primary DESC, summary ASC"
         );
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
     }
 
     #[test]
@@ -2165,7 +2263,80 @@ mod tests {
         let sql = CALENDAR_LIST_USER_IDS_SQL;
         assert!(sql.contains("DISTINCT user_id"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
-        assert!(sql.contains("ORDER BY user_id ASC"), "{sql}");
+        assert!(
+            sql.contains("user_id IN (SELECT id FROM users WHERE integration_type = 'google')"),
+            "only Google users: {sql}"
+        );
+        assert!(sql.trim_end().ends_with("ORDER BY user_id ASC"), "{sql}");
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
+    }
+
+    #[test]
+    fn calendar_insert_standalone_seeds_a_disabled_but_sync_enabled_row() {
+        let sql = CALENDAR_INSERT_STANDALONE_SQL;
+        assert!(sql.contains("INSERT INTO google_calendars"), "{sql}");
+        assert!(
+            sql.contains(
+                "ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET deleted_at = NULL"
+            ),
+            "a soft-deleted local calendar must be resurrected: {sql}"
+        );
+        // sync_enabled = 1 is what makes standalone events visible in the
+        // range/running queries; sync_status = 'disabled' keeps sync quiet.
+        assert!(sql.contains("sync_enabled"), "{sql}");
+        assert!(sql.contains("'disabled'"), "sync_status must be disabled: {sql}");
+        assert!(sql.contains("'owner'"), "{sql}");
+        assert!(sql.contains("'timed_masters_and_exceptions'"), "{sql}");
+        // Every NOT NULL column without a default is written explicitly.
+        for column in [
+            "id",
+            "user_id",
+            "google_calendar_id",
+            "summary",
+            "time_zone",
+            "is_primary",
+            "access_role",
+            "sync_enabled",
+            "sync_token",
+            "sync_status",
+            "sync_query_fingerprint",
+            "initial_sync_complete",
+            "last_synced_at",
+            "last_success_at",
+            "last_error_code",
+            "failure_streak",
+            "dirty_requested_generation",
+            "dirty_applied_generation",
+            "full_sync_requested",
+            "lease_owner",
+            "cache_revision",
+            "projection",
+            "event_labels",
+            "event_labels_updated_at",
+            "watch_coverage",
+            "event_coverage",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(sql.contains(column), "missing {column} in {sql}");
+        }
+        // 5 identity binds + 5 `now` binds + event_labels.
+        assert_eq!(sql.matches('?').count(), 11, "{sql}");
+    }
+
+    #[test]
+    fn standalone_event_labels_json_has_the_24_palette_ids() {
+        let json = standalone_event_labels_json();
+        let labels: Vec<serde_json::Value> = serde_json::from_str(&json).expect("json array");
+        assert_eq!(labels.len(), 24);
+        assert_eq!(labels[0]["id"], "1");
+        assert_eq!(labels[23]["id"], "24");
+        for (index, label) in labels.iter().enumerate() {
+            assert_eq!(
+                label["backgroundColor"], GOOGLE_EVENT_LABEL_COLORS[index],
+                "palette order must match the ids"
+            );
+        }
     }
 
     #[test]

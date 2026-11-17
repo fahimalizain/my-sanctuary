@@ -2,9 +2,27 @@ use worker::*;
 
 use api_core::repo::CalendarRepo;
 use api_core::{
-    models::NewEventInput, models::PatchEventFields, paint_events_default, paint_events_for_user,
-    CalendarError, CalendarEventView, OAuthConfig,
+    models::IntegrationType, models::NewEventInput, models::PatchEventFields, paint_events_default,
+    paint_events_for_user, CalendarError, CalendarEventView, CalendarView, CalendarsResponse,
 };
+
+use crate::calendar_access::{calendar_access, CalendarAccessError};
+
+/// Zone used to seed a missing standalone calendar when the deployment config
+/// is unavailable. Mirrors `api_core::DEFAULT_STANDALONE_TIME_ZONE` (not
+/// re-exported from `api_core`); the standalone access branch requires a
+/// config, so this is a defensive default only.
+const FALLBACK_STANDALONE_TIME_ZONE: &str = "UTC";
+
+/// Configured IANA zone for a standalone self-heal seed, with the defensive
+/// UTC fallback (the standalone access branch requires a config, so this only
+/// matters if the config is missing).
+fn standalone_seed_time_zone(ctx: &RouteContext<Option<api_core::Config>>) -> String {
+    ctx.data
+        .as_ref()
+        .map(|config| config.standalone_default_time_zone.clone())
+        .unwrap_or_else(|| FALLBACK_STANDALONE_TIME_ZONE.to_string())
+}
 
 /// 401 body for missing/invalid session only (ADR 0005 invariant 10).
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -24,23 +42,32 @@ fn json_error(
     Ok(response)
 }
 
-/// Authenticated user + OAuth config, or a `None` 401 signal: the credential
-/// is read once by [`crate::auth::authenticate`] (cookie or API key bearer),
-/// and a missing OAuth config stays a 401 exactly as it did cookie-only.
-async fn session_and_oauth<'a>(
+/// Authenticated user, or a `None` 401 signal: the credential is read once by
+/// [`crate::auth::authenticate`] (cookie or API key bearer).
+///
+/// This is only the auth gate: the calendar backend (Google or the standalone
+/// stand-in) comes from [`calendar_access`], which every handler that touches
+/// events calls. `repair_calendar` is D1-only and stops here.
+async fn session(
     req: &Request,
-    ctx: &'a RouteContext<Option<api_core::Config>>,
-) -> Result<Option<(api_core::SessionUser, &'a OAuthConfig)>> {
-    let Some(user) = crate::auth::authenticate(req, ctx).await else {
-        return Ok(None);
-    };
-    let Some(config) = ctx.data.as_ref() else {
-        return Ok(None);
-    };
-    let Some(oauth) = config.oauth.as_ref() else {
-        return Ok(None);
-    };
-    Ok(Some((user, oauth)))
+    ctx: &RouteContext<Option<api_core::Config>>,
+) -> Result<Option<api_core::SessionUser>> {
+    Ok(crate::auth::authenticate(req, ctx).await)
+}
+
+/// The response for a failed [`calendar_access`] on a **write** path: a
+/// Google refresh failure was always a 401 here, and it still is.
+fn access_denied(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    err: CalendarAccessError,
+) -> Result<Response> {
+    match err {
+        CalendarAccessError::Unauthorized => unauthorized(ctx),
+        CalendarAccessError::GoogleRefresh(err) => {
+            console_log!("calendar: token refresh failed: {err}");
+            unauthorized(ctx)
+        }
+    }
 }
 
 async fn paint_single_event(
@@ -99,6 +126,7 @@ async fn resolve_create_defaults(
     calendars: &crate::db::D1CalendarRepo,
     list_repo: &crate::db::D1TaskListRepo,
     category_repo: &crate::db::D1TaskCategoryRepo,
+    http: &dyn api_core::HttpClient,
     access: &api_core::GoogleAccess,
     user_id: &str,
     now_unix: i64,
@@ -161,14 +189,8 @@ async fn resolve_create_defaults(
     // Refresh a never-populated cache once; on failure fall back to an
     // uncolored create instead of failing the write.
     if cal.event_labels.is_empty() {
-        if let Err(err) = api_core::ensure_calendar_event_labels(
-            &crate::http::WorkerHttp,
-            calendars,
-            access,
-            &cal.id,
-            now_unix,
-        )
-        .await
+        if let Err(err) =
+            api_core::ensure_calendar_event_labels(http, calendars, access, &cal.id, now_unix).await
         {
             console_log!("calendar: create event-label refresh failed: {err}");
             input.color_hex = None;
@@ -187,9 +209,10 @@ async fn resolve_create_defaults(
 /// `GET /api/calendar/events` → 200
 /// `{"events":[...],"source":"cache"|"window"|"mixed","sync":{...}}`.
 ///
-/// Gated on the session cookie or an API key bearer; refreshes the Google
-/// token when stale; for each never-initialized sync-enabled calendar runs a
-/// bounded window fetch
+/// Gated on the session cookie or an API key bearer; resolves the calendar
+/// backend through [`calendar_access`] (Google: refresh the token when stale;
+/// standalone: the local stand-in, no Google I/O and no watches). For each
+/// never-initialized sync-enabled calendar runs a bounded window fetch
 /// (awaited, never fire-and-forget) without waiting on the replica token;
 /// then serves the overlap window from the D1 cache (plus ephemeral rows on
 /// lease miss) and a sanitized replica-health `sync` envelope. Google auth
@@ -199,12 +222,14 @@ pub async fn list_events(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
+    let Some(user) = session(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
 
-    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
-    let tokens = crate::db::D1TokenRepo::new(d1()?);
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
@@ -227,37 +252,66 @@ pub async fn list_events(
     let watches = crate::db::D1WatchChannelRepo::new(d1()?);
     let list_repo = crate::db::D1TaskListRepo::new(d1()?);
     let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
-    let watch_callback_url = ctx
-        .data
-        .as_ref()
-        .and_then(|config| config.watch_callback_url.as_deref());
+    // A standalone calendar never enters the watch path — there is no Google
+    // channel to create and the stand-in answers `events.watch` with a loud
+    // 501. Passing `None` keeps the read purely local.
+    let watch_callback_url = if user.integration_type == IntegrationType::Standalone {
+        None
+    } else {
+        ctx.data
+            .as_ref()
+            .and_then(|config| config.watch_callback_url.as_deref())
+    };
 
     // Everything that does not depend on the token or on each other runs
     // concurrently (D1 round trips cost ~100ms each from the Worker's
-    // region): the token read/refresh, the calendars + watch channels
+    // region): the access/token read/refresh, the calendars + watch channels
     // snapshot, and the paint taxonomy (lists, categories, patterns). Only
     // the range query has to wait — a window fetch may write through first.
-    let (refresh, snapshot, taxonomy) = futures::join!(
-        api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix),
+    let (access, snapshot, taxonomy) = futures::join!(
+        calendar_access(&ctx, &req, &user, now_unix),
         api_core::load_list_snapshot(&calendars, &watches, &user.id),
         api_core::load_paint_taxonomy(&list_repo, &category_repo, &user.id),
     );
 
-    let output = match refresh {
-        Ok(access) => {
-            let snapshot = match snapshot {
+    let output = match access {
+        Ok(session) => {
+            let mut snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     console_log!("calendar: list_events failed: {err}");
                     return json_error(&ctx, 500, "failed to load events");
                 }
             };
+            // Self-heal (ADR 0012): a standalone user whose local calendar row
+            // is missing (older account, manual delete) gets the seed before
+            // the read. The stand-in has no calendarList/events.list, so the
+            // empty-store import path must never be reached.
+            if user.integration_type == IntegrationType::Standalone && snapshot.calendars.is_empty()
+            {
+                let time_zone = standalone_seed_time_zone(&ctx);
+                if let Err(err) =
+                    api_core::ensure_standalone_calendar(&calendars, &user.id, &time_zone, now_unix)
+                        .await
+                {
+                    console_log!("calendar: standalone calendar seed failed: {err}");
+                    return json_error(&ctx, 500, "failed to load events");
+                }
+                snapshot = match api_core::load_list_snapshot(&calendars, &watches, &user.id).await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        console_log!("calendar: list_events failed: {err}");
+                        return json_error(&ctx, 500, "failed to load events");
+                    }
+                };
+            }
             match api_core::list_events_with_snapshot(
-                &crate::http::WorkerHttp,
+                session.http.as_ref(),
                 &calendars,
                 &events,
                 &watches,
-                &access,
+                &session.access,
                 &user.id,
                 &start,
                 &end,
@@ -277,22 +331,16 @@ pub async fn list_events(
                 }
             }
         }
-        Err(err) => {
+        Err(CalendarAccessError::Unauthorized) => return unauthorized(&ctx),
+        Err(CalendarAccessError::GoogleRefresh(err)) => {
             console_log!("calendar: token refresh failed: {err}");
-            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient
-            {
+            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient {
                 return json_error(&ctx, 500, "failed to load events");
             }
             // The snapshot was loaded before a revoked grant stamped the
             // calendars, so this path re-reads them itself.
             match api_core::list_events_after_refresh_failure(
-                &calendars,
-                &events,
-                &user.id,
-                &start,
-                &end,
-                now_unix,
-                &err,
+                &calendars, &events, &user.id, &start, &end, now_unix, &err,
             )
             .await
             {
@@ -331,11 +379,13 @@ pub async fn list_events(
 
 /// `GET /api/calendar/calendars` → 200 `{"calendars":[...]}`.
 ///
-/// Gated on the session cookie or an API key bearer; refreshes the Google
-/// token when stale. Serves the user's imported calendars from the D1 cache —
-/// no Google calls once the store has
-/// rows; an empty store runs the same first-contact `calendarList` import
-/// as `GET /api/calendar/events` (no event sync, no watch setup).
+/// Gated on the session cookie or an API key bearer; resolves the backend
+/// through [`calendar_access`]. Google: refresh the token when stale, then
+/// serve the imported calendars from the D1 cache — no Google calls once the
+/// store has rows; an empty store runs the same first-contact `calendarList`
+/// import as `GET /api/calendar/events` (no event sync, no watch setup).
+/// Standalone: the cached local calendar, self-healed when missing, and never
+/// a `calendarList` import (the stand-in does not emulate it).
 ///
 /// Missing/unusable credential → 401 `{"error":"unauthorized"}`.
 /// Google `refresh_if_needed` failure: revoked/missing grant → 200 cached
@@ -346,55 +396,62 @@ pub async fn list_calendars(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
+    let Some(user) = session(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
 
-    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
-    let tokens = crate::db::D1TokenRepo::new(d1()?);
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let now_rfc3339 = api_core::unix_secs_to_rfc3339(now_unix);
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
 
-    let response = match api_core::refresh_if_needed(
-        &crate::http::WorkerHttp,
-        &tokens,
-        oauth,
-        &user.id,
-        now_unix,
-    )
-    .await
-    {
-        Ok(access) => {
-            match api_core::list_calendars(
-                &crate::http::WorkerHttp,
-                &calendars,
-                &access,
-                &user.id,
-                &now_rfc3339,
-            )
-            .await
-            {
-                Ok(output) => Response::from_json(&output)?,
-                Err(CalendarError::GoogleApi(message)) => return json_error(&ctx, 502, &message),
-                Err(err) => {
-                    console_log!("calendar: list_calendars failed: {err}");
-                    return json_error(&ctx, 500, "failed to load calendars");
+    let response = match calendar_access(&ctx, &req, &user, now_unix).await {
+        Ok(session) => match user.integration_type {
+            // No `calendarList` import, no watches: the local store is the
+            // whole answer. Self-heal an empty store first so the first
+            // login-less request still paints `Personal`.
+            IntegrationType::Standalone => {
+                match standalone_calendars(&ctx, &calendars, &user.id, now_unix).await {
+                    Ok(output) => Response::from_json(&output)?,
+                    Err(err) => {
+                        console_log!("calendar: list_calendars failed: {err}");
+                        return json_error(&ctx, 500, "failed to load calendars");
+                    }
                 }
             }
-        }
-        Err(err) => {
+            IntegrationType::Google => {
+                match api_core::list_calendars(
+                    session.http.as_ref(),
+                    &calendars,
+                    &session.access,
+                    &user.id,
+                    &now_rfc3339,
+                )
+                .await
+                {
+                    Ok(output) => Response::from_json(&output)?,
+                    Err(CalendarError::GoogleApi(message)) => {
+                        return json_error(&ctx, 502, &message)
+                    }
+                    Err(err) => {
+                        console_log!("calendar: list_calendars failed: {err}");
+                        return json_error(&ctx, 500, "failed to load calendars");
+                    }
+                }
+            }
+        },
+        Err(CalendarAccessError::Unauthorized) => return unauthorized(&ctx),
+        Err(CalendarAccessError::GoogleRefresh(err)) => {
             console_log!("calendar: token refresh failed: {err}");
-            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient
-            {
+            if api_core::classify_refresh_failure(&err) == api_core::RefreshFailureKind::Transient {
                 return json_error(&ctx, 500, "failed to load calendars");
             }
             match api_core::list_calendars_after_refresh_failure(
-                &calendars,
-                &user.id,
-                now_unix,
-                &err,
+                &calendars, &user.id, now_unix, &err,
             )
             .await
             {
@@ -409,6 +466,30 @@ pub async fn list_calendars(
     Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
 }
 
+/// Standalone calendar listing: the cached rows, self-healing an empty store
+/// with [`api_core::ensure_standalone_calendar`].
+///
+/// The seed only resurrects/creates a row (`ON CONFLICT … DO UPDATE SET
+/// deleted_at = NULL`), so a stored time zone and label cache are never
+/// overwritten; the configured default zone only applies to a genuinely
+/// missing row.
+async fn standalone_calendars(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    calendars: &crate::db::D1CalendarRepo,
+    user_id: &str,
+    now_unix: i64,
+) -> Result<CalendarsResponse, CalendarError> {
+    let mut rows = calendars.list_by_user_id(user_id).await?;
+    if rows.is_empty() {
+        let time_zone = standalone_seed_time_zone(ctx);
+        api_core::ensure_standalone_calendar(calendars, user_id, &time_zone, now_unix).await?;
+        rows = calendars.list_by_user_id(user_id).await?;
+    }
+    Ok(CalendarsResponse {
+        calendars: rows.into_iter().map(CalendarView::from).collect(),
+    })
+}
+
 /// `POST /api/calendar/calendars/:id/repair` → 200
 /// `{"status":"queued"|"in_progress"|"cooldown","retry_after_seconds":?}`.
 ///
@@ -421,14 +502,20 @@ pub async fn repair_calendar(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user, _oauth)) = session_and_oauth(&req, &ctx).await? else {
+    // Authentication only: repair is a D1-only reseed request, and a
+    // standalone calendar (`sync_status = 'disabled'`) answers 400 below
+    // without any Google involvement.
+    let Some(user) = session(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
         return json_error(&ctx, 404, "calendar not found");
     };
 
-    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
@@ -465,21 +552,21 @@ pub async fn create_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
+    let Some(user) = session(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
 
-    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
-    let tokens = crate::db::D1TokenRepo::new(d1()?);
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix).await {
-        Ok(access) => access,
-        Err(err) => {
-            console_log!("calendar: token refresh failed: {err}");
-            return unauthorized(&ctx);
-        }
+    let session = match calendar_access(&ctx, &req, &user, now_unix).await {
+        Ok(session) => session,
+        Err(err) => return access_denied(&ctx, err),
     };
+    let access = &session.access;
 
     let mut input: NewEventInput = match req.json().await {
         Ok(input) => input,
@@ -495,7 +582,8 @@ pub async fn create_event(
         &calendars,
         &list_repo,
         &category_repo,
-        &access,
+        session.http.as_ref(),
+        access,
         &user.id,
         now_unix,
         &mut input,
@@ -503,11 +591,11 @@ pub async fn create_event(
     .await;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     match api_core::create_event(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &calendars,
         &events,
         &operations,
-        &access,
+        access,
         &user.id,
         &input,
         now_unix,
@@ -523,8 +611,7 @@ pub async fn create_event(
                 event,
                 source: output.source,
             })?;
-            Ok(response
-                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "calendar not found"),
         Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
@@ -554,24 +641,24 @@ pub async fn update_event(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
+    let Some(user) = session(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
         return json_error(&ctx, 404, "event not found");
     };
 
-    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
-    let tokens = crate::db::D1TokenRepo::new(d1()?);
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix).await {
-        Ok(access) => access,
-        Err(err) => {
-            console_log!("calendar: token refresh failed: {err}");
-            return unauthorized(&ctx);
-        }
+    let session = match calendar_access(&ctx, &req, &user, now_unix).await {
+        Ok(session) => session,
+        Err(err) => return access_denied(&ctx, err),
     };
+    let access = &session.access;
 
     let fields: PatchEventFields = match req.json().await {
         Ok(fields) => fields,
@@ -584,11 +671,11 @@ pub async fn update_event(
     let category_repo = crate::db::D1TaskCategoryRepo::new(d1()?);
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     match api_core::update_event_for_user(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &calendars,
         &events,
         &operations,
-        &access,
+        access,
         &user.id,
         &id,
         &fields,
@@ -605,8 +692,7 @@ pub async fn update_event(
                 event,
                 source: output.source,
             })?;
-            Ok(response
-                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
         Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),
@@ -630,35 +716,35 @@ pub async fn delete_event(
     req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
-    let Some((user, oauth)) = session_and_oauth(&req, &ctx).await? else {
+    let Some(user) = session(&req, &ctx).await? else {
         return unauthorized(&ctx);
     };
     let Some(id) = ctx.param("id").map(|s| s.to_string()) else {
         return json_error(&ctx, 404, "event not found");
     };
 
-    let d1 = || ctx.d1("DB").map_err(|_| Error::RustError("d1 binding not configured".to_string()));
-    let tokens = crate::db::D1TokenRepo::new(d1()?);
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = match api_core::refresh_if_needed(&crate::http::WorkerHttp, &tokens, oauth, &user.id, now_unix).await {
-        Ok(access) => access,
-        Err(err) => {
-            console_log!("calendar: token refresh failed: {err}");
-            return unauthorized(&ctx);
-        }
+    let session = match calendar_access(&ctx, &req, &user, now_unix).await {
+        Ok(session) => session,
+        Err(err) => return access_denied(&ctx, err),
     };
+    let access = &session.access;
 
     let calendars = crate::db::D1CalendarRepo::new(d1()?);
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     let operations = crate::db::D1CalendarEventOperationRepo::new(d1()?);
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     match api_core::delete_event_for_user(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &calendars,
         &events,
         &operations,
-        &access,
+        access,
         &user.id,
         &id,
         now_unix,
@@ -668,8 +754,7 @@ pub async fn delete_event(
     {
         Ok(()) => {
             let response = Response::from_json(&api_core::DeleteEventResponse { success: true })?;
-            Ok(response
-                .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(CalendarError::NotFound) => json_error(&ctx, 404, "event not found"),
         Err(CalendarError::Invalid(message)) => json_error(&ctx, 400, &message),

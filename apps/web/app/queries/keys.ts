@@ -4,6 +4,9 @@ export const queryKeys = {
   auth: {
     all: ['auth'] as const,
     me: () => [...queryKeys.auth.all, 'me'] as const,
+    // The login page's sign-in methods. Deliberately under `auth.all` so
+    // logout's `clear()` drops it with the rest of the session cache.
+    providers: () => [...queryKeys.auth.all, 'providers'] as const,
   },
   lists: {
     all: ['lists'] as const,

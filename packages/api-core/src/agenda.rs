@@ -4932,6 +4932,20 @@ mod tests {
         }
     }
 
+    /// A single local calendar shaped like `ensure_standalone_calendar`'s seed
+    /// (ADR 0012): `sync_enabled = 1`, `sync_status = 'disabled'`, UTC zone so
+    /// `NOW_UNIX` is still `2026-08-23`.
+    fn standalone_calendar() -> GoogleCalendar {
+        GoogleCalendar {
+            id: "standalone-cal-u-1".to_string(),
+            google_calendar_id: "standalone:u-1".to_string(),
+            summary: "Personal".to_string(),
+            sync_status: "disabled".to_string(),
+            initial_sync_complete: true,
+            ..calendar("standalone:u-1", true)
+        }
+    }
+
     /// The Google `events.insert` echo for an occurrence start — the exact
     /// shape Google returns (including the two occurrence carriers and the
     /// summary it was sent, i.e. the resolved title).
@@ -8576,6 +8590,109 @@ mod tests {
         assert_eq!(upserted[0].task_id, "", "calendar_events.task_id stays empty");
         assert_eq!(upserted[0].title, "Fajr Qadha", "the response echo maps the summary");
         assert_eq!(upserted[0].recurrence, "", "no recurrence on the cache row");
+    }
+
+    /// The occurrence flow over the standalone stand-in: the only
+    /// `HttpClient` the service sees is `StandaloneCalendarHttp`, so a Google
+    /// call would fail the test instead of silently succeeding.
+    #[test]
+    fn standalone_stand_in_covers_occurrence_start_and_complete() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+
+        // The stand-in and the service share the SAME repos (Arc), so the
+        // journal's cache upsert is visible to the stand-in's reads.
+        let calendars = Arc::new(FakeCalendarRepo::with(vec![standalone_calendar()]));
+        let events = Arc::new(FakeEventRepo::new());
+        let http = crate::calendar::StandaloneCalendarHttp::new(
+            calendars.clone(),
+            events.clone(),
+            "u-1".to_string(),
+            NOW_UNIX,
+        );
+        let access = access();
+        let operations = ops();
+
+        let started = pollster::block_on(start_occurrence(
+            &http,
+            calendars.as_ref(),
+            events.as_ref(),
+            &operations,
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &access,
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+            noop_notify(),
+        ))
+        .expect("standalone occurrence start");
+
+        assert_eq!(started.occurrence.status, OCCURRENCE_STATUS_IN_PROGRESS);
+        assert_eq!(
+            started.occurrence.calendar_id.as_deref(),
+            Some("standalone-cal-u-1")
+        );
+        let event = started.event.expect("start returns the event");
+        assert_eq!(event.title, "Fajr Qadha");
+        assert_eq!(event.calendar_id, "standalone-cal-u-1");
+        assert!(
+            !event.google_event_id.is_empty(),
+            "the stand-in echoed the journal's insert id"
+        );
+
+        // The cached row carries the occurrence carriers in raw_json and no
+        // task link — the stand-in rebuilt nothing.
+        let stored = events.stored.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1, "the journal cached the echoed insert");
+        assert_eq!(stored[0].task_id, "");
+        let raw: serde_json::Value = serde_json::from_str(&stored[0].raw_json).expect("raw JSON");
+        assert_eq!(
+            raw["extendedProperties"]["shared"]["sanctuary_routine_id"],
+            "rt-1"
+        );
+        assert_eq!(
+            raw["extendedProperties"]["shared"]["sanctuary_occurrence_id"],
+            "occ-1"
+        );
+
+        // Complete patches the chip's end through the same stand-in.
+        let complete_unix = NOW_UNIX + 600;
+        let expected_end = unix_secs_to_rfc3339(nearest_minute_unix(complete_unix));
+        let completed = pollster::block_on(complete_occurrence(
+            Some(&http),
+            Some(calendars.as_ref()),
+            Some(events.as_ref()),
+            Some(&operations),
+            Some(&access),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            "u-1",
+            "occ-1",
+            complete_unix,
+            noop_notify(),
+        ))
+        .expect("standalone occurrence complete");
+
+        assert_eq!(completed.occurrence.status, OCCURRENCE_STATUS_DONE);
+        let stored = events.stored.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1, "the patch updates the row in place");
+        assert_eq!(stored[0].end_time, expected_end, "end == snapped now");
+        assert!(
+            stored[0].sequence > 0,
+            "the stand-in bumped the sequence on patch"
+        );
+        let raw: serde_json::Value = serde_json::from_str(&stored[0].raw_json).expect("raw JSON");
+        assert_eq!(raw["end"]["dateTime"], expected_end);
+        assert_eq!(
+            raw["extendedProperties"]["shared"]["sanctuary_occurrence_id"], "occ-1",
+            "a patch keeps the occurrence carrier"
+        );
     }
 
     #[test]

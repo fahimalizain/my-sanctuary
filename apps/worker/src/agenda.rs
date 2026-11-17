@@ -1,14 +1,15 @@
 //! `/api/agenda/*` + `/api/occurrences/*` handlers (ADR 0004).
 //!
 //! Session-gated via the session cookie or an API key bearer — like
-//! `/api/lists/*` and `/api/routines`. The Google-touching verbs gate on a
-//! refreshable token:
+//! `/api/lists/*` and `/api/routines`. The Google-touching verbs resolve a
+//! calendar backend through [`crate::calendar_access`] (Google token refresh,
+//! or the local stand-in for a standalone user):
 //! `/start` always, pause/complete/skip **when the occurrence is `in_progress`
 //! with stored ids** (load first, like the focused delete), and the title
 //! PATCH **when a chip exists** (`google_event_id` set). Everything else
 //! needs only the credential. The orchestration lives in `api_core::agenda`
 //! (pure, unit-tested); this file extracts the authenticated user, wires the
-//! D1 repos, refreshes tokens, and maps errors to HTTP responses.
+//! D1 repos, asks for the backend, and maps errors to HTTP responses.
 //!
 //! Status map: 401 unauthorized (missing/unusable credential, or a
 //! Google-touching verb without a refreshable token), 400 invalid input
@@ -25,7 +26,7 @@ use worker::*;
 
 use api_core::agenda::AgendaError;
 use api_core::models::{MoveAgendaItemInput, RescheduleAgendaItemInput, UpdateOccurrence};
-use api_core::{GoogleAccess, OccurrenceRepo, OAuthConfig, UserRepo};
+use api_core::{OccurrenceRepo, UserRepo};
 
 /// 401 body for missing/invalid sessions.
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
@@ -81,9 +82,7 @@ fn occurrences_d1(
     Ok(crate::db::D1OccurrenceRepo::new(db))
 }
 
-fn routines_d1(
-    ctx: &RouteContext<Option<api_core::Config>>,
-) -> Result<crate::db::D1RoutineRepo> {
+fn routines_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1RoutineRepo> {
     let db = ctx
         .d1("DB")
         .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
@@ -127,16 +126,16 @@ fn users_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D
     Ok(crate::db::D1UserRepo::new(db))
 }
 
-fn calendars_d1(
-    ctx: &RouteContext<Option<api_core::Config>>,
-) -> Result<crate::db::D1CalendarRepo> {
+fn calendars_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1CalendarRepo> {
     let db = ctx
         .d1("DB")
         .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
     Ok(crate::db::D1CalendarRepo::new(db))
 }
 
-fn events_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1CalendarEventRepo> {
+fn events_d1(
+    ctx: &RouteContext<Option<api_core::Config>>,
+) -> Result<crate::db::D1CalendarEventRepo> {
     let db = ctx
         .d1("DB")
         .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
@@ -152,35 +151,27 @@ fn operations_d1(
     Ok(crate::db::D1CalendarEventOperationRepo::new(db))
 }
 
-fn tokens_d1(ctx: &RouteContext<Option<api_core::Config>>) -> Result<crate::db::D1TokenRepo> {
-    let db = ctx
-        .d1("DB")
-        .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?;
-    Ok(crate::db::D1TokenRepo::new(db))
-}
-
-/// OAuth config for the Google gate, or `None` — the caller has already
-/// authenticated, so a missing config or a missing grant both stay 401.
-fn google_access<'a>(ctx: &'a RouteContext<Option<api_core::Config>>) -> Option<&'a OAuthConfig> {
-    ctx.data.as_ref()?.oauth.as_ref()
-}
-
-/// Refreshes the user's Google access token. `None` when the stored token
-/// cannot be refreshed (missing/expired refresh token, Google 400) — callers
-/// respond 401 `{"error":"unauthorized"}` exactly like `/api/calendar/*`.
-async fn refresh_access(
-    tokens: &crate::db::D1TokenRepo,
-    oauth: &OAuthConfig,
-    user_id: &str,
-    now_unix: i64,
-) -> Option<GoogleAccess> {
-    match api_core::refresh_if_needed(&crate::http::WorkerHttp, tokens, oauth, user_id, now_unix)
-        .await
-    {
-        Ok(access) => Some(access),
-        Err(err) => {
+/// Calendar-access gate for the Google-touching agenda verbs.
+///
+/// The caller has already authenticated and (where relevant) loaded the
+/// occurrence, so a closed gate is always a plain `401 {"error":"unauthorized"}`
+/// — never a 404 leak. Google users get a refreshed token; standalone users
+/// get the local stand-in, subject to the same
+/// `ALLOW_STANDALONE_AUTH`/request-host gate.
+async fn session_access(
+    req: &Request,
+    ctx: &RouteContext<Option<api_core::Config>>,
+    user: &api_core::SessionUser,
+) -> Result<Result<crate::calendar_access::CalendarSession, Response>> {
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    match crate::calendar_access::calendar_access(ctx, req, user, now_unix).await {
+        Ok(session) => Ok(Ok(session)),
+        Err(crate::calendar_access::CalendarAccessError::Unauthorized) => {
+            Ok(Err(unauthorized(ctx)?))
+        }
+        Err(crate::calendar_access::CalendarAccessError::GoogleRefresh(err)) => {
             console_log!("agenda: token refresh failed: {err}");
-            None
+            Ok(Err(unauthorized(ctx)?))
         }
     }
 }
@@ -218,7 +209,10 @@ async fn focused_task_id(
 /// **pure range read**: it seeds nothing and writes no occurrence / agenda row
 /// (the old `?date=` parameter is ignored). The response carries the
 /// server-computed `today` + `time_zone`.
-pub async fn get_agenda(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
+pub async fn get_agenda(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
     let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
@@ -454,21 +448,18 @@ pub async fn patch_occurrence(
         return json_error(&ctx, 404, "not found");
     }
     let needs_google = occurrence.google_event_id.is_some() && occurrence.calendar_id.is_some();
-    let (http, access) = if needs_google {
-        let Some(oauth) = google_access(&ctx) else {
-            return unauthorized(&ctx);
-        };
-        let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-        let Some(access) = refresh_access(&tokens_d1(&ctx)?, oauth, &user.id, now_unix).await else {
-            return unauthorized(&ctx);
-        };
-        (
-            Some(&crate::http::WorkerHttp as &dyn api_core::HttpClient),
-            Some(access),
-        )
+    let session = if needs_google {
+        match session_access(&req, &ctx, &user).await? {
+            Ok(session) => Some(session),
+            Err(response) => return Ok(response),
+        }
     } else {
-        (None, None)
+        None
     };
+    let http = session
+        .as_ref()
+        .map(|session| session.http.as_ref() as &dyn api_core::HttpClient);
+    let access = session.as_ref().map(|session| &session.access);
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let calendars = calendars_d1(&ctx)?;
@@ -480,7 +471,7 @@ pub async fn patch_occurrence(
         needs_google.then(|| &calendars as &dyn api_core::CalendarRepo),
         needs_google.then(|| &events as &dyn api_core::CalendarEventRepo),
         needs_google.then(|| &operations as &dyn api_core::CalendarEventOperationRepo),
-        access.as_ref(),
+        access,
         &lists_d1(&ctx)?,
         &categories_d1(&ctx)?,
         &routines_d1(&ctx)?,
@@ -518,24 +509,21 @@ pub async fn start_occurrence(
     let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
         return unauthorized(&ctx);
     };
-    let Some(oauth) = google_access(&ctx) else {
-        return unauthorized(&ctx);
-    };
     let Some(id) = ctx.param("id") else {
         return json_error(&ctx, 404, "not found");
     };
-    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-    let tokens = tokens_d1(&ctx)?;
-    let Some(access) = refresh_access(&tokens, oauth, &user.id, now_unix).await else {
-        return unauthorized(&ctx);
+    let session = match session_access(&req, &ctx, &user).await? {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
     };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
 
     let calendars = calendars_d1(&ctx)?;
     let events = events_d1(&ctx)?;
     let operations = operations_d1(&ctx)?;
     let notify = crate::user_hub::UserHubNotify::new(&ctx.env);
     let result = api_core::start_occurrence(
-        &crate::http::WorkerHttp,
+        session.http.as_ref(),
         &calendars,
         &events,
         &operations,
@@ -544,7 +532,7 @@ pub async fn start_occurrence(
         &routines_d1(&ctx)?,
         &occurrences_d1(&ctx)?,
         &agenda_d1(&ctx)?,
-        &access,
+        &session.access,
         &user.id,
         id,
         now_unix,
@@ -593,23 +581,18 @@ macro_rules! occurrence_exit {
             let needs_google = occurrence.status == api_core::OCCURRENCE_STATUS_IN_PROGRESS
                 && occurrence.google_event_id.is_some()
                 && occurrence.calendar_id.is_some();
-            let (http, access) = if needs_google {
-                let Some(oauth) = google_access(&ctx) else {
-                    return unauthorized(&ctx);
-                };
-                let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
-                let Some(access) =
-                    refresh_access(&tokens_d1(&ctx)?, oauth, &user.id, now_unix).await
-                else {
-                    return unauthorized(&ctx);
-                };
-                (
-                    Some(&crate::http::WorkerHttp as &dyn api_core::HttpClient),
-                    Some(access),
-                )
+            let session = if needs_google {
+                match session_access(&req, &ctx, &user).await? {
+                    Ok(session) => Some(session),
+                    Err(response) => return Ok(response),
+                }
             } else {
-                (None, None)
+                None
             };
+            let http = session
+                .as_ref()
+                .map(|session| session.http.as_ref() as &dyn api_core::HttpClient);
+            let access = session.as_ref().map(|session| &session.access);
 
             let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
             let calendars = calendars_d1(&ctx)?;
@@ -621,7 +604,7 @@ macro_rules! occurrence_exit {
                 needs_google.then(|| &calendars as &dyn api_core::CalendarRepo),
                 needs_google.then(|| &events as &dyn api_core::CalendarEventRepo),
                 needs_google.then(|| &operations as &dyn api_core::CalendarEventOperationRepo),
-                access.as_ref(),
+                access,
                 &lists_d1(&ctx)?,
                 &categories_d1(&ctx)?,
                 &routines_d1(&ctx)?,
@@ -635,7 +618,8 @@ macro_rules! occurrence_exit {
             match result {
                 Ok(response) => {
                     let response = Response::from_json(&response)?;
-                    Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+                    Ok(response
+                        .with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
                 }
                 Err(err) => map_error(&ctx, err),
             }

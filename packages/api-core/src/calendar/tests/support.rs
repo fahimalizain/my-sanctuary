@@ -7,7 +7,7 @@ use crate::config::OAuthConfig;
 use crate::models::{
     CalendarEvent, CalendarEventOperation, GoogleCalendar, GoogleOAuthToken, NewCalendar,
     NewCalendarEvent, NewCalendarEventOperation, NewEventInput, NewToken, NewWatchChannel,
-    OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING, WatchChannel,
+    OP_STATUS_GOOGLE_COMMITTED, OP_STATUS_PENDING, StandaloneCalendarSeed, WatchChannel,
 };
 use crate::oauth::{HttpClient, HttpError};
 use crate::models::{
@@ -527,6 +527,8 @@ pub(crate) struct FakeCalendarRepo {
     pub(crate) fail_bump_dirty: Mutex<bool>,
     /// When true, `set_sync_enabled` returns `RepoError::Backend`.
     pub(crate) fail_set_sync_enabled: Mutex<bool>,
+    /// When true, `insert_standalone` returns `RepoError::Backend`.
+    pub(crate) fail_insert_standalone: Mutex<bool>,
     /// After this many `get_by_id` calls, increment
     /// `dirty_requested_generation` on the matched row (None = disabled).
     /// Snapshot is taken before the bump so the caller still sees the
@@ -573,6 +575,7 @@ impl FakeCalendarRepo {
             steal_lease_after_get_by_id: Mutex::new(None),
             fail_bump_dirty: Mutex::new(false),
             fail_set_sync_enabled: Mutex::new(false),
+            fail_insert_standalone: Mutex::new(false),
             bump_dirty_after_get_by_id: Mutex::new(None),
             bump_dirty_by: Mutex::new(1),
             renew_expiries: Mutex::new(Vec::new()),
@@ -787,6 +790,59 @@ impl CalendarRepo for FakeCalendarRepo {
                 stored.push(row);
             }
         }
+        Ok(())
+    }
+
+    /// Mirrors `CALENDAR_INSERT_STANDALONE_SQL`: on an existing
+    /// `(user_id, google_calendar_id)` only `deleted_at` is cleared (resurrect),
+    /// keeping the stored zone/labels; otherwise a fully-stamped local row
+    /// (`sync_enabled = 1`, `sync_status = 'disabled'`).
+    async fn insert_standalone(&self, seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
+        if *self.fail_insert_standalone.lock().unwrap() {
+            return Err(RepoError::Backend("standalone seed failed".into()));
+        }
+        let mut stored = self.stored.lock().unwrap();
+        if let Some(existing) = stored.iter_mut().find(|cal| {
+            cal.user_id == seed.user_id && cal.google_calendar_id == seed.google_calendar_id
+        }) {
+            // DO UPDATE SET deleted_at = NULL: resurrect only.
+            existing.deleted_at = None;
+            return Ok(());
+        }
+        stored.push(GoogleCalendar {
+            id: seed.id.clone(),
+            user_id: seed.user_id.clone(),
+            google_calendar_id: seed.google_calendar_id.clone(),
+            summary: seed.summary.clone(),
+            time_zone: seed.time_zone.clone(),
+            is_primary: true,
+            access_role: "owner".to_string(),
+            sync_enabled: true,
+            sync_token: String::new(),
+            last_synced_at: Some(seed.now_rfc3339.clone()),
+            event_labels: seed.event_labels.clone(),
+            event_labels_updated_at: Some(seed.now_rfc3339.clone()),
+            sync_query_fingerprint: String::new(),
+            sync_status: "disabled".to_string(),
+            initial_sync_complete: true,
+            last_attempt_at: None,
+            last_success_at: Some(seed.now_rfc3339.clone()),
+            last_error_code: String::new(),
+            failure_streak: 0,
+            next_retry_at: None,
+            dirty_requested_generation: 0,
+            dirty_applied_generation: 0,
+            full_sync_requested: false,
+            lease_owner: String::new(),
+            lease_expires_at: None,
+            cache_revision: 0,
+            projection: "timed_masters_and_exceptions".to_string(),
+            watch_coverage: "covered".to_string(),
+            event_coverage: "complete".to_string(),
+            created_at: seed.now_rfc3339.clone(),
+            updated_at: seed.now_rfc3339.clone(),
+            deleted_at: None,
+        });
         Ok(())
     }
 

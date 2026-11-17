@@ -22,6 +22,89 @@ npx nx run worker:build # production build (worker-build, implies web build)
 
 ---
 
+## Local Development
+
+The Worker reads local configuration from `apps/worker/.dev.vars`, which is git-ignored. Start from the template:
+
+```sh
+cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+```
+
+Apply migrations to the local D1 database (once, and again after pulling new migrations):
+
+```sh
+cd apps/worker
+npx wrangler d1 migrations apply sanctuary-db --local
+```
+
+`SESSION_SECRET` is required in every mode (at least 32 bytes) — it signs the session cookie, including for local accounts. `SECURE_COOKIE` defaults to `false` unless it is exactly `"true"`.
+
+There are two ways to sign in locally.
+
+### Zero-Google (standalone) mode
+
+Leave the Google credentials empty and enable standalone auth in `apps/worker/.dev.vars`:
+
+```sh
+SESSION_SECRET=<32+ random bytes>
+GOOGLE_CREDENTIALS_JSON=
+ALLOW_STANDALONE_AUTH=true
+SECURE_COOKIE=false
+# optional fallback; registration captures the browser's IANA time zone first
+STANDALONE_TIME_ZONE=
+```
+
+With `GOOGLE_CREDENTIALS_JSON` empty no OAuth client is configured: nothing calls `accounts.google.com`, `oauth2.googleapis.com`, or `www.googleapis.com`, `/auth/google` returns 500 "oauth not configured", and the login page shows only the username/password form (with a "Create account" toggle). Register a local account from the login page with a username (`[a-z0-9._-]`, 3–32 characters) and a password (8–128 characters). The account gets a local "Personal" calendar and the full app works: calendar events, tasks, the agenda, reports/digest, and MCP.
+
+Local accounts live in the local D1 database, so they survive restarts and only disappear if `.wrangler/state` is deleted or the local database is reset.
+
+### Google + standalone mode
+
+Fill in the Google OAuth client JSON and keep standalone enabled:
+
+```sh
+SESSION_SECRET=<32+ random bytes>
+GOOGLE_CREDENTIALS_JSON={"web":{"client_id":"...","client_secret":"..."}}
+ALLOW_STANDALONE_AUTH=true
+SECURE_COOKIE=false
+```
+
+The login page then shows both "Continue with Google" and the username/password form, and the two account types stay isolated. An existing Google-only setup keeps working unchanged: leave `ALLOW_STANDALONE_AUTH` unset (or `false`) and only the Google button appears.
+
+### Standalone auth is local-only
+
+Standalone auth is fail-closed and off by default. It is only enabled when **all** of the following hold:
+
+- `ALLOW_STANDALONE_AUTH=true`;
+- `SECURE_COOKIE` is not `true`;
+- both `FRONTEND_URL` and the incoming request host are non-public: loopback (`localhost`, `127.0.0.1`, `::1`), an RFC1918 address, a link-local address, or a `.local` / `.lan` name.
+
+Otherwise `/auth/providers` reports `standalone: false` and `/auth/standalone/*` returns 403. Open the app on `http://localhost:5173` (the Vite dev server, which proxies `/auth`) or `http://127.0.0.1:8787` (the Worker directly). A public hostname, `SECURE_COOKIE=true`, or the flag left unset turns standalone off, so production can never expose the local login form.
+
+### Cron locally
+
+`wrangler dev` does not fire the `[triggers] crons` schedules on its own. To exercise the scheduled paths (digest, agenda fill, and the Google-only fallback sync / elongation), run the Worker with the test endpoint enabled and trigger a tick manually:
+
+```sh
+cd apps/worker
+npx wrangler dev --test-scheduled
+curl "http://127.0.0.1:8787/__scheduled?cron=*/2+*+*+*+*"
+```
+
+In zero-Google mode the digest and agenda-fill cron paths still run; the Google-dependent ones are skipped. Standalone users therefore get no cron elongation of running events, so a running chip stops growing after 15 minutes — stop/pause/complete still record the correct end.
+
+### `wrangler dev --remote` and production D1
+
+`wrangler dev` uses a local SQLite database under `.wrangler/state`. `wrangler dev --remote` instead runs against real Cloudflare bindings, and `[[d1_databases]]` in `apps/worker/wrangler.toml` points at the **production** database — anything you create there, including local standalone accounts, is real production data. If you need `--remote`, create a dedicated dev database, uncomment `preview_database_id` in `apps/worker/wrangler.toml`, and migrate it first:
+
+```sh
+cd apps/worker
+npx wrangler d1 create sanctuary-db-dev
+npx wrangler d1 migrations apply sanctuary-db-dev --remote
+```
+
+---
+
 ## PWA
 
 The web app is a fully installable Progressive Web App:

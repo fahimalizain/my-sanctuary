@@ -1,4 +1,33 @@
-# Local-only Worker secrets (wrangler dev). Never commit real values.
-# Used by later slices: session cookies and Google OAuth.
+# Local-only Worker configuration for `wrangler dev`. Never commit real values.
+#
+#   cp apps/worker/.dev.vars.example apps/worker/.dev.vars
+#
+# Two supported local modes:
+#   * zero-Google (standalone only) — leave GOOGLE_CREDENTIALS_JSON empty and
+#     uncomment ALLOW_STANDALONE_AUTH; sign in with a local username/password.
+#   * Google + standalone — fill in GOOGLE_CREDENTIALS_JSON and uncomment
+#     ALLOW_STANDALONE_AUTH; both login options are shown.
+
+# Signs the session cookie. Required in every mode, at least 32 bytes.
 SESSION_SECRET=
+
+# Google OAuth client credentials (the OAuth client JSON from Google Cloud
+# Console, on one line). EMPTY = zero-Google local mode: no OAuth client is
+# configured, nothing calls accounts.google.com / oauth2.googleapis.com /
+# www.googleapis.com, and only username/password sign-in is offered.
+# Filling this in enables the "Continue with Google" path (and calendar sync).
 GOOGLE_CREDENTIALS_JSON=
+
+# Username/password (standalone) auth. Local-only and fail-closed: it is
+# effective only while SECURE_COOKIE is not "true" AND both FRONTEND_URL and
+# the request host are non-public (localhost / 127.0.0.1 / ::1 / RFC1918 /
+# link-local / .local / .lan). Never enable this in production.
+# ALLOW_STANDALONE_AUTH=true
+
+# Session cookies are only flagged `Secure` when this is exactly "true".
+# Local http:// needs false; standalone auth requires false. Default: false.
+# SECURE_COOKIE=false
+
+# Optional fallback IANA time zone for standalone accounts that register
+# without one (registration captures the browser's zone first). Blank = UTC.
+STANDALONE_TIME_ZONE=

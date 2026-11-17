@@ -560,7 +560,7 @@ export function CategoriesPage() {
 
             <div className="space-y-2 mb-6">
               <label className="text-sm font-medium text-foreground">
-                Google Calendar
+                Calendar
               </label>
               <CalendarPicker
                 value={googleCalendarId}
@@ -569,7 +569,7 @@ export function CategoriesPage() {
                 isLoading={calendarsLoading}
                 error={calendarsError}
                 placeholder="None — optional"
-                aria-label="Google Calendar"
+                aria-label="Calendar"
               />
             </div>
 
@@ -622,7 +622,7 @@ export function CategoriesPage() {
                     isLoading={calendarsLoading}
                     error={null}
                     placeholder="None — inherit"
-                    aria-label={`Pattern ${index + 1} Google Calendar`}
+                    aria-label={`Pattern ${index + 1} Calendar`}
                   />
                 </div>
               ))}

@@ -23,10 +23,32 @@ const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 /// than a truncated body that is no longer valid JSON.
 const MAX_UPSTREAM_BODY_BYTES: usize = 1024 * 1024;
 
-/// Dummy origin for in-process sub-requests. A web_sys `Request` needs an
-/// absolute URL; the router only matches on `Request::path()` and the handlers
-/// read the query string from `url()`.
-const SUBREQUEST_ORIGIN: &str = "https://sanctuary.internal";
+/// Fallback origin for in-process sub-requests when the outer request URL has
+/// no host. A web_sys `Request` needs an absolute URL; the router only matches
+/// on `Request::path()` and the handlers read the query string from `url()`.
+///
+/// The origin otherwise mirrors the **outer** request's scheme and host (ADR
+/// 0012/0009): the standalone gate ([`api_core::Config::standalone_enabled_for`])
+/// and [`crate::auth::authenticate`] check the request host, so a sub-request
+/// must not silently turn a public deployment into a loopback one. A public
+/// outer host therefore sees a public sub-request host, and a standalone
+/// bearer is refused on MCP exactly as it is over REST.
+const FALLBACK_SUBREQUEST_ORIGIN: &str = "http://localhost";
+
+/// The origin sub-requests are built on: the outer request's scheme and host,
+/// or [`FALLBACK_SUBREQUEST_ORIGIN`] when the URL has no host.
+fn subrequest_origin(req: &Request) -> String {
+    let Ok(url) = req.url() else {
+        return FALLBACK_SUBREQUEST_ORIGIN.to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return FALLBACK_SUBREQUEST_ORIGIN.to_string();
+    };
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
 
 /// `POST /api/mcp`: gates, then one stateless JSON-RPC exchange.
 pub(crate) async fn post(
@@ -34,6 +56,7 @@ pub(crate) async fn post(
     ctx: RouteContext<Option<api_core::Config>>,
 ) -> Result<Response> {
     let origin = crate::auth::frontend_url(&ctx).to_string();
+    let subrequest_origin = subrequest_origin(&req);
 
     // 1. Origin first: a browser page from anywhere else is refused before
     // authentication. An absent `Origin` (curl, Claude, Inspector) is fine, and
@@ -82,6 +105,7 @@ pub(crate) async fn post(
         authorization,
         config: ctx.data.clone(),
         env: ctx.env.clone(),
+        origin: subrequest_origin,
     };
     let response = api_core::mcp::handle_post(&body, env!("APP_VERSION"), &executor).await;
     json_response(&origin, response)
@@ -111,6 +135,9 @@ struct RestExecutor {
     authorization: String,
     config: Option<api_core::Config>,
     env: Env,
+    /// Scheme + host of the outer request, so sub-requests see the same host
+    /// the standalone gate evaluated.
+    origin: String,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -488,7 +515,7 @@ impl RestExecutor {
             return Err("sub-request refused".to_string());
         }
 
-        let mut url = url::Url::parse(&format!("{SUBREQUEST_ORIGIN}{path}"))
+        let mut url = url::Url::parse(&format!("{}{path}", self.origin))
             .map_err(|_| "sub-request failed".to_string())?;
         // `append_pair` percent-encodes, so an RFC 3339 `+` or `:` in a value
         // survives the round trip.

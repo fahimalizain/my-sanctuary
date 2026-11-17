@@ -16,10 +16,11 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::models::{
-    AgendaItem, GoogleOAuthToken, NewAgendaItem, NewRoutine, NewRoutineOccurrence, NewTask,
-    NewTaskCategory, NewTaskCategoryPattern, NewTaskList, NewTaskLog, NewToken, NewUser, Routine,
-    RoutineOccurrence, Task, TaskCategory, TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine,
-    UpdateTask, UpdateTaskCategory, UpdateTaskList, User,
+    AgendaItem, GoogleOAuthToken, LocalCredential, NewAgendaItem, NewLocalCredential, NewRoutine,
+    NewRoutineOccurrence, NewStandaloneUser, NewTask, NewTaskCategory, NewTaskCategoryPattern,
+    NewTaskList, NewTaskLog, NewToken, NewUser, Routine, RoutineOccurrence, Task, TaskCategory,
+    TaskCategoryPattern, TaskList, TaskLog, UpdateRoutine, UpdateTask, UpdateTaskCategory,
+    UpdateTaskList, User,
 };
 
 /// Errors surfaced by repository operations.
@@ -51,6 +52,47 @@ pub trait UserRepo: Send + Sync {
     /// Inserts a new user or updates the existing one (keyed on `google_id`).
     /// Returns the stored row, including the DB-generated `id`.
     async fn upsert_by_google_id(&self, user: NewUser) -> Result<User, RepoError>;
+    /// Inserts a standalone user (ADR 0012) with `integration_type =
+    /// 'standalone'` and returns the stored row.
+    ///
+    /// Deliberately NOT an upsert: one account per username, and the username
+    /// lives in [`LocalCredentialRepo`]. Kept for compatibility (identity
+    /// tests, repair tooling); registration uses the atomic
+    /// [`UserRepo::create_standalone_account`] instead, because a `users` row
+    /// without its credential can never log in and its UNIQUE email would
+    /// permanently block a retry.
+    ///
+    /// The default is a loud "not implemented" so existing test fakes keep
+    /// compiling; every production repo (`D1UserRepo`, the SQLite test repo)
+    /// implements it.
+    async fn create_standalone(&self, _user: NewStandaloneUser) -> Result<User, RepoError> {
+        Err(RepoError::Backend(
+            "create_standalone not implemented".to_string(),
+        ))
+    }
+    /// Inserts a standalone user **and** its `local_credentials` row in one
+    /// transaction, returning the inserted `users` row
+    /// (`integration_type = 'standalone'`, `picture`/`focused_task_id` NULL,
+    /// timestamps from `user`).
+    ///
+    /// Registration must be all-or-nothing: an orphan `users` row has no login
+    /// handle and its UNIQUE email blocks every later attempt, so a failure
+    /// here must undo the user insert too. A duplicate username (or duplicate
+    /// synthetic id/email) is [`RepoError::Conflict`] and writes nothing;
+    /// anything else is [`RepoError::Backend`].
+    ///
+    /// The default is a loud "not implemented" so existing test fakes keep
+    /// compiling; every production repo (`D1UserRepo`, the SQLite test repo)
+    /// implements it.
+    async fn create_standalone_account(
+        &self,
+        _user: NewStandaloneUser,
+        _credential: NewLocalCredential,
+    ) -> Result<User, RepoError> {
+        Err(RepoError::Backend(
+            "create_standalone_account not implemented".to_string(),
+        ))
+    }
     /// Sets (or clears, when `task_id` is `None`) the user's focus pointer —
     /// the one-focus lock backing the task-focus feature. `focused_task_id` is
     /// nullable TEXT; untouched by the login upsert. Only ever called with a
@@ -59,6 +101,30 @@ pub trait UserRepo: Send + Sync {
         &self,
         user_id: &str,
         task_id: Option<&str>,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
+}
+
+/// Standalone username/password persistence (`local_credentials` rows, ADR
+/// 0012).
+///
+/// One row per standalone user. Usernames are stored trimmed and lowercased by
+/// the caller; the UNIQUE column is the registration guard (a race loser gets
+/// [`RepoError::Conflict`]). Password hashes are the PBKDF2 strings from
+/// [`crate::password`] — this layer never sees a plaintext password.
+#[async_trait(?Send)]
+pub trait LocalCredentialRepo: Send + Sync {
+    /// The credential for `username`, or `None` when no such local account
+    /// exists. `username` must already be normalized by the caller.
+    async fn get_by_username(&self, username: &str) -> Result<Option<LocalCredential>, RepoError>;
+    /// Inserts the row and returns it. A duplicate username is
+    /// [`RepoError::Conflict`].
+    async fn insert(&self, credential: NewLocalCredential) -> Result<LocalCredential, RepoError>;
+    /// Replaces the stored hash for `user_id` and stamps `updated_at`.
+    async fn update_password(
+        &self,
+        user_id: &str,
+        password_hash: &str,
         now_rfc3339: &str,
     ) -> Result<(), RepoError>;
 }
@@ -580,6 +646,42 @@ pub const USER_SET_FOCUSED_TASK_ID_SQL: &str = "
     WHERE id = ? AND deleted_at IS NULL
 ";
 
+/// Insert a standalone user (ADR 0012). Binds: id, google_id, email, name,
+/// created_at, updated_at (6). `picture` is literal NULL and
+/// `integration_type` is the literal `'standalone'`, so a Google login can
+/// never turn a row standalone (and vice versa). A duplicate synthetic
+/// `google_id`/email violates the unique constraints.
+pub const USER_INSERT_STANDALONE_SQL: &str = "
+    INSERT INTO users
+        (id, google_id, email, name, picture, integration_type, created_at, updated_at)
+    VALUES (?, ?, ?, ?, NULL, 'standalone', ?, ?)
+    RETURNING *
+";
+
+/// One credential row by its normalized username (ADR 0012). Usernames are
+/// UNIQUE, so at most one row matches.
+pub const LOCAL_CREDENTIAL_GET_BY_USERNAME_SQL: &str =
+    "SELECT * FROM local_credentials WHERE username = ?";
+
+/// Binds: user_id, username, password_hash, created_at, updated_at (5).
+///
+/// Plain INSERT: the username UNIQUE constraint is the registration guard, so
+/// a concurrent duplicate surfaces as a constraint error (never a silent
+/// overwrite of another user's password).
+/// `UserRepo::create_standalone_account` runs this and
+/// [`USER_INSERT_STANDALONE_SQL`] in one transaction.
+pub const LOCAL_CREDENTIAL_INSERT_SQL: &str = "
+    INSERT INTO local_credentials (user_id, username, password_hash, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+";
+
+/// Binds: password_hash, updated_at, user_id (3). Keyed on the primary key, so
+/// the username (and therefore the login handle) never changes.
+pub const LOCAL_CREDENTIAL_UPDATE_PASSWORD_SQL: &str = "
+    UPDATE local_credentials SET password_hash = ?, updated_at = ?
+    WHERE user_id = ?
+";
+
 pub const TOKEN_GET_BY_USER_ID_SQL: &str =
     "SELECT * FROM google_oauth_tokens WHERE user_id = ? AND deleted_at IS NULL";
 
@@ -751,10 +853,17 @@ pub const TASK_CATEGORY_PATTERNS_INSERT_SQL: &str = "
 pub const TASK_LIST_BY_USER_ID_SQL: &str =
     "SELECT * FROM tasks WHERE user_id = ? AND deleted_at IS NULL ORDER BY status ASC, sort_order ASC, created_at ASC";
 
-/// The elongate cron's work list: every living IN_PROGRESS task, all users
-/// (IN_PROGRESS is a pile — soft-deleted rows are filtered).
-pub const TASK_LIST_IN_PROGRESS_SQL: &str =
-    "SELECT * FROM tasks WHERE status = 'IN_PROGRESS' AND deleted_at IS NULL";
+/// The elongate cron's work list: every living IN_PROGRESS task owned by a
+/// **Google** user (IN_PROGRESS is a pile — soft-deleted rows are filtered).
+///
+/// The `integration_type` subquery (ADR 0012) keeps standalone users out:
+/// their running chips are local, and there is no Google event to elongate.
+/// A subquery (not a join) keeps the `SELECT *` row shape unchanged.
+pub const TASK_LIST_IN_PROGRESS_SQL: &str = "
+    SELECT * FROM tasks
+    WHERE status = 'IN_PROGRESS' AND deleted_at IS NULL
+      AND user_id IN (SELECT id FROM users WHERE integration_type = 'google')
+";
 
 /// The agenda fill cron's user list: distinct owners of a living task that
 /// still needs a place on the agenda. Terminal rows (`COMPLETED`/
@@ -1007,11 +1116,16 @@ pub const OCCURRENCE_SET_STATUS_SQL: &str =
 /// occurrence that actually has a chip. Rows without ids are never recreated
 /// here — a start stores both ids together, so a missing one means the row
 /// never started (or the ids were lost) and there is nothing to grow.
+///
+/// The `integration_type` subquery (ADR 0012) keeps standalone users out: a
+/// standalone chip has no Google event to elongate. A subquery (not a join)
+/// keeps the `SELECT *` row shape unchanged.
 pub const OCCURRENCE_LIST_IN_PROGRESS_SQL: &str = "
     SELECT * FROM routine_occurrences
     WHERE status = 'in_progress'
       AND calendar_id IS NOT NULL AND calendar_id != ''
       AND google_event_id IS NOT NULL AND google_event_id != ''
+      AND user_id IN (SELECT id FROM users WHERE integration_type = 'google')
 ";
 
 /// `routine_occurrences` insert binds 6 columns per row (`id`, `routine_id`,
@@ -1541,13 +1655,88 @@ mod tests {
     #[test]
     fn task_list_in_progress_filters_status_and_living_rows() {
         // The elongate cron's work list: IN_PROGRESS is a column, not a
-        // singleton lock; soft-deleted rows are filtered, and there is
-        // deliberately no user filter — all users.
+        // singleton lock; soft-deleted rows are filtered. It spans all users,
+        // but only Google users (ADR 0012): standalone chips are local and
+        // have no Google event to elongate.
         let sql = TASK_LIST_IN_PROGRESS_SQL;
-        assert!(sql.starts_with("SELECT * FROM tasks"), "{sql}");
+        assert!(sql.contains("SELECT * FROM tasks"), "{sql}");
         assert!(sql.contains("status = 'IN_PROGRESS'"), "{sql}");
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
-        assert!(!sql.contains("user_id"), "all users, not one: {sql}");
+        assert!(
+            sql.contains("user_id IN (SELECT id FROM users WHERE integration_type = 'google')"),
+            "must fan out to Google users only: {sql}"
+        );
+        assert!(
+            !sql.contains("user_id = '"),
+            "not scoped to a literal user id: {sql}"
+        );
+        assert!(
+            !sql.contains("user_id = ?"),
+            "all Google users, not one bound user: {sql}"
+        );
+        assert_eq!(sql.matches('?').count(), 0, "no binds: {sql}");
+    }
+
+    #[test]
+    fn user_insert_standalone_is_explicit_and_returns_the_row() {
+        let sql = USER_INSERT_STANDALONE_SQL;
+        assert!(sql.trim_start().starts_with("INSERT INTO users"), "{sql}");
+        assert!(!sql.contains("ON CONFLICT"), "not an upsert: {sql}");
+        assert!(sql.contains("'standalone'"), "{sql}");
+        assert!(sql.contains("NULL"), "picture starts NULL: {sql}");
+        assert!(sql.contains("RETURNING *"), "{sql}");
+        for column in [
+            "id",
+            "google_id",
+            "email",
+            "name",
+            "picture",
+            "integration_type",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(sql.contains(column), "missing {column} in {sql}");
+        }
+        assert_eq!(sql.matches('?').count(), 6, "six binds: {sql}");
+    }
+
+    #[test]
+    fn local_credential_sql_is_username_scoped_and_never_selects_by_user() {
+        let get = LOCAL_CREDENTIAL_GET_BY_USERNAME_SQL;
+        assert!(get.starts_with("SELECT * FROM local_credentials"), "{get}");
+        assert!(get.contains("username = ?"), "{get}");
+        assert_eq!(get.matches('?').count(), 1, "{get}");
+
+        let insert = LOCAL_CREDENTIAL_INSERT_SQL;
+        assert!(
+            insert.trim_start().starts_with("INSERT INTO local_credentials"),
+            "{insert}"
+        );
+        assert!(!insert.contains("ON CONFLICT"), "duplicates must 409: {insert}");
+        for column in [
+            "user_id",
+            "username",
+            "password_hash",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(insert.contains(column), "missing {column} in {insert}");
+        }
+        assert_eq!(insert.matches('?').count(), 5, "{insert}");
+
+        let update = LOCAL_CREDENTIAL_UPDATE_PASSWORD_SQL;
+        assert!(
+            update.trim_start().starts_with("UPDATE local_credentials"),
+            "{update}"
+        );
+        assert!(update.contains("password_hash = ?"), "{update}");
+        assert!(update.contains("updated_at = ?"), "{update}");
+        assert!(update.contains("WHERE user_id = ?"), "{update}");
+        assert!(
+            !update.contains("username"),
+            "the login handle never changes: {update}"
+        );
+        assert_eq!(update.matches('?').count(), 3, "{update}");
     }
 
     #[test]
@@ -1805,6 +1994,18 @@ mod tests {
         assert!(
             OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("calendar_id") && OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("google_event_id"),
             "both ids required: {}",
+            OCCURRENCE_LIST_IN_PROGRESS_SQL
+        );
+        assert!(
+            OCCURRENCE_LIST_IN_PROGRESS_SQL.contains(
+                "user_id IN (SELECT id FROM users WHERE integration_type = 'google')"
+            ),
+            "standalone chips are local, not Google: {}",
+            OCCURRENCE_LIST_IN_PROGRESS_SQL
+        );
+        assert!(
+            !OCCURRENCE_LIST_IN_PROGRESS_SQL.contains("user_id = ?"),
+            "all Google users, not one bound user: {}",
             OCCURRENCE_LIST_IN_PROGRESS_SQL
         );
     }

@@ -183,6 +183,21 @@ pub async fn queue(
             }
         };
 
+        // Defense in depth (ADR 0012): a standalone user's local calendar is
+        // `sync_enabled = 1` so reads work, but it must never enter a Google
+        // walk. The already-loaded row says so without a second D1 read: the
+        // synthetic Google id, a disabled calendar, or a sync-disabled one has
+        // no token/channel to sync. Skip (ack) rather than refresh a token
+        // that cannot exist.
+        if cal.google_calendar_id.starts_with("standalone:")
+            || cal.sync_status == "disabled"
+            || !cal.sync_enabled
+        {
+            console_log!("queue: calendar {} is local/disabled — acking", cal.id);
+            message.ack();
+            continue;
+        }
+
         let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
         let access = match api_core::refresh_if_needed(
             &crate::http::WorkerHttp,

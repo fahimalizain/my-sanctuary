@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::models::IntegrationType;
+
 /// Name of the sealed session cookie.
 pub const SESSION_COOKIE_NAME: &str = "sanctuary-session";
 
@@ -38,13 +40,17 @@ const TAG_LEN: usize = 16;
 /// Identity carried by a session cookie.
 ///
 /// Mirrors the frontend `User` type in `apps/web/lib/auth.tsx` field for field;
-/// `picture` may be an empty string.
+/// `picture` may be an empty string. `integration_type` uses
+/// `#[serde(default)]` so a cookie sealed before ADR 0012 still decodes as a
+/// Google user instead of failing the unseal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUser {
     pub id: String,
     pub email: String,
     pub name: String,
     pub picture: String,
+    #[serde(default)]
+    pub integration_type: IntegrationType,
 }
 
 /// JSON payload sealed inside the cookie: the user identity plus an expiry.
@@ -189,6 +195,7 @@ mod tests {
             email: "ada@example.com".to_string(),
             name: "Ada Lovelace".to_string(),
             picture: "https://example.com/ada.png".to_string(),
+            integration_type: IntegrationType::Google,
         }
     }
 
@@ -340,8 +347,46 @@ mod tests {
         let json = serde_json::to_string(&MeResponse { user: Some(user()) }).unwrap();
         assert_eq!(
             json,
-            r#"{"user":{"id":"google-123","email":"ada@example.com","name":"Ada Lovelace","picture":"https://example.com/ada.png"}}"#
+            r#"{"user":{"id":"google-123","email":"ada@example.com","name":"Ada Lovelace","picture":"https://example.com/ada.png","integration_type":"google"}}"#
         );
+    }
+
+    #[test]
+    fn standalone_session_roundtrips_the_integration_type() {
+        let standalone = SessionUser {
+            id: "u-local".to_string(),
+            email: "ada@standalone.invalid".to_string(),
+            name: "Ada".to_string(),
+            picture: String::new(),
+            integration_type: IntegrationType::Standalone,
+        };
+        let token = seal(SECRET, &standalone, 0).unwrap();
+        assert_eq!(unseal(SECRET, &token, 0).unwrap(), standalone);
+        assert_eq!(
+            unseal(SECRET, &token, 0).unwrap().integration_type,
+            IntegrationType::Standalone
+        );
+    }
+
+    #[test]
+    fn legacy_cookie_without_integration_type_decodes_as_google() {
+        // A cookie sealed before ADR 0012 carries no `integration_type` key.
+        // It must still unseal, as a Google user.
+        let cipher = Aes256Gcm::new_from_slice(&derive_key(SECRET)).expect("32-byte key");
+        let plaintext =
+            br#"{"id":"u-1","email":"ada@example.com","name":"Ada","picture":"","exp":9999999999}"#;
+        let mut nonce = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce).expect("entropy");
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .expect("encrypt");
+        let mut token = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        token.extend_from_slice(&nonce);
+        token.extend_from_slice(&ciphertext);
+        let sealed = URL_SAFE_NO_PAD.encode(token);
+
+        let recovered = unseal(SECRET, &sealed, 0).unwrap();
+        assert_eq!(recovered.integration_type, IntegrationType::Google);
     }
 
     #[test]

@@ -1,5 +1,7 @@
-//! `/auth/*` handlers: session `me`/`logout`, plus the Google OAuth login
-//! flow (`/auth/google` → consent screen → `/auth/google/callback`).
+//! `/auth/*` handlers: session `me`/`logout`, the Google OAuth login flow
+//! (`/auth/google` → consent screen → `/auth/google/callback`), and the
+//! standalone username/password endpoints (`/auth/providers`,
+//! `/auth/standalone/register`, `/auth/standalone/login` — ADR 0012).
 //!
 //! Two credentials reach the data routes: the sealed session cookie set by the
 //! OAuth callback and an `Authorization: Bearer sk_…` API key. [`authenticate`]
@@ -13,7 +15,9 @@
 //! (default `http://localhost:5173`, matching the Vite dev proxy). The
 //! same-origin proxy path does not need CORS but is unaffected by it.
 
+use api_core::models::IntegrationType;
 use api_core::ApiKeyRepo;
+use serde::Deserialize;
 use worker::*;
 
 /// Name of the CSRF/state cookie set by `/auth/google` and cleared on callback.
@@ -32,7 +36,10 @@ pub(crate) fn cors_headers(origin: &str) -> Result<Headers> {
     let headers = Headers::new();
     headers.set("Access-Control-Allow-Origin", origin)?;
     headers.set("Access-Control-Allow-Credentials", "true")?;
-    headers.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")?;
+    headers.set(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PATCH, DELETE, OPTIONS",
+    )?;
     headers.set("Access-Control-Allow-Headers", "Accept, Content-Type")?;
     Ok(headers)
 }
@@ -79,14 +86,20 @@ fn ct_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Returns the session user carried by the request, or `None` when the cookie
 /// is absent, the secret is missing/invalid, or the cookie fails to unseal
 /// (including leftover gorilla cookies). Errors never propagate: a bad cookie
 /// is a logged-out request, not a 500.
-pub(crate) fn session_user(req: &Request, config: Option<&api_core::Config>) -> Option<api_core::SessionUser> {
+pub(crate) fn session_user(
+    req: &Request,
+    config: Option<&api_core::Config>,
+) -> Option<api_core::SessionUser> {
     let config = config?;
     let cookie_header = req.headers().get("Cookie").ok().flatten();
     let token = api_core::cookie_value_from_header(
@@ -107,6 +120,13 @@ pub(crate) fn session_user(req: &Request, config: Option<&api_core::Config>) -> 
 /// [`Malformed`](api_core::AuthorizationHeader::Malformed) or an unrecognized/
 /// expired/revoked key — both `None`, never a silent downgrade to the cookie.
 ///
+/// This is also the production gate for standalone identities on the API data
+/// routes and MCP (ADR 0012): a `standalone` session — cookie **or** API key —
+/// is refused unless [`api_core::Config::standalone_enabled_for`] approves
+/// this request host. API-key management and the realtime socket read the
+/// standalone session cookie with [`session_user`] directly, so they rely on
+/// the cookie's host binding rather than this check.
+///
 /// A D1 failure on the bearer path is logged and also reported as `None`: a
 /// 401 for a caller whose key cannot be verified right now is the safe answer,
 /// and the alternative (a 500) would have to be threaded through every data
@@ -116,11 +136,20 @@ pub(crate) async fn authenticate(
     ctx: &RouteContext<Option<api_core::Config>>,
 ) -> Option<api_core::SessionUser> {
     let header = req.headers().get("Authorization").ok().flatten();
-    match api_core::parse_authorization_header(header.as_deref()) {
+    let user = match api_core::parse_authorization_header(header.as_deref()) {
         api_core::AuthorizationHeader::Absent => session_user(req, ctx.data.as_ref()),
-        api_core::AuthorizationHeader::Malformed => None,
+        api_core::AuthorizationHeader::Malformed => return None,
         api_core::AuthorizationHeader::Bearer(secret) => bearer_user(secret, ctx).await,
+    }?;
+    if user.integration_type == IntegrationType::Standalone {
+        let Some(config) = ctx.data.as_ref() else {
+            return None;
+        };
+        if !config.standalone_enabled_for(crate::calendar_access::request_host(req).as_deref()) {
+            return None;
+        }
     }
+    Some(user)
 }
 
 /// Resolves an API key secret to its owner, touching `last_used_at` at most
@@ -191,6 +220,267 @@ pub fn options(_req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Re
     Ok(response.with_headers(cors_headers(frontend_url(&ctx))?))
 }
 
+/// `GET /auth/providers` → 200 `{"google":bool,"standalone":bool}`.
+///
+/// The login page reads this instead of guessing: `google` follows whether
+/// `GOOGLE_CREDENTIALS_JSON` parsed, `standalone` is the server-side
+/// [`api_core::Config::standalone_enabled_for`] answer for **this request
+/// host** (ADR 0012). A missing config (no `SESSION_SECRET`) reports both
+/// `false` rather than guessing.
+pub fn providers(req: Request, ctx: RouteContext<Option<api_core::Config>>) -> Result<Response> {
+    let request_host = crate::calendar_access::request_host(&req);
+    let (google, standalone) = match ctx.data.as_ref() {
+        Some(config) => (
+            config.oauth.is_some(),
+            config.standalone_enabled_for(request_host.as_deref()),
+        ),
+        None => (false, false),
+    };
+    let response = Response::from_json(&ProvidersResponse { google, standalone })?;
+    Ok(response.with_headers(json_headers(frontend_url(&ctx))?))
+}
+
+/// Body of `GET /auth/providers`.
+#[derive(serde::Serialize)]
+struct ProvidersResponse {
+    google: bool,
+    standalone: bool,
+}
+
+/// Body of `POST /auth/standalone/register`.
+///
+/// Wire shape only: [`api_core::RegisterInput`] is the validation input and
+/// deliberately carries no serde derives (it is not a transport type).
+#[derive(Deserialize)]
+struct StandaloneRegisterBody {
+    username: String,
+    password: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    time_zone: Option<String>,
+}
+
+/// Body of `POST /auth/standalone/login`.
+#[derive(Deserialize)]
+struct StandaloneLoginBody {
+    username: String,
+    password: String,
+}
+
+/// Body of a standalone auth success: `{"user":{...}}` plus the sealed cookie.
+#[derive(serde::Serialize)]
+struct StandaloneSessionResponse {
+    user: api_core::SessionUser,
+}
+
+/// JSON `{"error": msg}` + CORS, matching the data routes (the login page
+/// displays `error` verbatim).
+fn auth_json_error(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    status: u16,
+    message: &str,
+) -> Result<Response> {
+    let response = Response::from_json(&serde_json::json!({ "error": message }))?
+        .with_status(status)
+        .with_headers(json_headers(frontend_url(ctx))?);
+    Ok(response)
+}
+
+/// The deployment knobs [`api_core::standalone`] needs, from [`Config`]:
+/// the IANA fallback zone and the production PBKDF2 work factor.
+fn standalone_auth_config(config: &api_core::Config) -> api_core::StandaloneAuthConfig {
+    api_core::StandaloneAuthConfig {
+        default_time_zone: config.standalone_default_time_zone.clone(),
+        password_iterations: api_core::PASSWORD_ITERATIONS,
+    }
+}
+
+/// The standalone endpoints' shared gate: config present, standalone enabled
+/// for this host, `Content-Type: application/json`.
+///
+/// Returns `Err(response)` with the already-built 500/403/415 answer.
+fn standalone_gate<'a>(
+    req: &Request,
+    ctx: &'a RouteContext<Option<api_core::Config>>,
+) -> Result<Result<&'a api_core::Config, Response>> {
+    let Some(config) = ctx.data.as_ref() else {
+        // No SESSION_SECRET: we cannot seal a session at all.
+        return Ok(Err(auth_json_error(
+            ctx,
+            500,
+            "standalone auth not configured",
+        )?));
+    };
+    if !config.standalone_enabled_for(crate::calendar_access::request_host(req).as_deref()) {
+        return Ok(Err(auth_json_error(
+            ctx,
+            403,
+            "standalone auth is disabled",
+        )?));
+    }
+    let content_type = req
+        .headers()
+        .get("Content-Type")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !content_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("application/json")
+    {
+        return Ok(Err(auth_json_error(
+            ctx,
+            415,
+            "Content-Type must be application/json",
+        )?));
+    }
+    Ok(Ok(config))
+}
+
+/// Seals `user` into the session cookie and returns the 200 `{user}` body.
+fn standalone_session_response(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    config: &api_core::Config,
+    user: api_core::SessionUser,
+    now_unix: i64,
+) -> Result<Response> {
+    let sealed = match api_core::seal(&config.session_secret, &user, now_unix) {
+        Ok(sealed) => sealed,
+        Err(err) => {
+            console_log!("standalone auth: failed to seal session: {err}");
+            return auth_json_error(ctx, 500, "login failed");
+        }
+    };
+    let headers = json_headers(frontend_url(ctx))?;
+    headers.set(
+        "Set-Cookie",
+        &api_core::session_cookie_header(&sealed, config.secure_cookie),
+    )?;
+    let response = Response::from_json(&StandaloneSessionResponse { user })?;
+    Ok(response.with_headers(headers))
+}
+
+/// Maps a standalone auth failure to its HTTP answer. Only caller faults are
+/// echoed; storage/hashing/entropy detail is logged and answered 500.
+fn map_standalone_error(
+    ctx: &RouteContext<Option<api_core::Config>>,
+    err: api_core::StandaloneAuthError,
+    fallback: &str,
+) -> Result<Response> {
+    match err {
+        api_core::StandaloneAuthError::InvalidInput(message) => auth_json_error(ctx, 400, &message),
+        api_core::StandaloneAuthError::UsernameTaken => {
+            auth_json_error(ctx, 409, "username is already taken")
+        }
+        api_core::StandaloneAuthError::InvalidCredentials => {
+            auth_json_error(ctx, 401, "invalid username or password")
+        }
+        other => {
+            console_log!("standalone auth: {other}");
+            auth_json_error(ctx, 500, fallback)
+        }
+    }
+}
+
+/// `POST /auth/standalone/register` → 200 `{"user":{...}}` + `Set-Cookie`.
+///
+/// 500 when the Worker has no usable config, 403 when standalone auth is
+/// disabled for this request host (ADR 0012 — production fails closed), 415
+/// for a non-JSON body, 400 for a bad form value, 409 for a taken username.
+/// Creates the user, the PBKDF2 credential, and the local calendar seed.
+pub async fn standalone_register(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let config = match standalone_gate(&req, &ctx)? {
+        Ok(config) => config,
+        Err(response) => return Ok(response),
+    };
+
+    let body: StandaloneRegisterBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return auth_json_error(&ctx, 400, "invalid body"),
+    };
+
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
+    let users = crate::db::D1UserRepo::new(d1()?);
+    let credentials = crate::db::D1LocalCredentialRepo::new(d1()?);
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+
+    let input = api_core::RegisterInput {
+        username: body.username,
+        password: body.password,
+        name: body.name,
+        time_zone: body.time_zone,
+    };
+    match api_core::register(
+        &users,
+        &credentials,
+        &calendars,
+        input,
+        &standalone_auth_config(config),
+        now_unix,
+    )
+    .await
+    {
+        Ok(user) => standalone_session_response(&ctx, config, user, now_unix),
+        Err(err) => map_standalone_error(&ctx, err, "registration failed"),
+    }
+}
+
+/// `POST /auth/standalone/login` → 200 `{"user":{...}}` + `Set-Cookie`.
+///
+/// Same gate as register (500/403/415), then 401 for every miss (unknown
+/// username, wrong password, not a standalone user) and self-heals a missing
+/// local calendar.
+pub async fn standalone_login(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let config = match standalone_gate(&req, &ctx)? {
+        Ok(config) => config,
+        Err(response) => return Ok(response),
+    };
+
+    let body: StandaloneLoginBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return auth_json_error(&ctx, 400, "invalid body"),
+    };
+
+    let d1 = || {
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))
+    };
+    let users = crate::db::D1UserRepo::new(d1()?);
+    let credentials = crate::db::D1LocalCredentialRepo::new(d1()?);
+    let calendars = crate::db::D1CalendarRepo::new(d1()?);
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+
+    let input = api_core::LoginInput {
+        username: body.username,
+        password: body.password,
+    };
+    match api_core::login(
+        &users,
+        &credentials,
+        &calendars,
+        input,
+        &standalone_auth_config(config),
+        now_unix,
+    )
+    .await
+    {
+        Ok(user) => standalone_session_response(&ctx, config, user, now_unix),
+        Err(err) => map_standalone_error(&ctx, err, "login failed"),
+    }
+}
+
 /// `GET /auth/google` → 302 to Google's consent screen.
 ///
 /// Requires `GOOGLE_CREDENTIALS_JSON` to be configured; otherwise responds
@@ -257,12 +547,14 @@ pub async fn google_callback(
     let Some(oauth) = config.oauth.as_ref() else {
         return error_response(&ctx, 500, "oauth not configured", true);
     };
-    let users = crate::db::D1UserRepo::new(ctx.d1("DB").map_err(|_| Error::RustError(
-        "d1 binding not configured".to_string(),
-    ))?);
-    let tokens = crate::db::D1TokenRepo::new(ctx.d1("DB").map_err(|_| Error::RustError(
-        "d1 binding not configured".to_string(),
-    ))?);
+    let users = crate::db::D1UserRepo::new(
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?,
+    );
+    let tokens = crate::db::D1TokenRepo::new(
+        ctx.d1("DB")
+            .map_err(|_| Error::RustError("d1 binding not configured".to_string()))?,
+    );
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     let user = match api_core::exchange_and_login(

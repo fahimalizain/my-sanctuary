@@ -29,6 +29,17 @@ head_sampling_rate = 1
 pattern = "my-sanctuary.fahimalizain.com"
 custom_domain = true
 
+# `wrangler dev` uses a local SQLite copy under `.wrangler/state`, so local
+# accounts and events never reach this database. `wrangler dev --remote`
+# (remote bindings) does: it resolves to `database_id` — the PRODUCTION D1 —
+# unless `preview_database_id` is set.
+#
+# If you need `--remote`, create a dedicated dev database and point the preview
+# id at it, so local standalone accounts never land in production data:
+#   npx wrangler d1 create sanctuary-db-dev
+#   npx wrangler d1 migrations apply sanctuary-db-dev --remote
+# then uncomment (use the id printed by `d1 create`):
+# preview_database_id = "<dedicated-dev-database-id>"
 [[d1_databases]]
 binding = "DB"
 database_name = "sanctuary-db"

@@ -6,7 +6,8 @@
 
 use api_core::models::{
     CalendarEvent, CalendarEventOperation, GoogleCalendar, GoogleOAuthToken, NewCalendar,
-    NewCalendarEvent, NewCalendarEventOperation, NewToken, NewWatchChannel, WatchChannel,
+    NewCalendarEvent, NewCalendarEventOperation, NewToken, NewWatchChannel, StandaloneCalendarSeed,
+    WatchChannel,
 };
 use api_core::digest::repo::{EventSpan, EventSpanKeyRow, EventSpanRow};
 use api_core::repo::{
@@ -16,8 +17,9 @@ use api_core::repo::{
     WatchChannelRepo, CALENDAR_BEGIN_REPLICA_RESEED_SQL, CALENDAR_BUMP_DIRTY_REQUESTED_SQL,
     CALENDAR_CLEAR_AUTHORIZATION_REQUIRED_SQL, CALENDAR_DELETE_SQL,
     CALENDAR_GET_BY_GOOGLE_CAL_ID_SQL, CALENDAR_GET_BY_ID_SQL,
-    CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_LEASE_HELD_SQL, CALENDAR_LIST_BY_USER_ID_SQL,
-    CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL, CALENDAR_LIST_SYNC_ENABLED_SQL,
+    CALENDAR_GET_BY_ID_UNFILTERED_SQL, CALENDAR_INSERT_STANDALONE_SQL, CALENDAR_LEASE_HELD_SQL,
+    CALENDAR_LIST_BY_USER_ID_SQL, CALENDAR_LIST_STATE_GET_SQL, CALENDAR_LIST_STATE_UPSERT_SQL,
+    CALENDAR_LIST_SYNC_ENABLED_SQL,
     CALENDAR_LIST_USER_IDS_SQL, CALENDAR_MARK_DIRTY_APPLIED_SQL, CALENDAR_RECORD_SYNC_ATTEMPT_SQL,
     CALENDAR_RECORD_SYNC_CONTENTION_SQL, CALENDAR_RECORD_SYNC_FAILURE_SQL,
     CALENDAR_RECORD_SYNC_SUCCESS_IF_OWNER_SQL,
@@ -121,7 +123,7 @@ pub(crate) fn lock(db: &Db) -> Result<std::sync::MutexGuard<'_, Connection>, Rep
         .map_err(|_| RepoError::Backend("sqlite mutex poisoned".into()))
 }
 
-fn now_rfc3339_wall() -> String {
+pub(crate) fn now_rfc3339_wall() -> String {
     // Repos that generate timestamps for upsert without a caller clock use a
     // fixed far-past stamp only if needed; calendar upsert in tests seeds rows
     // directly. Prefer a deterministic clock for pure SQL tests.
@@ -207,6 +209,30 @@ impl CalendarRepo for SqliteCalendarRepo {
             )?;
         }
         Ok(())
+    }
+
+    async fn insert_standalone(&self, seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
+        let conn = lock(&self.db)?;
+        // Every health/identity column lives in the statement; the conflict
+        // clause only clears `deleted_at`, so an existing row (and its
+        // zone/labels) is kept and a soft-deleted one lives again.
+        exec(
+            &conn,
+            CALENDAR_INSERT_STANDALONE_SQL,
+            &[
+                &seed.id,
+                &seed.user_id,
+                &seed.google_calendar_id,
+                &seed.summary,
+                &seed.time_zone,
+                &seed.now_rfc3339, // last_synced_at
+                &seed.now_rfc3339, // last_success_at
+                &seed.event_labels,
+                &seed.now_rfc3339, // event_labels_updated_at
+                &seed.now_rfc3339, // created_at
+                &seed.now_rfc3339, // updated_at
+            ],
+        )
     }
 
     async fn update_sync_state(
