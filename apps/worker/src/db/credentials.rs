@@ -18,7 +18,7 @@ use api_core::repo::{
 };
 use worker::{D1Database, D1Type};
 
-use super::{backend, run_stmt};
+use super::{backend, run_stmt, unique_constraint_error};
 
 /// `local_credentials` table persistence.
 pub struct D1LocalCredentialRepo {
@@ -28,21 +28,6 @@ pub struct D1LocalCredentialRepo {
 impl D1LocalCredentialRepo {
     pub fn new(db: D1Database) -> Self {
         Self { db }
-    }
-}
-
-/// Maps a D1 insert failure to [`RepoError::Conflict`] when the UNIQUE
-/// `username` index rejected the row (a concurrent registration), and to
-/// [`RepoError::Backend`] otherwise.
-///
-/// `D1PreparedStatement::run` either throws (the JS promise rejects) or
-/// resolves with `success: false`; both carry the SQLite message, so both
-/// paths go through this matcher.
-fn credential_error(message: String) -> RepoError {
-    if message.contains("UNIQUE constraint failed") {
-        RepoError::Conflict
-    } else {
-        RepoError::Backend(message)
     }
 }
 
@@ -72,9 +57,9 @@ impl LocalCredentialRepo for D1LocalCredentialRepo {
         let result = stmt
             .run()
             .await
-            .map_err(|err| credential_error(err.to_string()))?;
+            .map_err(|err| unique_constraint_error(err.to_string()))?;
         if !result.success() {
-            return Err(credential_error(
+            return Err(unique_constraint_error(
                 result
                     .error()
                     .unwrap_or_else(|| "local credential insert failed".to_string()),

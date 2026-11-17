@@ -59,6 +59,13 @@ Constraints that drive the design:
   `password_hash`, `created_at`, `updated_at`, FK to `users` with
   `ON DELETE CASCADE`). Usernames are stored trimmed and lowercased; the
   UNIQUE index is the registration race loser's 409.
+- **Registration is atomic.** `UserRepo::create_standalone_account` writes the
+  `users` row and its `local_credentials` row together — one D1 `batch` in
+  production, one rusqlite transaction in the test repo — so a failure between
+  them can never leave an orphan `users` row. That matters because
+  `users.email` is UNIQUE: an orphan would own `<username>@standalone.invalid`
+  forever, and every retry would fail on the email constraint (a 500). Both
+  writes roll back, and the username UNIQUE surfaces as `Conflict` (409).
 - A standalone user is created explicitly (`POST /auth/standalone/register`),
   never auto-provisioned from a Google identity. The row gets a synthetic
   `google_id = 'standalone:<uuid>'` and `<username>@standalone.invalid` email
@@ -180,6 +187,6 @@ Because the stand-in rebuilds responses from the cached row's `raw_json`:
   silently relies on a scheduled tick in a zero-Google dev loop.
 - Touches: migration `0024`, `IntegrationType`/`User`/`SessionUser`,
   `Config::standalone_enabled_for`, `local_credentials` + password hashing,
-  `UserRepo::create_standalone`, `CalendarRepo::insert_standalone`, the four
-  cron filters, the standalone calendar stand-in, the worker auth routes and
-  handler rewiring, the web login/settings/banner, and this ADR.
+  `UserRepo::create_standalone_account`, `CalendarRepo::insert_standalone`, the
+  four cron filters, the standalone calendar stand-in, the worker auth routes
+  and handler rewiring, the web login/settings/banner, and this ADR.

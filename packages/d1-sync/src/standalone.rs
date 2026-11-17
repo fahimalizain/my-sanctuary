@@ -33,6 +33,28 @@ impl SqliteUserRepo {
     }
 }
 
+/// Maps only a UNIQUE-index violation (extended code 2067 / primary key 1555)
+/// to [`RepoError::Conflict`]; every other failure, including NOT NULL and FK
+/// violations, stays a [`RepoError::Backend`].
+///
+/// `create_standalone_account` relies on this: the registration guard is the
+/// UNIQUE `local_credentials.username` index, and everything else is a real
+/// database error (500), matching the D1 matcher's message check.
+fn map_unique(err: rusqlite::Error) -> RepoError {
+    if let rusqlite::Error::SqliteFailure(code, _) = &err {
+        if code.code == rusqlite::ErrorCode::ConstraintViolation
+            && matches!(
+                code.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            )
+        {
+            return RepoError::Conflict;
+        }
+    }
+    RepoError::Backend(err.to_string())
+}
+
 /// Maps a UNIQUE / NOT NULL / FK violation to [`RepoError::Conflict`].
 ///
 /// `create_standalone` and the credential insert rely on the schema as their
@@ -120,6 +142,47 @@ impl UserRepo for SqliteUserRepo {
             ],
         )?;
         row.ok_or_else(|| RepoError::Backend("standalone user insert returned no rows".to_string()))
+    }
+
+    async fn create_standalone_account(
+        &self,
+        user: NewStandaloneUser,
+        credential: NewLocalCredential,
+    ) -> Result<User, RepoError> {
+        let mut conn = lock(&self.db)?;
+        // Registration is one transaction: a credential insert that fails (a
+        // duplicate username, the registration race loser) rolls the `users`
+        // row back too. An orphan user has no login handle and its UNIQUE
+        // email would block every retry (ADR 0012).
+        let tx = conn.transaction().map_err(map_unique)?;
+        let row: Option<User> = insert_returning(
+            &tx,
+            USER_INSERT_STANDALONE_SQL,
+            &[
+                &user.id,
+                &user.google_id,
+                &user.email,
+                &user.name,
+                &user.created_at,
+                &user.updated_at,
+            ],
+        )?;
+        let row = row.ok_or_else(|| {
+            RepoError::Backend("standalone user insert returned no rows".to_string())
+        })?;
+        tx.execute(
+            LOCAL_CREDENTIAL_INSERT_SQL,
+            rusqlite::params![
+                credential.user_id,
+                credential.username,
+                credential.password_hash,
+                credential.created_at,
+                credential.updated_at,
+            ],
+        )
+        .map_err(map_unique)?;
+        tx.commit().map_err(map_unique)?;
+        Ok(row)
     }
 
     async fn set_focused_task_id(

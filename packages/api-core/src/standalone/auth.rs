@@ -1,10 +1,12 @@
 //! Standalone register/login orchestration (ADR 0012).
 //!
-//! `register` validates the form, mints a random local user id, writes the
-//! `users` row (`integration_type = 'standalone'`, synthetic
-//! `google_id = standalone:<id>`, `<username>@standalone.invalid` email), then
+//! `register` validates the form, mints a random local user id, then writes
+//! the `users` row (`integration_type = 'standalone'`, synthetic
+//! `google_id = standalone:<id>`, `<username>@standalone.invalid` email) and
 //! the `local_credentials` row (PBKDF2 hash — the plaintext never reaches the
-//! database), and finally seeds the user's local calendar.
+//! database) **in one atomic repo call**
+//! ([`UserRepo::create_standalone_account`]), and finally seeds the user's
+//! local calendar.
 //!
 //! `login` normalizes the username, verifies the stored PBKDF2 hash with a
 //! constant-time compare, refuses anything that is not a standalone user
@@ -217,14 +219,15 @@ fn taken_or_repo(err: RepoError) -> StandaloneAuthError {
     }
 }
 
-/// Registers a standalone user: validate → mint id → `users` row →
-/// `local_credentials` row → calendar seed.
+/// Registers a standalone user: validate → mint id → `users` row **and**
+/// `local_credentials` row in one atomic write → calendar seed.
 ///
-/// Returns the session identity for the new account. Saving the user before
-/// the credential is deliberate (schema FK direction); a duplicate username
-/// loses the race at the credential insert and surfaces as
-/// [`StandaloneAuthError::UsernameTaken`] (the earlier `get_by_username` check
-/// only makes the common case cheap).
+/// Returns the session identity for the new account. The user and credential
+/// are written together ([`UserRepo::create_standalone_account`]): a duplicate
+/// username loses the race at the credential insert and surfaces as
+/// [`StandaloneAuthError::UsernameTaken`] with nothing written, so a failed
+/// attempt never leaves an orphan user whose UNIQUE email blocks a retry (the
+/// earlier `get_by_username` check only makes the common case cheap).
 pub async fn register(
     users: &dyn UserRepo,
     credentials: &dyn LocalCredentialRepo,
@@ -249,25 +252,23 @@ pub async fn register(
     let id = mint_user_id()?;
     let now_rfc3339 = unix_secs_to_rfc3339(now_unix);
     let user = users
-        .create_standalone(NewStandaloneUser {
-            id: id.clone(),
-            google_id: format!("standalone:{id}"),
-            email: format!("{username}@standalone.invalid"),
-            name: name.clone(),
-            created_at: now_rfc3339.clone(),
-            updated_at: now_rfc3339.clone(),
-        })
-        .await
-        .map_err(taken_or_repo)?;
-
-    credentials
-        .insert(NewLocalCredential {
-            user_id: user.id.clone(),
-            username,
-            password_hash,
-            created_at: now_rfc3339.clone(),
-            updated_at: now_rfc3339,
-        })
+        .create_standalone_account(
+            NewStandaloneUser {
+                id: id.clone(),
+                google_id: format!("standalone:{id}"),
+                email: format!("{username}@standalone.invalid"),
+                name: name.clone(),
+                created_at: now_rfc3339.clone(),
+                updated_at: now_rfc3339.clone(),
+            },
+            NewLocalCredential {
+                user_id: id,
+                username,
+                password_hash,
+                created_at: now_rfc3339.clone(),
+                updated_at: now_rfc3339,
+            },
+        )
         .await
         .map_err(taken_or_repo)?;
 
@@ -315,7 +316,7 @@ pub async fn login(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
 
@@ -343,11 +344,31 @@ mod tests {
         }
     }
 
+    /// Converts an insert input into the row the fake stores.
+    fn user_row(user: NewStandaloneUser) -> User {
+        User {
+            id: user.id,
+            google_id: user.google_id,
+            email: user.email,
+            name: user.name,
+            picture: None,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            deleted_at: None,
+            focused_task_id: None,
+            integration_type: IntegrationType::Standalone,
+        }
+    }
+
     /// In-memory `UserRepo`: stores rows, honours the standalone insert guard,
-    /// never rewrites an existing id.
+    /// never rewrites an existing id. Its credential store is shared with the
+    /// paired [`FakeCredentialRepo`], so `create_standalone_account` writes
+    /// both rows the way the production repos do — the auth tests exercise the
+    /// real register path instead of a stub.
     #[derive(Default)]
     struct FakeUserRepo {
         stored: Mutex<Vec<User>>,
+        credentials: Arc<Mutex<Vec<LocalCredential>>>,
     }
 
     impl FakeUserRepo {
@@ -397,18 +418,34 @@ mod tests {
             {
                 return Err(RepoError::Conflict);
             }
-            let row = User {
-                id: user.id,
-                google_id: user.google_id,
-                email: user.email,
-                name: user.name,
-                picture: None,
-                created_at: user.created_at,
-                updated_at: user.updated_at,
-                deleted_at: None,
-                focused_task_id: None,
-                integration_type: IntegrationType::Standalone,
-            };
+            let row = user_row(user);
+            stored.push(row.clone());
+            Ok(row)
+        }
+
+        async fn create_standalone_account(
+            &self,
+            user: NewStandaloneUser,
+            credential: NewLocalCredential,
+        ) -> Result<User, RepoError> {
+            // Both checks happen before either row is pushed: a conflict
+            // leaves the store untouched, like the SQL transaction.
+            let mut stored = self.stored.lock().unwrap();
+            let mut credentials = self.credentials.lock().unwrap();
+            if credentials
+                .iter()
+                .any(|row| row.username == credential.username)
+            {
+                return Err(RepoError::Conflict);
+            }
+            if stored
+                .iter()
+                .any(|row| row.google_id == user.google_id || row.email == user.email)
+            {
+                return Err(RepoError::Conflict);
+            }
+            let row = user_row(user);
+            credentials.push(credential.into_row());
             stored.push(row.clone());
             Ok(row)
         }
@@ -426,7 +463,24 @@ mod tests {
     /// In-memory `LocalCredentialRepo` with the username UNIQUE guard.
     #[derive(Default)]
     struct FakeCredentialRepo {
-        stored: Mutex<Vec<LocalCredential>>,
+        stored: Arc<Mutex<Vec<LocalCredential>>>,
+    }
+
+    impl FakeCredentialRepo {
+        /// A credential repo over `users`' own store — the pair a register
+        /// writes through and login reads back.
+        fn sharing(users: &FakeUserRepo) -> Self {
+            Self {
+                stored: Arc::clone(&users.credentials),
+            }
+        }
+    }
+
+    /// A `UserRepo` + `LocalCredentialRepo` pair over one shared store.
+    fn repos() -> (FakeUserRepo, FakeCredentialRepo) {
+        let users = FakeUserRepo::default();
+        let credentials = FakeCredentialRepo::sharing(&users);
+        (users, credentials)
     }
 
     #[async_trait(?Send)]
@@ -513,8 +567,7 @@ mod tests {
 
     #[test]
     fn register_login_roundtrip_seeds_the_browser_zone() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         let session = pollster::block_on(register(
@@ -593,8 +646,7 @@ mod tests {
 
     #[test]
     fn duplicate_username_is_rejected_before_any_write() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         pollster::block_on(register(
@@ -622,9 +674,46 @@ mod tests {
     }
 
     #[test]
+    fn an_orphan_user_row_makes_register_username_taken_not_a_500() {
+        // A `users` row with the standalone email but no credential: the cheap
+        // pre-check misses it, so the conflict only surfaces at the atomic
+        // account write. It must be 409 (`UsernameTaken`), never a backend 500.
+        let (users, credentials) = repos();
+        let calendars = FakeCalendarRepo::with(Vec::new());
+        users.insert_raw(User {
+            id: "orphan".to_string(),
+            google_id: "standalone:orphan".to_string(),
+            email: "ada@standalone.invalid".to_string(),
+            name: "Ada".to_string(),
+            picture: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            deleted_at: None,
+            focused_task_id: None,
+            integration_type: IntegrationType::Standalone,
+        });
+
+        let err = pollster::block_on(register(
+            &users,
+            &credentials,
+            &calendars,
+            register_input("ada", "password-1"),
+            &config(),
+            NOW,
+        ))
+        .unwrap_err();
+        assert_eq!(err, StandaloneAuthError::UsernameTaken);
+        assert_eq!(users.rows().len(), 1, "the orphan row is untouched");
+        assert!(
+            credentials.stored.lock().unwrap().is_empty(),
+            "the failed attempt writes no credential"
+        );
+        assert!(calendars.stored.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn wrong_password_and_unknown_user_are_invalid_credentials() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         pollster::block_on(register(
@@ -666,8 +755,7 @@ mod tests {
 
     #[test]
     fn a_google_user_behind_a_credential_is_rejected() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         users.insert_raw(google_user("g-1"));
@@ -701,8 +789,7 @@ mod tests {
 
     #[test]
     fn invalid_browser_time_zone_is_a_400() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         let err = pollster::block_on(register(
@@ -735,8 +822,7 @@ mod tests {
             ("bogus/zone", "UTC"),
             ("", "UTC"),
         ] {
-            let users = FakeUserRepo::default();
-            let credentials = FakeCredentialRepo::default();
+            let (users, credentials) = repos();
             let calendars = FakeCalendarRepo::with(Vec::new());
             let config = StandaloneAuthConfig {
                 default_time_zone: configured.to_string(),
@@ -765,8 +851,7 @@ mod tests {
 
     #[test]
     fn name_defaults_to_the_username_and_is_bounded() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         let session = pollster::block_on(register(
@@ -807,8 +892,7 @@ mod tests {
 
     #[test]
     fn password_length_is_enforced() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         for password in ["", "short", &"x".repeat(7), &"x".repeat(129)] {
@@ -841,8 +925,7 @@ mod tests {
 
     #[test]
     fn login_self_heals_a_missing_calendar() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         pollster::block_on(register(
@@ -884,8 +967,7 @@ mod tests {
 
     #[test]
     fn registration_timestamps_come_from_now_unix() {
-        let users = FakeUserRepo::default();
-        let credentials = FakeCredentialRepo::default();
+        let (users, credentials) = repos();
         let calendars = FakeCalendarRepo::with(Vec::new());
 
         pollster::block_on(register(

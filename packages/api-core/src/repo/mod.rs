@@ -56,12 +56,41 @@ pub trait UserRepo: Send + Sync {
     /// 'standalone'` and returns the stored row.
     ///
     /// Deliberately NOT an upsert: one account per username, and the username
-    /// lives in [`LocalCredentialRepo`]. The default is a loud "not
-    /// implemented" so existing test fakes keep compiling; every production
-    /// repo (`D1UserRepo`, the SQLite test repo) implements it.
+    /// lives in [`LocalCredentialRepo`]. Kept for compatibility (identity
+    /// tests, repair tooling); registration uses the atomic
+    /// [`UserRepo::create_standalone_account`] instead, because a `users` row
+    /// without its credential can never log in and its UNIQUE email would
+    /// permanently block a retry.
+    ///
+    /// The default is a loud "not implemented" so existing test fakes keep
+    /// compiling; every production repo (`D1UserRepo`, the SQLite test repo)
+    /// implements it.
     async fn create_standalone(&self, _user: NewStandaloneUser) -> Result<User, RepoError> {
         Err(RepoError::Backend(
             "create_standalone not implemented".to_string(),
+        ))
+    }
+    /// Inserts a standalone user **and** its `local_credentials` row in one
+    /// transaction, returning the inserted `users` row
+    /// (`integration_type = 'standalone'`, `picture`/`focused_task_id` NULL,
+    /// timestamps from `user`).
+    ///
+    /// Registration must be all-or-nothing: an orphan `users` row has no login
+    /// handle and its UNIQUE email blocks every later attempt, so a failure
+    /// here must undo the user insert too. A duplicate username (or duplicate
+    /// synthetic id/email) is [`RepoError::Conflict`] and writes nothing;
+    /// anything else is [`RepoError::Backend`].
+    ///
+    /// The default is a loud "not implemented" so existing test fakes keep
+    /// compiling; every production repo (`D1UserRepo`, the SQLite test repo)
+    /// implements it.
+    async fn create_standalone_account(
+        &self,
+        _user: NewStandaloneUser,
+        _credential: NewLocalCredential,
+    ) -> Result<User, RepoError> {
+        Err(RepoError::Backend(
+            "create_standalone_account not implemented".to_string(),
         ))
     }
     /// Sets (or clears, when `task_id` is `None`) the user's focus pointer —
@@ -639,6 +668,8 @@ pub const LOCAL_CREDENTIAL_GET_BY_USERNAME_SQL: &str =
 /// Plain INSERT: the username UNIQUE constraint is the registration guard, so
 /// a concurrent duplicate surfaces as a constraint error (never a silent
 /// overwrite of another user's password).
+/// `UserRepo::create_standalone_account` runs this and
+/// [`USER_INSERT_STANDALONE_SQL`] in one transaction.
 pub const LOCAL_CREDENTIAL_INSERT_SQL: &str = "
     INSERT INTO local_credentials (user_id, username, password_hash, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?)

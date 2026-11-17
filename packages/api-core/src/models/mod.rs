@@ -186,7 +186,8 @@ pub struct NewUser {
     pub picture: Option<String>,
 }
 
-/// Insert input for [`crate::repo::UserRepo::create_standalone`] (ADR 0012).
+/// Insert input for [`crate::repo::UserRepo::create_standalone`] and
+/// [`crate::repo::UserRepo::create_standalone_account`] (ADR 0012).
 ///
 /// Unlike a Google login this is a plain INSERT (one account per username, no
 /// upsert). The caller mints the id, the synthetic `google_id`

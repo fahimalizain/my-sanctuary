@@ -226,6 +226,12 @@ fn raw_event(conn: &rusqlite::Connection, id: &str) -> CalendarEvent {
         .expect("event row")
 }
 
+/// `SELECT COUNT(*)` with one text parameter.
+fn count(conn: &rusqlite::Connection, sql: &str, param: &str) -> i64 {
+    conn.query_row(sql, rusqlite::params![param], |row| row.get(0))
+        .expect("count")
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct UserRow {
     integration_type: String,
@@ -513,6 +519,167 @@ fn duplicate_identity_writes_are_conflicts_and_focus_round_trips() {
             .expect("row")
             .focused_task_id,
         None
+    );
+}
+
+#[test]
+fn register_creates_exactly_one_user_one_credential_and_one_calendar() {
+    let h = open_harness().expect("harness");
+    let session = register_user(&h, "ada", Some("Asia/Kolkata"));
+
+    let conn = h.db.lock().expect("db");
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM users WHERE id = ?",
+            &session.id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM local_credentials WHERE user_id = ?",
+            &session.id,
+        ),
+        1,
+        "a standalone account always has exactly one credential"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM google_calendars WHERE user_id = ?",
+            &session.id,
+        ),
+        1,
+        "the seed writes one calendar"
+    );
+    // Nothing was orphaned: every user row is paired with a credential.
+    let orphaned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM local_credentials)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("orphan count");
+    assert_eq!(orphaned, 0, "no user row exists without a credential");
+}
+
+#[test]
+fn an_orphan_user_row_makes_register_username_taken_and_writes_no_credential() {
+    let h = open_harness().expect("harness");
+    {
+        let conn = h.db.lock().expect("db");
+        // The row the old non-atomic register could leave behind: a `users`
+        // row with the standalone email and no credential. The cheap
+        // `get_by_username` pre-check cannot see it, so register must reach the
+        // schema UNIQUE and answer 409 (`UsernameTaken`), not a 500.
+        exec(
+            &conn,
+            "INSERT INTO users (id, google_id, email, name, integration_type, created_at, updated_at)
+             VALUES ('orphan', 'standalone:orphan', 'ada@standalone.invalid', 'Ada', 'standalone', ?, ?)",
+            &[&NOW_RFC, &NOW_RFC],
+        )
+        .expect("orphan user row");
+    }
+
+    let err = pollster::block_on(register(
+        &h.users(),
+        &h.credentials(),
+        &h.calendars,
+        RegisterInput {
+            username: "ada".to_string(),
+            password: PASSWORD.to_string(),
+            name: None,
+            time_zone: None,
+        },
+        &config(),
+        NOW,
+    ))
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StandaloneAuthError::UsernameTaken,
+        "a UNIQUE email is a 409, never a backend 500"
+    );
+
+    let conn = h.db.lock().expect("db");
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM local_credentials WHERE username = ?",
+            "ada",
+        ),
+        0,
+        "the failed attempt wrote no credential"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM users WHERE email = ?",
+            "ada@standalone.invalid"
+        ),
+        1,
+        "the orphan row is untouched and no second user row was added"
+    );
+    assert!(
+        query_vec::<IdRow>(
+            &conn,
+            "SELECT id FROM google_calendars WHERE user_id = 'orphan'",
+            &[],
+        )
+        .expect("calendar rows")
+        .is_empty(),
+        "no calendar is seeded for the rejected registration"
+    );
+}
+
+#[test]
+fn create_standalone_account_rolls_back_the_user_row_on_a_duplicate_username() {
+    let h = open_harness().expect("harness");
+    register_user(&h, "ada", None);
+
+    // Fresh id and email, so the `users` INSERT itself would succeed; only the
+    // credential's UNIQUE `username` fails. Both rows must roll back.
+    let err = pollster::block_on(h.users().create_standalone_account(
+        NewStandaloneUser {
+            id: "second".to_string(),
+            google_id: "standalone:second".to_string(),
+            email: "second@standalone.invalid".to_string(),
+            name: "Second".to_string(),
+            created_at: NOW_RFC.to_string(),
+            updated_at: NOW_RFC.to_string(),
+        },
+        NewLocalCredential {
+            user_id: "second".to_string(),
+            username: "ada".to_string(),
+            password_hash: "pbkdf2-sha256$1$c2FsdA==$aGFzaA==".to_string(),
+            created_at: NOW_RFC.to_string(),
+            updated_at: NOW_RFC.to_string(),
+        },
+    ))
+    .unwrap_err();
+    assert_eq!(err, RepoError::Conflict);
+
+    assert!(
+        pollster::block_on(h.users().get_by_id("second"))
+            .expect("get second")
+            .is_none(),
+        "the user INSERT is rolled back with the credential INSERT"
+    );
+    let conn = h.db.lock().expect("db");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM users WHERE id = ?", "second"),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM local_credentials WHERE username = ?",
+            "ada",
+        ),
+        1,
+        "the original credential is untouched"
     );
 }
 
