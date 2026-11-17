@@ -117,9 +117,12 @@ sub-requests to the same REST routes the web app uses. The
 sub-requests build their router through that constructor. A tool then builds a
 request by hand and runs that router.
 
-The request URL must be absolute because web_sys `Request` requires one; a
-dummy origin such as `https://sanctuary.internal` plus the path and query
-works, since `Request::path()` is the URL pathname. Only the caller's
+The request URL must be absolute because web_sys `Request` requires one. The
+origin is the **outer** request's scheme and host (falling back to
+`http://localhost` only when the URL has no host), so a sub-request evaluates
+the same host-based gates as the caller — notably the standalone gate, which
+refuses a standalone identity on a public host (ADR 0012). Only the path and
+query of the tool's REST call are added to that origin. Only the caller's
 `Authorization` header is copied. `Cookie` is not. The router runs against the
 sub-request with a cloned `Env`; `Env` is `Clone` in worker 0.8.5.
 

@@ -87,7 +87,9 @@ Constraints that drive the design:
 ### Production gate
 
 `Config::standalone_enabled_for(request_host)` is the single server-side
-check, evaluated on every standalone auth endpoint and in calendar access:
+check. It is evaluated in `auth::authenticate` for **every** authenticated
+request carrying a standalone identity (session cookie or API key), on every
+standalone auth endpoint, and again in calendar access:
 
 1. `ALLOW_STANDALONE_AUTH == "true"` (exact match; default off).
 2. `SECURE_COOKIE != "true"` (production sessions are always secure).
@@ -107,8 +109,10 @@ offers a form the server would reject.
 ### Standalone calendar row
 
 A standalone user owns exactly one `google_calendars` row, seeded
-idempotently (`INSERT … ON CONFLICT(user_id, google_calendar_id) DO NOTHING`)
-on register, on login, and in the standalone list paths when the snapshot is
+idempotently (`INSERT … ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET
+deleted_at = NULL`, so a soft-deleted local calendar is resurrected while its
+stored time zone and labels survive) on register, on login, and in the
+standalone list paths (`list_events` and `list_calendars`) when the snapshot is
 empty:
 
 - `google_calendar_id = 'standalone:<user_id>'`, `summary = 'Personal'`.
@@ -139,7 +143,9 @@ The cron's cross-user queries add
 `TASK_LIST_IN_PROGRESS_SQL`, and `OCCURRENCE_LIST_IN_PROGRESS_SQL`.
 Subqueries (not joins) keep `SELECT *` row shapes unchanged. Queue messages
 that resolve to a standalone-owned calendar are acked as a defense-in-depth
-no-op.
+no-op, decided from the already-loaded calendar row (`google_calendar_id`
+starting with `standalone:`, `sync_status = 'disabled'`, or a disabled
+calendar) so the ack costs no extra D1 read.
 
 ### Stand-in limits (v1)
 
