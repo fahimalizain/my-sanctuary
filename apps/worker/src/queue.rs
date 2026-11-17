@@ -13,7 +13,7 @@
 //! `CalendarSync` variant comes first, so `{"calendar_id":"…"}` still
 //! deserializes exactly as it always did.
 
-use api_core::repo::{CalendarRepo, UserRepo};
+use api_core::repo::CalendarRepo;
 use worker::*;
 
 /// One digest tick for one user, logging the report. Never throws: a digest
@@ -185,38 +185,17 @@ pub async fn queue(
 
         // Defense in depth (ADR 0012): a standalone user's local calendar is
         // `sync_enabled = 1` so reads work, but it must never enter a Google
-        // walk. Skip (ack) rather than refresh a token that cannot exist.
-        // An unknown/lookup-failed owner also acks: nothing to sync.
-        let users = match env.d1("DB") {
-            Ok(db) => crate::db::D1UserRepo::new(db),
-            Err(err) => {
-                console_log!("queue: DB binding missing for owner lookup: {err} — acking");
-                message.ack();
-                continue;
-            }
-        };
-        match users.get_by_id(&cal.user_id).await {
-            Ok(Some(user))
-                if user.integration_type == api_core::models::IntegrationType::Standalone =>
-            {
-                console_log!(
-                    "queue: calendar {} belongs to a standalone user — acking",
-                    cal.id
-                );
-                message.ack();
-                continue;
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                console_log!("queue: calendar {calendar_id} owner missing — acking");
-                message.ack();
-                continue;
-            }
-            Err(err) => {
-                console_log!("queue: calendar {calendar_id} owner lookup failed: {err} — acking");
-                message.ack();
-                continue;
-            }
+        // walk. The already-loaded row says so without a second D1 read: the
+        // synthetic Google id, a disabled calendar, or a sync-disabled one has
+        // no token/channel to sync. Skip (ack) rather than refresh a token
+        // that cannot exist.
+        if cal.google_calendar_id.starts_with("standalone:")
+            || cal.sync_status == "disabled"
+            || !cal.sync_enabled
+        {
+            console_log!("queue: calendar {} is local/disabled — acking", cal.id);
+            message.ack();
+            continue;
         }
 
         let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
