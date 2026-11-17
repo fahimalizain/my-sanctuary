@@ -4,6 +4,7 @@ import { API_BASE_URL } from '@/lib/api';
 import { isStandaloneUser } from '@/lib/integration';
 import { useAuth } from '@/lib/auth';
 import type { SyncHealthBanner } from '../lib/sync-health';
+import { syncBannerControls } from '../lib/sync-banner-visibility';
 
 export interface CalendarSyncBannerProps {
   banner: SyncHealthBanner;
@@ -18,12 +19,13 @@ export function CalendarSyncBanner({
 }: CalendarSyncBannerProps) {
   const { user } = useAuth();
 
-  // Defense in depth: a standalone user has no Google grant to reconnect and
-  // no sync to retry. The backend already seeds their calendar as
-  // `sync_status = 'disabled'`, which keeps the banner `none`.
-  if (isStandaloneUser(user)) return null;
-
   if (banner.kind === 'none') return null;
+
+  // A standalone user has no Google grant to reconnect, but a real
+  // `fetch_error` is a local read failure worth a Retry (ADR 0012): only the
+  // reconnect link is hidden.
+  const standalone = isStandaloneUser(user);
+  const controls = syncBannerControls(banner, standalone);
 
   const retryLabel = banner.kind === 'fetch_error' ? 'Retry' : 'Try again';
 
@@ -33,7 +35,7 @@ export function CalendarSyncBanner({
         {banner.message}
       </p>
       <div className="flex items-center gap-2 shrink-0">
-        {banner.showRetry && (
+        {controls.retry && (
           <Button
             variant="outline"
             size="sm"
@@ -44,7 +46,7 @@ export function CalendarSyncBanner({
             {retryLabel}
           </Button>
         )}
-        {banner.showReconnect && (
+        {controls.reconnect && (
           <a
             href={`${API_BASE_URL}/auth/google`}
             className="inline-flex items-center justify-center h-8 px-3 rounded-md border border-input bg-background text-foreground hover:bg-muted text-sm font-medium transition-colors"
