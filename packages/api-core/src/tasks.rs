@@ -4063,6 +4063,7 @@ mod tests {
                 updated_at: "2026-08-18T00:00:00Z".to_string(),
                 deleted_at: None,
                 focused_task_id: self.pointer(),
+                integration_type: crate::models::IntegrationType::Google,
             }))
         }
 
