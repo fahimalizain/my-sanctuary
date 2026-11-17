@@ -8,8 +8,9 @@
 //!
 //! [`ensure_standalone_calendar`] is safe to call on register, on login, and
 //! from the standalone list self-heal: the repo's
-//! `INSERT … ON CONFLICT(user_id, google_calendar_id) DO NOTHING` keeps an
-//! existing row (and its stored time zone/labels) untouched.
+//! `INSERT … ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET deleted_at
+//! = NULL` keeps an existing row (and its stored time zone/labels) untouched
+//! and resurrects a soft-deleted local calendar.
 
 use crate::models::StandaloneCalendarSeed;
 use crate::repo::{standalone_event_labels_json, CalendarRepo, RepoError};
@@ -31,8 +32,9 @@ pub fn standalone_google_calendar_id(user_id: &str) -> String {
     format!("standalone:{user_id}")
 }
 
-/// Seeds the user's local calendar. `DO NOTHING` makes this idempotent; an
-/// existing row is never overwritten.
+/// Seeds the user's local calendar. The conflict clause only clears
+/// `deleted_at`, so this is idempotent, an existing row is never overwritten,
+/// and a soft-deleted local calendar is resurrected.
 ///
 /// `time_zone` is trimmed; empty/unknown IANA names store `UTC` (the same
 /// fallback rule as [`crate::time::parse_iana_tz`] — never an error, since this
@@ -147,10 +149,44 @@ mod tests {
         .expect("second seed");
 
         let rows = seeded(&calendars);
-        assert_eq!(rows.len(), 1, "DO NOTHING must not insert a second row");
+        assert_eq!(rows.len(), 1, "the seed must not insert a second row");
         assert_eq!(rows[0].time_zone, "America/New_York");
         assert_eq!(rows[0].created_at, "2023-11-14T22:13:20Z");
         assert_eq!(rows[0].updated_at, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn seeding_resurrects_a_soft_deleted_calendar_and_keeps_its_zone() {
+        let calendars = FakeCalendarRepo::with(Vec::new());
+        pollster::block_on(ensure_standalone_calendar(
+            &calendars,
+            "u-1",
+            "America/New_York",
+            NOW,
+        ))
+        .expect("first seed");
+
+        {
+            let mut stored = calendars.stored.lock().unwrap();
+            let row = stored.iter_mut().find(|row| row.user_id == "u-1").unwrap();
+            row.deleted_at = Some("2023-11-15T00:00:00Z".to_string());
+        }
+
+        pollster::block_on(ensure_standalone_calendar(
+            &calendars,
+            "u-1",
+            "UTC",
+            NOW + 3_600,
+        ))
+        .expect("resurrecting seed");
+
+        let rows = seeded(&calendars);
+        assert_eq!(rows.len(), 1, "the same row comes back, never a duplicate");
+        assert_eq!(rows[0].deleted_at, None, "the local calendar lives again");
+        assert_eq!(
+            rows[0].time_zone, "America/New_York",
+            "the stored zone survives the resurrection"
+        );
     }
 
     #[test]

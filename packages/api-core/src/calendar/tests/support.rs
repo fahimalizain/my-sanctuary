@@ -793,17 +793,20 @@ impl CalendarRepo for FakeCalendarRepo {
         Ok(())
     }
 
-    /// Mirrors `CALENDAR_INSERT_STANDALONE_SQL`: `DO NOTHING` on an existing
-    /// `(user_id, google_calendar_id)`, otherwise a fully-stamped local row
+    /// Mirrors `CALENDAR_INSERT_STANDALONE_SQL`: on an existing
+    /// `(user_id, google_calendar_id)` only `deleted_at` is cleared (resurrect),
+    /// keeping the stored zone/labels; otherwise a fully-stamped local row
     /// (`sync_enabled = 1`, `sync_status = 'disabled'`).
     async fn insert_standalone(&self, seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
         if *self.fail_insert_standalone.lock().unwrap() {
             return Err(RepoError::Backend("standalone seed failed".into()));
         }
         let mut stored = self.stored.lock().unwrap();
-        if stored.iter().any(|cal| {
+        if let Some(existing) = stored.iter_mut().find(|cal| {
             cal.user_id == seed.user_id && cal.google_calendar_id == seed.google_calendar_id
         }) {
+            // DO UPDATE SET deleted_at = NULL: resurrect only.
+            existing.deleted_at = None;
             return Ok(());
         }
         stored.push(GoogleCalendar {

@@ -433,6 +433,58 @@ fn seed_is_idempotent_and_login_self_heals_a_missing_calendar() {
 }
 
 #[test]
+fn seeding_resurrects_a_soft_deleted_standalone_calendar() {
+    let h = open_harness().expect("harness");
+    let session = register_user(&h, "ada", Some("Asia/Kolkata"));
+    let google_calendar_id = format!("standalone:{}", session.id);
+
+    // Soft-delete the seeded calendar (the repo's delete path).
+    pollster::block_on(
+        h.calendars
+            .delete(&format!("standalone-cal-{}", session.id), NOW_RFC),
+    )
+    .expect("soft delete");
+    assert!(
+        pollster::block_on(h.calendars.list_by_user_id(&session.id))
+            .expect("list")
+            .is_empty(),
+        "a soft-deleted calendar is invisible to the living read"
+    );
+
+    pollster::block_on(ensure_standalone_calendar(
+        &h.calendars,
+        &session.id,
+        "UTC",
+        NOW + 3_600,
+    ))
+    .expect("resurrecting seed");
+
+    {
+        let conn = h.db.lock().expect("db");
+        let row = raw_calendar(&conn, &session.id);
+        assert_eq!(row.deleted_at, None, "the local calendar lives again");
+        assert_eq!(
+            row.time_zone, "Asia/Kolkata",
+            "the original time zone survives the resurrection"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM google_calendars WHERE user_id = ?",
+                &session.id,
+            ),
+            1,
+            "no duplicate row is inserted"
+        );
+    }
+
+    let healed = calendar_by_gcal(&h, &session.id, &google_calendar_id);
+    assert_eq!(healed.time_zone, "Asia/Kolkata");
+    assert!(healed.sync_enabled);
+    assert_eq!(healed.sync_status, "disabled");
+}
+
+#[test]
 fn login_accepts_only_the_right_password() {
     let h = open_harness().expect("harness");
     let session = register_user(&h, "ada", None);

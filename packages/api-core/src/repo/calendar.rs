@@ -35,10 +35,11 @@ pub trait CalendarRepo: Send + Sync {
     async fn upsert_batch(&self, calendars: Vec<NewCalendar>) -> Result<(), RepoError>;
     /// Idempotently seeds a standalone user's local calendar (ADR 0012).
     ///
-    /// `INSERT … ON CONFLICT(user_id, google_calendar_id) DO NOTHING`: calling
-    /// it on register, on login, and from the standalone list self-heal is
-    /// safe, and an existing row is never overwritten (the user's time zone
-    /// and labels survive). The row is written with `sync_enabled = 1` (the
+    /// `INSERT … ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET
+    /// deleted_at = NULL`: calling it on register, on login, and from the
+    /// standalone list self-heal is safe, an existing row is never overwritten
+    /// (the user's time zone and labels survive), and a soft-deleted local
+    /// calendar is resurrected. The row is written with `sync_enabled = 1` (the
     /// event-range/running SQL require it) and `sync_status = 'disabled'` (so
     /// no sync, repair, or watch path treats it as a real calendar).
     ///
@@ -545,8 +546,9 @@ pub const CALENDAR_UPSERT_SQL: &str = "
 /// NULL without a default is written explicitly, and the health columns are
 /// hardcoded so the row can never enter a sync path: `sync_enabled = 1` (the
 /// event-range/running SQL require it) and `sync_status = 'disabled'` (no
-/// sync, no stale banner, no repair). `DO NOTHING` keeps an existing row — and
-/// its time zone/labels — untouched.
+/// sync, no stale banner, no repair). On conflict only `deleted_at` is
+/// cleared: a soft-deleted local calendar is resurrected, while the stored
+/// time zone, labels, and health columns are never overwritten.
 pub const CALENDAR_INSERT_STANDALONE_SQL: &str = "
     INSERT INTO google_calendars (
         id, user_id, google_calendar_id, summary, time_zone,
@@ -567,7 +569,7 @@ pub const CALENDAR_INSERT_STANDALONE_SQL: &str = "
         ?, ?, 'covered', 'complete',
         ?, ?
     )
-    ON CONFLICT(user_id, google_calendar_id) DO NOTHING
+    ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET deleted_at = NULL
 ";
 
 /// The `labelProperties.eventLabels` JSON a standalone calendar is seeded with:
@@ -2274,8 +2276,10 @@ mod tests {
         let sql = CALENDAR_INSERT_STANDALONE_SQL;
         assert!(sql.contains("INSERT INTO google_calendars"), "{sql}");
         assert!(
-            sql.contains("ON CONFLICT(user_id, google_calendar_id) DO NOTHING"),
-            "{sql}"
+            sql.contains(
+                "ON CONFLICT(user_id, google_calendar_id) DO UPDATE SET deleted_at = NULL"
+            ),
+            "a soft-deleted local calendar must be resurrected: {sql}"
         );
         // sync_enabled = 1 is what makes standalone events visible in the
         // range/running queries; sync_status = 'disabled' keeps sync quiet.

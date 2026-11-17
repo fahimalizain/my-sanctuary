@@ -216,8 +216,9 @@ impl CalendarRepo for D1CalendarRepo {
     async fn insert_standalone(&self, seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
         // Bind params only — every literal (`sync_enabled = 1`,
         // `sync_status = 'disabled'`, the empty-string health columns) lives in
-        // the statement. `DO NOTHING` makes register/login/self-heal
-        // idempotent and never overwrites a stored time zone or label cache.
+        // the statement. `ON CONFLICT … DO UPDATE SET deleted_at = NULL` makes
+        // register/login/self-heal idempotent, never overwrites a stored time
+        // zone or label cache, and resurrects a soft-deleted local calendar.
         let stmt = self
             .db
             .prepare(CALENDAR_INSERT_STANDALONE_SQL)

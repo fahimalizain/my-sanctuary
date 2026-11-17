@@ -308,7 +308,9 @@ pub async fn login(
         return Err(StandaloneAuthError::InvalidCredentials);
     }
 
-    // Idempotent: `DO NOTHING` keeps an existing row (and its stored zone).
+    // Idempotent: the conflict clause only clears `deleted_at`, so an existing
+    // row (and its stored zone/labels) is kept and a soft-deleted one lives
+    // again.
     ensure_standalone_calendar(calendars, &user.id, &default_time_zone(config), now_unix).await?;
 
     Ok(session_user(user))

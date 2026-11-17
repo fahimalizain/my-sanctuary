@@ -213,9 +213,9 @@ impl CalendarRepo for SqliteCalendarRepo {
 
     async fn insert_standalone(&self, seed: &StandaloneCalendarSeed) -> Result<(), RepoError> {
         let conn = lock(&self.db)?;
-        // Every health/identity column lives in the statement;
-        // `ON CONFLICT(user_id, google_calendar_id) DO NOTHING` keeps an
-        // existing row (and its zone/labels) untouched.
+        // Every health/identity column lives in the statement; the conflict
+        // clause only clears `deleted_at`, so an existing row (and its
+        // zone/labels) is kept and a soft-deleted one lives again.
         exec(
             &conn,
             CALENDAR_INSERT_STANDALONE_SQL,
