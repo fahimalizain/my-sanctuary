@@ -9,6 +9,7 @@ mod digest;
 mod record;
 mod repos;
 mod rules;
+mod standalone;
 
 pub use api_keys::SqliteApiKeyRepo;
 pub use digest::{
@@ -23,6 +24,7 @@ pub use repos::{
     SqliteWatchChannelRepo,
 };
 pub use rules::{seed_category, seed_category_seconds, SqliteRuleRepo};
+pub use standalone::{SqliteLocalCredentialRepo, SqliteUserRepo};
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -58,6 +60,16 @@ impl Harness {
     /// A record repo over the same connection (one D1 database).
     pub fn record(&self) -> SqliteRecordRepo {
         SqliteRecordRepo::new(Arc::clone(&self.db))
+    }
+
+    /// A `users` repo over the same connection (one D1 database).
+    pub fn users(&self) -> SqliteUserRepo {
+        SqliteUserRepo::new(Arc::clone(&self.db))
+    }
+
+    /// A `local_credentials` repo over the same connection (one D1 database).
+    pub fn credentials(&self) -> SqliteLocalCredentialRepo {
+        SqliteLocalCredentialRepo::new(Arc::clone(&self.db))
     }
 }
 
