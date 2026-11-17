@@ -15,6 +15,7 @@
 //! (default `http://localhost:5173`, matching the Vite dev proxy). The
 //! same-origin proxy path does not need CORS but is unaffected by it.
 
+use api_core::models::IntegrationType;
 use api_core::ApiKeyRepo;
 use serde::Deserialize;
 use worker::*;
@@ -119,6 +120,12 @@ pub(crate) fn session_user(
 /// [`Malformed`](api_core::AuthorizationHeader::Malformed) or an unrecognized/
 /// expired/revoked key — both `None`, never a silent downgrade to the cookie.
 ///
+/// This is also the single production gate for standalone identities (ADR
+/// 0012): a `standalone` session — cookie **or** API key — is refused unless
+/// [`api_core::Config::standalone_enabled_for`] approves this request host.
+/// Every authenticated route goes through here, so a public host fails closed
+/// everywhere, not just on `/auth/*` and the calendar handlers.
+///
 /// A D1 failure on the bearer path is logged and also reported as `None`: a
 /// 401 for a caller whose key cannot be verified right now is the safe answer,
 /// and the alternative (a 500) would have to be threaded through every data
@@ -128,11 +135,20 @@ pub(crate) async fn authenticate(
     ctx: &RouteContext<Option<api_core::Config>>,
 ) -> Option<api_core::SessionUser> {
     let header = req.headers().get("Authorization").ok().flatten();
-    match api_core::parse_authorization_header(header.as_deref()) {
+    let user = match api_core::parse_authorization_header(header.as_deref()) {
         api_core::AuthorizationHeader::Absent => session_user(req, ctx.data.as_ref()),
-        api_core::AuthorizationHeader::Malformed => None,
+        api_core::AuthorizationHeader::Malformed => return None,
         api_core::AuthorizationHeader::Bearer(secret) => bearer_user(secret, ctx).await,
+    }?;
+    if user.integration_type == IntegrationType::Standalone {
+        let Some(config) = ctx.data.as_ref() else {
+            return None;
+        };
+        if !config.standalone_enabled_for(crate::calendar_access::request_host(req).as_deref()) {
+            return None;
+        }
     }
+    Some(user)
 }
 
 /// Resolves an API key secret to its owner, touching `last_used_at` at most

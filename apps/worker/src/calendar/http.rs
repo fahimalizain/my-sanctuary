@@ -14,6 +14,16 @@ use crate::calendar_access::{calendar_access, CalendarAccessError};
 /// config, so this is a defensive default only.
 const FALLBACK_STANDALONE_TIME_ZONE: &str = "UTC";
 
+/// Configured IANA zone for a standalone self-heal seed, with the defensive
+/// UTC fallback (the standalone access branch requires a config, so this only
+/// matters if the config is missing).
+fn standalone_seed_time_zone(ctx: &RouteContext<Option<api_core::Config>>) -> String {
+    ctx.data
+        .as_ref()
+        .map(|config| config.standalone_default_time_zone.clone())
+        .unwrap_or_else(|| FALLBACK_STANDALONE_TIME_ZONE.to_string())
+}
+
 /// 401 body for missing/invalid session only (ADR 0005 invariant 10).
 fn unauthorized(ctx: &RouteContext<Option<api_core::Config>>) -> Result<Response> {
     json_error(ctx, 401, "unauthorized")
@@ -266,13 +276,36 @@ pub async fn list_events(
 
     let output = match access {
         Ok(session) => {
-            let snapshot = match snapshot {
+            let mut snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     console_log!("calendar: list_events failed: {err}");
                     return json_error(&ctx, 500, "failed to load events");
                 }
             };
+            // Self-heal (ADR 0012): a standalone user whose local calendar row
+            // is missing (older account, manual delete) gets the seed before
+            // the read. The stand-in has no calendarList/events.list, so the
+            // empty-store import path must never be reached.
+            if user.integration_type == IntegrationType::Standalone && snapshot.calendars.is_empty()
+            {
+                let time_zone = standalone_seed_time_zone(&ctx);
+                if let Err(err) =
+                    api_core::ensure_standalone_calendar(&calendars, &user.id, &time_zone, now_unix)
+                        .await
+                {
+                    console_log!("calendar: standalone calendar seed failed: {err}");
+                    return json_error(&ctx, 500, "failed to load events");
+                }
+                snapshot = match api_core::load_list_snapshot(&calendars, &watches, &user.id).await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        console_log!("calendar: list_events failed: {err}");
+                        return json_error(&ctx, 500, "failed to load events");
+                    }
+                };
+            }
             match api_core::list_events_with_snapshot(
                 session.http.as_ref(),
                 &calendars,
@@ -436,9 +469,10 @@ pub async fn list_calendars(
 /// Standalone calendar listing: the cached rows, self-healing an empty store
 /// with [`api_core::ensure_standalone_calendar`].
 ///
-/// The seed is idempotent (`DO NOTHING`), so a stored time zone and label
-/// cache are never overwritten; the configured default zone only applies to a
-/// genuinely missing row.
+/// The seed only resurrects/creates a row (`ON CONFLICT … DO UPDATE SET
+/// deleted_at = NULL`), so a stored time zone and label cache are never
+/// overwritten; the configured default zone only applies to a genuinely
+/// missing row.
 async fn standalone_calendars(
     ctx: &RouteContext<Option<api_core::Config>>,
     calendars: &crate::db::D1CalendarRepo,
@@ -447,11 +481,7 @@ async fn standalone_calendars(
 ) -> Result<CalendarsResponse, CalendarError> {
     let mut rows = calendars.list_by_user_id(user_id).await?;
     if rows.is_empty() {
-        let time_zone = ctx
-            .data
-            .as_ref()
-            .map(|config| config.standalone_default_time_zone.clone())
-            .unwrap_or_else(|| FALLBACK_STANDALONE_TIME_ZONE.to_string());
+        let time_zone = standalone_seed_time_zone(ctx);
         api_core::ensure_standalone_calendar(calendars, user_id, &time_zone, now_unix).await?;
         rows = calendars.list_by_user_id(user_id).await?;
     }
