@@ -1,6 +1,8 @@
 import { RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { API_BASE_URL } from '@/lib/api';
+import { isStandaloneUser } from '@/lib/integration';
+import { useAuth } from '@/lib/auth';
 import type { SyncHealthBanner } from '../lib/sync-health';
 
 export interface CalendarSyncBannerProps {
@@ -14,6 +16,13 @@ export function CalendarSyncBanner({
   onRetry,
   isRefreshing,
 }: CalendarSyncBannerProps) {
+  const { user } = useAuth();
+
+  // Defense in depth: a standalone user has no Google grant to reconnect and
+  // no sync to retry. The backend already seeds their calendar as
+  // `sync_status = 'disabled'`, which keeps the banner `none`.
+  if (isStandaloneUser(user)) return null;
+
   if (banner.kind === 'none') return null;
 
   const retryLabel = banner.kind === 'fetch_error' ? 'Retry' : 'Try again';
