@@ -87,9 +87,11 @@ Constraints that drive the design:
 ### Production gate
 
 `Config::standalone_enabled_for(request_host)` is the single server-side
-check. It is evaluated in `auth::authenticate` for **every** authenticated
-request carrying a standalone identity (session cookie or API key), on every
-standalone auth endpoint, and again in calendar access:
+check. It runs in `auth::authenticate` for the API data routes and MCP, on
+every standalone auth endpoint, and again in calendar access. API-key
+management (`api_keys.rs`) and the realtime socket (`user_hub.rs`) read the
+standalone session cookie with `auth::session_user` directly, so they rely on
+the cookie's host binding rather than this extra check:
 
 1. `ALLOW_STANDALONE_AUTH == "true"` (exact match; default off).
 2. `SECURE_COOKIE != "true"` (production sessions are always secure).

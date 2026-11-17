@@ -120,11 +120,12 @@ pub(crate) fn session_user(
 /// [`Malformed`](api_core::AuthorizationHeader::Malformed) or an unrecognized/
 /// expired/revoked key — both `None`, never a silent downgrade to the cookie.
 ///
-/// This is also the single production gate for standalone identities (ADR
-/// 0012): a `standalone` session — cookie **or** API key — is refused unless
-/// [`api_core::Config::standalone_enabled_for`] approves this request host.
-/// Every authenticated route goes through here, so a public host fails closed
-/// everywhere, not just on `/auth/*` and the calendar handlers.
+/// This is also the production gate for standalone identities on the API data
+/// routes and MCP (ADR 0012): a `standalone` session — cookie **or** API key —
+/// is refused unless [`api_core::Config::standalone_enabled_for`] approves
+/// this request host. API-key management and the realtime socket read the
+/// standalone session cookie with [`session_user`] directly, so they rely on
+/// the cookie's host binding rather than this check.
 ///
 /// A D1 failure on the bearer path is logged and also reported as `None`: a
 /// 401 for a caller whose key cannot be verified right now is the safe answer,
