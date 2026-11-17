@@ -366,7 +366,11 @@ pub struct ApiKeyOwnerRow {
     /// `COALESCE(users.picture, '') AS user_picture` — never NULL.
     pub user_picture: String,
     /// `users.integration_type AS user_integration_type` (ADR 0012).
-    /// Defaulted so a projection that predates migration 0024 reads as Google.
+    /// Migration `0024` must be applied before deploying this code: the SQL
+    /// selects the column, so an un-migrated database fails the whole
+    /// `API_KEY_AUTHENTICATE_SQL` query. The `default` is only a decode
+    /// fallback for a projection built without the column (e.g. a test row),
+    /// not a substitute for the migration.
     #[serde(default)]
     pub user_integration_type: IntegrationType,
 }
