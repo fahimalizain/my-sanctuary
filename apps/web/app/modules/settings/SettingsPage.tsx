@@ -6,10 +6,12 @@ import {
   LogOut,
   ChevronRight,
   Repeat,
+  CalendarDays,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/lib/auth';
+import { isStandaloneUser } from '@/lib/integration';
 import { useTheme } from '@/lib/theme-context';
 import { ThemePreferenceControl } from './ThemePreferenceControl';
 import { SettingsSection } from './SettingsSection';
@@ -58,6 +60,10 @@ export function SettingsPage() {
   const { user, logout } = useAuth();
   const { preference, setPreference } = useTheme();
   const navigate = useNavigate();
+
+  // Standalone accounts keep their data in the local calendar stand-in — they
+  // have no Google grant at all, so the integration row must not claim one.
+  const standalone = isStandaloneUser(user);
 
   const handleLogout = async () => {
     await logout();
@@ -167,17 +173,27 @@ export function SettingsPage() {
           <div className="space-y-1">
             <SettingsItem
               icon={
-                <svg className="h-5 w-5" viewBox="0 0 24 24">
-                  <path
-                    fill="currentColor"
-                    d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.4 16.2L16.2 18l-4.2-4.2-4.2 4.2-1.2-1.8 4.2-4.2-4.2-4.2 1.2-1.8 4.2 4.2 4.2-4.2 1.2 1.8-4.2 4.2 4.2 4.2z"
-                  />
-                </svg>
+                standalone ? (
+                  <CalendarDays className="h-5 w-5" />
+                ) : (
+                  <svg className="h-5 w-5" viewBox="0 0 24 24">
+                    <path
+                      fill="currentColor"
+                      d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.6 0 12 0zm5.4 16.2L16.2 18l-4.2-4.2-4.2 4.2-1.2-1.8 4.2-4.2-4.2-4.2 1.2-1.8 4.2 4.2 4.2-4.2 1.2 1.8-4.2 4.2 4.2 4.2z"
+                    />
+                  </svg>
+                )
               }
-              label="Google Calendar"
-              value={user ? 'Connected' : 'Not connected'}
+              label={standalone ? 'Calendar' : 'Google Calendar'}
+              value={
+                standalone
+                  ? 'Local (no Google)'
+                  : user
+                    ? 'Connected'
+                    : 'Not connected'
+              }
               action={
-                user ? (
+                !standalone && user ? (
                   <span className="text-sm text-primary font-medium">
                     Connected
                   </span>
