@@ -34,6 +34,8 @@
 //!   one-second request timestamp: two patches inside the same second must
 //!   still invalidate each other for the journal's `If-Match` retry path.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
@@ -48,11 +50,12 @@ use crate::time::{rfc3339_to_unix_secs, unix_secs_to_rfc3339};
 /// `…/channels/stop` parse.
 const GOOGLE_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 
-/// A repo-backed `HttpClient` for a standalone user. Holds owned repo handles
-/// so the Worker can build one per request from fresh D1 connections.
+/// A repo-backed `HttpClient` for a standalone user. Holds shared repo handles
+/// so the Worker can build one per request from fresh D1 connections, and so a
+/// test can hand the same repos to both a service call and the stand-in.
 pub struct StandaloneCalendarHttp {
-    calendars: Box<dyn CalendarRepo>,
-    events: Box<dyn CalendarEventRepo>,
+    calendars: Arc<dyn CalendarRepo>,
+    events: Arc<dyn CalendarEventRepo>,
     /// Owner of the only calendar this client may touch.
     user_id: String,
     /// Request instant used for `updated` stamps.
@@ -61,8 +64,8 @@ pub struct StandaloneCalendarHttp {
 
 impl StandaloneCalendarHttp {
     pub fn new(
-        calendars: Box<dyn CalendarRepo>,
-        events: Box<dyn CalendarEventRepo>,
+        calendars: Arc<dyn CalendarRepo>,
+        events: Arc<dyn CalendarEventRepo>,
         user_id: String,
         now_unix: i64,
     ) -> Self {
@@ -745,17 +748,12 @@ mod tests {
         StandaloneCalendarHttp,
         Arc<std::sync::Mutex<Vec<GoogleCalendar>>>,
     ) {
-        let calendar_repo = FakeCalendarRepo::with(calendars);
+        let calendar_repo = Arc::new(FakeCalendarRepo::with(calendars));
         let stored = Arc::clone(&calendar_repo.stored);
-        let event_repo = FakeEventRepo::new();
+        let event_repo = Arc::new(FakeEventRepo::new());
         event_repo.stored.lock().unwrap().extend(events);
         (
-            StandaloneCalendarHttp::new(
-                Box::new(calendar_repo),
-                Box::new(event_repo),
-                USER.to_string(),
-                NOW,
-            ),
+            StandaloneCalendarHttp::new(calendar_repo, event_repo, USER.to_string(), NOW),
             stored,
         )
     }

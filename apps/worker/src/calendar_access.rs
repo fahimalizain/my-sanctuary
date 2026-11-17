@@ -24,6 +24,8 @@
 //! for standalone), so [`list_events`](crate::calendar::list_events) calls it
 //! inside its existing `futures::join!` and pays no extra round trip.
 
+use std::sync::Arc;
+
 use api_core::models::IntegrationType;
 use api_core::{GoogleAccess, TokenError};
 use worker::{Request, RouteContext};
@@ -124,8 +126,8 @@ fn standalone_session(
     let events = crate::db::D1CalendarEventRepo::new(d1()?);
     Ok(CalendarSession {
         http: Box::new(api_core::StandaloneCalendarHttp::new(
-            Box::new(calendars),
-            Box::new(events),
+            Arc::new(calendars),
+            Arc::new(events),
             user.id.clone(),
             now_unix,
         )),

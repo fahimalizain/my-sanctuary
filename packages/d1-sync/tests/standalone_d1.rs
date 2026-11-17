@@ -114,8 +114,8 @@ fn login_user(
 /// its own `now_unix` (the stand-in stamps `updated` at construction).
 fn stand_in(h: &Harness, user_id: &str, now: i64) -> StandaloneCalendarHttp {
     StandaloneCalendarHttp::new(
-        Box::new(SqliteCalendarRepo::new(Arc::clone(&h.db))),
-        Box::new(SqliteCalendarEventRepo::new(Arc::clone(&h.db))),
+        Arc::new(SqliteCalendarRepo::new(Arc::clone(&h.db))),
+        Arc::new(SqliteCalendarEventRepo::new(Arc::clone(&h.db))),
         user_id.to_string(),
         now,
     )
@@ -394,7 +394,7 @@ fn seed_is_idempotent_and_login_self_heals_a_missing_calendar() {
     assert_eq!(
         calendar_by_gcal(&h, &session.id, &google_calendar_id).time_zone,
         "Asia/Kolkata",
-        "DO NOTHING keeps the original zone"
+        "the conflict clause keeps the original zone"
     );
 
     login_user(&h, "ada", PASSWORD, "UTC").expect("login");
