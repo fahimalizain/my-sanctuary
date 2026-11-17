@@ -9,7 +9,8 @@
 //! Status map: 401 unauthorized, 400 invalid input (title/category rules,
 //! `estimated_minutes < 1`, invalid rrule blob, empty PATCH body),
 //! 404 "routine not found" (missing/soft-deleted/other-user), 500 logged
-//! database errors.
+//! database errors. Reorder writes standing `sort_order` only — never
+//! occurrences or agenda rows (ADR 0004).
 
 use worker::*;
 
@@ -155,6 +156,33 @@ pub async fn create_routine(
     {
         Ok(response) => {
             let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+
+/// `POST /api/routines/reorder` → 200 `{"success":true}`. Body: `{ids: [...]}`
+/// — every living routine of the user exactly once; `sort_order` becomes the
+/// vec index. Occurrences and agenda rows are never touched, so already
+/// materialized Home days keep their order (ADR 0004).
+pub async fn reorder_routines(
+    mut req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+
+    let input: api_core::ReorderRoutinesInput = match req.json().await {
+        Ok(input) => input,
+        Err(_) => return json_error(&ctx, 400, "invalid body"),
+    };
+
+    let now_rfc3339 = api_core::unix_secs_to_rfc3339((worker::Date::now().as_millis() / 1000) as i64);
+    match api_core::reorder_routines(&routines_d1(&ctx)?, &user.id, &input, &now_rfc3339).await {
+        Ok(()) => {
+            let response = Response::from_json(&serde_json::json!({ "success": true }))?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
         }
         Err(err) => map_error(&ctx, err),

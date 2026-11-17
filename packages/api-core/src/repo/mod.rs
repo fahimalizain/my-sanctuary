@@ -280,6 +280,20 @@ pub trait RoutineRepo: Send + Sync {
     /// Highest living `sort_order` for the user's routines, or `None` when the
     /// pile is empty. Used by `create_routine` to append: `max+1`, else 0.
     async fn max_sort_order(&self, user_id: &str) -> Result<Option<i64>, RepoError>;
+    /// Cosmetic standing-order write. Sets `sort_order` and stamps `updated_at`
+    /// on one living routine owned by `user_id`. Does not touch `title`,
+    /// `estimated_minutes`, `rrule`, `deleted_at`, occurrences, or agenda rows.
+    /// A missing, soft-deleted, or other-user id updates zero rows and is not
+    /// an error — `reorder_routines` rejects those ids before calling this.
+    /// `updated_at` is stamped, matching rules' `set_sort_order` (a reorder is
+    /// a real write, not a silent rank patch).
+    async fn set_sort_order(
+        &self,
+        user_id: &str,
+        id: &str,
+        sort_order: i64,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError>;
     /// Distinct `user_id`s with at least one living routine — the agenda fill
     /// cron's user list (the fill never needs every routine up front, only the
     /// owners; the per-user pass loads them). Unordered; the caller sorts and
@@ -897,6 +911,13 @@ pub const ROUTINE_MAX_SORT_ORDER_SQL: &str = "
     WHERE user_id = ? AND deleted_at IS NULL
     ORDER BY sort_order DESC
     LIMIT 1
+";
+
+/// Binds: sort_order, updated_at, user_id, id (4).
+/// Living rows of this user only. Rank + `updated_at`; no other column.
+pub const ROUTINE_SET_SORT_ORDER_SQL: &str = "
+    UPDATE routines SET sort_order = ?, updated_at = ?
+    WHERE user_id = ? AND id = ? AND deleted_at IS NULL
 ";
 
 /// The agenda fill cron's user list: distinct owners of a living routine.
@@ -1722,6 +1743,25 @@ mod tests {
         assert!(sql.contains("deleted_at IS NULL"), "{sql}");
         assert!(sql.contains("ORDER BY sort_order DESC"), "{sql}");
         assert!(sql.contains("LIMIT 1"), "{sql}");
+    }
+
+    #[test]
+    fn routine_set_sort_order_touches_only_rank_on_living_rows() {
+        let sql = ROUTINE_SET_SORT_ORDER_SQL.trim();
+        assert!(sql.starts_with("UPDATE routines SET"), "{sql}");
+        assert!(sql.contains("sort_order = ?"), "{sql}");
+        assert!(sql.contains("updated_at = ?"), "{sql}");
+        assert!(!sql.contains("title"), "{sql}");
+        assert!(!sql.contains("estimated_minutes"), "{sql}");
+        assert!(!sql.contains("rrule"), "{sql}");
+        assert!(!sql.contains("deleted_at ="), "{sql}");
+        assert!(
+            sql.contains("WHERE user_id = ? AND id = ? AND deleted_at IS NULL"),
+            "{sql}"
+        );
+        assert_eq!(sql.matches('?').count(), 4, "four binds: {sql}");
+        assert!(!sql.contains("agenda_items"), "{sql}");
+        assert!(!sql.contains("routine_occurrences"), "{sql}");
     }
 
     #[test]

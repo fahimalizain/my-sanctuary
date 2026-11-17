@@ -40,7 +40,7 @@ use api_core::repo::{
     OCCURRENCE_UPDATE_TITLE_SQL, ROUTINE_DELETE_SQL, ROUTINE_GET_BY_ID_SQL, ROUTINE_INSERT_SQL,
     ROUTINE_LIST_BY_IDS_CHUNK_SIZE, ROUTINE_LIST_BY_USER_ID_SQL,
     ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL, ROUTINE_MAX_SORT_ORDER_SQL,
-    ROUTINE_UPDATE_SQL,
+    ROUTINE_SET_SORT_ORDER_SQL, ROUTINE_UPDATE_SQL,
     TASK_CATEGORY_COUNT_BY_USER_ID_SQL, TASK_CATEGORY_COUNT_CHILDREN_SQL, TASK_CATEGORY_DELETE_SQL,
     TASK_CATEGORY_GET_BY_ID_SQL, TASK_CATEGORY_GET_UNTRACKED_SQL, TASK_CATEGORY_INSERT_SQL,
     TASK_CATEGORY_LIST_BY_USER_ID_SQL, TASK_CATEGORY_PATTERNS_DELETE_SQL,
@@ -612,6 +612,28 @@ impl RoutineRepo for D1RoutineRepo {
             .map_err(backend)?;
         let row = stmt.first::<SortOrderRow>(None).await.map_err(backend)?;
         Ok(row.map(|row| row.sort_order))
+    }
+
+    async fn set_sort_order(
+        &self,
+        user_id: &str,
+        id: &str,
+        sort_order: i64,
+        now_rfc3339: &str,
+    ) -> Result<(), RepoError> {
+        // Standing-order write only: rank + `updated_at`, living rows of the
+        // owner. A miss is a 0-row UPDATE (the service rejects bad ids first).
+        let stmt = self
+            .db
+            .prepare(ROUTINE_SET_SORT_ORDER_SQL)
+            .bind_refs(&[
+                D1Type::Integer(sort_order as i32),
+                D1Type::Text(now_rfc3339),
+                D1Type::Text(user_id),
+                D1Type::Text(id),
+            ])
+            .map_err(backend)?;
+        run_stmt(stmt).await
     }
 
     async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {

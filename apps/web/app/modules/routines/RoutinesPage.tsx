@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
-import { ArrowLeft, Loader2, Pencil, Plus, Trash2 } from 'lucide-react';
+import { ArrowLeft, Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -8,10 +8,26 @@ import {
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import {
+  DndContext,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
 import { useNavigate } from '@tanstack/react-router';
 import {
   useCreateRoutine,
   useDeleteRoutine,
+  useReorderRoutines,
   useRoutinesQuery,
   useUpdateRoutine,
 } from '@/app/queries/routines';
@@ -30,9 +46,10 @@ import {
   occurrenceDates,
   parseRruleBlob,
   rruleParts,
-  rruleSummary,
   untilMatchesDtstartTime,
 } from './rrule-preview';
+import { SortableRoutineRow } from './RoutineRow';
+import { planRoutineReorder } from './reorder';
 
 type WeekdayCode = 'MO' | 'TU' | 'WE' | 'TH' | 'FR' | 'SA' | 'SU';
 const WEEKDAY_CODES: WeekdayCode[] = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
@@ -384,6 +401,48 @@ export function RoutinesPage() {
   };
 
   // ──────────────────────────────────────────
+  // Reorder — standing sort order only, so Home keeps its materialized order
+  // (ADR 0004). The grip is the only drag activator.
+  // ──────────────────────────────────────────
+
+  const reorder = useReorderRoutines();
+  const routineIds = useMemo(
+    () => routines.map((routine) => routine.id),
+    [routines],
+  );
+
+  // A short 8px move activates — the grip is the only activator, so no hold
+  // delay is needed (a long press would fight the page's own scroll). The
+  // keyboard sensor's sortable coordinate getter lets arrow keys walk the
+  // list.
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const handleDragEnd = async (event: DragEndEvent) => {
+    // One reorder at a time: a second drop mid-flight would plan against the
+    // optimistic order and submit a list the server may reject.
+    if (reorder.isPending) return;
+    const activeId = String(event.active.id);
+    const overId = event.over ? String(event.over.id) : null;
+    // The mutation's `onMutate` is the only optimistic write — the plan's ids
+    // are all this handler sends.
+    const plan = planRoutineReorder(routines, activeId, overId);
+    if (!plan) return;
+
+    setActionError(null);
+    try {
+      await reorder.mutateAsync(plan.ids);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Reorder failed');
+    }
+  };
+
+  // ──────────────────────────────────────────
   // Render
   // ──────────────────────────────────────────
 
@@ -476,67 +535,32 @@ export function RoutinesPage() {
 
         {/* Routine list — hidden only when there is nothing to show (first
             load in flight, or a load error that replaced the rows). API
-            order = standing sort order. */}
+            order = standing sort order; each row's grip is the only drag
+            activator, and a drop submits the full id list in the new
+            order. */}
         {routines.length > 0 && (
-          <div className="space-y-2">
-            {routines.map((routine) => {
-              const nextDates = occurrenceDates({
-                rrule: routine.rrule,
-                from: civilToday(),
-                to: addCivilDays(civilToday(), 30),
-              });
-              return (
-                <div
-                  key={routine.id}
-                  className="rounded-lg border border-border bg-background p-3"
-                >
-                  <div className="flex items-center gap-2">
-                    <span
-                      className="h-2.5 w-2.5 rounded-full flex-shrink-0"
-                      style={{ backgroundColor: routine.category.color }}
-                    />
-                    <span className="flex-1 min-w-0 text-sm font-medium text-foreground truncate">
-                      {routine.title}
-                    </span>
-                    {/* The category pill carries the color; the name is
-                        hidden for the untracked sink */}
-                    {!routine.category.is_untracked && (
-                      <span className="flex-shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-                        {routine.category.title}
-                      </span>
-                    )}
-                    <div className="flex flex-shrink-0 gap-1">
-                      <button
-                        onClick={() => openEdit(routine)}
-                        className="p-1.5 rounded-md hover:bg-muted transition-colors"
-                        aria-label={`Edit ${routine.title}`}
-                        title="Edit"
-                      >
-                        <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(routine)}
-                        className="p-1.5 rounded-md hover:bg-destructive/10 hover:text-destructive transition-colors"
-                        aria-label={`Delete ${routine.title}`}
-                        title="Delete"
-                      >
-                        <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    <span>{rruleSummary(routine.rrule)}</span>
-                    <span>{routine.estimated_minutes} min</span>
-                    {nextDates.length > 0 && (
-                      <span className="text-muted-foreground/80">
-                        next: {nextDates.slice(0, 3).join(' · ')}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={(event) => void handleDragEnd(event)}
+          >
+            <SortableContext
+              items={routineIds}
+              strategy={verticalListSortingStrategy}
+            >
+              <div className="space-y-2">
+                {routines.map((routine) => (
+                  <SortableRoutineRow
+                    key={routine.id}
+                    routine={routine}
+                    disabled={reorder.isPending}
+                    onEdit={openEdit}
+                    onDelete={(row) => void handleDelete(row)}
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          </DndContext>
         )}
       </div>
 

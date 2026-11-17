@@ -2975,6 +2975,30 @@ mod tests {
                 .max())
         }
 
+        async fn set_sort_order(
+            &self,
+            user_id: &str,
+            id: &str,
+            sort_order: i64,
+            now_rfc3339: &str,
+        ) -> Result<(), RepoError> {
+            // Mirrors ROUTINE_SET_SORT_ORDER_SQL: living rows of this user
+            // only; a miss is a 0-row UPDATE, never an error.
+            if let Some(row) = self
+                .stored
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|row| {
+                    row.user_id == user_id && row.id == id && row.deleted_at.is_none()
+                })
+            {
+                row.sort_order = sort_order;
+                row.updated_at = now_rfc3339.to_string();
+            }
+            Ok(())
+        }
+
         async fn list_user_ids_with_living_routines(&self) -> Result<Vec<String>, RepoError> {
             // Mirrors ROUTINE_LIST_USER_IDS_WITH_LIVING_SQL: distinct living
             // owners, unordered.
