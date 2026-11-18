@@ -4,8 +4,9 @@
 // ADR 0004 `/pause` lands pending + clears chip ids — rename, reschedule
 // popover) and the
 // task variant (checkbox completes a living row and reopens a finished one,
-// start, pause while in progress — ADR 0002 `/pause` lands PLANNED —
-// reschedule popover, tap → TaskModal). Living rows lead with a grab handle
+// start, pause while in progress — ADR 0002 `/pause` lands PLANNED — start a
+// WAITING row to take it back (ADR 0011), reschedule popover, tap → TaskModal).
+// Living rows lead with a grab handle
 // (ADR 0004 amendment — reorder is a handle): the grip is the ONLY drag
 // activator, so a tap on checkbox / title / skip / play / pause / calendar
 // never starts a drag. Parked rows (the Completed dump — ADR 0004 amendment)
@@ -675,8 +676,13 @@ function TaskRow({
   // Any in-flight row action quiets the controls a second click could reach.
   const busy = pending !== null;
   // Start is today-only on the API (it opens the running Google event "now").
+  // A WAITING row takes the same verb: `/start` is the "take back" move
+  // (WAITING → IN_PROGRESS), which also lands its row on today appended
+  // (ADR 0011 § Where the agenda row goes).
   const canStart =
-    (task.status === 'OPEN' || task.status === 'PLANNED') &&
+    (task.status === 'OPEN' ||
+      task.status === 'PLANNED' ||
+      task.status === 'WAITING') &&
     item.local_date === serverToday;
   return (
     <AgendaRowShell

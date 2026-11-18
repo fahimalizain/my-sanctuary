@@ -94,11 +94,13 @@ function mount(
   item: AgendaItemRecord,
   {
     onCompleteTask = () => {},
+    onStartTask = () => {},
     onPauseTask = () => {},
     pending = null,
     showHandle = false,
   }: {
     onCompleteTask?: (row: AgendaItemRecord) => void;
+    onStartTask?: (row: AgendaItemRecord) => void;
     onPauseTask?: (row: AgendaItemRecord) => void;
     pending?: 'check' | 'play' | 'calendar' | 'grip' | null;
     showHandle?: boolean;
@@ -115,7 +117,7 @@ function mount(
       onMoveToBacklog: () => {},
       onUnschedule: () => {},
       onCompleteTask,
-      onStartTask: () => {},
+      onStartTask,
       onPauseTask,
       onOpenTask: () => {},
       onCompleteOccurrence: () => {},
@@ -217,6 +219,42 @@ test('a planned row is open-looking and completes', () => {
   assert.ok(
     screen.getByRole('button', { name: 'Complete Buy Chicken' }),
     'a living row completes',
+  );
+});
+
+// ── WAITING (ADR 0011) ──────────────────────────────────────────────────
+
+test('a waiting row carries its chip and takes the task back from today', () => {
+  const item = taskItem('WAITING', 'Buy Chicken');
+  const starts: AgendaItemRecord[] = [];
+  mount(item, { onStartTask: (row) => starts.push(row) });
+
+  assert.ok(screen.getByText('Waiting'), 'the Waiting chip is visible');
+  assert.equal(
+    screen.getByText('Buy Chicken').className.includes('line-through'),
+    false,
+    'a waiting task is living, not finished',
+  );
+
+  const start = screen.getByRole('button', { name: 'Start Buy Chicken' });
+  fireEvent.click(start);
+  assert.equal(starts.length, 1, 'one click, one take-back');
+  assert.equal(starts[0], item, 'HomePage gets the row it owns');
+});
+
+test('a waiting row on another day offers no Start', () => {
+  // Start is today-only (it opens the running event "now"); a waiting row
+  // dated elsewhere must be rescheduled onto today first.
+  const item = {
+    ...taskItem('WAITING', 'Buy Chicken'),
+    local_date: '2026-08-24',
+  };
+  mount(item);
+
+  assert.equal(
+    screen.queryByRole('button', { name: 'Start Buy Chicken' }),
+    null,
+    'no Start away from today',
   );
 });
 

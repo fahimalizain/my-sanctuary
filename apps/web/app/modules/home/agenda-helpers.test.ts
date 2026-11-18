@@ -29,10 +29,12 @@ import {
   appendRankOnStream,
   applyAgendaMove,
   applyOpenTaskReorder,
+  BACKLOG_DROPPABLE_ID,
   canMoveToBacklog,
   canReschedule,
   canUnschedule,
   crossDaySortOrder,
+  DAY_ID_PREFIX,
   dedupeAgendaItems,
   eachCivilDate,
   groupItemsByDate,
@@ -46,17 +48,22 @@ import {
   openTaskMoveTargetAt,
   partitionAgendaItems,
   planOpenItem,
+  PLANNED_DROPPABLE_ID,
   previousHistoryWindow,
   replaceCachedTask,
+  resolveAgendaDrop,
+  restoreHandedOffRow,
   rescheduleMaxDate,
   reschedulePickerMonth,
   reschedulePresets,
+  runAgendaWriteFlow,
   splitBacklogSection,
   splitWaitingRows,
   streamBounds,
   streamItemsOf,
   unscheduleItem,
   updateStreamItem,
+  WAITING_DAY_ID_PREFIX,
 } from './agenda-helpers';
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -1894,4 +1901,440 @@ test('splitWaitingRows: empty input yields two empty piles; no mutation', () => 
   const before = [...pile];
   splitWaitingRows(pile);
   before.forEach((entry, i) => assert.equal(pile[i], entry));
+});
+
+// ── resolveAgendaDrop (ADR 0011 Waiting drag matrix) ───────────────────
+
+/** The ids painted in `page.items` — loaded day-stream rows only, never the
+ *  dated Backlog stretch. */
+function streamIds(...items: AgendaItemRecord[]): Set<string> {
+  return new Set(items.map((entry) => entry.id));
+}
+
+test('resolveAgendaDrop: a normal row dropped on a Waiting section hands off', () => {
+  const dragged = taskItemAt('a', 'PLANNED', TODAY, 0);
+  const items = [dragged];
+  const ids = streamIds(dragged);
+  const base = {
+    dragged,
+    overItem: null,
+    items,
+    streamItemIds: ids,
+    today: TODAY,
+  };
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: `${WAITING_DAY_ID_PREFIX}${TODAY}`,
+    }),
+    { kind: 'handOffToWaiting', date: TODAY },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: `${WAITING_DAY_ID_PREFIX}2026-08-25`,
+    }),
+    { kind: 'handOffToWaiting', date: '2026-08-25' },
+  );
+  // A past Waiting section is disabled and never a drop target.
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: `${WAITING_DAY_ID_PREFIX}2026-08-22`,
+    }),
+    { kind: 'none' },
+  );
+});
+
+test('resolveAgendaDrop: a normal row over a stream WAITING row hands off', () => {
+  const dragged = taskItemAt('a', 'OPEN', TODAY, 0);
+  const waiting = taskItemAt('w', 'WAITING', TODAY, 1);
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged,
+      overId: waiting.id,
+      overItem: waiting,
+      items: [dragged, waiting],
+      streamItemIds: streamIds(dragged, waiting),
+      today: TODAY,
+    }),
+    { kind: 'handOffToWaiting', date: TODAY },
+  );
+});
+
+test('resolveAgendaDrop: WAITING in the dated Backlog is not a hand-off target', () => {
+  // Both rows live in the Backlog's dated stretch (not in page.items): a
+  // PLANNED row dropped over the WAITING row keeps the old same-day reorder.
+  const date = '2026-09-05';
+  const dragged = taskItemAt('p', 'PLANNED', date, 0);
+  const waiting = taskItemAt('w', 'WAITING', date, 1);
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged,
+      overId: waiting.id,
+      overItem: waiting,
+      items: [dragged, waiting],
+      streamItemIds: new Set(),
+      today: TODAY,
+    }),
+    { kind: 'sameDay', target: 2 },
+  );
+});
+
+test('resolveAgendaDrop: occurrences and terminal cards never hand off', () => {
+  const occurrence = occurrenceItem('o', 'pending');
+  const terminal = taskItemAt('t', 'COMPLETED', TODAY, 0);
+  for (const dragged of [occurrence, terminal]) {
+    assert.deepEqual(
+      resolveAgendaDrop({
+        dragged,
+        overId: `${WAITING_DAY_ID_PREFIX}${TODAY}`,
+        overItem: null,
+        items: [dragged],
+        streamItemIds: new Set(),
+        today: TODAY,
+      }),
+      { kind: 'none' },
+    );
+  }
+});
+
+test('resolveAgendaDrop: a waiting row reorders against the whole-day ranks', () => {
+  // Waiting ranks 1 and 4 are interleaved with normal rows at 0, 2 and 3.
+  const normal0 = taskItemAt('n0', 'OPEN', TODAY, 0);
+  const waitingA = taskItemAt('w1', 'WAITING', TODAY, 1);
+  const normal1 = taskItemAt('n1', 'OPEN', TODAY, 2);
+  const normal2 = taskItemAt('n2', 'OPEN', TODAY, 3);
+  const waitingB = taskItemAt('w2', 'WAITING', TODAY, 4);
+  const items = [normal0, waitingA, normal1, normal2, waitingB];
+  const ids = streamIds(...items);
+  const base = {
+    items,
+    streamItemIds: ids,
+    today: TODAY,
+  };
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      dragged: waitingB,
+      overId: waitingA.id,
+      overItem: waitingA,
+    }),
+    { kind: 'sameDay', target: 1 },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      dragged: waitingA,
+      overId: waitingB.id,
+      overItem: waitingB,
+    }),
+    { kind: 'sameDay', target: 5 },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      dragged: waitingA,
+      overId: `${WAITING_DAY_ID_PREFIX}${TODAY}`,
+      overItem: null,
+    }),
+    { kind: 'sameDay', target: 5 },
+  );
+});
+
+test('resolveAgendaDrop: a waiting row travels to another Waiting section', () => {
+  const tomorrow = '2026-08-24';
+  const todayRow = taskItemAt('w', 'WAITING', TODAY, 0);
+  const tomorrowRow = taskItemAt('wt', 'WAITING', tomorrow, 7);
+  const base = {
+    dragged: todayRow,
+    items: [todayRow, tomorrowRow],
+    streamItemIds: streamIds(todayRow, tomorrowRow),
+    today: TODAY,
+  };
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: `${WAITING_DAY_ID_PREFIX}${tomorrow}`,
+      overItem: null,
+    }),
+    { kind: 'crossDay', date: tomorrow, sortOrder: undefined },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: tomorrowRow.id,
+      overItem: tomorrowRow,
+    }),
+    { kind: 'crossDay', date: tomorrow, sortOrder: 7 },
+  );
+});
+
+test('resolveAgendaDrop: a waiting row leaving its section becomes PLANNED', () => {
+  const waiting = taskItemAt('w', 'WAITING', TODAY, 5);
+  const normal = taskItemAt('n', 'OPEN', TODAY, 2);
+  const base = {
+    dragged: waiting,
+    overItem: null,
+    items: [waiting, normal],
+    streamItemIds: streamIds(waiting, normal),
+    today: TODAY,
+  };
+  assert.deepEqual(
+    resolveAgendaDrop({ ...base, overId: `${DAY_ID_PREFIX}${TODAY}` }),
+    { kind: 'waitingToDate', date: TODAY },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: `${DAY_ID_PREFIX}2026-08-25`,
+    }),
+    { kind: 'waitingToDate', date: '2026-08-25' },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({ ...base, overId: normal.id, overItem: normal }),
+    { kind: 'waitingToDate', date: TODAY, sortOrder: 2 },
+  );
+});
+
+test('resolveAgendaDrop: a waiting row shelves into Planned or Backlog', () => {
+  const waiting = taskItemAt('w', 'WAITING', TODAY, 0);
+  const base = {
+    dragged: waiting,
+    overItem: null,
+    items: [waiting],
+    streamItemIds: streamIds(waiting),
+    today: TODAY,
+  };
+  assert.deepEqual(
+    resolveAgendaDrop({ ...base, overId: PLANNED_DROPPABLE_ID }),
+    { kind: 'waitingToWarehouse', status: 'PLANNED' },
+  );
+  assert.deepEqual(
+    resolveAgendaDrop({ ...base, overId: BACKLOG_DROPPABLE_ID }),
+    { kind: 'waitingToWarehouse', status: 'OPEN' },
+  );
+});
+
+test('resolveAgendaDrop: a WAITING row outside a section is just rescheduled', () => {
+  // A waiting row in the dated Backlog dropped on a Waiting section keeps
+  // WAITING; it is not a hand-off from a section.
+  const waiting = taskItemAt('w', 'WAITING', '2026-09-05', 0);
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged: waiting,
+      overId: `${WAITING_DAY_ID_PREFIX}${TODAY}`,
+      overItem: null,
+      items: [waiting],
+      streamItemIds: new Set(),
+      today: TODAY,
+    }),
+    { kind: 'crossDay', date: TODAY, sortOrder: undefined },
+  );
+});
+
+test('resolveAgendaDrop: a dated-Backlog WAITING row still leaves on a day drop', () => {
+  const backlogDate = '2026-09-05';
+  const waiting = taskItemAt('w', 'WAITING', backlogDate, 0);
+  const normal = taskItemAt('n', 'OPEN', TODAY, 2);
+  const base = {
+    dragged: waiting,
+    items: [waiting, normal],
+    // The WAITING row lives in page.backlog; the normal row is a stream row.
+    streamItemIds: streamIds(normal),
+    today: TODAY,
+  };
+  // A day container always belongs to the stream: PLANNED on that date.
+  assert.deepEqual(
+    resolveAgendaDrop({
+      ...base,
+      overId: `${DAY_ID_PREFIX}${TODAY}`,
+      overItem: null,
+    }),
+    { kind: 'waitingToDate', date: TODAY },
+  );
+  // A normal row in a stream day is the same destination, at its rank.
+  assert.deepEqual(
+    resolveAgendaDrop({ ...base, overId: normal.id, overItem: normal }),
+    { kind: 'waitingToDate', date: TODAY, sortOrder: 2 },
+  );
+  // Inside the dated Backlog stretch, a cross-group move keeps WAITING.
+  const other = taskItemAt('o', 'OPEN', '2026-09-07', 3);
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged: waiting,
+      overId: other.id,
+      overItem: other,
+      items: [waiting, other],
+      streamItemIds: new Set(),
+      today: TODAY,
+    }),
+    { kind: 'crossDay', date: '2026-09-07', sortOrder: 3 },
+  );
+});
+
+test('resolveAgendaDrop: same-day reorder still works on a past day', () => {
+  const yesterday = '2026-08-22';
+  const dragged = taskItemAt('a', 'PLANNED', yesterday, 0);
+  const over = taskItemAt('b', 'PLANNED', yesterday, 1);
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged,
+      overId: over.id,
+      overItem: over,
+      items: [dragged, over],
+      streamItemIds: streamIds(dragged, over),
+      today: TODAY,
+    }),
+    { kind: 'sameDay', target: 2 },
+  );
+  // A cross-day move INTO the past is still refused.
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged: taskItemAt('c', 'PLANNED', TODAY, 0),
+      overId: over.id,
+      overItem: over,
+      items: [taskItemAt('c', 'PLANNED', TODAY, 0), over],
+      streamItemIds: streamIds(over),
+      today: TODAY,
+    }),
+    { kind: 'none' },
+  );
+});
+
+test('resolveAgendaDrop: waiting in-section reorder still works on a past day', () => {
+  const yesterday = '2026-08-22';
+  const dragged = taskItemAt('a', 'WAITING', yesterday, 0);
+  const over = taskItemAt('b', 'WAITING', yesterday, 1);
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged,
+      overId: over.id,
+      overItem: over,
+      items: [dragged, over],
+      streamItemIds: streamIds(dragged, over),
+      today: TODAY,
+    }),
+    { kind: 'sameDay', target: 2 },
+  );
+  // The section container appends inside that same past day too.
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged,
+      overId: `${WAITING_DAY_ID_PREFIX}${yesterday}`,
+      overItem: null,
+      items: [dragged, over],
+      streamItemIds: streamIds(dragged, over),
+      today: TODAY,
+    }),
+    { kind: 'sameDay', target: 2 },
+  );
+  // A waiting row from another day still cannot drop INTO the past.
+  assert.deepEqual(
+    resolveAgendaDrop({
+      dragged: taskItemAt('c', 'WAITING', TODAY, 0),
+      overId: over.id,
+      overItem: over,
+      items: [taskItemAt('c', 'WAITING', TODAY, 0), over],
+      streamItemIds: streamIds(over),
+      today: TODAY,
+    }),
+    { kind: 'none' },
+  );
+});
+
+// ── runAgendaWriteFlow / restoreHandedOffRow ────────────────────────────
+
+test('runAgendaWriteFlow: a first failure skips the second write', async () => {
+  const calls: string[] = [];
+  const result = await runAgendaWriteFlow({
+    first: async () => {
+      calls.push('first');
+      throw new Error('boom');
+    },
+    second: async () => {
+      calls.push('second');
+      return 'second-result';
+    },
+    onFirstSuccess: () => calls.push('first-success'),
+    onSecondSuccess: () => calls.push('second-success'),
+    onFirstFailure: (err) =>
+      calls.push(`first-failure:${err instanceof Error ? err.message : ''}`),
+    onSecondFailure: () => calls.push('second-failure'),
+  });
+  assert.equal(result, 'first-failed');
+  assert.deepEqual(calls, ['first', 'first-failure:boom']);
+});
+
+test('runAgendaWriteFlow: a second failure keeps the first result', async () => {
+  const calls: string[] = [];
+  const result = await runAgendaWriteFlow({
+    first: async () => {
+      calls.push('first');
+      return { id: 'first-result' };
+    },
+    second: async () => {
+      calls.push('second');
+      throw new Error('second-boom');
+    },
+    onFirstSuccess: (first) => calls.push(`first-success:${first.id}`),
+    onSecondSuccess: () => calls.push('second-success'),
+    onFirstFailure: () => calls.push('first-failure'),
+    onSecondFailure: (err, first) =>
+      calls.push(
+        `second-failure:${first.id}:${err instanceof Error ? err.message : ''}`,
+      ),
+  });
+  assert.equal(result, 'second-failed');
+  assert.deepEqual(calls, [
+    'first',
+    'first-success:first-result',
+    'second',
+    'second-failure:first-result:second-boom',
+  ]);
+});
+
+test('runAgendaWriteFlow: no second write is one successful write', async () => {
+  const calls: string[] = [];
+  const result = await runAgendaWriteFlow({
+    first: async () => {
+      calls.push('first');
+      return 'first-result';
+    },
+    onFirstSuccess: () => calls.push('first-success'),
+    onSecondSuccess: () => calls.push('second-success'),
+    onFirstFailure: () => calls.push('first-failure'),
+    onSecondFailure: () => calls.push('second-failure'),
+  });
+  assert.equal(result, 'ok');
+  assert.deepEqual(calls, ['first', 'first-success']);
+});
+
+test('restoreHandedOffRow: the row returns to today appended', () => {
+  const future = taskItemAt('a', 'WAITING', '2026-08-25', 0);
+  const todayPeer = taskItemAt('b', 'OPEN', TODAY, 3);
+  const data = {
+    pages: [page(TODAY, '2026-08-29', [todayPeer, future])],
+    pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
+  };
+  const fresh = task('a', 'WAITING', 'Handed off');
+  const next = restoreHandedOffRow(data, 'a', TODAY, fresh);
+  const landed = streamItemsOf(next).find((entry) => entry.id === 'a');
+  assert.equal(landed?.local_date, TODAY);
+  assert.equal(landed?.sort_order, 4, 'appended after the today pile');
+  assert.equal(landed?.task, fresh, 'the hand-off task embed is kept');
+});
+
+test('restoreHandedOffRow: a row already on today keeps its rank', () => {
+  const row = taskItemAt('a', 'WAITING', TODAY, 2);
+  const data = {
+    pages: [page(TODAY, '2026-08-29', [row])],
+    pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
+  };
+  const fresh = task('a', 'WAITING', 'Handed off');
+  const next = restoreHandedOffRow(data, 'a', TODAY, fresh);
+  const landed = streamItemsOf(next).find((entry) => entry.id === 'a');
+  assert.equal(landed?.local_date, TODAY);
+  assert.equal(landed?.sort_order, 2, 'no invented append');
+  assert.equal(landed?.task, fresh);
 });

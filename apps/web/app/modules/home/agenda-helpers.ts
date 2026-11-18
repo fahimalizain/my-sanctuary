@@ -15,6 +15,22 @@ import type {
 } from '../../types';
 import { addCivilDays, isCivilDateValid } from '../routines/rrule-preview';
 
+/** Every day's drop container id (`day-2026-08-23`) — also the day section's
+ *  DOM id, which is how the initial scroll and the Today button find a day. */
+export const DAY_ID_PREFIX = 'day-';
+/** One day's Waiting section droppable id (`waiting-day-2026-08-23`). It is
+ *  separate from the day's main pile: a drop here is a hand-off (normal row →
+ *  WAITING) or a waiting in-section move, never a normal day reschedule. */
+export const WAITING_DAY_ID_PREFIX = 'waiting-day-';
+/** The Backlog section's droppable id — a constant, never a `day-` id. */
+export const BACKLOG_DROPPABLE_ID = 'backlog';
+/** The Planned section's droppable id — a constant, never a `day-` id and
+ *  never the sentinel date: a day header at 2076 would be a future droppable
+ *  and the API would 400 the reschedule it implies. */
+export const PLANNED_DROPPABLE_ID = 'planned';
+/** A dated stretch group inside the Backlog (past today+6 … today+10y−1). */
+export const BACKLOG_DAY_ID_PREFIX = 'backlog-day-';
+
 const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTH_SHORT = [
   'Jan',
@@ -411,6 +427,24 @@ export function isAgendaItemPending(item: AgendaItemRecord): boolean {
     );
   }
   return false;
+}
+
+/** Can a drag grab this row? Living work only: open tasks (OPEN | PLANNED |
+ *  IN_PROGRESS | WAITING) and waiting/running occurrences of a LIVING routine.
+ *  A skipped occurrence is a decline (no grip), terminal tasks and
+ *  `routine_deleted` history are not draggable at all, and orphans have
+ *  nothing to drag. A `WAITING` row is draggable too (ADR 0011): inside its
+ *  day's Waiting section it reorders, and across sections it is the hand-off /
+ *  take-back gesture. */
+export function isAgendaRowDraggable(item: AgendaItemRecord): boolean {
+  const occurrence = item.occurrence;
+  if (item.kind === 'occurrence' && occurrence) {
+    if (occurrence.routine_deleted) return false;
+    return (
+      occurrence.status === 'pending' || occurrence.status === 'in_progress'
+    );
+  }
+  return isAgendaItemPending(item);
 }
 
 /** Home's agenda cache as the optimistic edits see it (`readAgendaPages` in
@@ -1009,6 +1043,281 @@ export function splitWaitingRows(items: AgendaItemRecord[]): {
   return { waiting, rest };
 }
 
+/** What one dnd-kit drop should do — the pure decision HomePage's
+ *  `handleDragEnd` acts on. `items` is `streamItemsOf` (page `items` plus
+ *  `backlog`), and `streamItemIds` names the rows painted in a day stream
+ *  (page `items`) rather than the Backlog's dated stretch. */
+export type AgendaDropDecision =
+  | { kind: 'none' }
+  | { kind: 'sameDay'; target: number }
+  | { kind: 'crossDay'; date: string; sortOrder?: number }
+  | {
+      kind: 'warehouseReorder';
+      status: 'OPEN' | 'PLANNED';
+      toIndex: number;
+      target: number;
+    }
+  | { kind: 'plan' }
+  | { kind: 'unschedule' }
+  | { kind: 'backlogDrop' }
+  | { kind: 'handOffToWaiting'; date: string }
+  | { kind: 'waitingToWarehouse'; status: 'OPEN' | 'PLANNED' }
+  | { kind: 'waitingToDate'; date: string; sortOrder?: number };
+
+export interface ResolveAgendaDropInput {
+  dragged: AgendaItemRecord;
+  overId: string;
+  overItem: AgendaItemRecord | null;
+  /** All loaded rows: every page's `items` then its `backlog`. */
+  items: AgendaItemRecord[];
+  /** Ids painted in `page.items` (the day stream). A row in `page.backlog`
+   *  is NOT in a Waiting section even when its status is WAITING. */
+  streamItemIds: ReadonlySet<string>;
+  today: string;
+}
+
+/** dnd-kit drop resolution, kept pure so `node:test` can cover the matrix
+ *  (HomePage only carries the decision out). The semantics are the ADR 0007 /
+ *  ADR 0010 warehouse rules plus ADR 0011's Waiting section:
+ *  - a normal row dropped into a Waiting section is handed off to WAITING
+ *    (and rescheduled when the section is another date);
+ *  - a waiting row dropped out of its section becomes a dated `PLANNED` row;
+ *  - a waiting row dropped in another day's Waiting section only reschedules;
+ *  - a waiting row reordered inside its section uses the waiting rows' agenda
+ *    ranks;
+ *  - waiting → Planned/Backlog shelves through the Board's status move;
+ *  - past days never accept a drop, but same-day reorder inside a past day
+ *    still works (the agenda `/move` has no date floor). */
+export function resolveAgendaDrop({
+  dragged,
+  overId,
+  overItem,
+  items,
+  streamItemIds,
+  today,
+}: ResolveAgendaDropInput): AgendaDropDecision {
+  if (!today) return { kind: 'none' };
+  const livingOf = (date: string) =>
+    partitionAgendaItems(items.filter((entry) => entry.local_date === date))
+      .living;
+  const waitingRowsOf = (date: string) =>
+    splitWaitingRows(livingOf(date)).waiting;
+  const stream = (id: string) => streamItemIds.has(id);
+  const draggedIsWaitingInSection =
+    dragged.task?.status === 'WAITING' && stream(dragged.id);
+  const backlog = dedupeAgendaItems(items.filter((entry) => !stream(entry.id)));
+  const warehouseRowsOf = (status: 'OPEN' | 'PLANNED') => {
+    const split = splitBacklogSection(backlog, today);
+    return status === 'OPEN' ? split.open : split.planned;
+  };
+  // The list dnd-kit measured: a stream day's main pile excludes Waiting; a
+  // dated Backlog group is one mixed list. A stale/missing id yields -1 and
+  // the rank helpers return null/undefined.
+  const sortableSameDay = () => {
+    const living = livingOf(dragged.local_date);
+    const sortable = stream(dragged.id)
+      ? splitWaitingRows(living).rest
+      : living;
+    return sortable.filter(isAgendaRowDraggable);
+  };
+  const crossDayRank = (date: string, overItemId: string) => {
+    const living = livingOf(date);
+    const sortable =
+      stream(dragged.id) && stream(overItemId)
+        ? splitWaitingRows(living).rest
+        : living;
+    return crossDaySortOrder(sortable, overItemId);
+  };
+
+  const draggedIsOpen = isOpenBacklogTask(dragged, today);
+  const draggedIsPlanned = isPlannedBacklogTask(dragged, today);
+  const plannedTarget =
+    overId === PLANNED_DROPPABLE_ID ||
+    (overItem !== null && isPlannedBacklogTask(overItem, today));
+  const openTarget =
+    overId === BACKLOG_DROPPABLE_ID ||
+    (overItem !== null && isOpenBacklogTask(overItem, today));
+  // A Waiting target is only the section itself or a WAITING row painted in
+  // the day stream. The same status in the dated Backlog stretch is an
+  // ordinary backlog row, not a second hand-off target.
+  const waitingTargetDate = overId.startsWith(WAITING_DAY_ID_PREFIX)
+    ? overId.slice(WAITING_DAY_ID_PREFIX.length)
+    : overItem?.task?.status === 'WAITING' && stream(overItem.id)
+      ? overItem.local_date
+      : null;
+
+  // 1. Waiting section.
+  if (waitingTargetDate) {
+    const sameDayWaitingReorder =
+      draggedIsWaitingInSection && waitingTargetDate === dragged.local_date;
+    if (waitingTargetDate < today && !sameDayWaitingReorder) {
+      return { kind: 'none' };
+    }
+    if (dragged.kind !== 'task' || !dragged.task) return { kind: 'none' };
+    if (
+      dragged.task.status === 'COMPLETED' ||
+      dragged.task.status === 'DISCARDED'
+    ) {
+      return { kind: 'none' };
+    }
+    if (draggedIsWaitingInSection) {
+      if (waitingTargetDate === dragged.local_date) {
+        const waiting =
+          waitingRowsOf(waitingTargetDate).filter(isAgendaRowDraggable);
+        const target = agendaMoveTargetAt(
+          waiting,
+          waiting.findIndex((entry) => entry.id === dragged.id),
+          overItem && overItem.task?.status === 'WAITING'
+            ? waiting.findIndex((entry) => entry.id === overItem.id)
+            : waiting.length - 1,
+        );
+        return target === null ? { kind: 'none' } : { kind: 'sameDay', target };
+      }
+      return {
+        kind: 'crossDay',
+        date: waitingTargetDate,
+        sortOrder:
+          overItem?.task?.status === 'WAITING'
+            ? crossDaySortOrder(waitingRowsOf(waitingTargetDate), overItem.id)
+            : undefined,
+      };
+    }
+    if (dragged.task.status === 'WAITING') {
+      // A WAITING row from the Backlog's dated stretch keeps its status and
+      // merely reschedules into the section it was dropped on.
+      return {
+        kind: 'crossDay',
+        date: waitingTargetDate,
+        sortOrder:
+          overItem?.task?.status === 'WAITING'
+            ? crossDaySortOrder(waitingRowsOf(waitingTargetDate), overItem.id)
+            : undefined,
+      };
+    }
+    return { kind: 'handOffToWaiting', date: waitingTargetDate };
+  }
+
+  // 2. Planned warehouse.
+  if (plannedTarget) {
+    if (dragged.kind !== 'task' || !dragged.task) return { kind: 'none' };
+    if (dragged.task.status === 'WAITING') {
+      return { kind: 'waitingToWarehouse', status: 'PLANNED' };
+    }
+    if (
+      dragged.task.status === 'IN_PROGRESS' ||
+      dragged.task.status === 'COMPLETED' ||
+      dragged.task.status === 'DISCARDED'
+    ) {
+      return { kind: 'none' };
+    }
+    if (draggedIsPlanned) {
+      const planned = warehouseRowsOf('PLANNED');
+      const toIndex = overItem
+        ? planned.findIndex((entry) => entry.id === overItem.id)
+        : planned.length - 1;
+      const target = openTaskMoveTargetAt(
+        planned,
+        planned.findIndex((entry) => entry.id === dragged.id),
+        toIndex,
+      );
+      return target === null
+        ? { kind: 'none' }
+        : { kind: 'warehouseReorder', status: 'PLANNED', toIndex, target };
+    }
+    if (dragged.task.status === 'OPEN') return { kind: 'plan' };
+    if (dragged.task.status === 'PLANNED') return { kind: 'unschedule' };
+    return { kind: 'none' };
+  }
+
+  // 3. Backlog.
+  if (openTarget) {
+    if (dragged.kind !== 'task' || !dragged.task) return { kind: 'none' };
+    if (dragged.task.status === 'WAITING') {
+      return { kind: 'waitingToWarehouse', status: 'OPEN' };
+    }
+    if (
+      dragged.task.status === 'IN_PROGRESS' ||
+      dragged.task.status === 'COMPLETED' ||
+      dragged.task.status === 'DISCARDED'
+    ) {
+      return { kind: 'none' };
+    }
+    if (draggedIsOpen) {
+      if (!overItem) return { kind: 'none' };
+      const open = warehouseRowsOf('OPEN');
+      const toIndex = open.findIndex((entry) => entry.id === overItem.id);
+      const target = openTaskMoveTargetAt(
+        open,
+        open.findIndex((entry) => entry.id === dragged.id),
+        toIndex,
+      );
+      return target === null
+        ? { kind: 'none' }
+        : { kind: 'warehouseReorder', status: 'OPEN', toIndex, target };
+    }
+    if (dragged.task.status === 'OPEN' || dragged.task.status === 'PLANNED') {
+      return { kind: 'backlogDrop' };
+    }
+    return { kind: 'none' };
+  }
+
+  // 4. A day's own container. A day container is always part of the day
+  //    stream, so every WAITING row dropped here leaves Waiting as a dated
+  //    PLANNED row — including one that was living in the dated Backlog.
+  if (overId.startsWith(DAY_ID_PREFIX)) {
+    const day = overId.slice(DAY_ID_PREFIX.length);
+    if (day < today) return { kind: 'none' };
+    if (dragged.task?.status === 'WAITING') {
+      return { kind: 'waitingToDate', date: day };
+    }
+    if (day === dragged.local_date) {
+      const sortable = sortableSameDay();
+      const target = agendaMoveTargetAt(
+        sortable,
+        sortable.findIndex((entry) => entry.id === dragged.id),
+        sortable.length - 1,
+      );
+      return target === null ? { kind: 'none' } : { kind: 'sameDay', target };
+    }
+    if (dragged.task?.status === 'IN_PROGRESS') return { kind: 'none' };
+    return { kind: 'crossDay', date: day };
+  }
+
+  // 5. Another row. A WAITING row dropped on a normal stream row leaves
+  //    Waiting as a dated PLANNED row. A WAITING row that already lives in
+  //    the dated Backlog only takes that route when the target is a stream
+  //    row; inside the dated stretch it is an ordinary same-group reorder or
+  //    cross-group reschedule (both keep WAITING).
+  if (!overItem) return { kind: 'none' };
+  if (
+    dragged.task?.status === 'WAITING' &&
+    (draggedIsWaitingInSection || stream(overItem.id))
+  ) {
+    if (overItem.local_date < today) return { kind: 'none' };
+    return {
+      kind: 'waitingToDate',
+      date: overItem.local_date,
+      sortOrder: crossDaySortOrder(livingOf(overItem.local_date), overId),
+    };
+  }
+  if (overItem.local_date === dragged.local_date) {
+    const sortable = sortableSameDay();
+    const target = agendaMoveTargetAt(
+      sortable,
+      sortable.findIndex((entry) => entry.id === dragged.id),
+      sortable.findIndex((entry) => entry.id === overId),
+    );
+    return target === null ? { kind: 'none' } : { kind: 'sameDay', target };
+  }
+  if (overItem.local_date < today) return { kind: 'none' };
+  if (dragged.task?.status === 'IN_PROGRESS') return { kind: 'none' };
+  return {
+    kind: 'crossDay',
+    date: overItem.local_date,
+    sortOrder: crossDayRank(overItem.local_date, overId),
+  };
+}
+
 /** The append rank on `date`'s pile — the server's `max + 1`, else 0. Used by
  *  HomePage for the optimistic mirror of `place_task_on_today` and of a
  *  reschedule that omits `sort_order`. */
@@ -1021,6 +1330,67 @@ export function appendRankOnStream(
       entry.local_date === date ? Math.max(rank, entry.sort_order + 1) : rank,
     0,
   );
+}
+
+/** The server's hand-off placement as a cache repair: the row carries the
+ *  fresh task embed and, when it was not already on `today`, travels there
+ *  appended (ADR 0011 rule 2). The second-write failure path uses this on the
+ *  PRE-hand-off snapshot so the cache never keeps a date the server refused. */
+export function restoreHandedOffRow(
+  data: AgendaStreamData | undefined,
+  id: string,
+  today: string,
+  task: TaskRecord,
+): AgendaStreamData | undefined {
+  const updated = updateStreamItem(data, id, (entry) =>
+    entry.task ? { ...entry, task } : entry,
+  );
+  const row = streamItemsOf(updated).find((entry) => entry.id === id);
+  if (!row || !today || row.local_date === today) return updated;
+  return moveStreamItem(updated, id, today, appendRankOnStream(updated, today));
+}
+
+/** Runs one agenda drop's write sequence: `first` always runs; `second` (when
+ *  present) runs only after `first` resolves. A first failure rejects the
+ *  whole move; a second failure keeps the first write's result and hands it to
+ *  `onSecondFailure` so the caller can repaint the server's actual state. */
+export type AgendaWriteFlowResult = 'ok' | 'first-failed' | 'second-failed';
+
+export interface AgendaWriteFlow<TFirst, TSecond> {
+  first: () => Promise<TFirst>;
+  /** Omitted for a one-write move (hand-off straight onto today). */
+  second?: () => Promise<TSecond>;
+  onFirstSuccess: (first: TFirst) => void;
+  onSecondSuccess: (second: TSecond) => void;
+  onFirstFailure: (error: unknown) => void;
+  onSecondFailure: (error: unknown, first: TFirst) => void;
+}
+
+export async function runAgendaWriteFlow<TFirst, TSecond = never>({
+  first,
+  second,
+  onFirstSuccess,
+  onSecondSuccess,
+  onFirstFailure,
+  onSecondFailure,
+}: AgendaWriteFlow<TFirst, TSecond>): Promise<AgendaWriteFlowResult> {
+  let firstResult: TFirst;
+  try {
+    firstResult = await first();
+  } catch (error) {
+    onFirstFailure(error);
+    return 'first-failed';
+  }
+  onFirstSuccess(firstResult);
+  if (!second) return 'ok';
+  try {
+    const secondResult = await second();
+    onSecondSuccess(secondResult);
+    return 'ok';
+  } catch (error) {
+    onSecondFailure(error, firstResult);
+    return 'second-failed';
+  }
 }
 
 /** Every loaded item the stream cache holds, in page order — each page's
