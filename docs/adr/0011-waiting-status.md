@@ -94,7 +94,12 @@ Wednesday. Monday's Waiting section does not keep a record of it; the
 ### Agenda
 
 - Each date in the agenda gets a **Waiting section**, rendered between the
-  date header and that day's main list. It lists that day's `WAITING` rows.
+  date header and that day's main list. It lists that day's `WAITING` rows,
+  collapsed by default behind a count ("5 tasks in Waiting"); clicking the
+  count slides the rows open.
+- An empty Waiting section is not permanent copy. While a task row is being
+  dragged, today and future days show a dashed drop target so a hand-off
+  still has a destination. Past days never show an empty target.
 - `WAITING` rows are day-bound like `IN_PROGRESS` rows: agenda fill leaves a
   row inside the 10-year horizon where it is.
 
