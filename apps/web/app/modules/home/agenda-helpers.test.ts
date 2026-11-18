@@ -57,6 +57,7 @@ import {
   reschedulePickerMonth,
   reschedulePresets,
   runAgendaWriteFlow,
+  shouldShowWaitingSection,
   splitBacklogSection,
   splitWaitingRows,
   streamBounds,
@@ -1908,6 +1909,17 @@ test('waitingSectionLabel: collapsed copy pluralizes the count', () => {
   assert.equal(waitingSectionLabel(0), 'No tasks waiting');
   assert.equal(waitingSectionLabel(1), '1 task in Waiting');
   assert.equal(waitingSectionLabel(5), '5 tasks in Waiting');
+});
+
+test('shouldShowWaitingSection: empty days only drop while dragging', () => {
+  // A day with waiting rows always shows its collapsed count.
+  assert.equal(shouldShowWaitingSection(2, false, false), true);
+  assert.equal(shouldShowWaitingSection(2, true, false), true);
+  // An empty day fades in as a drop target only during a drag.
+  assert.equal(shouldShowWaitingSection(0, false, false), false);
+  assert.equal(shouldShowWaitingSection(0, false, true), true);
+  // The past is never a drop target, even mid-drag.
+  assert.equal(shouldShowWaitingSection(0, true, true), false);
 });
 
 // ── resolveAgendaDrop (ADR 0011 Waiting drag matrix) ───────────────────

@@ -1051,6 +1051,18 @@ export function waitingSectionLabel(count: number): string {
   return `${count} task${count === 1 ? '' : 's'} in Waiting`;
 }
 
+/** Does this day paint a Waiting section? A day with waiting rows always
+ *  does (collapsed behind its count). An empty day only shows the dashed drop
+ *  target while a task row is being dragged, and never on a past day — the
+ *  API rejects a reschedule there. */
+export function shouldShowWaitingSection(
+  waitingCount: number,
+  isPast: boolean,
+  dragging: boolean,
+): boolean {
+  return waitingCount > 0 || (dragging && !isPast);
+}
+
 /** What one dnd-kit drop should do — the pure decision HomePage's
  *  `handleDragEnd` acts on. `items` is `streamItemsOf` (page `items` plus
  *  `backlog`), and `streamItemIds` names the rows painted in a day stream
