@@ -24,7 +24,7 @@ pub const TREND_WINDOW_DAYS: i64 = 59;
 /// board and the record never disagree about which civil date it is. Before
 /// the first calendar sync the primary zone is unknown while `daily_meta`
 /// already knows it; jumping straight to UTC would move the user's day.
-async fn report_time_zone(
+pub(crate) async fn report_time_zone(
     repo: &dyn RecordRepo,
     digest_repo: &dyn DigestRepo,
     user_id: &str,

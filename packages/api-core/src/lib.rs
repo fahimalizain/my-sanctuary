@@ -14,6 +14,7 @@ pub use calendar::replica as calendar_replica;
 pub use calendar::sync as calendar_sync;
 pub use calendar::window as calendar_window;
 pub mod categories;
+pub mod consumption;
 pub mod digest;
 pub mod google_color;
 pub mod lists;
@@ -119,6 +120,10 @@ pub use categories::{
     classify, create_category, delete_category, ensure_taxonomy, list_categories, slugify,
     update_category, CalendarScope, CategoriesError, CategoriesResponse, CategoryResponse,
     CategoryView, CategoryWithPatterns, ClassifyOutcome, DeleteCategoryResponse, MAX_PATTERN_LEN,
+};
+pub use consumption::{
+    assemble_consumption, consumption_report, ConsumptionGroupTotal, ConsumptionReport,
+    ConsumptionRow,
 };
 pub use oauth::{
     authorization_url, exchange_and_login, generate_state, HttpClient, HttpError, OAuthError,
