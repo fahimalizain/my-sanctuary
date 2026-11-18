@@ -111,8 +111,5 @@ test('consumptionGroupLine: a tiny group keeps the <1% form', () => {
 
 test('consumptionGroupLine: no groups is an empty line', () => {
   assert.equal(consumptionGroupLine([], 0), '');
-  assert.equal(
-    consumptionGroupLine([{ group: 'series', seconds: 0 }], 0),
-    '',
-  );
+  assert.equal(consumptionGroupLine([{ group: 'series', seconds: 0 }], 0), '');
 });
