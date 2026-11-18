@@ -48,7 +48,6 @@ import {
   DragOverlay,
   MouseSensor,
   TouchSensor,
-  closestCenter,
   useDroppable,
   useSensor,
   useSensors,
@@ -100,6 +99,7 @@ import {
 } from '@/app/queries/tasks';
 import { queryClient } from '@/lib/queryClient';
 import { cn } from '@/lib/utils';
+import { agendaCollisionDetection } from './agenda-collision';
 import { AgendaItemRow, SortableAgendaItemRow } from './AgendaItemRow';
 import { addCivilDays } from '../routines/rrule-preview';
 import {
@@ -286,6 +286,17 @@ function AgendaDay({
   useEffect(() => {
     if (highlightedWaiting) setWaitingOpen(true);
   }, [highlightedWaiting]);
+  // A row handed into a previously empty section should reveal itself; the
+  // count would otherwise be the only feedback once the drop zone unmounts.
+  const previousWaitingCount = useRef(waiting.length);
+  useEffect(() => {
+    if (waiting.length > previousWaitingCount.current) setWaitingOpen(true);
+    previousWaitingCount.current = waiting.length;
+  }, [waiting.length]);
+  // Leaving zero behind must not keep the next arrival open by default.
+  useEffect(() => {
+    if (waiting.length === 0) setWaitingOpen(false);
+  }, [waiting.length]);
   const { setNodeRef, isOver } = useDroppable({
     id: dayElementId(day),
     data: { day },
@@ -296,7 +307,10 @@ function AgendaDay({
   const { setNodeRef: setWaitingNodeRef, isOver: waitingIsOver } = useDroppable(
     {
       id: waitingDayElementId(day),
-      data: { day },
+      // `empty` lets Home's collision strategy keep the transient strip
+      // pointer-only: `closestCenter` must still prefer the day pile just
+      // below the header for drops aimed at the top of the pile.
+      data: { day, waiting: true, empty: waiting.length === 0 },
       // A past section only accepts its OWN waiting rows' in-section reorder;
       // `resolveAgendaDrop` refuses every cross-day/date-changing drop there.
     },
@@ -341,9 +355,32 @@ function AgendaDay({
             )}
           </>
         )}
+        {/* An empty day's Waiting target only exists during a drag. Keep it
+            inside the sticky header's own box: it must not take layout space
+            (or every day below it would shift the moment the drag starts) and
+            it must not cover the pile below (or it would steal ordinary
+            drops). The date stays in the copy so cross-day drags can still be
+            aimed. */}
+        {waiting.length === 0 && showWaitingSection && (
+          <div
+            ref={setWaitingNodeRef}
+            aria-hidden
+            className={cn(
+              'absolute inset-0 z-20 flex items-center justify-center border border-dashed bg-cream/95 px-1 text-center text-[11px] font-medium tracking-wide shadow-sm backdrop-blur transition-colors',
+              waitingIsOver
+                ? 'border-amber-400/70 text-amber-800 ring-1 ring-amber-400/30'
+                : 'border-amber-400/40 text-amber-700/70',
+            )}
+          >
+            <span className="truncate">
+              {agendaDateLabel(day, serverToday)} · Drop here to move it to
+              Waiting
+            </span>
+          </div>
+        )}
       </header>
 
-      {showWaitingSection && (
+      {showWaitingSection && waiting.length > 0 && (
         <SortableContext
           items={
             waitingExpanded ? waitingDraggable.map((entry) => entry.id) : []
@@ -355,96 +392,81 @@ function AgendaDay({
             className="px-1 pb-2"
             aria-label={`Waiting · ${agendaDateLabel(day, serverToday)}`}
           >
-            {waiting.length === 0 ? (
-              <div
+            <button
+              type="button"
+              onClick={() => setWaitingOpen((open) => !open)}
+              aria-expanded={waitingExpanded}
+              aria-controls={waitingBodyId}
+              className={cn(
+                'mt-2 flex w-full items-center gap-1.5 rounded-lg px-1 py-1 text-left text-xs font-medium tracking-wide transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/40',
+                waitingIsOver
+                  ? 'bg-amber-400/10 text-amber-700 ring-1 ring-amber-400/30'
+                  : 'text-amber-700/80 hover:bg-amber-400/10',
+              )}
+            >
+              <ChevronDown
                 className={cn(
-                  'mt-1 flex min-h-10 items-center justify-center rounded-lg border border-dashed px-1 py-1 text-center text-xs font-medium tracking-wide transition-colors',
-                  waitingIsOver
-                    ? 'border-amber-400/60 bg-amber-400/15 text-amber-700'
-                    : 'border-amber-400/30 bg-amber-400/5 text-amber-700/60',
+                  'h-3.5 w-3.5 shrink-0 transition-transform [transition-duration:200ms] motion-reduce:transition-none',
+                  waitingExpanded ? 'rotate-0' : '-rotate-90',
                 )}
-              >
-                Drop here to move it to Waiting
-              </div>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={() => setWaitingOpen((open) => !open)}
-                  aria-expanded={waitingExpanded}
-                  aria-controls={waitingBodyId}
-                  className={cn(
-                    'mt-2 flex w-full items-center gap-1.5 rounded-lg px-1 py-1 text-left text-xs font-medium tracking-wide transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/40',
-                    waitingIsOver
-                      ? 'bg-amber-400/10 text-amber-700 ring-1 ring-amber-400/30'
-                      : 'text-amber-700/80 hover:bg-amber-400/10',
-                  )}
-                >
-                  <ChevronDown
-                    className={cn(
-                      'h-3.5 w-3.5 shrink-0 transition-transform [transition-duration:200ms] motion-reduce:transition-none',
-                      waitingExpanded ? 'rotate-0' : '-rotate-90',
-                    )}
-                    aria-hidden
-                  />
-                  <span>{waitingCountLabel}</span>
-                </button>
-                <div
-                  id={waitingBodyId}
-                  aria-hidden={!waitingExpanded}
-                  inert={!waitingExpanded}
-                  className={cn(
-                    'grid transition-[grid-template-rows] [transition-duration:200ms] [transition-timing-function:ease-out] motion-reduce:transition-none',
-                    waitingExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
-                  )}
-                >
-                  <div className="overflow-hidden">
-                    <div className="pt-2">
-                      <div
-                        className={
-                          waitingIsOver
-                            ? 'min-h-10 rounded-lg bg-amber-400/10 px-1 py-1 ring-1 ring-amber-400/30 transition-colors'
-                            : 'min-h-10 px-1 py-1 transition-colors'
-                        }
-                      >
-                        <div className="space-y-2">
-                          {waiting.map((entry) =>
-                            isAgendaRowDraggable(entry) ? (
-                              <SortableAgendaItemRow
-                                key={entry.id}
-                                item={entry}
-                                disabled={!waitingExpanded}
-                                serverToday={serverToday}
-                                highlighted={highlightedItemId === entry.id}
-                                pending={handlers.pendingOf(entry.id)}
-                                {...handlers}
-                              />
-                            ) : (
-                              <AgendaItemRow
-                                key={entry.id}
-                                item={entry}
-                                isDragging={false}
-                                showHandle={false}
-                                serverToday={serverToday}
-                                highlighted={highlightedItemId === entry.id}
-                                pending={handlers.pendingOf(entry.id)}
-                                {...handlers}
-                              />
-                            ),
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    <hr
-                      className={cn(
-                        'mx-1 mt-2 border-border/60 transition-opacity [transition-duration:200ms] motion-reduce:transition-none',
-                        waitingExpanded ? 'opacity-100' : 'opacity-0',
+                aria-hidden
+              />
+              <span>{waitingCountLabel}</span>
+            </button>
+            <div
+              id={waitingBodyId}
+              aria-hidden={!waitingExpanded}
+              inert={!waitingExpanded}
+              className={cn(
+                'grid transition-[grid-template-rows] [transition-duration:200ms] [transition-timing-function:ease-out] motion-reduce:transition-none',
+                waitingExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
+              )}
+            >
+              <div className="min-h-0 overflow-clip">
+                <div className="pt-2">
+                  <div
+                    className={
+                      waitingIsOver
+                        ? 'min-h-10 rounded-lg bg-amber-400/10 px-1 py-1 ring-1 ring-amber-400/30 transition-colors'
+                        : 'min-h-10 px-1 py-1 transition-colors'
+                    }
+                  >
+                    <div className="space-y-2">
+                      {waiting.map((entry) =>
+                        isAgendaRowDraggable(entry) ? (
+                          <SortableAgendaItemRow
+                            key={entry.id}
+                            item={entry}
+                            disabled={!waitingExpanded}
+                            serverToday={serverToday}
+                            highlighted={highlightedItemId === entry.id}
+                            pending={handlers.pendingOf(entry.id)}
+                            {...handlers}
+                          />
+                        ) : (
+                          <AgendaItemRow
+                            key={entry.id}
+                            item={entry}
+                            isDragging={false}
+                            showHandle={false}
+                            serverToday={serverToday}
+                            highlighted={highlightedItemId === entry.id}
+                            pending={handlers.pendingOf(entry.id)}
+                            {...handlers}
+                          />
+                        ),
                       )}
-                    />
+                    </div>
                   </div>
                 </div>
-              </>
-            )}
+                <hr
+                  className={cn(
+                    'mx-1 mt-2 border-border/60 transition-opacity [transition-duration:200ms] motion-reduce:transition-none',
+                    waitingExpanded ? 'opacity-100' : 'opacity-0',
+                  )}
+                />
+              </div>
+            </div>
           </section>
         </SortableContext>
       )}
@@ -787,6 +809,9 @@ export function HomePage() {
   const [actionNotice, setActionNotice] = useState<ActionNotice | null>(null);
   // The row to ring briefly after Show has scrolled to it.
   const [flashItemId, setFlashItemId] = useState<string | null>(null);
+  // The notice Show is currently resolving — consumed by the layout effect
+  // below once the target row's Waiting section has expanded.
+  const [pendingShow, setPendingShow] = useState<ActionNotice | null>(null);
   // The row currently dragged — feeds the DragOverlay title chip.
   const [activeDrag, setActiveDrag] = useState<AgendaItemRecord | null>(null);
   // Row actions in flight: the render-time map behind `AgendaItemRow`'s
@@ -2196,6 +2221,14 @@ export function HomePage() {
   // ──────────────────────────────────────────
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  // The empty Waiting strip is hit-tested against its live box, clipped to
+  // the stream's own visible box — a sticky header scrolled past either edge
+  // must never accept a drop.
+  const agendaCollision = useCallback(
+    (args: Parameters<typeof agendaCollisionDetection>[0]) =>
+      agendaCollisionDetection(args, scrollRef.current),
+    [],
+  );
   const topSentinelRef = useRef<HTMLDivElement>(null);
   // The top loading row is real height above the day headers; its measured
   // height is added to (or removed from) `scrollTop` when it mounts/unmounts so
@@ -2229,31 +2262,38 @@ export function HomePage() {
   // scrolls.
   const [scrollTodayPending, setScrollTodayPending] = useState(false);
 
-  /** Success notice's Show: find the moved row (it has a stable DOM id) and
-   *  scroll it into view inside the stream, then ring it briefly. The day
-   *  header / dated Backlog group are fallbacks, then the warehouse section the
-   *  move named — a Planned move never scrolls to the Backlog header. */
+  /** Success notice's Show: paint the flash and open any collapsed Waiting
+   *  section holding the row, then scroll once that commit is in the DOM. The
+   *  clipped body must never be used as the scroll geometry — its rows are
+   *  stacked outside the zero-height grid row until the section expands. */
   const showDestination = (notice: ActionNotice) => {
-    let target = document.getElementById(`agenda-item-${notice.itemId}`);
-    if (!target && notice.date) {
-      target = document.getElementById(dayElementId(notice.date));
+    setFlashItemId(notice.itemId);
+    setPendingShow(notice);
+    setActionNotice(null);
+  };
+
+  useLayoutEffect(() => {
+    if (!pendingShow) return;
+    let target = document.getElementById(`agenda-item-${pendingShow.itemId}`);
+    if (!target && pendingShow.date) {
+      target = document.getElementById(dayElementId(pendingShow.date));
     }
-    if (!target && notice.date) {
-      target = document.getElementById(backlogDayElementId(notice.date));
+    if (!target && pendingShow.date) {
+      target = document.getElementById(backlogDayElementId(pendingShow.date));
     }
     if (!target) {
       target = document.getElementById(
-        notice.section === 'planned'
+        pendingShow.section === 'planned'
           ? PLANNED_DROPPABLE_ID
           : BACKLOG_DROPPABLE_ID,
       );
     }
-    if (!target) return;
-    const isRow = target.id.startsWith('agenda-item-');
-    target.scrollIntoView({ block: isRow ? 'center' : 'start' });
-    setFlashItemId(notice.itemId);
-    setActionNotice(null);
-  };
+    if (target) {
+      const isRow = target.id.startsWith('agenda-item-');
+      target.scrollIntoView({ block: isRow ? 'center' : 'start' });
+    }
+    setPendingShow(null);
+  }, [pendingShow]);
 
   // The history walk's own flags: older weeks APPEND to the history query, so
   // the top-edge gesture is a `fetchNextPage` while `hasNextPage`.
@@ -2702,7 +2742,7 @@ export function HomePage() {
                   />
                   <DndContext
                     sensors={sensors}
-                    collisionDetection={closestCenter}
+                    collisionDetection={agendaCollision}
                     autoScroll
                     onDragStart={(event) =>
                       setActiveDrag(

@@ -1051,8 +1051,8 @@ export function waitingSectionLabel(count: number): string {
   return `${count} task${count === 1 ? '' : 's'} in Waiting`;
 }
 
-/** Does this day paint a Waiting section? A day with waiting rows always
- *  does (collapsed behind its count). An empty day only shows the dashed drop
+/** Does this day paint a Waiting target? A day with waiting rows always does
+ *  (collapsed behind its count). An empty day only shows the dashed drop
  *  target while a task row is being dragged, and never on a past day — the
  *  API rejects a reschedule there. */
 export function shouldShowWaitingSection(

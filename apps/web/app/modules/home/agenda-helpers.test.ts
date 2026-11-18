@@ -1915,6 +1915,7 @@ test('shouldShowWaitingSection: empty days only drop while dragging', () => {
   // A day with waiting rows always shows its collapsed count.
   assert.equal(shouldShowWaitingSection(2, false, false), true);
   assert.equal(shouldShowWaitingSection(2, true, false), true);
+  assert.equal(shouldShowWaitingSection(2, true, true), true);
   // An empty day fades in as a drop target only during a drag.
   assert.equal(shouldShowWaitingSection(0, false, false), false);
   assert.equal(shouldShowWaitingSection(0, false, true), true);
