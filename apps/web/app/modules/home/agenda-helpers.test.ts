@@ -63,6 +63,7 @@ import {
   streamItemsOf,
   unscheduleItem,
   updateStreamItem,
+  waitingSectionLabel,
   WAITING_DAY_ID_PREFIX,
 } from './agenda-helpers';
 
@@ -1901,6 +1902,12 @@ test('splitWaitingRows: empty input yields two empty piles; no mutation', () => 
   const before = [...pile];
   splitWaitingRows(pile);
   before.forEach((entry, i) => assert.equal(pile[i], entry));
+});
+
+test('waitingSectionLabel: collapsed copy pluralizes the count', () => {
+  assert.equal(waitingSectionLabel(0), 'No tasks waiting');
+  assert.equal(waitingSectionLabel(1), '1 task in Waiting');
+  assert.equal(waitingSectionLabel(5), '5 tasks in Waiting');
 });
 
 // ── resolveAgendaDrop (ADR 0011 Waiting drag matrix) ───────────────────
