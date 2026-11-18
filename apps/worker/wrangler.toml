@@ -10,6 +10,15 @@ compatibility_date = "2026-05-02"
 [placement]
 mode = "smart"
 
+[dev]
+# `wrangler dev` otherwise uses the first [[routes]] host (the production
+# custom domain) as the request host, so the fail-closed standalone auth gate
+# treats local requests as public. Pin the local origin to a private name.
+# NOTE: not "localhost" — wrangler's dev proxy rewrites response header values
+# containing the dev host, which would corrupt `Access-Control-Allow-Origin:
+# http://localhost:5173` into `http://127.0.0.1:8787:5173`.
+host = "127.0.0.1"
+
 [observability]
 enabled = false
 head_sampling_rate = 1
