@@ -34,6 +34,11 @@ export const queryKeys = {
     all: ['record'] as const,
     range: (range: RecordRangeKey) => [...queryKeys.record.all, range] as const,
   },
+  // "Consumption" (reports slice 3). One fixed window, so one key and no
+  // range: The Record's picker never reaches it.
+  consumption: {
+    all: ['consumption'] as const,
+  },
   agenda: {
     all: ['agenda'] as const,
     // Home's two reads (ADR 0004 amendment, ADR 0007): the default window

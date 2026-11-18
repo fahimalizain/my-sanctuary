@@ -13,5 +13,6 @@ export * from './routines';
 export * from './api-keys';
 export * from './rules';
 export * from './record';
+export * from './consumption';
 export * from './calendar';
 export * from './auth';

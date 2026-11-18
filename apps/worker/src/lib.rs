@@ -197,8 +197,10 @@ pub(crate) fn router(
         .options("/api/routines/:id", auth::options)
         .get_async("/api/reports/status", reports::status)
         .get_async("/api/reports/record", reports::record)
+        .get_async("/api/reports/consumption", reports::consumption)
         .options("/api/reports/status", auth::options)
         .options("/api/reports/record", auth::options)
+        .options("/api/reports/consumption", auth::options)
         // Cookie-session only: a bearer-only request is 401 by design, so a
         // leaked key can never mint or revoke keys.
         .get_async("/api/keys", api_keys::list_keys)
