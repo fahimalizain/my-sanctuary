@@ -59,7 +59,7 @@ import {
   arrayMove,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
-import { Check, Loader2, Repeat, X } from 'lucide-react';
+import { Check, ChevronDown, Loader2, Repeat, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -99,6 +99,7 @@ import {
   useUpdateTask,
 } from '@/app/queries/tasks';
 import { queryClient } from '@/lib/queryClient';
+import { cn } from '@/lib/utils';
 import { AgendaItemRow, SortableAgendaItemRow } from './AgendaItemRow';
 import { addCivilDays } from '../routines/rrule-preview';
 import {
@@ -133,6 +134,7 @@ import {
   streamItemsOf,
   unscheduleItem,
   updateStreamItem,
+  waitingSectionLabel,
   WAITING_DAY_ID_PREFIX,
 } from './agenda-helpers';
 import type {
@@ -258,6 +260,21 @@ function AgendaDay({
   // section when they actually hold waiting rows, and accept only those rows'
   // in-section reorder.
   const showWaitingSection = waiting.length > 0 || !isPast;
+  // The section is collapsed by default — a day with a long waiting list would
+  // otherwise push the actual plan below the fold. The count in the header is
+  // the whole collapsed state; clicking slides the rows open. Keep the body
+  // mounted (with `inert`) so the grid-rows transition can close again and
+  // Show can still find a highlighted row before the open state commits.
+  const [waitingOpen, setWaitingOpen] = useState(false);
+  const waitingBodyId = `waiting-body-${day}`;
+  const waitingCountLabel = waitingSectionLabel(waiting.length);
+  const highlightedWaiting =
+    highlightedItemId !== null &&
+    waiting.some((entry) => entry.id === highlightedItemId);
+  const waitingExpanded = waitingOpen || highlightedWaiting;
+  useEffect(() => {
+    if (highlightedWaiting) setWaitingOpen(true);
+  }, [highlightedWaiting]);
   const { setNodeRef, isOver } = useDroppable({
     id: dayElementId(day),
     data: { day },
@@ -317,56 +334,106 @@ function AgendaDay({
 
       {showWaitingSection && (
         <SortableContext
-          items={waitingDraggable.map((entry) => entry.id)}
+          items={
+            waitingExpanded ? waitingDraggable.map((entry) => entry.id) : []
+          }
           strategy={verticalListSortingStrategy}
         >
           <section
             ref={setWaitingNodeRef}
-            className="space-y-2 px-1 pb-2"
+            className="px-1 pb-2"
             aria-label={`Waiting · ${agendaDateLabel(day, serverToday)}`}
           >
-            <h3 className="px-1 text-xs font-medium tracking-wide text-amber-700/80">
-              Waiting
-            </h3>
-            <div
-              className={
-                waitingIsOver
-                  ? 'min-h-10 rounded-lg bg-amber-400/10 px-1 py-1 ring-1 ring-amber-400/30 transition-colors'
-                  : 'min-h-10 px-1 py-1 transition-colors'
-              }
-            >
-              {waiting.length === 0 ? (
-                <p className="px-1 py-1.5 text-xs italic text-muted-foreground/70">
-                  Nothing waiting
-                </p>
-              ) : (
-                <div className="space-y-2">
-                  {waiting.map((entry) =>
-                    isAgendaRowDraggable(entry) ? (
-                      <SortableAgendaItemRow
-                        key={entry.id}
-                        item={entry}
-                        serverToday={serverToday}
-                        highlighted={highlightedItemId === entry.id}
-                        pending={handlers.pendingOf(entry.id)}
-                        {...handlers}
-                      />
-                    ) : (
-                      <AgendaItemRow
-                        key={entry.id}
-                        item={entry}
-                        isDragging={false}
-                        showHandle={false}
-                        serverToday={serverToday}
-                        highlighted={highlightedItemId === entry.id}
-                        pending={handlers.pendingOf(entry.id)}
-                        {...handlers}
-                      />
-                    ),
+            {waiting.length === 0 ? (
+              <p
+                className={cn(
+                  'rounded-lg px-1 py-1 text-xs font-medium tracking-wide transition-colors',
+                  waitingIsOver
+                    ? 'bg-amber-400/10 text-amber-700 ring-1 ring-amber-400/30'
+                    : 'text-muted-foreground/70',
+                )}
+              >
+                Nothing waiting
+              </p>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setWaitingOpen((open) => !open)}
+                  aria-expanded={waitingExpanded}
+                  aria-controls={waitingBodyId}
+                  className={cn(
+                    'mt-2 flex w-full items-center gap-1.5 rounded-lg px-1 py-1 text-left text-xs font-medium tracking-wide transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/40',
+                    waitingIsOver
+                      ? 'bg-amber-400/10 text-amber-700 ring-1 ring-amber-400/30'
+                      : 'text-amber-700/80 hover:bg-amber-400/10',
                   )}
+                >
+                  <ChevronDown
+                    className={cn(
+                      'h-3.5 w-3.5 shrink-0 transition-transform [transition-duration:200ms] motion-reduce:transition-none',
+                      waitingExpanded ? 'rotate-0' : '-rotate-90',
+                    )}
+                    aria-hidden
+                  />
+                  <span>{waitingCountLabel}</span>
+                </button>
+                <div
+                  id={waitingBodyId}
+                  aria-hidden={!waitingExpanded}
+                  inert={!waitingExpanded}
+                  className={cn(
+                    'grid transition-[grid-template-rows] [transition-duration:200ms] [transition-timing-function:ease-out] motion-reduce:transition-none',
+                    waitingExpanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
+                  )}
+                >
+                  <div className="overflow-hidden">
+                    <div className="pt-2">
+                      <div
+                        className={
+                          waitingIsOver
+                            ? 'min-h-10 rounded-lg bg-amber-400/10 px-1 py-1 ring-1 ring-amber-400/30 transition-colors'
+                            : 'min-h-10 px-1 py-1 transition-colors'
+                        }
+                      >
+                        <div className="space-y-2">
+                          {waiting.map((entry) =>
+                            isAgendaRowDraggable(entry) ? (
+                              <SortableAgendaItemRow
+                                key={entry.id}
+                                item={entry}
+                                disabled={!waitingExpanded}
+                                serverToday={serverToday}
+                                highlighted={highlightedItemId === entry.id}
+                                pending={handlers.pendingOf(entry.id)}
+                                {...handlers}
+                              />
+                            ) : (
+                              <AgendaItemRow
+                                key={entry.id}
+                                item={entry}
+                                isDragging={false}
+                                showHandle={false}
+                                serverToday={serverToday}
+                                highlighted={highlightedItemId === entry.id}
+                                pending={handlers.pendingOf(entry.id)}
+                                {...handlers}
+                              />
+                            ),
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <hr
+                      className={cn(
+                        'mx-1 mt-2 border-border/60 transition-opacity [transition-duration:200ms] motion-reduce:transition-none',
+                        waitingExpanded ? 'opacity-100' : 'opacity-0',
+                      )}
+                    />
+                  </div>
                 </div>
-              )}
-            </div>
+              </>
+            )}
           </section>
         </SortableContext>
       )}

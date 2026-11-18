@@ -1043,6 +1043,14 @@ export function splitWaitingRows(items: AgendaItemRecord[]): {
   return { waiting, rest };
 }
 
+/** The collapsed Waiting section's whole header copy (ADR 0011 § Agenda):
+ *  the count is the summary, and clicking the row reveals the tasks. Kept
+ *  pure so the pluralization is testable without mounting the page. */
+export function waitingSectionLabel(count: number): string {
+  if (count <= 0) return 'No tasks waiting';
+  return `${count} task${count === 1 ? '' : 's'} in Waiting`;
+}
+
 /** What one dnd-kit drop should do — the pure decision HomePage's
  *  `handleDragEnd` acts on. `items` is `streamItemsOf` (page `items` plus
  *  `backlog`), and `streamItemIds` names the rows painted in a day stream

@@ -838,9 +838,16 @@ export function AgendaItemRow(props: AgendaItemRowProps) {
  *  dragging, the source row dims — HomePage's DragOverlay shows the floating
  *  title. The activator props are handed to the row, which spreads them on
  *  the grip ONLY, so the rest of the row never starts a drag. */
-export function SortableAgendaItemRow(
-  props: Omit<AgendaItemRowProps, 'attributes' | 'listeners' | 'isDragging'>,
-) {
+export function SortableAgendaItemRow({
+  disabled = false,
+  ...props
+}: Omit<AgendaItemRowProps, 'attributes' | 'listeners' | 'isDragging'> & {
+  /** Keep the row mounted but out of dnd-kit's droppable set. HomePage uses
+   *  this for the collapsed Waiting section: its rows are clipped to zero
+   *  height, so leaving them registered would make their hidden boxes win a
+   *  `closestCenter` drop meant for the pile underneath. */
+  disabled?: boolean;
+}) {
   const { item } = props;
   const {
     attributes,
@@ -849,7 +856,7 @@ export function SortableAgendaItemRow(
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: item.id });
+  } = useSortable({ id: item.id, disabled });
 
   return (
     <div
