@@ -24,6 +24,7 @@ import {
   useUpdateRule,
 } from '@/app/queries/rules';
 import type { RuleScore } from '@/app/types';
+import { Consumption } from './Consumption';
 import { GlobalPauseDialog } from './GlobalPauseDialog';
 import { ArchiveRuleRow, RuleCard } from './RuleCard';
 import { RuleDialog } from './RuleDialog';
@@ -410,6 +411,13 @@ export function ConsistencyPage() {
             )}
           </>
         )}
+
+        {/* "Consumption" — the fixed 14-day table of platforms by gross
+            logged time. Above The Record and outside the board/archive
+            switch, so the archive view shows it too. Descriptive only, and a
+            load failure stays inside the section without unmounting the
+            cards. Unlike The Record it starts open. */}
+        <Consumption />
 
         {/* "The Record" — the descriptive report, collapsed and below the
             board. It fetches only once opened and never blocks the cards

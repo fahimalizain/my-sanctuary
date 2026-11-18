@@ -1100,3 +1100,44 @@ export interface RecordReport {
   quality: RecordQuality;
   years: RecordYearRow[];
 }
+
+// ──────────────────────────────────────────
+// Consumption (reports slice 3) — shapes mirror
+// `packages/api-core/src/consumption/assemble.rs`.
+//
+// The fixed 14-day window, descriptive only: integer seconds and event counts,
+// with no target and no verdict. There is no `share` and no `avg` — both are
+// the client's own formatting of `seconds`.
+// ──────────────────────────────────────────
+
+// One group's gross seconds across the window.
+export interface ConsumptionGroupTotal {
+  group: string;
+  seconds: number;
+}
+
+// One platform's gross seconds across the window.
+export interface ConsumptionRow {
+  platform: string;
+  /** `"series" | "social" | "messaging" | "gaming"`. */
+  group: string;
+  seconds: number;
+  /** Event count — adjacent blocks are never merged. */
+  sessions: number;
+  /** The single longest block's seconds. */
+  longest_seconds: number;
+}
+
+// The envelope returned by GET /api/reports/consumption.
+export interface ConsumptionReport {
+  as_of: string;
+  time_zone: string;
+  from: string;
+  to: string;
+  /** `sum(row.seconds)`. */
+  total_seconds: number;
+  /** Only non-empty groups, seconds descending, then group ascending. */
+  groups: ConsumptionGroupTotal[];
+  /** Only non-empty platforms, seconds descending, then platform ascending. */
+  rows: ConsumptionRow[];
+}
