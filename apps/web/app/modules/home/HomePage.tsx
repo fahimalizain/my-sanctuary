@@ -129,6 +129,7 @@ import {
   resolveAgendaDrop,
   restoreHandedOffRow,
   runAgendaWriteFlow,
+  shouldShowWaitingSection,
   splitBacklogSection,
   splitWaitingRows,
   streamItemsOf,
@@ -232,6 +233,7 @@ function AgendaDay({
   onMoveDayToToday,
   loadingHistory,
   highlightedItemId,
+  dragging,
 }: {
   day: string;
   serverToday: string;
@@ -240,6 +242,10 @@ function AgendaDay({
   onMoveDayToToday: (day: string) => void;
   loadingHistory: boolean;
   highlightedItemId: string | null;
+  /** True while a task row (not a routine occurrence) is being dragged. An
+   *  empty Waiting section only exists during such a drag — it is a drop
+   *  target, not permanent copy. */
+  dragging: boolean;
 }) {
   const { living, completed } = partitionAgendaItems(items);
   // ADR 0011: the day's WAITING rows get their own section between the header
@@ -255,11 +261,16 @@ function AgendaDay({
   const isPast = !!serverToday && day < serverToday;
   const draggable = rest.filter(isAgendaRowDraggable);
   const waitingDraggable = waiting.filter(isAgendaRowDraggable);
-  // Keep an empty Waiting target on today/future days so a normal row can be
-  // dragged in even when nothing is waiting yet. Past days only render the
+  // An empty Waiting section exists only while a drag is running: then it is
+  // a drop target for a hand-off, and it renders as one. With no drag, a day
+  // that has nothing waiting shows nothing at all. Past days only render the
   // section when they actually hold waiting rows, and accept only those rows'
   // in-section reorder.
-  const showWaitingSection = waiting.length > 0 || !isPast;
+  const showWaitingSection = shouldShowWaitingSection(
+    waiting.length,
+    isPast,
+    dragging,
+  );
   // The section is collapsed by default — a day with a long waiting list would
   // otherwise push the actual plan below the fold. The count in the header is
   // the whole collapsed state; clicking slides the rows open. Keep the body
@@ -345,16 +356,16 @@ function AgendaDay({
             aria-label={`Waiting · ${agendaDateLabel(day, serverToday)}`}
           >
             {waiting.length === 0 ? (
-              <p
+              <div
                 className={cn(
-                  'rounded-lg px-1 py-1 text-xs font-medium tracking-wide transition-colors',
+                  'mt-1 flex min-h-10 items-center justify-center rounded-lg border border-dashed px-1 py-1 text-center text-xs font-medium tracking-wide transition-colors',
                   waitingIsOver
-                    ? 'bg-amber-400/10 text-amber-700 ring-1 ring-amber-400/30'
-                    : 'text-muted-foreground/70',
+                    ? 'border-amber-400/60 bg-amber-400/15 text-amber-700'
+                    : 'border-amber-400/30 bg-amber-400/5 text-amber-700/60',
                 )}
               >
-                Nothing waiting
-              </p>
+                Drop here to move it to Waiting
+              </div>
             ) : (
               <>
                 <button
@@ -2712,6 +2723,7 @@ export function HomePage() {
                         handlers={handlers}
                         loadingHistory={isLoadingOlderHistory}
                         highlightedItemId={flashItemId}
+                        dragging={activeDrag?.kind === 'task'}
                         onMoveDayToToday={(target) =>
                           void handleMoveDayToToday(target)
                         }
