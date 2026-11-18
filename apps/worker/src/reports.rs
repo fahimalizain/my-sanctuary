@@ -14,6 +14,9 @@
 //! ("The Record"): the days, the ranking, the productive trend, the hour ×
 //! weekday grid, the data quality, and the year table. It starts the backfill
 //! the same way `/status` does and never waits for it.
+//!
+//! `GET /api/reports/consumption` is the fixed 14-civil-day consumption fold:
+//! descriptive only, no range parameter, no target — and it never queues work.
 
 use worker::*;
 
@@ -112,6 +115,30 @@ pub async fn record(
 
     let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
     match api_core::record_report(&record_d1(&ctx)?, &d1(&ctx)?, &user.id, range, now_unix).await {
+        Ok(report) => {
+            let response = Response::from_json(&report)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
+                &ctx,
+            ))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+
+/// `GET /api/reports/consumption` → 200 the assembled `ConsumptionReport`.
+///
+/// A fixed window of 14 civil days, resolved in the user's own zone. The report
+/// is descriptive only — it never carries a target or a verdict — and there is
+/// no range parameter to widen it.
+pub async fn consumption(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return json_error(&ctx, 401, "unauthorized");
+    };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+    match api_core::consumption_report(&record_d1(&ctx)?, &d1(&ctx)?, &user.id, now_unix).await {
         Ok(report) => {
             let response = Response::from_json(&report)?;
             Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(
