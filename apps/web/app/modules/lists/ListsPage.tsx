@@ -780,12 +780,15 @@ function TaskChip({
         </span>
       )}
       {/* Actions — Start on OPEN and PLANNED (pause parks tasks in PLANNED,
-          so the Lists page must be able to restart them); IN_PROGRESS is a
+          so the Lists page must be able to restart them), and on WAITING
+          (ADR 0011: start is the "take back" move); IN_PROGRESS is a
           column, not a singleton lock, so Start works even while other
           tasks run; Stop + Pause only while this task runs;
           Complete/Discard whenever the task is not already in that terminal
           state */}
-      {(task.status === 'OPEN' || task.status === 'PLANNED') && (
+      {(task.status === 'OPEN' ||
+        task.status === 'PLANNED' ||
+        task.status === 'WAITING') && (
         <button
           onClick={(e) => {
             e.stopPropagation();
