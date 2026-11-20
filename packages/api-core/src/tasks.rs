@@ -1895,13 +1895,14 @@ async fn stop_or_pause(
 ///
 /// Agenda (status/date decoupling): the idempotent no-op returns above, so a
 /// status write here is always a **real** transition. A **dated** agenda row
-/// keeps its date and rank — including a terminal → terminal move, which never
-/// pulls an old history row onto today. An **undated** row is dated civil
-/// today, and a missing row is inserted there, for every terminal target
-/// (living or terminal pre-status) — this is "dating an undated task", not
-/// moving a date. Placement runs **last**, after the terminal log and the
-/// board rank. A placement failure is swallowed — the status, the log, and the
-/// rank are already committed.
+/// is never touched. A **living** source (`OPEN`/`PLANNED`/`IN_PROGRESS`/
+/// `WAITING`) dates an undated row — or inserts a missing one — on civil
+/// today; this is "dating an undated task", not moving a date. Terminal →
+/// terminal **never places**: ADR 0006 gives a terminal task no agenda row
+/// until it is reopened, so a missing or undated history row stays exactly as
+/// it is. Placement runs **last**, after the terminal log and the board rank.
+/// A placement failure is swallowed — the status, the log, and the rank are
+/// already committed.
 async fn complete_or_discard(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -2034,15 +2035,22 @@ async fn complete_or_discard(
     };
 
     // Placement is last and best-effort: the status, the terminal log, and the
-    // board rank are already committed. A dated row is never touched (terminal
-    // → terminal included); an undated row, or a missing one, is dated today.
+    // board rank are already committed. A dated row is never touched; a living
+    // source dates an undated/missing row today; terminal → terminal never
+    // places (ADR 0006: a terminal task needs no agenda row until reopened).
     // The cron dates a MISSING OR UNDATED row; it never repairs a half-written
     // Google log.
-    if let Err(_) = date_undated_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
-    {
-        // A stale row is the least-bad outcome: a 500 would report a write
-        // that already landed — status, terminal log, board rank, and the
-        // Google exit all committed.
+    if matches!(
+        task.status.as_str(),
+        TASK_STATUS_OPEN | TASK_STATUS_PLANNED | TASK_STATUS_IN_PROGRESS | TASK_STATUS_WAITING
+    ) {
+        if let Err(_) =
+            date_undated_task_on_today(agenda_repo, calendars, user_id, task_id, now_unix).await
+        {
+            // A stale row is the least-bad outcome: a 500 would report a
+            // write that already landed — status, terminal log, board rank,
+            // and the Google exit all committed.
+        }
     }
 
     let taxonomy = load_taxonomy(category_repo, user_id).await?;
@@ -11530,6 +11538,66 @@ mod tests {
             "terminal → terminal is a real status change but never drags history onto today"
         );
         assert_eq!(rows[0].sort_order, 3, "and never reshuffles it");
+    }
+
+    #[test]
+    fn terminal_to_terminal_never_inserts_or_moves_a_history_row() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let rowless = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let undated = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        // Complete both from a living status, then leave one task rowless and
+        // park the other's row on the backlog sentinel (undated).
+        for id in [&rowless.id, &undated.id] {
+            pollster::block_on(complete_task(
+                &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+                &access(), "u-1", id, AGENDA_NOW_UNIX, &agenda,
+                noop_notify(),
+            ))
+            .unwrap();
+        }
+        let rows = agenda.rows("u-1");
+        let rowless_row = rows.iter().find(|row| row.ref_id == rowless.id).unwrap();
+        let undated_row = rows.iter().find(|row| row.ref_id == undated.id).unwrap();
+        agenda
+            .stored
+            .lock()
+            .unwrap()
+            .retain(|stored| stored.id != rowless_row.id);
+        agenda.move_row(&undated_row.id, AGENDA_BACKLOG, 0);
+
+        for id in [&rowless.id, &undated.id] {
+            let response = pollster::block_on(move_task(
+                None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+                None, "u-1", id, AGENDA_NOW_UNIX,
+                &MoveTaskInput {
+                    status: TASK_STATUS_DISCARDED.to_string(),
+                    sort_order: Some(0),
+                },
+                &agenda,
+                noop_notify(),
+            ))
+            .unwrap();
+            assert_eq!(response.task.status, TASK_STATUS_DISCARDED);
+        }
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1, "the rowless task stays rowless — no insert");
+        assert!(
+            rows.iter().all(|row| row.ref_id != rowless.id),
+            "terminal → terminal never inserts a history row"
+        );
+        let undated_row = rows.iter().find(|row| row.ref_id == undated.id).unwrap();
+        assert_eq!(
+            undated_row.local_date, AGENDA_BACKLOG,
+            "terminal → terminal never dates an undated history row"
+        );
+        assert_eq!(undated_row.sort_order, 0, "and never reshuffles it");
     }
 
     #[test]
