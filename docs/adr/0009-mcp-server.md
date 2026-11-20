@@ -256,10 +256,11 @@ Per tool:
   no rank is a no-op. Status moves **preserve the agenda date** (ADR 0013): an
   undated task may be dated today when it becomes `IN_PROGRESS`, `WAITING`,
   `COMPLETED`, or `DISCARDED`; targets `OPEN`/`PLANNED` leave it undated, and
-  a rowless task gets its target-status default. Date changes go through
-  `reschedule_agenda_item`. `destructiveHint` is true because the tool can
-  discard or complete a task, and entering or leaving `IN_PROGRESS` writes
-  Google.
+  a rowless task gets its target-status default. A terminal -> `PLANNED`
+  reopen is the exception: a rowless or undated row lands on today. Date
+  changes go through `reschedule_agenda_item`. `destructiveHint` is true
+  because the tool can discard or complete a task, and entering or leaving
+  `IN_PROGRESS` writes Google.
 - **`reschedule_agenda_item`** takes exactly one of `date` (with optional
   `sort_order`), `backlog: true` (drops the row on the backlog sentinel and
   unplans a `PLANNED` task to `OPEN`), or `unschedule: true` (keeps `PLANNED`

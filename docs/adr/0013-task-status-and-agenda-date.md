@@ -105,7 +105,8 @@ The fill maintains the one-row invariant without overriding a real date:
 
 ### Explicit scheduling actions
 
-Only these actions write a row's `local_date`:
+Only these actions move an existing dated row or clear a date. Status
+transitions may still date an undated or missing row as described above.
 
 | Action                            | Row                                                              | Status                                                                                                 |
 | --------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -162,9 +163,10 @@ The still-valid read decisions from ADR 0007/0010/0011 are kept:
 
 ### Web
 
-Home's optimistic paint mirrors the server: start, complete, reopen, and
-hand-off only date an **undated** row on today; a dated row keeps its day and
-rank. Planning (`OPEN -> PLANNED`) never retargets a dated row to the
+Home's optimistic paint mirrors the server: start, complete, hand-off, and a
+terminal -> `PLANNED` reopen only date an **undated** row on today; a dated
+row keeps its day and rank. Reopen -> `OPEN` preserves the history date and
+never dates. Planning (`OPEN -> PLANNED`) never retargets a dated row to the
 sentinel. Because `WAITING -> OPEN`/`PLANNED` no longer shelves by itself,
 Home sends the `/move` and then an explicit `{ backlog: true }` or
 `{ unschedule: true }` reschedule; if the second write fails it repaints the
@@ -210,6 +212,9 @@ user can reschedule them.
 
 - Reopening a past terminal row keeps the past date; the row can pin the
   anchor until the user reschedules it or completes it again.
+- Any status-only move that leaves a living row on a past date — start, stop,
+  pause, unplan, hand-off — keeps that pending row pinning the anchor until it
+  is rescheduled or finished.
 - A dated `OPEN`/`PLANNED` row is easy to mistake for a bug: it is deliberately
   outside the warehouse stretches and inside the day stream.
 - Explicit date actions can still change status (`OPEN -> PLANNED` on a dated
@@ -217,7 +222,9 @@ user can reschedule them.
   a date change must accept the workflow side effect.
 - `move-day-to-today` can pull warehouse-era dated rows forward; it cannot
   resurrect a date that was already lost.
-- A failed best-effort placement leaves a rowless or undated task in the wrong
-  place until the next `*/15` tick.
+- A failed best-effort placement is healed only for a missing row on a living
+  task and for an undated `IN_PROGRESS`/`WAITING` row. A missing or undated
+  terminal row, or an undated `PLANNED` row left by a failed terminal ->
+  `PLANNED` reopen, is not healed automatically.
 - `checked_add_months` clamps 29 February, so both the horizon and the sentinel
   can land on 28 February.

@@ -8,7 +8,7 @@ Date: 2026-10-17
 > `backlog` array (later three stretches), and the `{ "backlog": true }`
 > reschedule form; those survive. Its placement table and its rule that the
 > task row's date follows the task status do not: status transitions no
-> longer move an existing agenda row. Current placement is in
+> longer move an existing dated row. Current placement is in
 > `docs/adr/0013-task-status-and-agenda-date.md`.
 
 ## Context
