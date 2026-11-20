@@ -250,16 +250,23 @@ Per tool:
   the page does. Also not a user-facing mutation.
 - **`create_task`** creates a new row on every call; it is not idempotent.
 - **`update_task`** never sets status; status changes go through `move_task`.
-- **`move_task`** sends `status` only — one of `OPEN`, `PLANNED`, `IN_PROGRESS`,
-  `COMPLETED`, `DISCARDED` — and omits `sort_order` so the server applies the
-  column default. Sending the same status twice with no rank is a no-op.
-  `PLANNED` does not schedule an undated task for today; it parks the row in
-  the Planned warehouse. `destructiveHint` is true because the tool can discard
-  or complete a task, and entering or leaving `IN_PROGRESS` writes Google.
+- **`move_task`** sends `status` only — one of `OPEN`, `PLANNED`,
+  `IN_PROGRESS`, `WAITING`, `COMPLETED`, `DISCARDED` — and omits `sort_order`
+  so the server applies the column default. Sending the same status twice with
+  no rank is a no-op. Status moves **preserve the agenda date** (ADR 0013): an
+  undated task may be dated today when it becomes `IN_PROGRESS`, `WAITING`,
+  `COMPLETED`, or `DISCARDED`; targets `OPEN`/`PLANNED` leave it undated, and
+  a rowless task gets its target-status default. Date changes go through
+  `reschedule_agenda_item`. `destructiveHint` is true because the tool can
+  discard or complete a task, and entering or leaving `IN_PROGRESS` writes
+  Google.
 - **`reschedule_agenda_item`** takes exactly one of `date` (with optional
-  `sort_order`), `backlog: true` (unplans a `PLANNED` task to `OPEN`), or
-  `unschedule: true` (keeps `PLANNED` and parks the row in the Planned
-  warehouse). A rank is ignored on the two flags.
+  `sort_order`), `backlog: true` (drops the row on the backlog sentinel and
+  unplans a `PLANNED` task to `OPEN`), or `unschedule: true` (keeps `PLANNED`
+  and drops the row on the sentinel). A rank is ignored on the two flags. This
+  is the only tool that relocates a dated row; `move_task` only dates a row
+  that was undated or missing, and a `date` reschedule of an `OPEN` task
+  deliberately plans it.
 - **`create_event`** requires `summary`, `start`, and `end`; it accepts
   `description`, `is_all_day`, `start_time_zone`, and `calendar_id`. When
   `calendar_id` is omitted it resolves the primary calendar's local id and
