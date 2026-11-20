@@ -3,9 +3,12 @@
 Status: Accepted
 Date: 2026-11-16
 
-> Amends ADR 0007's row-placement table and ADR 0010's backlog read: adds a
-> sixth task status, `WAITING`, with its own placement rules and a Waiting
-> section under every date in the agenda.
+> Amended by ADR 0013 (2026-11-20). The `WAITING` status, its log, its
+> agenda/Board surfaces, and its no-calendar-time rule stand. The
+> row-placement table and the self-heal placement rules in this ADR are
+> superseded: a status transition never moves a dated row, and leaving
+> `WAITING` for `OPEN`/`PLANNED` no longer shelves the row by itself. See
+> `docs/adr/0013-task-status-and-agenda-date.md`.
 
 ## Context
 
@@ -42,10 +45,10 @@ This ADR keeps two things apart:
 - New status `WAITING`, a living (non-terminal) status alongside `OPEN`,
   `PLANNED` and `IN_PROGRESS`.
 - **No transition restrictions.** Any status can move to `WAITING`, and
-  `WAITING` can move to any status, including `COMPLETED`/`DISCARDED →
-WAITING`. A terminal → `WAITING` move writes a single `handed_off` log, not
-  `reopened` followed by `handed_off`.
-- `WAITING` holds **no calendar time**. `IN_PROGRESS → WAITING` closes the
+  `WAITING` can move to any status, including `COMPLETED`/`DISCARDED` ->
+  `WAITING`. A terminal -> `WAITING` move writes a single `handed_off` log,
+  not `reopened` followed by `handed_off`.
+- `WAITING` holds **no calendar time**. `IN_PROGRESS -> WAITING` closes the
   running Google event through the same Google-gated path as pause.
 - Handing off clears focus. Focus stays `IN_PROGRESS`-only.
 - New task log type: `handed_off`, written on every real transition into
@@ -54,42 +57,18 @@ WAITING`. A terminal → `WAITING` move writes a single `handed_off` log, not
   session or PR link goes in the task description. Deferred deliberately; a
   dedicated field would be its own ADR.
 
-### Where the agenda row goes on a transition
+### Placement
 
-**The rule:**
-
-1. A row moves **only on a real status transition**, never on its own. No
-   cron, read-time rule or day rollover moves a `WAITING` row forward.
-2. A transition **into active or terminal work** (`WAITING`, `IN_PROGRESS`,
-   `COMPLETED`, `DISCARDED`) moves the row to **civil today**, appended.
-3. A transition **into the backlog** (`OPEN`, `PLANNED`) moves the row to the
-   **backlog date** (today+50y), appended.
-
-Rule 3 applies to every transition out of `WAITING`. Two older transitions
-predate it and are deliberately left as they are: pause (`IN_PROGRESS →
-PLANNED`) leaves the row unchanged, and reopen → `PLANNED` lands on today
-(ADR 0007).
-
-| Event                                    | Status →           | Row date               | Log                       |
-| ---------------------------------------- | ------------------ | ---------------------- | ------------------------- |
-| hand off (any status → `WAITING`)        | `WAITING`          | today, appended        | `handed_off`              |
-| take back (`WAITING` → `IN_PROGRESS`)    | `IN_PROGRESS`      | today, appended        | `started` (opens event)   |
-| complete / discard from `WAITING`        | terminal           | today, appended        | `completed` / `discarded` |
-| shelve (`WAITING` → `OPEN` / `PLANNED`)  | `OPEN` / `PLANNED` | backlog date, appended | `unplanned` / `planned`   |
-| `WAITING` → `WAITING` (same-status drag) | unchanged          | unchanged (reorder)    | none                      |
-
-Shelving reuses the log named for the destination: `WAITING → PLANNED` writes
-`planned`, `WAITING → OPEN` writes `unplanned`. No new log type. `stopped` and
-`paused` are not used because they imply a closed calendar event, and
-`WAITING` never has one. An `unplanned` log can therefore follow either
-`PLANNED` or `WAITING`; the preceding log (`handed_off`) tells them apart.
+**Superseded by ADR 0013.** Status is workflow; the agenda row's date is
+scheduling intent. A status transition never moves a dated row: an undated or
+missing row is dated by its target default, and `WAITING` follows the same
+rule as `IN_PROGRESS`. `WAITING -> OPEN`/`PLANNED` preserves the date, so
+shelving requires a second, explicit `{ "backlog": true }` or
+`{ "unschedule": true }` reschedule. See
+`docs/adr/0013-task-status-and-agenda-date.md`.
 
 Placement stays **best-effort** after the status and log writes, as in ADR
-0006/0007. "Already on today" is a no-op for the row, as for start.
-
-Consequence: a task handed off Monday and taken back Wednesday ends up on
-Wednesday. Monday's Waiting section does not keep a record of it; the
-`handed_off` log does.
+0006/0013.
 
 ### Agenda
 
@@ -100,20 +79,19 @@ Wednesday. Monday's Waiting section does not keep a record of it; the
 - An empty Waiting section is not permanent copy. While a task row is being
   dragged, today and future days show a dashed drop target so a hand-off
   still has a destination. Past days never show an empty target.
-- `WAITING` rows are day-bound like `IN_PROGRESS` rows: agenda fill leaves a
-  row inside the 10-year horizon where it is.
+- `WAITING` rows are day-bound: a dated row stays on its day, and only an
+  undated or missing row is dated today (ADR 0013).
 
 ### Self-heal
 
-Agenda fill (the `*/15` cron) treats `WAITING` like `IN_PROGRESS`: a
-`WAITING` task with **no agenda row**, or with its row on the backlog
-sentinel, is placed on today. A row already on a real date is never touched.
-This is not an automatic move under rule 1: it only completes a hand-off
-placement that failed, and lands where the hand-off would have put it. It
-never creates a calendar event.
+Agenda fill (the `*/15` cron) treats `WAITING` like `IN_PROGRESS`: a rowless
+`WAITING` task, or one whose row is **undated** at/after the 10-year horizon,
+is placed on today. A row already on a real date is never touched. This is
+not an automatic move: it only completes a failed hand-off placement, and
+lands where the hand-off would have put it. It never creates a calendar event.
 
-Concretely: one new arm in the fill match (`agenda_fill.rs`) and a
-`status_rank` for `WAITING`, ranked after `IN_PROGRESS`.
+Concretely: one arm in the fill match (`agenda_fill.rs`) and a `status_rank`
+for `WAITING`, ranked after `IN_PROGRESS`.
 
 ### Board
 
@@ -128,7 +106,7 @@ Concretely: one new arm in the fill match (`agenda_fill.rs`) and a
 
 - `move_task` accepts `WAITING` in its `status` enum. Its description gains:
   "`WAITING` holds no calendar time; leaving `IN_PROGRESS` for `WAITING`
-  closes the Google event."
+  closes the Google event." Status moves preserve the agenda date (ADR 0013).
 - No new tool. `reschedule_agenda_item` and `move_agenda_item` need no schema
   change; they inherit the server rules (reschedule allowed, unschedule 400).
 - No `hand_back` tool: checking waiting tasks stays manual.
@@ -141,9 +119,8 @@ Concretely: one new arm in the fill match (`agenda_fill.rs`) and a
   Thursday." This differs from `IN_PROGRESS`, which still rejects reschedule.
 - **Unschedule** (`{ "unschedule": true }`) of a `WAITING` row is rejected
   with a 400 telling the client to move the task to Open or Planned instead.
-  Under the placement rule, reaching the backlog requires a status change;
-  unschedule does not change status, and a `WAITING` task on the backlog
-  sentinel is a state that cannot occur any other way.
+  Unschedule is a `PLANNED`-only date action; a `WAITING` task must first move
+  to `OPEN`/`PLANNED` (which preserves its date), then be shelved explicitly.
 
 ## Consequences
 
@@ -153,21 +130,20 @@ Concretely: one new arm in the fill match (`agenda_fill.rs`) and a
 - A review done by completing straight from `WAITING` opens no event, so
   that review time never reaches the calendar. Accepted for quick
   "looks good, merge" reviews; start the task first if the time matters.
-- The Waiting section under a date is not a history. A task handed off Monday
-  and taken back Wednesday shows only on Wednesday; the `handed_off` log is
-  the record.
+- A dated `WAITING` row stays on its day across hand-off and take-back. The
+  Waiting section under a date is still not a history: the `handed_off` log is
+  the record of how long the task waited.
 - Agent runtime is measurable from `task_logs` alone: `handed_off` to the next
   transition. No extra span or flag.
 - Nothing nudges a stale `WAITING` task and nothing signals that an agent has
   finished. Checking is manual by design.
-- Known inconsistencies, left for later ADRs:
-  - Terminal → `WAITING` is one move, but terminal → `IN_PROGRESS` is not
-    (reopen still only reaches `OPEN`/`PLANNED`). Restarting a finished task
-    takes reopen then start.
-  - Placement rule 3 covers every move out of `WAITING`, but pause
-    (`IN_PROGRESS → PLANNED`, row unchanged) and reopen → `PLANNED` (row on
-    today) keep their ADR 0007 behaviour.
+- Known asymmetries, left for later ADRs:
+  - The **reopen** verb reaches only `OPEN`/`PLANNED`; terminal -> `WAITING` is
+    a single move. A direct start on a finished task is allowed and opens a new
+    event (ADR 0006).
   - `WAITING` rows can be rescheduled; `IN_PROGRESS` rows cannot.
+  - Shelving a `WAITING` task takes a status move plus an explicit date
+    action; the server does not combine them.
 - Touches: the status and log constants in `api-core`, the move matrix and
   Google gate, agenda fill (`status_rank` + one arm), reschedule/unschedule
   validation, the Board columns, the agenda Waiting section, the

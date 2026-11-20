@@ -19,16 +19,17 @@
 // (`/reschedule` with the target rank — an `OPEN` task becomes `PLANNED`); a
 // same-day drop is the old `/move` reorder. Dragging into Backlog drops a row
 // (`{ backlog: true }` → `OPEN` on today+50y, still the unplan), dragging into
-// Planned plans an `OPEN` row (`/move { status: 'PLANNED' }` with no rank — it
-// never lands on today, the row parks on the sentinel), and dragging a dated
-// `PLANNED` row there unschedules it (`{ unschedule: true }`: status, log and
-// Board rank all untouched). Dragging inside one warehouse is that column's
-// Board task `/move`, so Home and Board share one order per column;
+// Planned plans an `OPEN` row (`/move { status: 'PLANNED' }` with no rank — a
+// dated row keeps its day, an undated row keeps its sentinel), and dragging a
+// dated `PLANNED` row there unschedules it (`{ unschedule: true }`: status, log
+// and Board rank all untouched). Dragging inside one warehouse is that
+// column's Board task `/move`, so Home and Board share one order per column;
 // occurrences and running tasks are never dropped there. The old header date
 // picker, the add-task picker and remove-from-day are gone — tasks are born on
-// the Board, and a task's row follows the task's own lifecycle. A row's
-// calendar menu offers today-relative presets, a month picker and (for tasks)
-// Unschedule / Backlog.
+// the Board. A task's status is workflow and its row's `local_date` is
+// scheduling intent: a status-only move never re-dates a dated row, and only
+// an undated (warehoused) row is dated today. A row's calendar menu offers
+// today-relative presets, a month picker and (for tasks) Unschedule / Backlog.
 // Built on the existing task/occurrence
 // actions (complete, skip, reopen, start, pause, rename, TaskModal, error
 // banner, move notice, optimistic `['tasks']` patches) and reschedule/complete
@@ -124,7 +125,9 @@ import {
   moveStreamItem,
   partitionAgendaItems,
   planOpenItem,
+  planWaitingToDateSecondWrite,
   PLANNED_DROPPABLE_ID,
+  placeUndatedTaskOnToday,
   replaceCachedTask,
   resolveAgendaDrop,
   restoreHandedOffRow,
@@ -868,31 +871,6 @@ export function HomePage() {
     [],
   );
 
-  /** Optimistic mirror of the server's `place_task_on_today` (ADR 0004
-   *  amendment): a task's single row travels to civil today on a real
-   *  lifecycle transition (start / complete / discard / reopen), appended at
-   *  the pile's end; a row already there keeps its rank. `fn` paints the
-   *  embed flip first (so `partitionAgendaItems` parks a completed row in the
-   *  Completed dump). */
-  const placeTaskOnToday = useCallback(
-    (
-      data: AgendaPages | undefined,
-      itemId: string,
-      fn: (item: AgendaItemRecord) => AgendaItemRecord,
-    ): AgendaPages | undefined => {
-      const next = updateStreamItem(data, itemId, fn);
-      const row = streamItemsOf(next).find((entry) => entry.id === itemId);
-      if (!row || !serverToday || row.local_date === serverToday) return next;
-      return moveStreamItem(
-        next,
-        itemId,
-        serverToday,
-        appendRankOnStream(next, serverToday),
-      );
-    },
-    [serverToday],
-  );
-
   const mergeRow = useCallback(
     (itemId: string, updater: (item: AgendaItemRecord) => AgendaItemRecord) => {
       patchStream((current) => updateStreamItem(current, itemId, updater));
@@ -1155,14 +1133,14 @@ export function HomePage() {
   };
 
   /** Hand a living task off to WAITING by dropping it into a day's Waiting
-   *  section (ADR 0011 § Where the agenda row goes). The transition always
-   *  lands the row on civil today server-side, so a drop on another date is a
-   *  second, reschedule write that preserves the section the user aimed at.
-   *  The optimistic paint goes straight to the FINAL day/status — the server's
-   *  intermediate today row is never shown. A first-write failure restores the
-   *  snapshot; a second-write failure leaves the successful hand-off on today
-   *  and banners (the row would otherwise claim a date the server never
-   *  stored). */
+   *  section (ADR 0011 § Where the agenda row goes). A status-only transition
+   *  never moves a dated row: it preserves the day the task already sits on,
+   *  and only dates an undated row on civil today. A drop on another date is
+   *  therefore a second, reschedule write that preserves the section the user
+   *  aimed at. The optimistic paint goes straight to the FINAL day/status. A
+   *  first-write failure restores the snapshot; a second-write failure repaints
+   *  the state the server actually holds (`restoreHandedOffRow`: the dated row
+   *  stayed on its old day, an undated one landed on today) and banners. */
   const handleHandOffToWaiting = async (
     item: AgendaItemRecord,
     targetDate: string,
@@ -1175,13 +1153,28 @@ export function HomePage() {
     if (!beginRowAction(item.id, 'grip')) return;
     try {
       const snapshot = readStream();
+      // Where the first write leaves the row: a dated row keeps its own day,
+      // an undated (or missing) row lands on today.
+      const sourceRow = streamItemsOf(snapshot).find(
+        (entry) => entry.id === item.id,
+      );
+      const horizon = addMonthsClamp(serverToday, 120);
+      const placedDate =
+        sourceRow && sourceRow.local_date < horizon
+          ? sourceRow.local_date
+          : serverToday;
       patchStream((current) => {
-        const handed = placeTaskOnToday(current, item.id, (entry) =>
-          entry.task
-            ? { ...entry, task: { ...entry.task, status: 'WAITING' } }
-            : entry,
+        const handed = placeUndatedTaskOnToday(
+          current,
+          item.id,
+          serverToday,
+          (entry) =>
+            entry.task
+              ? { ...entry, task: { ...entry.task, status: 'WAITING' } }
+              : entry,
         );
-        if (!handed || targetDate === serverToday) return handed;
+        const row = streamItemsOf(handed).find((entry) => entry.id === item.id);
+        if (!row || row.local_date === targetDate) return handed;
         return moveStreamItem(
           handed,
           item.id,
@@ -1197,7 +1190,7 @@ export function HomePage() {
             input: { status: 'WAITING' } satisfies MoveTaskInput,
           }),
         second:
-          targetDate === serverToday
+          targetDate === placedDate
             ? undefined
             : () =>
                 rescheduleAgendaItemMutation.mutateAsync({
@@ -1227,9 +1220,10 @@ export function HomePage() {
           );
         },
         onSecondFailure: (err, first) => {
-          // The hand-off itself succeeded (the row is WAITING on today); only
-          // the date move failed. Repaint the state the server actually holds
-          // before asking the stream to re-read.
+          // The hand-off itself succeeded; only the date move failed.
+          // `restoreHandedOffRow` repaints the server's state — a dated row
+          // stayed on its old day, an undated one landed on today — before
+          // asking the stream to re-read.
           patchStream(() =>
             restoreHandedOffRow(snapshot, item.id, serverToday, first.task),
           );
@@ -1245,9 +1239,12 @@ export function HomePage() {
           });
         },
       });
-      if (result === 'ok' && targetDate === serverToday) {
+      if (result === 'ok' && targetDate === placedDate) {
         setActionNotice({
-          message: 'Handed off · Waiting',
+          message:
+            targetDate === serverToday
+              ? 'Handed off · Waiting'
+              : `Handed off · ${agendaDateLabel(targetDate, serverToday)}`,
           itemId: item.id,
           date: targetDate,
         });
@@ -1257,11 +1254,17 @@ export function HomePage() {
     }
   };
 
-  /** Shelve a WAITING row into a warehouse (ADR 0011 rule 3): `WAITING` →
-   *  `PLANNED` / `OPEN` through the Board's `/move`, which parks its one
-   *  agenda row on the backlog sentinel and appends the destination column.
-   *  Painted with the same `unscheduleItem` / `moveItemToBacklog` mirrors the
-   *  other warehouse drops use, then merged with the authoritative task. */
+  /** Shelve a WAITING row into a warehouse (ADR 0013): `WAITING` →
+   *  `OPEN` / `PLANNED` through the Board's `/move`, then an explicit date
+   *  action parks the row in that warehouse — `{ backlog: true }` for OPEN and
+   *  `{ unschedule: true }` for PLANNED. The status move alone preserves a
+   *  dated row by design (status and date are decoupled), so the second write
+   *  is what actually shelves it. The optimistic paint goes straight to the
+   *  final SHELVED state with `moveItemToBacklog` / `unscheduleItem`, then
+   *  merges the authoritative row. A first-write failure restores the
+   *  snapshot; a second-write failure repaints the server's real state — the
+   *  status move succeeded, but the row kept its old date — with `first.task`
+   *  and banners. */
   const handleWaitingToWarehouse = async (
     item: AgendaItemRecord,
     status: 'OPEN' | 'PLANNED',
@@ -1278,7 +1281,8 @@ export function HomePage() {
           return moveItemToBacklog(current, item.id, sentinel);
         }
         // A WAITING → PLANNED transition appends the Planned column (ADR
-        // 0011), then the row parks on the sentinel.
+        // 0013); the explicit `{ unschedule: true }` write is what parks the
+        // row on the sentinel.
         const appendRank = streamItemsOf(current)
           .filter((entry) => entry.id !== item.id)
           .flatMap((entry) =>
@@ -1300,38 +1304,76 @@ export function HomePage() {
         return unscheduleItem(planned, item.id, sentinel, serverToday);
       });
       setActionError(null);
-      try {
-        const data = await moveTaskMutation.mutateAsync({
-          id: task.id,
-          input: { status } satisfies MoveTaskInput,
-        });
-        mergeRow(item.id, (entry) =>
-          entry.task ? { ...entry, task: data.task } : entry,
-        );
-        setTasksCache((prev) => replaceCachedTask(prev, data.task));
-        setActionNotice({
-          message:
-            status === 'PLANNED' ? 'Moved to Planned' : 'Moved to Backlog',
-          itemId: item.id,
-          section: status === 'PLANNED' ? 'planned' : 'backlog',
-        });
-      } catch (err) {
-        patchStream(() => snapshot);
-        setActionNotice(null);
-        setActionError(err instanceof Error ? err.message : 'Move failed');
-      }
+      await runAgendaWriteFlow({
+        first: () =>
+          moveTaskMutation.mutateAsync({
+            id: task.id,
+            input: { status } satisfies MoveTaskInput,
+          }),
+        second: () =>
+          rescheduleAgendaItemMutation.mutateAsync({
+            id: item.id,
+            input:
+              status === 'OPEN'
+                ? ({ backlog: true } satisfies RescheduleAgendaItemInput)
+                : ({ unschedule: true } satisfies RescheduleAgendaItemInput),
+          }),
+        onFirstSuccess: (data) => {
+          mergeRow(item.id, (entry) =>
+            entry.task ? { ...entry, task: data.task } : entry,
+          );
+          setTasksCache((prev) => replaceCachedTask(prev, data.task));
+        },
+        onSecondSuccess: (data) => {
+          mergeRow(data.item.id, () => data.item);
+          setTasksCache((prev) => replaceCachedTask(prev, data.item.task));
+          setActionNotice({
+            message:
+              status === 'PLANNED' ? 'Moved to Planned' : 'Moved to Backlog',
+            itemId: data.item.id,
+            section: status === 'PLANNED' ? 'planned' : 'backlog',
+          });
+        },
+        onFirstFailure: (err) => {
+          patchStream(() => snapshot);
+          setActionNotice(null);
+          setActionError(err instanceof Error ? err.message : 'Move failed');
+        },
+        onSecondFailure: (err, first) => {
+          // The status move succeeded; only the shelving write failed, so the
+          // row kept its old date. Repaint the snapshot with the first write's
+          // task embed — never the sentinel — before asking the stream to
+          // re-read.
+          patchStream(() =>
+            updateStreamItem(snapshot, item.id, (entry) =>
+              entry.task ? { ...entry, task: first.task } : entry,
+            ),
+          );
+          setActionNotice(null);
+          setActionError(
+            `Changed status, but could not shelve the row: ${
+              err instanceof Error ? err.message : 'Move failed'
+            }`,
+          );
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.agenda.all,
+          });
+        },
+      });
     } finally {
       endRowAction(item.id);
     }
   };
 
   /** Take a WAITING row out to a real day by dropping it on the normal pile
-   *  (ADR 0011): the destination says PLANNED, so the task leaves Waiting as
-   *  a dated `PLANNED` row on `targetDate`. The transition itself shelves the
-   *  row to the backlog sentinel, so this is a second `/reschedule` write to
-   *  the date the user aimed at. A first-write failure restores the snapshot;
-   *  a second-write failure leaves the successful PLANNED task in the
-   *  warehouse and banners. */
+   *  (ADR 0011). The destination says PLANNED, so the task leaves Waiting as a
+   *  `PLANNED` row. The status move preserves the row's date (ADR 0013), so a
+   *  CROSS-DAY drop needs a second `/reschedule`; a SAME-DAY drop with a rank
+   *  needs an agenda `/move` reorder (a same-date reschedule is a server no-op
+   *  that would drop the rank); a same-day drop without a rank needs no second
+   *  write. A first-write failure restores the snapshot; a second-write failure
+   *  repaints the server's real state — the PLANNED task on its old date and
+   *  rank — with `first.task` and banners. */
   const handleWaitingToDate = async (
     item: AgendaItemRecord,
     targetDate: string,
@@ -1343,35 +1385,66 @@ export function HomePage() {
     if (!beginRowAction(item.id, 'grip')) return;
     try {
       const snapshot = readStream();
+      // PLANNED preserves any existing row's date: a dated row keeps its day,
+      // an undated one stays undated. Fall back to the dragged row when the
+      // cache lookup somehow misses.
+      const sourceRow = streamItemsOf(snapshot).find(
+        (entry) => entry.id === item.id,
+      );
+      const placedDate = sourceRow?.local_date ?? item.local_date;
+      const secondWrite = planWaitingToDateSecondWrite(
+        placedDate,
+        targetDate,
+        sortOrder,
+      );
       patchStream((current) => {
         const planned = updateStreamItem(current, item.id, (entry) =>
           entry.task
             ? { ...entry, task: { ...entry.task, status: 'PLANNED' } }
             : entry,
         );
-        return moveStreamItem(
+        if (!planned || secondWrite.kind === 'none') return planned;
+        if (secondWrite.kind === 'reschedule') {
+          return moveStreamItem(
+            planned,
+            item.id,
+            targetDate,
+            secondWrite.input.sort_order ??
+              appendRankOnStream(planned, targetDate),
+          );
+        }
+        // Same-day drop with a rank: mirror the agenda `/move` reorder over the
+        // day's WHOLE pile (parked ranks shift too, like `handleSameDayMove`).
+        const dayItems = dayItemsOf(streamItemsOf(planned), targetDate);
+        const moved = applyAgendaMove(dayItems, item.id, secondWrite.sortOrder);
+        if (moved === dayItems) return planned;
+        return moved.reduce<AgendaPages | undefined>(
+          (acc, entry) => updateStreamItem(acc, entry.id, () => entry),
           planned,
-          item.id,
-          targetDate,
-          sortOrder ?? appendRankOnStream(planned, targetDate),
         );
       });
       setActionError(null);
-      const input: RescheduleAgendaItemInput =
-        sortOrder === undefined
-          ? { date: targetDate }
-          : { date: targetDate, sort_order: sortOrder };
+      const second =
+        secondWrite.kind === 'none'
+          ? undefined
+          : secondWrite.kind === 'reorder'
+            ? () =>
+                moveAgendaItemMutation.mutateAsync({
+                  id: item.id,
+                  input: { sort_order: secondWrite.sortOrder },
+                })
+            : () =>
+                rescheduleAgendaItemMutation.mutateAsync({
+                  id: item.id,
+                  input: secondWrite.input,
+                });
       await runAgendaWriteFlow({
         first: () =>
           moveTaskMutation.mutateAsync({
             id: task.id,
             input: { status: 'PLANNED' } satisfies MoveTaskInput,
           }),
-        second: () =>
-          rescheduleAgendaItemMutation.mutateAsync({
-            id: item.id,
-            input,
-          }),
+        second,
         onFirstSuccess: (data) => {
           mergeRow(item.id, (entry) =>
             entry.task ? { ...entry, task: data.task } : entry,
@@ -1389,26 +1462,25 @@ export function HomePage() {
           setActionError(err instanceof Error ? err.message : 'Move failed');
         },
         onSecondFailure: (err, first) => {
-          // The PLANNED transition succeeded (the row is in the warehouse);
-          // only the date move failed. Repaint the row where the server holds
-          // it — on the backlog sentinel, with the first write's task embed,
-          // in Planned order — before asking the stream to re-read.
-          patchStream((current) =>
-            unscheduleItem(
-              updateStreamItem(current, item.id, (entry) =>
-                entry.task ? { ...entry, task: first.task } : entry,
-              ),
-              item.id,
-              addMonthsClamp(serverToday, 600),
-              serverToday,
+          // The PLANNED transition succeeded; only the second write failed, so
+          // the row still sits on its old date and rank. Repaint that row with
+          // the first write's task embed — never a date or rank the server
+          // refused — before asking the stream to re-read.
+          patchStream(() =>
+            updateStreamItem(snapshot, item.id, (entry) =>
+              entry.task ? { ...entry, task: first.task } : entry,
             ),
           );
           setActionNotice(null);
           setActionError(
-            `Moved out of Waiting, but could not place it on ${agendaShortDateLabel(
-              targetDate,
-              serverToday,
-            )}: ${err instanceof Error ? err.message : 'Move failed'}`,
+            secondWrite.kind === 'reorder'
+              ? `Moved out of Waiting, but could not reorder it: ${
+                  err instanceof Error ? err.message : 'Move failed'
+                }`
+              : `Moved out of Waiting, but could not place it on ${agendaShortDateLabel(
+                  targetDate,
+                  serverToday,
+                )}: ${err instanceof Error ? err.message : 'Move failed'}`,
           );
           void queryClient.invalidateQueries({
             queryKey: queryKeys.agenda.all,
@@ -1466,28 +1538,21 @@ export function HomePage() {
 
   /** Drop a row into the Planned warehouse (ADR 0010): the Board's
    *  `POST /api/tasks/:id/move { status: 'PLANNED' }` with **no rank** — the
-   *  plan appends the task to the Planned column server-side and parks its
-   *  agenda row on the backlog sentinel, never on civil today. (The hovered
-   *  card's rank would be a same-status reorder of that column, not an
-   *  append.) Painted optimistically with the SAME month clamp the server uses,
-   *  then merged with the authoritative task, whose status and Board rank both
-   *  land in the shared `['tasks']` cache. A failure restores the snapshot and
-   *  banners; `useMoveTask` invalidates the stream on settle — never awaited,
-   *  so the rollback cannot race it. */
+   *  plan appends the task to the Planned column server-side and updates only
+   *  the task's status: a dated agenda row keeps its day, an undated row keeps
+   *  its sentinel. (The hovered card's rank would be a same-status reorder of
+   *  that column, not an append.) Painted optimistically with the SAME horizon
+   *  rule the server uses, then merged with the authoritative task, whose
+   *  status and Board rank both land in the shared `['tasks']` cache. A failure
+   *  restores the snapshot and banners; `useMoveTask` invalidates the stream on
+   *  settle — never awaited, so the rollback cannot race it. */
   const handlePlanDrop = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task || task.status !== 'OPEN' || !serverToday) return;
     if (!beginRowAction(item.id, 'grip')) return;
     try {
       const snapshot = readStream();
-      patchStream((current) =>
-        planOpenItem(
-          current,
-          item.id,
-          addMonthsClamp(serverToday, 600),
-          serverToday,
-        ),
-      );
+      patchStream((current) => planOpenItem(current, item.id, serverToday));
       setActionError(null);
       try {
         const data = await moveTaskMutation.mutateAsync({
@@ -1725,9 +1790,10 @@ export function HomePage() {
    *  top) or, for a finished row — `COMPLETED` or `DISCARDED` — back to
    *  PLANNED through the Board's `/move` (ADR 0004 amendment — uncheck is the
    *  Board reopen, no new endpoint; ADR 0002 — a discarded task reopens the
-   *  same way, it is never completed). Both travel onto civil today
-   *  server-side — the paint mirrors that. Reopening never stamps: living
-   *  sorts by `sort_order`. */
+   *  same way, it is never completed). Status and date are decoupled: a dated
+   *  row keeps its day; only an undated row is dated on civil today. The paint
+   *  mirrors that undated-only rule. Reopening never stamps: living sorts by
+   *  `sort_order`. */
   const handleCompleteTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
@@ -1739,7 +1805,7 @@ export function HomePage() {
       const wasDiscarded = task.status === 'DISCARDED';
       if (task.status === 'COMPLETED' || wasDiscarded) {
         patchStream((current) =>
-          placeTaskOnToday(current, item.id, (entry) =>
+          placeUndatedTaskOnToday(current, item.id, serverToday, (entry) =>
             entry.task
               ? { ...entry, task: { ...entry.task, status: 'PLANNED' } }
               : entry,
@@ -1773,7 +1839,7 @@ export function HomePage() {
         return;
       }
       patchStream((current) =>
-        placeTaskOnToday(current, item.id, (entry) =>
+        placeUndatedTaskOnToday(current, item.id, serverToday, (entry) =>
           entry.task
             ? {
                 ...entry,
@@ -1811,8 +1877,9 @@ export function HomePage() {
 
   /** Task → the existing `/start` (Board → In Progress). A `WAITING` task
    *  takes back the hand-off the same way (ADR 0011): `/start` opens the
-   *  review event and its row travels onto civil today server-side. The
-   *  FocusTimer is a separate surface and this just flips the card. */
+   *  review event and flips the status. A dated row keeps its day; only an
+   *  undated row is dated on civil today. The FocusTimer is a separate surface
+   *  and this just flips the card. */
   const handleStartTask = async (item: AgendaItemRecord) => {
     const task = item.task;
     if (!task) return;
@@ -1820,7 +1887,7 @@ export function HomePage() {
     try {
       const snapshot = readStream();
       patchStream((current) =>
-        placeTaskOnToday(current, item.id, (entry) =>
+        placeUndatedTaskOnToday(current, item.id, serverToday, (entry) =>
           entry.task
             ? { ...entry, task: { ...entry.task, status: 'IN_PROGRESS' } }
             : entry,

@@ -28,6 +28,13 @@
 //! The companion reconcile lives in [`crate::routines`]: a rule change rewrites
 //! only **untouched** rows from tomorrow through today+6, and a routine delete
 //! hard-deletes those same rows.
+//!
+//! The task half ([`ensure_task_items`]) only **supplies a default**: a
+//! rowless `OPEN`/`PLANNED` task gets the backlog sentinel, a rowless
+//! `IN_PROGRESS`/`WAITING` task gets today, and an undated (at/after the
+//! 10-year horizon) `IN_PROGRESS`/`WAITING` row is dated today. It never moves
+//! a dated row — in particular `move-day-to-today` may explicitly put an
+//! `OPEN` row on a real day, and this cron must not undo it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -220,9 +227,10 @@ pub async fn fill_occurrence_horizon(
 // Task placement (self-heal, ADR 0007)
 // ──────────────────────────────────────────
 
-/// Puts every living task's single agenda row where its **status** says it
-/// belongs — the `*/15` self-heal and the ADR 0007 migration (existing `OPEN`
-/// rows leave the day stream on the first tick; no SQL migration).
+/// Puts each living task's single agenda row on its **status default** only
+/// when the task has no row or holds an **undated** row — the `*/15` self-heal
+/// after status and date were decoupled. A **dated** row is scheduling
+/// intent and is never moved by this fill, whatever the task's status.
 ///
 /// - Living tasks only (`list_by_user_id` hides soft-deleted rows) and only
 ///   `OPEN | PLANNED | IN_PROGRESS | WAITING`: `COMPLETED`/`DISCARDED` get
@@ -231,25 +239,24 @@ pub async fn fill_occurrence_horizon(
 ///   row it already holds, if any (never a second row — one row per task is
 ///   the 0018 invariant). The backlog date is civil today + 50 years
 ///   ([`backlog_local_date`]); the 10-year line is civil today + 10 years
-///   ([`planning_horizon_date`]).
-/// - `OPEN` with a row dated `<` the horizon → the row moves to the backlog
-///   date; `OPEN` with no row → one is inserted there. An `OPEN` row already
-///   at `>=` the horizon is left alone, even when its date is not exactly
-///   today's backlog date (yesterday's backlog date is still past the line).
-/// - `PLANNED` with no row → one is inserted on the backlog date (ADR 0010: a
-///   planned task the user never dated is warehouse work, never today). Any
-///   existing `PLANNED` row is left alone — past, dated future, and at/after
-///   the horizon are all valid (a `PLANNED` row past the line is no longer a
-///   misplacement).
+///   ([`planning_horizon_date`]). A row below that line is **dated**; at/after
+///   it the row is **undated** (warehoused).
+/// - `OPEN` with no row → one is inserted on the backlog date. **Any**
+///   existing `OPEN` row is left alone, dated or undated: `move-day-to-today`
+///   may deliberately put an `OPEN` row on a real day, and the cron must not
+///   undo that. An undated `OPEN` row (yesterday's sentinel included) is still
+///   valid warehouse work and is not normalized either.
+/// - `PLANNED` with no row → one is inserted on the backlog date (ADR 0010).
+///   Any existing `PLANNED` row is left alone — past, dated future, and
+///   at/after the horizon are all valid.
 /// - `IN_PROGRESS` with a row dated `>=` the horizon → the row moves to
-///   today; with no row → one is inserted on today. A dated future row in
-///   `[today, horizon)` and a past row are never touched (a past
-///   `IN_PROGRESS` row can still pin the anchor). Nothing is rewritten just
-///   to normalize it onto exactly today's backlog date.
+///   today; with no row → one is inserted on today. A dated row in
+///   `[past, horizon)` is never touched (a past `IN_PROGRESS` row can still
+///   pin the anchor).
 /// - `WAITING` behaves exactly like `IN_PROGRESS` (ADR 0011): a rowless task
-///   or a row parked at/after the horizon lands on today — this only completes
-///   a failed hand-off placement; a row on a real date is never touched, and
-///   no calendar event is created.
+///   or an undated row lands on today — this only completes a failed
+///   placement; a row on a real date is never touched, and no calendar event
+///   is created.
 /// - The arrivals are appended in **board order** per destination: the today
 ///   pile holds `IN_PROGRESS` first and then `WAITING`, the backlog pile
 ///   `PLANNED` first and then `OPEN`, each by `tasks.sort_order` with ties
@@ -259,7 +266,7 @@ pub async fn fill_occurrence_horizon(
 ///   keep their ranks — moving and inserting share one counter, so a healed
 ///   row and a rowless task land as one board.
 ///
-/// Idempotent: a second pass with nothing missing or misplaced writes nothing
+/// Idempotent: a second pass with nothing missing or undated writes nothing
 /// (no `insert_many`, no `set_local_date`).
 pub async fn ensure_task_items(
     agenda_repo: &dyn AgendaItemRepo,
@@ -298,11 +305,12 @@ pub async fn ensure_task_items(
     for task in &tasks {
         let row = rows_by_task.get(task.id.as_str()).copied();
         match (task.status.as_str(), row) {
-            // OPEN is warehouse work whatever its row says: a rowless task or
-            // a row still inside the horizon moves to the sentinel; a row
-            // already at/after the horizon is left alone.
-            (TASK_STATUS_OPEN, Some(row)) if row.local_date.as_str() >= horizon.as_str() => {}
-            (TASK_STATUS_OPEN, row) => backlog_pile.push((task, row)),
+            // OPEN is a warehouse status by default, but the row is scheduling
+            // intent and the fill never moves a dated one: `move-day-to-today`
+            // may deliberately put an OPEN row on a real day, and the cron must
+            // not undo that. Only a rowless OPEN task gets the sentinel.
+            (TASK_STATUS_OPEN, None) => backlog_pile.push((task, None)),
+            (TASK_STATUS_OPEN, Some(_)) => {}
             // PLANNED is a warehouse status since ADR 0010: a rowless task is
             // parked on the sentinel, and ANY existing row (past, dated
             // future, or at/after the horizon) is valid and left alone.
@@ -415,9 +423,11 @@ pub struct AgendaFillReport {
 }
 
 /// The agenda fill cron (the `*/15 * * * *` tick): for each affected user,
-/// materialize the occurrence horizon and place or repair every living task's
-/// single agenda row (`OPEN` and `PLANNED` on the backlog date, `IN_PROGRESS`
-/// and `WAITING` on today — [`ensure_task_items`], ADR 0007 / 0009 / 0011).
+/// materialize the occurrence horizon and supply each living task's single
+/// agenda row only when it is missing or undated — [`ensure_task_items`].
+/// A dated row is never moved; a rowless `OPEN`/`PLANNED` task lands on the
+/// backlog date, and a rowless or undated `IN_PROGRESS`/`WAITING` task lands
+/// on today (status/date decoupling; ADR 0007 / 0009 / 0010 / 0011).
 ///
 /// The work list is the sorted, deduped union of
 /// [`RoutineRepo::list_user_ids_with_living_routines`] and

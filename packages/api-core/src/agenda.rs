@@ -684,8 +684,8 @@ fn resolve_window(
 ///
 /// 1. The **dated** stretch — every row before the 10-year line, kept in the
 ///    range query's order (`local_date`, `sort_order`, `created_at`, the
-///    repo's contract, never re-sorted here; a not-yet-healed `OPEN` row on a
-///    real future day belongs to this stretch).
+///    repo's contract, never re-sorted here; a dated `OPEN` row on a real day
+///    belongs to this stretch and the self-heal leaves it there).
 /// 2. The **Planned warehouse** — `PLANNED` tasks at or past the horizon in
 ///    **Board order** (`tasks.sort_order`, ties by task id — deliberately not
 ///    the agenda row's rank, so Home and the Board share one order).
@@ -9959,9 +9959,9 @@ mod tests {
         for task in [running, planned, open, completed, placed] {
             repos.tasks.push(task);
         }
-        // An OPEN row inside the ten-year line is misplaced under ADR 0007:
-        // the fill moves it out to the backlog date (it is no longer "already
-        // placed, leave it alone").
+        // A dated OPEN row is scheduling intent, not a misplacement: the fill
+        // leaves it on its real day (the status/date decoupling rule). Only
+        // the rowless OPEN task below gets the backlog sentinel.
         agenda_row(
             &repos,
             "ai-placed",
@@ -9988,12 +9988,12 @@ mod tests {
         assert_eq!(
             membership_triples(&repos, "u-1"),
             vec![
+                ("task-placed".to_string(), 2, "2026-08-20".to_string()),
                 ("task-run".to_string(), 0, "2026-08-23".to_string()),
                 ("task-plan".to_string(), 0, "2076-08-23".to_string()),
                 ("task-open".to_string(), 1, "2076-08-23".to_string()),
-                ("task-placed".to_string(), 2, "2076-08-23".to_string()),
             ],
-            "rowless PLANNED then OPEN land on the backlog date in board order, never on today"
+            "rowless PLANNED then OPEN land on the backlog date in board order; the dated OPEN row stays"
         );
         assert!(
             membership_triples(&repos, "u-1")
@@ -10017,11 +10017,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_task_items_moves_an_open_row_before_the_horizon_onto_the_backlog_date() {
+    fn ensure_task_items_leaves_a_dated_open_row_alone() {
         let repos = repos();
         let mut open = task_row("task-open", "u-1", "Open | Work", "OPEN");
         open.sort_order = 3;
         repos.tasks.push(open);
+        // `move-day-to-today` may deliberately put an OPEN row on a real day;
+        // the */15 self-heal must not undo it by relocating it to the sentinel.
         agenda_row(
             &repos,
             "ai-open",
@@ -10032,16 +10034,19 @@ mod tests {
             4,
         );
 
+        repos.agenda.reset_calls();
         ensure_tasks(&repos, "u-1").unwrap();
 
         let rows = items_of(&repos, "task-open");
-        assert_eq!(rows.len(), 1, "the row travels; no second row is inserted");
-        assert_eq!(rows[0].id, "ai-open", "the same row moved");
+        assert_eq!(rows.len(), 1, "one row per task — never a duplicate");
+        assert_eq!(rows[0].id, "ai-open", "the same row, never replaced");
+        assert_eq!(rows[0].local_date, "2026-08-23", "the dated OPEN row stays");
+        assert_eq!(rows[0].sort_order, 4, "and keeps its rank");
         assert_eq!(
-            rows[0].local_date, "2076-08-23",
-            "the backlog date, not today"
+            repos.agenda.call_counts().insert_many,
+            0,
+            "no row is inserted for a task that already has one"
         );
-        assert_eq!(rows[0].sort_order, 0, "appended on an empty backlog pile");
     }
 
     #[test]

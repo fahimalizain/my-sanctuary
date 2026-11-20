@@ -3,12 +3,15 @@
 Status: Accepted
 Date: 2026-10-17
 
-> Superseded in part by ADR 0007 (2026-10-17): a living task's single agenda
-> row follows its status — `OPEN` sits on today+50y (the backlog), not on
-> today. The default `GET /api/agenda` is `anchor_date … today+6` plus a
-> `backlog` array, not the anchor week. Reschedule is bounded to
-> `[today, today+10y)` and plans an `OPEN` task. Stop, plan, and unplan move
-> the row. See `docs/adr/0007-agenda-backlog.md`.
+> Superseded in part by ADR 0007 (2026-10-17), ADR 0010 (2026-10-30), and
+> ADR 0013 (2026-11-20). ADR 0007 added the backlog sentinel and widened the
+> default read; ADR 0010 split the warehouse into Planned and Open; ADR 0013
+> decoupled task status from the agenda date. The task-row placement table
+> below and the "row follows the task's status/lifecycle" wording are
+> superseded: a status-only transition never moves an existing dated row. The
+> stream, the one-row-per-task invariant, the occurrence model, and the read
+> contract (as amended) still hold. Current task placement is in
+> `docs/adr/0013-task-status-and-agenda-date.md`.
 
 ## Context
 
@@ -69,8 +72,8 @@ One vertically scrolling run of civil days, contiguous, with no gaps: scroll up
 for history, down for the future. Opening Home lands on `anchor_date` (below),
 and the browser extends the stream a page at a time. There is **no date picker,
 no Add task and no Remove from day** — tasks are born on the Board, and a
-task's row follows the task's own lifecycle. An empty day still renders, as a
-header and a drop target whenever it is today or later.
+task's row carries the user's scheduling intent (ADR 0013). An empty day still
+renders, as a header and a drop target whenever it is today or later.
 
 ### One row per task
 
@@ -81,10 +84,11 @@ task is missing or soft-deleted and collapsing duplicates to the greatest
 `UNIQUE (user_id, local_date, kind, ref_id)`: occurrence rows still rely on it,
 and two occurrence rows of the same routine on one day remain legal.
 
-Every living task in `OPEN | PLANNED | IN_PROGRESS` holds exactly one row. The
-index makes that **at most one**; a backfill (below) gives every rowless open
-task one on today, so in practice it is exactly one. **Backlog (`OPEN`) is
-included.**
+Every living task in `OPEN | PLANNED | IN_PROGRESS | WAITING` holds exactly
+one row. The index makes that **at most one**; the fill gives every rowless
+living task its status default (ADR 0013), so in practice it is exactly one.
+**Backlog (`OPEN`) is included.** A terminal task may keep its last row as
+history; terminal -> terminal never creates one.
 
 `COMPLETED | DISCARDED` tasks need no agenda row — they reappear when
 reopened. A soft-deleted task **hard-deletes** its agenda row, so no ghost can
@@ -92,29 +96,25 @@ keep a day pending.
 
 ### The day a task's row sits on
 
-Complete and discard arrive from **any** surface — `/complete`, `/discard`, a
-Board drop into Done or Discarded, the Home checkbox, TaskModal. The rule is the
-same everywhere:
+**Superseded by ADR 0007, ADR 0010, and ADR 0013.** The task-row placement
+table that stood here (create, start, complete, and reopen on today; stop,
+pause, and `OPEN` ↔ `PLANNED` unchanged) no longer holds. Current rule: status
+is workflow, the row's `local_date` is scheduling intent, and a status-only
+transition never moves an existing dated row. See
+`docs/adr/0013-task-status-and-agenda-date.md`.
 
-| Event                                                | The task's row       |
-| ---------------------------------------------------- | -------------------- |
-| create                                               | **today**, appended  |
-| real complete or discard                             | **today**, appended  |
-| reopen (terminal → any open status)                  | **today**, appended  |
-| real start (`/start`, or `/move` → `IN_PROGRESS`)    | **today**, appended  |
-| stop, pause, reorder, `OPEN` ↔ `PLANNED`, title edit | unchanged            |
-| soft delete                                          | row **hard-deleted** |
+Two invariants still hold:
 
-Only a **real** transition moves a row. An idempotent re-complete, a re-start
-while already `IN_PROGRESS`, and a same-status drag are not transitions and
-move nothing. "Today" is always the server's civil today (below); "appended" is
-`max(sort_order) + 1` on today's pile, so arriving on today never reshuffles
-ranks already there.
-
-**Unfinished work never moves by itself.** There is no auto-skip, no `missed`
-status, no midnight rollover. A day the user did not finish stays exactly where
-it was until its work is completed, discarded, deleted, or swept with "Move all
-to today".
+- Only a **real** transition does placement work (insert a missing row or date
+  an undated one). An idempotent re-complete, a re-start while already
+  `IN_PROGRESS`, and a same-status drag are not transitions and do nothing.
+  "Today" is the server's civil today (below); "appended" is
+  `max(sort_order) + 1` on today's pile, so arriving on today never reshuffles
+  ranks already there.
+- **Unfinished work never moves by itself.** There is no auto-skip, no `missed`
+  status, no midnight rollover. A day the user did not finish stays exactly
+  where it was until its work is completed, discarded, deleted, or swept with
+  "Move all to today".
 
 ### Occurrences keep their rule date
 
@@ -129,7 +129,7 @@ what keeps a moved occurrence from re-attaching to its rule date.
 A row counts as pending when either:
 
 - it is a task item whose task is living with an open status —
-  `OPEN`, `PLANNED` or `IN_PROGRESS`; or
+  `OPEN`, `PLANNED`, `IN_PROGRESS` or `WAITING` (ADR 0011); or
 - it is an occurrence item whose status is `pending | in_progress` and whose
   routine is living.
 
@@ -161,7 +161,9 @@ move-to-today sweep — not a column and not a fifth task status.
 when a living routine's rule covers the window. Bound rules:
 
 - `from` / `to` are inclusive, `to >= from`, span at most **31 days**.
-- **Both omitted → the anchor week:** `anchor_date … anchor_date + 6`.
+- **Both omitted → the amended default read:** `anchor_date … today + 6`
+  inclusive plus the `backlog` array (ADR 0007, ADR 0010, ADR 0013). The
+  original anchor week (`anchor_date … anchor_date + 6`) no longer applies.
 - Exactly one supplied → 400.
 
 The response carries `items` (ordered by `local_date`, then `sort_order`, then
@@ -175,7 +177,9 @@ The response carries `items` (ordered by `local_date`, then `sort_order`, then
 | `earliest_date` | `MIN(local_date)` over every row, else today — the browser's back-scroll floor |
 
 `POST /api/agenda/items` and `DELETE /api/agenda/items/:id` are **removed**. A
-task leaves the agenda by being completed, discarded, or deleted — nothing else.
+task leaves the agenda only when it is soft-deleted (the row is hard-deleted).
+Completing or discarding keeps the last row as history; there is no manual
+add/remove path. A rowless living task is repaired by the fill (ADR 0013).
 
 ### The fill
 
@@ -200,11 +204,12 @@ backfilled into the past.
 - **Untouched** means the row is still `pending`, with no title override, no
   Google chip, and not rescheduled (its agenda row still sits on its rule date).
   Anything the user has acted on survives a reconcile.
-- Open tasks with no row are **backfilled onto today in board order**:
-  `IN_PROGRESS`, then `PLANNED`, then `OPEN` (each by `tasks.sort_order`, ties by
-  id), appended after today's existing ranks. This is the migration backfill and
-  the self-healing path; the task lifecycle hooks maintain the single row on the
-  normal path.
+- Task rows are maintained by the lifecycle hooks and the fill, not by the
+  read. The fill inserts a row for a rowless living task using its status
+  default: `OPEN`/`PLANNED` on the backlog sentinel, `IN_PROGRESS`/`WAITING`
+  on today, appended in board order (`tasks.sort_order`, ties by id). It
+  never moves a dated task row (ADR 0013). This is the self-healing path; the
+  task lifecycle hooks maintain the single row on the normal path.
 - **The read path never inserts.** A failed fill leaves gaps until the next tick;
   no GET repairs them.
 

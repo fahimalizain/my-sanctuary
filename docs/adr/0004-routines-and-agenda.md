@@ -5,8 +5,11 @@ Date: 2026-08-23
 
 > Superseded in part by ADR 0006 (2026-10-17): the agenda is a stream of
 > days. Seed-on-read, many agenda rows per task, the date-scoped Home, and
-> the add/unpin endpoints no longer hold. See
-> `docs/adr/0006-agenda-stream.md`.
+> the add/unpin endpoints no longer hold. Task status and agenda date were
+> later decoupled by ADR 0013 (2026-11-20): a task's status is workflow and
+> its row's `local_date` is scheduling intent. See
+> `docs/adr/0006-agenda-stream.md` and
+> `docs/adr/0013-task-status-and-agenda-date.md`.
 
 > Amendment (2026-08-25): a dedicated **pause** verb joins the occurrence
 > matrix: `POST /api/occurrences/:id/pause`. `in_progress` → `pending` after
