@@ -10,7 +10,9 @@
 // through the Board's own same-status `reorder_in_place` (the hovered rank in
 // both directions, peers shifted), a backlog drop appends the row at today+50y,
 // and an unschedule parks a dated PLANNED row on the sentinel with no status
-// change while a plan appends it to the Planned stretch.
+// change. Status and date are decoupled: a plan (OPEN -> PLANNED) keeps a dated
+// row on its day and only re-inserts an undated/warehoused row into the Planned
+// stretch, and `placeUndatedTaskOnToday` dates only an undated row on today.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -47,6 +49,7 @@ import {
   moveStreamItem,
   openTaskMoveTargetAt,
   partitionAgendaItems,
+  placeUndatedTaskOnToday,
   planOpenItem,
   PLANNED_DROPPABLE_ID,
   previousHistoryWindow,
@@ -1123,7 +1126,7 @@ test('unscheduleItem: a row outside both warehouses survives the rebuild', () =>
   );
 });
 
-test('planOpenItem: a dated OPEN row appends to Planned and leaves its day', () => {
+test('planOpenItem: a dated OPEN row stays on its day with only the embed updated', () => {
   const dated = taskItemAt('o', 'OPEN', '2026-08-25', 2);
   dated.sort_order = 6;
   // The Planned column already holds rank 4 → the mover appends at max + 1,
@@ -1138,20 +1141,24 @@ test('planOpenItem: a dated OPEN row appends to Planned and leaves its day', () 
     ],
     pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
   };
-  const next = planOpenItem(data, 'o', BACKLOG_DATE, TODAY);
+  const next = planOpenItem(data, 'o', TODAY);
   const page0 = next?.pages[0];
   assert.deepEqual(
     page0?.items.map((entry) => entry.id),
-    ['x'],
-    'a dated row leaves the day stream for the warehouse',
+    ['o', 'x'],
+    'a dated row keeps its place on the day',
   );
   assert.deepEqual(
     page0?.backlog.map((entry) => entry.id),
-    ['p', 'o', 'b'],
-    'end of the Planned stretch, before Open',
+    ['p', 'b'],
+    'the warehouses are untouched',
   );
-  const moved = page0?.backlog[1];
-  assert.equal(moved?.local_date, BACKLOG_DATE, 'the sentinel, never today');
+  const moved = page0?.items[0];
+  assert.equal(
+    moved?.local_date,
+    '2026-08-25',
+    'the date is scheduling intent',
+  );
   assert.equal(moved?.task?.status, 'PLANNED');
   assert.equal(moved?.task?.sort_order, 5, 'append = max(4) + 1');
   assert.equal(moved?.sort_order, 6, 'the agenda rank is untouched');
@@ -1172,7 +1179,7 @@ test('planOpenItem: an OPEN warehouse row keeps its own sentinel and still appen
     ],
     pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
   };
-  const next = planOpenItem(data, 's', BACKLOG_DATE, TODAY);
+  const next = planOpenItem(data, 's', TODAY);
   const page0 = next?.pages[0];
   assert.deepEqual(
     page0?.backlog.map((entry) => entry.id),
@@ -1195,25 +1202,116 @@ test('planOpenItem: only an OPEN task is planned; a missing id keeps the referen
     ],
     pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
   };
-  assert.equal(planOpenItem(data, 'p', BACKLOG_DATE, TODAY), data);
-  assert.equal(planOpenItem(data, 'orphan', BACKLOG_DATE, TODAY), data);
-  assert.equal(planOpenItem(data, 'missing', BACKLOG_DATE, TODAY), data);
-  assert.equal(planOpenItem(undefined, 'a', BACKLOG_DATE, TODAY), undefined);
+  assert.equal(planOpenItem(data, 'p', TODAY), data);
+  assert.equal(planOpenItem(data, 'orphan', TODAY), data);
+  assert.equal(planOpenItem(data, 'missing', TODAY), data);
+  assert.equal(planOpenItem(undefined, 'a', TODAY), undefined);
 });
 
 test('planOpenItem: a row outside both warehouses survives the rebuild', () => {
-  const dated = taskItemAt('o', 'OPEN', '2026-08-25', 2);
+  const warehoused = taskItemAt('o', 'OPEN', BACKLOG_DATE, 2);
   const stale = taskItemAt('r', 'IN_PROGRESS', HORIZON, 0);
   const data = {
-    pages: [page('2026-08-23', '2026-08-29', [dated], { backlog: [stale] })],
+    pages: [
+      page('2026-08-23', '2026-08-29', [], { backlog: [stale, warehoused] }),
+    ],
     pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
   };
-  const next = planOpenItem(data, 'o', BACKLOG_DATE, TODAY);
+  const next = planOpenItem(data, 'o', TODAY);
   assert.deepEqual(
     next?.pages[0].backlog.map((entry) => entry.id),
     ['r', 'o'],
     'the stale row stays, the plan joins the Planned stretch',
   );
+});
+
+test('planOpenItem: a malformed today leaves an undated row where it is', () => {
+  const sentinel = taskItemAt('s', 'OPEN', BACKLOG_DATE, 2);
+  const data = {
+    pages: [page('2026-08-23', '2026-08-29', [], { backlog: [sentinel] })],
+    pageParams: storedParams({ from: '2026-08-23', to: '2026-08-29' }),
+  };
+  const next = planOpenItem(data, 's', '2026-13-01');
+  const moved = next?.pages[0].backlog[0];
+  assert.equal(moved?.local_date, BACKLOG_DATE, 'the date is unknowable');
+  assert.equal(moved?.task?.status, 'PLANNED');
+});
+
+// ── placeUndatedTaskOnToday ─────────────────────────────────────────────
+
+test('placeUndatedTaskOnToday: a sentinel row moves to today appended', () => {
+  const sentinel = taskItemAt('a', 'OPEN', BACKLOG_DATE, 2);
+  const todayPeer = taskItemAt('b', 'OPEN', TODAY, 3);
+  const data = {
+    pages: [page(TODAY, '2026-08-29', [todayPeer], { backlog: [sentinel] })],
+    pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
+  };
+  const next = placeUndatedTaskOnToday(data, 'a', TODAY, (entry) =>
+    entry.task
+      ? { ...entry, task: { ...entry.task, status: 'IN_PROGRESS' } }
+      : entry,
+  );
+  const page0 = next?.pages[0];
+  assert.deepEqual(
+    page0?.items.map((entry) => entry.id),
+    ['b', 'a'],
+    'the row joins today at the end of the pile',
+  );
+  assert.deepEqual(page0?.backlog, [], 'the warehouse no longer holds it');
+  const landed = page0?.items[1];
+  assert.equal(landed?.local_date, TODAY);
+  assert.equal(landed?.sort_order, 4, 'appended = max(3) + 1');
+  assert.equal(landed?.task?.status, 'IN_PROGRESS', 'the embed flip is kept');
+});
+
+test('placeUndatedTaskOnToday: a dated row keeps its day and rank', () => {
+  // Today, a past day and a future day are all DATED: status moves never
+  // re-date the user's scheduling intent.
+  for (const date of [TODAY, '2026-08-20', '2026-08-25']) {
+    const row = taskItemAt('a', 'OPEN', date, 5);
+    const data = {
+      pages: [page('2026-08-16', '2026-08-29', [row])],
+      pageParams: storedParams({ from: '2026-08-16', to: '2026-08-29' }),
+    };
+    const next = placeUndatedTaskOnToday(data, 'a', TODAY, (entry) =>
+      entry.task
+        ? { ...entry, task: { ...entry.task, status: 'IN_PROGRESS' } }
+        : entry,
+    );
+    const landed = streamItemsOf(next).find((entry) => entry.id === 'a');
+    assert.equal(landed?.local_date, date, `${date} stays put`);
+    assert.equal(landed?.sort_order, 5, 'no invented append');
+    assert.equal(landed?.task?.status, 'IN_PROGRESS');
+  }
+});
+
+test('placeUndatedTaskOnToday: a missing id (or no data) keeps the reference', () => {
+  const data = {
+    pages: [page(TODAY, '2026-08-29', [item('a', 0)])],
+    pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
+  };
+  const identity = (entry: AgendaItemRecord) => entry;
+  assert.equal(placeUndatedTaskOnToday(data, 'missing', TODAY, identity), data);
+  assert.equal(
+    placeUndatedTaskOnToday(undefined, 'a', TODAY, identity),
+    undefined,
+  );
+});
+
+test('placeUndatedTaskOnToday: an invalid today leaves the date alone', () => {
+  const sentinel = taskItemAt('a', 'OPEN', BACKLOG_DATE, 2);
+  const data = {
+    pages: [page(TODAY, '2026-08-29', [], { backlog: [sentinel] })],
+    pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
+  };
+  const next = placeUndatedTaskOnToday(data, 'a', '', (entry) =>
+    entry.task
+      ? { ...entry, task: { ...entry.task, status: 'IN_PROGRESS' } }
+      : entry,
+  );
+  const landed = streamItemsOf(next).find((entry) => entry.id === 'a');
+  assert.equal(landed?.local_date, BACKLOG_DATE, 'the date is unknowable');
+  assert.equal(landed?.task?.status, 'IN_PROGRESS');
 });
 
 // ── appendRankOnStream / streamItemsOf / dedupeAgendaItems ──────────────
@@ -2330,11 +2428,11 @@ test('runAgendaWriteFlow: no second write is one successful write', async () => 
   assert.deepEqual(calls, ['first', 'first-success']);
 });
 
-test('restoreHandedOffRow: the row returns to today appended', () => {
-  const future = taskItemAt('a', 'WAITING', '2026-08-25', 0);
+test('restoreHandedOffRow: a sentinel WAITING row returns to today appended', () => {
+  const sentinel = taskItemAt('a', 'WAITING', BACKLOG_DATE, 0);
   const todayPeer = taskItemAt('b', 'OPEN', TODAY, 3);
   const data = {
-    pages: [page(TODAY, '2026-08-29', [todayPeer, future])],
+    pages: [page(TODAY, '2026-08-29', [todayPeer], { backlog: [sentinel] })],
     pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
   };
   const fresh = task('a', 'WAITING', 'Handed off');
@@ -2343,6 +2441,22 @@ test('restoreHandedOffRow: the row returns to today appended', () => {
   assert.equal(landed?.local_date, TODAY);
   assert.equal(landed?.sort_order, 4, 'appended after the today pile');
   assert.equal(landed?.task, fresh, 'the hand-off task embed is kept');
+});
+
+test('restoreHandedOffRow: a future dated WAITING row stays future', () => {
+  // A dated row is scheduling intent: the hand-off transition preserves it,
+  // so the second-write repair must not drag it onto today.
+  const future = taskItemAt('a', 'WAITING', '2026-08-25', 0);
+  const data = {
+    pages: [page(TODAY, '2026-08-29', [future])],
+    pageParams: storedParams({ from: TODAY, to: '2026-08-29' }),
+  };
+  const fresh = task('a', 'WAITING', 'Handed off');
+  const next = restoreHandedOffRow(data, 'a', TODAY, fresh);
+  const landed = streamItemsOf(next).find((entry) => entry.id === 'a');
+  assert.equal(landed?.local_date, '2026-08-25', 'the day is untouched');
+  assert.equal(landed?.sort_order, 0, 'no invented append');
+  assert.equal(landed?.task, fresh);
 });
 
 test('restoreHandedOffRow: a row already on today keeps its rank', () => {

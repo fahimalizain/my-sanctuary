@@ -67,17 +67,18 @@ export function setTasksCache(
 // would fight applyOptimisticMove's sibling-rank contract, so it is never
 // used here.
 //
-// `['agenda']` is a different story: a task's ONE agenda row follows the
-// task's status (ADR 0007), so Home's day-stream must re-read after every
-// write that can move it — the page's optimistic paint cannot know which way
-// the row travelled. Create, unplan (`/stop`, a Board drag to Open, or a
-// reopen to `OPEN`) park the row on the **backlog date** (today+50y); reopen
-// to `PLANNED`, start, complete and discard put it on civil today. Plan
-// (`OPEN → PLANNED`) is the ADR 0010 exception: it parks the row on the
-// backlog sentinel too (unless the row already sits at/after the 10-year
-// horizon), because planning a task must never invent a civil day the user
-// did not choose. `/pause` alone leaves the row where it is, so its re-read is
-// redundant — never wrong.
+// `['agenda']` is a different story: a task's ONE agenda row carries its
+// scheduling intent, while the task's status is workflow (status/dates are
+// decoupled). A status-only transition never moves a DATED row
+// (`local_date < today+10y`); it dates only an UNDATED/warehoused row on civil
+// today — except targets OPEN and PLANNED, which leave an undated row undated.
+// A transition that finds no row inserts its status default: OPEN/PLANNED on
+// the **backlog date** (today+50y), every other target on civil today. Explicit
+// date actions (`/reschedule`) still retarget the row, so Home's day-stream
+// must re-read after every write that can place it: create, unplan (`/stop`, a
+// Board drag to Open), start, complete, plan, discard, reopen and hand-off.
+// `/pause` alone changes no date and no row, so its re-read is redundant —
+// never wrong.
 // ──────────────────────────────────────────
 
 async function cancelTasksQuery(): Promise<void> {

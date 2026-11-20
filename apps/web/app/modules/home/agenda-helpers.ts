@@ -676,19 +676,26 @@ export function unscheduleItem(
 /** The optimistic mirror of a **plan** (`POST /api/tasks/:id/move {
  *  status: 'PLANNED' }` with no rank, ADR 0010): an `OPEN` task becomes
  *  `PLANNED` with the appended Planned-column rank (`max + 1` over every other
- *  `PLANNED` embed in the loaded cache, else 0) and its one agenda row parks in
- *  the Planned warehouse instead of on civil today. A row already at/after the
- *  horizon is left where it is — sentinel and exact-horizon parking are both
- *  valid, and the server does not retarget them — so even its agenda
- *  `sort_order` is untouched; a row below the horizon takes `sentinelDate`.
- *  The row leaves every page's `items` and `backlog` and lands at the END of
- *  the Planned stretch of the greatest-`to` page (dated ++ planned ++ open).
- *  Anything that is not an `OPEN` task (an already-planned row, an occurrence,
- *  an orphan) returns the same reference, as does a missing id. */
+ *  `PLANNED` embed in the loaded cache, else 0).
+ *
+ *  The plan is a status-only transition, so the row's `local_date` and agenda
+ *  `sort_order` are the user's scheduling intent and are left byte-for-byte
+ *  alone:
+ *  - a **dated** row (`local_date` below the 10-year horizon) stays exactly
+ *    where it is — in its page's `items` (or the dated backlog stretch) — and
+ *    only its task embed flips status and takes the appended Planned rank;
+ *  - an **undated/warehoused** row keeps its own date (sentinel and
+ *    exact-horizon parking are both valid) and is re-inserted into the END of
+ *    the Planned stretch of the greatest-`to` page (dated ++ planned ++ open),
+ *    because its Board rank space just changed.
+ *
+ *  A malformed/absent `today` cannot prove the row is warehoused, so the row
+ *  stays where it is. Anything that is not an `OPEN` task (an already-planned
+ *  row, an occurrence, an orphan) returns the same reference, as does a missing
+ *  id. */
 export function planOpenItem(
   data: AgendaStreamData | undefined,
   id: string,
-  sentinelDate: string,
   today: string,
 ): AgendaStreamData | undefined {
   if (!data || data.pages.length === 0) return data;
@@ -705,12 +712,14 @@ export function planOpenItem(
     (rank, value) => Math.max(rank, value + 1),
     0,
   );
-  const warehoused = !!horizon && item.local_date >= horizon;
   const moved: AgendaItemRecord = {
     ...item,
-    local_date: warehoused ? item.local_date : sentinelDate,
     task: { ...item.task, status: 'PLANNED', sort_order: appendRank },
   };
+  if (!horizon || item.local_date < horizon) {
+    // Dated (or unknowable): only the embed changes, the row stays put.
+    return updateStreamItem(data, id, () => moved);
+  }
   const target = data.pages.reduce((best, page) =>
     page.to > best.to ? page : best,
   );
@@ -1105,7 +1114,9 @@ export interface ResolveAgendaDropInput {
  *  - a waiting row dropped in another day's Waiting section only reschedules;
  *  - a waiting row reordered inside its section uses the waiting rows' agenda
  *    ranks;
- *  - waiting → Planned/Backlog shelves through the Board's status move;
+ *  - waiting → Planned/Backlog changes status through the Board's `/move`,
+ *    followed by the explicit date action that shelves the row (the status
+ *    move alone preserves a dated row);
  *  - past days never accept a drop, but same-day reorder inside a past day
  *    still works (the agenda `/move` has no date floor). */
 export function resolveAgendaDrop({
@@ -1339,8 +1350,8 @@ export function resolveAgendaDrop({
 }
 
 /** The append rank on `date`'s pile — the server's `max + 1`, else 0. Used by
- *  HomePage for the optimistic mirror of `place_task_on_today` and of a
- *  reschedule that omits `sort_order`. */
+ *  HomePage for the optimistic mirror of dating an undated task on today and of
+ *  a reschedule that omits `sort_order`. */
 export function appendRankOnStream(
   data: AgendaStreamData | undefined,
   date: string,
@@ -1352,22 +1363,45 @@ export function appendRankOnStream(
   );
 }
 
+/** The optimistic mirror of the server's **date an undated task on today**
+ *  rule (`date_undated_task_on_today`): the status flip happens either way (the
+ *  embed is mapped through `fn`), but the row only travels to `today` — appended
+ *  at the pile's end — when its date is **undated/warehoused**
+ *  (`local_date >= today+10y`). A **dated** row is the user's scheduling
+ *  intent: a status-only transition never moves it, so it keeps its date and
+ *  rank. A row already on `today` keeps its rank too (the server's placement is
+ *  a no-op there), and a missing/invalid `today` cannot prove the row is
+ *  undated, so it is left where it is. Returns the same reference when `data`
+ *  is missing or no row carries `id`. */
+export function placeUndatedTaskOnToday(
+  data: AgendaStreamData | undefined,
+  id: string,
+  today: string,
+  fn: (item: AgendaItemRecord) => AgendaItemRecord,
+): AgendaStreamData | undefined {
+  const updated = updateStreamItem(data, id, fn);
+  if (!updated || !today || !isCivilDateValid(today)) return updated;
+  const row = streamItemsOf(updated).find((entry) => entry.id === id);
+  if (!row || row.local_date < addMonthsClamp(today, 120)) return updated;
+  return moveStreamItem(updated, id, today, appendRankOnStream(updated, today));
+}
+
 /** The server's hand-off placement as a cache repair: the row carries the
- *  fresh task embed and, when it was not already on `today`, travels there
- *  appended (ADR 0011 rule 2). The second-write failure path uses this on the
- *  PRE-hand-off snapshot so the cache never keeps a date the server refused. */
+ *  fresh task embed and, when it was **undated** (at/after the 10-year
+ *  horizon), travels to `today` appended. A dated row stays on its own day —
+ *  the hand-off transition preserves the date (ADR 0011 rule 2 amended by the
+ *  status/date decoupling) — and a malformed/absent `today` leaves it there
+ *  too. The second-write failure path uses this on the PRE-hand-off snapshot so
+ *  the cache never keeps a date the server refused. */
 export function restoreHandedOffRow(
   data: AgendaStreamData | undefined,
   id: string,
   today: string,
   task: TaskRecord,
 ): AgendaStreamData | undefined {
-  const updated = updateStreamItem(data, id, (entry) =>
+  return placeUndatedTaskOnToday(data, id, today, (entry) =>
     entry.task ? { ...entry, task } : entry,
   );
-  const row = streamItemsOf(updated).find((entry) => entry.id === id);
-  if (!row || !today || row.local_date === today) return updated;
-  return moveStreamItem(updated, id, today, appendRankOnStream(updated, today));
 }
 
 /** Runs one agenda drop's write sequence: `first` always runs; `second` (when
