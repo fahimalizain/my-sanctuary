@@ -146,7 +146,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         mutating(
             "move_task",
-            "Move a task to `status`: OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED. `id` and `status` are required. Rank is the server default. `PLANNED` does not schedule an undated task for today; it parks it in the Planned warehouse. Can discard or complete a task, and entering or leaving IN_PROGRESS writes Google. `WAITING` holds no calendar time; leaving `IN_PROGRESS` for `WAITING` closes the Google event.",
+            "Move a task to `status`: OPEN, PLANNED, IN_PROGRESS, WAITING, COMPLETED, or DISCARDED. `id` and `status` are required. Rank is the server default. Status moves preserve the task's agenda date; an undated task may get today's date when it becomes IN_PROGRESS, WAITING, COMPLETED, or DISCARDED. Change dates with `reschedule_agenda_item`. Entering or leaving IN_PROGRESS writes Google; `WAITING` holds no calendar time, and leaving IN_PROGRESS for WAITING closes the Google event.",
             json!({
                 "type": "object",
                 "properties": {
