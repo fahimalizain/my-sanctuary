@@ -128,10 +128,12 @@
 //! its target status default: `OPEN`/`PLANNED` the backlog sentinel (civil
 //! today + 50 years via [`crate::agenda::backlog_local_date`]),
 //! `IN_PROGRESS`/`WAITING`/`COMPLETED`/`DISCARDED` civil today (a
-//! terminal → `PLANNED` reopen dates a rowless task today too). An **undated**
-//! row is dated today only when the target is `IN_PROGRESS`, `WAITING`,
-//! `COMPLETED`, or `DISCARDED`; targets `OPEN` and `PLANNED` leave it
-//! undated. This is "dating an undated task", not moving a date — see
+//! terminal → `PLANNED` reopen dates a rowless or undated task today too).
+//! An **undated** row is dated today only when the target is
+//! `IN_PROGRESS`, `WAITING`, `COMPLETED`, or `DISCARDED`; targets `OPEN` and
+//! `PLANNED` leave it undated. Terminal → terminal never inserts or moves a
+//! row (ADR 0006: a terminal task needs no agenda row until reopened). This is
+//! "dating an undated task", not moving a date — see
 //! [`date_undated_task_on_today`] and
 //! [`ensure_task_row_on_backlog_if_missing`].
 //!
@@ -903,7 +905,9 @@ pub(crate) async fn place_task_on_backlog(
 /// byte-for-byte alone: no date change, no rank churn, no `updated_at` bump.
 /// A row at/after the horizon is **undated** (warehoused) and is dated today,
 /// appended; a missing row is inserted on today, appended. This is "dating an
-/// undated task", never moving a real date.
+/// undated task", never moving a real date. The writes are direct
+/// (`set_local_date` / `INSERT OR IGNORE`) — this helper never re-reads and
+/// relocates a row that another request changed in between.
 ///
 /// Used by every status transition whose target is `IN_PROGRESS`, `WAITING`,
 /// `COMPLETED`, or `DISCARDED`: start, a hand-off, complete/discard, reopen →
@@ -928,8 +932,28 @@ pub(crate) async fn date_undated_task_on_today(
             // never touch it.
             return Ok(());
         }
+        // Undated row: date it, but write the date directly instead of going
+        // through `place_task_on` (which re-reads and could relocate a row a
+        // racing request changed in between).
+        let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &today).await?);
+        agenda_repo
+            .set_local_date(&row.id, &today, sort_order)
+            .await?;
+        return Ok(());
     }
-    place_task_on(agenda_repo, user_id, task_id, &today).await
+    // No row: insert one on today. `insert` is `INSERT OR IGNORE`, so a racing
+    // duplicate returns the stored row and is never relocated.
+    let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &today).await?);
+    agenda_repo
+        .insert(NewAgendaItem {
+            user_id: user_id.to_string(),
+            local_date: today,
+            kind: AGENDA_KIND_TASK.to_string(),
+            ref_id: task_id.to_string(),
+            sort_order,
+        })
+        .await?;
+    Ok(())
 }
 
 /// Inserts the task's single agenda row on the **backlog date** when the task
@@ -940,6 +964,8 @@ pub(crate) async fn date_undated_task_on_today(
 /// for a rowless task landing in `OPEN` or `PLANNED`, whose status default is
 /// the warehouse. Deliberately **not** [`place_task_on_backlog`] directly:
 /// that primitive always retargets the sentinel and would move a dated row.
+/// The no-row path writes a direct `INSERT OR IGNORE` at the append rank, so a
+/// row that appeared concurrently is returned by the index and never moved.
 pub(crate) async fn ensure_task_row_on_backlog_if_missing(
     agenda_repo: &dyn AgendaItemRepo,
     calendars: &dyn CalendarRepo,
@@ -958,7 +984,20 @@ pub(crate) async fn ensure_task_row_on_backlog_if_missing(
         .await
         .map_err(placement_error)?;
     let backlog = backlog_local_date(&today).map_err(placement_error)?;
-    place_task_on(agenda_repo, user_id, task_id, &backlog).await
+    // Direct `INSERT OR IGNORE`: a racing duplicate returns the stored row and
+    // is never relocated. Never call `place_task_on` from this helper — it
+    // re-reads and would retarget an existing row.
+    let sort_order = append_rank(agenda_repo.max_sort_order(user_id, &backlog).await?);
+    agenda_repo
+        .insert(NewAgendaItem {
+            user_id: user_id.to_string(),
+            local_date: backlog,
+            kind: AGENDA_KIND_TASK.to_string(),
+            ref_id: task_id.to_string(),
+            sort_order,
+        })
+        .await?;
+    Ok(())
 }
 
 /// Plans a task onto the real day a reschedule targets (ADR 0007): the
@@ -1594,7 +1633,7 @@ pub async fn stop_task(
 /// (IN_PROGRESS → PLANNED) the task **prepends Planned** (rank 0 — peers
 /// shift up). Already PLANNED → no re-rank.
 ///
-/// Agenda (status/date decoupling): pause never moves the task's agenda row —
+/// Agenda (status/date decoupling): pause never moves an existing agenda row —
 /// a dated row keeps its date and rank, and an undated row stays undated
 /// (`PLANNED` is a warehouse target). Only a rowless task gets its status
 /// default row on the backlog sentinel.
@@ -2357,8 +2396,10 @@ fn require_google<'a>(
 ///
 /// Agenda (status/date decoupling): every arm preserves an existing **dated**
 /// row. `OPEN`/`PLANNED` targets insert the backlog sentinel only when the
-/// task has no row; `IN_PROGRESS`/`WAITING`/terminal targets date an
-/// **undated** row on today. No status-only leg retargets a real date.
+/// task has no row; `IN_PROGRESS`/`WAITING` targets date an **undated** row on
+/// today, and a terminal target does the same only when the source is living
+/// (terminal → terminal never places). No status-only leg retargets a real
+/// date.
 ///
 /// `http`/`access` are only consumed by the Google-touching arms; the
 /// session-only arms work with both `None` (see [`require_google`]).
@@ -2498,8 +2539,9 @@ async fn dispatch_matrix_action(
             if let Err(_) = placement {
                 // Best-effort: the status and the `reopened` log are already
                 // committed, so a 500 would only make the client retry a
-                // reopen that landed. The cron backfills a MISSING OR
-                // MISPLACED row.
+                // reopen that landed. The cron inserts a MISSING row and dates
+                // an undated IN_PROGRESS/WAITING row; it does not heal a
+                // terminal target, so a failed reopen placement stays stale.
             }
             Ok(None)
         }
@@ -2720,16 +2762,21 @@ async fn reorder_in_place(
 ///
 /// Agenda (status/date decoupling): a status move **never changes a dated
 /// agenda row's day or rank** — the row's `local_date` is scheduling intent,
-/// not a function of the status. A transition that finds an **undated** row
-/// dates it on civil today only when the target is `IN_PROGRESS`, `WAITING`,
-/// `COMPLETED`, or `DISCARDED`; targets `OPEN` and `PLANNED` leave it
-/// undated. A transition that finds **no row at all** inserts the target's
-/// status default: the backlog sentinel for `OPEN`/`PLANNED`, civil today for
-/// the other four (with one deliberate exception: terminal → `PLANNED` dates
-/// a rowless or undated task today). Plan, unplan, reopen, pause, stop,
-/// hand-off, and terminal → terminal all preserve an existing dated row.
-/// Explicit date changes go through the reschedule / backlog-drop helpers, not
-/// `/move`.
+/// not a function of the status.
+///
+/// - Living source (`OPEN`/`PLANNED`/`IN_PROGRESS`/`WAITING`): a missing row
+///   inserts the target's status default — the backlog sentinel for
+///   `OPEN`/`PLANNED`, civil today for the other four — and an undated row is
+///   dated today only for those four real-day targets.
+/// - Terminal source: reopen → `OPEN` inserts/keeps the warehouse sentinel;
+///   reopen → `PLANNED` dates a rowless or undated row today; a start or a
+///   hand-off to `WAITING` dates today. Terminal → terminal **never inserts or
+///   moves a row** (ADR 0006: a terminal task needs no agenda row until
+///   reopened).
+///
+/// Plan, unplan, reopen, pause, stop, and hand-off all preserve an existing
+/// dated row. Explicit date changes go through the reschedule / backlog-drop
+/// helpers, not `/move`.
 pub async fn move_task(
     http: Option<&dyn HttpClient>,
     calendars: &dyn CalendarRepo,
@@ -9902,17 +9949,10 @@ mod tests {
     fn move_in_progress_to_waiting_is_a_hand_off() {
         // The hand-off closes the running event through the pause path, writes
         // exactly one `handed_off` carrying the closed event's ids, clears
-        // focus (`unfocused` + pointer), and lands the row on civil today.
+        // focus (`unfocused` + pointer), and leaves the dated agenda row the
+        // start created exactly where it is.
         let (lists, categories, tasks, agenda, calendars) = seeded();
-        let peer = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
         let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
-        // A peer row on today's pile proves the append rank.
-        let peer_row = agenda
-            .rows("u-1")
-            .into_iter()
-            .find(|row| row.ref_id == peer.id)
-            .unwrap();
-        agenda.move_row(&peer_row.id, AGENDA_TODAY, 0);
         let (_start_http, calendars, events, logs) =
             start_running(&lists, &categories, &tasks, &agenda, &task.id);
         drop(_start_http);
@@ -10013,7 +10053,10 @@ mod tests {
 
         let rows = agenda.rows("u-1");
         let row = rows.iter().find(|row| row.ref_id == task.id).unwrap();
-        assert_eq!(row.local_date, AGENDA_TODAY, "status/date decoupling: the hand-off preserves the row's date");
+        assert_eq!(
+            row.local_date, AGENDA_TODAY,
+            "an undated row is dated today by the hand-off"
+        );
         assert_eq!(row.sort_order, 1, "appended after today's peer");
     }
 
@@ -10111,6 +10154,49 @@ mod tests {
             dropped_row.local_date, AGENDA_TODAY,
             "an undated row is dated today on hand-off"
         );
+    }
+
+    #[test]
+    fn rowless_open_and_terminal_tasks_hand_off_insert_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let open = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let terminal = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&terminal.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        agenda.stored.lock().unwrap().retain(|stored| {
+            stored.ref_id != open.id && stored.ref_id != terminal.id
+        });
+        assert!(agenda.rows("u-1").is_empty(), "rowless fixture");
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        for id in [&open.id, &terminal.id] {
+            let response = agenda_move_to(
+                &http, &calendars, &events, &lists, &categories, &tasks, &logs, &users, &agenda,
+                None, id, TASK_STATUS_WAITING, Some(0),
+            )
+            .unwrap();
+            assert_eq!(response.task.status, TASK_STATUS_WAITING);
+            assert!(response.event.is_none());
+        }
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "one inserted row per hand-off");
+        let open_row = rows.iter().find(|row| row.ref_id == open.id).unwrap();
+        assert_eq!(
+            open_row.local_date, AGENDA_TODAY,
+            "a rowless OPEN task handed off inserts today"
+        );
+        assert_eq!(open_row.sort_order, 0);
+        let terminal_row = rows.iter().find(|row| row.ref_id == terminal.id).unwrap();
+        assert_eq!(
+            terminal_row.local_date, AGENDA_TODAY,
+            "a rowless terminal task handed off inserts today"
+        );
+        assert_eq!(terminal_row.sort_order, 1);
     }
 
     #[test]
@@ -11272,8 +11358,10 @@ mod tests {
         );
         assert_eq!(rows[0].sort_order, 4, "and never reshuffles it");
 
-        // Idempotent second complete: the clock moved two days on, but the
-        // no-op returns before any placement — the row stays where it is.
+        // Idempotent second complete on an undated history row: the no-op
+        // returns before any placement, so the row stays on the sentinel. If
+        // the guard regressed, this would be moved onto today.
+        agenda.move_row(&row.id, AGENDA_BACKLOG, 0);
         pollster::block_on(complete_task(
             &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 2 * 86_400, &agenda,
@@ -11282,8 +11370,11 @@ mod tests {
         .unwrap();
         let rows = agenda.rows("u-1");
         assert_eq!(rows.len(), 1, "no extra row");
-        assert_eq!(rows[0].local_date, AGENDA_PAST, "the no-op never places");
-        assert_eq!(rows[0].sort_order, 4, "and never reshuffles");
+        assert_eq!(
+            rows[0].local_date, AGENDA_BACKLOG,
+            "the no-op leaves an undated history row undated"
+        );
+        assert_eq!(rows[0].sort_order, 0, "and never reshuffles");
     }
 
     #[test]
@@ -11337,6 +11428,51 @@ mod tests {
         let peer_row = rows.iter().find(|row| row.ref_id == peer.id).unwrap();
         assert_eq!(peer_row.local_date, AGENDA_TODAY);
         assert_eq!(peer_row.sort_order, 0, "the peer keeps its rank");
+    }
+
+    #[test]
+    fn rowless_living_tasks_complete_and_discard_insert_today() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let completed = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let discarded = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        agenda.stored.lock().unwrap().retain(|stored| {
+            stored.ref_id != completed.id && stored.ref_id != discarded.id
+        });
+        assert!(agenda.rows("u-1").is_empty(), "rowless fixture");
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        let http = FakeHttp::new(vec![]);
+
+        pollster::block_on(complete_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &completed.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+        pollster::block_on(discard_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+            &access(), "u-1", &discarded.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "one inserted row per living task");
+        let completed_row = rows.iter().find(|row| row.ref_id == completed.id).unwrap();
+        assert_eq!(
+            completed_row.local_date, AGENDA_TODAY,
+            "a rowless living task completed inserts today"
+        );
+        assert_eq!(completed_row.sort_order, 0);
+        let discarded_row = rows.iter().find(|row| row.ref_id == discarded.id).unwrap();
+        assert_eq!(
+            discarded_row.local_date, AGENDA_TODAY,
+            "a rowless living task discarded inserts today"
+        );
+        assert_eq!(discarded_row.sort_order, 1);
     }
 
     #[test]
@@ -11500,6 +11636,69 @@ mod tests {
             inserted.local_date, AGENDA_BACKLOG,
             "reopen → OPEN inserts the backlog sentinel for a rowless task"
         );
+    }
+
+    #[test]
+    fn reopen_rowless_planned_dates_today_and_undated_open_stays_undated() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let rowless = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let undated = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // `rowless` loses its row; `undated` keeps create's sentinel row.
+        let rowless_row = agenda
+            .rows("u-1")
+            .into_iter()
+            .find(|row| row.ref_id == rowless.id)
+            .unwrap();
+        agenda
+            .stored
+            .lock()
+            .unwrap()
+            .retain(|stored| stored.id != rowless_row.id);
+        pollster::block_on(tasks.set_status(&rowless.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_status(&undated.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &rowless.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_PLANNED.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+        pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &undated.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_OPEN.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "one row per task after both reopens");
+        let rowless_row = rows.iter().find(|row| row.ref_id == rowless.id).unwrap();
+        assert_eq!(
+            rowless_row.local_date, AGENDA_TODAY,
+            "reopen → PLANNED dates a rowless task today"
+        );
+        assert_eq!(rowless_row.sort_order, 0);
+        let undated_row = rows.iter().find(|row| row.ref_id == undated.id).unwrap();
+        assert_eq!(
+            undated_row.local_date, AGENDA_BACKLOG,
+            "reopen → OPEN leaves an undated row undated"
+        );
+        assert_eq!(undated_row.sort_order, 1, "and never reshuffles it");
     }
 
     #[test]
@@ -11736,6 +11935,62 @@ mod tests {
             "start dates an undated row on today"
         );
         assert_eq!(rows[0].sort_order, 0, "today's pile was empty → rank 0");
+    }
+
+    #[test]
+    fn start_on_a_completed_task_keeps_a_dated_row_and_dates_an_undated_one() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let dated = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let undated = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&dated.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        pollster::block_on(tasks.set_status(&undated.id, TASK_STATUS_COMPLETED, NOW)).unwrap();
+        let rows = agenda.rows("u-1");
+        let dated_row = rows.iter().find(|row| row.ref_id == dated.id).unwrap();
+        let undated_row = rows.iter().find(|row| row.ref_id == undated.id).unwrap();
+        agenda.move_row(&dated_row.id, AGENDA_PAST, 4);
+        // `undated` keeps create's backlog-sentinel row (rank 1).
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&dated.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &dated.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+        let http = FakeHttp::new(vec![(
+            "/events",
+            200,
+            &created_event_json(&undated.id, NOW_SNAPPED, NOW_END),
+        )]);
+        pollster::block_on(start_task(
+            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+            &access(), "u-1", &undated.id, AGENDA_NOW_UNIX, &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "one row per task");
+        let dated_row = rows.iter().find(|row| row.ref_id == dated.id).unwrap();
+        assert_eq!(
+            dated_row.local_date, AGENDA_PAST,
+            "starting a COMPLETED task keeps its dated history row"
+        );
+        assert_eq!(dated_row.sort_order, 4);
+        let undated_row = rows.iter().find(|row| row.ref_id == undated.id).unwrap();
+        assert_eq!(
+            undated_row.local_date, AGENDA_TODAY,
+            "starting a COMPLETED task dates its undated row today"
+        );
+        assert_eq!(undated_row.sort_order, 0);
     }
 
     #[test]
@@ -12018,6 +12273,46 @@ mod tests {
     }
 
     #[test]
+    fn unplan_from_a_missing_row_inserts_the_backlog_sentinel() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_PLANNED, NOW)).unwrap();
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda
+            .stored
+            .lock()
+            .unwrap()
+            .retain(|stored| stored.id != row.id);
+        assert!(agenda.rows("u-1").is_empty(), "rowless fixture");
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+
+        pollster::block_on(move_task(
+            None, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs, &users,
+            None, "u-1", &task.id, AGENDA_NOW_UNIX,
+            &MoveTaskInput {
+                status: TASK_STATUS_OPEN.to_string(),
+                sort_order: Some(0),
+            },
+            &agenda,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 1, "one row per living task");
+        assert_eq!(rows[0].ref_id, task.id);
+        assert_eq!(
+            rows[0].local_date, AGENDA_BACKLOG,
+            "rowless PLANNED → OPEN inserts the backlog sentinel"
+        );
+        assert_eq!(rows[0].sort_order, 0);
+    }
+
+    #[test]
     fn stop_preserves_the_dated_row_it_started_on() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
         let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
@@ -12063,53 +12358,42 @@ mod tests {
     }
 
     #[test]
-    fn stop_while_already_open_does_not_move_the_agenda_row() {
+    fn stop_while_already_open_never_inserts_an_agenda_row() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
         let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        // The already-OPEN stop is not a status transition: with no row at
+        // all, it must not insert one (only a real transition supplies the
+        // status default).
+        let row = agenda.rows("u-1").pop().unwrap();
+        agenda
+            .stored
+            .lock()
+            .unwrap()
+            .retain(|stored| stored.id != row.id);
+        assert!(agenda.rows("u-1").is_empty(), "rowless fixture");
+
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
         let users = FakeUserRepo::default();
-        let http = FakeHttp::new(vec![(
-            "/events",
-            200,
-            &created_event_json(&task.id, NOW_SNAPPED, NOW_END),
-        )]);
-        pollster::block_on(start_task(
-            &http, &calendars, &events, &ops(), &lists, &categories, &tasks, &logs,
+        let http = FakeHttp::new(vec![]);
+
+        let response = pollster::block_on(stop_task(
+            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
             &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
             noop_notify(),
         ))
         .unwrap();
-        let patch = FakeHttp::new(vec![(
-            "/events/g-1",
-            200,
-            &patched_event_json(&task.id, NOW_SNAPPED, "2026-08-23T10:05:00Z"),
-        )]);
-        pollster::block_on(stop_task(
-            &patch, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 300, &agenda,
-            noop_notify(),
-        ))
-        .unwrap();
-        let row = agenda.rows("u-1").pop().unwrap();
-        assert_eq!(row.local_date, AGENDA_TODAY, "the real stop kept today's row");
-
-        // Park the row somewhere else, then stop the already-OPEN task again:
-        // the 200 still rewrites status and logs `stopped`, but moves nothing.
-        agenda.move_row(&row.id, AGENDA_FUTURE, 3);
-        let response = pollster::block_on(stop_task(
-            &patch, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, AGENDA_NOW_UNIX + 600, &agenda,
-            noop_notify(),
-        ))
-        .unwrap();
         assert_eq!(response.task.status, TASK_STATUS_OPEN);
+        assert!(response.event.is_none(), "no running event to close");
+        let inserted = logs.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 1, "the idempotent stop still logs");
+        assert_eq!(inserted[0].r#type, TASK_LOG_STOPPED);
 
-        let rows = agenda.rows("u-1");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].local_date, AGENDA_FUTURE, "an already-OPEN stop never places");
-        assert_eq!(rows[0].sort_order, 3, "and never reshuffles");
+        assert!(
+            agenda.rows("u-1").is_empty(),
+            "an already-OPEN stop never inserts a status-default row"
+        );
     }
 
     #[test]
@@ -12214,6 +12498,52 @@ mod tests {
     }
 
     #[test]
+    fn raw_pause_from_open_and_waiting_preserves_a_dated_row() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let open = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let waiting = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&waiting.id, TASK_STATUS_WAITING, NOW)).unwrap();
+        let rows = agenda.rows("u-1");
+        let open_row = rows.iter().find(|row| row.ref_id == open.id).unwrap();
+        let waiting_row = rows.iter().find(|row| row.ref_id == waiting.id).unwrap();
+        agenda.move_row(&open_row.id, AGENDA_FUTURE, 3);
+        agenda.move_row(&waiting_row.id, AGENDA_PAST, 5);
+
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+        let logs = FakeTaskLogRepo::default();
+        let users = FakeUserRepo::default();
+        // No started log → no Google PATCH; both pauses are status-only.
+        let http = FakeHttp::new(vec![]);
+
+        for id in [&open.id, &waiting.id] {
+            let response = pollster::block_on(pause_task(
+                &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+                &access(), "u-1", id, AGENDA_NOW_UNIX, &agenda,
+                noop_notify(),
+            ))
+            .unwrap();
+            assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+            assert!(response.event.is_none(), "no running event to close");
+        }
+
+        let rows = agenda.rows("u-1");
+        assert_eq!(rows.len(), 2, "one row per task");
+        let open_row = rows.iter().find(|row| row.ref_id == open.id).unwrap();
+        assert_eq!(
+            open_row.local_date, AGENDA_FUTURE,
+            "raw /pause from OPEN preserves the date"
+        );
+        assert_eq!(open_row.sort_order, 3);
+        let waiting_row = rows.iter().find(|row| row.ref_id == waiting.id).unwrap();
+        assert_eq!(
+            waiting_row.local_date, AGENDA_PAST,
+            "raw /pause from WAITING preserves the date"
+        );
+        assert_eq!(waiting_row.sort_order, 5);
+    }
+
+    #[test]
     fn pause_never_places_the_agenda_row() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
         let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
@@ -12257,40 +12587,48 @@ mod tests {
     }
 
     #[test]
-    fn pause_from_a_rowless_task_inserts_the_backlog_sentinel() {
+    fn raw_pause_from_a_rowless_open_or_waiting_task_inserts_the_backlog_sentinel() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
-        let task = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
-        let row = agenda.rows("u-1").pop().unwrap();
-        // Simulate the one-row invariant's gap: the task has no agenda row.
-        agenda
-            .stored
-            .lock()
-            .unwrap()
-            .retain(|stored| stored.id != row.id);
-        pollster::block_on(tasks.set_status(&task.id, TASK_STATUS_IN_PROGRESS, NOW)).unwrap();
+        let open = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        let waiting = agenda_task(&lists, &categories, &tasks, &agenda, &calendars);
+        pollster::block_on(tasks.set_status(&waiting.id, TASK_STATUS_WAITING, NOW)).unwrap();
+        // Simulate the one-row invariant's gap: both tasks are rowless.
+        agenda.stored.lock().unwrap().retain(|stored| {
+            stored.ref_id != open.id && stored.ref_id != waiting.id
+        });
+        assert!(agenda.rows("u-1").is_empty(), "rowless fixture");
 
         let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
         let events = FakeEventRepo::new();
         let logs = FakeTaskLogRepo::default();
         let users = FakeUserRepo::default();
-        // No started log → no Google PATCH; the pause is status-only.
+        // No started log → no Google PATCH; the pauses are status-only.
         let http = FakeHttp::new(vec![]);
 
-        let response = pollster::block_on(pause_task(
-            &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
-            &access(), "u-1", &task.id, AGENDA_NOW_UNIX, &agenda,
-            noop_notify(),
-        ))
-        .unwrap();
-        assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        for id in [&open.id, &waiting.id] {
+            let response = pollster::block_on(pause_task(
+                &http, &calendars, &events, &ops(), &categories, &tasks, &logs, &users,
+                &access(), "u-1", id, AGENDA_NOW_UNIX, &agenda,
+                noop_notify(),
+            ))
+            .unwrap();
+            assert_eq!(response.task.status, TASK_STATUS_PLANNED);
+        }
 
         let rows = agenda.rows("u-1");
-        assert_eq!(rows.len(), 1, "the invariant is restored with one row");
-        assert_eq!(rows[0].ref_id, task.id);
+        assert_eq!(rows.len(), 2, "one row per living task");
+        let open_row = rows.iter().find(|row| row.ref_id == open.id).unwrap();
         assert_eq!(
-            rows[0].local_date, AGENDA_BACKLOG,
-            "PLANNED's default for a rowless task is the backlog sentinel"
+            open_row.local_date, AGENDA_BACKLOG,
+            "PLANNED's default for a rowless OPEN task is the backlog sentinel"
         );
+        assert_eq!(open_row.sort_order, 0);
+        let waiting_row = rows.iter().find(|row| row.ref_id == waiting.id).unwrap();
+        assert_eq!(
+            waiting_row.local_date, AGENDA_BACKLOG,
+            "PLANNED's default for a rowless WAITING task is the backlog sentinel"
+        );
+        assert_eq!(waiting_row.sort_order, 1);
     }
 
     #[test]
