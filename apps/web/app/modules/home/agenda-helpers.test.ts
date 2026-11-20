@@ -51,6 +51,7 @@ import {
   partitionAgendaItems,
   placeUndatedTaskOnToday,
   planOpenItem,
+  planWaitingToDateSecondWrite,
   PLANNED_DROPPABLE_ID,
   previousHistoryWindow,
   replaceCachedTask,
@@ -2426,6 +2427,37 @@ test('runAgendaWriteFlow: no second write is one successful write', async () => 
   });
   assert.equal(result, 'ok');
   assert.deepEqual(calls, ['first', 'first-success']);
+});
+
+// ── planWaitingToDateSecondWrite ────────────────────────────────────────
+
+test('planWaitingToDateSecondWrite: a cross-day drop reschedules with a rank', () => {
+  assert.deepEqual(planWaitingToDateSecondWrite(TODAY, '2026-08-25', 7), {
+    kind: 'reschedule',
+    input: { date: '2026-08-25', sort_order: 7 },
+  });
+});
+
+test('planWaitingToDateSecondWrite: a cross-day drop without a rank reschedules', () => {
+  assert.deepEqual(planWaitingToDateSecondWrite(TODAY, '2026-08-25'), {
+    kind: 'reschedule',
+    input: { date: '2026-08-25' },
+  });
+});
+
+test('planWaitingToDateSecondWrite: a same-day drop with a rank reorders', () => {
+  // A same-date `/reschedule` is a server no-op that ignores `sort_order`, so
+  // the rank has to go through the agenda `/move` instead.
+  assert.deepEqual(planWaitingToDateSecondWrite(TODAY, TODAY, 4), {
+    kind: 'reorder',
+    sortOrder: 4,
+  });
+});
+
+test('planWaitingToDateSecondWrite: a same-day drop without a rank writes nothing', () => {
+  assert.deepEqual(planWaitingToDateSecondWrite(TODAY, TODAY), {
+    kind: 'none',
+  });
 });
 
 test('restoreHandedOffRow: a sentinel WAITING row returns to today appended', () => {

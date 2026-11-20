@@ -1389,10 +1389,10 @@ export function placeUndatedTaskOnToday(
 /** The server's hand-off placement as a cache repair: the row carries the
  *  fresh task embed and, when it was **undated** (at/after the 10-year
  *  horizon), travels to `today` appended. A dated row stays on its own day —
- *  the hand-off transition preserves the date (ADR 0011 rule 2 amended by the
- *  status/date decoupling) — and a malformed/absent `today` leaves it there
- *  too. The second-write failure path uses this on the PRE-hand-off snapshot so
- *  the cache never keeps a date the server refused. */
+ *  the hand-off transition preserves the date (ADR 0011 rule 2, amended by
+ *  ADR 0013) — and a malformed/absent `today` leaves it there too. The
+ *  second-write failure path uses this on the PRE-hand-off snapshot so the
+ *  cache never keeps a date the server refused. */
 export function restoreHandedOffRow(
   data: AgendaStreamData | undefined,
   id: string,
@@ -1402,6 +1402,41 @@ export function restoreHandedOffRow(
   return placeUndatedTaskOnToday(data, id, today, (entry) =>
     entry.task ? { ...entry, task } : entry,
   );
+}
+
+/** What the SECOND write of a WAITING → PLANNED take-back must do, given where
+ *  the first `/move { status: 'PLANNED' }` leaves the row (`placedDate`).
+ *
+ *  The status move preserves the row's date (ADR 0013), so:
+ *  - a **cross-day** drop still needs `/reschedule` to the target date, with
+ *    the hovered rank when one was requested;
+ *  - a **same-day** drop with a rank cannot use `/reschedule`: a same-date
+ *    reschedule is a server no-op that ignores `sort_order`, so the rank must
+ *    go through the agenda `/move` reorder instead;
+ *  - a **same-day** drop without a rank needs no second write at all — the
+ *    row already sits where the user asked. */
+export type WaitingToDateSecondWrite =
+  | { kind: 'reschedule'; input: { date: string; sort_order?: number } }
+  | { kind: 'reorder'; sortOrder: number }
+  | { kind: 'none' };
+
+export function planWaitingToDateSecondWrite(
+  placedDate: string,
+  targetDate: string,
+  sortOrder?: number,
+): WaitingToDateSecondWrite {
+  if (targetDate !== placedDate) {
+    return {
+      kind: 'reschedule',
+      input:
+        sortOrder === undefined
+          ? { date: targetDate }
+          : { date: targetDate, sort_order: sortOrder },
+    };
+  }
+  return sortOrder === undefined
+    ? { kind: 'none' }
+    : { kind: 'reorder', sortOrder };
 }
 
 /** Runs one agenda drop's write sequence: `first` always runs; `second` (when
