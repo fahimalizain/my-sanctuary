@@ -49,6 +49,10 @@ export const queryKeys = {
     current: () => [...queryKeys.agenda.all, 'current'] as const,
     history: (anchor: string) =>
       [...queryKeys.agenda.all, 'history', anchor] as const,
+    // The Board's date-grouped Planned column (ADR 0014). Deliberately under
+    // `agenda.all`: every existing task/agenda invalidation already prefixes
+    // `['agenda']`, so a status or date write reaches this read too.
+    boardPlanned: () => [...queryKeys.agenda.all, 'board-planned'] as const,
   },
   calendar: {
     all: ['calendar'] as const,

@@ -8,6 +8,7 @@ export * from './lists';
 export * from './categories';
 export * from './tasks';
 export * from './agenda';
+export * from './board';
 export * from './occurrences';
 export * from './routines';
 export * from './api-keys';

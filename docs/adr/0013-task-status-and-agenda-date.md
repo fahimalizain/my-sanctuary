@@ -161,6 +161,31 @@ The still-valid read decisions from ADR 0007/0010/0011 are kept:
 - Play stays today-only; Pause stays available on a running row whatever its
   date; the browser never computes today.
 
+### Two rank spaces
+
+This is a clarification of the split above, not a new decision.
+
+| Rank                      | Scope                          | Orders                                                 |
+| ------------------------- | ------------------------------ | ------------------------------------------------------ |
+| `tasks.sort_order`        | per user, per **status**       | the Board's column order                               |
+| `agenda_items.sort_order` | per user, per **`local_date`** | that day's run-of-show, task and occurrence rows alike |
+
+- The two ranks are independent, not duplicates. `tasks.sort_order` answers
+  "where in its Board column"; `agenda_items.sort_order` answers "where in its
+  day". Neither is derived from the other.
+- A dated `PLANNED` row is read by Home's day stream and the dated backlog
+  stretch, so it follows the **agenda** rank.
+- An undated `PLANNED` row is Home's Planned warehouse, read in Board order,
+  so it follows the **Board** rank.
+- A status-only transition leaves both `local_date` and the agenda rank
+  byte-for-byte untouched (§ Status-only transitions). An explicit date action
+  may append the agenda row to its target day and may also append the Board
+  rank when it changes status (`OPEN -> PLANNED`, and `{ "backlog": true }`
+  appends the Open column); `{ "unschedule": true }` never re-ranks the Board.
+- One rank cannot serve both: the Board orders one status across many dates,
+  while Home orders one date across statuses. A single integer would have to
+  satisfy both orders at once.
+
 ### Web
 
 Home's optimistic paint mirrors the server: start, complete, hand-off, and a

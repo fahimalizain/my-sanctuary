@@ -9,6 +9,7 @@ import {
   columnOf,
   dropInsertIndex,
   pickPointerHit,
+  removeFromPreview,
 } from './board-dnd';
 import type { BoardColumnItems } from './board-dnd';
 import type { TaskStatus } from '../../types';
@@ -103,6 +104,59 @@ test('pickPointerHit: a column wins over an unknown-type hit', () => {
   );
 });
 
+test('pickPointerHit: a planned-group body beats its parent column (append to the day)', () => {
+  assert.equal(
+    pickPointerHit([
+      { id: 'planned-group:2026-11-21', type: 'planned-group' },
+      { id: 'column:PLANNED', type: 'column' },
+    ]),
+    'planned-group:2026-11-21',
+  );
+});
+
+test('pickPointerHit: a planned-group header/gap wins even when listed after the column', () => {
+  // The group section (header + padding + body) is one droppable; the column
+  // hit never wins over it, regardless of array order.
+  assert.equal(
+    pickPointerHit([
+      { id: 'column:PLANNED', type: 'column' },
+      { id: 'planned-group:2026-11-21', type: 'planned-group' },
+    ]),
+    'planned-group:2026-11-21',
+  );
+});
+
+test('pickPointerHit: a card beats its planned group and the column', () => {
+  assert.equal(
+    pickPointerHit([
+      { id: 'task-1', type: 'task' },
+      { id: 'planned-group:2026-11-21', type: 'planned-group' },
+      { id: 'column:PLANNED', type: 'column' },
+    ]),
+    'task-1',
+  );
+});
+
+test('pickPointerHit: a planned group wins over an unknown-type hit', () => {
+  assert.equal(
+    pickPointerHit([
+      { id: 'unknown' },
+      { id: 'planned-group:undated', type: 'planned-group' },
+    ]),
+    'planned-group:undated',
+  );
+});
+
+test('pickPointerHit: two planned-group hits resolve to the first (nearest)', () => {
+  assert.equal(
+    pickPointerHit([
+      { id: 'planned-group:2026-11-21', type: 'planned-group' },
+      { id: 'planned-group:2026-11-22', type: 'planned-group' },
+    ]),
+    'planned-group:2026-11-21',
+  );
+});
+
 // ── columnOf (which preview column holds an id) ─────────────────────────
 
 test('columnOf: reports the column holding the id', () => {
@@ -112,6 +166,38 @@ test('columnOf: reports the column holding the id', () => {
 
 test('columnOf: an id in no column resolves to null', () => {
   assert.equal(columnOf(board({ OPEN: ['o-1'] }), 'zzz'), null);
+});
+
+// ── removeFromPreview (the grouped Planned placeholder lift) ────────────
+
+test('removeFromPreview: drops the id from the column that holds it', () => {
+  const items = board({ OPEN: ['o-1'], PLANNED: ['p-1', 'p-2'] });
+
+  const next = removeFromPreview(items, 'p-1');
+
+  assert.deepEqual(next.PLANNED, ['p-2']);
+  assert.deepEqual(next.OPEN, ['o-1']);
+  assert.notEqual(next, items);
+  assert.equal(next.OPEN, items.OPEN);
+});
+
+test('removeFromPreview: an absent id keeps the same map and every array', () => {
+  const items = board({ OPEN: ['o-1'], PLANNED: ['p-1'] });
+
+  const next = removeFromPreview(items, 'ghost');
+
+  assert.equal(next, items);
+  assert.equal(next.OPEN, items.OPEN);
+  assert.equal(next.PLANNED, items.PLANNED);
+});
+
+test('removeFromPreview: removes a mover lifted out of Open', () => {
+  const items = board({ OPEN: ['o-1', 'o-2'], PLANNED: [] });
+
+  const next = removeFromPreview(items, 'o-1');
+
+  assert.deepEqual(next.OPEN, ['o-2']);
+  assert.equal(next.PLANNED, items.PLANNED);
 });
 
 // ── cloneBoardItems (the drag-start snapshot) ────────────────────────────

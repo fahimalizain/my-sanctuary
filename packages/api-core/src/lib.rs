@@ -7,6 +7,7 @@
 pub mod agenda;
 pub mod agenda_fill;
 pub mod api_key;
+pub mod board;
 pub mod calendar;
 pub mod calendar_color;
 pub use calendar::apply as calendar_apply;
@@ -49,6 +50,7 @@ pub use agenda_fill::{
     ensure_task_items, fill_occurrence_horizon, run_agenda_fill_cron, AgendaFillReport,
     OCCURRENCE_HORIZON_DAYS,
 };
+pub use board::{get_planned_board, PlannedBoardResponse, PlannedBoardRow};
 pub use api_key::{
     create_api_key, expiry_instant_rfc3339, generate_api_key, hash_api_key, is_well_formed_api_key,
     list_api_keys, parse_authorization_header, revoke_api_key, should_touch_last_used,
