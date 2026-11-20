@@ -2539,9 +2539,9 @@ async fn dispatch_matrix_action(
             if let Err(_) = placement {
                 // Best-effort: the status and the `reopened` log are already
                 // committed, so a 500 would only make the client retry a
-                // reopen that landed. The cron inserts a MISSING row and dates
-                // an undated IN_PROGRESS/WAITING row; it does not heal a
-                // terminal target, so a failed reopen placement stays stale.
+                // reopen that landed. The cron inserts a missing row; a failed
+                // reopen → PLANNED dating stays undated because the fill leaves
+                // existing PLANNED rows alone.
             }
             Ok(None)
         }
