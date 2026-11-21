@@ -4,12 +4,20 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { Plus } from 'lucide-react';
-import { useLayoutEffect, useRef, useState, type RefObject } from 'react';
+import {
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from 'react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import type { TaskRecord, TaskStatus } from '@/app/types';
 import { COLUMN_ID_PREFIX } from './board-model';
 import type { BoardColumn } from './board-model';
+import type { PlannedBoardGroup } from './planned-board';
+import { PlannedGroupSection } from './PlannedGroupSection';
 import { scrollEdges } from './board-scroll';
 import { SortableTaskCard } from './TaskCard';
 
@@ -79,6 +87,11 @@ export function BoardColumnView({
   onToggleFocus,
   focusDisabled,
   onAddTask,
+  plannedGroups,
+  plannedToday,
+  plannedPreview,
+  plannedReady,
+  hiddenTaskId,
 }: {
   column: BoardColumn;
   tasks: TaskRecord[];
@@ -93,6 +106,19 @@ export function BoardColumnView({
   focusDisabled?: boolean;
   /** Column-header + : opens New Task locked to this column's status. */
   onAddTask: (status: TaskStatus) => void;
+  /** The Planned column's date groups (ADR 0014). Provided ONLY for the
+   *  Planned column; every other status keeps the flat render. */
+  plannedGroups?: PlannedBoardGroup[];
+  /** Server-computed civil today, for the group day labels. */
+  plannedToday?: string;
+  /** The dashed placeholder the page paints while a drag hovers a group. */
+  plannedPreview?: { groupId: string; index: number } | null;
+  /** False until `GET /api/board/planned` resolves: the column shows a loading
+   *  line instead of claiming "No tasks". */
+  plannedReady?: boolean;
+  /** The card currently lifted by dnd-kit: its committed group stays rendered,
+   *  but the card itself is hidden (the overlay carries it). */
+  hiddenTaskId?: string | null;
 }) {
   const columnDroppableId = `${COLUMN_ID_PREFIX}${column.status}`;
   const { setNodeRef, isOver } = useDroppable({
@@ -118,6 +144,92 @@ export function BoardColumnView({
   // shifts scrollHeight without resizing the list's own box, and a pure
   // reorder never flips an edge.
   const edges = useColumnScrollEdges(scrollRef, tasks.length);
+
+  // The Planned column renders date groups when the page provides them; every
+  // other column (and a Planned column without the read yet) keeps the flat
+  // SortableContext untouched (ADR 0014).
+  const groupedPlanned =
+    column.status === 'PLANNED' && plannedGroups !== undefined;
+  const groups = plannedGroups ?? [];
+  const tasksById = useMemo(
+    () => new Map(tasks.map((task) => [task.id, task])),
+    [tasks],
+  );
+  const plannedBody = (
+    <>
+      {!plannedReady ? (
+        <p className="text-sm text-muted-foreground italic">Loading dates…</p>
+      ) : groups.length === 0 ? (
+        <p className="text-sm text-muted-foreground italic">No tasks</p>
+      ) : (
+        groups.map((group) => (
+          <PlannedGroupSection
+            key={group.id}
+            group={group}
+            tasks={group.taskIds
+              .map((id) => tasksById.get(id))
+              .filter((task): task is TaskRecord => task !== undefined)}
+            today={plannedToday ?? ''}
+            previewIndex={
+              plannedPreview?.groupId === group.id ? plannedPreview.index : null
+            }
+            hiddenTaskId={hiddenTaskId ?? null}
+            movingIds={movingIds}
+            onEditTask={onEditTask}
+            onToggleFocus={onToggleFocus}
+            focusDisabled={focusDisabled}
+          />
+        ))
+      )}
+    </>
+  );
+
+  // The scroll box and its edge fades are the same in both renders; only the
+  // body and the SortableContext owner differ.
+  const scrollArea = (
+    <div className="relative min-h-0 flex-1">
+      <div
+        ref={setScrollNode}
+        className={cn(
+          'h-full min-h-0 overflow-y-auto overscroll-contain p-3 transition-colors',
+          groupedPlanned ? 'space-y-0' : 'space-y-2',
+          overThisColumn && tasks.length === 0 && 'bg-muted/40 rounded-lg',
+        )}
+      >
+        {groupedPlanned ? (
+          plannedBody
+        ) : tasks.length > 0 ? (
+          tasks.map((task) => (
+            <SortableTaskCard
+              key={task.id}
+              task={task}
+              columnStatus={column.status}
+              onEdit={onEditTask}
+              onToggleFocus={onToggleFocus}
+              focusDisabled={focusDisabled}
+              disabled={movingIds.has(task.id)}
+            />
+          ))
+        ) : (
+          <p className="text-sm text-muted-foreground italic">No tasks</p>
+        )}
+      </div>
+      <div
+        aria-hidden
+        className={cn(
+          'pointer-events-none absolute inset-x-0 top-0 z-10 h-3 bg-gradient-to-b from-card to-transparent',
+          !edges.top && 'opacity-0',
+        )}
+      />
+      <div
+        aria-hidden
+        className={cn(
+          'pointer-events-none absolute inset-x-0 bottom-0 z-10 h-3 bg-gradient-to-t from-card to-transparent',
+          !edges.bottom && 'opacity-0',
+        )}
+      />
+    </div>
+  );
 
   return (
     <section
@@ -165,49 +277,17 @@ export function BoardColumnView({
         </div>
       </header>
 
-      <SortableContext items={items} strategy={verticalListSortingStrategy}>
-        {/* Wrapper owns the flex sizing; the scroller below fills it and
-            stays the droppable (`setNodeRef` must not move up here). */}
-        <div className="relative min-h-0 flex-1">
-          <div
-            ref={setScrollNode}
-            className={cn(
-              'h-full min-h-0 space-y-2 overflow-y-auto overscroll-contain p-3 transition-colors',
-              overThisColumn && tasks.length === 0 && 'bg-muted/40 rounded-lg',
-            )}
-          >
-            {tasks.length > 0 ? (
-              tasks.map((task) => (
-                <SortableTaskCard
-                  key={task.id}
-                  task={task}
-                  columnStatus={column.status}
-                  onEdit={onEditTask}
-                  onToggleFocus={onToggleFocus}
-                  focusDisabled={focusDisabled}
-                  disabled={movingIds.has(task.id)}
-                />
-              ))
-            ) : (
-              <p className="text-sm text-muted-foreground italic">No tasks</p>
-            )}
-          </div>
-          <div
-            aria-hidden
-            className={cn(
-              'pointer-events-none absolute inset-x-0 top-0 z-10 h-3 bg-gradient-to-b from-card to-transparent',
-              !edges.top && 'opacity-0',
-            )}
-          />
-          <div
-            aria-hidden
-            className={cn(
-              'pointer-events-none absolute inset-x-0 bottom-0 z-10 h-3 bg-gradient-to-t from-card to-transparent',
-              !edges.bottom && 'opacity-0',
-            )}
-          />
-        </div>
-      </SortableContext>
+      {groupedPlanned ? (
+        // Each group owns its own SortableContext; the outer flat context
+        // would let dnd-kit sort a card across groups it cannot measure.
+        scrollArea
+      ) : (
+        <SortableContext items={items} strategy={verticalListSortingStrategy}>
+          {/* Wrapper owns the flex sizing; the scroller below fills it and
+              stays the droppable (`setNodeRef` must not move up here). */}
+          {scrollArea}
+        </SortableContext>
+      )}
     </section>
   );
 }

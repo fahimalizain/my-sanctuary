@@ -33,6 +33,23 @@ export function columnOf(
   return null;
 }
 
+/** Removes `id` from whichever column preview array holds it, preserving every
+ *  other array reference and returning the SAME map when it is absent. The
+ *  date-grouped Planned column uses this while a card hovers a day section: the
+ *  card is painted as a dashed placeholder there, never spliced into the flat
+ *  PLANNED array (which would double it with the grouped render). */
+export function removeFromPreview(
+  items: BoardColumnItems,
+  id: string,
+): BoardColumnItems {
+  for (const status of Object.keys(items) as TaskStatus[]) {
+    const list = items[status];
+    if (!list.includes(id)) continue;
+    return { ...items, [status]: list.filter((entry) => entry !== id) };
+  }
+  return items;
+}
+
 function sameIds(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((id, i) => id === b[i]);
 }
@@ -140,16 +157,20 @@ export const TOUCH_DND_TOLERANCE_PX = 8;
 // A's empty space can land on a card in column B. Pointer-inside wins here;
 // only when the pointer sits in a gap (between columns, or outside them) do
 // we fall back to the nearest *column* — never a card.
-export type BoardDroppableType = 'task' | 'column';
+export type BoardDroppableType = 'task' | 'column' | 'planned-group';
 
 /** Which pointer-within hit wins: the nearest card (insert at that index),
- *  else the nearest column (append), else nothing. Type wins over array
- *  order — a card nested inside its column beats the column itself. */
+ *  then a Planned day group (append to that day / its own insert), else the
+ *  nearest column (append), else nothing. Type wins over array order — a card
+ *  nested inside its group/column beats the container itself, and a group
+ *  nested inside the Planned column beats the column body. */
 export function pickPointerHit(
   hits: ReadonlyArray<{ id: string; type?: BoardDroppableType }>,
 ): string | null {
   const taskHit = hits.find((hit) => hit.type === 'task');
   if (taskHit) return taskHit.id;
+  const plannedGroupHit = hits.find((hit) => hit.type === 'planned-group');
+  if (plannedGroupHit) return plannedGroupHit.id;
   const columnHit = hits.find((hit) => hit.type === 'column');
   return columnHit ? columnHit.id : null;
 }

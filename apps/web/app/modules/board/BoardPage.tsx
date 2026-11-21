@@ -27,6 +27,15 @@ import { useNavigate, useSearch } from '@tanstack/react-router';
 import { useCategoriesQuery } from '@/app/queries/categories';
 import { useListsQuery } from '@/app/queries/lists';
 import {
+  readPlannedBoardCache,
+  setPlannedBoardCache,
+  usePlannedBoardQuery,
+} from '@/app/queries/board';
+import {
+  useMoveAgendaItem,
+  useRescheduleAgendaItem,
+} from '@/app/queries/agenda';
+import {
   setTasksCache,
   useCreateTask,
   useDeleteTask,
@@ -37,16 +46,23 @@ import {
   useUpdateTask,
 } from '@/app/queries/tasks';
 import {
+  type AgendaItemRecord,
   type FocusTaskResponse,
   type MoveTaskInput,
   type MoveTaskResponse,
   type NewTaskInput,
+  type PlannedBoardRow,
+  type RescheduleAgendaItemInput,
   type TaskDifficulty,
   type TaskPriority,
   type TaskRecord,
   type TaskResponse,
   type TaskStatus,
 } from '@/app/types';
+import { getPlannedBoard } from '@/lib/api';
+import { queryClient } from '@/lib/queryClient';
+import { queryKeys } from '@/app/queries/keys';
+import { agendaDateLabel, replaceCachedTask } from '../home/agenda-helpers';
 import { BoardColumnView } from './BoardColumn';
 import { BoardColumnTabs } from './BoardColumnTabs';
 import { BoardFilters } from './BoardFilters';
@@ -60,6 +76,7 @@ import {
   cloneBoardItems,
   columnOf,
   dropInsertIndex,
+  removeFromPreview,
 } from './board-dnd';
 import type { BoardColumnItems } from './board-dnd';
 import {
@@ -77,6 +94,23 @@ import {
   resolveSortOrder,
 } from './board-model';
 import type { BoardSearch } from './board-model';
+import {
+  applyPlannedAgendaMove,
+  applyPlannedBoardReorder,
+  buildPlannedGroups,
+  markPlannedRowUndated,
+  movePlannedRowToDate,
+  plannedGroupOfTask,
+  plannedRowsByTaskId,
+  plannedRowFromItem,
+  resolvePlannedDrop,
+  upsertPlannedRow,
+} from './planned-board';
+import type {
+  PlannedBoardGroup,
+  PlannedDropDecision,
+  PlannedDropTarget,
+} from './planned-board';
 import { pickVisibleColumn } from './board-scroll';
 
 interface TaskFormState {
@@ -86,6 +120,10 @@ interface TaskFormState {
   /** Create destination. Always set when mode === 'create' on the board. */
   createStatus?: TaskStatus;
 }
+
+/** Stable empty rows for a missing/errored Planned read — never allocate a
+ *  fresh `[]` on every render. */
+const EMPTY_PLANNED_ROWS: PlannedBoardRow[] = [];
 
 export function BoardPage() {
   const navigate = useNavigate();
@@ -122,6 +160,22 @@ export function BoardPage() {
   // Cards with a /move request in flight — dragging them again is ignored
   // until the response lands (no queuing).
   const [movingIds, setMovingIds] = useState<Set<string>>(new Set());
+  // Synchronous companion to `movingIds`: a drag can end before React flushes
+  // the state update, so the drop handler's "is this card busy?" check reads
+  // this ref instead (see beginPlannedMove).
+  const plannedMovingRef = useRef<Set<string>>(new Set());
+  // The Planned group the pointer is over, plus the slot the dashed
+  // placeholder occupies (ADR 0014). Null everywhere else — including while
+  // the column is loaded but the pointer is not over it.
+  const [plannedHover, setPlannedHover] = useState<{
+    groupId: string;
+    index: number;
+  } | null>(null);
+  // Latest hover for the drop handler, mirroring `dragItemsRef`.
+  const plannedHoverRef = useRef<{ groupId: string; index: number } | null>(
+    null,
+  );
+  plannedHoverRef.current = plannedHover;
   // A focus request (POST /api/tasks/:id/focus or DELETE /api/focus) is in
   // flight: further pin taps are ignored and every pin is disabled.
   const [focusInFlight, setFocusInFlight] = useState(false);
@@ -158,13 +212,29 @@ export function BoardPage() {
   // → shared cache); the ref stays.
   const tasksRef = useRef<TaskRecord[]>([]);
   tasksRef.current = tasks;
+  // The Planned column's placement read (ADR 0014). Seed-gated like tasks:
+  // the first `/api/lists` read owns the first-visit seed, so this must not
+  // race it. `today` is the SERVER's civil day — never a browser clock.
+  const plannedQuery = usePlannedBoardQuery({
+    enabled: listsQuery.isSuccess,
+    refetchOnWindowFocus: !busy,
+  });
+  const plannedRows = plannedQuery.data?.rows ?? EMPTY_PLANNED_ROWS;
+  const plannedToday = plannedQuery.data?.today ?? '';
+  const plannedReady = plannedQuery.data !== undefined;
+  const plannedRowsByTask = useMemo(
+    () => plannedRowsByTaskId(plannedRows),
+    [plannedRows],
+  );
   // Full-page loader only while there is no data yet (first load, or a retry
   // after a hard error) — Query's `isLoading` already means "no data yet",
   // so a quiet refresh with cards on screen never flashes the spinner.
   const isLoading =
     listsQuery.isLoading ||
     (listsQuery.isSuccess &&
-      (tasksQuery.isLoading || categoriesQuery.isLoading));
+      (tasksQuery.isLoading ||
+        categoriesQuery.isLoading ||
+        plannedQuery.isLoading));
   // Load failures: the first Error.message among the three queries, else
   // null. Replaces the board with the error+retry banner when there are no
   // lists to show.
@@ -173,7 +243,8 @@ export function BoardPage() {
   const loadError =
     firstErrorMessage(listsQuery.error, 'Failed to load board') ??
     firstErrorMessage(tasksQuery.error, 'Failed to load tasks') ??
-    firstErrorMessage(categoriesQuery.error, 'Failed to load categories');
+    firstErrorMessage(categoriesQuery.error, 'Failed to load categories') ??
+    firstErrorMessage(plannedQuery.error, 'Failed to load Planned dates');
   // Action failures (move 409, etc.): rendered as a banner above the
   // still-visible board — cards are never unmounted by an action error.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -316,6 +387,11 @@ export function BoardPage() {
   // cache themselves and never invalidate on success (invalidation would
   // fight applyOptimisticMove's sibling-rank contract).
   const moveTaskMutation = useMoveTask();
+  // Agenda writes for the date-grouped Planned column (ADR 0014): a reorder
+  // inside one dated group is `/move`, a date change/unschedule is
+  // `/reschedule`.
+  const moveAgendaItemMutation = useMoveAgendaItem();
+  const rescheduleAgendaItemMutation = useRescheduleAgendaItem();
   const focusTaskMutation = useFocusTask();
   const unfocusTaskMutation = useUnfocusTask();
   const createTaskMutation = useCreateTask();
@@ -527,6 +603,17 @@ export function BoardPage() {
     [displayItems, taskById],
   );
 
+  // The Planned column's date groups (ADR 0014), built from the COMMITTED
+  // filtered tasks — never the drag preview. A lifted card must stay in its
+  // group so the group itself remains rendered and droppable; the renderer
+  // hides only that card (`hiddenTaskId` below). This also keeps the active
+  // card's own group resolvable at drop time, even while the flat preview has
+  // moved it to another column.
+  const plannedGroups = useMemo(
+    () => buildPlannedGroups(tasks, plannedRows, matchesFilters),
+    [tasks, plannedRows, matchesFilters],
+  );
+
   // ──────────────────────────────────────────
   // Drag + optimistic move (ADR 0002 § DnD, § UI)
   // ──────────────────────────────────────────
@@ -538,23 +625,155 @@ export function BoardPage() {
     // Snapshot the displayed (filtered + capped) columns: the drag mutates
     // only this preview, never the committed `tasks`.
     setDragItems(cloneBoardItems(itemsByColumn));
+    // A fresh drag never inherits the previous placeholder.
+    plannedHoverRef.current = null;
+    setPlannedHover(null);
   };
 
-  /** Live preview while hovering (`onDragOver`, ADR 0002 § DnD): moves the
-   *  REAL dragged id between the preview's column arrays so the dest
-   *  SortableContext mounts a dimmed ghost and its cards part. Nothing is
-   *  persisted and `applyOptimisticMove` stays drop-only — a cancel or
-   *  drop-outside just discards the map. */
+  /** The Planned drop target an over id names, or null when it is outside the
+   *  grouped Planned surface (or the read is not ready). Mirrors
+   *  `handleDragEnd` exactly, so preview and drop resolve the same way. */
+  const plannedTargetForOver = (overId: string): PlannedDropTarget | null => {
+    if (!plannedReady) return null;
+    if (overId === `${COLUMN_ID_PREFIX}PLANNED`) return { kind: 'column' };
+    if (plannedGroups.some((group) => group.id === overId)) {
+      return { kind: 'group', groupId: overId };
+    }
+    if (plannedGroupOfTask(plannedGroups, overId)) {
+      return { kind: 'card', taskId: overId };
+    }
+    return null;
+  };
+
+  /** The rendered group a Planned drop target belongs to (Undated for the
+   *  column body), or null when it has no section. */
+  const plannedTargetGroup = (
+    target: PlannedDropTarget,
+    groups: PlannedBoardGroup[],
+  ): PlannedBoardGroup | null => {
+    if (target.kind === 'column') {
+      return groups.find((group) => group.undated) ?? null;
+    }
+    if (target.kind === 'group') {
+      return groups.find((group) => group.id === target.groupId) ?? null;
+    }
+    return plannedGroupOfTask(groups, target.taskId);
+  };
+
+  /** Live preview while hovering (`onDragOver`, ADR 0002 § DnD, ADR 0014):
+   *  inside the Planned column the dragged card is removed from every flat
+   *  preview array (it must not also be spliced into the flat PLANNED list the
+   *  grouped render hides). The dashed group placeholder is derived from the
+   *  SAME drop decision as `handleDragEnd`, so it only appears when the write
+   *  uses a position; everywhere else the flat cross-column preview moves the
+   *  id as before. */
   const handleDragOver = (event: DragOverEvent) => {
     const { active, over } = event;
     if (!over || typeof active.id !== 'string') return;
-    setDragItems((prev) =>
-      applyDragOverPreview(
-        prev ?? itemsByColumn,
-        String(active.id),
-        String(over.id),
-      ),
-    );
+    const activeId = active.id;
+    const overId = String(over.id);
+
+    // When the placement read is missing/errored the column falls back to the
+    // flat Planned render, so the grouped date branches stay off and the flat
+    // status/rank preview owns `column:PLANNED` too.
+    const plannedTarget = plannedTargetForOver(overId);
+    if (plannedTarget) {
+      const group = plannedTargetGroup(plannedTarget, plannedGroups);
+      const activeTask = tasksRef.current.find((task) => task.id === activeId);
+      const activeGroup = plannedGroupOfTask(plannedGroups, activeId);
+      const cardIndex = group ? group.taskIds.indexOf(overId) : -1;
+      const hoverIndex = group
+        ? cardIndex >= 0
+          ? cardIndex
+          : group.taskIds.length
+        : 0;
+
+      let nextHover: { groupId: string; index: number } | null = null;
+      if (activeTask) {
+        const decision = resolvePlannedDrop({
+          activeTaskId: activeId,
+          activeStatus: activeTask.status,
+          activeGroup,
+          over: plannedTarget,
+          groups: plannedGroups,
+          rows: plannedRowsByTask,
+          tasks: taskById,
+          today: plannedToday,
+        });
+        // The placeholder is a promise about the write: it only appears when
+        // the resolved write actually uses a position. Unschedule / inert /
+        // leave decisions paint nothing (the group's `isOver` still lights).
+        switch (decision.kind) {
+          case 'reorderDated':
+          case 'reorderUndated':
+            nextHover = group ? { groupId: group.id, index: hoverIndex } : null;
+            break;
+          case 'moveToDate':
+          case 'joinDated':
+            nextHover =
+              decision.targetRank !== undefined && group
+                ? { groupId: group.id, index: hoverIndex }
+                : {
+                    groupId: decision.group.id,
+                    index: decision.group.taskIds.length,
+                  };
+            break;
+          case 'joinUndated': {
+            const undated = plannedGroups.find((entry) => entry.undated);
+            if (undated) {
+              nextHover = {
+                groupId: undated.id,
+                index: cardIndex >= 0 ? hoverIndex : undated.taskIds.length,
+              };
+            }
+            break;
+          }
+          case 'unschedule':
+          case 'none':
+          case 'leavePlanned':
+            nextHover = null;
+            break;
+        }
+      }
+
+      const prevHover = plannedHoverRef.current;
+      if (
+        prevHover?.groupId !== nextHover?.groupId ||
+        prevHover?.index !== nextHover?.index
+      ) {
+        plannedHoverRef.current = nextHover;
+        setPlannedHover(nextHover);
+      }
+      setDragItems((prev) =>
+        removeFromPreview(prev ?? itemsByColumn, activeId),
+      );
+      return;
+    }
+
+    // Leaving the Planned column: the grouped placeholder path (including a
+    // suppressed Undated placeholder) has lifted the id out of every preview
+    // array, so restore it to its committed column before the flat
+    // cross-column preview can move it into the new destination.
+    setDragItems((prev) => {
+      let base = prev ?? itemsByColumn;
+      if (columnOf(base, activeId) === null) {
+        const activeTask = tasksRef.current.find(
+          (task) => task.id === activeId,
+        );
+        if (activeTask) {
+          const committed = itemsByColumn[activeTask.status];
+          const at = committed.indexOf(activeId);
+          const restored = [...base[activeTask.status]];
+          restored.splice(at < 0 ? restored.length : at, 0, activeId);
+          base = { ...base, [activeTask.status]: restored };
+        }
+      }
+      return applyDragOverPreview(base, activeId, overId);
+    });
+    if (plannedHoverRef.current !== null) {
+      plannedHoverRef.current = null;
+      setPlannedHover(null);
+    }
   };
 
   /** One negotiated `/move` request. Applies the OPTIMISTIC change first
@@ -596,7 +815,13 @@ export function BoardPage() {
    *  persist. `applyOptimisticMove` shifts the dest column's sibling ranks
    *  exactly like the server (reorder_in_place / place_at), so the board
    *  paints the real slot immediately — the success merge only replaces the
-   *  mover (`response.task`). */
+   *  mover (`response.task`).
+   *
+   *  Planned → another column also lands here: it is a status-only move (no
+   *  date write), and the grouped render already hides the card because
+   *  `buildPlannedGroups` filters by status. The stale planned row is dropped
+   *  by the `['agenda']` invalidation on settle, so no separate optimistic row
+   *  edit is needed. */
   const performMove = async (
     taskId: string,
     destStatus: TaskStatus,
@@ -618,6 +843,421 @@ export function BoardPage() {
     );
   };
 
+  // ──────────────────────────────────────────
+  // Planned column: optimistic rows + negotiated writes (ADR 0014)
+  // ──────────────────────────────────────────
+
+  /** Edits the date-grouped Planned read in place, keeping the read's `today`
+   *  and `time_zone` untouched. A missing cache is left missing (a write can
+   *  land before the first read; the query's own refetch heals it). */
+  const patchPlannedRows = (
+    updater: (rows: PlannedBoardRow[]) => PlannedBoardRow[],
+  ): void => {
+    setPlannedBoardCache((prev) =>
+      prev ? { ...prev, rows: updater(prev.rows) } : prev,
+    );
+  };
+
+  const restorePlannedRows = (rows: PlannedBoardRow[]): void => {
+    setPlannedBoardCache((prev) => (prev ? { ...prev, rows } : prev));
+  };
+
+  /** Merges an authoritative agenda item into the Planned read and the shared
+   *  tasks cache. A reschedule's item keeps the server's own date/rank; an
+   *  unschedule parks the row in Undated (`board_sort_order` still owns its
+   *  place there). */
+  const mergePlannedItem = (
+    item: AgendaItemRecord,
+    undated?: boolean,
+  ): void => {
+    const row: PlannedBoardRow =
+      undated === true
+        ? {
+            task_id: item.ref_id,
+            item_id: item.id,
+            local_date: item.local_date,
+            agenda_sort_order: null,
+            board_sort_order: item.task?.sort_order ?? 0,
+            undated: true,
+          }
+        : plannedRowFromItem(item);
+    patchPlannedRows((rows) => upsertPlannedRow(rows, row));
+    if (item.task) {
+      setTasks((prev) => replaceCachedTask(prev, item.task));
+    }
+  };
+
+  /** Synchronous in-flight lock for every Planned drop handler: a second drop
+   *  or a re-drag of the same card is ignored until the first request settles.
+   *  The ref is authoritative (state updates are async); `movingIds` disables
+   *  the card and keeps background sync paused. */
+  const beginPlannedMove = (taskId: string): boolean => {
+    if (plannedMovingRef.current.has(taskId)) return false;
+    plannedMovingRef.current.add(taskId);
+    setMovingIds((prev) => {
+      if (prev.has(taskId)) return prev;
+      const next = new Set(prev);
+      next.add(taskId);
+      return next;
+    });
+    setActionError(null);
+    return true;
+  };
+
+  const endPlannedMove = (taskId: string): void => {
+    plannedMovingRef.current.delete(taskId);
+    setMovingIds((prev) => {
+      if (!prev.has(taskId)) return prev;
+      const next = new Set(prev);
+      next.delete(taskId);
+      return next;
+    });
+  };
+
+  const plannedMoveError = (err: unknown): string =>
+    err instanceof Error ? err.message : 'Move failed';
+
+  /** Stops an in-flight Planned read from landing over this handler's
+   *  optimistic rows. The agenda mutations already do this for themselves;
+   *  the tasks-based Undated/join writes need it explicitly. */
+  const cancelPlannedRead = (): Promise<void> =>
+    queryClient.cancelQueries({ queryKey: queryKeys.agenda.boardPlanned() });
+
+  /** Re-reads the Planned placement after a partial (or unreadable) two-write
+   *  drop: the status move already happened, so only the server can say which
+   *  date/rank the row actually holds. */
+  const refreshPlannedBoard = (): void => {
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.agenda.boardPlanned(),
+    });
+  };
+
+  /** Dated group, same-date reorder: `POST /agenda/items/:id/move`. It never
+   *  changes a date (Undated → dated goes through `moveToDate`). The
+   *  optimistic pass mirrors the server's rank shift. */
+  const reorderDated = async (
+    taskId: string,
+    group: PlannedBoardGroup,
+    itemId: string,
+    targetRank: number,
+  ): Promise<void> => {
+    if (!beginPlannedMove(taskId)) return;
+    await cancelPlannedRead();
+    const date = group.date!;
+    const rowsSnapshot = readPlannedBoardCache()?.rows;
+    patchPlannedRows((rows) =>
+      applyPlannedAgendaMove(rows, date, itemId, targetRank),
+    );
+    try {
+      const data = await moveAgendaItemMutation.mutateAsync({
+        id: itemId,
+        input: { sort_order: targetRank },
+      });
+      mergePlannedItem(data.item);
+      // The same agenda rank is Home's day order. The mutation stays neutral
+      // (Home must not refetch its whole window after every same-day move),
+      // so the Board refreshes the one view it does not own.
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.agenda.current(),
+      });
+    } catch (err) {
+      if (rowsSnapshot) restorePlannedRows(rowsSnapshot);
+      setActionError(plannedMoveError(err));
+    } finally {
+      endPlannedMove(taskId);
+    }
+  };
+
+  /** A date-changing move inside Planned: one `/reschedule` with the target
+   *  date (and rank when the drop landed on a card). */
+  const moveToDate = async (
+    taskId: string,
+    group: PlannedBoardGroup,
+    itemId: string,
+    targetRank?: number,
+  ): Promise<void> => {
+    if (!beginPlannedMove(taskId)) return;
+    await cancelPlannedRead();
+    const date = group.date!;
+    const rowsSnapshot = readPlannedBoardCache()?.rows;
+    patchPlannedRows((rows) =>
+      movePlannedRowToDate(rows, itemId, date, targetRank),
+    );
+    const input: RescheduleAgendaItemInput =
+      targetRank === undefined ? { date } : { date, sort_order: targetRank };
+    try {
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: itemId,
+        input,
+      });
+      mergePlannedItem(data.item);
+    } catch (err) {
+      if (rowsSnapshot) restorePlannedRows(rowsSnapshot);
+      setActionError(plannedMoveError(err));
+    } finally {
+      endPlannedMove(taskId);
+    }
+  };
+
+  /** Dated → Undated / column body: `{ unschedule: true }` keeps the task
+   *  PLANNED and parks its row in the warehouse. */
+  const unschedule = async (taskId: string, itemId: string): Promise<void> => {
+    if (!beginPlannedMove(taskId)) return;
+    await cancelPlannedRead();
+    const rowsSnapshot = readPlannedBoardCache()?.rows;
+    patchPlannedRows((rows) => markPlannedRowUndated(rows, itemId));
+    try {
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: itemId,
+        input: { unschedule: true },
+      });
+      mergePlannedItem(data.item, true);
+    } catch (err) {
+      if (rowsSnapshot) restorePlannedRows(rowsSnapshot);
+      setActionError(plannedMoveError(err));
+    } finally {
+      endPlannedMove(taskId);
+    }
+  };
+
+  /** Undated → Undated reorder: the Board's same-status `/move`, mirrored over
+   *  the whole Planned rank space. */
+  const reorderUndated = async (
+    taskId: string,
+    targetRank: number,
+  ): Promise<void> => {
+    if (!beginPlannedMove(taskId)) return;
+    await cancelPlannedRead();
+    const rowsSnapshot = readPlannedBoardCache()?.rows;
+    const tasksSnapshot = tasksRef.current;
+    patchPlannedRows((rows) =>
+      applyPlannedBoardReorder(rows, taskId, targetRank),
+    );
+    setTasks((prev) =>
+      applyOptimisticMove(prev, taskId, 'PLANNED', targetRank),
+    );
+    try {
+      const data = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: { status: 'PLANNED', sort_order: targetRank },
+      });
+      setTasks((prev) => replaceCachedTask(prev, data.task));
+      patchPlannedRows((rows) =>
+        rows.map((row) =>
+          row.task_id === taskId
+            ? { ...row, board_sort_order: data.task.sort_order }
+            : row,
+        ),
+      );
+    } catch (err) {
+      if (rowsSnapshot) restorePlannedRows(rowsSnapshot);
+      setTasks(tasksSnapshot);
+      setActionError(plannedMoveError(err));
+    } finally {
+      endPlannedMove(taskId);
+    }
+  };
+
+  /** Non-PLANNED → dated group: status first, then the date (ADR 0014
+   *  § Two-write drops). The PLANNED row is published before the task's new
+   *  status, so the grouped render never sees a rowless Planned card and
+   *  flashes it in Undated. A failed second write keeps the honest state —
+   *  PLANNED on its old date — and re-reads the server. */
+  const joinDated = async (
+    taskId: string,
+    group: PlannedBoardGroup,
+    targetRank?: number,
+  ): Promise<void> => {
+    if (!beginPlannedMove(taskId)) return;
+    await cancelPlannedRead();
+    const date = group.date!;
+    const label = agendaDateLabel(date, plannedToday);
+    let first: MoveTaskResponse;
+    try {
+      first = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: { status: 'PLANNED' },
+      });
+    } catch (err) {
+      // Nothing was optimistically painted before the write, so there is no
+      // snapshot to restore (which could wipe a concurrent successful move).
+      setActionError(plannedMoveError(err));
+      endPlannedMove(taskId);
+      return;
+    }
+
+    let board;
+    try {
+      board = await getPlannedBoard();
+    } catch (err) {
+      // The status move succeeded; the date is unknown. Do NOT paint the task
+      // PLANNED without its row — the grouped render would invent Undated for
+      // a card that may hold a dated row. Leave the committed caches alone and
+      // let both refetches land the honest server state (the card stays in its
+      // source column until then).
+      void queryClient.invalidateQueries({ queryKey: queryKeys.tasks.all });
+      refreshPlannedBoard();
+      setActionError(
+        `Moved to Planned, but could not move it to ${label}: ${plannedMoveError(err)}`,
+      );
+      endPlannedMove(taskId);
+      return;
+    }
+    // Planned read FIRST: it already carries this task's row, so patching the
+    // PLANNED status afterwards cannot create a missing-row Undated frame.
+    setPlannedBoardCache(board);
+    setTasks((prev) => replaceCachedTask(prev, first.task));
+    const row = board.rows.find((entry) => entry.task_id === taskId);
+    if (!row?.item_id) {
+      // The status move succeeded; the agenda row's fill has not run yet, so
+      // there is no date to write. The server's read heals it.
+      setActionError('Planned, but its agenda row is not ready yet.');
+      endPlannedMove(taskId);
+      return;
+    }
+    const itemId = row.item_id;
+    if (row.local_date === date) {
+      // Already on the target day: a hovered-card drop is a same-date agenda
+      // reorder, never a reschedule (a same-date reschedule would drop the
+      // rank server-side).
+      if (targetRank !== undefined) {
+        const rowsSnapshot = readPlannedBoardCache()?.rows;
+        patchPlannedRows((rows) =>
+          applyPlannedAgendaMove(rows, date, itemId, targetRank),
+        );
+        try {
+          const data = await moveAgendaItemMutation.mutateAsync({
+            id: itemId,
+            input: { sort_order: targetRank },
+          });
+          mergePlannedItem(data.item);
+        } catch (err) {
+          if (rowsSnapshot) restorePlannedRows(rowsSnapshot);
+          setActionError(plannedMoveError(err));
+        }
+      }
+      endPlannedMove(taskId);
+      return;
+    }
+    const input: RescheduleAgendaItemInput =
+      targetRank === undefined ? { date } : { date, sort_order: targetRank };
+    try {
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: itemId,
+        input,
+      });
+      mergePlannedItem(data.item);
+    } catch (err) {
+      setActionError(
+        `Moved to Planned, but could not move it to ${label}: ${plannedMoveError(err)}`,
+      );
+      refreshPlannedBoard();
+    } finally {
+      endPlannedMove(taskId);
+    }
+  };
+
+  /** Non-PLANNED → Undated / column body: status + Board rank in one `/move`,
+   *  then the explicit unschedule only if the task arrived with a dated row.
+   *  Same two-phase publication as `joinDated`. */
+  const joinUndated = async (
+    taskId: string,
+    targetRank: number,
+  ): Promise<void> => {
+    if (!beginPlannedMove(taskId)) return;
+    await cancelPlannedRead();
+    let first: MoveTaskResponse;
+    try {
+      first = await moveTaskMutation.mutateAsync({
+        id: taskId,
+        input: { status: 'PLANNED', sort_order: targetRank },
+      });
+    } catch (err) {
+      setActionError(plannedMoveError(err));
+      endPlannedMove(taskId);
+      return;
+    }
+
+    let board;
+    try {
+      board = await getPlannedBoard();
+    } catch (err) {
+      // Same honest-state policy as `joinDated`: never paint a PLANNED task
+      // without its row (that would flash a false Undated card). Refetch both
+      // reads and leave the source column as-is until they land.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.tasks.all });
+      refreshPlannedBoard();
+      setActionError(
+        `Moved to Planned, but could not move it to Undated: ${plannedMoveError(err)}`,
+      );
+      endPlannedMove(taskId);
+      return;
+    }
+    setPlannedBoardCache(board);
+    setTasks((prev) => replaceCachedTask(prev, first.task));
+    const row = board.rows.find((entry) => entry.task_id === taskId);
+    // Rowless or already-undated is the target: nothing left to write.
+    if (!row || row.undated || !row.item_id) {
+      endPlannedMove(taskId);
+      return;
+    }
+    try {
+      const data = await rescheduleAgendaItemMutation.mutateAsync({
+        id: row.item_id,
+        input: { unschedule: true },
+      });
+      mergePlannedItem(data.item, true);
+    } catch (err) {
+      setActionError(
+        `Moved to Planned, but could not move it to Undated: ${plannedMoveError(err)}`,
+      );
+      refreshPlannedBoard();
+    } finally {
+      endPlannedMove(taskId);
+    }
+  };
+
+  /** Carries one `resolvePlannedDrop` decision out. Each handler owns its own
+   *  in-flight lock, snapshot and banner. */
+  const executePlannedDecision = async (
+    taskId: string,
+    decision: PlannedDropDecision,
+  ): Promise<void> => {
+    switch (decision.kind) {
+      case 'reorderDated':
+        await reorderDated(
+          taskId,
+          decision.group,
+          decision.itemId,
+          decision.targetRank,
+        );
+        return;
+      case 'moveToDate':
+        await moveToDate(
+          taskId,
+          decision.group,
+          decision.itemId,
+          decision.targetRank,
+        );
+        return;
+      case 'unschedule':
+        await unschedule(taskId, decision.itemId);
+        return;
+      case 'reorderUndated':
+        await reorderUndated(decision.taskId, decision.targetRank);
+        return;
+      case 'joinDated':
+        await joinDated(taskId, decision.group, decision.targetRank);
+        return;
+      case 'joinUndated':
+        await joinUndated(taskId, decision.targetRank);
+        return;
+      case 'none':
+      case 'leavePlanned':
+        return;
+    }
+  };
+
   /** Resolves a drop against the displayed (filtered + capped) lists and
    *  starts the optimistic move, or does nothing (dropped back onto its own
    *  slot). A drop onto In Progress is a plain `/move` — it starts the card
@@ -632,17 +1272,76 @@ export function BoardPage() {
     // The preview is throwaway — clearing restores the committed columns
     // even when the /move below fails and reverts `tasks`.
     setDragItems(null);
+    // The group placeholder is throwaway too: never let it outlive the drag.
+    plannedHoverRef.current = null;
+    setPlannedHover(null);
     if (!over || typeof active.id !== 'string') return;
     const activeId = active.id;
 
     const activeTask = tasksRef.current.find((task) => task.id === activeId);
     if (!activeTask) return;
 
+    const overId = over.id;
+
+    // ── Planned column (ADR 0014 § DnD matrix) ────────────────────────
+    // Only ids that belong to the CURRENT grouped Planned render count: a
+    // card, a group section, or the column's padding. When the placement read
+    // is missing/errored (`!plannedReady`) this whole branch is off and the
+    // flat path below keeps the old Board semantics, so a column-body drop is
+    // a plain status/rank `/move`, not a guessed date write.
+    const plannedTarget =
+      typeof overId === 'string' ? plannedTargetForOver(overId) : null;
+    if (plannedTarget) {
+      // The committed grouping still holds the mover, so its own group is
+      // resolvable even while the flat preview has moved it elsewhere.
+      const activeGroup = plannedGroupOfTask(plannedGroups, activeId);
+      const decision = resolvePlannedDrop({
+        activeTaskId: activeId,
+        activeStatus: activeTask.status,
+        activeGroup,
+        over: plannedTarget,
+        groups: plannedGroups,
+        rows: plannedRowsByTask,
+        tasks: taskById,
+        today: plannedToday,
+      });
+      if (decision.kind === 'none') {
+        const targetGroup = plannedTargetGroup(plannedTarget, plannedGroups);
+        // Prefer the rowless explanation when both apply: without an
+        // `agenda_items` row there is no date write to perform at all.
+        const rowless =
+          targetGroup?.date != null &&
+          activeTask.status === 'PLANNED' &&
+          plannedRowsByTask.get(activeId)?.item_id == null;
+        if (rowless) {
+          setActionError(
+            'This task has no agenda row yet — try again after the next sync.',
+          );
+        } else if (
+          targetGroup?.date != null &&
+          plannedToday !== '' &&
+          targetGroup.date < plannedToday &&
+          activeGroup?.id !== targetGroup.id
+        ) {
+          // A past dated group is readable but refuses date changes. Say so
+          // instead of leaving an inexplicably inert drop (a same-group reorder
+          // is not a date change and never reaches this branch).
+          setActionError('Past days are read-only on the Board.');
+        }
+        return;
+      }
+      if (decision.kind !== 'leavePlanned') {
+        void executePlannedDecision(activeId, decision);
+        return;
+      }
+      // `leavePlanned` (a Planned target that is not PLANNED — unreachable in
+      // the grouped render) falls through to the flat path.
+    }
+
     // `over` is either a card (task id) or a column (`column:<status>`).
     // Dest IDENTITY prefers the preview column (where the pointer last saw
     // things); every index math stays on committed `tasksForColumn` — the
     // preview decides where the card goes, never what gets sent.
-    const overId = over.id;
     let destStatus: TaskStatus;
     let destIndex: number; // view index in the dest column's displayed list
     // Only the self-over branch yields a PREVIEW index; it is already shaped
@@ -1074,6 +1773,7 @@ export function BoardPage() {
                 if (listsQuery.isSuccess) {
                   void tasksQuery.refetch();
                   void categoriesQuery.refetch();
+                  void plannedQuery.refetch();
                 }
               }}
             >
@@ -1178,6 +1878,8 @@ export function BoardPage() {
             // Discard the preview or a cancelled cross-column hover would
             // leave the ghost parked in dest.
             setDragItems(null);
+            plannedHoverRef.current = null;
+            setPlannedHover(null);
           }}
         >
           <div
@@ -1202,6 +1904,21 @@ export function BoardPage() {
                   onToggleFocus={handleToggleFocus}
                   focusDisabled={focusInFlight}
                   onAddTask={openCreateTask}
+                  plannedGroups={
+                    column.status === 'PLANNED' && plannedReady
+                      ? plannedGroups
+                      : undefined
+                  }
+                  plannedToday={plannedToday}
+                  plannedPreview={
+                    column.status === 'PLANNED' ? plannedHover : null
+                  }
+                  plannedReady={plannedReady}
+                  hiddenTaskId={
+                    column.status === 'PLANNED'
+                      ? (activeDrag?.id ?? null)
+                      : null
+                  }
                 />
               ))}
             </div>

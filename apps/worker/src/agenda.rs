@@ -260,6 +260,44 @@ pub async fn get_agenda(
     }
 }
 
+/// `GET /api/board/planned` → 200 `{"today":"YYYY-MM-DD","time_zone":"IANA",
+/// "rows":[{"task_id":…,"item_id":…,"local_date":…,"agenda_sort_order":…,
+/// "board_sort_order":…,"undated":…}]}`.
+///
+/// One row per living `PLANNED` task of the authenticated user. The task's
+/// single `agenda_items` row (kind `task`, any date) supplies
+/// `item_id`/`local_date`/`agenda_sort_order`; a rowless task paints all three
+/// `null`. `undated` is server-computed (ADR 0013): rowless, or the row sits
+/// at/after the `today + 10 years` planning horizon. Dated rows come first in
+/// `(local_date, agenda_sort_order, task_id)` order, then undated rows in
+/// `(tasks.sort_order, task_id)` order. Session/API-key gated; **pure read** —
+/// it seeds nothing and writes no agenda row.
+pub async fn planned_board(
+    req: Request,
+    ctx: RouteContext<Option<api_core::Config>>,
+) -> Result<Response> {
+    let Some(user) = crate::auth::authenticate(&req, &ctx).await else {
+        return unauthorized(&ctx);
+    };
+    let now_unix = (worker::Date::now().as_millis() / 1000) as i64;
+
+    match api_core::get_planned_board(
+        &calendars_d1(&ctx)?,
+        &tasks_d1(&ctx)?,
+        &agenda_d1(&ctx)?,
+        &user.id,
+        now_unix,
+    )
+    .await
+    {
+        Ok(response) => {
+            let response = Response::from_json(&response)?;
+            Ok(response.with_headers(crate::auth::json_headers(crate::auth::frontend_url(&ctx))?))
+        }
+        Err(err) => map_error(&ctx, err),
+    }
+}
+
 /// `POST /api/agenda/items/:id/move` → 200 `{"item":{...}}`. Body:
 /// `{sort_order}` (>= 0, required). Reorders that item's date pile only;
 /// same-rank is a 200 no-op.

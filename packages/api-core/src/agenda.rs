@@ -10707,4 +10707,274 @@ mod tests {
             vec![("task-1".to_string(), 0, "2076-08-23".to_string())]
         );
     }
+
+    // ──────────────────────────────────────────
+    // GET /api/board/planned — date-grouped Planned column read
+    // ──────────────────────────────────────────
+
+    /// The new read reuses the agenda fakes: a PLANNED task in `tasks` plus
+    /// (optionally) its single `kind = task` agenda row.
+    fn planned_board(
+        repos: &Repos,
+        user_id: &str,
+    ) -> Result<crate::board::PlannedBoardResponse, AgendaError> {
+        pollster::block_on(crate::board::get_planned_board(
+            &repos.calendars,
+            &repos.tasks,
+            &repos.agenda,
+            user_id,
+            NOW_UNIX,
+        ))
+    }
+
+    fn planned_task(repos: &Repos, id: &str, user_id: &str, board_rank: i64) {
+        let mut task = task_row(id, user_id, "Plan | Work", TASK_STATUS_PLANNED);
+        task.sort_order = board_rank;
+        repos.tasks.push(task);
+    }
+
+    #[test]
+    fn planned_board_dated_rows_sort_by_date_then_agenda_rank_then_task_id() {
+        let repos = repos();
+        planned_task(&repos, "t-late", "u-1", 0);
+        planned_task(&repos, "t-b", "u-1", 8);
+        planned_task(&repos, "t-a", "u-1", 1);
+        planned_task(&repos, "t-z-tie", "u-1", 6);
+        planned_task(&repos, "t-a-tie", "u-1", 7);
+        agenda_row(&repos, "ai-late", "u-1", "2026-08-26", AGENDA_KIND_TASK, "t-late", 0);
+        agenda_row(&repos, "ai-a", "u-1", "2026-08-24", AGENDA_KIND_TASK, "t-a", 2);
+        agenda_row(&repos, "ai-b", "u-1", "2026-08-24", AGENDA_KIND_TASK, "t-b", 1);
+        // Same date and rank: the task id breaks the tie.
+        agenda_row(&repos, "ai-z-tie", "u-1", "2026-08-25", AGENDA_KIND_TASK, "t-z-tie", 0);
+        agenda_row(&repos, "ai-a-tie", "u-1", "2026-08-25", AGENDA_KIND_TASK, "t-a-tie", 0);
+
+        let board = planned_board(&repos, "u-1").expect("planned board");
+
+        assert_eq!(board.today, "2026-08-23");
+        assert_eq!(board.time_zone, "UTC");
+        assert_eq!(
+            board
+                .rows
+                .iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-b", "t-a", "t-a-tie", "t-z-tie", "t-late"],
+            "date first, then the agenda rank, then the task id"
+        );
+        let first = &board.rows[0];
+        assert_eq!(first.item_id.as_deref(), Some("ai-b"));
+        assert_eq!(first.local_date.as_deref(), Some("2026-08-24"));
+        assert_eq!(first.agenda_sort_order, Some(1));
+        assert_eq!(first.board_sort_order, 8, "board rank is the task's own");
+        assert!(!first.undated);
+        let last = &board.rows[4];
+        assert_eq!(last.item_id.as_deref(), Some("ai-late"));
+        assert_eq!(last.agenda_sort_order, Some(0));
+        assert!(!last.undated);
+    }
+
+    #[test]
+    fn planned_board_horizon_rows_are_undated_and_sort_by_board_rank_after_dated_rows() {
+        let repos = repos();
+        // A dated row with the *highest* board rank still precedes every
+        // undated row: the date spine wins.
+        planned_task(&repos, "t-dated", "u-1", 9);
+        agenda_row(&repos, "ai-dated", "u-1", "2026-08-24", AGENDA_KIND_TASK, "t-dated", 0);
+        // The day before the horizon is still dated; the horizon day itself
+        // (`today + 10y`, 2036-08-23) is the undated region.
+        planned_task(&repos, "t-before-horizon", "u-1", 3);
+        agenda_row(
+            &repos,
+            "ai-before-horizon",
+            "u-1",
+            "2036-08-22",
+            AGENDA_KIND_TASK,
+            "t-before-horizon",
+            0,
+        );
+        planned_task(&repos, "t-horizon", "u-1", 4);
+        planned_task(&repos, "t-backlog", "u-1", 1);
+        planned_task(&repos, "t-tie", "u-1", 1);
+        agenda_row(
+            &repos,
+            "ai-horizon",
+            "u-1",
+            "2036-08-23",
+            AGENDA_KIND_TASK,
+            "t-horizon",
+            3,
+        );
+        agenda_row(
+            &repos,
+            "ai-backlog",
+            "u-1",
+            "2076-08-23",
+            AGENDA_KIND_TASK,
+            "t-backlog",
+            5,
+        );
+        agenda_row(&repos, "ai-tie", "u-1", "2036-09-01", AGENDA_KIND_TASK, "t-tie", 0);
+
+        let board = planned_board(&repos, "u-1").expect("planned board");
+
+        assert_eq!(
+            board
+                .rows
+                .iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "t-dated",
+                "t-before-horizon",
+                "t-backlog",
+                "t-tie",
+                "t-horizon"
+            ],
+            "dated rows by date, then undated rows by board rank (ties by task id)"
+        );
+        assert!(!board.rows[0].undated);
+        let before_horizon = &board.rows[1];
+        assert!(
+            !before_horizon.undated,
+            "today+10y-1 is still a dated day"
+        );
+        assert_eq!(before_horizon.local_date.as_deref(), Some("2036-08-22"));
+        let backlog = &board.rows[2];
+        assert!(backlog.undated, "the 50-year sentinel is undated");
+        assert_eq!(backlog.item_id.as_deref(), Some("ai-backlog"));
+        assert_eq!(backlog.local_date.as_deref(), Some("2076-08-23"));
+        assert_eq!(backlog.agenda_sort_order, Some(5), "the row's own rank");
+        assert_eq!(backlog.board_sort_order, 1);
+        let at_horizon = &board.rows[4];
+        assert!(at_horizon.undated, "today+10y itself is the undated region");
+        assert_eq!(at_horizon.local_date.as_deref(), Some("2036-08-23"));
+        assert_eq!(at_horizon.agenda_sort_order, Some(3));
+        assert_eq!(at_horizon.board_sort_order, 4);
+    }
+
+    #[test]
+    fn planned_board_empty_user_is_an_empty_read() {
+        let repos = repos();
+        let board = planned_board(&repos, "u-empty").expect("planned board");
+
+        assert!(board.rows.is_empty());
+        assert_eq!(board.today, "2026-08-23");
+        assert_eq!(board.time_zone, "UTC");
+    }
+
+    #[test]
+    fn planned_board_rowless_task_is_undated_with_null_membership_fields() {
+        let repos = repos();
+        planned_task(&repos, "t-rowless", "u-1", 2);
+        planned_task(&repos, "t-dated", "u-1", 0);
+        agenda_row(&repos, "ai-dated", "u-1", "2026-08-24", AGENDA_KIND_TASK, "t-dated", 0);
+
+        let board = planned_board(&repos, "u-1").expect("planned board");
+
+        assert_eq!(
+            board
+                .rows
+                .iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-dated", "t-rowless"]
+        );
+        let rowless = &board.rows[1];
+        assert_eq!(rowless.item_id, None);
+        assert_eq!(rowless.local_date, None);
+        assert_eq!(rowless.agenda_sort_order, None);
+        assert_eq!(rowless.board_sort_order, 2);
+        assert!(rowless.undated);
+    }
+
+    #[test]
+    fn planned_board_excludes_non_planned_tasks() {
+        let repos = repos();
+        for (id, status) in [
+            ("t-open", TASK_STATUS_OPEN),
+            ("t-running", TASK_STATUS_IN_PROGRESS),
+            ("t-waiting", TASK_STATUS_WAITING),
+            ("t-done", TASK_STATUS_COMPLETED),
+            ("t-discarded", TASK_STATUS_DISCARDED),
+        ] {
+            let mut task = task_row(id, "u-1", "Other | Work", status);
+            task.sort_order = 0;
+            repos.tasks.push(task);
+            // A dating row must not smuggle a non-PLANNED task onto the
+            // Planned column.
+            agenda_row(&repos, &format!("ai-{id}"), "u-1", "2026-08-24", AGENDA_KIND_TASK, id, 0);
+        }
+        // A soft-deleted PLANNED task is not living: neither it nor its row
+        // belongs on the column.
+        let mut deleted = task_row("t-deleted", "u-1", "Gone | Work", TASK_STATUS_PLANNED);
+        deleted.deleted_at = Some("2026-08-23T00:00:00Z".to_string());
+        repos.tasks.push(deleted);
+        agenda_row(
+            &repos,
+            "ai-deleted",
+            "u-1",
+            "2026-08-24",
+            AGENDA_KIND_TASK,
+            "t-deleted",
+            0,
+        );
+        planned_task(&repos, "t-planned", "u-1", 5);
+
+        let board = planned_board(&repos, "u-1").expect("planned board");
+
+        assert_eq!(
+            board
+                .rows
+                .iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-planned"]
+        );
+        assert!(board.rows[0].undated);
+    }
+
+    #[test]
+    fn planned_board_excludes_other_users_tasks_and_rows() {
+        let repos = repos();
+        planned_task(&repos, "t-mine", "u-1", 0);
+        planned_task(&repos, "t-theirs", "u-2", 0);
+        agenda_row(&repos, "ai-theirs", "u-2", "2026-08-24", AGENDA_KIND_TASK, "t-theirs", 0);
+        // Another user's row referencing my task id is not mine: it must not
+        // date my row (the repo read is user-scoped).
+        repos.agenda.stored.lock().unwrap().push(AgendaItem {
+            id: "ai-cross-user".to_string(),
+            user_id: "u-2".to_string(),
+            local_date: "2026-08-25".to_string(),
+            kind: AGENDA_KIND_TASK.to_string(),
+            ref_id: "t-mine".to_string(),
+            sort_order: 0,
+            created_at: "2026-08-23T00:00:00Z".to_string(),
+            updated_at: "2026-08-23T00:00:00Z".to_string(),
+        });
+
+        let board = planned_board(&repos, "u-1").expect("planned board");
+
+        assert_eq!(
+            board
+                .rows
+                .iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-mine"]
+        );
+        assert_eq!(board.rows[0].item_id, None, "another user's row is invisible");
+        assert_eq!(board.rows[0].local_date, None);
+        assert!(board.rows[0].undated);
+
+        let theirs = planned_board(&repos, "u-2").expect("u-2 board");
+        assert_eq!(
+            theirs
+                .rows
+                .iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t-theirs"]
+        );
+        assert_eq!(theirs.rows[0].item_id.as_deref(), Some("ai-theirs"));
+    }
 }

@@ -703,6 +703,47 @@ export interface OccurrenceActionResponse {
 }
 
 // ──────────────────────────────────────────
+// Planned Board (ADR 0014) — the date-grouped Planned column, mirroring
+// `packages/api-core/src/board.rs`.
+//
+// `GET /api/board/planned` returns one row per **living `PLANNED` task only**
+// (never another status, never a terminal or soft-deleted row). A task is
+// either dated (it holds an agenda row before the planning horizon) or
+// undated. `undated` is **server-computed** with the 10-year horizon: `true`
+// when the task has no agenda row, or its row's `local_date` is at/after
+// `today + 120 months`. The browser never recomputes it from its own clock.
+//
+// `rows` is ordered dated-first (by `local_date`, `agenda_sort_order`,
+// `task_id`), then undated (by `board_sort_order`, `task_id`). The client still
+// groups by `local_date` because the display's own ordering is view-relative.
+// ──────────────────────────────────────────
+
+export interface PlannedBoardRow {
+  /** `tasks.id`. */
+  task_id: string;
+  /** The agenda item's id, or `null` when the task has no row. */
+  item_id: string | null;
+  /** The agenda row's local civil date (`YYYY-MM-DD`), or `null` when rowless. */
+  local_date: string | null;
+  /** The agenda row's rank inside its date pile, or `null` when rowless. */
+  agenda_sort_order: number | null;
+  /** The task's own `tasks.sort_order` — always present; orders Undated. */
+  board_sort_order: number;
+  /** Server-computed 10-year-horizon flag (see above). */
+  undated: boolean;
+}
+
+// The envelope returned by GET /api/board/planned.
+export interface PlannedBoardResponse {
+  /** `YYYY-MM-DD` — civil today in `time_zone` (the server's, never ours). */
+  today: string;
+  /** IANA zone that produced `today` (primary calendar's zone, else "UTC"). */
+  time_zone: string;
+  /** One row per living `PLANNED` task, dated first then undated. */
+  rows: PlannedBoardRow[];
+}
+
+// ──────────────────────────────────────────
 // Consistency rules (reports slice 4) — shapes mirror
 // `packages/api-core/src/rules/{score,params,service}.rs`.
 // ──────────────────────────────────────────

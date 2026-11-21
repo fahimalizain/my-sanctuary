@@ -231,6 +231,7 @@ pub(crate) fn router(
         .delete_async("/api/pauses/:id", rules::delete_pause)
         .options("/api/pauses", auth::options)
         .options("/api/pauses/:id", auth::options)
+        .get_async("/api/board/planned", agenda::planned_board)
         .get_async("/api/agenda", agenda::get_agenda)
         .post_async("/api/agenda/items/:id/move", agenda::move_agenda_item)
         .post_async(
@@ -241,6 +242,7 @@ pub(crate) fn router(
             "/api/agenda/days/:date/move-to-today",
             agenda::move_day_to_today,
         )
+        .options("/api/board/planned", auth::options)
         .options("/api/agenda", auth::options)
         .options("/api/agenda/items/:id/move", auth::options)
         .options("/api/agenda/items/:id/reschedule", auth::options)
