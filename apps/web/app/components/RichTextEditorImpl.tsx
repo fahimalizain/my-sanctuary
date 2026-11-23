@@ -166,7 +166,7 @@ export function RichTextEditorImpl({
       )}
     >
       <div
-        className="flex flex-wrap items-center gap-0.5 border-b border-border/70 bg-muted/30 px-2 py-1.5"
+        className="sanctuary-editor-toolbar flex flex-nowrap items-center gap-0.5 overflow-x-auto border-b border-border/70 bg-muted/30 px-2 py-1.5"
         role="toolbar"
         aria-label="Formatting"
       >
@@ -315,7 +315,7 @@ function ToolbarButton({
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(
-        'rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-background hover:text-foreground',
+        'shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-background hover:text-foreground',
         active && 'bg-background text-primary shadow-sm',
       )}
     >
@@ -325,7 +325,7 @@ function ToolbarButton({
 }
 
 function Divider() {
-  return <span className="mx-1 h-4 w-px bg-border/70" aria-hidden />;
+  return <span className="mx-1 h-4 w-px shrink-0 bg-border/70" aria-hidden />;
 }
 
 /** Only http(s) and mailto links leave the editor. */

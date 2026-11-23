@@ -114,6 +114,27 @@
 }
 
 @layer components {
+  /* One horizontal row that scrolls on narrow dialogs instead of wrapping
+     into a second row and eating the description's height. */
+  .sanctuary-editor-toolbar {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border) / 0.35) transparent;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .sanctuary-editor-toolbar::-webkit-scrollbar {
+    height: 4px;
+  }
+
+  .sanctuary-editor-toolbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .sanctuary-editor-toolbar::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background: hsl(var(--border) / 0.35);
+  }
+
   /* TipTap's editable surface. The toolbar supplies the border; this is the
      document area only. Keep the prose compact — descriptions live in dense
      dialogs, not article pages. */
