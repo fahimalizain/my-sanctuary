@@ -3,6 +3,7 @@ import { CSS } from '@dnd-kit/utilities';
 import { GripVertical, Pencil, Trash2 } from 'lucide-react';
 import type { RoutineRecord } from '@/app/types';
 import { cn } from '@/lib/utils';
+import { markdownPreview } from './description-preview';
 import {
   addCivilDays,
   civilToday,
@@ -48,6 +49,7 @@ export function SortableRoutineRow({
     from,
     to: addCivilDays(from, 30),
   });
+  const descriptionPreview = markdownPreview(routine.description);
 
   return (
     <div
@@ -114,6 +116,11 @@ export function SortableRoutineRow({
           </span>
         )}
       </div>
+      {descriptionPreview && (
+        <p className="mt-1.5 line-clamp-2 text-xs text-muted-foreground/90">
+          {descriptionPreview}
+        </p>
+      )}
     </div>
   );
 }

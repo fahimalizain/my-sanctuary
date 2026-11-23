@@ -1663,6 +1663,10 @@ pub async fn start_occurrence(
         .as_deref()
         .unwrap_or(&routine.title)
         .to_string();
+    // The one-shot event carries the routine's standing notes rendered to
+    // readable plain text (ADR 0015); blank notes omit the key entirely (same
+    // convention as task starts).
+    let description = crate::rich_text::markdown_to_calendar_text(&routine.description);
     let taxonomy = load_taxonomy_seeded(list_repo, category_repo, user_id).await?;
     let target = resolve_occurrence_calendar(calendars, &taxonomy, &resolved_title, user_id).await?;
 
@@ -1682,7 +1686,11 @@ pub async fn start_occurrence(
             calendar_id: target.calendar_id.clone(),
             calendar_id_explicit: true,
             summary: resolved_title,
-            description: None,
+            description: if description.is_empty() {
+                None
+            } else {
+                Some(description)
+            },
             start: start_rfc3339,
             end: end_rfc3339,
             task_id: None,
@@ -2868,6 +2876,7 @@ mod tests {
                 id: id.to_string(),
                 user_id: user_id.to_string(),
                 title: title.to_string(),
+                description: String::new(),
                 estimated_minutes: 15,
                 rrule: rrule.to_string(),
                 sort_order,
@@ -2909,6 +2918,7 @@ mod tests {
                 id: format!("rt-{next}"),
                 user_id: routine.user_id,
                 title: routine.title,
+                description: routine.description,
                 estimated_minutes: routine.estimated_minutes,
                 rrule: routine.rrule,
                 sort_order: routine.sort_order,
@@ -8553,6 +8563,10 @@ mod tests {
         assert!(url.contains("primary%40example.com"), "{url}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["summary"], "Fajr Qadha", "resolved title at start");
+        assert!(
+            body.get("description").is_none(),
+            "blank routine notes omit the key: {body}"
+        );
         assert_eq!(body["start"]["dateTime"], "2026-08-23T10:00:00Z");
         assert_eq!(
             body["end"]["dateTime"], "2026-08-23T10:15:00Z",
@@ -8590,6 +8604,44 @@ mod tests {
         assert_eq!(upserted[0].task_id, "", "calendar_events.task_id stays empty");
         assert_eq!(upserted[0].title, "Fajr Qadha", "the response echo maps the summary");
         assert_eq!(upserted[0].recurrence, "", "no recurrence on the cache row");
+    }
+
+    #[test]
+    fn start_copies_the_routine_description_to_the_event() {
+        let repos = repos();
+        seed_occurrence(&repos, OCCURRENCE_STATUS_PENDING);
+        // The routine's standing notes ride onto the one-shot log, rendered
+        // from Markdown to readable plain text.
+        repos.routines.stored.lock().unwrap()[0].description =
+            "**Bring** the mat\n\n- water".to_string();
+        let http = FakeHttp::new(vec![(
+            "/calendars/primary%40example.com/events",
+            200,
+            &created_occurrence_json("rt-1", "occ-1", "2026-08-23T10:00:00Z", "2026-08-23T10:15:00Z"),
+        )]);
+        let calendars = FakeCalendarRepo::with(vec![calendar("primary@example.com", true)]);
+        let events = FakeEventRepo::new();
+
+        pollster::block_on(start_occurrence(
+            &http,
+            &calendars,
+            &events, &ops(),
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            &repos.occurrences,
+            &repos.agenda,
+            &access(),
+            "u-1",
+            "occ-1",
+            NOW_UNIX,
+            noop_notify(),
+        ))
+        .unwrap();
+
+        let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["description"], "Bring the mat\n\n- water", "{body}");
     }
 
     /// The occurrence flow over the standalone stand-in: the only
@@ -9685,6 +9737,7 @@ mod tests {
             user_id,
             &NewRoutineInput {
                 title: title.to_string(),
+                description: None,
                 estimated_minutes: None,
                 rrule: rrule.to_string(),
             },

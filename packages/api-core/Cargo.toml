@@ -12,6 +12,7 @@ chrono-tz = "0.9"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 getrandom = { version = "0.2", features = ["js"] }
 pbkdf2 = "0.12"
+pulldown-cmark = { version = "0.13", default-features = false }
 regex = "1"
 rrule = "0.13"
 regex-syntax = "0.8"

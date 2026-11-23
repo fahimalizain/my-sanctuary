@@ -1175,6 +1175,10 @@ pub async fn create_task(
     if title.is_empty() {
         return Err(TasksError::Invalid("title must not be empty".to_string()));
     }
+    let description = input.description.as_deref().unwrap_or("").trim();
+    if !crate::rich_text::description_is_within_limit(description) {
+        return Err(TasksError::Invalid("description too long".to_string()));
+    }
     let duration_minutes = input.duration_minutes.unwrap_or(DEFAULT_DURATION_MINUTES);
     if duration_minutes < MIN_DURATION_MINUTES {
         return Err(TasksError::Invalid("duration must be at least 1 minute".to_string()));
@@ -1218,7 +1222,7 @@ pub async fn create_task(
         .insert(NewTask {
             user_id: user_id.to_string(),
             title,
-            description: input.description.as_deref().unwrap_or("").trim().to_string(),
+            description: description.to_string(),
             duration_minutes,
             priority,
             difficulty,
@@ -1265,6 +1269,11 @@ pub async fn update_task(
         && updates.difficulty.is_none()
     {
         return Err(TasksError::Invalid("nothing to update".to_string()));
+    }
+    if let Some(description) = updates.description.as_deref() {
+        if !crate::rich_text::description_is_within_limit(description) {
+            return Err(TasksError::Invalid("description too long".to_string()));
+        }
     }
     if let Some(duration_minutes) = updates.duration_minutes {
         if duration_minutes < MIN_DURATION_MINUTES {
@@ -1418,16 +1427,14 @@ fn task_segment_input(
     start: String,
     end: String,
 ) -> NewEventInput {
-    let notes = task.description.trim();
+    // Markdown is our storage format (ADR 0015); Google gets the readable
+    // rendering, never the `**`/`#`/backticks.
+    let notes = crate::rich_text::markdown_to_calendar_text(&task.description);
     NewEventInput {
         calendar_id,
         calendar_id_explicit: true,
         summary: task.title.clone(),
-        description: if notes.is_empty() {
-            None
-        } else {
-            Some(notes.to_string())
-        },
+        description: if notes.is_empty() { None } else { Some(notes) },
         start,
         end,
         task_id: Some(task.id.clone()),
@@ -4812,6 +4819,36 @@ mod tests {
     }
 
     #[test]
+    fn description_is_capped_on_create_and_update() {
+        let (lists, categories, tasks, agenda, calendars) = seeded();
+        let too_long = "x".repeat(crate::rich_text::MAX_DESCRIPTION_BYTES + 1);
+        let create = NewTaskInput {
+            description: Some(too_long.clone()),
+            ..input("Work")
+        };
+        assert!(matches!(
+            pollster::block_on(create_task(
+                &lists, &categories, &tasks, "u-1", &create, &agenda, &calendars, NOW_UNIX
+            )),
+            Err(TasksError::Invalid(m)) if m == "description too long"
+        ));
+
+        let created = pollster::block_on(create_task(
+            &lists, &categories, &tasks, "u-1", &input("Work"), &agenda, &calendars, NOW_UNIX,
+        ))
+        .unwrap()
+        .task;
+        let update = UpdateTask {
+            description: Some(too_long),
+            ..UpdateTask::default()
+        };
+        assert!(matches!(
+            pollster::block_on(update_task(&categories, &tasks, "u-1", &created.id, &update)),
+            Err(TasksError::Invalid(m)) if m == "description too long"
+        ));
+    }
+
+    #[test]
     fn first_create_seeds_taxonomy_so_fresh_user_can_file_tasks() {
         let lists = FakeTaskListRepo::new();
         let categories = FakeTaskCategoryRepo::new();
@@ -6713,7 +6750,7 @@ mod tests {
     fn start_carries_task_notes_onto_the_insert_body() {
         let (lists, categories, tasks, agenda, calendars) = seeded();
         let mut notes_input = input("Work");
-        notes_input.description = Some("Deep focus session".to_string());
+        notes_input.description = Some("**Deep** focus\n\n- one".to_string());
         let task = pollster::block_on(create_task(
             &lists, &categories, &tasks, "u-1", &notes_input, &agenda, &calendars, NOW_UNIX,
         ))
@@ -6736,10 +6773,11 @@ mod tests {
         ))
         .unwrap();
 
-        // The task's notes ride onto the Google `description` at create time.
+        // The task's notes ride onto the Google `description` at create time,
+        // rendered from Markdown to readable plain text.
         let (_, body) = http.posts.lock().unwrap().first().unwrap().clone();
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(body["description"], "Deep focus session");
+        assert_eq!(body["description"], "Deep focus\n\n- one");
     }
 
     #[test]

@@ -123,10 +123,11 @@ pub async fn list_routines(
 }
 
 /// `POST /api/routines` → 200 `{"routine":{...}}`. Body:
-/// `{title, estimated_minutes?, rrule}` — `rrule` is the two-line recurrence
-/// blob (`DTSTART:` line + `RRULE:` line). Invalid rrule or a title that does
-/// not uniquely classify is 400; nothing is persisted then. A successful
-/// create fills the routine's occurrence horizon (today … today+6).
+/// `{title, description?, estimated_minutes?, rrule}` — `rrule` is the
+/// two-line recurrence blob (`DTSTART:` line + `RRULE:` line). Invalid rrule
+/// or a title that does not uniquely classify is 400; nothing is persisted
+/// then. A successful create fills the routine's occurrence horizon
+/// (today … today+6).
 pub async fn create_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,
@@ -190,9 +191,9 @@ pub async fn reorder_routines(
 }
 
 /// `PATCH /api/routines/:id` → 200 `{"routine":{...}}`. Body:
-/// `{title?, estimated_minutes?, rrule?, sort_order?}` — at least one field
-/// required (400 otherwise). A changed `rrule` reconciles the horizon: only
-/// untouched rows from tomorrow through today+6 are rewritten.
+/// `{title?, description?, estimated_minutes?, rrule?, sort_order?}` — at
+/// least one field required (400 otherwise). A changed `rrule` reconciles the
+/// horizon: only untouched rows from tomorrow through today+6 are rewritten.
 pub async fn update_routine(
     mut req: Request,
     ctx: RouteContext<Option<api_core::Config>>,

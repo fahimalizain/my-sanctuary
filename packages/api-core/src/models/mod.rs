@@ -604,6 +604,10 @@ pub struct Routine {
     pub id: String,
     pub user_id: String,
     pub title: String,
+    /// Optional notes, mirroring `tasks.description`. Nullable column mapped
+    /// to `""` via [`de_empty_string`]; blank means "no description".
+    #[serde(default, deserialize_with = "de_empty_string")]
+    pub description: String,
     /// Planned estimate in minutes; service enforces `>= 1` (default 15).
     /// Deliberately NOT `duration_minutes` — that stays the task column.
     pub estimated_minutes: i64,
@@ -631,6 +635,8 @@ pub struct Routine {
 pub struct NewRoutine {
     pub user_id: String,
     pub title: String,
+    /// Empty string when the caller omitted a description.
+    pub description: String,
     pub estimated_minutes: i64,
     /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line).
     pub rrule: String,
@@ -644,6 +650,9 @@ pub struct NewRoutine {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NewRoutineInput {
     pub title: String,
+    /// Optional notes, trimmed on create. Omitted and blank both store `""`.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub estimated_minutes: Option<i64>,
     /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line),
@@ -658,6 +667,8 @@ pub struct NewRoutineInput {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub struct UpdateRoutine {
     pub title: Option<String>,
+    /// Present `""` clears the description; absent leaves it unchanged.
+    pub description: Option<String>,
     pub estimated_minutes: Option<i64>,
     /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line).
     pub rrule: Option<String>,
@@ -1048,6 +1059,23 @@ mod tests {
         assert_eq!(task.sort_order, 3, "rank is part of the row shape");
         assert_eq!(task.status, "OPEN");
         assert_eq!(task.deleted_at, None);
+    }
+
+    #[test]
+    fn routine_deserializes_from_d1_row_shape_with_null_description() {
+        let routine: Routine = serde_json::from_str(
+            r#"{
+                "id": "r-1", "user_id": "u-1", "title": "Fajr",
+                "description": null, "estimated_minutes": 15,
+                "rrule": "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
+                "sort_order": 0,
+                "created_at": "2026-08-18T00:00:00Z",
+                "updated_at": "2026-08-18T00:00:00Z", "deleted_at": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(routine.description, "", "NULL maps to empty string");
+        assert_eq!(routine.title, "Fajr");
     }
 
     #[test]

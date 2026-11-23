@@ -9,6 +9,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { CategoryPicker } from './CategoryPicker';
+import { RichTextEditor } from './RichTextEditor';
 import {
   useTitleClassification,
   type ClassifyStatus,
@@ -549,12 +550,10 @@ export function TaskModal({
                   (optional)
                 </span>
               </label>
-              <textarea
+              <RichTextEditor
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={setDescription}
                 placeholder="Add more details about this task..."
-                rows={3}
-                className="w-full px-4 py-3 rounded-xl border border-input bg-background text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all resize-none"
               />
             </div>
 

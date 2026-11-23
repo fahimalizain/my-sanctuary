@@ -493,6 +493,8 @@ export interface RoutineRecord {
   id: string;
   user_id: string;
   title: string;
+  // Optional notes, mirroring `TaskRecord.description`. Empty when unset.
+  description: string;
   estimated_minutes: number;
   // The whole recurrence in one TEXT blob — exactly two `\n`-separated lines
   // (ADR 0004 amendment): `DTSTART:YYYYMMDDTHHMMSS` (floating local, no
@@ -527,6 +529,8 @@ export interface ReorderRoutinesResponse {
 // blob (`DTSTART:` line + `RRULE:` line), validated on create.
 export interface NewRoutineInput {
   title: string;
+  // Optional notes; omitted and blank both store an empty description.
+  description?: string;
   estimated_minutes?: number;
   rrule: string;
 }
@@ -536,6 +540,8 @@ export interface NewRoutineInput {
 // blob is validated on its own (it carries its own DTSTART).
 export interface UpdateRoutineInput {
   title?: string;
+  // Present `''` clears the description; omitted leaves it unchanged.
+  description?: string;
   estimated_minutes?: number;
   rrule?: string;
   sort_order?: number;
