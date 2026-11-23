@@ -403,51 +403,53 @@ test('title commit: trim on blur; unchanged and blank are no-ops', () => {
 
 // ── 3. Description ──────────────────────────────────────────────────────
 
-test('description: writable textarea with placeholder when empty', () => {
+test('description: writable editor with placeholder when empty', async () => {
   mount({ event: makeEvent({ id: 'e1', description: '' }) });
-  const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
-  assert.equal(ta.tagName, 'TEXTAREA');
-  assert.equal(ta.value, '');
-  assert.equal(ta.placeholder, 'Description');
+  const editor = await screen.findByLabelText('Description');
+  assert.equal(editor.getAttribute('contenteditable'), 'true');
+  assert.equal(editor.textContent?.trim(), '');
+  const placeholder = editor.querySelector('[data-placeholder]');
+  assert.equal(placeholder?.getAttribute('data-placeholder'), 'Description');
 });
 
-test('description: writable textarea shows non-empty value', () => {
+test('description: writable editor shows non-empty value', async () => {
   mount({
     event: makeEvent({ id: 'e2', description: 'Bring snacks' }),
   });
-  const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
-  assert.equal(ta.value, 'Bring snacks');
+  const editor = await screen.findByLabelText('Description');
+  assert.equal(editor.getAttribute('contenteditable'), 'true');
+  assert.equal(editor.textContent?.trim(), 'Bring snacks');
 });
 
-test('description commit: trim on blur; unchanged no-op; clear commits empty', () => {
+test('description: writable editor renders stored HTML', async () => {
+  mount({
+    event: makeEvent({
+      id: 'e2-html',
+      description: '<p>Bring <b>snacks</b></p>',
+    }),
+  });
+  const editor = await screen.findByLabelText('Description');
+  assert.equal(editor.querySelector('strong')?.textContent, 'snacks');
+});
+
+test('description commit: unchanged no-op; clear commits empty', async () => {
   const spies = makeSpies();
   mount({ event: makeEvent({ id: 'e3', description: 'Bring snacks' }) }, spies);
 
-  const ta = screen.getByLabelText('Description') as HTMLTextAreaElement;
-  assert.equal(ta.value, 'Bring snacks');
+  const editor = await screen.findByLabelText('Description');
+  assert.equal(editor.textContent?.trim(), 'Bring snacks');
 
-  // Changed + trimmed → onSaveDescription once.
-  fireEvent.change(ta, { target: { value: '  Pack lunch  ' } });
-  fireEvent.blur(ta);
+  // Unchanged blur is a no-op.
+  fireEvent.blur(editor);
+  assert.equal(spies.saveDescriptionCalls.length, 0);
+
+  // Clear to an empty document → commits "" (unlike title).
+  editor.innerHTML = '<p><br></p>';
+  fireEvent.input(editor);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  fireEvent.blur(editor);
   assert.equal(spies.saveDescriptionCalls.length, 1);
-  assert.equal(spies.saveDescriptionCalls[0][0], 'Pack lunch');
-
-  // Same after trim → no-op.
-  fireEvent.change(ta, { target: { value: 'Pack lunch' } });
-  fireEvent.blur(ta);
-  assert.equal(spies.saveDescriptionCalls.length, 1);
-
-  // Clear to empty → commits "" (unlike title).
-  fireEvent.change(ta, { target: { value: '' } });
-  fireEvent.blur(ta);
-  assert.equal(spies.saveDescriptionCalls.length, 2);
-  assert.equal(spies.saveDescriptionCalls[1][0], '');
-
-  // Whitespace-only → treated as empty; already saved "" → no-op.
-  fireEvent.change(ta, { target: { value: '   ' } });
-  fireEvent.blur(ta);
-  assert.equal(spies.saveDescriptionCalls.length, 2);
-  assert.equal(ta.value, '');
+  assert.equal(spies.saveDescriptionCalls[0][0], '');
 });
 
 // ── 4. Calendar row ─────────────────────────────────────────────────────
@@ -615,7 +617,7 @@ test('overflow Delete calls onDelete; available for owner/writer/omitted', () =>
 
 // ── 7b. Saves never disable the form ────────────────────────────────────
 
-test('fields stay enabled and editable while earlier saves are pending', () => {
+test('fields stay enabled and editable while earlier saves are pending', async () => {
   const spies = makeSpies();
   // Handlers that never settle: a save stays "in flight" for the whole test.
   const pending = new Promise<void>(() => {});
@@ -645,7 +647,6 @@ test('fields stay enabled and editable while earlier saves are pending', () => {
 
   const labels = [
     'Title',
-    'Description',
     'Start time',
     'End time',
     'Date',
@@ -658,6 +659,12 @@ test('fields stay enabled and editable while earlier saves are pending', () => {
     const el = screen.getByLabelText(label) as HTMLInputElement;
     assert.equal(el.disabled, false, `${label} should stay enabled`);
   }
+  const description = await screen.findByLabelText('Description');
+  assert.equal(
+    description.getAttribute('contenteditable'),
+    'true',
+    'Description should stay editable',
+  );
 
   // The same field can be edited again while the first save is pending.
   fireEvent.change(title, { target: { value: 'Second' } });
@@ -725,6 +732,27 @@ test('read-only reader and freeBusyReader: static title/description/when, no Del
     assert.equal(screen.queryByLabelText('More actions'), null);
     assert.equal(screen.queryByLabelText('Delete event'), null);
   }
+});
+
+test('read-only HTML description is sanitized and rendered', () => {
+  mount({
+    event: makeEvent({
+      id: 'ro-html-desc',
+      description:
+        '<p>Secret <b>plans</b></p><script>alert(1)</script>' +
+        '<img src=x onerror=alert(1)>',
+    }),
+    calendar: makeCalendar({ access_role: 'reader' }),
+    focusTitle: true,
+  });
+  assert.equal(screen.queryByLabelText('Description'), null);
+  assert.equal(
+    document.querySelector('.rich-text-content b')?.textContent,
+    'plans',
+  );
+  assert.equal(document.querySelector('script'), null);
+  assert.equal(document.querySelector('img'), null);
+  assert.doesNotMatch(document.body.textContent ?? '', /<b>|<script>/);
 });
 
 test('read-only empty description shows static placeholder', () => {

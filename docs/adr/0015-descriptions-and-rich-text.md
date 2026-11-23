@@ -3,10 +3,10 @@
 Status: Accepted
 Date: 2026-11-21
 
-> Implementation note (2026-11-21): the routine `description` column and the
-> shared Markdown editor for task/routine descriptions are implemented. Event
-> descriptions remain Google-owned HTML with the existing plain textarea; the
-> sanitized rich renderer/editor described below is the Phase 3 follow-up.
+> Implementation note (2026-11-23): the routine `description` column and the
+> shared editor are implemented. Tasks and routines use the Markdown mode;
+> calendar event descriptions now use the same editor in HTML mode, with
+> sanitized read-only rendering for plain text and Google/Notion HTML.
 
 ## Context
 

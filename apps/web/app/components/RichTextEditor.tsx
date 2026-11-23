@@ -28,6 +28,7 @@ export function RichTextEditor(props: RichTextEditorProps) {
 function EditorFallback({
   value,
   onChange,
+  onBlur,
   placeholder,
   disabled,
   className,
@@ -36,6 +37,7 @@ function EditorFallback({
     <textarea
       value={value}
       onChange={(e) => onChange(e.target.value)}
+      onBlur={onBlur}
       placeholder={placeholder}
       disabled={disabled}
       rows={3}

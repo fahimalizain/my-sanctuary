@@ -15,9 +15,16 @@ import {
   PopoverAnchor,
   PopoverContent,
 } from '@/components/ui/popover';
+import { RichTextEditor } from '@/app/components/RichTextEditor';
 import type { CalendarEvent, GoogleCalendar } from '@/app/types';
+import { normalizeEditorHtml } from '@/lib/rich-text-html';
 import { cn } from '@/lib/utils';
 import { eventChipColor } from '../lib/calendar-model';
+import {
+  eventDescriptionToEditorHtml,
+  isHtmlDescription,
+  sanitizeEventDescriptionHtml,
+} from '../lib/event-description';
 import { notionEventCssVars } from '../lib/event-colors';
 import { isTempEventId } from '../lib/event-overlays';
 import { DESKTOP_MQ, eventChipSelector } from '../lib/inspector-anchor';
@@ -367,7 +374,12 @@ function InspectorForm({
   // Read-only: static chips only when set.
   const showChipRow = writable || isAllDay || Boolean(timeZone) || showRepeat;
 
-  const descriptionDisplay = description.trim();
+  // Read-only views use the stored description, never the editor's local HTML.
+  const storedDescription = (event.description ?? '').trim();
+  const storedDescriptionIsHtml = isHtmlDescription(storedDescription);
+  const safeStoredDescription = storedDescriptionIsHtml
+    ? sanitizeEventDescriptionHtml(storedDescription)
+    : '';
   const calendarLabel = calendar?.summary || 'Calendar';
   const swatch = eventChipColor(event);
 
@@ -609,28 +621,27 @@ function InspectorForm({
           </div>
         </div>
 
-        {/* Description — textarea when writable; static when read-only */}
+        {/* Description — Google-owned HTML: rich editor when writable,
+            sanitized static HTML when read-only */}
         {writable ? (
-          <textarea
+          <RichTextEditor
             value={description}
-            onChange={(e) => setDescription(e.target.value)}
+            onChange={setDescription}
             onBlur={commitDescription}
-            onKeyDown={(e) => {
-              // Enter inserts a newline; Cmd/Ctrl+Enter blurs to commit.
-              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault();
-                (e.target as HTMLTextAreaElement).blur();
-              }
-            }}
-            aria-label="Description"
+            format="html"
             placeholder="Description"
-            rows={3}
-            className="w-full resize-none border-0 bg-transparent p-0 text-sm text-foreground whitespace-pre-wrap placeholder:text-muted-foreground/60 focus:outline-none focus:ring-0"
           />
-        ) : descriptionDisplay ? (
-          <p className="selectable whitespace-pre-wrap text-sm text-foreground">
-            {descriptionDisplay}
-          </p>
+        ) : storedDescription ? (
+          storedDescriptionIsHtml ? (
+            <div
+              className="rich-text-content selectable text-sm text-foreground"
+              dangerouslySetInnerHTML={{ __html: safeStoredDescription }}
+            />
+          ) : (
+            <p className="selectable whitespace-pre-wrap text-sm text-foreground">
+              {storedDescription}
+            </p>
+          )
         ) : (
           <p className="text-sm text-muted-foreground">Description</p>
         )}
@@ -704,9 +715,13 @@ export function EventInspector({
   const titleRef = useRef<HTMLInputElement>(null);
   // Track the last-saved title so blur after an unchanged edit is a no-op.
   const savedTitleRef = useRef(event.title);
-  const [description, setDescription] = useState(event.description ?? '');
-  // Committed (trimmed) description — blank is a valid clear, unlike title.
-  const savedDescriptionRef = useRef((event.description ?? '').trim());
+  // The editor works in Google's native HTML. Plain-text notes are escaped and
+  // their line breaks preserved before they reach it.
+  const [description, setDescription] = useState(() =>
+    eventDescriptionToEditorHtml(event.description ?? ''),
+  );
+  // Committed description — blank is a valid clear, unlike title.
+  const savedDescriptionRef = useRef(description);
   const isDesktop = useIsDesktop();
   const rect = useChipRect(event.id);
   const hidden = isDragging;
@@ -737,9 +752,9 @@ export function EventInspector({
   useEffect(() => {
     const dirty = description !== savedDescriptionRef.current;
     if (dirty) return;
-    const next = event.description ?? '';
+    const next = eventDescriptionToEditorHtml(event.description ?? '');
     setDescription(next);
-    savedDescriptionRef.current = next.trim();
+    savedDescriptionRef.current = next;
   }, [event.id, event.description]);
 
   useEffect(() => {
@@ -820,9 +835,9 @@ export function EventInspector({
   };
 
   const commitDescription = () => {
-    const next = description.trim();
+    const next = normalizeEditorHtml(description);
     if (next === savedDescriptionRef.current) {
-      // Normalize whitespace-only / trailing spaces in the field.
+      // Normalize an empty document (`<p></p>`) or trailing whitespace.
       if (description !== next) setDescription(next);
       return;
     }

@@ -20,6 +20,7 @@ import {
   Undo2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { normalizeEditorHtml } from '@/lib/rich-text-html';
 
 export type RichTextFormat = 'markdown' | 'html';
 
@@ -27,6 +28,8 @@ export interface RichTextEditorProps {
   /** Markdown when `format="markdown"`, HTML when `format="html"`. */
   value: string;
   onChange: (value: string) => void;
+  /** Fired when the editable surface loses focus (used for autosave). */
+  onBlur?: () => void;
   /** `"markdown"` for tasks/routines; `"html"` for Google-owned events. */
   format?: RichTextFormat;
   placeholder?: string;
@@ -49,6 +52,7 @@ export interface RichTextEditorProps {
 export function RichTextEditorImpl({
   value,
   onChange,
+  onBlur,
   format = 'markdown',
   placeholder = 'Add more details...',
   disabled = false,
@@ -58,6 +62,8 @@ export function RichTextEditorImpl({
   // current without recreating the editor on every parent render.
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const onBlurRef = useRef(onBlur);
+  onBlurRef.current = onBlur;
   const lastValueRef = useRef(value);
 
   const editor = useEditor(
@@ -91,20 +97,31 @@ export function RichTextEditorImpl({
       editable: !disabled,
       editorProps: {
         attributes: {
-          class: 'sanctuary-editor-content',
+          class: 'sanctuary-editor-content rich-text-content',
           'aria-label': 'Description',
+        },
+        handleKeyDown: (_view, event) => {
+          // Match the old textarea contract: Cmd/Ctrl+Enter blurs to commit.
+          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            (event.target as HTMLElement | null)?.blur();
+            return true;
+          }
+          return false;
         },
       },
       onUpdate: ({ editor }) => {
-        // TipTap's Markdown serializer ends with a newline; trim it so a
-        // no-op edit does not churn `updated_at` or store blank lines.
-        const next = (
-          format === 'markdown' ? editor.getMarkdown() : editor.getHTML()
-        ).trimEnd();
+        const raw =
+          format === 'markdown' ? editor.getMarkdown() : editor.getHTML();
+        // Markdown ends with a newline and HTML with an empty `<p>`; trim both
+        // so a no-op edit does not churn `updated_at` or store blank lines.
+        const next =
+          format === 'html' ? normalizeEditorHtml(raw) : raw.trimEnd();
         if (next === lastValueRef.current) return;
         lastValueRef.current = next;
         onChangeRef.current(next);
       },
+      onBlur: () => onBlurRef.current?.(),
     },
     [format, disabled],
   );

@@ -149,63 +149,71 @@
     outline: none;
   }
 
-  .sanctuary-editor-content > * + * {
+  /* Shared prose rendering for the editable surface and read-only event
+     descriptions (Google/Notion HTML). */
+  .rich-text-content {
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: hsl(var(--foreground));
+  }
+
+  .rich-text-content > * + * {
     margin-top: 0.5rem;
   }
 
-  .sanctuary-editor-content p {
+  .rich-text-content p {
     margin: 0;
   }
 
-  .sanctuary-editor-content h1,
-  .sanctuary-editor-content h2,
-  .sanctuary-editor-content h3 {
+  .rich-text-content h1,
+  .rich-text-content h2,
+  .rich-text-content h3 {
     @apply font-heading font-semibold text-foreground;
     line-height: 1.25;
     margin: 0;
   }
 
-  .sanctuary-editor-content h1 {
+  .rich-text-content h1 {
     font-size: 1.125rem;
   }
 
-  .sanctuary-editor-content h2 {
+  .rich-text-content h2 {
     font-size: 1rem;
   }
 
-  .sanctuary-editor-content h3 {
+  .rich-text-content h3 {
     font-size: 0.9375rem;
   }
 
-  .sanctuary-editor-content ul,
-  .sanctuary-editor-content ol {
+  .rich-text-content ul,
+  .rich-text-content ol {
     margin: 0;
     padding-left: 1.25rem;
   }
 
-  .sanctuary-editor-content ul {
+  .rich-text-content ul {
     list-style: disc outside;
   }
 
-  .sanctuary-editor-content ol {
+  .rich-text-content ol {
     list-style: decimal outside;
   }
 
-  .sanctuary-editor-content li {
+  .rich-text-content li {
     margin: 0.125rem 0;
   }
 
-  .sanctuary-editor-content li > p {
+  .rich-text-content li > p {
     margin: 0;
   }
 
-  .sanctuary-editor-content blockquote {
+  .rich-text-content blockquote {
     border-left: 2px solid hsl(var(--border));
     padding-left: 0.75rem;
     color: hsl(var(--muted-foreground));
   }
 
-  .sanctuary-editor-content code {
+  .rich-text-content code {
     border-radius: 0.25rem;
     background-color: hsl(var(--muted));
     padding: 0.0625rem 0.25rem;
@@ -213,26 +221,26 @@
     font-size: 0.8125rem;
   }
 
-  .sanctuary-editor-content pre {
+  .rich-text-content pre {
     overflow-x: auto;
     border-radius: 0.5rem;
     background-color: hsl(var(--muted));
     padding: 0.625rem 0.75rem;
   }
 
-  .sanctuary-editor-content pre code {
+  .rich-text-content pre code {
     background: transparent;
     padding: 0;
     font-size: 0.8125rem;
   }
 
-  .sanctuary-editor-content a {
+  .rich-text-content a {
     color: hsl(var(--primary));
     text-decoration: underline;
     text-underline-offset: 2px;
   }
 
-  .sanctuary-editor-content hr {
+  .rich-text-content hr {
     border: 0;
     border-top: 1px solid hsl(var(--border));
     margin: 0.75rem 0;
