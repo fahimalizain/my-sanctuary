@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { ArrowLeft, Loader2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { RichTextEditor } from '@/app/components/RichTextEditor';
 import {
   Dialog,
   DialogContent,
@@ -116,6 +117,7 @@ export function RoutinesPage() {
   // Routine dialog state.
   const [form, setForm] = useState<RoutineFormState | null>(null);
   const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
   const [estimatedMinutes, setEstimatedMinutes] = useState('15');
   const [dtstartDate, setDtstartDate] = useState(civilToday());
   const [dtstartTime, setDtstartTime] = useState('06:30');
@@ -156,6 +158,7 @@ export function RoutinesPage() {
   const openCreate = () => {
     setForm({ mode: 'create' });
     setTitle('');
+    setDescription('');
     setEstimatedMinutes('15');
     setDtstartDate(civilToday());
     setDtstartTime('06:30');
@@ -246,6 +249,7 @@ export function RoutinesPage() {
   const openEdit = (routine: RoutineRecord) => {
     setForm({ mode: 'edit', routine });
     setTitle(routine.title);
+    setDescription(routine.description);
     setEstimatedMinutes(String(routine.estimated_minutes));
     // The stored recurrence is ONE blob: split its DTSTART (basic form) into
     // the builder's civil date + time fields, and prefill the rule body.
@@ -363,6 +367,7 @@ export function RoutinesPage() {
 
     const payload: NewRoutineInput = {
       title: title.trim(),
+      description: description.trim(),
       estimated_minutes: Number(estimatedMinutes),
       rrule: rruleBlob,
     };
@@ -615,6 +620,21 @@ export function RoutinesPage() {
                   Title matches multiple categories — be more specific
                 </p>
               )}
+            </div>
+
+            {/* Description — same notes field tasks carry */}
+            <div className="space-y-2 mb-5">
+              <label className="text-sm font-medium text-foreground">
+                Description{' '}
+                <span className="text-muted-foreground/60 font-normal">
+                  (optional)
+                </span>
+              </label>
+              <RichTextEditor
+                value={description}
+                onChange={setDescription}
+                placeholder="Add more details about this routine..."
+              />
             </div>
 
             {/* Estimate */}

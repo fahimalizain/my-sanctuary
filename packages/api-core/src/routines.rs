@@ -131,6 +131,8 @@ pub struct RoutineView {
     pub id: String,
     pub user_id: String,
     pub title: String,
+    /// Optional notes; `""` when the routine has none.
+    pub description: String,
     pub estimated_minutes: i64,
     /// The two-line recurrence blob (`DTSTART:` line + `RRULE:` line).
     pub rrule: String,
@@ -341,6 +343,8 @@ pub async fn list_routines(
 ///
 /// - `title` is trimmed and must not be empty AND must uniquely match a
 ///   non-untracked category — the exact `create_task` rules and messages.
+/// - `description` is optional free text; it is trimmed on write and an
+///   omitted/blank value stores `""` (same convention as task notes).
 /// - `estimated_minutes` defaults to [`DEFAULT_ESTIMATED_MINUTES`] and must be
 ///   >= [`MIN_ESTIMATED_MINUTES`].
 /// - `rrule` (the two-line blob) is validated (invalid rule → 400
@@ -368,6 +372,10 @@ pub async fn create_routine(
     if title.is_empty() {
         return Err(RoutinesError::Invalid("title must not be empty".to_string()));
     }
+    let description = input.description.as_deref().unwrap_or("").trim();
+    if !crate::rich_text::description_is_within_limit(description) {
+        return Err(RoutinesError::Invalid("description too long".to_string()));
+    }
     let estimated_minutes = input.estimated_minutes.unwrap_or(DEFAULT_ESTIMATED_MINUTES);
     if estimated_minutes < MIN_ESTIMATED_MINUTES {
         return Err(RoutinesError::Invalid(
@@ -390,6 +398,7 @@ pub async fn create_routine(
         .insert(NewRoutine {
             user_id: user_id.to_string(),
             title,
+            description: description.to_string(),
             estimated_minutes,
             rrule: input.rrule.trim().to_string(),
             sort_order: append_rank(max),
@@ -420,12 +429,13 @@ pub async fn create_routine(
     })
 }
 
-/// Updates a routine's `title`/`estimated_minutes`/`rrule`/`sort_order`
-/// (`None` = unchanged).
+/// Updates a routine's `title`/`description`/`estimated_minutes`/`rrule`/
+/// `sort_order` (`None` = unchanged).
 ///
 /// - A body with nothing to update is 400 ("nothing to update").
 /// - When `title` is present it must be non-blank AND uniquely match a
 ///   non-untracked category (same rules and messages as create).
+/// - A present `description` replaces the notes; `""` clears them.
 /// - `estimated_minutes` must be >= 1 when present. A changed `rrule` blob is
 ///   validated on its own (it carries its own DTSTART).
 /// - A missing, soft-deleted, or another user's routine is 404.
@@ -454,11 +464,17 @@ pub async fn update_routine(
     now_unix: i64,
 ) -> Result<RoutineResponse, RoutinesError> {
     if updates.title.is_none()
+        && updates.description.is_none()
         && updates.estimated_minutes.is_none()
         && updates.rrule.is_none()
         && updates.sort_order.is_none()
     {
         return Err(RoutinesError::Invalid("nothing to update".to_string()));
+    }
+    if let Some(description) = updates.description.as_deref() {
+        if !crate::rich_text::description_is_within_limit(description) {
+            return Err(RoutinesError::Invalid("description too long".to_string()));
+        }
     }
     if let Some(estimated_minutes) = updates.estimated_minutes {
         if estimated_minutes < MIN_ESTIMATED_MINUTES {
@@ -900,6 +916,7 @@ fn to_view(routine: &Routine, taxonomy: &Taxonomy) -> RoutineView {
         id: routine.id.clone(),
         user_id: routine.user_id.clone(),
         title: routine.title.clone(),
+        description: routine.description.clone(),
         estimated_minutes: routine.estimated_minutes,
         rrule: routine.rrule.clone(),
         sort_order: routine.sort_order,
@@ -964,6 +981,7 @@ mod tests {
                 id: id.to_string(),
                 user_id: user_id.to_string(),
                 title: title.to_string(),
+                description: String::new(),
                 estimated_minutes: 15,
                 rrule: rrule.to_string(),
                 sort_order,
@@ -1006,6 +1024,7 @@ mod tests {
                 id: format!("rt-{next}"),
                 user_id: routine.user_id,
                 title: routine.title,
+                description: routine.description,
                 estimated_minutes: routine.estimated_minutes,
                 rrule: routine.rrule,
                 sort_order: routine.sort_order,
@@ -1017,6 +1036,7 @@ mod tests {
             self.inserted.lock().unwrap().push(NewRoutine {
                 user_id: row.user_id.clone(),
                 title: row.title.clone(),
+                description: row.description.clone(),
                 estimated_minutes: row.estimated_minutes,
                 rrule: row.rrule.clone(),
                 sort_order: row.sort_order,
@@ -1039,6 +1059,9 @@ mod tests {
             };
             if let Some(title) = &updates.title {
                 row.title = title.clone();
+            }
+            if let Some(description) = &updates.description {
+                row.description = description.clone();
             }
             if let Some(estimated_minutes) = updates.estimated_minutes {
                 row.estimated_minutes = estimated_minutes;
@@ -2154,6 +2177,7 @@ mod tests {
     fn input(title: &str, rrule: &str) -> NewRoutineInput {
         NewRoutineInput {
             title: title.to_string(),
+            description: None,
             estimated_minutes: None,
             rrule: rrule.to_string(),
         }
@@ -2262,6 +2286,7 @@ mod tests {
             "u-1",
             &NewRoutineInput {
                 title: "Salat".to_string(),
+                description: Some("  Face the qibla  ".to_string()),
                 estimated_minutes: Some(10),
                 rrule: blob("2026-01-01T05:30:00", "FREQ=DAILY"),
             },
@@ -2273,6 +2298,10 @@ mod tests {
         .unwrap();
         assert_eq!(second.routine.sort_order, 1, "append rank max+1");
         assert_eq!(second.routine.estimated_minutes, 10);
+        assert_eq!(
+            second.routine.description, "Face the qibla",
+            "create trims the description like task notes"
+        );
         assert_eq!(
             second.routine.rrule, "DTSTART:20260101T053000\nRRULE:FREQ=DAILY",
             "the blob round-trips"
@@ -2334,6 +2363,26 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, RoutinesError::Invalid(ref m) if m == "estimated_minutes must be at least 1"),
+            "{err:?}"
+        );
+        let too_long = NewRoutineInput {
+            description: Some("x".repeat(crate::rich_text::MAX_DESCRIPTION_BYTES + 1)),
+            ..input("Work", &good)
+        };
+        let err = pollster::block_on(create_routine(
+            &repos.lists,
+            &repos.categories,
+            &repos.routines,
+            "u-1",
+            &too_long,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, RoutinesError::Invalid(ref m) if m == "description too long"),
             "{err:?}"
         );
         for bad in [
@@ -2517,6 +2566,45 @@ mod tests {
             updated.routine.rrule, "DTSTART:20260105T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE",
             "the blob round-trips"
         );
+        assert_eq!(updated.routine.description, "", "omitted description stays empty");
+
+        // Description set/clear is a plain partial update: no occurrence or
+        // agenda work, and `""` is a valid clear (unlike title).
+        let with_notes = UpdateRoutine {
+            description: Some("Bring water".to_string()),
+            ..UpdateRoutine::default()
+        };
+        let updated = pollster::block_on(update_routine(
+            &repos.categories,
+            &repos.routines,
+            "u-1",
+            &id,
+            &with_notes,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+        .unwrap();
+        assert_eq!(updated.routine.description, "Bring water");
+
+        let cleared = UpdateRoutine {
+            description: Some(String::new()),
+            ..UpdateRoutine::default()
+        };
+        let updated = pollster::block_on(update_routine(
+            &repos.categories,
+            &repos.routines,
+            "u-1",
+            &id,
+            &cleared,
+            &repos.occurrences,
+            &repos.agenda,
+            &repos.calendars,
+            NOW_UNIX,
+        ))
+        .unwrap();
+        assert_eq!(updated.routine.description, "", "empty string clears the notes");
 
         // A bad replacement blob is refused; the stored rule stays intact.
         let invalid_rule = UpdateRoutine {

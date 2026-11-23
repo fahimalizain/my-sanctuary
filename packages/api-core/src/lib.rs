@@ -27,6 +27,7 @@ pub mod pattern_gen;
 pub mod realtime;
 pub mod record;
 pub mod repo;
+pub mod rich_text;
 pub mod routines;
 pub mod rules;
 pub mod standalone;
@@ -151,6 +152,7 @@ pub use record::{
     RECORD_PRODUCTIVE_SECONDS_SQL, RECORD_UNCLASSIFIED_TITLES_SQL, TREND_WINDOW_DAYS,
     UNCLASSIFIED_TITLES_CAP, YEARS_CAP,
 };
+pub use rich_text::markdown_to_calendar_text;
 pub use routines::{
     create_routine, delete_routine, list_routines, occurrence_dates, reorder_routines,
     update_routine, validate_recurrence, DeleteRoutineResponse, ReorderRoutinesInput,

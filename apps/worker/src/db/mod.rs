@@ -654,6 +654,7 @@ impl RoutineRepo for D1RoutineRepo {
                 D1Type::Text(&id),
                 D1Type::Text(&routine.user_id),
                 D1Type::Text(&routine.title),
+                D1Type::Text(&routine.description),
                 D1Type::Integer(routine.estimated_minutes as i32),
                 D1Type::Text(&routine.rrule),
                 D1Type::Integer(routine.sort_order as i32),
@@ -666,6 +667,7 @@ impl RoutineRepo for D1RoutineRepo {
             id: id.clone(),
             user_id: routine.user_id,
             title: routine.title,
+            description: routine.description,
             estimated_minutes: routine.estimated_minutes,
             rrule: routine.rrule,
             sort_order: routine.sort_order,
@@ -682,6 +684,7 @@ impl RoutineRepo for D1RoutineRepo {
     ) -> Result<Option<Routine>, RepoError> {
         // NULL binds flow through COALESCE and leave the column unchanged.
         let title = optional_text(updates.title.as_deref());
+        let description = optional_text(updates.description.as_deref());
         let estimated_minutes = match updates.estimated_minutes {
             Some(value) => D1Type::Integer(value as i32),
             None => D1Type::Null,
@@ -697,6 +700,7 @@ impl RoutineRepo for D1RoutineRepo {
             .prepare(ROUTINE_UPDATE_SQL)
             .bind_refs(&[
                 title,
+                description,
                 estimated_minutes,
                 rrule,
                 sort_order,

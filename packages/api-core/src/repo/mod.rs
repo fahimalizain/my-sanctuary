@@ -988,8 +988,8 @@ pub const ROUTINE_GET_BY_ID_SQL: &str =
 /// arrives as the two-line recurrence blob (DTSTART + RRULE).
 pub const ROUTINE_INSERT_SQL: &str = "
     INSERT INTO routines
-        (id, user_id, title, estimated_minutes, rrule, sort_order, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (id, user_id, title, description, estimated_minutes, rrule, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ";
 
 /// Partial update: NULL binds leave the column unchanged (`COALESCE`). The
@@ -999,6 +999,7 @@ pub const ROUTINE_INSERT_SQL: &str = "
 pub const ROUTINE_UPDATE_SQL: &str = "
     UPDATE routines SET
         title = COALESCE(?, title),
+        description = COALESCE(?, description),
         estimated_minutes = COALESCE(?, estimated_minutes),
         rrule = COALESCE(?, rrule),
         sort_order = COALESCE(?, sort_order),
@@ -1886,17 +1887,17 @@ mod tests {
     }
 
     #[test]
-    fn routine_insert_binds_all_8_columns() {
+    fn routine_insert_binds_all_9_columns() {
         assert!(ROUTINE_INSERT_SQL.contains("INSERT INTO routines"), "{}", ROUTINE_INSERT_SQL);
         assert!(!ROUTINE_INSERT_SQL.contains("ON CONFLICT"), "{}", ROUTINE_INSERT_SQL);
         assert_eq!(
             ROUTINE_INSERT_SQL.matches('?').count(),
-            8,
+            9,
             "one placeholder per column: {}",
             ROUTINE_INSERT_SQL
         );
         for column in [
-            "id", "user_id", "title", "estimated_minutes", "rrule",
+            "id", "user_id", "title", "description", "estimated_minutes", "rrule",
             "sort_order", "created_at", "updated_at",
         ] {
             assert!(ROUTINE_INSERT_SQL.contains(column), "missing {column}");

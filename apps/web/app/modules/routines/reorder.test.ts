@@ -9,6 +9,7 @@ function routine(id: string, sort_order: number): RoutineRecord {
     id,
     user_id: 'u-1',
     title: `Title ${id}`,
+    description: '',
     estimated_minutes: 15,
     rrule: 'DTSTART:20260101T063000\nRRULE:FREQ=DAILY',
     sort_order,
